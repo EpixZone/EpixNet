@@ -39,18 +39,18 @@ class TestWeb:
         assert "Forbidden" in getUrl("%s/media/../config.py" % site_url)
         assert "Forbidden" in getUrl("%s/media/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../sites.json" % site_url)
         assert "Forbidden" in getUrl("%s/media/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/..//sites.json" % site_url)
-        assert "Forbidden" in getUrl("%s/media/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../../zeronet.py" % site_url)
+        assert "Forbidden" in getUrl("%s/media/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../../epixnet.py" % site_url)
 
         assert "Not Found" in getUrl("%s/raw/sites.json" % site_url)
         assert "Forbidden" in getUrl("%s/raw/./sites.json" % site_url)
         assert "Forbidden" in getUrl("%s/raw/../config.py" % site_url)
         assert "Forbidden" in getUrl("%s/raw/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../sites.json" % site_url)
         assert "Forbidden" in getUrl("%s/raw/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/..//sites.json" % site_url)
-        assert "Forbidden" in getUrl("%s/raw/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../../zeronet.py" % site_url)
+        assert "Forbidden" in getUrl("%s/raw/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../../epixnet.py" % site_url)
 
         assert "Forbidden" in getUrl("%s/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../sites.json" % site_url)
         assert "Forbidden" in getUrl("%s/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/..//sites.json" % site_url)
-        assert "Forbidden" in getUrl("%s/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../../zeronet.py" % site_url)
+        assert "Forbidden" in getUrl("%s/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/../../epixnet.py" % site_url)
 
         assert "Forbidden" in getUrl("%s/content.db" % site_url)
         assert "Forbidden" in getUrl("%s/./users.json" % site_url)
@@ -59,7 +59,7 @@ class TestWeb:
 
     def testLinkSecurity(self, browser, site_url):
         browser.get("%s/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/test/security.html" % site_url)
-        WebDriverWait(browser, 10).until(title_is("ZeroHello - ZeroNet"))
+        WebDriverWait(browser, 10).until(title_is("ZeroHello - EpixNet"))
         assert getContextUrl(browser) == "%s/1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr/test/security.html" % site_url
 
         # Switch to inner frame

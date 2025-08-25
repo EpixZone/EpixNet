@@ -1,8 +1,7 @@
 {
-	"ZeroNet config": "Konfiguracja ZeroNet",
+	"EpixNet config": "Konfiguracja EpixNet",
 	"Web Interface": "Interfejs webowy",
-	"Open web browser on ZeroNet startup": "Otwórz przeglądarkę podczas uruchomienia ZeroNet",
-
+	"Open web browser on EpixNet startup": "Otwórz przeglądarkę podczas uruchomienia EpixNet",
 	"Network": "Sieć",
 	"Offline mode": "Tryb offline",
 	"Disable network communication.": "Wyłącz komunikacje sieciową",
@@ -10,28 +9,23 @@
 	"Accept incoming peers using IPv4 or IPv6 address. (default: dual)": "Akceptuj połączenia przychodzące używając IPv4 i IPv6. (domyślnie: oba)",
 	"Dual (IPv4 & IPv6)": "Oba (IPv4 i IPv6)",
 	"File server port": "Port serwera plików",
-	"Other peers will use this port to reach your served sites. (default: 15441)": "Inni użytkownicy będą używać tego portu do połączenia się z Tobą. (domyślnie 15441)",
+	"Other peers will use this port to reach your served sites. (default: 10042)": "Inni użytkownicy będą używać tego portu do połączenia się z Tobą. (domyślnie 10042)",
 	"File server external ip": "Zewnętrzny adres IP serwera plików",
 	"Detect automatically": "Wykryj automatycznie",
 	"Your file server is accessible on these ips. (default: detect automatically)": "Twój serwer plików będzie dostępny na tych adresach IP. (domyślnie: wykryj automatycznie)",
-
 	"Disable: Don't connect to peers on Tor network": "Wyłącz: Nie łącz się do użytkowników sieci Tor",
 	"Enable: Only use Tor for Tor network peers": "Włącz: Łącz się do użytkowników sieci Tor",
 	"Always: Use Tor for every connections to hide your IP address (slower)": "Zawsze Tor: Użyj Tor dla wszystkich połączeń w celu ukrycia Twojego adresu IP (wolne działanie)",
-
 	"Disable": "Wyłącz",
 	"Enable": "Włącz",
 	"Always": "Zawsze Tor",
-
 	"Use Tor bridges": "Użyj Tor bridges",
 	"Use obfuscated bridge relays to avoid network level Tor block (even slower)": "Użyj obfuskacji, aby uniknąć blokowania Tor na poziomie sieci (jeszcze wolniejsze działanie)",
 	"Trackers": "Trackery",
 	"Discover new peers using these adresses": "Wykryj użytkowników korzystając z tych adresów trackerów",
-
 	"Trackers files": "Pliki trackerów",
 	"Load additional list of torrent trackers dynamically, from a file": "Dynamicznie wczytaj dodatkową listę trackerów z pliku .json",
 	"Eg.: data/trackers.json": "Np.: data/trackers.json",
-
 	"Proxy for tracker connections": "Serwer proxy dla trackerów",
 	"Custom": "Własny",
 	"Custom socks proxy address for trackers": "Adres serwera proxy do łączenia z trackerami",
@@ -54,9 +48,8 @@
 	"4 threads": "4 wątki",
 	"5 threads": "5 wątków",
 	"10 threads": "10 wątków",
-
 	" configuration item value changed": " obiekt konfiguracji zmieniony",
 	"Save settings": "Zapisz ustawienia",
-	"Some changed settings requires restart": "Niektóre zmiany ustawień wymagają ponownego uruchomienia ZeroNet",
-	"Restart ZeroNet client": "Uruchom ponownie ZeroNet"
+	"Some changed settings requires restart": "Niektóre zmiany ustawień wymagają ponownego uruchomienia EpixNet",
+	"Restart EpixNet client": "Uruchom ponownie EpixNet"
 }

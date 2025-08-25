@@ -96,7 +96,7 @@ def electrum_sig(coincurve_signature):
 
 def sign_data(secretkey, byte_string):
     """Sign [byte_string] with [secretkey].
-    Return serialized signature compatible with Electrum (ZeroNet)."""
+    Return serialized signature compatible with Electrum (EpixNet)."""
     # encode the message
     encoded = zero_format(byte_string)
     # sign the message and get a coincurve signature

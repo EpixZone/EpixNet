@@ -44,7 +44,7 @@ if sys.platform == "win32":
     CHROMEDRIVER_PATH = "tools/chrome/chromedriver.exe"
 else:
     CHROMEDRIVER_PATH = "chromedriver"
-SITE_URL = "http://127.0.0.1:43110"
+SITE_URL = "http://127.0.0.1:42222"
 
 TEST_DATA_PATH = 'src/Test/testdata'
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/../lib"))  # External modules directory
@@ -73,8 +73,8 @@ config.verbose = True  # Use test data for unittests
 config.tor = "disable"  # Don't start Tor client
 config.trackers = []
 config.data_dir = TEST_DATA_PATH  # Use test data for unittests
-if "ZERONET_LOG_DIR" in os.environ:
-    config.log_dir = os.environ["ZERONET_LOG_DIR"]
+if "EPIXNET_LOG_DIR" in os.environ:
+    config.log_dir = os.environ["EPIXNET_LOG_DIR"]
 config.initLogging(console_logging=False)
 
 # Set custom formatter with realative time format (via: https://stackoverflow.com/questions/31521859/python-logging-module-time-since-last-log)
@@ -120,7 +120,7 @@ from User import UserManager
 from File import FileServer
 from Connection import ConnectionServer
 from Crypt import CryptConnection
-from Crypt import CryptBitcoin
+from Crypt import CryptEpix
 from Ui import UiWebsocket
 from Tor import TorManager
 from Content import ContentDb
@@ -275,7 +275,7 @@ def site_url():
     try:
         urllib.request.urlopen(SITE_URL).read()
     except Exception as err:
-        raise pytest.skip("Test requires zeronet client running: %s" % err)
+        raise pytest.skip("Test requires epixnet client running: %s" % err)
     return SITE_URL
 
 
@@ -397,10 +397,10 @@ def tor_manager():
 
 @pytest.fixture()
 def db(request):
-    db_path = "%s/zeronet.db" % config.data_dir
+    db_path = "%s/epixnet.db" % config.data_dir
     schema = {
         "db_name": "TestDb",
-        "db_file": "%s/zeronet.db" % config.data_dir,
+        "db_file": "%s/epixnet.db" % config.data_dir,
         "maps": {
             "data.json": {
                 "to_table": [
@@ -444,11 +444,15 @@ def db(request):
     return db
 
 
-@pytest.fixture(params=["sslcrypto", "sslcrypto_fallback", "libsecp256k1"])
+@pytest.fixture(params=["sslcrypto"])
 def crypt_bitcoin_lib(request, monkeypatch):
-    monkeypatch.setattr(CryptBitcoin, "lib_verify_best", request.param)
-    CryptBitcoin.loadLib(request.param)
-    return CryptBitcoin
+    monkeypatch.setattr(CryptEpix, "lib_verify_best", request.param)
+    return CryptEpix
+
+@pytest.fixture(params=["sslcrypto"])
+def crypt_epix_lib(request, monkeypatch):
+    monkeypatch.setattr(CryptEpix, "lib_verify_best", request.param)
+    return CryptEpix
 
 @pytest.fixture(scope='function', autouse=True)
 def logCaseStart(request):

@@ -38,7 +38,7 @@ def launch():
         with open(error_log_path, 'w') as f:
             traceback.print_exc(file=f)
         print("---")
-        print("Please report it: https://github.com/zeronet-conservancy/zeronet-conservancy/issues/new?template=bug-report.md")
+        print("Please report it: https://github.com/EpixZone/EpixNet/issues/new?template=bug-report.md")
         if sys.platform.startswith("win") and "python.exe" not in sys.executable:
             displayErrorMessage(err, error_log_path)
 
@@ -74,10 +74,10 @@ def displayErrorMessage(err, error_log_path):
     err_message = "%s: %s" % (type(err).__name__, err)
     err_title = "Unhandled exception: %s\nReport error?" % err_message
 
-    res = ctypes.windll.user32.MessageBoxW(0, err_title, "ZeroNet error", MB_YESNOCANCEL | MB_ICONEXCLAIMATION)
+    res = ctypes.windll.user32.MessageBoxW(0, err_title, "EpixNet error", MB_YESNOCANCEL | MB_ICONEXCLAIMATION)
     if res == ID_YES:
         import webbrowser
-        report_url = "https://github.com/zeronet-conservancy/zeronet-conservancy/issues/new"
+        report_url = "https://github.com/epixnet/epixnet/issues/new"
         webbrowser.open(report_url)
     if res in [ID_YES, ID_NO]:
         subprocess.Popen(['notepad.exe', error_log_path])
@@ -133,7 +133,7 @@ def restart():
 def start():
     config.working_dir = os.getcwd()
     app_dir = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(app_dir)  # Change working dir to zeronet.py dir
+    os.chdir(app_dir)  # Change working dir to epixnet.py dir
     sys.path.insert(0, os.path.join(app_dir, "src/lib"))  # External liblary directory
     sys.path.insert(0, os.path.join(app_dir, "src"))  # Imports relative to src
 

@@ -23,7 +23,7 @@ class TrackerStorage(object):
         return {"shared": {}}
 
     def onTrackerFound(self, tracker_address, type="shared", my=False):
-        if not tracker_address.startswith("zero://"):
+        if not tracker_address.startswith("epix://"):
             return False
 
         trackers = self.getTrackers()
@@ -97,7 +97,7 @@ class TrackerStorage(object):
         self.log.debug("Loaded %s shared trackers" % len(trackers))
         for address, tracker in list(trackers.items()):
             tracker["num_error"] = 0
-            if not address.startswith("zero://"):
+            if not address.startswith("epix://"):
                 del trackers[address]
 
     def save(self):
@@ -176,7 +176,7 @@ class FileServerPlugin(object):
         res = super(FileServerPlugin, self).portCheck(*args, **kwargs)
         if res and not config.tor == "always" and "Bootstrapper" in PluginManager.plugin_manager.plugin_names:
             for ip in self.ip_external_list:
-                my_tracker_address = "zero://%s:%s" % (ip, config.fileserver_port)
+                my_tracker_address = "epix://%s:%s" % (ip, config.fileserver_port)
                 tracker_storage.onTrackerFound(my_tracker_address, my=True)
         return res
 

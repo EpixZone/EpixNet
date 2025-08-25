@@ -9,7 +9,7 @@ from Plugin import PluginManager
 @PluginManager.acceptPlugins
 class Actions:
     def call(self, function_name, kwargs):
-        logging.info(f'zeronet-conservancy {config.version_full} on Python {sys.version} Gevent {gevent.__version__}')
+        logging.info(f'epixnet {config.version_full} on Python {sys.version} Gevent {gevent.__version__}')
 
         func = getattr(self, function_name, None)
         back = func(**kwargs)
@@ -83,7 +83,7 @@ class Actions:
 
     def siteCreate(self, use_master_seed=True):
         logging.info("Generating new privatekey (use_master_seed: %s)..." % config.use_master_seed)
-        from Crypt import CryptBitcoin
+        from Crypt import CryptEpix
         if use_master_seed:
             from User import UserManager
             user = UserManager.user_manager.get()
@@ -93,8 +93,8 @@ class Actions:
             privatekey = site_data["privatekey"]
             logging.info("Generated using master seed from users.json, site index: %s" % address_index)
         else:
-            privatekey = CryptBitcoin.newPrivatekey()
-            address = CryptBitcoin.privatekeyToAddress(privatekey)
+            privatekey = CryptEpix.newPrivatekey()
+            address = CryptEpix.privatekeyToAddress(privatekey)
         logging.info("----------------------------------------------------------------------")
         logging.info("Site private key: %s" % privatekey)
         logging.info("                  !!! ^ Save it now, required to modify the site ^ !!!")
@@ -351,7 +351,7 @@ class Actions:
         ws = websocket.create_connection(ws_address)
         return ws
 
-    def sitePublish(self, address, peer_ip=None, peer_port=15441, inner_path="content.json", recursive=False):
+    def sitePublish(self, address, peer_ip=None, peer_port=10042, inner_path="content.json", recursive=False):
         from Site import SiteManager
         logging.info("Loading site...")
         site = SiteManager.site_manager.get(address)
@@ -410,34 +410,34 @@ class Actions:
 
     # Crypto commands
     def cryptPrivatekeyToAddress(self, privatekey=None):
-        from Crypt import CryptBitcoin
+        from Crypt import CryptEpix
         if not privatekey:  # If no privatekey in args then ask it now
             import getpass
             privatekey = getpass.getpass("Private key (input hidden):")
 
-        print(CryptBitcoin.privatekeyToAddress(privatekey))
+        print(CryptEpix.privatekeyToAddress(privatekey))
 
     def cryptSign(self, message, privatekey):
-        from Crypt import CryptBitcoin
-        print(CryptBitcoin.sign(message, privatekey))
+        from Crypt import CryptEpix
+        print(CryptEpix.sign(message, privatekey))
 
     def cryptVerify(self, message, sign, address):
-        from Crypt import CryptBitcoin
-        print(CryptBitcoin.verify(message, address, sign))
+        from Crypt import CryptEpix
+        print(CryptEpix.verify(message, address, sign))
 
     def cryptGetPrivatekey(self, master_seed, site_address_index=None):
-        from Crypt import CryptBitcoin
+        from Crypt import CryptEpix
         if len(master_seed) != 64:
             logging.error("Error: Invalid master seed length: %s (required: 64)" % len(master_seed))
             return False
-        privatekey = CryptBitcoin.hdPrivatekey(master_seed, site_address_index)
+        privatekey = CryptEpix.hdPrivatekey(master_seed, site_address_index)
         print("Requested private key: %s" % privatekey)
 
     # Peer
     def peerPing(self, peer_ip, peer_port=None):
         import main
         if not peer_port:
-            peer_port = 15441
+            peer_port = 10042
         logging.info("Opening a simple connection server")
         from Connection import ConnectionServer
         main.file_server = ConnectionServer("127.0.0.1", 1234)

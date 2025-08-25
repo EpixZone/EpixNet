@@ -1,31 +1,34 @@
 def grad(n):
-    s = 0x08
-    r = 0xff
-    g = 0x00
-    b = 0x00
-    for i in range(n):
-        if r >= s and b < s:
-            r -= s
-            g += s
-        elif g >= s and r < s:
-            g -= s
-            b += s
-        elif b >= s and g < s:
-            b -= s
-            r += s
+    colors = [
+        (0x31, 0xBD, 0xC6),
+        (0x8A, 0x4B, 0xDB),
+        (0x6B, 0x3A, 0xB8),
+        (0x4C, 0x29, 0x95),
+        (0x24, 0x1F, 0x90),
+        
+    ]
+
+    color_index = (n // 2) % len(colors)
+    r, g, b = colors[color_index]
+
     return f'#{r:02x}{g:02x}{b:02x}'
 
 def fancy_greet(version):
     from rich.console import Console
     from rich.text import Text
-    zc_msg = fr'''
-|||   . . _  _._|_     _. . . _ .__ _.. _.  . __.. _  __.  .
-|||  //\|/ |/_| |  == /  / \|/ |(  /_||/ |  | __||/ |/   \_|
-|||  \_/|  |\_  |.    \__\_/|  |_) \_ |   \/ |__||  |\__ _/
+    epix_msg = fr'''
+|||  ______       _      _   _      _   
+||| |  ____|     (_)    | \ | |    | |  
+||| | |__   _ __  ___  _|  \| | ___| |_ 
+||| |  __| | '_ \| \ \/ / . ` |/ _ \ __|
+||| | |____| |_) | |>  <| |\  |  __/ |_ 
+||| |______| .__/|_/_/\_\_| \_|\___|\__|
+|||        | |                          
+|||        |_|                          
 |||
 |||  v{version}
 '''
-    lns = zc_msg.split('\n')
+    lns = epix_msg.split('\n')
     console = Console()
     for l in lns:
         txt = Text(l)

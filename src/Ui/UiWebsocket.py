@@ -15,7 +15,7 @@ from rich import print
 
 from Config import config
 from Site import SiteManager
-from Crypt import CryptBitcoin
+from Crypt import CryptEpix
 from Debug import Debug
 from util import QueryJson, RateLimit
 from Plugin import PluginManager
@@ -339,7 +339,7 @@ class UiWebsocket(object):
                 # For compat only
                 'plugins_rev' : {},
                 'user_settings' : self.user.settings,
-                'lib_verify_best' : CryptBitcoin.lib_verify_best
+                'lib_verify_best' : CryptEpix.lib_verify_best
             }
         else:
             back = {
@@ -348,7 +348,7 @@ class UiWebsocket(object):
                 'platform' : 'generic',
                 'dist_type' : 'generic',
                 'fileserver_ip' : '127.0.0.1',
-                'fileserver_port' : 15441,
+                'fileserver_port' : 10042,
                 'tor_enabled' : True,
                 'tor_status' : 'OK',
                 'tor_has_meek_bridges' : True,
@@ -517,8 +517,6 @@ class UiWebsocket(object):
 
     # Sign and publish content.json
     def actionSitePublish(self, to, privatekey=None, inner_path="content.json", sign=True, remove_missing_optional=False, update_changed_files=False):
-        # TODO: check certificates (https://github.com/zeronet-conservancy/zeronet-conservancy/issues/190)
-        # TODO: update certificates (https://github.com/zeronet-conservancy/zeronet-conservancy/issues/194)
         if sign:
             inner_path = self.actionSiteSign(
                 to, privatekey, inner_path, response_ok=False,
@@ -923,7 +921,7 @@ class UiWebsocket(object):
     @flag.admin
     def actionPermissionDetails(self, to, permission):
         if permission == "ADMIN":
-            self.response(to, _["Allow this site to administrate your 0net node"] + " <span style='color: red'>" + _["(Make sure you trust site developer before accepting!)"] + "</span>")
+            self.response(to, _["Allow this site to administrate your EpixNet node"] + " <span style='color: red'>" + _["(Make sure you trust site developer before accepting!)"] + "</span>")
         elif permission == "NOSANDBOX":
             self.response(to, _["Modify your client's configuration and access all site"] + " <span style='color: red'>" + _["(Dangerous!)"] + "</span>")
         elif permission == "PushNotification":
@@ -1231,7 +1229,7 @@ class UiWebsocket(object):
             for websocket in self.server.websockets:
                 websocket.cmd(
                     "notification",
-                    ["info", _["Updating ZeroNet client, will be back in a few minutes..."], 20000]
+                    ["info", _["Updating EpixNet client, will be back in a few minutes..."], 20000]
                 )
                 websocket.cmd("updating")
 
@@ -1244,7 +1242,7 @@ class UiWebsocket(object):
 
         self.cmd(
             "confirm",
-            [_["Update <b>ZeroNet client</b> to latest version?"], _["Update"]],
+            [_["Update <b>EpixNet client</b> to latest version?"], _["Update"]],
             cbServerUpdate
         )
 
@@ -1271,9 +1269,9 @@ class UiWebsocket(object):
             main.ui_server.stop()
 
         if restart:
-            message = [_["Restart <b>ZeroNet client</b>?"], _["Restart"]]
+            message = [_["Restart <b>EpixNet client</b>?"], _["Restart"]]
         else:
-            message = [_["Shut down <b>ZeroNet client</b>?"], _["Shut down"]]
+            message = [_["Shut down <b>EpixNet client</b>?"], _["Shut down"]]
         self.cmd("confirm", message, cbServerShutdown)
 
     @flag.admin

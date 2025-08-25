@@ -1,16 +1,14 @@
 {
-	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the ZeroNet network!": "Tebrikler, portunuz (<b>{0}</b>) açık.<br>Artık ZeroNet ağına katıldınız!",
+	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the EpixNet network!": "Tebrikler, portunuz (<b>{0}</b>) açık.<br>Artık EpixNet ağına katıldınız!",
 	"Tor mode active, every connection using Onion route.": "Tor aktif, tüm bağlantılar Onion yönlendircisini kullanıyor.",
 	"Successfully started Tor onion hidden services.": "Gizli Tor hizmetleri başlatıldı.",
 	"Unable to start hidden services, please check your config.": "Gizli hizmetler başlatılamadı, lütfen ayarlarınızı kontrol ediniz.",
 	"For faster connections open <b>{0}</b> port on your router.": "Daha hızlı bağlantı için <b>{0}</b> nolu portu bilgisayarınıza yönlendirin.",
 	"Your connection is restricted. Please, open <b>{0}</b> port on your router": "Sınırlı bağlantı. Lütfen, <b>{0}</b> nolu portu bilgisayarınıza yönlendirin",
-	"or configure Tor to become a full member of the ZeroNet network.": "ya da ZeroNet ağına tam olarak katılabilmek için Tor'u kullanın.",
-
+	"or configure Tor to become a full member of the EpixNet network.": "ya da EpixNet ağına tam olarak katılabilmek için Tor'u kullanın.",
 	"Select account you want to use in this site:": "Bu sitede kullanmak için bir hesap seçiniz:",
 	"currently selected": "kullanılan",
 	"Unique to site": "Bu site için benzersiz",
-
 	"Content signing failed": "İçerik imzalama başarısız oldu",
 	"Content publish queued for {0:.0f} seconds.": "İçerik yayımlanmak üzere {0:.0f} saniyedir kuyrukta.",
 	"Content published to {0} peers.": "İçerik {0} eşe dağıtıldı.",
@@ -25,10 +23,8 @@
 	"Change it to {auth_type}/{auth_user_name}@{domain}": "{auth_type}/{auth_user_name}@{domain} olarak değiştir.",
 	"Certificate changed to: <b>{auth_type}/{auth_user_name}@{domain}</b>.": "<b>{auth_type}/{auth_user_name}@{domain}</b> olarak değiştirildi",
 	"Site cloned": "Site klonlandı",
-
 	"You have successfully changed the web interface's language!": "WEB ara yüzü için dil başarıyla değiştirildi!",
 	"Due to the browser's caching, the full transformation could take some minute.": "Tam dönüşümün sağlanması, tarayıcı önbelleklemesi yüzünden zaman alabilir.",
-
 	"Connection with <b>UiServer Websocket</b> was lost. Reconnecting...": "<b>UiServer Websocket</b> ile bağlantı kesildi. Yeniden bağlanılıyor...",
 	"Connection with <b>UiServer Websocket</b> recovered.": "<b>UiServer Websocket</b> ile bağlantı yeniden kuruldu.",
 	"UiServer Websocket error, please reload the page.": "UiServer Websocket hatası, lütfen sayfayı yenileyin.",
@@ -47,5 +43,4 @@
 	" New version of this page has just released.<br>Reload to see the modified content.": " Bu sayfanın yeni versiyonu yayımlandı.<br>Değişen içeriği görmek için yeniden yükleyiniz.",
 	"This site requests permission:": "Bu site bir izin istiyor:",
 	"_(Accept)": "İzin ver"
-
 }

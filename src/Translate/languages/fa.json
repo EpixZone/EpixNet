@@ -1,16 +1,14 @@
 {
-	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the ZeroNet network!": "تبریک، درگاه <b>{0}</b> شما باز شده است.<br>شما یک عضو تمام شبکه ZeroNet هستید!",
+	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the EpixNet network!": "تبریک، درگاه <b>{0}</b> شما باز شده است.<br>شما یک عضو تمام شبکه EpixNet هستید!",
 	"Tor mode active, every connection using Onion route.": "حالت Tor فعال است، هر ارتباط از مسیریابی پیاز (Onion) استفاده می‌کند.",
 	"Successfully started Tor onion hidden services.": "خدمات پنهان پیاز (Onion) Tor با موفقیت راه‌اندازی شد.",
 	"Unable to start hidden services, please check your config.": "قادر به راه‌اندازی خدمات پنهان نیستیم، لطفا تنظیمات خود را بررسی نمایید.",
 	"For faster connections open <b>{0}</b> port on your router.": "برای ارتباطات سریعتر درگاه <b>{0}</b> را بر روی مسیریاب (روتر) خود باز نمایید.",
 	"Your connection is restricted. Please, open <b>{0}</b> port on your router": "ارتباط شما محدود‌شده است. لطفا درگاه <b>{0}</b> را در مسیریاب (روتر) خود باز نمایید",
-	"or configure Tor to become a full member of the ZeroNet network.": "یا پیکربندی Tor را انجام دهید تا به یک عضو تمام شبکه ZeroNet تبدیل شوید.",
-
+	"or configure Tor to become a full member of the EpixNet network.": "یا پیکربندی Tor را انجام دهید تا به یک عضو تمام شبکه EpixNet تبدیل شوید.",
 	"Select account you want to use in this site:": "حسابی را که می‌خواهید در این سایت استفاده کنید، انتخاب کنید:",
 	"currently selected": "در حال حاضر انتخاب‌شده",
 	"Unique to site": "مختص به سایت",
-
 	"Content signing failed": "امضای محتوا با شکست مواجه شد",
 	"Content publish queued for {0:.0f} seconds.": "محتوا در صف انتشار با {0:.0f} ثانیه تاخیر قرار گرفت.",
 	"Content published to {0} peers.": "محتوا برای {0} تعداد همتا انتشار یافت.",
@@ -25,10 +23,8 @@
 	"Change it to {auth_type}/{auth_user_name}@{domain}": "تغییرش بده به {auth_type}/{auth_user_name}@{domain}",
 	"Certificate changed to: <b>{auth_type}/{auth_user_name}@{domain}</b>.": "گواهینامه به: <b>{auth_type}/{auth_user_name}@{domain}</b> تغییر پیدا کرد.",
 	"Site cloned": "سایت همسان‌سازی شد",
-
 	"You have successfully changed the web interface's language!": "شما با موفقیت زبان رابط وب را تغییر دادید!",
 	"Due to the browser's caching, the full transformation could take some minute.": "به دلیل ذخیره‌سازی در مرور‌گر، امکان دارد تغییر شکل کامل چند دقیقه طول بکشد.",
-
 	"Connection with <b>UiServer Websocket</b> was lost. Reconnecting...": "اتصال با <b>UiServer Websocket</b> قطع شد. اتصال دوباره...",
 	"Connection with <b>UiServer Websocket</b> recovered.": "ارتباط با <b>UiServer Websocket</b> دوباره بر‌قرار شد.",
 	"UiServer Websocket error, please reload the page.": "خطای UiServer Websocket, لطفا صفحه را دوباره بارگیری کنید.",

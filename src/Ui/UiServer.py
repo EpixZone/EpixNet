@@ -64,7 +64,7 @@ class UiServer:
         elif config.ui_ip == "127.0.0.1":
             # IP Addresses are inherently allowed as they are immune to DNS
             # rebinding attacks.
-            self.allowed_hosts = set(["zero", "localhost:%s" % config.ui_port])
+            self.allowed_hosts = set(["epix", "localhost:%s" % config.ui_port])
             # "URI producers and normalizers should omit the port component and
             # its ':' delimiter if port is empty or if its value would be the
             # same as that of the scheme's default."

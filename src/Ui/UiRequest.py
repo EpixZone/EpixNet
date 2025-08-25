@@ -120,7 +120,7 @@ class UiRequest:
         return f'Cors:{t_address}' in s_site.settings['permissions']
 
     def isCrossOriginRequest(self):
-        """Prevent detecting sites on this 0net instance
+        """Prevent detecting sites on this EpixNet instance
 
         In particular, we block non-user requests from other hosts as well as
         cross-site
@@ -139,7 +139,7 @@ class UiRequest:
         if not origin and not referer:
             return True
 
-        # Deny requests from non-0net origins
+        # Deny requests from non-EpixNet origins
         if origin and not self.isSameHost(origin, url):
             return True
 
@@ -174,7 +174,7 @@ class UiRequest:
 
         if config.ui_check_cors and self.isCrossOriginRequest():
             # we are still exposed by answering on port
-            self.log.warning('Cross-origin request detected. Someone might be trying to analyze your 0net usage')
+            self.log.warning('Cross-origin request detected. Someone might be trying to analyze your EpixNet usage')
             return []
 
         # Restict Ui access by ip
@@ -204,7 +204,7 @@ class UiRequest:
         # Prepend .bit host for transparent proxy
         if self.isDomain(self.env.get("HTTP_HOST")):
             path = re.sub("^/", "/" + self.env.get("HTTP_HOST") + "/", path)
-        path = re.sub("^http://zero[/]+", "/", path)  # Remove begining http://zero/ for chrome extension
+        path = re.sub("^http://epix[/]+", "/", path)  # Remove begining http://epix/ for chrome extension
         path = re.sub("^http://", "/", path)  # Remove begining http for chrome extension .bit access
 
         # Sanitize request url
@@ -228,8 +228,8 @@ class UiRequest:
         elif path in ("/favicon.ico", "/apple-touch-icon.png"):
             return self.actionFile("src/Ui/media/img/%s" % path)
         # Internal functions
-        elif "/ZeroNet-Internal/" in path:
-            path = re.sub(".*?/ZeroNet-Internal/", "/", path)
+        elif "/EpixNet-Internal/" in path:
+            path = re.sub(".*?/EpixNet-Internal/", "/", path)
             func = getattr(self, "action" + path.strip("/"), None)  # Check if we have action+request_path function
             if func:
                 return func()
@@ -336,22 +336,22 @@ class UiRequest:
 
     def getRequestUrl(self):
         if self.isProxyRequest():
-            if self.env["PATH_INFO"].startswith("http://zero/"):
+            if self.env["PATH_INFO"].startswith("http://epix/"):
                 return self.env["PATH_INFO"]
-            else:  # Add http://zero to direct domain access
-                return self.env["PATH_INFO"].replace("http://", "http://zero/", 1)
+            else:  # Add http://epix to direct domain access
+                return self.env["PATH_INFO"].replace("http://", "http://epix/", 1)
         else:
             return self.env["wsgi.url_scheme"] + "://" + self.env["HTTP_HOST"] + self.env["PATH_INFO"]
 
     def getReferer(self):
         referer = self.env.get("HTTP_REFERER")
-        if referer and self.isProxyRequest() and not referer.startswith("http://zero/"):
-            return referer.replace("http://", "http://zero/", 1)
+        if referer and self.isProxyRequest() and not referer.startswith("http://epix/"):
+            return referer.replace("http://", "http://epix/", 1)
         else:
             return referer
 
     def getRequestSite(self):
-        """Return 0net site addr associated with current request
+        """Return EpixNet site addr associated with current request
 
         If request is site-agnostic, returns /
         """
@@ -524,14 +524,13 @@ class UiRequest:
                 gevent.spawn(site.update, announce=True)
 
             return iter([self.renderWrapper(site, path, inner_path, title, extra_headers, script_nonce=script_nonce)])
-            # Make response be sent at once (see https://github.com/HelloZeroNet/ZeroNet/issues/1092)
 
         else:  # Bad url
             return False
 
     def getSiteUrl(self, address):
         if self.isProxyRequest():
-            return "http://zero/" + address
+            return "http://epix/" + address
         else:
             return "/" + address
 
@@ -549,7 +548,7 @@ class UiRequest:
         return ':'.join(self.env['HTTP_HOST'].split(':')[:-1])
 
     def processQueryString(self, site, query_string):
-        match = re.search("zeronet_peers=(.*?)(&|$)", query_string)
+        match = re.search("epixnet_peers=(.*?)(&|$)", query_string)
         if match:
             query_string = query_string.replace(match.group(0), "")
             num_added = 0
@@ -573,7 +572,7 @@ class UiRequest:
 
         address = re.sub("/.*", "", path.lstrip("/"))
         if self.isProxyRequest() and (not path or "/" in path[1:]):
-            if self.env["HTTP_HOST"] == "zero":
+            if self.env["HTTP_HOST"] == "epix":
                 root_url = "/" + address + "/"
                 file_url = "/" + address + "/" + inner_path
             else:
@@ -606,7 +605,7 @@ class UiRequest:
             inner_query_string = "%swrapper_nonce=%s" % (sep, wrapper_nonce)
 
         if self.isProxyRequest():  # Its a remote proxy request
-            homepage = "http://zero/" + config.homepage
+            homepage = "http://epix/" + config.homepage
         else:  # Use relative path
             homepage = "/" + config.homepage
 
@@ -725,7 +724,7 @@ class UiRequest:
         return host_a == host_b
 
     def isSameOrigin(self, url_a, url_b):
-        """Check if 0net origin is the same"""
+        """Check if EpixNet origin is the same"""
         if not url_a or not url_b:
             return False
 
@@ -911,7 +910,7 @@ class UiRequest:
 
             if send_header:
                 extra_headers = extra_headers.copy()
-                content_encoding = self.get.get("zeronet_content_encoding", "")
+                content_encoding = self.get.get("epixnet_content_encoding", "")
                 if all(part.strip() in ("gzip", "compress", "deflate", "identity", "br") for part in content_encoding.split(",")):
                     extra_headers["Content-Encoding"] = content_encoding
                 extra_headers["Accept-Ranges"] = "bytes"
@@ -1060,7 +1059,7 @@ class UiRequest:
 
         if details and config.debug:
             details = {key: val for key, val in list(self.env.items()) if hasattr(val, "endswith") and "COOKIE" not in key}
-            details["version_zeronet"] = config.version_full
+            details["version_epixnet"] = config.version_full
             details["version_python"] = sys.version
             details["version_gevent"] = gevent.__version__
             details["plugins"] = PluginManager.plugin_manager.plugin_names
@@ -1073,7 +1072,7 @@ class UiRequest:
                 </style>
                 <h1>%s</h1>
                 <h2>%s</h3>
-                <h3>Please <a href="https://github.com/HelloZeroNet/ZeroNet/issues" target="_top">report it</a> if you think this an error.</h3>
+                <h3>Please <a href="https://github.com/EpixZone/EpixNet/issues" target="_top">report it</a> if you think this an error.</h3>
                 <h4>Details:</h4>
                 <pre>%s</pre>
             """ % (title, html.escape(message), html.escape(json.dumps(details, indent=4, sort_keys=True)))

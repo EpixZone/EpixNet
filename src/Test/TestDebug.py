@@ -16,8 +16,8 @@ class TestDebug:
         (["@\\src\\Db\\__init__.py:17"], ["Db/__init__.py line 17"]),  # Windows paths
         (["<frozen importlib._bootstrap>:1"], []),  # importlib builtins
         (["<frozen importlib._bootstrap_external>:1"], []),  # importlib builtins
-        (["/home/ivanq/ZeroNet/src/main.py:13"], ["?/src/main.py line 13"]),  # best-effort anonymization
-        (["C:\\ZeroNet\\core\\src\\main.py:13"], ["?/src/main.py line 13"]),
+        (["/home/ivanq/EpixNet/src/main.py:13"], ["?/src/main.py line 13"]),  # best-effort anonymization
+        (["C:\\EpixNet\\core\\src\\main.py:13"], ["?/src/main.py line 13"]),
         (["/root/main.py:17"], ["/root/main.py line 17"]),
         (["{gevent}:13"], ["<gevent>/__init__.py line 13"]),  # modules
         (["{os}:13"], ["<os> line 13"]),  # python builtin modules

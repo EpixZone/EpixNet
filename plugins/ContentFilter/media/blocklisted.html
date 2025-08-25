@@ -53,7 +53,7 @@ async function sha256hex(s) {
 
 class Page extends ZeroFrame {
     onOpenWebsocket () {
-    	this.cmd("wrapperSetTitle", "Visiting a blocked site - ZeroNet")
+    	this.cmd("wrapperSetTitle", "Visiting a blocked site - EpixNet")
         this.cmd("siteInfo", {}, (site_info) => {
             this.site_info = site_info
         })

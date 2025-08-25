@@ -1,6 +1,6 @@
 # Pure ctypes windows taskbar notification icon
 # via https://gist.github.com/jasonbot/5759510
-# Modified for ZeroNet
+# Modified for EpixNet
 
 import ctypes
 import ctypes.wintypes
@@ -709,7 +709,7 @@ if __name__ == "__main__":
     def dynamicTitle():
         return "!The time is: %s" % time.time()
 
-    ni = NotificationIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../trayicon.ico'), "ZeroNet 0.2.9")
+    ni = NotificationIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../trayicon.ico'), "EpixNet 0.2.9")
     ni.items = [
         (dynamicTitle, False),
         ('Hello', greet),

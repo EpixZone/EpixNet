@@ -9,4 +9,4 @@ fi
 
 source "$VENVPATH"
 python3 -m pip install -r requirements.txt
-python3 zeronet.py "$@"
+python3 epixnet.py "$@"

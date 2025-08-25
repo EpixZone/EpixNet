@@ -1,5 +1,5 @@
 {
 	"name": "Bootstrapper",
-	"description": "Add BitTorrent tracker server like features to your ZeroNet client.",
+	"description": "Add BitTorrent tracker server like features to your EpixNet client.",
 	"default": "disabled"
 }

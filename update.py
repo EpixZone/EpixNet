@@ -6,7 +6,7 @@ import shutil
 
 
 def update():
-    print('please update zeronet-conservancy via git. usually it can be done via single commnad')
+    print('please update epixnet via git. usually it can be done via single commnad')
     print('  git pull')
     print('although it depends on your branches setup')
     print('updating through 1update site is not considered safe at the moment')
@@ -41,7 +41,7 @@ def update():
     inner_paths = list(updatesite_content_json.get("files", {}).keys())
     inner_paths += list(updatesite_content_json.get("files_optional", {}).keys())
 
-    # Keep file only in ZeroNet directory
+    # Keep file only in EpixNet directory
     inner_paths = [inner_path for inner_path in inner_paths if re.match("^(core|bundle)", inner_path)]
 
     # Checking plugins

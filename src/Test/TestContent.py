@@ -4,7 +4,7 @@ import io
 
 import pytest
 
-from Crypt import CryptBitcoin
+from Crypt import CryptEpix
 from Content.ContentManager import VerifyError, SignError
 from util.SafeRe import UnsafePatternError
 
@@ -17,7 +17,9 @@ class TestContent:
         # Rules defined in parent content.json
         rules = site.content_manager.getRules("data/test_include/content.json")
 
-        assert rules["signers"] == ["15ik6LeBWnACWfaika1xqGapRZ1zh3JpCo"]  # Valid signer
+        # Get the expected signer address from the private key
+        expected_signer = CryptEpix.privatekeyToAddress(self.privatekey)
+        assert expected_signer in rules["signers"]  # Valid signer
         assert rules["user_name"] == "test"  # Extra data
         assert rules["max_size"] == 20000  # Max size of files
         assert not rules["includes_allowed"]  # Don't allow more includes
@@ -36,7 +38,8 @@ class TestContent:
         assert len(valid_signers) == 2
 
         # Valid signers for root content.json
-        assert site.content_manager.getValidSigners("content.json") == ["1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT"]
+        expected_signer = CryptEpix.privatekeyToAddress(self.privatekey)
+        assert expected_signer in site.content_manager.getValidSigners("content.json")
 
     def testInlcudeLimits(self, site, crypt_bitcoin_lib):
         # Data validation
@@ -51,8 +54,11 @@ class TestContent:
             "modified": time.time()
         }
 
+        # Get the Epix address for the test site
+        test_address = CryptEpix.privatekeyToAddress(self.privatekey)
+
         # Normal data
-        data_dict["signs"] = {"1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
+        data_dict["signs"] = {test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
         data_json = json.dumps(data_dict).encode()
         data = io.BytesIO(data_json)
         assert site.content_manager.verifyFile("data/test_include/content.json", data, ignore_same=False)
@@ -62,7 +68,7 @@ class TestContent:
 
         # Too large
         data_dict["files"]["data.json"]["size"] = 200000  # Emulate 2MB sized data.json
-        data_dict["signs"] = {"1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
+        data_dict["signs"] = {test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
         data = io.BytesIO(json.dumps(data_dict).encode())
         with pytest.raises(VerifyError) as err:
             site.content_manager.verifyFile("data/test_include/content.json", data, ignore_same=False)
@@ -74,7 +80,7 @@ class TestContent:
 
         # Not allowed file
         data_dict["files"]["notallowed.exe"] = data_dict["files"]["data.json"]
-        data_dict["signs"] = {"1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
+        data_dict["signs"] = {test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
         data = io.BytesIO(json.dumps(data_dict).encode())
         with pytest.raises(VerifyError) as err:
             site.content_manager.verifyFile("data/test_include/content.json", data, ignore_same=False)
@@ -85,7 +91,7 @@ class TestContent:
         del data_dict["signs"]
 
         # Should work again
-        data_dict["signs"] = {"1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
+        data_dict["signs"] = {test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)}
         data = io.BytesIO(json.dumps(data_dict).encode())
         assert site.content_manager.verifyFile("data/test_include/content.json", data, ignore_same=False)
 
@@ -110,9 +116,9 @@ class TestContent:
 
         # Everything should be same as before except the modified timestamp and the signs
         assert (
-            {key: val for key, val in content_old.items() if key not in ["modified", "signs", "sign", "zeronet_version"]}
+            {key: val for key, val in content_old.items() if key not in ["modified", "signs", "sign", "epixnet_version"]}
             ==
-            {key: val for key, val in content.items() if key not in ["modified", "signs", "sign", "zeronet_version"]}
+            {key: val for key, val in content.items() if key not in ["modified", "signs", "sign", "epixnet_version"]}
         )
 
     def testSignOptionalFiles(self, site):
@@ -157,9 +163,12 @@ class TestContent:
         data_dict = site.storage.loadJson(inner_path)
         data = io.BytesIO(json.dumps(data_dict).encode("utf8"))
 
+        # Get the Epix address for the test site
+        test_address = CryptEpix.privatekeyToAddress(self.privatekey)
+
         # Re-sign
         data_dict["signs"] = {
-            "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
+            test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
         }
         assert site.content_manager.verifyFile(inner_path, data, ignore_same=False)
 
@@ -167,7 +176,7 @@ class TestContent:
         data_dict["address"] = "Othersite"
         del data_dict["signs"]
         data_dict["signs"] = {
-            "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
+            test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
         }
         data = io.BytesIO(json.dumps(data_dict).encode())
         with pytest.raises(VerifyError) as err:
@@ -175,11 +184,11 @@ class TestContent:
         assert "Wrong site address" in str(err.value)
 
         # Wrong inner_path
-        data_dict["address"] = "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT"
+        data_dict["address"] = test_address
         data_dict["inner_path"] = "content.json"
         del data_dict["signs"]
         data_dict["signs"] = {
-            "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
+            test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
         }
         data = io.BytesIO(json.dumps(data_dict).encode())
         with pytest.raises(VerifyError) as err:
@@ -187,11 +196,11 @@ class TestContent:
         assert "Wrong inner_path" in str(err.value)
 
         # Everything right again
-        data_dict["address"] = "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT"
+        data_dict["address"] = test_address
         data_dict["inner_path"] = inner_path
         del data_dict["signs"]
         data_dict["signs"] = {
-            "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
+            test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
         }
         data = io.BytesIO(json.dumps(data_dict).encode())
         assert site.content_manager.verifyFile(inner_path, data, ignore_same=False)
@@ -200,6 +209,9 @@ class TestContent:
         inner_path = "content.json"
         data_dict = site.storage.loadJson(inner_path)
 
+        # Get the Epix address for the test site
+        test_address = CryptEpix.privatekeyToAddress(self.privatekey)
+
         for good_relative_path in ["data.json", "out/data.json", "Any File [by none] (1).jpg", "árvzítűrő/tükörfúrógép.txt"]:
             data_dict["files"] = {good_relative_path: {"sha512": "369d4e780cc80504285f13774ca327fe725eed2d813aad229e62356b07365906", "size": 505}}
 
@@ -207,7 +219,7 @@ class TestContent:
                 del data_dict["sign"]
             del data_dict["signs"]
             data_dict["signs"] = {
-                "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
+                test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
             }
             data = io.BytesIO(json.dumps(data_dict).encode())
             assert site.content_manager.verifyFile(inner_path, data, ignore_same=False)
@@ -219,7 +231,7 @@ class TestContent:
                 del data_dict["sign"]
             del data_dict["signs"]
             data_dict["signs"] = {
-                "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT": CryptBitcoin.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
+                test_address: CryptEpix.sign(json.dumps(data_dict, sort_keys=True), self.privatekey)
             }
             data = io.BytesIO(json.dumps(data_dict).encode())
             with pytest.raises(VerifyError) as err:

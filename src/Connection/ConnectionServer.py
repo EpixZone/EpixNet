@@ -27,7 +27,7 @@ class ConnectionServer(object):
                 ip = "::1"
             else:
                 ip = "127.0.0.1"
-            port = 15441
+            port = 10042
         self.ip = ip
         self.port = port
         self.last_connection_id = 1  # Connection id incrementer

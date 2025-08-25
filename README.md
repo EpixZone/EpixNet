@@ -1,286 +1,322 @@
-# zeronet-conservancy
+# EpixNet
 
-[![Packaging status](https://repology.org/badge/vertical-allrepos/zeronet-conservancy.svg)](https://repology.org/project/zeronet-conservancy/versions)
+**EpixNet** is a decentralized peer-to-peer web platform that enables users to create, host, and access websites without relying on traditional centralized servers. Built on BitTorrent technology and cryptographic principles, EpixNet creates a censorship-resistant internet where content is distributed across a network of peers.
 
-(NOTE THAT TRANSLATIONS ARE USUALLY BEHIND THIS FILE)
+## What is EpixNet?
 
-[по-русски](README-ru.md) | [em português](README-ptbr.md) | [简体中文](README-zh-cn.md) | [日本語](README-ja.md)
+EpixNet is a Python-based implementation of a decentralized web platform where:
 
-`zeronet-conservancy` is a fork/continuation of [ZeroNet](https://github.com/HelloZeroNet/ZeroNet) project
-(that has been abandoned by its creator) that is dedicated to sustaining existing p2p network and developing
-its values of decentralization and freedom, while gradually switching to a better designed network
+- **Websites are distributed**: Each site is stored across multiple peers in the network
+- **No central servers**: Sites remain online as long as at least one peer hosts them
+- **Cryptographically secured**: All content is signed and verified using public-key cryptography
+- **BitTorrent-powered**: Uses BitTorrent protocol for peer discovery and content distribution
+- **Real-time updates**: Site owners can update content and changes propagate across the network
+- **Privacy-focused**: Supports Tor integration for anonymous browsing and hosting
 
-## State of the fork
+## Core Features
 
-During onion-v3 switch crisis, we needed a fork that worked with onion-v3 and didn't depend on trust to one or
-two people. This fork started from fulfilling that mission, implementing minimal changes to
-[ZeroNet/py3](https://github.com/HelloZeroNet/ZeroNet/tree/py3) branch which are easy to audit by anyone.
+- **Decentralized hosting**: Sites are served by visitors, eliminating hosting costs
+- **Cryptographic authentication**: Password-less authorization using private/public key pairs
+- **Real-time synchronization**: Live updates across all peers when content changes
+- **Built-in database**: P2P synchronized SQLite database for dynamic content
+- **Tor integration**: Full support for .onion hidden services (including onion-v3)
+- **Offline capability**: Access cached sites even without internet connection
+- **Clone protection**: One-click site cloning and forking
+- **Multi-platform**: Works on Windows, macOS, Linux, and Android (via Termux)
 
-Now 0net is in deeper crisis than ever before and this fork seems to
-be the last one standing.  Development is sparse and slow, but some of
-the work is being done behind the scenes. If you're completely new to
-0net, don't have anybody to guide you there and are not a developer,
-we recommend waiting until v0.8 is out.
+## How It Works
 
-## Why 0net?
+1. **Start EpixNet**: Run `python3 epixnet.py` to start the local server
+2. **Access sites**: Visit `http://127.0.0.1:42222/{site_address}` in your browser
+3. **Peer discovery**: When you visit a site, EpixNet finds peers using BitTorrent trackers
+4. **Content verification**: All files are verified against cryptographic signatures
+5. **Automatic serving**: Sites you visit are automatically shared with other peers
+6. **Content updates**: Site owners sign and publish updates, which propagate through the network
 
-* We believe in open, free, and uncensored networks and communication.
-* No single point of failure: Site remains online so long as at least 1 peer is
-  serving it.
-* No hosting costs: Sites are served by visitors.
-* Impossible to shut down: It's nowhere because it's everywhere.
-* Fast and works offline: You can access the site even if Internet is
-  unavailable.
+## Quick Start
 
+### Prerequisites
 
-## Features
- * Real-time updated sites
- * Clone websites in one click
- * Password-less authorization using private/public keys
- * Built-in SQL server with P2P data synchronization: allows easier dynamic site development
- * Anonymity: Tor network support with .onion hidden services (including onion-v3 support)
- * TLS encrypted connections (through clearnet)
- * Automatic uPnP port opening (if opted in)
- * Plugin for multiuser (openproxy) support
- * Works with any modern browser/OS
- * Works offline and can be synced via alternative transports (or when connection is back)
+- Python 3.8 or higher
+- Git (for cloning the repository)
+- Basic development tools (compiler, etc.)
 
+### Installation
 
-## How does it work?
+1. **Clone the repository**:
 
-* After starting `zeronet.py` you will be able to visit zeronet sites using
-  `http://127.0.0.1:43110/{zeronet_address}` (eg.
-  `http://127.0.0.1:43110/1MCoA8rQHhwu4LY2t2aabqcGSRqrL8uf2X/`).
-* When you visit a new zeronet site, it tries to find peers using the BitTorrent
-  network so it can download the site files (html, css, js...) from them.
-* Each visited site is also served by you.
-* Every site contains a `content.json` file which holds all other files in a sha512 hash
-  and a signature generated using the site's private key.
-* If the site owner (who has the private key for the site address) modifies the
-  site, then he/she signs the new `content.json` and publishes it to the peers.
-  Afterwards, the peers verify the `content.json` integrity (using the
-  signature), they download the modified files and publish the new content to
-  other peers.
+   ```bash
+   git clone https://github.com/EpixZone/EpixNet.git
+   cd EpixNet
+   ```
 
-Following links relate to original ZeroNet:
+2. **Create a virtual environment**:
 
-- [Slideshow about ZeroNet cryptography, site updates, multi-user sites »](https://docs.google.com/presentation/d/1_2qK1IuOKJ51pgBvllZ9Yu7Au2l551t3XBgyTSvilew/pub?start=false&loop=false&delayms=3000)
-- [Frequently asked questions »](https://zeronet.io/docs/faq/)
-- [ZeroNet Developer Documentation »](https://zeronet.io/docs/site_development/getting_started/) (getting outdated)
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-## How to join
+3. **Install dependencies**:
 
-### Install from your distribution repository
+   ```bash
+   python3 -m pip install -r requirements.txt
+   ```
 
-- NixOS: [zeronet-conservancy packages search](https://search.nixos.org/packages?from=0&size=50&sort=relevance&type=packages&query=zeronet-conservancy) (and see below)
-- ArchLinux: [latest release](https://aur.archlinux.org/packages/zeronet-conservancy), [fresh git version](https://aur.archlinux.org/packages/zeronet-conservancy-git)
+4. **Run EpixNet**:
 
-### Install from Nix package manager (Linux or MacOS)
+   ```bash
+   python3 epixnet.py
+   ```
 
- - install & configure nix package manager (if needed)
- - `nix-env -iA nixpkgs.zeronet-conservancy`
+5. **Access the dashboard**:
+   Open your browser and navigate to: `http://127.0.0.1:42222/`
 
-or add `zeronet-conservancy` to your system configuration if you're on NixOS
+### Creating Your First Site
 
-(thanks @fgaz for making & maintaining the package)
-
-### Install from source
-
-#### System dependencies
-
-##### Generic unix-like (including mac os x)
+1. Visit the EpixNet dashboard at `http://127.0.0.1:42222/`
+2. Click **⋮** > **"Create new, empty site"**
+3. You'll be redirected to your new site that only you can modify
+4. Find your site files in the `data/[your_site_address]` directory
+5. Edit your content, then drag the "0" button left and click **"Sign and publish"**
 
-Install autoconf and other basic development tools, python3 and pip, then proceed to "building python dependencies"
-(if running fails due to missing dependency, please report it/make pull request to fix dependency list)
-
-##### Apt-based (debian, ubuntu, etc)
- - `sudo apt update`
- - `sudo apt install git pkg-config libffi-dev python3-pip python3-venv python3-dev build-essential libtool`
+### System Dependencies for Source Installation
 
-##### Red Hat and Fedora based
- - `yum install epel-release -y 2>/dev/null`
- - `yum install git python3 python3-wheel`
-
-##### Fedora based dandified
- - `sudo dnf install git python3-pip python3-wheel -y`
-
-##### openSUSE
- - `sudo zypper install python3-pip python3-setuptools python3-wheel`
-
-##### Arch and Manjaro based
- - `sudo pacman -S git python-pip -v --no-confirm`
-
-##### Android/Termux
- - install [Termux](https://termux.com/) (in Termux you can install packages via `pkg install <package-names>`)
- - `pkg update`
- - `pkg install python automake git binutils libtool`
- - (on an older android versions you may also need to install) `pkg install openssl-tool libcrypt clang`
- - (if you've installed the above packages and still run into launch issues, please report)
- - (optional) `pkg install tor`
- - (optional) run tor via `tor --ControlPort 9051 --CookieAuthentication 1` command (you can then open new session by swiping to the right)
-
-#### Building python dependencies, venv & running
- - clone this repo (NOTE: on Android/Termux you should clone it into "home" folder of Termux, because virtual environment cannot live in `storage/`)
- - `python3 -m venv venv` (make python virtual environment, the last `venv` is just a name, if you use different you should replace it in later commands)
- - `source venv/bin/activate` (activate environment)
- - `python3 -m pip install -r requirements.txt` (install dependencies)
- - `python3 zeronet.py` (**run zeronet-conservancy!**)
- - open the landing page in your browser by navigating to: http://127.0.0.1:43110/
- - to start it again from fresh terminal, you need to navigate to repo directory and:
- - `source venv/bin/activate`
- - `python3 zeronet.py`
-
-#### (alternatively) On NixOS
-- clone this repo
-- `nix-shell '<nixpkgs>' -A zeronet-conservancy` to enter shell with installed dependencies
-- `./zeronet.py`
-
-#### (alternatively) Build Docker image
-- build 0net image: `docker build -t 0net-conservancy:latest . -f Dockerfile`
-- or build 0net image with integrated tor: `docker build -t 0net-conservancy:latest . -f Dockerfile.integrated_tor`
-- and run it: `docker run --rm -it -v </path/to/0n/data/directory>:/app/data -p 43110:43110 -p 26552:26552 0net-conservancy:latest`
-- /path/to/0n/data/directory - directory, where all data will be saved, including your secret certificates. If you run it with production mode, do not remove this folder!
-- or you can run it with docker-compose: `docker compose up -d 0net-conservancy` up two containers - 0net and tor separately.
-- or: `docker compose up -d 0net-tor` for run 0net and tor in one container.
-(please check if these instructions are still accurate)
-
-#### Alternative one-liner (by @ssdifnskdjfnsdjk) (installing python dependencies globally)
-
-Clone Github repository and install required Python modules. First
-edit zndir path at the begining of the command, to be the path where
-you want to store `zeronet-conservancy`:
+#### Ubuntu/Debian
 
-`zndir="/home/user/myapps/zeronet" ; if [[ ! -d "$zndir" ]]; then git clone --recursive "https://github.com/zeronet-conservancy/zeronet-conservancy.git" "$zndir" && cd "$zndir"||exit; else cd "$zndir";git pull origin master; fi; cd "$zndir" && pip install -r requirements.txt|grep -v "already satisfied"; echo "Try to run: python3 $(pwd)/zeronet.py"`
-
-(This command can also be used to keep `zeronet-conservancy` up to date)
+```bash
+sudo apt update
+sudo apt install git pkg-config libffi-dev python3-pip python3-venv python3-dev build-essential libtool
+```
 
-#### Alternative script
- - after installing general dependencies and cloning repo (as above),
-   run `start-venv.sh` which will create a virtual env for you and
-   install python requirements
- - more convenience scripts to be added soon
-
-### (unofficial) Windows OS build
-
-Download and extract .zip archive
-[zeronet-conservancy-0.7.10-unofficial-win64.zip](https://github.com/zeronet-conservancy/zeronet-conservancy/releases/download/v0.7.10/zeronet-conservancy-0.7.10-unofficial-win64.zip)
+#### Fedora/CentOS/RHEL
 
-### Building under Windows OS
+```bash
+# Fedora
+sudo dnf install git python3-pip python3-wheel python3-devel gcc
 
-(These instructions are work-in-progress, please help us test it and improve it!)
-
-- install python from https://www.python.org/downloads/
-- install some windows compiler suitable for python , this proved to be the most difficult part for me as non-windows user (see here https://wiki.python.org/moin/WindowsCompilers and i'll link more references later)
-- [optionally to get latest dev version] install git from https://git-scm.com/downloads
-- [optionally to use tor for better connectivity and anonymization] install tor browser from https://www.torproject.org/download/
-- open git bash console
-- type/copypaste `git clone https://github.com/zeronet-conservancy/zeronet-conservancy.git` into command line
-- wait till git downloads latest dev version and continue in console
-- `cd zeronet-conservancy`
-- `python -m venv venv` (create virtual python environment)
-- `venv\Scripts\activate` (this activates the environment)
-- `pip install -r requirements.txt` (install python dependencies) (some users reported that this command doesn't successfully install requirements and only manual installation of dependencies one by one works)
-- (NOTE: if previous step fails, it most likely means you haven't installed c/c++ compiler successfully)
-- [optional for tor for better connectivity and anonymity] launch Tor Browser
-- (NOTE: windows might show a window saying it blocked access to internet for "security reasons" — you should allow the access)
-- `python zeronet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151` (launch zeronet-conservancy!)
-- [for full tor anonymity launch this instead] `python zeronet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151 --tor always`
-- navigate to http://127.0.0.1:43110 in your favourite browser!
-
-To build .exe
-
-- follow the same steps as above, but additionally
-- `pip install pyinstaller`
-- `pyinstaller -p src -p plugins --hidden-import merkletools --hidden-import lib.bencode_open --hidden-import Crypt.Crypt --hidden-import Db.DbQuery --hidden-import lib.subtl --hidden-import lib.subtl.subtl --hidden-import sockshandler --add-data "src;src" --add-data "plugins;plugins" --clean zeronet.py`
-- dist/zeronet should contain working zeronet.exe!
-
-## Current limitations
-
-* File transactions are not compressed
-* No private sites
-* No DHT support
-* No I2P support
-* Centralized elements like zeroid (we're working on this!)
-* No reliable spam protection (and on this too)
-* Doesn't work directly from browser (one of the top priorities for mid-future)
-* No data transparency
-* No reproducible builds
-* No on-disk encryption
-* No reproducible builds (hence no builds beyond certain GNU/Linux distributions)
-
-
-## How can I create a ZeroNet site?
-
- * Click on **⋮** > **"Create new, empty site"** menu item on the [dashboard](http://127.0.0.1:43110/191CazMVNaAcT9Y1zhkxd9ixMBPs59g2um/).
- * You will be **redirected** to a completely new site that is only modifiable by you!
- * You can find and modify your site's content in **data/[yoursiteaddress]** directory
- * After the modifications open your site, drag the topright "0" button to the left, then press **sign and publish** button on the bottom
-
-Next steps: [ZeroNet Developer Documentation](https://zeronet.io/docs/site_development/getting_started/)
-
-## Help this project stay alive
-
-### Become a maintainer
-
-We need more maintainers! Become one today! You don't need to know how to code,
-there's a lot of other work to do.
-
-### Make builds for your platforms
-
-We need reproducible stand-alone builds for major platforms, as well as presense in various FLOSS
-repositories. If you're using one of Linux distributions which don't have packages yet, why not make
-a package for it or (if you don't know how) ask a maintainer now?
-
-### Fix bugs & add features
-
-We've decided to go ahead and make a perfect p2p web, so we need more help
-implementing it.
-
-### Make your site/bring your content
-
-We know the documentation is lacking, but we try our best to support anyone
-who wants to migrate. Don't hesitate to ask.
-
-### Use it and spread the word
-
-Make sure to tell people why do you use 0net and this fork in particular! People
-need to know their alternatives.
-
-### Financially support maintainers
-
-This fork was created and maintained by @caryoscelus. You can
-see ways to donate to them on https://caryoscelus.github.io/donate/ (or check
-sidebar if you're reading this on github for more ways). As our team grows, we
-will create team accounts on friendly crowdfunding platforms as well.
-
-If you want to make sure your donation is recognized as donation for this
-project, there is a dedicated bitcoin address for that, too:
-1Kjuw3reZvxRVNs27Gen7jPJYCn6LY7Fg6. And if you want to stay more anonymous and
-private, a Monero wallet:
-4AiYUcqVRH4C2CVr9zbBdkhRnJnHiJoypHEsq4N7mQziGUoosPCpPeg8SPr87nvwypaRzDgMHEbWWDekKtq8hm9LBmgcMzC
-
-If you want to donate in a different way, feel free to contact maintainer or
-create an issue
-
-# We're using GitHub under protest
-
-This project is currently hosted on GitHub. This is not ideal; GitHub is a
-proprietary, trade-secret system that is not Free/Libre and Open Souce Software
-(FLOSS). We are deeply concerned about using a proprietary system like GitHub
-to develop our FLOSS project. We have an
-[open issue](https://github.com/zeronet-conservancy/zeronet-conservancy/issues/89)
-to track moving away from GitHub in the long term.  We urge you to read about the
-[Give up GitHub](https://GiveUpGitHub.org) campaign from
-[the Software Freedom Conservancy](https://sfconservancy.org) to understand
-some of the reasons why GitHub is not a good place to host FOSS projects.
-
-If you are a contributor who personally has already quit using GitHub, feel
-free to [check out from our mirror on notabug](https://notabug.org/caryoscelus/zeronet-conservancy)
-and develop there or send git patches directly to project maintainer via
-preffered [contact channel](https://caryoscelus.github.io/contacts/).
-
-Any use of this project's code by GitHub Copilot, past or present, is done
-without our permission. We do not consent to GitHub's use of this project's
-code in Copilot.
-
-![Logo of the GiveUpGitHub campaign](https://sfconservancy.org/img/GiveUpGitHub.png)
+# CentOS/RHEL
+sudo yum install epel-release
+sudo yum install git python3 python3-wheel python3-devel gcc
+```
+
+#### openSUSE
+
+```bash
+sudo zypper install python3-pip python3-setuptools python3-wheel python3-devel gcc
+```
+
+#### Arch Linux
+
+```bash
+sudo pacman -S git python-pip base-devel
+```
+
+#### macOS
+
+```bash
+# Install Xcode command line tools
+xcode-select --install
+
+# Install Python 3 via Homebrew (recommended)
+brew install python3
+```
+
+#### Android (Termux)
+
+```bash
+# Install Termux from F-Droid or Google Play
+pkg update
+pkg install python automake git binutils libtool
+
+# For older Android versions, you may also need:
+pkg install openssl-tool libcrypt clang
+
+# Optional: Install Tor for enhanced privacy
+pkg install tor
+```
+
+### Docker Installation
+
+#### Using Docker Compose (Recommended)
+
+```bash
+# Clone the repository
+git clone https://github.com/EpixZone/EpixNet.git
+cd EpixNet
+
+# Run with separate Tor container
+docker compose up -d epixnet
+
+# Or run with integrated Tor
+docker compose up -d epixnet-tor
+```
+
+#### Manual Docker Build
+
+```bash
+# Build standard image
+docker build -t epixnet:latest . -f docker/Dockerfile
+
+# Build with integrated Tor
+docker build -t epixnet:latest . -f docker/tor.Dockerfile
+
+# Run the container
+docker run --rm -it \
+  -v /path/to/data:/app/data \
+  -p 42222:42222 \
+  -p 42223:42223 \
+  -p 10042:10042 \
+  epixnet:latest
+```
+
+**Note**: Replace `/path/to/data` with your desired data directory. This directory will contain your sites and private keys.
+
+### Convenience Scripts
+
+#### Automated Setup Script
+
+```bash
+# Use the provided setup script
+./start-venv.sh
+```
+
+This script automatically:
+
+- Creates a Python virtual environment
+- Installs all dependencies
+- Starts EpixNet
+
+### Windows Installation
+
+#### Prerequisites
+
+1. **Install Python 3.8+** from [python.org](https://www.python.org/downloads/)
+2. **Install Git** from [git-scm.com](https://git-scm.com/downloads)
+3. **Install Visual Studio Build Tools** (for compiling dependencies)
+
+#### Installation Steps
+
+```cmd
+# Clone the repository
+git clone https://github.com/EpixZone/EpixNet.git
+cd EpixNet
+
+# Create virtual environment
+python -m venv venv
+venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run EpixNet
+python epixnet.py
+```
+
+#### With Tor Support
+
+```cmd
+# Install Tor Browser or standalone Tor
+# Run EpixNet with Tor proxy
+python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151
+
+# For full Tor anonymity
+python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151 --tor always
+```
+
+## Configuration
+
+### Command Line Options
+
+```bash
+# Basic usage
+python3 epixnet.py
+
+# Custom port
+python3 epixnet.py --ui_port 43110
+
+# Enable Tor
+python3 epixnet.py --tor always
+
+# Offline mode
+python3 epixnet.py --offline
+
+# Custom data directory
+python3 epixnet.py --data_dir /path/to/data
+
+# Debug mode
+python3 epixnet.py --debug
+```
+
+### Configuration File
+
+EpixNet creates a `epixnet.conf` file in your data directory where you can set persistent configuration options.
+
+## Usage
+
+### Accessing Sites
+
+- **Local dashboard**: `http://127.0.0.1:42222/`
+- **Specific site**: `http://127.0.0.1:42222/{site_address}/`
+- **Dashboard site**: `http://127.0.0.1:42222/epix15m0nn8gh00a2vppd8wzn8fmnm2vr6j7zg6fgq2/`
+
+### Site Management
+
+- **Create new site**: Dashboard → ⋮ → "Create new, empty site"
+- **Clone existing site**: Visit site → Clone button
+- **Manage sites**: Dashboard shows all your sites and visited sites
+- **Site files**: Located in `data/{site_address}/` directory
+
+## Development
+
+### Architecture
+
+EpixNet is built with a modular plugin architecture:
+
+- **Core**: Site management, peer discovery, content verification
+- **File Server**: Handles file serving and peer connections
+- **UI Server**: Web interface for site management
+- **Plugins**: Extensible functionality (Tor, BitTorrent, etc.)
+
+### Key Technologies
+
+- **Python 3.8+**: Core runtime
+- **gevent**: Asynchronous networking
+- **SQLite**: Local database storage
+- **BitTorrent**: Peer discovery protocol
+- **Cryptography**: Content signing and verification
+- **Tor**: Anonymous networking (optional)
+
+### Contributing
+
+We welcome contributions! Here's how you can help:
+
+1. **Report bugs**: Use GitHub issues to report problems
+2. **Submit patches**: Fork the repo and submit pull requests
+3. **Improve documentation**: Help make the docs clearer
+4. **Test on different platforms**: Help ensure compatibility
+5. **Create packages**: Help package EpixNet for more distributions
+
+### Current Limitations
+
+- No DHT support (relies on BitTorrent trackers)
+- No I2P integration
+- Limited spam protection mechanisms
+- No built-in encryption for local storage
+- Requires local installation (no browser-only access)
+
+## Security Considerations
+
+- **Private keys**: Stored locally in `data/users.json` - keep this file secure
+- **Site verification**: All content is cryptographically verified
+- **Tor integration**: Use `--tor always` for maximum anonymity
+- **Network exposure**: EpixNet opens network ports for peer connections
+- **Content responsibility**: You become a host for sites you visit
+
+## Community and Support
+
+- **GitHub Issues**: [Report bugs and request features](https://github.com/EpixZone/EpixNet/issues)
+
+## License
+
+EpixNet is free and open-source software licensed under the GNU General Public License v3.0. See the [LICENSE](LICENSE) file for details.

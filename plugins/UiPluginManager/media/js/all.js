@@ -1490,7 +1490,7 @@
     };
 
     UiPluginManager.prototype.onOpenWebsocket = function() {
-      this.cmd("wrapperSetTitle", "Plugin manager - ZeroNet");
+      this.cmd("wrapperSetTitle", "Plugin manager - EpixNet");
       this.cmd("serverInfo", {}, (function(_this) {
         return function(server_info) {
           return _this.server_info = server_info;
@@ -1591,7 +1591,7 @@
             loading: this.restart_loading
           },
           onclick: this.handleRestartClick
-        }, "Restart ZeroNet client")
+        }, "Restart EpixNet client")
       ]));
     };
 

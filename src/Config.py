@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from rich import print
 
-VERSION = "0.7.10+"
+VERSION = "0.0.1"
 
 class StartupError(RuntimeError):
     def __init__(self, message, *paths):
@@ -29,7 +29,22 @@ class Config:
         try:
             from . import Build
         except ImportError:
-            from .util import Git
+            try:
+                from .util import Git
+            except ImportError:
+                # Handle case when running from pytest or other contexts
+                try:
+                    from util import Git
+                except ImportError:
+                    # Create a mock Git module for testing
+                    class MockGit:
+                        @staticmethod
+                        def branch():
+                            return 'test'
+                        @staticmethod
+                        def commit():
+                            return 'test-commit'
+                    Git = MockGit
             self.build_type = 'source'
             self.branch = Git.branch() or 'unknown'
             self.commit = Git.commit() or 'unknown'
@@ -43,7 +58,7 @@ class Config:
             self.platform = Build.platform
         self.is_android = hasattr(sys, 'getandroidapilevel')
         self.version_full = f'{self.version} ({self.build_type} from {self.branch}-{self.commit})'
-        self.user_agent = "conservancy"
+        self.user_agent = "EpixNet"
         # for compatibility
         self.user_agent_rev = 8192
         self.argv = argv
@@ -94,10 +109,10 @@ class Config:
         if "--start-dir" in self.argv:
             start_dir = self.argv[self.argv.index("--start-dir") + 1]
         elif this_file.endswith("/Contents/Resources/core/src/Config.py"):
-            # Running as ZeroNet.app
+            # Running as EpixNet.app
             if this_file.startswith("/Application") or this_file.startswith("/private") or this_file.startswith(os.path.expanduser("~/Library")):
                 # Runnig from non-writeable directory, put data to Application Support
-                start_dir = os.path.expanduser("~/Library/Application Support/ZeroNet")
+                start_dir = os.path.expanduser("~/Library/Application Support/EpixNet")
             else:
                 # Running from writeable directory put data next to .app
                 start_dir = re.sub("/[^/]+/Contents/Resources/core/src/Config.py", "", this_file)
@@ -106,7 +121,7 @@ class Config:
             start_dir = this_file.replace("/core/src/Config.py", "")
         elif not os.access(this_file.replace('/src/Config.py', ''), os.R_OK | os.W_OK):
             # Running from non-writeable location, e.g., AppImage
-            start_dir = os.path.expanduser("~/ZeroNet")
+            start_dir = os.path.expanduser("~/EpixNet")
         else:
             start_dir = "."
         return start_dir
@@ -135,7 +150,7 @@ class Config:
 
     def updatePaths(self):
         if self.config_file is None:
-            self.config_file = self.start_dir / 'znc.conf'
+            self.config_file = self.start_dir / 'epixnet.conf'
         if self.config_dir is None:
             self.config_dir = self.start_dir
         if self.private_dir is None:
@@ -152,7 +167,7 @@ class Config:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
     def checkDir(self, root):
-        return (root / 'znc.conf').is_file()
+        return (root / 'epixnet.conf').is_file()
 
     def doMigrate(self, old_dir, new_dir):
         raise StartupError('Migration not implemented yet')
@@ -169,11 +184,11 @@ class Config:
 
     def createNewConfig(self, new_dir):
         new_dir.mkdir(parents=True, exist_ok=True)
-        with (new_dir / 'znc.conf').open('w') as f:
-            f.write('# zeronet-conervancy config file')
+        with (new_dir / 'epixnet.conf').open('w') as f:
+            f.write('# epixnet config file')
 
     def maybeMigrate(self, old_dir, new_dir, no_migrate, silent):
-        if (old_dir / 'zeronet.conf').exists() and new_dir.exists():
+        if (old_dir / 'epixnet.conf').exists() and new_dir.exists():
             if old_dir == new_dir:
                 if self.checkDir(new_dir):
                     return new_dir
@@ -214,9 +229,9 @@ class Config:
         if '--portable' in self.argv or self.build_type == 'portable':
             return here
 
-        MACOSX_DIR = '~/Library/Application Support/zeronet-conservancy'
-        WINDOWS_DIR = '~/AppData/zeronet-conservancy'
-        LIBREDESKTOP_DIR = '~/.local/share/zeronet-conservancy'
+        MACOSX_DIR = '~/Library/Application Support/EpixNet'
+        WINDOWS_DIR = '~/AppData/EpixNet'
+        LIBREDESKTOP_DIR = '~/.local/share/EpixNet'
         if self.platform == 'source':
             if platform.system() == 'Darwin':
                 path = MACOSX_DIR
@@ -237,10 +252,17 @@ class Config:
     # Create command line arguments
     def createArguments(self):
         try:
-            language, enc = locale.getdefaultlocale()
-            language = language.lower().replace("_", "-")
-            if language not in ["pt-br", "zh-tw"]:
-                language = language.split("-")[0]
+            language = locale.getlocale()[0]
+            if language is None:
+                language = locale.getencoding()
+                if language:
+                    language = "en"  # Default fallback
+                else:
+                    language = "en"
+            else:
+                language = language.lower().replace("_", "-")
+                if language not in ["pt-br", "zh-tw"]:
+                    language = language.split("-")[0]
         except Exception:
             language = "en"
 
@@ -289,7 +311,7 @@ class Config:
         action.add_argument('peer_ip', help='Peer ip to publish (default: random peers ip from tracker)',
                             default=None, nargs='?')
         action.add_argument('peer_port', help='Peer port to publish (default: random peer port from tracker)',
-                            default=15441, nargs='?')
+                            default=10042, nargs='?')
         action.add_argument('--inner-path', help='Content.json you want to publish (default: content.json)',
                             default="content.json", metavar="inner_path")
         action.add_argument('--recursive', help="Whether to publish all of site's content.json. "
@@ -344,7 +366,7 @@ class Config:
         action.add_argument('privatekey', help='Private key')
 
         # Crypt Verify
-        action = self.subparsers.add_parser("cryptVerify", help='Verify message using Bitcoin public address')
+        action = self.subparsers.add_parser("cryptVerify", help='Verify message using Epix public address')
         action.add_argument('message', help='Message to verify')
         action.add_argument('sign', help='Signiture for message')
         action.add_argument('address', help='Signer\'s address')
@@ -375,7 +397,7 @@ class Config:
         self.parser.add_argument('--start-dir', help='Path of working dir for variable content (data, log, config)', default=self.start_dir, metavar="path")
         self.parser.add_argument('--config-file', help='Path of config file', default=config_file, metavar="path")
         self.parser.add_argument('--data-dir', help='Path of data directory', default=data_dir, metavar="path")
-        self.parser.add_argument('--migrate', help="Try to migrate data from old 0net versions (not implemented yet)", action=BooleanOptionalAction, default=False)
+        self.parser.add_argument('--migrate', help="Try to migrate data from old EpixNet versions (not implemented yet)", action=BooleanOptionalAction, default=False)
 
         self.parser.add_argument('--console-log-level', help='Level of logging to console', default="default", choices=["default", "DEBUG", "INFO", "ERROR", "off"])
 
@@ -387,7 +409,7 @@ class Config:
         self.parser.add_argument('--language', help='Web interface language', default=language, metavar='language')
         self.parser.add_argument('--ui-ip-protect', help="Protect UI server from being accessed through third-party pages and on unauthorized cross-origin pages (enabled by default when serving on localhost IPs; doesn't work with non-local IPs, need testing with host names)", choices=['always', 'local', 'off'], default='local')
         self.parser.add_argument('--ui-ip', help='Web interface bind address', default="127.0.0.1", metavar='ip')
-        self.parser.add_argument('--ui-port', help='Web interface bind port', default=43110, type=int, metavar='port')
+        self.parser.add_argument('--ui-port', help='Web interface bind port', default=42222, type=int, metavar='port')
         self.parser.add_argument('--ui-site-port', help='Port for serving site content, defaults to ui_port+1', default=None, metavar='port')
         self.parser.add_argument('--ui-restrict', help='Restrict web access', default=False, metavar='ip', nargs='*')
         self.parser.add_argument('--ui-host', help='Allow access using this hosts', metavar='host', nargs='*')
@@ -395,7 +417,7 @@ class Config:
 
         self.parser.add_argument('--open-browser', help='Open homepage in web browser automatically',
                                  nargs='?', const="default_browser", metavar='browser_name')
-        self.parser.add_argument('--homepage', help='Web interface Homepage', default='191CazMVNaAcT9Y1zhkxd9ixMBPs59g2um',
+        self.parser.add_argument('--homepage', help='Web interface Dashboard', default='epix15m0nn8gh00a2vppd8wzn8fmnm2vr6j7zg6fgq2',
                                  metavar='address')
         # self.parser.add_argument('--updatesite', help='Source code update site', default='1uPDaT3uSyWAPdCv1WkMb5hBQjWSNNACf',
                                  # metavar='address')
@@ -422,10 +444,10 @@ class Config:
         self.parser.add_argument('--disable-udp', help='Disable UDP connections', action='store_true')
         self.parser.add_argument('--proxy', help='Socks proxy address', metavar='ip:port')
         self.parser.add_argument('--bind', help='Bind outgoing sockets to this address', metavar='ip')
-        self.parser.add_argument('--bootstrap-url', help='URL of file with link to bootstrap bundle', default='https://raw.githubusercontent.com/zeronet-conservancy/zeronet-conservancy/master/bootstrap.url', type=str)
+        self.parser.add_argument('--bootstrap-url', help='URL of file with link to bootstrap bundle', default='https://raw.githubusercontent.com/EpixZone/EpixNet/master/bootstrap.url', type=str)
         self.parser.add_argument('--bootstrap', help='Enable downloading bootstrap information from clearnet', action=BooleanOptionalAction, default=True)
         self.parser.add_argument('--trackers', help='Bootstraping torrent trackers', default=[], metavar='protocol://address', nargs='*')
-        self.parser.add_argument('--trackers-file', help='Load torrent trackers dynamically from a file (using Syncronite by default)', default=['{data_dir}/15CEFKBRHFfAP9rmL6hhLmHoXrrgmw4B5o/cache/1/Syncronite.html'], metavar='path', nargs='*')
+        self.parser.add_argument('--trackers-file', help='Load torrent trackers dynamically from a file (using Syncronite by default)', default=['{data_dir}/epix19zp9takt69qdt5len3su40jfyf9nxmjwvrm4ak/cache/1/Syncronite.html'], metavar='path', nargs='*')
         self.parser.add_argument('--trackers-proxy', help='Force use proxy to connect to trackers (disable, tor, ip:port)', default="disable")
         self.parser.add_argument('--use-libsecp256k1', help='Use Libsecp256k1 liblary for speedup', type='bool', choices=[True, False], default=True)
         self.parser.add_argument('--use-openssl', help='Use OpenSSL liblary for speedup', type='bool', choices=[True, False], default=True)
@@ -465,10 +487,10 @@ class Config:
         self.parser.add_argument('--tor-password', help='Tor controller password', metavar='password')
         self.parser.add_argument('--tor-use-bridges', help='Use obfuscated bridge relays to avoid Tor block', action='store_true')
         self.parser.add_argument('--tor-hs-limit', help='Maximum number of hidden services in Tor always mode', metavar='limit', type=int, default=10)
-        self.parser.add_argument('--tor-hs-port', help='Hidden service port in Tor always mode', metavar='limit', type=int, default=15441)
+        self.parser.add_argument('--tor-hs-port', help='Hidden service port in Tor always mode', metavar='limit', type=int, default=10042)
 
         self.parser.add_argument('--repl', help='Instead of printing logs in console, drop into REPL after initialization', action='store_true')
-        self.parser.add_argument('--version', action='version', version=f'zeronet-conservancy {self.version_full}')
+        self.parser.add_argument('--version', action='version', version=f'EpixNet {self.version_full}')
         self.parser.add_argument('--end', help='Stop multi value argument parsing', action='store_true')
 
         return self.parser
@@ -486,7 +508,7 @@ class Config:
                 elif trackers_file.startswith("{data_dir}"):  # Relative to data_dir
                     trackers_file_path = trackers_file.replace('{data_dir}', str(self.data_dir))
                 else:
-                    # Relative to zeronet.py or something else, unsupported
+                    # Relative to epixnet.py or something else, unsupported
                     raise RuntimeError(f'trackers_file should be relative to {{data_dir}} or absolute path (not {trackers_file})')
 
                 for line in open(trackers_file_path):
@@ -572,7 +594,7 @@ class Config:
                 self.ip_local.append(self.fileserver_ip)
 
         if silent:  # Restore original functions
-            if current_parser.exited and self.action == "main":  # Argument parsing halted, don't start ZeroNet with main action
+            if current_parser.exited and self.action == "main":  # Argument parsing halted, don't start EpixNet with main action
                 self.action = None
             current_parser._print_message = original_print_message
             current_parser.exit = original_exit

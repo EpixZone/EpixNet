@@ -1,16 +1,14 @@
 {
-	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the ZeroNet network!": "Поздравляем, ваш порт <b>{0}</b> открыт.<br>Вы полноценный участник сети ZeroNet!",
+	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the EpixNet network!": "Поздравляем, ваш порт <b>{0}</b> открыт.<br>Вы полноценный участник сети EpixNet!",
 	"Tor mode active, every connection using Onion route.": "Режим Tor включен, все соединения осуществляются через Tor.",
 	"Successfully started Tor onion hidden services.": "Скрытый сервис Tor запущено успешно.",
 	"Unable to start hidden services, please check your config.": "Ошибка при запуске скрытого сервиса, пожалуйста проверьте настройки",
 	"For faster connections open <b>{0}</b> port on your router.": "Для более быстрой работы сети откройте <b>{0}</b> порт на вашем роутере.",
 	"Your connection is restricted. Please, open <b>{0}</b> port on your router": "Подключение ограничено. Пожалуйста откройте <b>{0}</b> порт на вашем роутере",
-	"or configure Tor to become a full member of the ZeroNet network.": "или настройте Tor что бы стать полноценным участником сети ZeroNet.",
-
+	"or configure Tor to become a full member of the EpixNet network.": "или настройте Tor что бы стать полноценным участником сети EpixNet.",
 	"Select account you want to use in this site:": "Выберите аккаунт для использования на этом сайте:",
 	"currently selected": "сейчас выбран",
 	"Unique to site": "Уникальный для этого сайта",
-
 	"Content signing failed": "Подпись контента не удалась",
 	"Content publish queued for {0:.0f} seconds.": "Публикация контента поставлена в очередь {0:.0f} секунд.",
 	"Content published to {0} peers.": "Контент опубликован на {0} пирах.",
@@ -25,10 +23,8 @@
 	"Change it to {auth_type}/{auth_user_name}@{domain}": "Изменить его на {auth_type}/{auth_user_name}@{domain}",
 	"Certificate changed to: <b>{auth_type}/{auth_user_name}@{domain}</b>.": "Сертификат изменен на: <b>{auth_type}/{auth_user_name}@{domain}</b>.",
 	"Site cloned": "Сайт склонирован",
-
 	"You have successfully changed the web interface's language!": "Язык интерфейса успешно изменен!",
 	"Due to the browser's caching, the full transformation could take some minute.": "В зависимости от работы вашего браузера полное преобразование может занять пару минут.",
-
 	"Connection with <b>UiServer Websocket</b> was lost. Reconnecting...": "Подключение к <b>UiServer Websocket</b> прервано. Переподключаюсь...",
 	"Connection with <b>UiServer Websocket</b> recovered.": "Подключение к <b>UiServer Websocket</b> восстановлено.",
 	"UiServer Websocket error, please reload the page.": "Ошибка <b>UiServer Websocket</b>, перезагрузите страницу!",
@@ -47,5 +43,4 @@
 	" New version of this page has just released.<br>Reload to see the modified content.": "Доступна новая версия данной страницы<br>Обновите страницу, что бы увидеть изменения!",
 	"This site requests permission:": "Данный сайт запрашивает разрешения:",
 	"_(Accept)": "Предоставить"
-
 }

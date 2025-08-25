@@ -62,7 +62,7 @@ class ConfigPlugin(object):
     def createArguments(self):
         group = self.parser.add_argument_group("Zeroname plugin")
         group.add_argument(
-            "--bit-resolver", help="ZeroNet site to resolve .bit domains (deprecated)",
+            "--bit-resolver", help="EpixNet site to resolve .bit domains (deprecated)",
             default="1GnACKctkJrGWHTqxk9T9zXo2bLQc2PDnF", metavar="address"
         )
 

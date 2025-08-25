@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Suggest an idea for `zeronet-conservancy`
+about: Suggest an idea for `epixnet`
 title: ''
 labels: 'enhancement'
 assignees: ''

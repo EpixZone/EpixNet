@@ -18,8 +18,8 @@ import gevent
 import gevent.monkey
 gevent.monkey.patch_all(thread=False)
 
-update_after_shutdown = False  # If set True then update and restart zeronet after main loop ended
-restart_after_shutdown = False  # If set True then restart zeronet after main loop ended
+update_after_shutdown = False  # If set True then update and restart epixnet after main loop ended
+restart_after_shutdown = False  # If set True then restart epixnet after main loop ended
 
 from Config import config
 
@@ -31,7 +31,7 @@ def load_config():
 
 def importBundle(bundle):
     from zipfile import ZipFile
-    from Crypt.CryptBitcoin import isValidAddress
+    from Crypt.CryptEpix import isValidAddress
     import json
 
     sites_json_path = config.private_dir / 'sites.json'
@@ -132,7 +132,7 @@ def init():
             lock = helper.openLocked(config.start_dir / 'lock.pid', "w")
             lock.write(f"{os.getpid()}")
         except BlockingIOError as err:
-            startupError(f"Can't open lock file, your 0net client is probably already running, exiting... ({err})")
+            startupError(f"Can't open lock file, your EpixNet client is probably already running, exiting... ({err})")
             proc = helper.openBrowser(config.open_browser)
             r = proc.wait()
             sys.exit(r)
@@ -196,7 +196,7 @@ from Actions import Actions
 
 actions = Actions()
 
-# Starts here when running zeronet.py
+# Starts here when running epixnet.py
 def start():
     # Call function
     action_kwargs = config.getActionArguments()

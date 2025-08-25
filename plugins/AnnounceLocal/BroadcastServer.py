@@ -127,7 +127,7 @@ class BroadcastServer(object):
         func_name = "action" + cmd[0].upper() + cmd[1:]
         func = getattr(self, func_name, None)
 
-        if sender["service"] != "zeronet" or sender["peer_id"] == self.sender_info["peer_id"]:
+        if sender["service"] != "epixnet" or sender["peer_id"] == self.sender_info["peer_id"]:
             # Skip messages not for us or sent by us
             message = None
         elif func:

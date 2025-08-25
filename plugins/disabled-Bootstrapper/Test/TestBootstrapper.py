@@ -37,7 +37,7 @@ class TestBootstrapper:
         # Verify empty result
         res = peer.request("announce", {
             "hashes": [hash1, hash2],
-            "port": 15441, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
+            "port": 10042, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
         })
 
         assert len(res["peers"][0][ip_type]) == 0  # Empty result
@@ -59,35 +59,35 @@ class TestBootstrapper:
         # Verify empty result
         res = peer.request("announce", {
             "hashes": [hash1, hash2],
-            "port": 15441, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
+            "port": 10042, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
         })
 
         assert len(res["peers"][0][ip_type]) == 0  # Empty result
 
         # Verify added peer on previous request
-        bootstrapper_db.peerAnnounce(ip_type, file_server.ip_external, port=15441, hashes=[hash1, hash2], delete_missing_hashes=True)
+        bootstrapper_db.peerAnnounce(ip_type, file_server.ip_external, port=10042, hashes=[hash1, hash2], delete_missing_hashes=True)
 
         res = peer.request("announce", {
             "hashes": [hash1, hash2],
-            "port": 15441, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
+            "port": 10042, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
         })
         assert len(res["peers"][0][ip_type]) == 1
         assert len(res["peers"][1][ip_type]) == 1
 
         # hash2 deleted from 1.2.3.4
-        bootstrapper_db.peerAnnounce(ip_type, file_server.ip_external, port=15441, hashes=[hash1], delete_missing_hashes=True)
+        bootstrapper_db.peerAnnounce(ip_type, file_server.ip_external, port=10042, hashes=[hash1], delete_missing_hashes=True)
         res = peer.request("announce", {
             "hashes": [hash1, hash2],
-            "port": 15441, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
+            "port": 10042, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
         })
         assert len(res["peers"][0][ip_type]) == 1
         assert len(res["peers"][1][ip_type]) == 0
 
         # Announce 3 hash again
-        bootstrapper_db.peerAnnounce(ip_type, file_server.ip_external, port=15441, hashes=[hash1, hash2, hash3], delete_missing_hashes=True)
+        bootstrapper_db.peerAnnounce(ip_type, file_server.ip_external, port=10042, hashes=[hash1, hash2, hash3], delete_missing_hashes=True)
         res = peer.request("announce", {
             "hashes": [hash1, hash2, hash3],
-            "port": 15441, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
+            "port": 10042, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
         })
         assert len(res["peers"][0][ip_type]) == 1
         assert len(res["peers"][1][ip_type]) == 1
@@ -95,7 +95,7 @@ class TestBootstrapper:
 
         # Single hash announce
         res = peer.request("announce", {
-            "hashes": [hash1], "port": 15441, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
+            "hashes": [hash1], "port": 10042, "need_types": [ip_type], "need_num": 10, "add": [ip_type]
         })
         assert len(res["peers"][0][ip_type]) == 1
 
@@ -114,9 +114,9 @@ class TestBootstrapper:
         ip_type = helper.getIpType(file_server.ip)
         hash1 = hashlib.sha256(b"hash1").digest()
 
-        bootstrapper_db.peerAnnounce(ip_type, address=None, port=15441, hashes=[hash1])
+        bootstrapper_db.peerAnnounce(ip_type, address=None, port=10042, hashes=[hash1])
         res = peer.request("announce", {
-            "hashes": [hash1], "port": 15441, "need_types": [ip_type], "need_num": 10, "add": []
+            "hashes": [hash1], "port": 10042, "need_types": [ip_type], "need_num": 10, "add": []
         })
 
         assert len(res["peers"][0]["ipv4"]) == 0  # Empty result
@@ -132,7 +132,7 @@ class TestBootstrapper:
         bootstrapper_db.peerAnnounce(ip_type="ipv4", address="1.2.3.4", port=1234, hashes=[hash1, hash2, hash3])
         res = peer.request("announce", {
             "onions": [onion1, onion1, onion2],
-            "hashes": [hash1, hash2, hash3], "port": 15441, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
+            "hashes": [hash1, hash2, hash3], "port": 10042, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
         })
         assert len(res["peers"][0]["ipv4"]) == 1
 
@@ -149,7 +149,7 @@ class TestBootstrapper:
         res = peer.request("announce", {
             "onions": [onion1], "onion_sign_this": res["onion_sign_this"],
             "onion_signs": {tor_manager.getPublickey(onion2): sign2},
-            "hashes": [hash1], "port": 15441, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
+            "hashes": [hash1], "port": 10042, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
         })
         assert "onion_sign_this" in res
         site_peers1 = bootstrapper_db.peerList(address="1.2.3.4", port=1234, hash=hash1)
@@ -159,7 +159,7 @@ class TestBootstrapper:
         res = peer.request("announce", {
             "onions": [onion1, onion1, onion2], "onion_sign_this": res["onion_sign_this"],
             "onion_signs": {tor_manager.getPublickey(onion1): sign1},
-            "hashes": [hash1, hash2, hash3], "port": 15441, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
+            "hashes": [hash1, hash2, hash3], "port": 10042, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
         })
         assert "onion_sign_this" in res
         site_peers1 = bootstrapper_db.peerList(address="1.2.3.4", port=1234, hash=hash1)
@@ -169,7 +169,7 @@ class TestBootstrapper:
         res = peer.request("announce", {
             "onions": [onion1, onion1, onion2], "onion_sign_this": res["onion_sign_this"],
             "onion_signs": {tor_manager.getPublickey(onion1): sign1, tor_manager.getPublickey(onion2): sign2},
-            "hashes": [hash1, hash2, hash3], "port": 15441, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
+            "hashes": [hash1, hash2, hash3], "port": 10042, "need_types": ["ipv4", "onion"], "need_num": 10, "add": ["onion"]
         })
         assert "onion_sign_this" not in res
 
@@ -198,12 +198,12 @@ class TestBootstrapper:
         # Request peers from tracker
         assert len(site.peers) == 0
         bootstrapper_db.peerAnnounce(ip_type="ipv4", address="1.2.3.4", port=1234, hashes=[hash])
-        site.announcer.announceTracker("zero://%s:%s" % (file_server.ip, file_server.port))
+        site.announcer.announceTracker("epix://%s:%s" % (file_server.ip, file_server.port))
         assert len(site.peers) == 1
 
         # Test onion address store
         bootstrapper_db.peerAnnounce(ip_type="onion", address="bka4ht2bzxchy44r", port=1234, hashes=[hash], onion_signed=True)
-        site.announcer.announceTracker("zero://%s:%s" % (file_server.ip, file_server.port))
+        site.announcer.announceTracker("epix://%s:%s" % (file_server.ip, file_server.port))
         assert len(site.peers) == 2
         assert "bka4ht2bzxchy44r.onion:1234" in site.peers
 
@@ -214,11 +214,11 @@ class TestBootstrapper:
         hash2 = hashlib.sha256(b"1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr").digest()
         peer = Peer("zero.booth.moe", 443, connection_server=file_server)
         assert peer.request("ping")
-        peer = Peer("boot3rdez4rzn36x.onion", 15441, connection_server=file_server)
+        peer = Peer("boot3rdez4rzn36x.onion", 10042, connection_server=file_server)
         assert peer.request("ping")
         res = peer.request("announce", {
             "hashes": [hash1, hash2],
-            "port": 15441, "need_types": ["ip4", "onion"], "need_num": 100, "add": [""]
+            "port": 10042, "need_types": ["ip4", "onion"], "need_num": 100, "add": [""]
         })
 
         assert res
@@ -227,12 +227,12 @@ class TestBootstrapper:
         peer = Peer(file_server.ip, 1544, connection_server=file_server)
         hash1 = hashlib.sha256(b"site1").digest()
 
-        bootstrapper_db.peerAnnounce("ipv4", file_server.ip_external, port=15441, hashes=[hash1], delete_missing_hashes=True)
+        bootstrapper_db.peerAnnounce("ipv4", file_server.ip_external, port=10042, hashes=[hash1], delete_missing_hashes=True)
 
         # Test with ipv4 need type
         res = peer.request("announce", {
             "hashes": [hash1],
-            "port": 15441, "need_types": ["ipv4"], "need_num": 10, "add": []
+            "port": 10042, "need_types": ["ipv4"], "need_num": 10, "add": []
         })
 
         assert len(res["peers"][0]["ipv4"]) == 1
@@ -240,7 +240,7 @@ class TestBootstrapper:
         # Test with ip4 need type
         res = peer.request("announce", {
             "hashes": [hash1],
-            "port": 15441, "need_types": ["ip4"], "need_num": 10, "add": []
+            "port": 10042, "need_types": ["ip4"], "need_num": 10, "add": []
         })
 
         assert len(res["peers"][0]["ip4"]) == 1

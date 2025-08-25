@@ -128,7 +128,7 @@ class Db(object):
 
             self.log.debug(
                 "Connected to %s in %.3fs (opened: %s, sqlite version: %s)..." %
-                (self.db_path, time.time() - s, len(opened_dbs), sqlite3.version)
+                (self.db_path, time.time() - s, len(opened_dbs), sqlite3.sqlite_version)
             )
             self.log.debug("Connect by thread: %s" % threading.current_thread().ident)
             self.log.debug("Connect called by %s" % Debug.formatStack())

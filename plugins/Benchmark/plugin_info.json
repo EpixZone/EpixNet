@@ -1,5 +1,5 @@
 {
 	"name": "Benchmark",
-	"description": "Test and benchmark database and cryptographic functions related to ZeroNet.",
+	"description": "Test and benchmark database and cryptographic functions related to EpixNet.",
 	"default": "enabled"
 }

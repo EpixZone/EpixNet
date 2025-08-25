@@ -41,7 +41,7 @@ if "upload_nonces" not in locals():
 @PluginManager.registerTo("UiRequest")
 class UiRequestPlugin(object):
     def isCorsAllowed(self, path):
-        if path == "/ZeroNet-Internal/BigfileUpload":
+        if path == "/EpixNet-Internal/BigfileUpload":
             return True
         else:
             return super(UiRequestPlugin, self).isCorsAllowed(path)
@@ -196,7 +196,7 @@ class UiWebsocketPlugin(object):
 
         if protocol == "xhr":
             return {
-                "url": "/ZeroNet-Internal/BigfileUpload?upload_nonce=" + nonce,
+                "url": "/EpixNet-Internal/BigfileUpload?upload_nonce=" + nonce,
                 "piece_size": piece_size,
                 "inner_path": inner_path,
                 "file_relative_path": file_relative_path
@@ -209,7 +209,7 @@ class UiWebsocketPlugin(object):
             else:
                 origin = "{origin}"
             return {
-                "url": origin + "/ZeroNet-Internal/BigfileUploadWebsocket?upload_nonce=" + nonce,
+                "url": origin + "/EpixNet-Internal/BigfileUploadWebsocket?upload_nonce=" + nonce,
                 "piece_size": piece_size,
                 "inner_path": inner_path,
                 "file_relative_path": file_relative_path
@@ -271,7 +271,7 @@ class ContentManagerPlugin(object):
                 break
             yield part
 
-            if part_num % 100 == 0:  # Avoid blocking ZeroNet execution during upload
+            if part_num % 100 == 0:  # Avoid blocking EpixNet execution during upload
                 time.sleep(0.001)
 
             recv_left -= read_size

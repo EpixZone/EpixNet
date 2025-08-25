@@ -49,7 +49,7 @@ class TestOptionalManager:
         file_row = contents.db.execute("SELECT * FROM file_optional WHERE inner_path = 'testfile'").fetchone()
         assert not file_row["is_downloaded"]
 
-        # Write file from outside of ZeroNet
+        # Write file from outside of EpixNet
         site.storage.open("testfile", "wb").write(b"A" * 1234)  # For quick check hash does not matter only file size
 
         hashfield_len_before = len(site.content_manager.hashfield)
@@ -59,7 +59,7 @@ class TestOptionalManager:
         file_row = contents.db.execute("SELECT * FROM file_optional WHERE inner_path = 'testfile'").fetchone()
         assert file_row["is_downloaded"]
 
-        # Delete file outside of ZeroNet
+        # Delete file outside of EpixNet
         site.storage.delete("testfile")
         site.storage.verifyFiles(quick_check=True)
         file_row = contents.db.execute("SELECT * FROM file_optional WHERE inner_path = 'testfile'").fetchone()
@@ -83,7 +83,7 @@ class TestOptionalManager:
 
         assert site.content_manager.hashfield.getHashId("aaaabbbbcccc") == site.content_manager.hashfield.getHashId("aaaabbbbdddd")
 
-        # Write files from outside of ZeroNet (For quick check hash does not matter only file size)
+        # Write files from outside of EpixNet (For quick check hash does not matter only file size)
         site.storage.open("testfile1", "wb").write(b"A" * 1234)
         site.storage.open("testfile2", "wb").write(b"B" * 2345)
 

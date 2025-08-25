@@ -99,7 +99,7 @@ class TorManagerPlugin(object):
                 await_publication = False
             )
             if service.private_key_type != "RSA1024":
-                raise Exception("ZeroNet doesn't support crypto " + service.private_key_type)
+                raise Exception("EpixNet doesn't support crypto " + service.private_key_type)
 
             self.log.debug("Stem created %s.onion (async descriptor publication)" % service.service_id)
 
