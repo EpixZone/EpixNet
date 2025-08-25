@@ -1354,7 +1354,7 @@
       section = this.createSection("Web Interface");
       section.items.push({
         key: "open_browser",
-        title: "Open web browser on ZeroNet startup",
+        title: "Open web browser on EpixNet startup",
         type: "checkbox"
       });
       section = this.createSection("Network");
@@ -1875,7 +1875,7 @@
     };
 
     UiConfig.prototype.onOpenWebsocket = function() {
-      this.cmd("wrapperSetTitle", "Config - ZeroNet");
+      this.cmd("wrapperSetTitle", "Config - EpixNet");
       this.cmd("serverInfo", {}, (function(_this) {
         return function(server_info) {
           return _this.server_info = server_info;
@@ -2051,7 +2051,7 @@
             loading: this.restart_loading
           },
           onclick: this.handleRestartClick
-        }, "Restart ZeroNet client")
+        }, "Restart EpixNet client")
       ]));
     };
 

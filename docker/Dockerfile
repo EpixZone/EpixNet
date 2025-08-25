@@ -2,11 +2,11 @@ FROM python:3.12-alpine
 
 RUN apk --update --no-cache --no-progress add git gcc libffi-dev musl-dev make openssl g++ autoconf automake libtool
 
-RUN adduser -u 1600 -D service-0net
+RUN adduser -u 1600 -D service-epixnet
 
-USER service-0net:service-0net
+USER service-epixnet:service-epixnet
 
-WORKDIR /home/service-0net
+WORKDIR /home/service-epixnet
 
 COPY requirements.txt .
 
@@ -16,10 +16,10 @@ RUN python3 -m pip install -r requirements.txt
 
 COPY . .
 
-ENTRYPOINT python3 zeronet.py --ui_ip "*" --fileserver_port 26552 \
+ENTRYPOINT python3 epixnet.py --ui_ip "*" --fileserver_port 10042 \
     --tor $TOR_ENABLED --tor_controller tor:$TOR_CONTROL_PORT \
     --tor_proxy tor:$TOR_SOCKS_PORT --tor_password $TOR_CONTROL_PASSWD
 
 CMD main
 
-EXPOSE 43110 26552
+EXPOSE 42222 10042

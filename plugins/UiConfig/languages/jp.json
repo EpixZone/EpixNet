@@ -1,8 +1,7 @@
 {
-	"ZeroNet config": "ZeroNetの設定",
+	"EpixNet config": "EpixNetの設定",
 	"Web Interface": "WEBインターフェース",
-	"Open web browser on ZeroNet startup": "ZeroNet起動時に自動でブラウザーを開く",
-
+	"Open web browser on EpixNet startup": "EpixNet起動時に自動でブラウザーを開く",
 	"Network": "ネットワーク",
 	"Offline mode": "オフラインモード",
 	"Disable network communication.": "通信を無効化します",
@@ -14,28 +13,21 @@
 	"File server external ip": "ファイルサーバの外部IP",
 	"Detect automatically": "自動検出",
 	"Your file server is accessible on these ips. (default: detect automatically)": "あなたのファイルサーバへはここで設定したIPでアクセスできます （既定: 自動検出）",
-
 	"Disable: Don't connect to peers on Tor network": "無効: Torネットワーク上のピアに接続しない",
 	"Enable: Only use Tor for Tor network peers": "有効: Torネットワーク上のピアに対してのみTorを使って接続する",
 	"Always: Use Tor for every connections to hide your IP address (slower)": "常時: 全ての接続にTorを使いIPを秘匿する（低速）",
-
 	"Disable": "無効",
 	"Enable": "有効",
 	"Always": "常時",
-
 	"Use Tor bridges": "Torブリッジを使用",
 	"Use obfuscated bridge relays to avoid network level Tor block (even slower)": "難読化されたブリッジリレーを使用してネットワークレベルのTorブロックを避ける（超低速）",
-
 	"Discover new peers using these adresses": "ここで設定したアドレスを用いてピアを発見します",
-
 	"Trackers files": "トラッカーファイル",
 	"Load additional list of torrent trackers dynamically, from a file": "ファイルからトレントラッカーの追加リストを動的に読み込みます",
 	"Eg.: data/trackers.json": "例: data/trackers.json",
-
 	"Proxy for tracker connections": "トラッカーへの接続に使うプロキシ",
 	"Custom": "カスタム",
 	"Custom socks proxy address for trackers": "トラッカーに接続するためのカスタムsocksプロキシのアドレス",
-
 	"Performance": "性能",
 	"Level of logging to file": "ログレベル",
 	"Everything": "全て",
@@ -54,9 +46,8 @@
 	"4 threads": "4スレッド",
 	"5 threads": "5スレッド",
 	"10 threads": "10スレッド",
-
 	" configuration item value changed": " の項目の値が変更されました",
 	"Save settings": "設定を保存",
 	"Some changed settings requires restart": "一部の変更の適用には再起動が必要です。",
-	"Restart ZeroNet client": "ZeroNetクライアントを再起動"
+	"Restart EpixNet client": "EpixNetクライアントを再起動"
 }

@@ -120,7 +120,7 @@ class UiWebsocketPlugin(object):
         if self_onion is not None:
             peer_ips.append(self_onion+'.onion')
         peer_ips.sort(key=lambda peer_ip: ".onion:" in peer_ip)
-        copy_link = f'http://127.0.0.1:43110/{site.address}/?zeronet_peers={",".join(peer_ips)}'
+        copy_link = f'http://127.0.0.1:43110/{site.address}/?epixnet_peers={",".join(peer_ips)}'
 
         body.append(_("""
             <li>
@@ -177,7 +177,7 @@ class UiWebsocketPlugin(object):
               <a href='/list/{site.address}' class='link-right link-outline' id="browse-files">{_[Browse files]}</a>
               <small class="label-right">
                <a href='#Site+directory' id='link-directory' class='link-right'>{_[Open site directory]}</a>
-               <a href='/ZeroNet-Internal/Zip?address={site.address}' id='link-zip' class='link-right' download='site.zip'>{_[Save as .zip]}</a>
+               <a href='/EpixNet-Internal/Zip?address={site.address}' id='link-zip' class='link-right' download='site.zip'>{_[Save as .zip]}</a>
               </small>
              </label>
              <ul class='graph graph-stacked'>
@@ -790,7 +790,7 @@ class UiWebsocketPlugin(object):
     @flag.admin
     @flag.no_multiuser
     def actionSiteRecoverPrivatekey(self, to):
-        from Crypt import CryptBitcoin
+        from Crypt import CryptEpix
 
         site_data = self.user.sites[self.site.address]
         if site_data.get("privatekey"):
@@ -800,8 +800,8 @@ class UiWebsocketPlugin(object):
         if not address_index:
             return {"error": "No address_index in content.json"}
 
-        privatekey = CryptBitcoin.hdPrivatekey(self.user.master_seed, address_index)
-        privatekey_address = CryptBitcoin.privatekeyToAddress(privatekey)
+        privatekey = CryptEpix.hdPrivatekey(self.user.master_seed, address_index)
+        privatekey_address = CryptEpix.privatekeyToAddress(privatekey)
 
         if privatekey_address == self.site.address:
             site_data["privatekey"] = privatekey

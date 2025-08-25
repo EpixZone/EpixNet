@@ -25,7 +25,7 @@ class SiteAnnouncerPlugin(object):
 
 class LocalAnnouncer(BroadcastServer.BroadcastServer):
     def __init__(self, server, listen_port):
-        super(LocalAnnouncer, self).__init__("zeronet", listen_port=listen_port)
+        super(LocalAnnouncer, self).__init__("epixnet", listen_port=listen_port)
         self.server = server
 
         self.sender_info["peer_id"] = self.server.peer_id

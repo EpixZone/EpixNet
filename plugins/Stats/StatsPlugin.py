@@ -574,16 +574,16 @@ class ActionsPlugin:
         import importlib
         import coincurve
         import sqlite3
-        from Crypt import CryptBitcoin
+        from Crypt import CryptEpix
 
         yield "\n"
 
         yield from self.formatTable(
-            ["zeronet-conservancy version:", config.version_full],
+            ["epixnet version:", config.version_full],
             ["Python:", "%s" % sys.version],
             ["Platform:", "%s" % sys.platform],
-            ["Crypt verify lib:", "%s" % CryptBitcoin.lib_verify_best],
-            ["OpenSSL:", "%s" % CryptBitcoin.sslcrypto.ecc.get_backend()],
+            ["Crypt verify lib:", "%s" % CryptEpix.lib_verify_best],
+            ["OpenSSL:", "%s" % CryptEpix.sslcurve.get_backend()],
             ["Libsecp256k1:", "%s" % type(coincurve._libsecp256k1.lib).__name__],
             ["SQLite:", "%s, API: %s" % (sqlite3.sqlite_version, sqlite3.version)],
             format=format

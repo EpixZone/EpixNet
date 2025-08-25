@@ -4,7 +4,7 @@ import json
 
 from Config import config
 from Plugin import PluginManager
-from Crypt import CryptBitcoin
+from Crypt import CryptEpix
 from . import UserPlugin
 from util.Flag import flag
 from Translate import translate as _
@@ -200,7 +200,7 @@ class UiWebsocketPlugin(object):
     # Login form submit
     def responseUserLogin(self, master_seed):
         user_manager = UserManager.user_manager
-        user = user_manager.get(CryptBitcoin.privatekeyToAddress(master_seed))
+        user = user_manager.get(CryptEpix.privatekeyToAddress(master_seed))
         if not user:
             user = user_manager.create(master_seed=master_seed)
         if user.master_address:
@@ -235,15 +235,15 @@ class UiWebsocketPlugin(object):
             <input type='text' class='masterseed' id='button_notification_masterseed' value='Click here to show' readonly/>
             <div style='text-align: center; font-size: 85%; margin-bottom: 10px;'>
              or <a href='#Download' id='button_notification_download'
-             class='masterseed_download' download='zeronet_private_key.backup'>Download backup as text file</a>
+             class='masterseed_download' download='epixnet_private_key.backup'>Download backup as text file</a>
             </div>
             <div>
              This is your private key, <b>save it</b>, so you can login next time.<br>
              <b>Warning: Without this key, your account will be lost forever!</b>
             </div><br>
             <a href='#' class='button' style='margin-left: 0px'>Ok, Saved it!</a><br><br>
-            <small>This site allows you to browse ZeroNet content, but if you want to secure your account <br>
-            and help to keep the network alive, then please run your own <a href='https://zeronet.io' target='_blank'>ZeroNet client</a>.</small>
+            <small>This site allows you to browse EpixNet content, but if you want to secure your account <br>
+            and help to keep the network alive, then please run your own <a href='https://epixnet.io' target='_blank'>EpixNet client</a>.</small>
         """
 
         self.cmd("notification", ["info", message])
@@ -253,7 +253,7 @@ class UiWebsocketPlugin(object):
                 this.value = "{master_seed}"; this.setSelectionRange(0,100);
             })
             $("#button_notification_download").on("mousedown", function() {
-                this.href = window.URL.createObjectURL(new Blob(["ZeroNet user master seed:\\r\\n{master_seed}"]))
+                this.href = window.URL.createObjectURL(new Blob(["EpixNet user master seed:\\r\\n{master_seed}"]))
             })
         """.replace("{master_seed}", master_seed)
         self.cmd("injectScript", script)

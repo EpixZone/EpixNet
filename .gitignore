@@ -32,10 +32,10 @@ tools/tor/data
 # PhantomJS, downloaded manually for unit tests
 tools/phantomjs
 
-# ZeroNet config file
-zeronet.conf
+# EpixNet config file
+epixnet.conf
 
-# ZeroNet log files
+# EpixNet log files
 log/*
 
 # Enabled plugins that disabled by default
@@ -48,3 +48,18 @@ plugins/UiPassword
 
 # Build files
 src/Build.py
+
+# Test data and cache files
+src/Test/testdata-temp/
+src/Test/__pycache__/
+.pytest_cache/
+*.pyc
+test_address_mappings.json
+
+# Test generated site directories (Epix addresses)
+src/Test/testdata/epix1*/
+
+# Test configuration files generated during tests
+src/Test/testdata/filters.json
+src/Test/testdata/sites.json
+src/Test/testdata/users.json

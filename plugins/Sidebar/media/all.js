@@ -114,12 +114,12 @@
       })(this);
       $(window).on("hashchange", (function(_this) {
         return function() {
-          if (window.top.location.hash.startsWith("#ZeroNet:Console")) {
+          if (window.top.location.hash.startsWith("#EpixNet:Console")) {
             return _this.open();
           }
         };
       })(this));
-      if (window.top.location.hash.startsWith("#ZeroNet:Console")) {
+      if (window.top.location.hash.startsWith("#EpixNet:Console")) {
         setTimeout(((function(_this) {
           return function() {
             return _this.open();
@@ -347,7 +347,7 @@
       $("a", this.tabs).removeClass("active");
       elem.addClass("active");
       this.changeFilter(this.tab_active);
-      window.top.location.hash = "#ZeroNet:Console:" + elem.data("title");
+      window.top.location.hash = "#EpixNet:Console:" + elem.data("title");
       return false;
     };
 
@@ -640,7 +640,7 @@ window.initScrollable = function () {
       this.globe = null;
       this.preload_html = null;
       this.original_set_site_info = this.wrapper.setSiteInfo;
-      if (window.top.location.hash === "#ZeroNet:OpenSidebar") {
+      if (window.top.location.hash === "#EpixNet:OpenSidebar") {
         this.startDrag();
         this.moved("x");
         this.fixbutton_targetx = this.fixbutton_initx - this.width;

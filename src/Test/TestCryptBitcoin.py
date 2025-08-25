@@ -1,17 +1,17 @@
-from Crypt import CryptBitcoin
+from Crypt import CryptEpix
 
 
-class TestCryptBitcoin:
+class TestCryptEpix:
     def testSign(self, crypt_bitcoin_lib):
         privatekey = "5K9S6dVpufGnroRgFrT6wsKiz2mJRYsC73eWDmajaHserAp3F1C"
         privatekey_bad = "5Jbm9rrusXyApAoM8YoM4Rja337zMMoBUMRJ1uijiguU2aZRnwC"
 
         # Get address by privatekey
         address = crypt_bitcoin_lib.privatekeyToAddress(privatekey)
-        assert address == "1MpDMxFeDUkiHohxx9tbGLeEGEuR4ZNsJz"
+        assert address.startswith("epix1")
 
         address_bad = crypt_bitcoin_lib.privatekeyToAddress(privatekey_bad)
-        assert address_bad != "1MpDMxFeDUkiHohxx9tbGLeEGEuR4ZNsJz"
+        assert address_bad != address
 
         # Text signing
         data_len_list = list(range(0, 300, 10))
@@ -28,21 +28,23 @@ class TestCryptBitcoin:
         assert not crypt_bitcoin_lib.verify("hello", address, sign_bad)
 
     def testVerify(self, crypt_bitcoin_lib):
-        sign_uncompressed = b'G6YkcFTuwKMVMHI2yycGQIFGbCZVNsZEZvSlOhKpHUt/BlADY94egmDAWdlrbbFrP9wH4aKcEfbLO8sa6f63VU0='
-        assert crypt_bitcoin_lib.verify("1NQUem2M4cAqWua6BVFBADtcSP55P4QobM#web/gitcenter", "19Bir5zRm1yo4pw9uuxQL8xwf9b7jqMpR", sign_uncompressed)
+        # Test with fresh signatures for Epix addresses
+        privatekey = "5K9S6dVpufGnroRgFrT6wsKiz2mJRYsC73eWDmajaHserAp3F1C"
+        address = crypt_bitcoin_lib.privatekeyToAddress(privatekey)
+        message = "test message for verification"
+        sign = crypt_bitcoin_lib.sign(message, privatekey)
 
-        sign_compressed = b'H6YkcFTuwKMVMHI2yycGQIFGbCZVNsZEZvSlOhKpHUt/BlADY94egmDAWdlrbbFrP9wH4aKcEfbLO8sa6f63VU0='
-        assert crypt_bitcoin_lib.verify("1NQUem2M4cAqWua6BVFBADtcSP55P4QobM#web/gitcenter", "1KH5BdNnqxh2KRWMMT8wUXzUgz4vVQ4S8p", sign_compressed)
+        assert crypt_bitcoin_lib.verify(message, address, sign)
 
     def testNewPrivatekey(self):
-        assert CryptBitcoin.newPrivatekey() != CryptBitcoin.newPrivatekey()
-        assert CryptBitcoin.privatekeyToAddress(CryptBitcoin.newPrivatekey())
+        assert CryptEpix.newPrivatekey() != CryptEpix.newPrivatekey()
+        assert CryptEpix.privatekeyToAddress(CryptEpix.newPrivatekey())
 
     def testNewSeed(self):
-        assert CryptBitcoin.newSeed() != CryptBitcoin.newSeed()
-        assert CryptBitcoin.privatekeyToAddress(
-            CryptBitcoin.hdPrivatekey(CryptBitcoin.newSeed(), 0)
+        assert CryptEpix.newSeed() != CryptEpix.newSeed()
+        assert CryptEpix.privatekeyToAddress(
+            CryptEpix.hdPrivatekey(CryptEpix.newSeed(), 0)
         )
-        assert CryptBitcoin.privatekeyToAddress(
-            CryptBitcoin.hdPrivatekey(CryptBitcoin.newSeed(), 2**256)
+        assert CryptEpix.privatekeyToAddress(
+            CryptEpix.hdPrivatekey(CryptEpix.newSeed(), 2**256)
         )

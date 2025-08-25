@@ -28,7 +28,7 @@ class ActionsPlugin(object):
 
         icon = notificationicon.NotificationIcon(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), 'trayicon.ico'),
-            "ZeroNet %s" % config.version
+            "EpixNet %s" % config.version
         )
         self.icon = icon
 
@@ -53,12 +53,12 @@ class ActionsPlugin(object):
             (self.titleConsole, self.toggleConsole),
             (self.titleAutorun, self.toggleAutorun),
             "--",
-            (_["ZeroNet Twitter"], lambda: self.opensite("https://twitter.com/HelloZeroNet")),
-            (_["ZeroNet Reddit"], lambda: self.opensite("http://www.reddit.com/r/zeronet/")),
-            (_["ZeroNet Github"], lambda: self.opensite("https://github.com/HelloZeroNet/ZeroNet")),
-            (_["Report bug/request feature"], lambda: self.opensite("https://github.com/HelloZeroNet/ZeroNet/issues")),
+            (_["EpixNet Twitter"], lambda: self.opensite("https://twitter.com/HelloEpixNet")),
+            (_["EpixNet Reddit"], lambda: self.opensite("http://www.reddit.com/r/epixnet/")),
+            (_["EpixNet Github"], lambda: self.opensite("https://github.com/HelloEpixNet/EpixNet")),
+            (_["Report bug/request feature"], lambda: self.opensite("https://github.com/HelloEpixNet/EpixNet/issues")),
             "--",
-            (_["!Open ZeroNet"], lambda: self.opensite("http://%s:%s/%s" % (ui_ip, config.ui_port, config.homepage))),
+            (_["!Open EpixNet"], lambda: self.opensite("http://%s:%s/%s" % (ui_ip, config.ui_port, config.homepage))),
             "--",
             (_["Quit"], self.quit),
         ]
@@ -121,7 +121,7 @@ class ActionsPlugin(object):
             self.console = True
 
     def getAutorunPath(self):
-        return "%s\\zeronet.cmd" % winfolders.get(winfolders.STARTUP)
+        return "%s\\epixnet.cmd" % winfolders.get(winfolders.STARTUP)
 
     def formatAutorun(self):
         args = sys.argv[:]
@@ -142,7 +142,7 @@ class ActionsPlugin(object):
         cmd = " ".join(args)
 
         # Dont open browser on autorun
-        cmd = cmd.replace("start.py", "zeronet.py").strip()
+        cmd = cmd.replace("start.py", "epixnet.py").strip()
         cmd += ' --open_browser ""'
 
         return "\r\n".join([
@@ -158,7 +158,7 @@ class ActionsPlugin(object):
         return os.path.isfile(path) and open(path, "rb").read().decode("utf8") == self.formatAutorun()
 
     def titleAutorun(self):
-        translate = _["Start ZeroNet when Windows starts"]
+        translate = _["Start EpixNet when Windows starts"]
         if self.isAutorunEnabled():
             return "+" + translate
         else:

@@ -4,7 +4,7 @@ import os
 import gevent
 
 from Plugin import PluginManager
-from Crypt import CryptBitcoin, CryptHash
+from Crypt import CryptEpix, CryptHash
 from Config import config
 import sslcrypto
 
@@ -101,12 +101,12 @@ class UiWebsocketPlugin(object):
         if privatekey is None:  # Sign using user's privatekey
             privatekey = self.user.getAuthPrivatekey(self.site.address)
 
-        self.response(to, CryptBitcoin.sign(data, privatekey))
+        self.response(to, CryptEpix.sign(data, privatekey))
 
     # Verify data using ECDSA (address is either a address or array of addresses)
     # Return: bool
     def actionEcdsaVerify(self, to, data, address, signature):
-        self.response(to, CryptBitcoin.verify(data, address, signature))
+        self.response(to, CryptEpix.verify(data, address, signature))
 
     # Gets the publickey of a given privatekey
     def actionEccPrivToPub(self, to, privatekey):
@@ -133,7 +133,7 @@ class UserPlugin(object):
         if "encrypt_privatekey_%s" % index not in site_data:
             address_index = self.getAddressAuthIndex(address)
             crypt_index = address_index + 1000 + index
-            site_data["encrypt_privatekey_%s" % index] = CryptBitcoin.hdPrivatekey(self.master_seed, crypt_index)
+            site_data["encrypt_privatekey_%s" % index] = CryptEpix.hdPrivatekey(self.master_seed, crypt_index)
             self.log.debug("New encrypt privatekey generated for %s:%s" % (address, index))
         return site_data["encrypt_privatekey_%s" % index]
 

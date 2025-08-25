@@ -70,7 +70,7 @@ class TestMsgpack:
             type(unpacked["utf8"]) == str
             type(unpacked["bin"]) == bytes
 
-        # Packed with use_bin_type=False (pre-ZeroNet 0.7.0)
+        # Packed with use_bin_type=False (pre-EpixNet 0.7.0)
         unpacked = Msgpack.unpack(packed["py3"], decode=True)
         type(unpacked["utf8"]) == str
         type(unpacked["bin"]) == bytes

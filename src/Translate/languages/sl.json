@@ -1,16 +1,14 @@
 {
-	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the ZeroNet network!": "Čestitke, vaša vrata <b>{0}</b> so odprta.<br>Postali ste polnopravni član ZeroNet omrežja!",
+	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the EpixNet network!": "Čestitke, vaša vrata <b>{0}</b> so odprta.<br>Postali ste polnopravni član EpixNet omrežja!",
 	"Tor mode active, every connection using Onion route.": "Način Tor aktiven.",
 	"Successfully started Tor onion hidden services.": "Storitve Tor uspešno zagnane.",
 	"Unable to start hidden services, please check your config.": "Ni bilo mogoče zagnati Tor storitev. Preverite nastavitve.",
 	"For faster connections open <b>{0}</b> port on your router.": "Za hitrejše povezave na svojem usmerjevalniku odprite vrata <b>{0}</b>.",
 	"Your connection is restricted. Please, open <b>{0}</b> port on your router": "Vaša povezava je omejena. Na svojem usmerjevalniku odprite vrata <b>{0}</b>",
-	"or configure Tor to become a full member of the ZeroNet network.": "ali nastavite Tor, da postanete polnopravni član ZeroNet omrežja.",
-
+	"or configure Tor to become a full member of the EpixNet network.": "ali nastavite Tor, da postanete polnopravni član EpixNet omrežja.",
 	"Select account you want to use in this site:": "Izberite račun, ki ga želite uporabiti na tem spletnem mestu:",
 	"currently selected": "trenutno izbrano",
 	"Unique to site": "Edinstven za spletno mesto",
-
 	"Content signing failed": "Podpisovanje vsebine ni uspelo",
 	"Content publish queued for {0:.0f} seconds.": "Objava vsebine na čakanju za {0:.0f} sekund.",
 	"Content published to {0} peers.": "Vsebina objavljena na {0} povezavah.",
@@ -25,10 +23,8 @@
 	"Change it to {auth_type}/{auth_user_name}@{domain}": "Spremenite ga na {auth_type}/{auth_user_name}@{domain}",
 	"Certificate changed to: <b>{auth_type}/{auth_user_name}@{domain}</b>.": "Potrdilo spremenjeno na: <b>{auth_type}/{auth_user_name}@{domain}</b>.",
 	"Site cloned": "Stran klonirana",
-
 	"You have successfully changed the web interface's language!": "Uspešno ste spremenili jezik spletnega vmesnika!",
 	"Due to the browser's caching, the full transformation could take some minute.": "Zaradi predpomnjenja brskalnika lahko popolna preobrazba traja nekaj minut.",
-
 	"Connection with <b>UiServer Websocket</b> was lost. Reconnecting...": "Povezava z <b>UiServer Websocket</b> je bila izgubljena. Ponovno povezovanje ...",
 	"Connection with <b>UiServer Websocket</b> recovered.": "Povezava z <b>UiServer Websocket</b> je vzpostavljena.",
 	"UiServer Websocket error, please reload the page.": "Napaka UiServer Websocket. Prosimo osvežite stran.",
@@ -47,5 +43,4 @@
 	" New version of this page has just released.<br>Reload to see the modified content.": " Ravnokar je bila objavljena nova različica te strani.<br>Osvežite jo, da boste videli novo vsebino.",
 	"This site requests permission:": "Ta stran zahteva dovoljenja:",
 	"_(Accept)": "Dovoli"
-
 }

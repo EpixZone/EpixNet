@@ -134,7 +134,7 @@ def _get_local_ips():
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             # Not using <broadcast> because gevents getaddrinfo doesn't like that
             # using port 1 as per hobbldygoop's comment about port 0 not working on osx:
-            # https://github.com/sirMackk/ZeroNet/commit/fdcd15cf8df0008a2070647d4d28ffedb503fba2#commitcomment-9863928
+            # https://github.com/sirMackk/EpixNet/commit/fdcd15cf8df0008a2070647d4d28ffedb503fba2#commitcomment-9863928
             s.connect(('239.255.255.250', 1))
             return [s.getsockname()[0]]
         except:
@@ -304,7 +304,7 @@ def _orchestrate_soap_request(ip, port, msg_fn, protos=("TCP", "UDP")):
     _send_requests(soap_messages, **idg_data)
 
 
-def _communicate_with_igd(port=15441,
+def _communicate_with_igd(port=10042,
                           retries=3,
                           fn=_create_open_message,
                           protos=("TCP", "UDP")):
@@ -354,7 +354,7 @@ def _communicate_with_igd(port=15441,
     return success
 
 
-def ask_to_open_port(port=15441, retries=3, protos=("TCP", "UDP")):
+def ask_to_open_port(port=10042, retries=3, protos=("TCP", "UDP")):
     logger.debug("Trying to open port %d." % port)
     return _communicate_with_igd(port=port,
                           retries=retries,
@@ -362,7 +362,7 @@ def ask_to_open_port(port=15441, retries=3, protos=("TCP", "UDP")):
                           protos=protos)
 
 
-def ask_to_close_port(port=15441, retries=3, protos=("TCP", "UDP")):
+def ask_to_close_port(port=10042, retries=3, protos=("TCP", "UDP")):
     logger.debug("Trying to close port %d." % port)
     # retries=1 because multiple successes cause 500 response and failure
     return _communicate_with_igd(port=port,
@@ -379,11 +379,11 @@ if __name__ == "__main__":
 
     s = time.time()
     print("Opening port...")
-    print("Success:", ask_to_open_port(15443, "ZeroNet", protos=["TCP"]))
+    print("Success:", ask_to_open_port(10042, "EpixNet", protos=["TCP"]))
     print("Done in", time.time() - s)
 
 
     print("Closing port...")
-    print("Success:", ask_to_close_port(15443, "ZeroNet", protos=["TCP"]))
+    print("Success:", ask_to_close_port(10042, "EpixNet", protos=["TCP"]))
     print("Done in", time.time() - s)
 

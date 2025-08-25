@@ -51,4 +51,4 @@ def get(intFolder):
 if __name__ == "__main__":
 	import os
 	print(get(STARTUP))
-	open(get(STARTUP)+"\\zeronet.cmd", "w").write("cd /D %s\r\nzeronet.py" % os.getcwd())
+	open(get(STARTUP)+"\\epixnet.cmd", "w").write("cd /D %s\r\nepixnet.py" % os.getcwd())

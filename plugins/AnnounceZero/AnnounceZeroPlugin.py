@@ -48,7 +48,7 @@ def processPeerRes(tracker_address, site, peers):
 @PluginManager.registerTo("SiteAnnouncer")
 class SiteAnnouncerPlugin(object):
     def getTrackerHandler(self, protocol):
-        if protocol == "zero":
+        if protocol == "epix":
             return self.announceTrackerZero
         else:
             return super(SiteAnnouncerPlugin, self).getTrackerHandler(protocol)
@@ -133,7 +133,7 @@ class SiteAnnouncerPlugin(object):
             tracker_peer.remove()  # Close connection, we don't need it in next 5 minute
 
         self.site.log.debug(
-            "Tracker announce result: zero://%s (sites: %s, new peers: %s, add: %s, mode: %s) in %.3fs" %
+            "Tracker announce result: epix://%s (sites: %s, new peers: %s, add: %s, mode: %s) in %.3fs" %
             (tracker_address, site_index, peers_added, add_types, mode, time.time() - s)
         )
 

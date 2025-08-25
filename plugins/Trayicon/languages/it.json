@@ -1,14 +1,14 @@
 {
-	"ZeroNet Twitter": "ZeroNet Twitter",
-	"ZeroNet Reddit": "ZeroNet Reddit",
-	"ZeroNet Github": "ZeroNet Github",
+	"EpixNet Twitter": "EpixNet Twitter",
+	"EpixNet Reddit": "EpixNet Reddit",
+	"EpixNet Github": "EpixNet Github",
 	"Report bug/request feature": "Segnala bug/richiesta di una funzione",
-	"!Open ZeroNet": "!Apri ZeroNet",
+	"!Open EpixNet": "!Apri EpixNet",
 	"Quit": "Chiudi",
 	"(active)": "(attivo)",
 	"(passive)": "(passivo)",
 	"Connections: %s": "Connessioni: %s",
 	"Received: %.2f MB | Sent: %.2f MB": "Ricevuto: %.2f MB | Inviato: %.2f MB",
 	"Show console window": "Mostra finestra console",
-	"Start ZeroNet when Windows starts": "Avvia ZeroNet all'avvio di Windows"
+	"Start EpixNet when Windows starts": "Avvia EpixNet all'avvio di Windows"
 }

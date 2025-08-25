@@ -180,7 +180,7 @@ class TestUpnpPunch(object):
 
         assert mock_collect_idg.called
         assert '192.168.0.12' in soap_msg
-        assert '15441' in soap_msg
+        assert '10042' in soap_msg
         assert 'schema-yo' in soap_msg
 
     @mock.patch('util.UpnpPunch._get_local_ips')

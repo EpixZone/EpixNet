@@ -17,3 +17,6 @@ pyaes
 requests
 ipython>=8
 GitPython
+pytest>=8.0.0
+mock>=5.0.0
+bech32>=1.2.0

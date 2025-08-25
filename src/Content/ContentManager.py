@@ -10,7 +10,7 @@ import gevent
 
 from Debug import Debug
 from Crypt import CryptHash
-from Crypt import CryptBitcoin
+from Crypt import CryptEpix
 from Config import config
 from util import helper
 from util import Diff
@@ -49,7 +49,7 @@ class ContentManager:
         self.has_optional_files = False
 
     def addBadCert(self, sign):
-        addr = CryptBitcoin.get_sign_address_64('compromised', sign)
+        addr = CryptEpix.get_sign_address_64('compromised', sign)
         if addr:
             self.bad_certs.add(addr)
             with open(f'{config.data_dir}/badcerts.json', 'w') as f:
@@ -707,7 +707,7 @@ class ContentManager:
                 content = {"files": {}, "signs": {}}  # Default content.json
 
             if inner_path == "content.json":  # It's the root content.json, add some more fields
-                content["title"] = "%s - ZeroNet_" % self.site.address
+                content["title"] = "%s - EpixNet_" % self.site.address
                 content["description"] = ""
                 content["signs_required"] = 1
                 content["ignore"] = ""
@@ -760,7 +760,7 @@ class ContentManager:
         new_content["modified"] = int(time.time())  # Add timestamp
         if inner_path == "content.json":
             # add for backward compatibility, but don't expose user version
-            new_content["zeronet_version"] = config.user_agent
+            new_content["epixnet_version"] = config.version
             new_content["signs_required"] = content.get("signs_required", 1)
 
         new_content["address"] = self.site.address
@@ -768,7 +768,7 @@ class ContentManager:
 
         # Verify private key
         self.log.info("Verifying private key...")
-        privatekey_address = CryptBitcoin.privatekeyToAddress(privatekey)
+        privatekey_address = CryptEpix.privatekeyToAddress(privatekey)
         valid_signers = self.getValidSigners(inner_path, new_content)
         if privatekey_address not in valid_signers:
             raise SignError(
@@ -780,7 +780,7 @@ class ContentManager:
         if inner_path == "content.json" and privatekey_address == self.site.address:
             # If signing using the root key, then sign the valid signers
             signers_data = "%s:%s" % (new_content["signs_required"], ",".join(valid_signers))
-            new_content["signers_sign"] = CryptBitcoin.sign(str(signers_data), privatekey)
+            new_content["signers_sign"] = CryptEpix.sign(str(signers_data), privatekey)
             if not new_content["signers_sign"]:
                 self.log.info("Old style address, signers_sign is none")
 
@@ -792,7 +792,7 @@ class ContentManager:
             del(new_content["sign"])  # Delete old sign (backward compatibility)
 
         sign_content = json.dumps(new_content, sort_keys=True)
-        sign = CryptBitcoin.sign(sign_content, privatekey)
+        sign = CryptEpix.sign(sign_content, privatekey)
         # new_content["signs"] = content.get("signs", {}) # TODO: Multisig
         if sign:  # If signing is successful (not an old address)
             new_content["signs"] = {}
@@ -834,7 +834,7 @@ class ContentManager:
 
     def verifyCertSign(self, user_address, user_auth_type, user_name, issuer_address, sign):
         cert_subject = f'{user_address}#{user_auth_type}/{user_name}'
-        return CryptBitcoin.verify(cert_subject, issuer_address, sign)
+        return CryptEpix.verify(cert_subject, issuer_address, sign)
 
     def verifyCert(self, inner_path, content):
         rules = self.getRules(inner_path, content)
@@ -1007,7 +1007,7 @@ class ContentManager:
 
                     if inner_path == "content.json" and len(valid_signers) > 1:  # Check signers_sign on root content.json
                         signers_data = "%s:%s" % (signs_required, ",".join(valid_signers))
-                        if not CryptBitcoin.verify(signers_data, self.site.address, new_content["signers_sign"]):
+                        if not CryptEpix.verify(signers_data, self.site.address, new_content["signers_sign"]):
                             raise VerifyError("Invalid signers_sign!")
 
                     if inner_path != "content.json" and not self.verifyCert(inner_path, new_content):  # Check if cert valid
@@ -1016,7 +1016,7 @@ class ContentManager:
                     valid_signs = 0
                     for address in valid_signers:
                         if address in signs:
-                            valid_signs += CryptBitcoin.verify(sign_content, address, signs[address])
+                            valid_signs += CryptEpix.verify(sign_content, address, signs[address])
                         if valid_signs >= signs_required:
                             break  # Break if we has enough signs
                     if valid_signs < signs_required:

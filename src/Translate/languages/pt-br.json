@@ -1,16 +1,14 @@
 {
-	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the ZeroNet network!": "Parabéns, a porta<b>{0}</b> está aberta.<br>Você é um membro completo da rede ZeroNet!",
+	"Congratulations, your port <b>{0}</b> is opened.<br>You are a full member of the EpixNet network!": "Parabéns, a porta<b>{0}</b> está aberta.<br>Você é um membro completo da rede EpixNet!",
 	"Tor mode active, every connection using Onion route.": "Modo Tor ativado, todas as conexões usam a rota Onion.",
 	"Successfully started Tor onion hidden services.": "Os serviços ocultos Tor onion foram inciados com sucesso.",
 	"Unable to start hidden services, please check your config.": "Não foi possível iniciar os serviços ocultos, por favor verifique suas configurações.",
 	"For faster connections open <b>{0}</b> port on your router.": "Para conexões mais rápidas, abra a porta <b>{0}</b> em seu roteador.",
 	"Your connection is restricted. Please, open <b>{0}</b> port on your router": "Sua conexão está restrita. Por favor, abra a porta <b>{0}</b> em seu roteador",
-	"or configure Tor to become a full member of the ZeroNet network.": "ou configure o Tor para se tornar um membro completo da rede ZeroNet.",
-
+	"or configure Tor to become a full member of the EpixNet network.": "ou configure o Tor para se tornar um membro completo da rede EpixNet.",
 	"Select account you want to use in this site:": "Selecione a conta que deseja usar nesse site:",
 	"currently selected": "atualmente selecionada",
 	"Unique to site": "Única para o site",
-
 	"Content signing failed": "Assinatura de conteúdo falhou",
 	"Content publish queued for {0:.0f} seconds.": "Publicação de conteúdo na fila por {0:.0f} segundos.",
 	"Content published to {0} peers.": "Conteúdo publicado para {0} peers.",
@@ -25,10 +23,8 @@
 	"Change it to {auth_type}/{auth_user_name}@{domain}": "Alterar para {auth_type}/{auth_user_name}@{domain}",
 	"Certificate changed to: <b>{auth_type}/{auth_user_name}@{domain}</b>.": "Certificado alterado para: <b>{auth_type}/{auth_user_name}@{domain}</b>.",
 	"Site cloned": "Site clonado",
-
 	"You have successfully changed the web interface's language!": "Você alterou o idioma da interface web com sucesso!",
 	"Due to the browser's caching, the full transformation could take some minute.": "Devido ao cache do navegador, a transformação completa pode levar alguns minutos.",
-
 	"Connection with <b>UiServer Websocket</b> was lost. Reconnecting...": "A conexão com <b>UiServer Websocket</b> foi perdida. Reconectando...",
 	"Connection with <b>UiServer Websocket</b> recovered.": "Conexão com <b>UiServer Websocket</b> recuperada.",
 	"UiServer Websocket error, please reload the page.": "Erro de UiServer Websocket, por favor atualize a página.",
@@ -47,11 +43,9 @@
 	" New version of this page has just released.<br>Reload to see the modified content.": " Uma nova versão desse site acaba de ser publicada.<br>Atualize para ver o conteúdo modificado.",
 	"This site requests permission:": "Esse site solicita permissão:",
 	"_(Accept)": "Conceder",
-	
 	"Save": "Salvar",
 	"Trackers announcing": "Trackers anunciando",
 	"Error": "Erro",
 	"Done": "Concluído",
 	"Tracker connection error detected.": "Erro de conexão com tracker foi detectado."
-
 }

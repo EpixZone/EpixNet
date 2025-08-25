@@ -1,5 +1,5 @@
 {
 	"name": "MultiUser",
-	"description": "Cookie based multi-users support on your ZeroNet web interface.",
+	"description": "Cookie based multi-users support on your EpixNet web interface.",
 	"default": "disabled"
 }

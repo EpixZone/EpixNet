@@ -139,7 +139,8 @@ class SiteManager(object):
 
     # Checks if its a valid address
     def isAddress(self, address):
-        return re.match("^[A-Za-z0-9]{26,35}$", address)
+        from Crypt import CryptEpix
+        return CryptEpix.isValidAddress(address)
 
     def isDomain(self, address):
         return False

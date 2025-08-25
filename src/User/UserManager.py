@@ -3,7 +3,7 @@ import json
 import logging
 import time
 
-# ZeroNet Modules
+# EpixNet Modules
 from .User import User
 from Plugin import PluginManager
 from Config import config
