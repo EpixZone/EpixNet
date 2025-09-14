@@ -44,16 +44,16 @@
 
 }).call(this);
 
-/* ---- lib/ZeroWebsocket.coffee ---- */
+/* ---- lib/EpixWebsocket.coffee ---- */
 
 
 (function () {
-  var ZeroWebsocket,
+  var EpixWebsocket,
     bind = function (fn, me) { return function () { return fn.apply(me, arguments); }; },
     slice = [].slice;
 
-  ZeroWebsocket = (function () {
-    function ZeroWebsocket(url) {
+  EpixWebsocket = (function () {
+    function EpixWebsocket(url) {
       this.onCloseWebsocket = bind(this.onCloseWebsocket, this);
       this.onErrorWebsocket = bind(this.onErrorWebsocket, this);
       this.onOpenWebsocket = bind(this.onOpenWebsocket, this);
@@ -67,11 +67,11 @@
       this.init();
     }
 
-    ZeroWebsocket.prototype.init = function () {
+    EpixWebsocket.prototype.init = function () {
       return this;
     };
 
-    ZeroWebsocket.prototype.connect = function () {
+    EpixWebsocket.prototype.connect = function () {
       this.ws = new WebSocket(this.url);
       this.ws.onmessage = this.onMessage;
       this.ws.onopen = this.onOpenWebsocket;
@@ -81,7 +81,7 @@
       return this.message_queue = [];
     };
 
-    ZeroWebsocket.prototype.onMessage = function (e) {
+    EpixWebsocket.prototype.onMessage = function (e) {
       var cmd, message;
       message = JSON.parse(e.data);
       cmd = message.cmd;
@@ -98,11 +98,11 @@
       }
     };
 
-    ZeroWebsocket.prototype.route = function (cmd, message) {
+    EpixWebsocket.prototype.route = function (cmd, message) {
       return this.log("Unknown command", message);
     };
 
-    ZeroWebsocket.prototype.response = function (to, result) {
+    EpixWebsocket.prototype.response = function (to, result) {
       return this.send({
         "cmd": "response",
         "to": to,
@@ -110,7 +110,7 @@
       });
     };
 
-    ZeroWebsocket.prototype.cmd = function (cmd, params, cb) {
+    EpixWebsocket.prototype.cmd = function (cmd, params, cb) {
       if (params == null) {
         params = {};
       }
@@ -123,7 +123,7 @@
       }, cb);
     };
 
-    ZeroWebsocket.prototype.send = function (message, cb) {
+    EpixWebsocket.prototype.send = function (message, cb) {
       if (cb == null) {
         cb = null;
       }
@@ -142,13 +142,13 @@
       }
     };
 
-    ZeroWebsocket.prototype.log = function () {
+    EpixWebsocket.prototype.log = function () {
       var args;
       args = 1 <= arguments.length ? slice.call(arguments, 0) : [];
-      return console.log.apply(console, ["[ZeroWebsocket]"].concat(slice.call(args)));
+      return console.log.apply(console, ["[EpixWebsocket]"].concat(slice.call(args)));
     };
 
-    ZeroWebsocket.prototype.onOpenWebsocket = function (e) {
+    EpixWebsocket.prototype.onOpenWebsocket = function (e) {
       var i, len, message, ref;
       this.log("Open");
       this.connected = true;
@@ -163,14 +163,14 @@
       }
     };
 
-    ZeroWebsocket.prototype.onErrorWebsocket = function (e) {
+    EpixWebsocket.prototype.onErrorWebsocket = function (e) {
       this.log("Error", e);
       if (this.onError != null) {
         return this.onError(e);
       }
     };
 
-    ZeroWebsocket.prototype.onCloseWebsocket = function (e, reconnect) {
+    EpixWebsocket.prototype.onCloseWebsocket = function (e, reconnect) {
       if (reconnect == null) {
         reconnect = 10000;
       }
@@ -191,11 +191,11 @@
       }
     };
 
-    return ZeroWebsocket;
+    return EpixWebsocket;
 
   })();
 
-  window.ZeroWebsocket = ZeroWebsocket;
+  window.EpixWebsocket = EpixWebsocket;
 
 }).call(this);
 
@@ -964,7 +964,7 @@ if (window.getComputedStyle(document.body).transform) {
       this.fixbutton = new Fixbutton();
       window.addEventListener("message", this.onMessageInner, false);
       this.inner = document.getElementById("inner-iframe").contentWindow;
-      this.ws = new ZeroWebsocket(ws_url);
+      this.ws = new EpixWebsocket(ws_url);
       this.ws.next_message_id = 1000000;
       this.ws.onOpen = this.onOpenWebsocket;
       this.ws.onClose = this.onCloseWebsocket;
@@ -2012,24 +2012,24 @@ if (window.getComputedStyle(document.body).transform) {
 }).call(this);
 
 
-/* ---- WrapperZeroFrame.coffee ---- */
+/* ---- WrapperEpixFrame.coffee ---- */
 
 
 (function () {
-  var WrapperZeroFrame,
+  var WrapperEpixFrame,
     bind = function (fn, me) { return function () { return fn.apply(me, arguments); }; };
 
-  WrapperZeroFrame = (function () {
-    function WrapperZeroFrame(wrapper) {
+  WrapperEpixFrame = (function () {
+    function WrapperEpixFrame(wrapper) {
       this.certSelectGotoSite = bind(this.certSelectGotoSite, this);
       this.response = bind(this.response, this);
       this.cmd = bind(this.cmd, this);
       this.wrapperCmd = wrapper.cmd;
       this.wrapperResponse = wrapper.ws.response;
-      console.log("WrapperZeroFrame", wrapper);
+      console.log("WrapperEpixFrame", wrapper);
     }
 
-    WrapperZeroFrame.prototype.cmd = function (cmd, params, cb) {
+    WrapperEpixFrame.prototype.cmd = function (cmd, params, cb) {
       if (params == null) {
         params = {};
       }
@@ -2039,15 +2039,15 @@ if (window.getComputedStyle(document.body).transform) {
       return this.wrapperCmd(cmd, params, cb);
     };
 
-    WrapperZeroFrame.prototype.response = function (to, result) {
+    WrapperEpixFrame.prototype.response = function (to, result) {
       return this.wrapperResponse(to, result);
     };
 
-    WrapperZeroFrame.prototype.isProxyRequest = function () {
+    WrapperEpixFrame.prototype.isProxyRequest = function () {
       return window.location.pathname === "/";
     };
 
-    WrapperZeroFrame.prototype.certSelectGotoSite = function (elem) {
+    WrapperEpixFrame.prototype.certSelectGotoSite = function (elem) {
       var href;
       href = $(elem).attr("href");
       if (this.isProxyRequest()) {
@@ -2055,11 +2055,11 @@ if (window.getComputedStyle(document.body).transform) {
       }
     };
 
-    return WrapperZeroFrame;
+    return WrapperEpixFrame;
 
   })();
 
-  window.zeroframe = new WrapperZeroFrame(window.wrapper);
+  window.epixframe = new WrapperEpixFrame(window.wrapper);
 
 }).call(this);
 
@@ -2079,10 +2079,10 @@ if (window.getComputedStyle(document.body).transform) {
   mqLight = window.matchMedia(LIGHT);
 
   changeColorScheme = function (theme) {
-    zeroframe.cmd("userGetGlobalSettings", [], function (user_settings) {
+    epixframe.cmd("userGetGlobalSettings", [], function (user_settings) {
       if (user_settings.theme !== theme) {
         user_settings.theme = theme;
-        zeroframe.cmd("userSetGlobalSettings", [user_settings], function (status) {
+        epixframe.cmd("userSetGlobalSettings", [user_settings], function (status) {
           if (status === "ok") {
             location.reload();
           }
@@ -2097,11 +2097,11 @@ if (window.getComputedStyle(document.body).transform) {
     if (!matches) {
       return;
     }
-    zeroframe.cmd("siteInfo", [], function (site_info) {
+    epixframe.cmd("siteInfo", [], function (site_info) {
       if (indexOf.call(site_info.settings.permissions, "ADMIN") >= 0) {
-        zeroframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please reload site to use it."]);
+        epixframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please reload site to use it."]);
       } else {
-        zeroframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please open ZeroHello to use it."]);
+        epixframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please open ZeroHello to use it."]);
       }
     });
   };
@@ -2116,7 +2116,7 @@ if (window.getComputedStyle(document.body).transform) {
     mqLight.addListener(displayNotification);
   };
 
-  zeroframe.cmd("userGetGlobalSettings", [], function (user_settings) {
+  epixframe.cmd("userGetGlobalSettings", [], function (user_settings) {
     if (user_settings.use_system_theme === true) {
       detectColorScheme();
     }

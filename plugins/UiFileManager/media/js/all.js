@@ -1012,19 +1012,19 @@
 
 }).call(this);
 
-/* ---- lib/ZeroFrame.coffee ---- */
+/* ---- lib/EpixFrame.coffee ---- */
 
 
 (function () {
-  var ZeroFrame,
+  var EpixFrame,
     bind = function (fn, me) { return function () { return fn.apply(me, arguments); }; },
     extend = function (child, parent) { for (var key in parent) { if (hasProp.call(parent, key)) child[key] = parent[key]; } function ctor() { this.constructor = child; } ctor.prototype = parent.prototype; child.prototype = new ctor(); child.__super__ = parent.prototype; return child; },
     hasProp = {}.hasOwnProperty;
 
-  ZeroFrame = (function (superClass) {
-    extend(ZeroFrame, superClass);
+  EpixFrame = (function (superClass) {
+    extend(EpixFrame, superClass);
 
-    function ZeroFrame(url) {
+    function EpixFrame(url) {
       this.onCloseWebsocket = bind(this.onCloseWebsocket, this);
       this.onOpenWebsocket = bind(this.onOpenWebsocket, this);
       this.onRequest = bind(this.onRequest, this);
@@ -1038,11 +1038,11 @@
       this.init();
     }
 
-    ZeroFrame.prototype.init = function () {
+    EpixFrame.prototype.init = function () {
       return this;
     };
 
-    ZeroFrame.prototype.connect = function () {
+    EpixFrame.prototype.connect = function () {
       this.target = window.parent;
       window.addEventListener("message", this.onMessage, false);
       this.cmd("innerReady");
@@ -1066,7 +1066,7 @@
       })(this));
     };
 
-    ZeroFrame.prototype.onMessage = function (e) {
+    EpixFrame.prototype.onMessage = function (e) {
       var cmd, message;
       message = e.data;
       cmd = message.cmd;
@@ -1089,11 +1089,11 @@
       }
     };
 
-    ZeroFrame.prototype.onRequest = function (cmd, message) {
+    EpixFrame.prototype.onRequest = function (cmd, message) {
       return this.log("Unknown request", message);
     };
 
-    ZeroFrame.prototype.response = function (to, result) {
+    EpixFrame.prototype.response = function (to, result) {
       return this.send({
         "cmd": "response",
         "to": to,
@@ -1101,7 +1101,7 @@
       });
     };
 
-    ZeroFrame.prototype.cmd = function (cmd, params, cb) {
+    EpixFrame.prototype.cmd = function (cmd, params, cb) {
       if (params == null) {
         params = {};
       }
@@ -1114,7 +1114,7 @@
       }, cb);
     };
 
-    ZeroFrame.prototype.send = function (message, cb) {
+    EpixFrame.prototype.send = function (message, cb) {
       if (cb == null) {
         cb = null;
       }
@@ -1127,19 +1127,19 @@
       }
     };
 
-    ZeroFrame.prototype.onOpenWebsocket = function () {
+    EpixFrame.prototype.onOpenWebsocket = function () {
       return this.log("Websocket open");
     };
 
-    ZeroFrame.prototype.onCloseWebsocket = function () {
+    EpixFrame.prototype.onCloseWebsocket = function () {
       return this.log("Websocket close");
     };
 
-    return ZeroFrame;
+    return EpixFrame;
 
   })(Class);
 
-  window.ZeroFrame = ZeroFrame;
+  window.EpixFrame = EpixFrame;
 
 }).call(this);
 
@@ -3033,7 +3033,7 @@
 
     return UiFileManager;
 
-  })(ZeroFrame);
+  })(EpixFrame);
 
   window.Page = new UiFileManager();
 
