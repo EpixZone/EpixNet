@@ -1,6 +1,5 @@
 import base64
 import binascii
-import hashlib
 import bech32
 
 from collections.abc import Container
@@ -50,20 +49,50 @@ def privatekeyToAddress(privatekey):  # Return Epix address from private key
 
 
 def publicKeyToAddress(public_key):
-    """Convert a public key to an Epix bech32 address"""
+    """Convert a public key to an Epix bech32 address using Ethereum-style generation"""
     try:
-        # Hash the public key (SHA256 + RIPEMD160)
-        h = hashlib.sha256(public_key).digest()
-        from lib.sslcrypto._ecc import ripemd160
-        hash160 = ripemd160(h).digest()
-        
+        # Use Keccak256 for Ethereum-compatible address generation
+        from Crypto.Hash import keccak
+
+        # Handle different public key formats
+        if len(public_key) == 65 and public_key[0] == 0x04:
+            # Uncompressed key with 0x04 prefix - remove prefix
+            public_key_for_hash = public_key[1:]
+        elif len(public_key) == 64:
+            # Already in correct format (64 bytes: 32 x + 32 y)
+            public_key_for_hash = public_key
+        elif len(public_key) == 33:
+            # Compressed key - need to decompress it to 64 bytes for Ethereum-style hashing
+            # TODO: Implement proper point decompression for compressed keys
+            raise NotImplementedError(
+                "Compressed public keys are not yet supported for Ethereum-style address generation. "
+                "Please use uncompressed public keys (64 or 65 bytes)."
+            )
+        else:
+            return False
+
+        # Apply Keccak256 hash to the 64-byte public key
+        hash_obj = keccak.new(digest_bits=256)
+        hash_obj.update(public_key_for_hash)
+        full_hash = hash_obj.digest()
+
+        # Take the last 20 bytes for Ethereum-style address
+        address_bytes = full_hash[-20:]
+
         # Convert to bech32 format with 'epix' prefix
-        converted = bech32.convertbits(hash160, 8, 5)
+        converted = bech32.convertbits(address_bytes, 8, 5)
         if converted is None:
             return False
-            
+
         address = bech32.bech32_encode(EPIX_PREFIX, converted)
         return address
+
+    except ImportError as e:
+        # pycryptodome is required for correct Ethereum-style address generation
+        raise ImportError(
+            "pycryptodome is required for Epix address generation. "
+            "Install it with: pip install pycryptodome"
+        ) from e
     except Exception:
         return False
 
@@ -72,9 +101,19 @@ def sign(data: str, privatekey: str) -> str:
     """Sign data with privatekey, return base64 string signature"""
     if privatekey.startswith("23") and len(privatekey) > 52:
         return None  # Old style private key not supported
+
+    # Handle different private key formats (same as privatekeyToAddress)
+    try:
+        if len(privatekey) == 64:
+            privatekey_bin = bytes.fromhex(privatekey)
+        else:
+            privatekey_bin = sslcurve.wif_to_private(privatekey.encode())
+    except Exception:
+        return None  # Invalid privatekey format
+
     return base64.b64encode(sslcurve.sign(
         data.encode(),
-        sslcurve.wif_to_private(privatekey.encode()),
+        privatekey_bin,
         recoverable=True,
         hash=dbl_format
     )).decode()

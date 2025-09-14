@@ -68,7 +68,7 @@ class TestCryptEpix:
 
     def testAddressConversion(self):
         # Test address to hash160 conversion
-        address = "epix15m0nn8gh00a2vppd8wzn8fmnm2vr6j7zg6fgq2"
+        address = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t"
         hash160 = CryptEpix.addressToHash160(address)
         assert hash160 is not None
         assert len(hash160) == 20

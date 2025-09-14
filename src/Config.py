@@ -376,6 +376,10 @@ class Config:
         action.add_argument('master_seed', help='Source master seed')
         action.add_argument('site_address_index', help='Site address index', type=int)
 
+        # Crypt PrivatekeyToAddress
+        action = self.subparsers.add_parser("cryptPrivatekeyToAddress", help='Get address from private key')
+        action.add_argument('privatekey', help='Private key', nargs='?')
+
         action = self.subparsers.add_parser("getConfig", help='Return json-encoded info')
         action = self.subparsers.add_parser("testConnection", help='Testing')
         action = self.subparsers.add_parser("testAnnounce", help='Testing')
@@ -417,7 +421,7 @@ class Config:
 
         self.parser.add_argument('--open-browser', help='Open homepage in web browser automatically',
                                  nargs='?', const="default_browser", metavar='browser_name')
-        self.parser.add_argument('--homepage', help='Web interface Dashboard', default='epix15m0nn8gh00a2vppd8wzn8fmnm2vr6j7zg6fgq2',
+        self.parser.add_argument('--homepage', help='Web interface Dashboard', default='epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t',
                                  metavar='address')
         # self.parser.add_argument('--updatesite', help='Source code update site', default='1uPDaT3uSyWAPdCv1WkMb5hBQjWSNNACf',
                                  # metavar='address')
