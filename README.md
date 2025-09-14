@@ -258,7 +258,7 @@ EpixNet creates a `epixnet.conf` file in your data directory where you can set p
 
 - **Local dashboard**: `http://127.0.0.1:42222/`
 - **Specific site**: `http://127.0.0.1:42222/{site_address}/`
-- **Dashboard site**: `http://127.0.0.1:42222/epix15m0nn8gh00a2vppd8wzn8fmnm2vr6j7zg6fgq2/`
+- **Dashboard site**: `http://127.0.0.1:42222/epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t/`
 
 ### Site Management
 
