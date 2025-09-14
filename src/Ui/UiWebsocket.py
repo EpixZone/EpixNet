@@ -893,7 +893,7 @@ class UiWebsocket(object):
         script = """
              $(".notification .select.cert").on("click", function() {
                 $(".notification .select").removeClass('active')
-                zeroframe.response(%s, this.title)
+                epixframe.response(%s, this.title)
                 return false
              })
         """ % self.next_message_id

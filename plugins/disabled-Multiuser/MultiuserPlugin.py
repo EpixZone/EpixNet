@@ -75,7 +75,7 @@ class UiRequestPlugin(object):
                 <!-- Multiser plugin -->
                 <script nonce="{script_nonce}">
                  setTimeout(function() {
-                    zeroframe.cmd("wrapperNotification", ["done", "{message}<br><small>You have been logged in successfully</small>", 5000])
+                    epixframe.cmd("wrapperNotification", ["done", "{message}<br><small>You have been logged in successfully</small>", 5000])
                  }, 1000)
                 </script>
                 </body>
@@ -136,7 +136,7 @@ class UiWebsocketPlugin(object):
         self.cmd("notification", ["done", message, 1000000])  # 1000000 = Show ~forever :)
 
         script = "document.cookie = 'master_address=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/';"
-        script += "$('#button_notification').on('click', function() { zeroframe.cmd(\"userLoginForm\", []); });"
+        script += "$('#button_notification').on('click', function() { epixframe.cmd(\"userLoginForm\", []); });"
         self.cmd("injectScript", script)
         # Delete from user_manager
         user_manager = UserManager.user_manager
@@ -155,7 +155,7 @@ class UiWebsocketPlugin(object):
             raise Exception("No user found")
 
         script = "document.cookie = 'master_address=%s;path=/;max-age=2592000;';" % master_address
-        script += "zeroframe.cmd('wrapperReload', ['login=done']);"
+        script += "epixframe.cmd('wrapperReload', ['login=done']);"
         self.cmd("notification", ["done", "Successful login, reloading page..."])
         self.cmd("injectScript", script)
 
@@ -185,7 +185,7 @@ class UiWebsocketPlugin(object):
         script = """
              $(".notification .select.user").on("click", function() {
                 $(".notification .select").removeClass('active')
-                zeroframe.response(%s, this.title)
+                epixframe.response(%s, this.title)
                 return false
              })
         """ % self.next_message_id
@@ -205,7 +205,7 @@ class UiWebsocketPlugin(object):
             user = user_manager.create(master_seed=master_seed)
         if user.master_address:
             script = "document.cookie = 'master_address=%s;path=/;max-age=2592000;';" % user.master_address
-            script += "zeroframe.cmd('wrapperReload', ['login=done']);"
+            script += "epixframe.cmd('wrapperReload', ['login=done']);"
             self.cmd("notification", ["done", "Successful login, reloading page..."])
             self.cmd("injectScript", script)
         else:

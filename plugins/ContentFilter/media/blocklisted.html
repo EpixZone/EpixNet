@@ -39,7 +39,7 @@
  </div>
 </div>
 
-<script type="text/javascript" src="js/ZeroFrame.js"></script>
+<script type="text/javascript" src="js/EpixFrame.js"></script>
 
 <script>
 function buf2hex(buffer) {
@@ -51,7 +51,7 @@ async function sha256hex(s) {
     return "0x" + buf2hex(await crypto.subtle.digest("SHA-256", buff))
 }
 
-class Page extends ZeroFrame {
+class Page extends EpixFrame {
     onOpenWebsocket () {
     	this.cmd("wrapperSetTitle", "Visiting a blocked site - EpixNet")
         this.cmd("siteInfo", {}, (site_info) => {
