@@ -120,7 +120,7 @@ class UiWebsocketPlugin(object):
         if self_onion is not None:
             peer_ips.append(self_onion+'.onion')
         peer_ips.sort(key=lambda peer_ip: ".onion:" in peer_ip)
-        copy_link = f'http://127.0.0.1:43110/{site.address}/?epixnet_peers={",".join(peer_ips)}'
+        copy_link = f'http://127.0.0.1:42222/{site.address}/?epixnet_peers={",".join(peer_ips)}'
 
         body.append(_("""
             <li>

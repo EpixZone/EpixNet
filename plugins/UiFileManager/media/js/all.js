@@ -730,19 +730,19 @@
 
     Text.prototype.fixHtmlLinks = function (text) {
       if (window.is_proxy) {
-        return text.replace(/href="http:\/\/(127.0.0.1|localhost):43110/g, 'href="http://epix');
+        return text.replace(/href="http:\/\/(127.0.0.1|localhost):42222/g, 'href="http://epix');
       } else {
-        return text.replace(/href="http:\/\/(127.0.0.1|localhost):43110/g, 'href="');
+        return text.replace(/href="http:\/\/(127.0.0.1|localhost):42222/g, 'href="');
       }
     };
 
     Text.prototype.fixLink = function (link) {
       var back;
       if (window.is_proxy) {
-        back = link.replace(/http:\/\/(127.0.0.1|localhost):43110/, 'http://epix');
+        back = link.replace(/http:\/\/(127.0.0.1|localhost):42222/, 'http://epix');
         return back.replace(/http:\/\/zero\/([^\/]+\.bit)/, "http://$1");
       } else {
-        return link.replace(/http:\/\/(127.0.0.1|localhost):43110/, '');
+        return link.replace(/http:\/\/(127.0.0.1|localhost):42222/, '');
       }
     };
 
