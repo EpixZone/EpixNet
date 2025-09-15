@@ -151,7 +151,7 @@ if sys.platform == "win32":
 else:
     namecoin_location = os.path.expanduser("~/.namecoin/")
 
-config_path = namecoin_location + 'zeroname_config.json'
+config_path = namecoin_location + 'epixname_config.json'
 if not os.path.isfile(config_path):  # Create sample config
     open(config_path, "w").write(
         json.dumps({'site': 'site', 'epixnet_path': '/home/epixnet', 'privatekey': '', 'lastprocessed': 223910}, indent=2)
