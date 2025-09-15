@@ -25,12 +25,12 @@ class TestUser:
     def testAuthAddress(self, user):
         # Auth address without Cert
         auth_address = user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr")
-        assert auth_address == "1MyJgYQjeEkR9QD66nkfJc9zqi9uUy5Lr2"
+        assert auth_address == "epix1pp7m6d33p0tq99zyz6j42vnka6h4d5rk7f7hga"
         auth_privatekey = user.getAuthPrivatekey("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr")
         assert CryptEpix.privatekeyToAddress(auth_privatekey) == auth_address
 
     def testCert(self, user):
-        cert_auth_address = user.getAuthAddress("1iD5ZQJMNXu43w1qLB8sfdHVKppVMduGz")  # Add site to user's registry
+        cert_auth_address = user.getAuthAddress("epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c")  # Add site to user's registry
         # Add cert
         user.addCert(cert_auth_address, "zeroid.bit", "faketype", "fakeuser", "fakesign")
         user.setCert("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr", "zeroid.bit")
@@ -47,4 +47,4 @@ class TestUser:
 
         # Re-create add site should generate normal, unique auth_address
         assert not user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr") == cert_auth_address
-        assert user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr") == "1MyJgYQjeEkR9QD66nkfJc9zqi9uUy5Lr2"
+        assert user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr") == "epix1pp7m6d33p0tq99zyz6j42vnka6h4d5rk7f7hga"

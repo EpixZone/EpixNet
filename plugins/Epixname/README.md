@@ -1,10 +1,10 @@
-# ZeroName
+# EpixName
 
-Zeroname plugin to connect Namecoin and register all the .bit domain name.
+Epixname plugin to connect Namecoin and register all the .bit domain name.
 
 ## Start
 
-You can create your own Zeroname.
+You can create your own Epixname.
 
 ### Namecoin node
 
@@ -30,7 +30,7 @@ Don't forget to change the `rpcuser` value and `rpcpassword` value!
 
 You can start your node : `./namecoind`
 
-### Create a Zeroname site
+### Create a Epixname site
 
 You will also need to create a site `python epixnet.py createSite` and register the info.
 
@@ -40,9 +40,9 @@ In the site you will need to create a file `./data/<your-site>/data/names.json` 
 {}
 ```
 
-### `zeroname_config.json` file
+### `epixname_config.json` file
 
-In `~/.namecoin/zeroname_config.json`
+In `~/.namecoin/epixname_config.json`
 
 ```
 {
@@ -55,4 +55,4 @@ In `~/.namecoin/zeroname_config.json`
 
 ### Run updater
 
-You can now run the script : `updater/zeroname_updater.py` and wait until it is fully sync (it might take a while).
+You can now run the script : `updater/epixname_updater.py` and wait until it is fully sync (it might take a while).

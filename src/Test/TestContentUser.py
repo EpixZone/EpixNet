@@ -198,14 +198,14 @@ class TestContentUser:
         # Override valid cert signers for the test
         rules_content["user_contents"]["cert_signers"]["zeroid.bit"] = [
             "14wgQ4VDDZNoRMFF4yCDuTrBSHmYhL3bet",
-            "1iD5ZQJMNXu43w1qLB8sfdHVKppVMduGz"
+            "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
         ]
 
         # Check valid cert signers
         rules = site.content_manager.getRules("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
         assert rules["cert_signers"] == {"zeroid.bit": [
             "14wgQ4VDDZNoRMFF4yCDuTrBSHmYhL3bet",
-            "1iD5ZQJMNXu43w1qLB8sfdHVKppVMduGz"
+            "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
         ]}
 
         # Sign a valid cert
@@ -284,7 +284,7 @@ class TestContentUser:
         # Override valid cert signers for the test
         rules_content["user_contents"]["cert_signers"]["zeroid.bit"] = [
             "14wgQ4VDDZNoRMFF4yCDuTrBSHmYhL3bet",
-            "1iD5ZQJMNXu43w1qLB8sfdHVKppVMduGz"
+            "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
         ]
 
         # Sign a valid cert

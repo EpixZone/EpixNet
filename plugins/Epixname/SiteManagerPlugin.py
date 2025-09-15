@@ -7,19 +7,19 @@ from Plugin import PluginManager
 
 allow_reload = False  # No reload supported
 
-log = logging.getLogger("ZeronamePlugin")
+log = logging.getLogger("EpixnamePlugin")
 
 
 @PluginManager.registerTo("SiteManager")
 class SiteManagerPlugin(object):
-    site_zeroname = None
+    site_epixname = None
     db_domains = {}
     db_domains_modified = None
 
     def load(self, *args, **kwargs):
         super(SiteManagerPlugin, self).load(*args, **kwargs)
         if not self.get(config.bit_resolver):
-            self.need(config.bit_resolver)  # Need ZeroName site
+            self.need(config.bit_resolver)  # Need EpixName site
 
     # Return: True if the address is .bit domain
     def isBitDomain(self, address):
@@ -29,23 +29,23 @@ class SiteManagerPlugin(object):
     # Return: The address or None
     def resolveBitDomain(self, domain):
         domain = domain.lower()
-        if not self.site_zeroname:
-            self.site_zeroname = self.need(config.bit_resolver)
+        if not self.site_epixname:
+            self.site_epixname = self.need(config.bit_resolver)
 
-        site_zeroname_modified = self.site_zeroname.content_manager.contents.get("content.json", {}).get("modified", 0)
-        if not self.db_domains or self.db_domains_modified != site_zeroname_modified:
-            self.site_zeroname.needFile("data/names.json", priority=10)
+        site_epixname_modified = self.site_epixname.content_manager.contents.get("content.json", {}).get("modified", 0)
+        if not self.db_domains or self.db_domains_modified != site_epixname_modified:
+            self.site_epixname.needFile("data/names.json", priority=10)
             s = time.time()
             try:
-                self.db_domains = self.site_zeroname.storage.loadJson("data/names.json")
+                self.db_domains = self.site_epixname.storage.loadJson("data/names.json")
             except Exception as err:
                 log.error("Error loading names.json: %s" % err)
 
             log.debug(
                 "Domain db with %s entries loaded in %.3fs (modification: %s -> %s)" %
-                (len(self.db_domains), time.time() - s, self.db_domains_modified, site_zeroname_modified)
+                (len(self.db_domains), time.time() - s, self.db_domains_modified, site_epixname_modified)
             )
-            self.db_domains_modified = site_zeroname_modified
+            self.db_domains_modified = site_epixname_modified
         return self.db_domains.get(domain)
 
     # Turn domain into address
@@ -60,10 +60,10 @@ class SiteManagerPlugin(object):
 @PluginManager.registerTo("ConfigPlugin")
 class ConfigPlugin(object):
     def createArguments(self):
-        group = self.parser.add_argument_group("Zeroname plugin")
+        group = self.parser.add_argument_group("Epixname plugin")
         group.add_argument(
             "--bit-resolver", help="EpixNet site to resolve .bit domains (deprecated)",
-            default="1GnACKctkJrGWHTqxk9T9zXo2bLQc2PDnF", metavar="address"
+            default="epix1epxrwflutk4j2saxuy84wvv52tdepuep8yqcqk", metavar="address"
         )
 
         return super(ConfigPlugin, self).createArguments()
