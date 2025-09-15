@@ -354,7 +354,7 @@ class UiWebsocket(object):
                 'tor_has_meek_bridges' : True,
                 'tor_use_bridges' : True,
                 'ui_ip' : '127.0.0.1',
-                'ui_port' : 43110,
+                'ui_port' : 42222,
                 'version' : config.user_agent,
                 'rev' : config.user_agent_rev,
                 'timecorrection' : 0.0,

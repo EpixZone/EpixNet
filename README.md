@@ -233,7 +233,7 @@ python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151 --t
 python3 epixnet.py
 
 # Custom port
-python3 epixnet.py --ui_port 43110
+python3 epixnet.py --ui_port 42222
 
 # Enable Tor
 python3 epixnet.py --tor always

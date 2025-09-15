@@ -59,7 +59,7 @@ class SiteAnnouncerPlugin(object):
         tracker.connect()
         if not tracker.poll_once():
             raise AnnounceError("Could not connect")
-        tracker.announce(info_hash=self.site.address_sha1, num_want=num_want, left=431102370)
+        tracker.announce(info_hash=self.site.address_sha1, num_want=num_want, left=422222370)
         back = tracker.poll_once()
         if not back:
             raise AnnounceError("No response after %.0fs" % (time.time() - s))
@@ -108,7 +108,7 @@ class SiteAnnouncerPlugin(object):
         params = {
             'info_hash': self.site.address_sha1,
             'peer_id': self.peer_id, 'port': port,
-            'uploaded': 0, 'downloaded': 0, 'left': 431102370, 'compact': 1, 'numwant': num_want,
+            'uploaded': 0, 'downloaded': 0, 'left': 422222370, 'compact': 1, 'numwant': num_want,
             'event': 'started'
         }
 
