@@ -48,6 +48,8 @@ plugins/UiPassword
 
 # Build files
 src/Build.py
+build/
+dist/
 
 # Test data and cache files
 src/Test/testdata-temp/

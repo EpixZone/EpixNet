@@ -1,0 +1,152 @@
+name: Build Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., v1.0.0)'
+        required: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Generate build info
+        run: |
+          python build.py --type=installer --platform=windows
+      
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller epixnet.spec --distpath dist/windows
+      
+      - name: Create Windows installer
+        run: |
+          mkdir -p dist/installers
+          cd dist/windows
+          7z a -r ../installers/EpixNet-windows-x64.zip EpixNet/
+      
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: windows-installer
+          path: dist/installers/EpixNet-windows-x64.zip
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Generate build info
+        run: |
+          python build.py --type=installer --platform=macos
+      
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller epixnet.spec --distpath dist/macos
+      
+      - name: Create macOS DMG
+        run: |
+          mkdir -p dist/installers
+          hdiutil create -volname "EpixNet" -srcfolder dist/macos/EpixNet.app -ov -format UDZO dist/installers/EpixNet-macos.dmg
+      
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: macos-installer
+          path: dist/installers/EpixNet-macos.dmg
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libffi-dev python3-dev build-essential libtool
+      
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Generate build info
+        run: |
+          python build.py --type=installer --platform=linux
+      
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller epixnet.spec --distpath dist/linux
+      
+      - name: Create Linux tarball
+        run: |
+          mkdir -p dist/installers
+          cd dist/linux
+          tar -czf ../installers/EpixNet-linux-x64.tar.gz EpixNet/
+      
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-installer
+          path: dist/installers/EpixNet-linux-x64.tar.gz
+
+  create-release:
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/windows-installer/EpixNet-windows-x64.zip
+            artifacts/macos-installer/EpixNet-macos.dmg
+            artifacts/linux-installer/EpixNet-linux-x64.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
