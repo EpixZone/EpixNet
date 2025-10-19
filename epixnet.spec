@@ -126,15 +126,16 @@ exe = EXE(
     icon=icon_file,
 )
 
-# macOS app bundle
-app = BUNDLE(
-    exe,
-    name='EpixNet.app',
-    icon=icon_file,
-    bundle_identifier='com.epixnet.app',
-    info_plist={
-        'NSPrincipalClass': 'NSApplication',
-        'NSHighResolutionCapable': 'True',
-    },
-)
+# macOS app bundle (only on macOS)
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        exe,
+        name='EpixNet.app',
+        icon=icon_file,
+        bundle_identifier='com.epixnet.app',
+        info_plist={
+            'NSPrincipalClass': 'NSApplication',
+            'NSHighResolutionCapable': 'True',
+        },
+    )
 

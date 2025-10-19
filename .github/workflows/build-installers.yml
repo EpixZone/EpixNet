@@ -39,10 +39,33 @@ jobs:
         run: |
           pyinstaller epixnet.spec --distpath dist/windows
 
+      - name: Debug - List build output
+        run: |
+          echo "Contents of dist/windows:"
+          dir dist/windows /s
+          echo ""
+          echo "Looking for EpixNet executable..."
+          if exist "dist\windows\EpixNet\EpixNet.exe" (
+            echo "Found: dist\windows\EpixNet\EpixNet.exe"
+          ) else if exist "dist\windows\EpixNet.exe" (
+            echo "Found: dist\windows\EpixNet.exe"
+          ) else (
+            echo "ERROR: EpixNet.exe not found!"
+          )
+
       - name: Prepare installer files
         run: |
           mkdir -p dist/installers
-          xcopy dist\windows\EpixNet dist\installers\EpixNet /E /I /Y
+          if exist "dist\windows\EpixNet" (
+            xcopy dist\windows\EpixNet dist\installers\EpixNet /E /I /Y
+          ) else if exist "dist\windows\EpixNet.exe" (
+            mkdir dist\installers\EpixNet
+            xcopy dist\windows\*.exe dist\installers\EpixNet /Y
+            xcopy dist\windows\*.dll dist\installers\EpixNet /Y 2>nul
+          ) else (
+            echo "ERROR: Build output not found"
+            exit /b 1
+          )
 
       - name: Create Windows installer with NSIS
         uses: joncloud/makensis-action@v4
