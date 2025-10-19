@@ -38,18 +38,32 @@ jobs:
       - name: Build with PyInstaller
         run: |
           pyinstaller epixnet.spec --distpath dist/windows
-      
-      - name: Create Windows installer
+
+      - name: Prepare installer files
         run: |
           mkdir -p dist/installers
-          cd dist/windows
-          7z a -r ../installers/EpixNet-windows-x64.zip EpixNet/
+          xcopy dist\windows\EpixNet dist\installers\EpixNet /E /I /Y
+
+      - name: Create Windows installer with NSIS
+        uses: joncloud/makensis-action@v4
+        with:
+          script-file: installer.nsi
+
+      - name: Verify installer was created
+        run: |
+          if exist "dist/installers/EpixNet-windows-x64.exe" (
+            echo "Installer created successfully"
+            dir dist/installers/EpixNet-windows-x64.exe
+          ) else (
+            echo "ERROR: Installer not created"
+            exit /b 1
+          )
       
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: dist/installers/EpixNet-windows-x64.zip
+          path: dist/installers/EpixNet-windows-x64.exe
 
   build-macos:
     runs-on: macos-latest
@@ -145,7 +159,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/windows-installer/EpixNet-windows-x64.zip
+            artifacts/windows-installer/EpixNet-windows-x64.exe
             artifacts/macos-installer/EpixNet-macos.dmg
             artifacts/linux-installer/EpixNet-linux-x64.tar.gz
           draft: false
