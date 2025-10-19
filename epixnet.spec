@@ -10,6 +10,17 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 block_cipher = None
 
+# Determine platform-specific icon
+if sys.platform == 'darwin':
+    # macOS requires .icns format
+    icon_file = 'plugins/Trayicon/trayicon.icns'
+elif sys.platform == 'win32':
+    # Windows uses .ico format
+    icon_file = 'plugins/Trayicon/trayicon.ico'
+else:
+    # Linux uses .ico format
+    icon_file = 'plugins/Trayicon/trayicon.ico'
+
 # Collect all data files and submodules for dependencies
 datas = []
 binaries = []
@@ -112,14 +123,14 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='plugins/Trayicon/trayicon.ico',
+    icon=icon_file,
 )
 
 # macOS app bundle
 app = BUNDLE(
     exe,
     name='EpixNet.app',
-    icon='plugins/Trayicon/trayicon.ico',
+    icon=icon_file,
     bundle_identifier='com.epixnet.app',
     info_plist={
         'NSPrincipalClass': 'NSApplication',
