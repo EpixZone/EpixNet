@@ -43,7 +43,7 @@ jobs:
           7z a -r ../installers/EpixNet-windows-x64.zip EpixNet/
       
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: dist/installers/EpixNet-windows-x64.zip
@@ -79,7 +79,7 @@ jobs:
           hdiutil create -volname "EpixNet" -srcfolder dist/macos/EpixNet.app -ov -format UDZO dist/installers/EpixNet-macos.dmg
       
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: macos-installer
           path: dist/installers/EpixNet-macos.dmg
@@ -121,7 +121,7 @@ jobs:
           tar -czf ../installers/EpixNet-linux-x64.tar.gz EpixNet/
       
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: linux-installer
           path: dist/installers/EpixNet-linux-x64.tar.gz
@@ -134,7 +134,7 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Download all artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
       
