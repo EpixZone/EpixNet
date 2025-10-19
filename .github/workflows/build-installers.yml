@@ -40,32 +40,37 @@ jobs:
           pyinstaller epixnet.spec --distpath dist/windows
 
       - name: Debug - List build output
+        shell: pwsh
         run: |
-          echo "Contents of dist/windows:"
-          dir dist/windows /s
-          echo ""
-          echo "Looking for EpixNet executable..."
-          if exist "dist\windows\EpixNet\EpixNet.exe" (
-            echo "Found: dist\windows\EpixNet\EpixNet.exe"
-          ) else if exist "dist\windows\EpixNet.exe" (
-            echo "Found: dist\windows\EpixNet.exe"
-          ) else (
-            echo "ERROR: EpixNet.exe not found!"
-          )
+          Write-Host "Contents of dist/windows:"
+          Get-ChildItem -Path dist/windows -Recurse
+          Write-Host ""
+          Write-Host "Looking for EpixNet executable..."
+          if (Test-Path "dist/windows/EpixNet/EpixNet.exe") {
+            Write-Host "Found: dist/windows/EpixNet/EpixNet.exe"
+          } elseif (Test-Path "dist/windows/EpixNet.exe") {
+            Write-Host "Found: dist/windows/EpixNet.exe"
+          } else {
+            Write-Host "ERROR: EpixNet.exe not found!"
+          }
 
       - name: Prepare installer files
+        shell: pwsh
         run: |
-          mkdir -p dist/installers
-          if exist "dist\windows\EpixNet" (
-            xcopy dist\windows\EpixNet dist\installers\EpixNet /E /I /Y
-          ) else if exist "dist\windows\EpixNet.exe" (
-            mkdir dist\installers\EpixNet
-            xcopy dist\windows\*.exe dist\installers\EpixNet /Y
-            xcopy dist\windows\*.dll dist\installers\EpixNet /Y 2>nul
-          ) else (
-            echo "ERROR: Build output not found"
-            exit /b 1
-          )
+          New-Item -ItemType Directory -Path dist/installers -Force | Out-Null
+
+          if (Test-Path "dist/windows/EpixNet") {
+            Write-Host "Copying dist/windows/EpixNet to dist/installers/EpixNet"
+            Copy-Item -Path dist/windows/EpixNet -Destination dist/installers/EpixNet -Recurse -Force
+          } elseif (Test-Path "dist/windows/EpixNet.exe") {
+            Write-Host "Copying individual files"
+            New-Item -ItemType Directory -Path dist/installers/EpixNet -Force | Out-Null
+            Copy-Item -Path dist/windows/*.exe -Destination dist/installers/EpixNet -Force
+            Copy-Item -Path dist/windows/*.dll -Destination dist/installers/EpixNet -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "ERROR: Build output not found"
+            exit 1
+          }
 
       - name: Create Windows installer with NSIS
         uses: joncloud/makensis-action@v4
@@ -73,14 +78,15 @@ jobs:
           script-file: installer.nsi
 
       - name: Verify installer was created
+        shell: pwsh
         run: |
-          if exist "dist/installers/EpixNet-windows-x64.exe" (
-            echo "Installer created successfully"
-            dir dist/installers/EpixNet-windows-x64.exe
-          ) else (
-            echo "ERROR: Installer not created"
-            exit /b 1
-          )
+          if (Test-Path "dist/installers/EpixNet-windows-x64.exe") {
+            Write-Host "Installer created successfully"
+            Get-Item dist/installers/EpixNet-windows-x64.exe
+          } else {
+            Write-Host "ERROR: Installer not created"
+            exit 1
+          }
       
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
