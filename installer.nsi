@@ -39,6 +39,7 @@ Section "Install"
   ; Write registry keys for uninstall
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\EpixNet" "DisplayName" "EpixNet"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\EpixNet" "UninstallString" "$INSTDIR\uninstall.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\EpixNet" "DisplayIcon" "$INSTDIR\EpixNet.exe"
   
   ; Create uninstaller
   WriteUninstaller "$INSTDIR\uninstall.exe"
