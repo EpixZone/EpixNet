@@ -55,48 +55,30 @@ jobs:
             Get-ChildItem -Path "dist\windows\EpixNet" -Recurse | Select-Object -First 20
           }
 
-      - name: Flatten PyInstaller output for installer
+      - name: Verify PyInstaller output structure
         shell: pwsh
         run: |
-          # Create a flat directory structure for the installer
-          # Move all files from _internal to the root level
+          # Verify the PyInstaller output has the correct structure
           $sourceDir = "dist\windows\EpixNet"
-          $flatDir = "dist\windows\EpixNet-flat"
 
-          # Create the flat directory
-          New-Item -ItemType Directory -Path $flatDir -Force | Out-Null
-
-          # Copy the executable (handle both with and without .exe extension)
+          Write-Host "Checking PyInstaller output structure..."
           if (Test-Path "$sourceDir\EpixNet.exe") {
-            Copy-Item -Path "$sourceDir\EpixNet.exe" -Destination "$flatDir\EpixNet.exe" -Force
-            Write-Host "✓ Copied EpixNet.exe"
-          } elseif (Test-Path "$sourceDir\EpixNet") {
-            Copy-Item -Path "$sourceDir\EpixNet" -Destination "$flatDir\EpixNet.exe" -Force
-            Write-Host "✓ Copied EpixNet (renamed to .exe)"
+            Write-Host "✓ Found EpixNet.exe"
           } else {
-            Write-Host "ERROR: Executable not found!"
+            Write-Host "ERROR: EpixNet.exe not found!"
             exit 1
           }
 
-          # Copy all files from _internal to the root level
           if (Test-Path "$sourceDir\_internal") {
-            Write-Host "Copying _internal files..."
-            Get-ChildItem -Path "$sourceDir\_internal" -Recurse | ForEach-Object {
-              $relativePath = $_.FullName.Substring("$sourceDir\_internal".Length).TrimStart('\')
-              $targetPath = Join-Path $flatDir $relativePath
-
-              if ($_.PSIsContainer) {
-                New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
-              } else {
-                New-Item -ItemType Directory -Path (Split-Path $targetPath) -Force | Out-Null
-                Copy-Item -Path $_.FullName -Destination $targetPath -Force
-              }
-            }
+            Write-Host "✓ Found _internal directory"
+            $dllCount = (Get-ChildItem -Path "$sourceDir\_internal" -Recurse -Filter "*.dll" | Measure-Object).Count
+            Write-Host "  - DLL files: $dllCount"
+          } else {
+            Write-Host "ERROR: _internal directory not found!"
+            exit 1
           }
 
-          Write-Host "✓ Flattened structure created"
-          Get-ChildItem -Path $flatDir | ForEach-Object { Write-Host "  $_" }
-          Get-ChildItem -Path $flatDir -Recurse | Measure-Object | ForEach-Object { Write-Host "Total files: $($_.Count)" }
+          Write-Host "✓ PyInstaller output structure is correct"
 
       - name: Create installers directory
         shell: pwsh
@@ -104,12 +86,12 @@ jobs:
           New-Item -ItemType Directory -Path dist/installers -Force | Out-Null
           Write-Host "✓ Created dist/installers directory"
 
-          # Verify flattened directory exists
-          if (Test-Path "dist\windows\EpixNet-flat") {
-            $fileCount = (Get-ChildItem -Path "dist\windows\EpixNet-flat" -Recurse | Measure-Object).Count
-            Write-Host "✓ Flattened directory ready with $fileCount files"
+          # Verify PyInstaller output directory exists
+          if (Test-Path "dist\windows\EpixNet") {
+            $fileCount = (Get-ChildItem -Path "dist\windows\EpixNet" -Recurse | Measure-Object).Count
+            Write-Host "✓ PyInstaller output ready with $fileCount files"
           } else {
-            Write-Host "ERROR: Flattened directory not found!"
+            Write-Host "ERROR: PyInstaller output directory not found!"
             exit 1
           }
 

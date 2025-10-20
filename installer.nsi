@@ -24,10 +24,9 @@ SetCompressor /SOLID lzma
 Section "Install"
   SetOutPath "$INSTDIR"
 
-  ; Copy all files from the flattened build directory
-  ; This includes the executable, all DLLs, libraries, plugins, and source files
-  ; at the root level (matching the old ZeroNet structure)
-  File /r "dist\windows\EpixNet-flat\*.*"
+  ; Copy all files from the PyInstaller output directory
+  ; This preserves the _internal directory structure required by PyInstaller
+  File /r "dist\windows\EpixNet\*.*"
   
   ; Create Start Menu shortcuts
   CreateDirectory "$SMPROGRAMS\EpixNet"
