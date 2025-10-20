@@ -36,6 +36,7 @@ datas += [('src', 'src')]
 
 # Hidden imports for gevent and other packages
 hiddenimports += collect_submodules('gevent')
+hiddenimports += collect_submodules('asyncio_gevent')
 hiddenimports += [
     'gevent',
     'gevent.monkey',
@@ -84,6 +85,11 @@ hiddenimports += [
     'Cryptodome.Util',
     'Cryptodome.Hash',
     'Cryptodome.Signature',
+    'asyncio_gevent',
+    'sockshandler',
+    'aiobtdht',
+    'aioudp',
+    'merkletools',
 ]
 
 a = Analysis(
@@ -116,7 +122,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=True,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,

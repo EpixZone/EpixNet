@@ -230,7 +230,7 @@ class Config:
             return here
 
         MACOSX_DIR = '~/Library/Application Support/EpixNet'
-        WINDOWS_DIR = '~/AppData/EpixNet'
+        WINDOWS_DIR = '~/AppData/Roaming/EpixNet'
         LIBREDESKTOP_DIR = '~/.local/share/EpixNet'
         if self.platform == 'source':
             if platform.system() == 'Darwin':

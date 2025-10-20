@@ -30,8 +30,8 @@ class CryptConnectionManager:
         self.openssl_conf = config.private_dir / "openssl.cnf"
 
         self.openssl_env = {
-            "OPENSSL_CONF": self.openssl_conf,
-            "RANDFILE": config.private_dir / "openssl-rand.tmp"
+            "OPENSSL_CONF": str(self.openssl_conf),
+            "RANDFILE": str(config.private_dir / "openssl-rand.tmp")
         }
 
         self.crypt_supported = []  # Supported cryptos
