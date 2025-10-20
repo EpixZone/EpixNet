@@ -39,6 +39,22 @@ jobs:
         run: |
           pyinstaller epixnet.spec --distpath dist/windows
 
+      - name: Debug - Check PyInstaller output
+        shell: pwsh
+        run: |
+          Write-Host "Contents of dist/windows/EpixNet:"
+          Get-ChildItem -Path "dist\windows\EpixNet" -Force
+          Write-Host ""
+          Write-Host "Looking for executable..."
+          if (Test-Path "dist\windows\EpixNet\EpixNet.exe") {
+            Write-Host "Found: EpixNet.exe"
+          } elseif (Test-Path "dist\windows\EpixNet\EpixNet") {
+            Write-Host "Found: EpixNet (no extension)"
+          } else {
+            Write-Host "ERROR: Executable not found!"
+            Get-ChildItem -Path "dist\windows\EpixNet" -Recurse | Select-Object -First 20
+          }
+
       - name: Flatten PyInstaller output for installer
         shell: pwsh
         run: |
@@ -50,11 +66,21 @@ jobs:
           # Create the flat directory
           New-Item -ItemType Directory -Path $flatDir -Force | Out-Null
 
-          # Copy the executable
-          Copy-Item -Path "$sourceDir\EpixNet" -Destination "$flatDir\EpixNet.exe" -Force
+          # Copy the executable (handle both with and without .exe extension)
+          if (Test-Path "$sourceDir\EpixNet.exe") {
+            Copy-Item -Path "$sourceDir\EpixNet.exe" -Destination "$flatDir\EpixNet.exe" -Force
+            Write-Host "✓ Copied EpixNet.exe"
+          } elseif (Test-Path "$sourceDir\EpixNet") {
+            Copy-Item -Path "$sourceDir\EpixNet" -Destination "$flatDir\EpixNet.exe" -Force
+            Write-Host "✓ Copied EpixNet (renamed to .exe)"
+          } else {
+            Write-Host "ERROR: Executable not found!"
+            exit 1
+          }
 
           # Copy all files from _internal to the root level
           if (Test-Path "$sourceDir\_internal") {
+            Write-Host "Copying _internal files..."
             Get-ChildItem -Path "$sourceDir\_internal" -Recurse | ForEach-Object {
               $relativePath = $_.FullName.Substring("$sourceDir\_internal".Length).TrimStart('\')
               $targetPath = Join-Path $flatDir $relativePath
@@ -69,6 +95,7 @@ jobs:
           }
 
           Write-Host "✓ Flattened structure created"
+          Get-ChildItem -Path $flatDir | ForEach-Object { Write-Host "  $_" }
           Get-ChildItem -Path $flatDir -Recurse | Measure-Object | ForEach-Object { Write-Host "Total files: $($_.Count)" }
 
       - name: Install NSIS
