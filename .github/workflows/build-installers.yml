@@ -98,13 +98,34 @@ jobs:
           Get-ChildItem -Path $flatDir | ForEach-Object { Write-Host "  $_" }
           Get-ChildItem -Path $flatDir -Recurse | Measure-Object | ForEach-Object { Write-Host "Total files: $($_.Count)" }
 
+      - name: Create installers directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/installers -Force | Out-Null
+          Write-Host "✓ Created dist/installers directory"
+
+          # Verify flattened directory exists
+          if (Test-Path "dist\windows\EpixNet-flat") {
+            $fileCount = (Get-ChildItem -Path "dist\windows\EpixNet-flat" -Recurse | Measure-Object).Count
+            Write-Host "✓ Flattened directory ready with $fileCount files"
+          } else {
+            Write-Host "ERROR: Flattened directory not found!"
+            exit 1
+          }
+
       - name: Install NSIS
         run: choco install nsis -y
 
       - name: Create Windows installer with NSIS
-        shell: cmd
+        shell: pwsh
         run: |
-          "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi
+          Write-Host "Running NSIS..."
+          & "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: NSIS failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "✓ NSIS completed successfully"
 
       - name: Verify installer was created
         shell: pwsh
