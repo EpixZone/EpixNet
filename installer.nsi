@@ -5,9 +5,12 @@
 
 ; Basic Settings
 Name "EpixNet"
-OutFile "dist/installers/EpixNet-windows-x64.exe"
+OutFile "dist\installers\EpixNet-windows-x64.exe"
 InstallDir "$PROGRAMFILES\EpixNet"
 InstallDirRegKey HKCU "Software\EpixNet" ""
+
+; Set compression
+SetCompressor /SOLID lzma
 
 ; MUI Settings
 !insertmacro MUI_PAGE_WELCOME
@@ -20,9 +23,11 @@ InstallDirRegKey HKCU "Software\EpixNet" ""
 ; Installer sections
 Section "Install"
   SetOutPath "$INSTDIR"
-  
-  ; Copy all files from the build output
-  File /r "dist\installers\EpixNet\*.*"
+
+  ; Copy all files from the flattened build directory
+  ; This includes the executable, all DLLs, libraries, plugins, and source files
+  ; at the root level (matching the old ZeroNet structure)
+  File /r "dist\windows\EpixNet-flat\*.*"
   
   ; Create Start Menu shortcuts
   CreateDirectory "$SMPROGRAMS\EpixNet"

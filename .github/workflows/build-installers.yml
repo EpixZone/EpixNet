@@ -39,38 +39,37 @@ jobs:
         run: |
           pyinstaller epixnet.spec --distpath dist/windows
 
-      - name: Debug - List build output
+      - name: Flatten PyInstaller output for installer
         shell: pwsh
         run: |
-          Write-Host "Contents of dist/windows:"
-          Get-ChildItem -Path dist/windows -Recurse
-          Write-Host ""
-          Write-Host "Looking for EpixNet executable..."
-          if (Test-Path "dist/windows/EpixNet/EpixNet.exe") {
-            Write-Host "Found: dist/windows/EpixNet/EpixNet.exe"
-          } elseif (Test-Path "dist/windows/EpixNet.exe") {
-            Write-Host "Found: dist/windows/EpixNet.exe"
-          } else {
-            Write-Host "ERROR: EpixNet.exe not found!"
+          # Create a flat directory structure for the installer
+          # Move all files from _internal to the root level
+          $sourceDir = "dist\windows\EpixNet"
+          $flatDir = "dist\windows\EpixNet-flat"
+
+          # Create the flat directory
+          New-Item -ItemType Directory -Path $flatDir -Force | Out-Null
+
+          # Copy the executable
+          Copy-Item -Path "$sourceDir\EpixNet" -Destination "$flatDir\EpixNet.exe" -Force
+
+          # Copy all files from _internal to the root level
+          if (Test-Path "$sourceDir\_internal") {
+            Get-ChildItem -Path "$sourceDir\_internal" -Recurse | ForEach-Object {
+              $relativePath = $_.FullName.Substring("$sourceDir\_internal".Length).TrimStart('\')
+              $targetPath = Join-Path $flatDir $relativePath
+
+              if ($_.PSIsContainer) {
+                New-Item -ItemType Directory -Path $targetPath -Force | Out-Null
+              } else {
+                New-Item -ItemType Directory -Path (Split-Path $targetPath) -Force | Out-Null
+                Copy-Item -Path $_.FullName -Destination $targetPath -Force
+              }
+            }
           }
 
-      - name: Prepare installer files
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path dist/installers -Force | Out-Null
-
-          if (Test-Path "dist/windows/EpixNet") {
-            Write-Host "Copying dist/windows/EpixNet to dist/installers/EpixNet"
-            Copy-Item -Path dist/windows/EpixNet -Destination dist/installers/EpixNet -Recurse -Force
-          } elseif (Test-Path "dist/windows/EpixNet.exe") {
-            Write-Host "Copying individual files"
-            New-Item -ItemType Directory -Path dist/installers/EpixNet -Force | Out-Null
-            Copy-Item -Path dist/windows/*.exe -Destination dist/installers/EpixNet -Force
-            Copy-Item -Path dist/windows/*.dll -Destination dist/installers/EpixNet -Force -ErrorAction SilentlyContinue
-          } else {
-            Write-Host "ERROR: Build output not found"
-            exit 1
-          }
+          Write-Host "✓ Flattened structure created"
+          Get-ChildItem -Path $flatDir -Recurse | Measure-Object | ForEach-Object { Write-Host "Total files: $($_.Count)" }
 
       - name: Install NSIS
         run: choco install nsis -y
@@ -83,9 +82,12 @@ jobs:
       - name: Verify installer was created
         shell: pwsh
         run: |
-          if (Test-Path "dist/installers/EpixNet-windows-x64.exe") {
-            Write-Host "Installer created successfully"
-            Get-Item dist/installers/EpixNet-windows-x64.exe
+          $exePath = "dist\installers\EpixNet-windows-x64.exe"
+          if (Test-Path $exePath) {
+            $exe = Get-Item $exePath
+            Write-Host "✓ Installer created successfully"
+            Write-Host "  Size: $($exe.Length / 1MB) MB"
+            Write-Host "  Path: $($exe.FullName)"
           } else {
             Write-Host "ERROR: Installer not created"
             exit 1
