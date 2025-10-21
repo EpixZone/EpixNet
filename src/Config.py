@@ -86,6 +86,7 @@ class Config:
         self.openssl_bin_file = None
 
         self.trackers_file = None
+        self.debug = False  # Default value before parsing
         self.createParser()
         self.createArguments()
 

@@ -1,6 +1,7 @@
 import base64
 import binascii
 import bech32
+import logging
 
 from collections.abc import Container
 from typing import Optional
@@ -49,7 +50,8 @@ def privatekeyToAddress(privatekey):  # Return Epix address from private key
 
         # Convert to Epix address using bech32 encoding
         return publicKeyToAddress(public_key)
-    except Exception:  # Invalid privatekey
+    except Exception as e:  # Invalid privatekey
+        logging.debug(f"privatekeyToAddress error: {type(e).__name__}")
         return False
 
 
@@ -66,14 +68,14 @@ def publicKeyToAddress(public_key):
         elif len(public_key) == 64:
             # Already in correct format (64 bytes: 32 x + 32 y)
             public_key_for_hash = public_key
-        elif len(public_key) == 33:
-            # Compressed key - need to decompress it to 64 bytes for Ethereum-style hashing
-            # TODO: Implement proper point decompression for compressed keys
-            raise NotImplementedError(
-                "Compressed public keys are not yet supported for Ethereum-style address generation. "
-                "Please use uncompressed public keys (64 or 65 bytes)."
-            )
+        elif len(public_key) == 33 and public_key[0] in (0x02, 0x03):
+            # Compressed key - decompress it to 64 bytes for Ethereum-style hashing
+            public_key_for_hash = sslcurve.decompress_point(public_key)
+            # decompress_point returns a tuple (x, y), convert to bytes
+            if isinstance(public_key_for_hash, tuple):
+                public_key_for_hash = public_key_for_hash[0] + public_key_for_hash[1]
         else:
+            logging.debug(f"publicKeyToAddress: Invalid public key length: {len(public_key)}")
             return False
 
         # Apply Keccak256 hash to the 64-byte public key
@@ -87,6 +89,7 @@ def publicKeyToAddress(public_key):
         # Convert to bech32 format with 'epix' prefix
         converted = bech32.convertbits(address_bytes, 8, 5)
         if converted is None:
+            logging.debug("publicKeyToAddress: bech32.convertbits returned None")
             return False
 
         address = bech32.bech32_encode(EPIX_PREFIX, converted)
@@ -98,7 +101,8 @@ def publicKeyToAddress(public_key):
             "pycryptodome is required for Epix address generation. "
             "Install it with: pip install pycryptodome"
         ) from e
-    except Exception:
+    except Exception as e:
+        logging.debug(f"publicKeyToAddress error: {type(e).__name__}")
         return False
 
 
