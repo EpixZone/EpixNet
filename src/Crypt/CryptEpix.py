@@ -28,7 +28,12 @@ def newSeed():
 
 def hdPrivatekey(seed, child):
     # Too large child id could cause problems
-    privatekey_bin = sslcurve.derive_child(seed.encode(), child % 100000000)
+    # Convert hex seed string to binary
+    if isinstance(seed, str):
+        seed_bin = bytes.fromhex(seed)
+    else:
+        seed_bin = seed
+    privatekey_bin = sslcurve.derive_child(seed_bin, child % 100000000)
     return sslcurve.private_to_wif(privatekey_bin).decode()
 
 
@@ -38,10 +43,10 @@ def privatekeyToAddress(privatekey):  # Return Epix address from private key
             privatekey_bin = bytes.fromhex(privatekey)
         else:
             privatekey_bin = sslcurve.wif_to_private(privatekey.encode())
-        
-        # Get public key from private key
+
+        # Get public key from private key (uncompressed format)
         public_key = sslcurve.private_to_public(privatekey_bin)
-        
+
         # Convert to Epix address using bech32 encoding
         return publicKeyToAddress(public_key)
     except Exception:  # Invalid privatekey

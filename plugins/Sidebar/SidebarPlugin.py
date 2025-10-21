@@ -803,6 +803,9 @@ class UiWebsocketPlugin(object):
         privatekey = CryptEpix.hdPrivatekey(self.user.master_seed, address_index)
         privatekey_address = CryptEpix.privatekeyToAddress(privatekey)
 
+        if not privatekey_address or privatekey_address is False:
+            return {"error": "Failed to generate valid address from privatekey"}
+
         if privatekey_address == self.site.address:
             site_data["privatekey"] = privatekey
             self.user.save()

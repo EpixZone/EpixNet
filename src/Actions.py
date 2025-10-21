@@ -95,6 +95,8 @@ class Actions:
         else:
             privatekey = CryptEpix.newPrivatekey()
             address = CryptEpix.privatekeyToAddress(privatekey)
+            if not address or address is False:
+                raise Exception("Failed to generate valid site address from privatekey")
         logging.info("----------------------------------------------------------------------")
         logging.info("Site private key: %s" % privatekey)
         logging.info("                  !!! ^ Save it now, required to modify the site ^ !!!")
