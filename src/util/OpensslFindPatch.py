@@ -13,11 +13,17 @@ def getOpensslPath():
         return config.openssl_lib_file
 
     if sys.platform.startswith("win"):
-        lib_paths = [
-            os.path.join(os.getcwd(), "tools/openssl/libeay32.dll"),  # EpixNetBundle Windows
+        lib_paths = []
+        # Handle PyInstaller bundled paths (_internal directory on Windows)
+        if hasattr(sys, '_MEIPASS'):
+            lib_paths.append(os.path.join(sys._MEIPASS, "tools/openssl/libeay32.dll"))
+        # Also check current working directory (for source installations)
+        lib_paths.append(os.path.join(os.getcwd(), "tools/openssl/libeay32.dll"))
+        # Python installation paths
+        lib_paths.extend([
             os.path.join(os.path.dirname(sys.executable), "DLLs/libcrypto-1_1-x64.dll"),
             os.path.join(os.path.dirname(sys.executable), "DLLs/libcrypto-1_1.dll")
-        ]
+        ])
     elif sys.platform == "cygwin":
         lib_paths = ["/bin/cygcrypto-1.0.0.dll"]
     else:

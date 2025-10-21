@@ -26,8 +26,14 @@ class TorManager(object):
     def __init__(self, fileserver_ip=None, fileserver_port=None):
         self.privatekeys = {}  # Onion: Privatekey
         self.site_onions = {}  # Site address: Onion
-        self.tor_exe = "tools/tor/tor.exe"
-        self.has_meek_bridges = os.path.isfile("tools/tor/PluggableTransports/meek-client.exe")
+        # Handle PyInstaller bundled paths (_internal directory on Windows)
+        if hasattr(sys, '_MEIPASS'):
+            # Running as frozen PyInstaller executable
+            self.tor_exe = os.path.join(sys._MEIPASS, "tools/tor/tor.exe")
+        else:
+            # Running from source
+            self.tor_exe = "tools/tor/tor.exe"
+        self.has_meek_bridges = os.path.isfile(os.path.join(os.path.dirname(self.tor_exe), "PluggableTransports/meek-client.exe"))
         self.tor_process = None
         self.log = logging.getLogger("TorManager")
         self.start_onions = None
@@ -153,8 +159,14 @@ class TorManager(object):
                     if not os.path.isfile(cookie_file) and self.tor_process:
                         # Workaround for tor client cookie auth file utf8 encoding bug (https://github.com/torproject/stem/issues/57)
                         cookie_file = os.path.dirname(self.tor_exe) + "\\data\\control_auth_cookie"
-                    auth_hex = binascii.b2a_hex(open(cookie_file, "rb").read())
-                    res_auth = self.send("AUTHENTICATE %s" % auth_hex.decode("utf8"), conn)
+                    try:
+                        auth_hex = binascii.b2a_hex(open(cookie_file, "rb").read())
+                        res_auth = self.send("AUTHENTICATE %s" % auth_hex.decode("utf8"), conn)
+                    except (FileNotFoundError, IOError) as err:
+                        # Cookie file not accessible (e.g., external Tor with Linux path on Windows)
+                        # Try authentication without cookie
+                        self.log.debug("Cookie file not accessible (%s), trying empty authentication" % err)
+                        res_auth = self.send("AUTHENTICATE", conn)
                 else:
                     res_auth = self.send("AUTHENTICATE", conn)
 
