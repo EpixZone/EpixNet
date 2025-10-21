@@ -102,7 +102,7 @@ class TrackerStorage(object):
 
     def save(self):
         s = time.time()
-        helper.atomicWrite(self.file_path, json.dumps(self.file_content, indent=2, sort_keys=True).encode("utf8"))
+        helper.atomicWrite(self.file_path, helper.jsonDumps(self.file_content).encode("utf8"))
         self.log.debug("Saved in %.3fs" % (time.time() - s))
 
     def discoverTrackers(self, peers):

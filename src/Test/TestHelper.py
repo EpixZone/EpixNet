@@ -77,3 +77,53 @@ class TestHelper:
 
         os.unlink(locked_f.name)
         os.unlink(locked_f_different.name)
+
+    def testJsonDumps(self):
+        # Test with normal data
+        data = {"key": "value", "number": 123, "bool": True}
+        result = helper.jsonDumps(data)
+        assert isinstance(result, str)
+        assert "key" in result
+        assert "value" in result
+
+        # Test with mixed type keys (bool and str) - this was causing the original error
+        data_with_mixed_keys = {
+            "string_key": "value",
+            True: "bool_key_value",
+            False: "another_bool_key"
+        }
+        result = helper.jsonDumps(data_with_mixed_keys)
+        assert isinstance(result, str)
+        # Keys should be converted to strings
+        assert "True" in result or "string_key" in result
+
+        # Test with nested structures
+        nested_data = {
+            "users": {
+                "user1": {"name": "Alice", "active": True},
+                "user2": {"name": "Bob", "active": False}
+            },
+            "settings": [1, 2, 3]
+        }
+        result = helper.jsonDumps(nested_data)
+        assert isinstance(result, str)
+        assert "Alice" in result
+        assert "Bob" in result
+
+        # Test the specific case from the error: users.json structure with boolean values
+        # This simulates the scenario where ContentDbDict stores False as a value
+        users_data = {
+            "1ABC123": {
+                "master_seed": "seed123",
+                "sites": {
+                    "site1": {"auth_address": "addr1", "auth_privatekey": "key1"},
+                    "site2": {"auth_address": "addr2", "auth_privatekey": "key2"}
+                },
+                "certs": {},
+                "settings": {}
+            }
+        }
+        result = helper.jsonDumps(users_data)
+        assert isinstance(result, str)
+        assert "1ABC123" in result
+        assert "seed123" in result

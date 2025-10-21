@@ -40,6 +40,17 @@ def atomicWrite(dest, content, mode="wb"):
 
 
 def jsonDumps(data):
+    # Convert all dictionary keys to strings to avoid TypeError when sorting mixed types
+    # This is necessary because json.dumps with sort_keys=True fails when comparing bool and str keys
+    def convert_keys_to_str(obj):
+        if isinstance(obj, dict):
+            return {str(k): convert_keys_to_str(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_keys_to_str(item) for item in obj]
+        else:
+            return obj
+
+    data = convert_keys_to_str(data)
     content = json.dumps(data, indent=1, sort_keys=True)
 
     # Make it a little more compact by removing unnecessary white space
