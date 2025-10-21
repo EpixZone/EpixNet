@@ -72,7 +72,9 @@ config.debug_socket = True  # Use test data for unittests
 config.verbose = True  # Use test data for unittests
 config.tor = "disable"  # Don't start Tor client
 config.trackers = []
-config.data_dir = TEST_DATA_PATH  # Use test data for unittests
+from pathlib import Path
+config.data_dir = Path(TEST_DATA_PATH)  # Use test data for unittests
+config.private_dir = Path(TEST_DATA_PATH)  # Use test data for unittests (for users.json)
 if "EPIXNET_LOG_DIR" in os.environ:
     config.log_dir = os.environ["EPIXNET_LOG_DIR"]
 config.initLogging(console_logging=False)
@@ -131,18 +133,26 @@ from Debug import Debug
 gevent.get_hub().NOT_ERROR += (Debug.Notify,)
 
 def cleanup():
-    Db.dbCloseAll()
-    for dir_path in [config.data_dir, config.data_dir + "-temp"]:
-        if os.path.isdir(dir_path):
-            for file_name in os.listdir(dir_path):
-                ext = file_name.rsplit(".", 1)[-1]
-                if ext not in ["csr", "pem", "srl", "db", "json", "tmp"]:
-                    continue
-                file_path = dir_path + "/" + file_name
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
+    try:
+        Db.dbCloseAll()
+    except Exception:
+        pass  # Ignore errors during database cleanup
 
-atexit_register(cleanup)
+    try:
+        for dir_path in [config.data_dir, Path(str(config.data_dir) + "-temp")]:
+            if os.path.isdir(dir_path):
+                for file_name in os.listdir(dir_path):
+                    ext = file_name.rsplit(".", 1)[-1]
+                    if ext not in ["csr", "pem", "srl", "db", "json", "tmp"]:
+                        continue
+                    file_path = dir_path / file_name
+                    if os.path.isfile(file_path):
+                        os.unlink(file_path)
+    except Exception:
+        pass  # Ignore errors during file cleanup
+
+# Don't register cleanup with atexit to avoid gevent shutdown issues
+# atexit_register(cleanup)
 
 @pytest.fixture(scope="session")
 def resetSettings(request):
@@ -150,7 +160,7 @@ def resetSettings(request):
     open("%s/filters.json" % config.data_dir, "w").write("{}")
     open("%s/users.json" % config.data_dir, "w").write("""
         {
-            "15E5rhcAUD69WbiYsYARh4YHJ4sLm2JEyc": {
+            "epix16jha5q3qvr7fgldrgem4x5ju8vwd78d3lwawtn": {
                 "certs": {},
                 "master_seed": "024bceac1105483d66585d8a60eaf20aa8c3254b0f266e0d626ddb6114e2949a",
                 "sites": {}
@@ -168,7 +178,7 @@ def resetTempSettings(request):
     open("%s/filters.json" % data_dir_temp, "w").write("{}")
     open("%s/users.json" % data_dir_temp, "w").write("""
         {
-            "15E5rhcAUD69WbiYsYARh4YHJ4sLm2JEyc": {
+            "epix16jha5q3qvr7fgldrgem4x5ju8vwd78d3lwawtn": {
                 "certs": {},
                 "master_seed": "024bceac1105483d66585d8a60eaf20aa8c3254b0f266e0d626ddb6114e2949a",
                 "sites": {}
@@ -243,7 +253,7 @@ def site_temp(request):
 
 
 @pytest.fixture(scope="session")
-def user():
+def user(resetSettings):
     user = UserManager.user_manager.get()
     if not user:
         user = UserManager.user_manager.create()

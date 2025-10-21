@@ -6,9 +6,9 @@ from Crypt import CryptEpix
 @pytest.mark.usefixtures("resetSettings")
 class TestUser:
     def testAddress(self, user):
-        assert user.master_address == "15E5rhcAUD69WbiYsYARh4YHJ4sLm2JEyc"
-        address_index = 1458664252141532163166741013621928587528255888800826689784628722366466547364755811
-        assert user.getAddressAuthIndex("15E5rhcAUD69WbiYsYARh4YHJ4sLm2JEyc") == address_index
+        assert user.master_address == "epix16jha5q3qvr7fgldrgem4x5ju8vwd78d3lwawtn"
+        address_index = 14199856986777972317416200829214867103927393370315628508069949862373673319704318642080835749710491251822
+        assert user.getAddressAuthIndex("epix16jha5q3qvr7fgldrgem4x5ju8vwd78d3lwawtn") == address_index
 
     # Re-generate privatekey based on address_index
     def testNewSite(self, user):
@@ -24,27 +24,33 @@ class TestUser:
 
     def testAuthAddress(self, user):
         # Auth address without Cert
-        auth_address = user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr")
-        assert auth_address == "epix1pp7m6d33p0tq99zyz6j42vnka6h4d5rk7f7hga"
-        auth_privatekey = user.getAuthPrivatekey("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr")
+        test_site_address = "epix1test0000000000000000000000000000000000"
+        auth_address = user.getAuthAddress(test_site_address)
+        assert auth_address == "epix19mqssu8uf40xfuzfczlxrxauus9k8r5jaznrgf"
+        auth_privatekey = user.getAuthPrivatekey(test_site_address)
         assert CryptEpix.privatekeyToAddress(auth_privatekey) == auth_address
 
     def testCert(self, user):
-        cert_auth_address = user.getAuthAddress("epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c")  # Add site to user's registry
+        cert_site_address = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
+        test_site_address = "epix1test0000000000000000000000000000000000"
+
+        cert_auth_address = user.getAuthAddress(cert_site_address)  # Add site to user's registry
+        assert cert_auth_address == "epix1lxfgsrns0uex5gtlvn3ta74adnam2cwjvpet4q"
+
         # Add cert
         user.addCert(cert_auth_address, "zeroid.bit", "faketype", "fakeuser", "fakesign")
-        user.setCert("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr", "zeroid.bit")
+        user.setCert(test_site_address, "zeroid.bit")
 
         # By using certificate the auth address should be same as the certificate provider
-        assert user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr") == cert_auth_address
-        auth_privatekey = user.getAuthPrivatekey("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr")
+        assert user.getAuthAddress(test_site_address) == cert_auth_address
+        auth_privatekey = user.getAuthPrivatekey(test_site_address)
         assert CryptEpix.privatekeyToAddress(auth_privatekey) == cert_auth_address
 
         # Test delete site data
-        assert "1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr" in user.sites
-        user.deleteSiteData("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr")
-        assert "1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr" not in user.sites
+        assert test_site_address in user.sites
+        user.deleteSiteData(test_site_address)
+        assert test_site_address not in user.sites
 
         # Re-create add site should generate normal, unique auth_address
-        assert not user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr") == cert_auth_address
-        assert user.getAuthAddress("1EU1tbG9oC1A8jz2ouVwGZyQ5asrNsE4Vr") == "epix1pp7m6d33p0tq99zyz6j42vnka6h4d5rk7f7hga"
+        assert not user.getAuthAddress(test_site_address) == cert_auth_address
+        assert user.getAuthAddress(test_site_address) == "epix19mqssu8uf40xfuzfczlxrxauus9k8r5jaznrgf"

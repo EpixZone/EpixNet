@@ -7,7 +7,7 @@ VENV_SCRIPT="start-venv.sh"
 if [[ -d "$REPO_DIR" ]]; then
     (cd "$REPO_DIR" && git pull --ff-only)
 else
-    git clone https://github.com/epixnet/epixnet "$REPO_DIR"
+    git clone https://github.com/EpixZone/EpixNet "$REPO_DIR"
 fi
 
 pkg update -y

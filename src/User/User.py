@@ -19,12 +19,16 @@ class User(object):
         if master_seed:
             self.master_seed = master_seed
             self.master_address = CryptEpix.privatekeyToAddress(self.master_seed)
+            if not self.master_address or self.master_address is False:
+                raise Exception("Failed to generate valid master address from seed")
         elif master_address:
             self.master_address = master_address
             self.master_seed = data.get("master_seed")
         else:
             self.master_seed = CryptEpix.newSeed()
             self.master_address = CryptEpix.privatekeyToAddress(self.master_seed)
+            if not self.master_address or self.master_address is False:
+                raise Exception("Failed to generate valid master address from new seed")
         self.sites = data.get("sites", {})
         self.certs = data.get("certs", {})
         self.settings = data.get("settings", {})
@@ -55,6 +59,8 @@ class User(object):
             self.delayed_save_thread = gevent.spawn_later(5, self.save)
 
     def getAddressAuthIndex(self, address):
+        if not isinstance(address, str):
+            raise TypeError(f"Address must be a string, got {type(address).__name__}: {address}")
         return int(binascii.hexlify(address.encode()), 16)
 
     @util.Noparallel()
@@ -62,8 +68,11 @@ class User(object):
         s = time.time()
         address_id = self.getAddressAuthIndex(address)  # Convert site address to int
         auth_privatekey = CryptEpix.hdPrivatekey(self.master_seed, address_id)
+        auth_address = CryptEpix.privatekeyToAddress(auth_privatekey)
+        if not auth_address or auth_address is False:
+            raise Exception(f"Failed to generate valid auth address for site {address}")
         self.sites[address] = {
-            "auth_address": CryptEpix.privatekeyToAddress(auth_privatekey),
+            "auth_address": auth_address,
             "auth_privatekey": auth_privatekey
         }
         self.saveDelayed()
@@ -98,6 +107,8 @@ class User(object):
         bip32_index = random.randrange(2 ** 256) % 100000000
         site_privatekey = CryptEpix.hdPrivatekey(self.master_seed, bip32_index)
         site_address = CryptEpix.privatekeyToAddress(site_privatekey)
+        if not site_address or site_address is False:
+            raise Exception("Failed to generate valid site address from privatekey")
         if site_address in self.sites:
             raise Exception("Random error: site exist!")
         # Save to sites

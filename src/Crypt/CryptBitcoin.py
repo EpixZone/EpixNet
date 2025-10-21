@@ -57,7 +57,12 @@ def newSeed():
 
 def hdPrivatekey(seed, child):
     # Too large child id could cause problems
-    privatekey_bin = sslcurve.derive_child(seed.encode(), child % 100000000)
+    # Convert hex seed string to binary
+    if isinstance(seed, str):
+        seed_bin = bytes.fromhex(seed)
+    else:
+        seed_bin = seed
+    privatekey_bin = sslcurve.derive_child(seed_bin, child % 100000000)
     return sslcurve.private_to_wif(privatekey_bin).decode()
 
 
