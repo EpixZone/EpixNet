@@ -30,7 +30,43 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-      
+
+      - name: Download EpixNetBundle tools
+        shell: pwsh
+        run: |
+          $repoUrl = "https://github.com/EpixZone/EpixNetBundle"
+          $branch = "py3"
+          $toolsPath = "tools_win"
+
+          # Create tools directory
+          New-Item -ItemType Directory -Path "tools" -Force | Out-Null
+
+          # Download files from the repository
+          $apiUrl = "https://api.github.com/repos/EpixZone/EpixNetBundle/contents/$toolsPath?ref=$branch"
+
+          Write-Host "Downloading tools from $repoUrl/$toolsPath (branch: $branch)..."
+
+          try {
+            $response = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept" = "application/vnd.github.v3+json"}
+
+            foreach ($item in $response) {
+              if ($item.type -eq "file") {
+                $fileName = $item.name
+                $downloadUrl = $item.download_url
+                $outputPath = "tools/$fileName"
+
+                Write-Host "Downloading $fileName..."
+                Invoke-WebRequest -Uri $downloadUrl -OutFile $outputPath
+                Write-Host "✓ Downloaded $fileName"
+              }
+            }
+
+            Write-Host "✓ All tools downloaded successfully"
+          } catch {
+            Write-Host "ERROR: Failed to download tools: $_"
+            exit 1
+          }
+
       - name: Generate build info
         run: |
           python build.py --type=installer --platform=windows

@@ -14,7 +14,7 @@ def getOpensslPath():
 
     if sys.platform.startswith("win"):
         lib_paths = [
-            os.path.join(os.getcwd(), "tools/openssl/libeay32.dll"),  # ZeroBundle Windows
+            os.path.join(os.getcwd(), "tools/openssl/libeay32.dll"),  # EpixNetBundle Windows
             os.path.join(os.path.dirname(sys.executable), "DLLs/libcrypto-1_1-x64.dll"),
             os.path.join(os.path.dirname(sys.executable), "DLLs/libcrypto-1_1.dll")
         ]
@@ -22,8 +22,8 @@ def getOpensslPath():
         lib_paths = ["/bin/cygcrypto-1.0.0.dll"]
     else:
         lib_paths = [
-            "../runtime/lib/libcrypto.so.1.1",  # ZeroBundle Linux
-            "../../Frameworks/libcrypto.1.1.dylib",  # ZeroBundle macOS
+            "../runtime/lib/libcrypto.so.1.1",  # EpixNetBundle Linux
+            "../../Frameworks/libcrypto.1.1.dylib",  # EpixNetBundle macOS
             "/opt/lib/libcrypto.so.1.0.0",  # For optware and entware
             "/usr/local/ssl/lib/libcrypto.so"
         ]
