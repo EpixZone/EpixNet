@@ -34,6 +34,10 @@ datas += collect_data_files('maxminddb')
 datas += [('plugins', 'plugins')]
 datas += [('src', 'src')]
 
+# Add tools directory (OpenSSL, Tor, etc.) if it exists
+if os.path.isdir('tools'):
+    datas += [('tools', 'tools')]
+
 # Hidden imports for gevent and other packages
 hiddenimports += collect_submodules('gevent')
 hiddenimports += collect_submodules('asyncio_gevent')
