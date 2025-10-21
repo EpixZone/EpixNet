@@ -30,11 +30,11 @@ Section "Install"
   
   ; Create Start Menu shortcuts
   CreateDirectory "$SMPROGRAMS\EpixNet"
-  CreateShortcut "$SMPROGRAMS\EpixNet\EpixNet.lnk" "$INSTDIR\EpixNet.exe"
+  CreateShortcut "$SMPROGRAMS\EpixNet\EpixNet.lnk" "$INSTDIR\EpixNet.exe" "--open-browser"
   CreateShortcut "$SMPROGRAMS\EpixNet\Uninstall.lnk" "$INSTDIR\uninstall.exe"
-  
+
   ; Create Desktop shortcut
-  CreateShortcut "$DESKTOP\EpixNet.lnk" "$INSTDIR\EpixNet.exe"
+  CreateShortcut "$DESKTOP\EpixNet.lnk" "$INSTDIR\EpixNet.exe" "--open-browser"
   
   ; Write registry keys for uninstall
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\EpixNet" "DisplayName" "EpixNet"

@@ -134,7 +134,7 @@ def init():
         except BlockingIOError as err:
             startupError(f"Can't open lock file, your EpixNet client is probably already running, exiting... ({err})")
             proc = helper.openBrowser(config.open_browser)
-            r = proc.wait()
+            r = proc.wait() if proc else 0
             sys.exit(r)
 
     config.initLogging(console_logging=False)

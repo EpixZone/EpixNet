@@ -92,7 +92,7 @@ def getFreeSpace():
             import ctypes
             free_space_pointer = ctypes.c_ulonglong(0)
             ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-                ctypes.c_wchar_p(config.data_dir), None, None, ctypes.pointer(free_space_pointer)
+                ctypes.c_wchar_p(str(config.data_dir)), None, None, ctypes.pointer(free_space_pointer)
             )
             free_space = free_space_pointer.value
         except Exception as err:
@@ -330,7 +330,13 @@ def openBrowser(agent):
         else: # IPv4
             url = f'http://{ui_ip}:{config.ui_port}/{config.homepage}'
         try:
-            import subprocess
-            return subprocess.Popen([config.open_browser, url])
+            if agent == "default_browser":
+                import webbrowser
+                webbrowser.open(url, new=0)
+                return None
+            else:
+                # Use custom browser executable
+                import subprocess
+                return subprocess.Popen([agent, url])
         except Exception as err:
             print(f"Error starting browser: {err}")
