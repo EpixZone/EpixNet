@@ -170,8 +170,14 @@ class TorManager(object):
                     if not os.path.isfile(cookie_file) and self.tor_process:
                         # Workaround for tor client cookie auth file utf8 encoding bug (https://github.com/torproject/stem/issues/57)
                         cookie_file = os.path.dirname(self.tor_exe) + "\\data\\control_auth_cookie"
-                    auth_hex = binascii.b2a_hex(open(cookie_file, "rb").read())
-                    res_auth = self.send("AUTHENTICATE %s" % auth_hex.decode("utf8"), conn)
+                    try:
+                        auth_hex = binascii.b2a_hex(open(cookie_file, "rb").read())
+                        res_auth = self.send("AUTHENTICATE %s" % auth_hex.decode("utf8"), conn)
+                    except (FileNotFoundError, IOError) as err:
+                        # Cookie file not accessible (e.g., external Tor with Linux path on Windows)
+                        # Try authentication without cookie
+                        self.log.debug("Cookie file not accessible (%s), trying empty authentication" % err)
+                        res_auth = self.send("AUTHENTICATE", conn)
                 else:
                     res_auth = self.send("AUTHENTICATE", conn)
 
