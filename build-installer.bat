@@ -46,7 +46,7 @@ if not exist "dist\installers" mkdir dist\installers
 REM Build for Windows
 echo.
 echo Building for Windows...
-"!PYTHON_EXE!" -m PyInstaller epixnet.spec --distpath dist\windows
+"!PYTHON_EXE!" -m PyInstaller epixnet.spec --distpath dist\windows --noconfirm
 
 if errorlevel 1 (
     echo Error: PyInstaller build failed

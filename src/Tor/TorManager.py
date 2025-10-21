@@ -26,8 +26,14 @@ class TorManager(object):
     def __init__(self, fileserver_ip=None, fileserver_port=None):
         self.privatekeys = {}  # Onion: Privatekey
         self.site_onions = {}  # Site address: Onion
-        self.tor_exe = "tools/tor/tor.exe"
-        self.has_meek_bridges = os.path.isfile("tools/tor/PluggableTransports/meek-client.exe")
+        # Handle PyInstaller bundled paths (_internal directory on Windows)
+        if hasattr(sys, '_MEIPASS'):
+            # Running as frozen PyInstaller executable
+            self.tor_exe = os.path.join(sys._MEIPASS, "tools", "tor", "tor.exe")
+        else:
+            # Running from source
+            self.tor_exe = os.path.join("tools", "tor", "tor.exe")
+        self.has_meek_bridges = os.path.isfile(os.path.join(os.path.dirname(self.tor_exe), "PluggableTransports", "meek-client.exe"))
         self.tor_process = None
         self.log = logging.getLogger("TorManager")
         self.start_onions = None
@@ -88,12 +94,23 @@ class TorManager(object):
             try:
                 self.log.info("Starting Tor client %s..." % self.tor_exe)
                 tor_dir = os.path.dirname(self.tor_exe)
+
+                # Create data directory if it doesn't exist
+                data_dir = os.path.join(tor_dir, "data")
+                os.makedirs(data_dir, exist_ok=True)
+
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                cmd = r"%s -f torrc --defaults-torrc torrc-defaults --ignore-missing-torrc" % self.tor_exe
+                # Use command line arguments instead of torrc file for better control
+                cmd = r'"%s" --defaults-torrc torrc-defaults --ignore-missing-torrc' % self.tor_exe
+                cmd += r' --DataDirectory "%s"' % data_dir
+                cmd += r' --ControlPort 127.0.0.1:%d' % self.port
+                cmd += r' --SocksPort 127.0.0.1:%d' % self.proxy_port
+                cmd += r' --CookieAuthentication 1'
                 if config.tor_use_bridges:
                     cmd += " --UseBridges 1"
 
+                self.log.debug("Tor command: %s" % cmd)
                 self.tor_process = subprocess.Popen(cmd, cwd=tor_dir, close_fds=True, startupinfo=startupinfo)
                 for wait in range(1, 3):  # Wait for startup
                     time.sleep(wait * 0.5)
