@@ -63,7 +63,7 @@ class ConfigPlugin(object):
         group = self.parser.add_argument_group("Epixname plugin")
         group.add_argument(
             "--bit-resolver", help="EpixNet site to resolve .bit domains (deprecated)",
-            default="epix1epxrwflutk4j2saxuy84wvv52tdepuep8yqcqk", metavar="address"
+            default="epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t", metavar="address"
         )
 
         return super(ConfigPlugin, self).createArguments()
