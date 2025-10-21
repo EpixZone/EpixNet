@@ -137,6 +137,17 @@ class CryptConnectionManager:
 
         import subprocess
 
+        # Prepare entropy file for Windows
+        randfile_path = config.private_dir / "openssl-rand.tmp"
+        try:
+            # Generate entropy data and write it to the RANDFILE
+            with open(randfile_path, 'wb') as f:
+                # Write 2048 bytes of random data to seed the entropy pool
+                f.write(os.urandom(2048))
+            self.log.debug("Generated entropy file at %s" % randfile_path)
+        except Exception as e:
+            self.log.warning("Failed to generate entropy file: %s" % e)
+
         # Replace variables in config template
         conf_template = open(self.openssl_conf_template).read()
         conf_template = conf_template.replace("$ENV::CN", self.openssl_env['CN'])
@@ -148,9 +159,10 @@ class CryptConnectionManager:
             self.openssl_conf,
             random.choice(casubjects),
             self.cakey_pem,
-            self.cacert_pem
+            self.cacert_pem,
+            str(randfile_path)
         )
-        cmd = "%s req -new -newkey rsa:2048 -days 3650 -nodes -x509 -config %s -subj %s -keyout %s -out %s -batch" % cmd_params
+        cmd = "%s req -new -newkey rsa:2048 -days 3650 -nodes -x509 -config %s -subj %s -keyout %s -out %s -batch -rand %s" % cmd_params
         self.log.debug("Generating RSA CAcert and CAkey PEM files...")
         self.log.debug("Running: %s" % cmd)
         proc = subprocess.Popen(
@@ -173,8 +185,9 @@ class CryptConnectionManager:
             self.cert_csr,
             "/CN=" + self.openssl_env['CN'],
             self.openssl_conf,
+            str(randfile_path)
         )
-        cmd = "%s req -new -newkey rsa:2048 -keyout %s -out %s -subj %s -sha256 -nodes -batch -config %s" % cmd_params
+        cmd = "%s req -new -newkey rsa:2048 -keyout %s -out %s -subj %s -sha256 -nodes -batch -config %s -rand %s" % cmd_params
         self.log.debug("Generating certificate key and signing request...")
         proc = subprocess.Popen(
             cmd, shell=True, stderr=subprocess.STDOUT,
@@ -191,9 +204,10 @@ class CryptConnectionManager:
             self.cacert_pem,
             self.cakey_pem,
             self.cert_pem,
-            self.openssl_conf
+            self.openssl_conf,
+            str(randfile_path)
         )
-        cmd = "%s x509 -req -in %s -CA %s -CAkey %s -set_serial 01 -out %s -days 730 -sha256 -extensions x509_ext -extfile %s" % cmd_params
+        cmd = "%s x509 -req -in %s -CA %s -CAkey %s -set_serial 01 -out %s -days 730 -sha256 -extensions x509_ext -extfile %s -rand %s" % cmd_params
         self.log.debug("Generating RSA cert...")
         proc = subprocess.Popen(
             cmd, shell=True, stderr=subprocess.STDOUT,
