@@ -69,7 +69,10 @@ class PeerPortchecker(object):
     def checkCanyouseeme(self, port):
         data = urllib.request.urlopen("https://www.canyouseeme.org/", b"ip=1.1.1.1&port=%s" % str(port).encode("ascii"), timeout=20.0).read().decode("utf8")
 
-        message = re.match(r'.*<p style="padding-left:15px">(.*?)</p>', data, re.DOTALL).group(1)
+        match = re.match(r'.*<p style="padding-left:15px">(.*?)</p>', data, re.DOTALL)
+        if not match:
+            raise Exception("Could not extract message from canyouseeme response")
+        message = match.group(1)
         message = re.sub(r"<.*?>", "", message.replace("<br>", " ").replace("&nbsp;", " "))  # Strip http tags
 
         match = re.match(r".*service on (.*?) on", message)
@@ -87,7 +90,10 @@ class PeerPortchecker(object):
 
     def checkIpfingerprints(self, port):
         data = self.requestUrl("https://www.ipfingerprints.com/portscan.php").read().decode("utf8")
-        ip = re.match(r'.*name="remoteHost".*?value="(.*?)"', data, re.DOTALL).group(1)
+        match = re.match(r'.*name="remoteHost".*?value="(.*?)"', data, re.DOTALL)
+        if not match:
+            raise Exception("Could not extract IP from ipfingerprints response")
+        ip = match.group(1)
 
         post_data = {
             "remoteHost": ip, "start_port": port, "end_port": port,
@@ -107,12 +113,18 @@ class PeerPortchecker(object):
 
         data = self.requestUrl(url).read().decode("utf8")
 
-        ip = re.match(r'.*Your IP address is:[ ]*([0-9\.:a-z]+)', data.replace("&nbsp;", ""), re.DOTALL).group(1)
+        match = re.match(r'.*Your IP address is:[ ]*([0-9\.:a-z]+)', data.replace("&nbsp;", ""), re.DOTALL)
+        if not match:
+            raise Exception("Could not extract IP from my-addr response")
+        ip = match.group(1)
 
         post_data = {"addr": ip, "ports_selected": "", "ports_list": port}
         data = self.requestUrl(url, post_data).read().decode("utf8")
 
-        message = re.match(r".*<table class='table_font_16'>(.*?)</table>", data, re.DOTALL).group(1)
+        match = re.match(r".*<table class='table_font_16'>(.*?)</table>", data, re.DOTALL)
+        if not match:
+            raise Exception("Could not extract port scan result from my-addr response")
+        message = match.group(1)
 
         if "ok.png" in message:
             return {"ip": ip, "opened": True}
@@ -126,12 +138,18 @@ class PeerPortchecker(object):
 
         data = self.requestUrl(url).read().decode("utf8")
 
-        ip = re.match(r'.*Your IP address is[ ]*([0-9\.:a-z]+)', data.replace("&nbsp;", ""), re.DOTALL).group(1)
+        match = re.match(r'.*Your IP address is[ ]*([0-9\.:a-z]+)', data.replace("&nbsp;", ""), re.DOTALL)
+        if not match:
+            raise Exception("Could not extract IP from ipv6scanner response")
+        ip = match.group(1)
 
         post_data = {"host": ip, "scanType": "1", "port": port, "protocol": "tcp", "authorized": "yes"}
         data = self.requestUrl(url, post_data).read().decode("utf8")
 
-        message = re.match(r".*<table id='scantable'>(.*?)</table>", data, re.DOTALL).group(1)
+        match = re.match(r".*<table id='scantable'>(.*?)</table>", data, re.DOTALL)
+        if not match:
+            raise Exception("Could not extract port scan result from ipv6scanner response")
+        message = match.group(1)
         message_text = re.sub("<.*?>", " ", message.replace("<br>", " ").replace("&nbsp;", " ").strip())  # Strip http tags
 
         if "OPEN" in message_text:
