@@ -41,31 +41,42 @@ jobs:
           # Create tools directory
           New-Item -ItemType Directory -Path "tools" -Force | Out-Null
 
-          # Download files from the repository
-          $apiUrl = "https://api.github.com/repos/EpixZone/EpixNetBundle/contents/$toolsPath?ref=$branch"
-
           Write-Host "Downloading tools from $repoUrl/$toolsPath (branch: $branch)..."
 
-          try {
-            $response = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept" = "application/vnd.github.v3+json"}
+          # Recursive function to download files from GitHub API
+          function Download-GitHubDirectory {
+            param(
+              [string]$apiPath,
+              [string]$localPath
+            )
 
-            foreach ($item in $response) {
-              if ($item.type -eq "file") {
-                $fileName = $item.name
-                $downloadUrl = $item.download_url
-                $outputPath = "tools/$fileName"
+            $apiUrl = "https://api.github.com/repos/EpixZone/EpixNetBundle/contents/$apiPath`?ref=$branch"
 
-                Write-Host "Downloading $fileName..."
-                Invoke-WebRequest -Uri $downloadUrl -OutFile $outputPath
-                Write-Host "✓ Downloaded $fileName"
+            try {
+              $response = Invoke-RestMethod -Uri $apiUrl -Headers @{"Accept" = "application/vnd.github.v3+json"}
+
+              foreach ($item in $response) {
+                if ($item.type -eq "file") {
+                  $fileName = $item.name
+                  $downloadUrl = $item.download_url
+                  $outputPath = Join-Path $localPath $fileName
+
+                  Write-Host "Downloading $($item.path)..."
+                  Invoke-WebRequest -Uri $downloadUrl -OutFile $outputPath
+                } elseif ($item.type -eq "dir") {
+                  $dirPath = Join-Path $localPath $item.name
+                  New-Item -ItemType Directory -Path $dirPath -Force | Out-Null
+                  Download-GitHubDirectory -apiPath $item.path -localPath $dirPath
+                }
               }
+            } catch {
+              Write-Host "ERROR: Failed to download from $apiPath : $_"
+              exit 1
             }
-
-            Write-Host "✓ All tools downloaded successfully"
-          } catch {
-            Write-Host "ERROR: Failed to download tools: $_"
-            exit 1
           }
+
+          Download-GitHubDirectory -apiPath $toolsPath -localPath "tools"
+          Write-Host "✓ All tools downloaded successfully"
 
       - name: Generate build info
         run: |
