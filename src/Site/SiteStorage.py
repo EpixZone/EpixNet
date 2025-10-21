@@ -5,6 +5,7 @@ import json
 import time
 import errno
 from collections import defaultdict
+from pathlib import Path
 
 import sqlite3
 import gevent.event
@@ -399,6 +400,10 @@ class SiteStorage(object):
 
     # Security check and return path of site's file
     def getPath(self, inner_path):
+        # Convert Path objects to string
+        if isinstance(inner_path, Path):
+            inner_path = str(inner_path)
+
         inner_path = inner_path.replace("\\", "/")  # Windows separator fix
         if not inner_path:
             return self.directory
