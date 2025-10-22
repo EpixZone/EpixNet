@@ -14,7 +14,13 @@ class CryptConnectionManager:
         if config.openssl_bin_file:
             self.openssl_bin = config.openssl_bin_file
         elif sys.platform.startswith("win"):
-            self.openssl_bin = "tools\\openssl\\openssl.exe"
+            # Handle PyInstaller bundled paths (_internal directory on Windows)
+            if hasattr(sys, '_MEIPASS'):
+                # Running as frozen PyInstaller executable
+                self.openssl_bin = os.path.join(sys._MEIPASS, "tools", "openssl", "openssl.exe")
+            else:
+                # Running from source
+                self.openssl_bin = "tools\\openssl\\openssl.exe"
         elif config.dist_type.startswith("bundle_linux"):
             self.openssl_bin = "../runtime/bin/openssl"
         elif config.is_android:
@@ -163,6 +169,9 @@ class CryptConnectionManager:
             "-out", str(self.cacert_pem),
             "-batch"
         ]
+        # Add -rand parameter on Windows to explicitly provide entropy source
+        if sys.platform.startswith("win"):
+            cmd.extend(["-rand", str(randfile_path)])
         self.log.debug("Generating RSA CAcert and CAkey PEM files...")
         self.log.debug("Running: %s" % " ".join(cmd))
         proc = subprocess.Popen(
@@ -187,6 +196,9 @@ class CryptConnectionManager:
             "-subj", "/CN=" + self.openssl_env['CN'],
             "-sha256", "-nodes", "-batch"
         ]
+        # Add -rand parameter on Windows to explicitly provide entropy source
+        if sys.platform.startswith("win"):
+            cmd.extend(["-rand", str(randfile_path)])
         self.log.debug("Generating certificate key and signing request...")
         proc = subprocess.Popen(
             cmd, stderr=subprocess.STDOUT,
@@ -207,6 +219,9 @@ class CryptConnectionManager:
             "-out", str(self.cert_pem),
             "-days", "730", "-sha256"
         ]
+        # Add -rand parameter on Windows to explicitly provide entropy source
+        if sys.platform.startswith("win"):
+            cmd.extend(["-rand", str(randfile_path)])
         self.log.debug("Generating RSA cert...")
         proc = subprocess.Popen(
             cmd, stderr=subprocess.STDOUT,

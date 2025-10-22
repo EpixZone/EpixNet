@@ -106,8 +106,9 @@ class TorManager(object):
                 self.log.info("Starting Tor client %s..." % self.tor_exe)
                 tor_dir = os.path.dirname(self.tor_exe)
 
-                # Create data directory if it doesn't exist
-                data_dir = os.path.join(tor_dir, "data")
+                # Create data directory in user's writable data directory, not in bundled tools
+                # This avoids permission issues when installed in Program Files on Windows
+                data_dir = os.path.join(config.data_dir, "tor")
                 os.makedirs(data_dir, exist_ok=True)
 
                 # Build command based on platform
@@ -119,6 +120,9 @@ class TorManager(object):
                     cmd += r' --ControlPort 127.0.0.1:%d' % self.port
                     cmd += r' --SocksPort 127.0.0.1:%d' % self.proxy_port
                     cmd += r' --CookieAuthentication 1'
+                    # Add log file path to avoid issues with relative paths in torrc-defaults
+                    log_file = os.path.join(data_dir, "notice.log")
+                    cmd += r' --Log "notice file %s"' % log_file
                     if config.tor_use_bridges:
                         cmd += " --UseBridges 1"
                     self.log.debug("Tor command: %s" % cmd)
@@ -130,6 +134,9 @@ class TorManager(object):
                     cmd += ["--ControlPort", "127.0.0.1:%d" % self.port]
                     cmd += ["--SocksPort", "127.0.0.1:%d" % self.proxy_port]
                     cmd += ["--CookieAuthentication", "1"]
+                    # Add log file path to avoid issues with relative paths in torrc-defaults
+                    log_file = os.path.join(data_dir, "notice.log")
+                    cmd += ["--Log", "notice file %s" % log_file]
                     if config.tor_use_bridges:
                         cmd += ["--UseBridges", "1"]
                     self.log.debug("Tor command: %s" % " ".join(cmd))
