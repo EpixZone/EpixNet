@@ -27,13 +27,24 @@ class TorManager(object):
         self.privatekeys = {}  # Onion: Privatekey
         self.site_onions = {}  # Site address: Onion
         # Handle PyInstaller bundled paths (_internal directory on Windows)
+        # Determine the correct Tor executable name based on platform
+        if sys.platform.startswith("win"):
+            tor_exe_name = "tor.exe"
+            meek_client_name = "meek-client.exe"
+        elif sys.platform == "darwin":
+            tor_exe_name = "tor"
+            meek_client_name = "meek-client"
+        else:  # Linux and other Unix-like systems
+            tor_exe_name = "tor"
+            meek_client_name = "meek-client"
+
         if hasattr(sys, '_MEIPASS'):
             # Running as frozen PyInstaller executable
-            self.tor_exe = os.path.join(sys._MEIPASS, "tools", "tor", "tor.exe")
+            self.tor_exe = os.path.join(sys._MEIPASS, "tools", "tor", tor_exe_name)
         else:
             # Running from source
-            self.tor_exe = os.path.join("tools", "tor", "tor.exe")
-        self.has_meek_bridges = os.path.isfile(os.path.join(os.path.dirname(self.tor_exe), "PluggableTransports", "meek-client.exe"))
+            self.tor_exe = os.path.join("tools", "tor", tor_exe_name)
+        self.has_meek_bridges = os.path.isfile(os.path.join(os.path.dirname(self.tor_exe), "PluggableTransports", meek_client_name))
         self.tor_process = None
         self.log = logging.getLogger("TorManager")
         self.start_onions = None
@@ -90,7 +101,7 @@ class TorManager(object):
                 main.ui_server.updateWebsocket()
 
     def startTor(self):
-        if sys.platform.startswith("win"):
+        if sys.platform.startswith("win") or sys.platform == "darwin" or sys.platform.startswith("linux"):
             try:
                 self.log.info("Starting Tor client %s..." % self.tor_exe)
                 tor_dir = os.path.dirname(self.tor_exe)
@@ -99,19 +110,31 @@ class TorManager(object):
                 data_dir = os.path.join(tor_dir, "data")
                 os.makedirs(data_dir, exist_ok=True)
 
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                # Use command line arguments instead of torrc file for better control
-                cmd = r'"%s" --defaults-torrc torrc-defaults --ignore-missing-torrc' % self.tor_exe
-                cmd += r' --DataDirectory "%s"' % data_dir
-                cmd += r' --ControlPort 127.0.0.1:%d' % self.port
-                cmd += r' --SocksPort 127.0.0.1:%d' % self.proxy_port
-                cmd += r' --CookieAuthentication 1'
-                if config.tor_use_bridges:
-                    cmd += " --UseBridges 1"
+                # Build command based on platform
+                if sys.platform.startswith("win"):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    cmd = r'"%s" --defaults-torrc torrc-defaults --ignore-missing-torrc' % self.tor_exe
+                    cmd += r' --DataDirectory "%s"' % data_dir
+                    cmd += r' --ControlPort 127.0.0.1:%d' % self.port
+                    cmd += r' --SocksPort 127.0.0.1:%d' % self.proxy_port
+                    cmd += r' --CookieAuthentication 1'
+                    if config.tor_use_bridges:
+                        cmd += " --UseBridges 1"
+                    self.log.debug("Tor command: %s" % cmd)
+                    self.tor_process = subprocess.Popen(cmd, cwd=tor_dir, close_fds=True, startupinfo=startupinfo)
+                else:
+                    # Mac and Linux
+                    cmd = [self.tor_exe, "--defaults-torrc", "torrc-defaults", "--ignore-missing-torrc"]
+                    cmd += ["--DataDirectory", data_dir]
+                    cmd += ["--ControlPort", "127.0.0.1:%d" % self.port]
+                    cmd += ["--SocksPort", "127.0.0.1:%d" % self.proxy_port]
+                    cmd += ["--CookieAuthentication", "1"]
+                    if config.tor_use_bridges:
+                        cmd += ["--UseBridges", "1"]
+                    self.log.debug("Tor command: %s" % " ".join(cmd))
+                    self.tor_process = subprocess.Popen(cmd, cwd=tor_dir, close_fds=True)
 
-                self.log.debug("Tor command: %s" % cmd)
-                self.tor_process = subprocess.Popen(cmd, cwd=tor_dir, close_fds=True, startupinfo=startupinfo)
                 for wait in range(1, 3):  # Wait for startup
                     time.sleep(wait * 0.5)
                     self.enabled = True
@@ -169,7 +192,11 @@ class TorManager(object):
                     cookie_file = cookie_match.group(1).encode("ascii").decode("unicode_escape")
                     if not os.path.isfile(cookie_file) and self.tor_process:
                         # Workaround for tor client cookie auth file utf8 encoding bug (https://github.com/torproject/stem/issues/57)
-                        cookie_file = os.path.dirname(self.tor_exe) + "\\data\\control_auth_cookie"
+                        if sys.platform.startswith("win"):
+                            cookie_file = os.path.dirname(self.tor_exe) + "\\data\\control_auth_cookie"
+                        else:
+                            # Mac and Linux use forward slashes
+                            cookie_file = os.path.join(os.path.dirname(self.tor_exe), "data", "control_auth_cookie")
                     try:
                         auth_hex = binascii.b2a_hex(open(cookie_file, "rb").read())
                         res_auth = self.send("AUTHENTICATE %s" % auth_hex.decode("utf8"), conn)

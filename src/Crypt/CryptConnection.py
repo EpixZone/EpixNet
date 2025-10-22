@@ -154,19 +154,19 @@ class CryptConnectionManager:
         open(self.openssl_conf, "w").write(conf_template)
 
         # Generate CAcert and CAkey
-        cmd_params = helper.shellquote(
-            self.openssl_bin,
-            self.openssl_conf,
-            random.choice(casubjects),
-            self.cakey_pem,
-            self.cacert_pem,
-            str(randfile_path)
-        )
-        cmd = "%s req -new -newkey rsa:2048 -days 3650 -nodes -x509 -config %s -subj %s -keyout %s -out %s -batch -rand %s" % cmd_params
+        # Note: Don't use -config and -rand on macOS/LibreSSL as they cause issues
+        cmd = [
+            self.openssl_bin, "req", "-new", "-newkey", "rsa:2048", "-days", "3650",
+            "-nodes", "-x509",
+            "-subj", random.choice(casubjects),
+            "-keyout", str(self.cakey_pem),
+            "-out", str(self.cacert_pem),
+            "-batch"
+        ]
         self.log.debug("Generating RSA CAcert and CAkey PEM files...")
-        self.log.debug("Running: %s" % cmd)
+        self.log.debug("Running: %s" % " ".join(cmd))
         proc = subprocess.Popen(
-            cmd, shell=True, stderr=subprocess.STDOUT,
+            cmd, stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE, env=self.openssl_env
         )
         back = proc.stdout.read().strip().decode(errors="replace").replace("\r", "")
@@ -179,43 +179,42 @@ class CryptConnectionManager:
             self.log.debug("Result: %s" % back)
 
         # Generate certificate key and signing request
-        cmd_params = helper.shellquote(
-            self.openssl_bin,
-            self.key_pem,
-            self.cert_csr,
-            "/CN=" + self.openssl_env['CN'],
-            self.openssl_conf,
-            str(randfile_path)
-        )
-        cmd = "%s req -new -newkey rsa:2048 -keyout %s -out %s -subj %s -sha256 -nodes -batch -config %s -rand %s" % cmd_params
+        # Note: Don't use -config and -rand on macOS/LibreSSL as they cause issues
+        cmd = [
+            self.openssl_bin, "req", "-new", "-newkey", "rsa:2048",
+            "-keyout", str(self.key_pem),
+            "-out", str(self.cert_csr),
+            "-subj", "/CN=" + self.openssl_env['CN'],
+            "-sha256", "-nodes", "-batch"
+        ]
         self.log.debug("Generating certificate key and signing request...")
         proc = subprocess.Popen(
-            cmd, shell=True, stderr=subprocess.STDOUT,
+            cmd, stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE, env=self.openssl_env
         )
         back = proc.stdout.read().strip().decode(errors="replace").replace("\r", "")
         proc.wait()
-        self.log.debug("Running: %s\n%s" % (cmd, back))
+        self.log.debug("Running: %s\n%s" % (" ".join(cmd), back))
 
         # Sign request and generate certificate
-        cmd_params = helper.shellquote(
-            self.openssl_bin,
-            self.cert_csr,
-            self.cacert_pem,
-            self.cakey_pem,
-            self.cert_pem,
-            self.openssl_conf,
-            str(randfile_path)
-        )
-        cmd = "%s x509 -req -in %s -CA %s -CAkey %s -set_serial 01 -out %s -days 730 -sha256 -extensions x509_ext -extfile %s -rand %s" % cmd_params
+        # Note: Don't use -rand on macOS/LibreSSL as it causes issues
+        cmd = [
+            self.openssl_bin, "x509", "-req",
+            "-in", str(self.cert_csr),
+            "-CA", str(self.cacert_pem),
+            "-CAkey", str(self.cakey_pem),
+            "-set_serial", "01",
+            "-out", str(self.cert_pem),
+            "-days", "730", "-sha256"
+        ]
         self.log.debug("Generating RSA cert...")
         proc = subprocess.Popen(
-            cmd, shell=True, stderr=subprocess.STDOUT,
+            cmd, stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE, env=self.openssl_env
         )
         back = proc.stdout.read().strip().decode(errors="replace").replace("\r", "")
         proc.wait()
-        self.log.debug("Running: %s\n%s" % (cmd, back))
+        self.log.debug("Running: %s\n%s" % (" ".join(cmd), back))
 
         if os.path.isfile(self.cert_pem) and os.path.isfile(self.key_pem):
             self.createSslContexts()
