@@ -23,12 +23,27 @@ echo "Python version: $PYTHON_VERSION"
 # Install build dependencies
 echo -e "${YELLOW}Installing build dependencies...${NC}"
 python3 -m pip install --upgrade pip
-pip install -r requirements.txt
-pip install pyinstaller
+python3 -m pip install -r requirements.txt
+python3 -m pip install pyinstaller
 
 # Generate build info
 echo -e "${YELLOW}Generating build info...${NC}"
-python3 build.py --type=installer --platform="$OS_TYPE"
+# Convert OS_TYPE to platform name
+case "$OS_TYPE" in
+  Darwin)
+    PLATFORM="macosx"
+    ;;
+  Linux)
+    PLATFORM="libredesktop"
+    ;;
+  MINGW64_NT*|MSYS_NT*|CYGWIN_NT*)
+    PLATFORM="windows"
+    ;;
+  *)
+    PLATFORM="$OS_TYPE"
+    ;;
+esac
+python3 build.py --type=installer --platform="$PLATFORM"
 
 # Create dist directory
 mkdir -p dist/installers
@@ -37,7 +52,7 @@ mkdir -p dist/installers
 case "$OS_TYPE" in
   Linux)
     echo -e "${YELLOW}Building for Linux...${NC}"
-    pyinstaller epixnet.spec --distpath dist/linux
+    python3 -m PyInstaller epixnet.spec --distpath dist/linux
     cd dist/linux
     tar -czf ../installers/EpixNet-linux-${ARCH}.tar.gz EpixNet/
     cd ../..
@@ -45,13 +60,13 @@ case "$OS_TYPE" in
     ;;
   Darwin)
     echo -e "${YELLOW}Building for macOS...${NC}"
-    pyinstaller epixnet.spec --distpath dist/macos
+    python3 -m PyInstaller epixnet.spec --distpath dist/macos
     hdiutil create -volname "EpixNet" -srcfolder dist/macos/EpixNet.app -ov -format UDZO dist/installers/EpixNet-macos.dmg
     echo -e "${GREEN}✓ macOS build complete: dist/installers/EpixNet-macos.dmg${NC}"
     ;;
   MINGW64_NT*|MSYS_NT*|CYGWIN_NT*)
     echo -e "${YELLOW}Building for Windows...${NC}"
-    pyinstaller epixnet.spec --distpath dist/windows
+    python3 -m PyInstaller epixnet.spec --distpath dist/windows
     cd dist/windows
     7z a -r ../installers/EpixNet-windows-x64.zip EpixNet/
     cd ../..

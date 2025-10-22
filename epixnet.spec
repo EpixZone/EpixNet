@@ -111,7 +111,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['pyi_rth_open_browser.py'],  # Add runtime hook to open browser by default
     excludedimports=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -156,13 +156,21 @@ coll = COLLECT(
 # macOS app bundle (only on macOS)
 if sys.platform == 'darwin':
     app = BUNDLE(
-        exe,
+        coll,
         name='EpixNet.app',
         icon=icon_file,
         bundle_identifier='com.epixnet.app',
         info_plist={
             'NSPrincipalClass': 'NSApplication',
             'NSHighResolutionCapable': 'True',
+            'CFBundleExecutable': 'EpixNet',
+            'CFBundleDisplayName': 'EpixNet',
+            'CFBundleIdentifier': 'com.epixnet.app',
+            'CFBundleInfoDictionaryVersion': '6.0',
+            'CFBundleName': 'EpixNet',
+            'CFBundlePackageType': 'APPL',
+            'CFBundleShortVersionString': '1.0',
+            'CFBundleVersion': '1.0',
         },
     )
 
