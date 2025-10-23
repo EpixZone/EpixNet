@@ -823,7 +823,11 @@ class Config:
             )
 
             if os.path.isfile(log_file_path):
-                file_logger.doRollover()  # Always start with empty log file
+                try:
+                    file_logger.doRollover()  # Always start with empty log file
+                except (OSError, PermissionError) as err:
+                    # Log file may be locked by another instance, skip rollover
+                    print(f"Warning: Could not rotate log file (file may be in use): {err}")
         file_logger.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)-8s %(name)s %(message)s'))
         file_logger.setLevel(logging.getLevelName(self.log_level))
         logging.getLogger('').setLevel(logging.getLevelName(self.log_level))
