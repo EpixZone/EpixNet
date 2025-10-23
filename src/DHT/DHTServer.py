@@ -29,6 +29,8 @@ class DHTServer:
     """Process DHT requests"""
     def __init__(self):
         self.peers = {}
+        self.dht = None
+        self.loop = None
 
     def start(self):
         self.loop = asyncio_gevent.EventLoop()
@@ -52,12 +54,16 @@ class DHTServer:
         logging.info('DHT bootstrap complete')
 
     async def _announce(self, site_hash):
+        if self.dht is None:
+            logging.warning(f'DHT not yet initialized, skipping announce for {site_hash.hex()}')
+            return
         await self.dht.announce(site_hash, config.fileserver_port)
         logging.info(f'DHT: announced {site_hash.hex()}, looking for peers')
         self.peers[site_hash] = await self.dht[site_hash]
 
     def announce(self, site_hash):
         # send announce to DHT
-        self.loop.create_task(self._announce(site_hash))
+        if self.loop is not None:
+            self.loop.create_task(self._announce(site_hash))
         # return peers that we already have
         return [{'addr': peer[0], 'port': peer[1]} for peer in self.peers.get(site_hash, set())]

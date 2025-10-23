@@ -23,7 +23,7 @@ class Actions:
 
     def initDHT(self):
         import main
-        if config.dht:
+        if config.dht and not config.disable_udp:
             from DHT import DHTServer
             main.dht_server = DHTServer()
         else:
