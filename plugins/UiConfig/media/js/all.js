@@ -1315,10 +1315,10 @@
     };
 
     ConfigStorage.prototype.formatValue = function(value) {
-      if (!value) {
-        return false;
-      } else if (typeof value === "object") {
+      if (typeof value === "object" && value !== null) {
         return value.join("\n");
+      } else if (!value) {
+        return false;
       } else if (typeof value === "number") {
         return value.toString();
       } else {
@@ -1427,7 +1427,8 @@
         title: "Trackers",
         key: "trackers",
         type: "textarea",
-        description: "Discover new peers using these adresses"
+        description: "Discover new peers using these adresses",
+        placeholder: "Eg.: http://tracker.example.com:8080\nOne tracker per line"
       });
       section.items.push({
         title: "Trackers files",
@@ -1918,7 +1919,7 @@
       ref = this.values;
       for (key in ref) {
         value = ref[key];
-        if (this.config_storage.formatValue(value) !== this.config_storage.formatValue((ref1 = this.config[key]) != null ? ref1.value : void 0)) {
+        if (value !== this.config_storage.formatValue((ref1 = this.config[key]) != null ? ref1.value : void 0)) {
           values_changed.push({
             key: key,
             value: value
@@ -1942,7 +1943,7 @@
     };
 
     UiConfig.prototype.saveValues = function(cb) {
-      var base, changed_values, default_value, i, item, j, last, len, match, message, results, value, value_same_as_default;
+      var base, changed_values, default_value, i, item, j, last, len, match, message, results, value, value_same_as_default, k, tracker;
       changed_values = this.getValuesChanged();
       results = [];
       for (i = j = 0, len = changed_values.length; j < len; i = ++j) {
@@ -1951,7 +1952,21 @@
         value = this.config_storage.deformatValue(item.value, typeof this.config[item.key]["default"]);
         default_value = this.config_storage.deformatValue(this.config[item.key]["default"], typeof this.config[item.key]["default"]);
         value_same_as_default = JSON.stringify(default_value) === JSON.stringify(value);
-        if (this.config[item.key].item.valid_pattern && !(typeof (base = this.config[item.key].item).isHidden === "function" ? base.isHidden() : void 0)) {
+
+        // Special validation for trackers field
+        if (item.key === "trackers" && value !== null && Array.isArray(value)) {
+          for (k = 0; k < value.length; k++) {
+            tracker = value[k].trim();
+            if (tracker && (tracker.indexOf("://") === -1 || !tracker.match(/^[A-Za-z0-9:\/\\.#-]+$/))) {
+              message = "Invalid tracker format: " + tracker + " (must contain '://' and only contain alphanumeric, colon, slash, dot, hash, hyphen)";
+              Page.cmd("wrapperNotification", ["error", message]);
+              cb(false);
+              return results;
+            }
+          }
+        }
+
+        if (this.config[item.key].item.valid_pattern && value !== null && !(typeof (base = this.config[item.key].item).isHidden === "function" ? base.isHidden() : void 0)) {
           match = value.match(this.config[item.key].item.valid_pattern);
           if (!match || match[0] !== value) {
             message = "Invalid value of " + this.config[item.key].item.title + ": " + value + " (does not matches " + this.config[item.key].item.valid_pattern + ")";
