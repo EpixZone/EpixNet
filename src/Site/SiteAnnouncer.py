@@ -186,7 +186,7 @@ class SiteAnnouncer:
         peers = self.dht_server.announce(self.site.address_sha1)
         self.site.log.info(f'DHT {self.site.address_sha1.hex()} got {peers=}')
         for peer in peers:
-            self.site.addPeer(peer['addr'], peer['port'], 'dht')
+            self.site.addPeer(peer['addr'], peer['port'], source='dht')
 
     def announceTracker(self, tracker, mode="start", num_want=10):
         """Announces site to tracker, receives site peers from it

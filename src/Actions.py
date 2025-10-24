@@ -82,6 +82,9 @@ class Actions:
     # Site commands
 
     def siteCreate(self, use_master_seed=True):
+        import main
+        self.initDHT()
+
         logging.info("Generating new privatekey (use_master_seed: %s)..." % config.use_master_seed)
         from Crypt import CryptEpix
         if use_master_seed:
@@ -130,6 +133,9 @@ class Actions:
         logging.info("Site created!")
 
     def siteSign(self, address, privatekey=None, inner_path="content.json", publish=False, remove_missing_optional=False):
+        import main
+        self.initDHT()
+
         from Site.Site import Site
         from Site import SiteManager
         from Debug import Debug
@@ -175,6 +181,9 @@ class Actions:
 
     def siteVerify(self, address):
         import time
+        import main
+        self.initDHT()
+
         from Site.Site import Site
         from Site import SiteManager
         SiteManager.site_manager.load()
@@ -211,6 +220,9 @@ class Actions:
             logging.error("[ERROR] Error during verifying site files!")
 
     def dbRebuild(self, address):
+        import main
+        self.initDHT()
+
         from Site.Site import Site
         from Site import SiteManager
         SiteManager.site_manager.load()
@@ -225,6 +237,9 @@ class Actions:
             logging.error(err)
 
     def dbQuery(self, address, query):
+        import main
+        self.initDHT()
+
         from Site.Site import Site
         from Site import SiteManager
         SiteManager.site_manager.load()
@@ -319,8 +334,11 @@ class Actions:
     def siteCmd(self, address, cmd, parameters):
         import json
         from Site import SiteManager
+        import main
 
-        site = SiteManager.site_manager.get(address)
+        self.initDHT()
+
+        site = SiteManager.site_manager.need(address)
 
         if not site:
             logging.error("Site not found: %s" % address)
@@ -354,6 +372,9 @@ class Actions:
         return ws
 
     def sitePublish(self, address, peer_ip=None, peer_port=10042, inner_path="content.json", recursive=False):
+        import main
+        self.initDHT()
+
         from Site import SiteManager
         logging.info("Loading site...")
         site = SiteManager.site_manager.get(address)
