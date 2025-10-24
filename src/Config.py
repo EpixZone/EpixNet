@@ -452,7 +452,7 @@ class Config:
         self.parser.add_argument('--bootstrap-url', help='URL of file with link to bootstrap bundle', default='https://raw.githubusercontent.com/EpixZone/EpixNet/master/bootstrap.url', type=str)
         self.parser.add_argument('--bootstrap', help='Enable downloading bootstrap information from clearnet', action=BooleanOptionalAction, default=True)
         self.parser.add_argument('--trackers', help='Bootstraping torrent trackers', default=[], metavar='protocol://address', nargs='*')
-        self.parser.add_argument('--trackers-file', help='Load torrent trackers dynamically from a file (using Syncronite by default)', default=['{data_dir}/epix19zp9takt69qdt5len3su40jfyf9nxmjwvrm4ak/cache/1/Syncronite.html'], metavar='path', nargs='*')
+        self.parser.add_argument('--trackers-file', help='Load torrent trackers dynamically from a file (using Syncronite by default)', default=['{data_dir}/epix1syncas7xskggydscp24x4fdcr09ygegr53j8m7/cache/1/Syncronite.html'], metavar='path', nargs='*')
         self.parser.add_argument('--trackers-proxy', help='Force use proxy to connect to trackers (disable, tor, ip:port)', default="disable")
         self.parser.add_argument('--use-libsecp256k1', help='Use Libsecp256k1 liblary for speedup', type='bool', choices=[True, False], default=True)
         self.parser.add_argument('--use-openssl', help='Use OpenSSL liblary for speedup', type='bool', choices=[True, False], default=True)
