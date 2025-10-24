@@ -7,6 +7,10 @@ import asyncio
 
 import asyncio_gevent
 
+# Apply fix for aiobtdht KeyError bug before importing DHT
+from .aiobtdht_fix import patch_aiobtdht
+patch_aiobtdht()
+
 from aiobtdht import DHT
 from aioudp import UDPServer
 
