@@ -495,7 +495,24 @@ class Actions:
             print("Response time: %.3fs" % (time.time() - s))
             input("Check memory")
         else:
-            print(peer.getFile(site, filename).read())
+            try:
+                # Enable verbose logging to see what's happening
+                old_verbose = config.verbose
+                config.verbose = True
+                result = peer.getFile(site, filename)
+                config.verbose = old_verbose
+                if result:
+                    print(result.read())
+                else:
+                    print("Error: Failed to get file from peer")
+                    if peer.connection_error:
+                        print("Connection error count: %s" % peer.connection_error)
+                    if peer.hash_failed:
+                        print("Hash failed count: %s" % peer.hash_failed)
+            except Exception as err:
+                print("Exception while getting file: %s" % err)
+                import traceback
+                traceback.print_exc()
 
     def peerCmd(self, peer_ip, peer_port, cmd, parameters):
         import main

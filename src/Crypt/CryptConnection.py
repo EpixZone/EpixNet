@@ -4,6 +4,13 @@ import os
 import ssl
 import hashlib
 import random
+from datetime import datetime, timedelta, timezone
+
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 
 from Config import config
 from util import helper
@@ -130,119 +137,141 @@ class CryptConnectionManager:
     # Return: True on success
     def createSslRsaCert(self):
         casubjects = [
-            "/C=US/O=Amazon/OU=Server CA 1B/CN=Amazon",
-            "/C=US/O=Let's Encrypt/CN=Let's Encrypt Authority X3",
-            "/C=US/O=DigiCert Inc/OU=www.digicert.com/CN=DigiCert SHA2 High Assurance Server CA",
-            "/C=GB/ST=Greater Manchester/L=Salford/O=COMODO CA Limited/CN=COMODO RSA Domain Validation Secure Server CA"
+            ("US", "Amazon", "Server CA 1B", "Amazon"),
+            ("US", "Let's Encrypt", "", "Let's Encrypt Authority X3"),
+            ("US", "DigiCert Inc", "www.digicert.com", "DigiCert SHA2 High Assurance Server CA"),
+            ("GB", "COMODO CA Limited", "", "COMODO RSA Domain Validation Secure Server CA")
         ]
         self.openssl_env['CN'] = random.choice(self.fakedomains)
 
         if os.path.isfile(self.cert_pem) and os.path.isfile(self.key_pem):
             self.createSslContexts()
-            return True  # Files already exits
+            return True  # Files already exist
 
-        import subprocess
-
-        # Prepare entropy file for Windows
-        randfile_path = config.private_dir / "openssl-rand.tmp"
         try:
-            # Generate entropy data and write it to the RANDFILE
-            with open(randfile_path, 'wb') as f:
-                # Write 2048 bytes of random data to seed the entropy pool
-                f.write(os.urandom(2048))
-            self.log.debug("Generated entropy file at %s" % randfile_path)
+            self.log.debug("Generating RSA CAcert and CAkey PEM files using cryptography library...")
+
+            # Generate CA private key
+            ca_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+
+            # Generate CA certificate
+            ca_subject = random.choice(casubjects)
+            ca_name = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, ca_subject[0]),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, ca_subject[1]),
+            ])
+            if ca_subject[2]:
+                ca_name = x509.Name(list(ca_name) + [
+                    x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ca_subject[2]),
+                ])
+            ca_name = x509.Name(list(ca_name) + [
+                x509.NameAttribute(NameOID.COMMON_NAME, ca_subject[3]),
+            ])
+
+            now = datetime.now(timezone.utc)
+            ca_cert = x509.CertificateBuilder().subject_name(
+                ca_name
+            ).issuer_name(
+                ca_name
+            ).public_key(
+                ca_key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                now
+            ).not_valid_after(
+                now + timedelta(days=3650)
+            ).add_extension(
+                x509.BasicConstraints(ca=True, path_length=None),
+                critical=True,
+            ).sign(ca_key, hashes.SHA256())
+
+            # Save CA certificate and key
+            with open(self.cacert_pem, "wb") as f:
+                f.write(ca_cert.public_bytes(serialization.Encoding.PEM))
+            with open(self.cakey_pem, "wb") as f:
+                f.write(ca_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+
+            self.log.debug("Generated CA certificate and key")
+
+            # Generate server private key
+            server_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+
+            # Generate server certificate signing request
+            server_name = x509.Name([
+                x509.NameAttribute(NameOID.COMMON_NAME, self.openssl_env['CN']),
+            ])
+
+            csr = x509.CertificateSigningRequestBuilder().subject_name(
+                server_name
+            ).sign(server_key, hashes.SHA256())
+
+            # Save CSR
+            with open(self.cert_csr, "wb") as f:
+                f.write(csr.public_bytes(serialization.Encoding.PEM))
+
+            # Sign the CSR with CA certificate
+            now = datetime.now(timezone.utc)
+            server_cert = x509.CertificateBuilder().subject_name(
+                csr.subject
+            ).issuer_name(
+                ca_cert.subject
+            ).public_key(
+                csr.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                now
+            ).not_valid_after(
+                now + timedelta(days=730)
+            ).sign(ca_key, hashes.SHA256())
+
+            # Save server certificate and key
+            with open(self.cert_pem, "wb") as f:
+                f.write(server_cert.public_bytes(serialization.Encoding.PEM))
+            with open(self.key_pem, "wb") as f:
+                f.write(server_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+
+            self.log.debug("Generated server certificate and key")
+
+            if os.path.isfile(self.cert_pem) and os.path.isfile(self.key_pem):
+                self.createSslContexts()
+
+                # Remove no longer necessary files
+                try:
+                    if os.path.isfile(self.openssl_conf):
+                        os.unlink(self.openssl_conf)
+                    if os.path.isfile(self.cacert_pem):
+                        os.unlink(self.cacert_pem)
+                    if os.path.isfile(self.cakey_pem):
+                        os.unlink(self.cakey_pem)
+                    if os.path.isfile(self.cert_csr):
+                        os.unlink(self.cert_csr)
+                except Exception as e:
+                    self.log.warning("Failed to clean up temporary files: %s" % e)
+
+                return True
+            else:
+                self.log.error("RSA SSL cert generation failed, cert or key files not exist.")
+                return False
+
         except Exception as e:
-            self.log.warning("Failed to generate entropy file: %s" % e)
-
-        # Replace variables in config template
-        conf_template = open(self.openssl_conf_template).read()
-        conf_template = conf_template.replace("$ENV::CN", self.openssl_env['CN'])
-        open(self.openssl_conf, "w").write(conf_template)
-
-        # Generate CAcert and CAkey
-        # Note: Don't use -config and -rand on macOS/LibreSSL as they cause issues
-        cmd = [
-            self.openssl_bin, "req", "-new", "-newkey", "rsa:2048", "-days", "3650",
-            "-nodes", "-x509",
-            "-subj", random.choice(casubjects),
-            "-keyout", str(self.cakey_pem),
-            "-out", str(self.cacert_pem),
-            "-batch"
-        ]
-        # Add -rand parameter on Windows to explicitly provide entropy source
-        if sys.platform.startswith("win"):
-            cmd.extend(["-rand", str(randfile_path)])
-        self.log.debug("Generating RSA CAcert and CAkey PEM files...")
-        self.log.debug("Running: %s" % " ".join(cmd))
-        proc = subprocess.Popen(
-            cmd, stderr=subprocess.STDOUT,
-            stdout=subprocess.PIPE, env=self.openssl_env
-        )
-        back = proc.stdout.read().strip().decode(errors="replace").replace("\r", "")
-        proc.wait()
-
-        if not (os.path.isfile(self.cacert_pem) and os.path.isfile(self.cakey_pem)):
-            self.log.error("RSA ECC SSL CAcert generation failed, CAcert or CAkey files not exist. (%s)" % back)
+            self.log.error("RSA SSL cert generation failed: %s" % e)
             return False
-        else:
-            self.log.debug("Result: %s" % back)
-
-        # Generate certificate key and signing request
-        # Note: Don't use -config and -rand on macOS/LibreSSL as they cause issues
-        cmd = [
-            self.openssl_bin, "req", "-new", "-newkey", "rsa:2048",
-            "-keyout", str(self.key_pem),
-            "-out", str(self.cert_csr),
-            "-subj", "/CN=" + self.openssl_env['CN'],
-            "-sha256", "-nodes", "-batch"
-        ]
-        # Add -rand parameter on Windows to explicitly provide entropy source
-        if sys.platform.startswith("win"):
-            cmd.extend(["-rand", str(randfile_path)])
-        self.log.debug("Generating certificate key and signing request...")
-        proc = subprocess.Popen(
-            cmd, stderr=subprocess.STDOUT,
-            stdout=subprocess.PIPE, env=self.openssl_env
-        )
-        back = proc.stdout.read().strip().decode(errors="replace").replace("\r", "")
-        proc.wait()
-        self.log.debug("Running: %s\n%s" % (" ".join(cmd), back))
-
-        # Sign request and generate certificate
-        # Note: Don't use -rand on macOS/LibreSSL as it causes issues
-        cmd = [
-            self.openssl_bin, "x509", "-req",
-            "-in", str(self.cert_csr),
-            "-CA", str(self.cacert_pem),
-            "-CAkey", str(self.cakey_pem),
-            "-set_serial", "01",
-            "-out", str(self.cert_pem),
-            "-days", "730", "-sha256"
-        ]
-        # Add -rand parameter on Windows to explicitly provide entropy source
-        if sys.platform.startswith("win"):
-            cmd.extend(["-rand", str(randfile_path)])
-        self.log.debug("Generating RSA cert...")
-        proc = subprocess.Popen(
-            cmd, stderr=subprocess.STDOUT,
-            stdout=subprocess.PIPE, env=self.openssl_env
-        )
-        back = proc.stdout.read().strip().decode(errors="replace").replace("\r", "")
-        proc.wait()
-        self.log.debug("Running: %s\n%s" % (" ".join(cmd), back))
-
-        if os.path.isfile(self.cert_pem) and os.path.isfile(self.key_pem):
-            self.createSslContexts()
-
-            # Remove no longer necessary files
-            os.unlink(self.openssl_conf)
-            os.unlink(self.cacert_pem)
-            os.unlink(self.cakey_pem)
-            os.unlink(self.cert_csr)
-
-            return True
-        else:
-            self.log.error("RSA ECC SSL cert generation failed, cert or key files not exist.")
 
 
 manager = CryptConnectionManager()
