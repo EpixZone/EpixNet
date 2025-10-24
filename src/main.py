@@ -30,7 +30,7 @@ def load_config():
         config.parse()
 
 def importBundle(bundle):
-    from zipfile import ZipFile
+    from zipfile import ZipFile, BadZipFile
     from Crypt.CryptEpix import isValidAddress
     import json
 
@@ -41,30 +41,35 @@ def importBundle(bundle):
     except Exception as err:
         sites = {}
 
-    with ZipFile(bundle) as zf:
-        all_files = zf.namelist()
-        top_files = list(set(map(lambda f: f.split('/')[0], all_files)))
-        if len(top_files) == 1 and not isValidAddress(top_files[0]):
-            prefix = top_files[0]+'/'
-        else:
-            prefix = ''
-        top_2 = list(set(filter(lambda f: len(f)>0,
-                                map(lambda f: removeprefix(f, prefix).split('/')[0], all_files))))
-        for d in top_2:
-            if isValidAddress(d):
-                print(f'Unpacking {d} into {config.data_dir}')
-                for fname in filter(lambda f: f.startswith(prefix+d) and not f.endswith('/'), all_files):
-                    tgt = removeprefix(fname, prefix)
-                    print(f'-- {fname} --> {tgt}')
-                    info = zf.getinfo(fname)
-                    info.filename = tgt
-                    zf.extract(info, path=config.data_dir)
-                logging.info(f'add site {d}')
-                sites[d] = {}
+    try:
+        with ZipFile(bundle) as zf:
+            all_files = zf.namelist()
+            top_files = list(set(map(lambda f: f.split('/')[0], all_files)))
+            if len(top_files) == 1 and not isValidAddress(top_files[0]):
+                prefix = top_files[0]+'/'
             else:
-                print(f'Warning: unknown file in a bundle: {prefix+d}')
-    with open(sites_json_path, 'w') as f:
-        json.dump(sites, f)
+                prefix = ''
+            top_2 = list(set(filter(lambda f: len(f)>0,
+                                    map(lambda f: removeprefix(f, prefix).split('/')[0], all_files))))
+            for d in top_2:
+                if isValidAddress(d):
+                    print(f'Unpacking {d} into {config.data_dir}')
+                    for fname in filter(lambda f: f.startswith(prefix+d) and not f.endswith('/'), all_files):
+                        tgt = removeprefix(fname, prefix)
+                        print(f'-- {fname} --> {tgt}')
+                        info = zf.getinfo(fname)
+                        info.filename = tgt
+                        zf.extract(info, path=config.data_dir)
+                    logging.info(f'add site {d}')
+                    sites[d] = {}
+                else:
+                    print(f'Warning: unknown file in a bundle: {prefix+d}')
+        with open(sites_json_path, 'w') as f:
+            json.dump(sites, f)
+    except BadZipFile as err:
+        startupError(f"Invalid bootstrap bundle (not a valid zip file): {err}")
+    except Exception as err:
+        startupError(f"Error importing bootstrap bundle: {err}")
 
 def init_dirs():
     data_dir = Path(config.data_dir)
@@ -87,16 +92,43 @@ def init_dirs():
         import requests
         from io import BytesIO
 
+        url = None
+
+        # Try to fetch bootstrap URL from remote source
         print(f'fetching {config.bootstrap_url}')
-        response = requests.get(config.bootstrap_url)
-        if response.status_code != 200:
-            startupError(f"Cannot load bootstrap bundle (response status: {response.status_code})")
-        url = response.text
-        print(f'got {url}')
-        response = requests.get(url)
-        if response.status_code < 200 or response.status_code >= 300:
-            startupError(f"Cannot load boostrap bundle (response status: {response.status_code})")
-        importBundle(BytesIO(response.content))
+        try:
+            response = requests.get(config.bootstrap_url, timeout=10)
+            if response.status_code == 200:
+                url = response.text.strip()
+                print(f'got {url}')
+            else:
+                print(f'Warning: Cannot load bootstrap URL (response status: {response.status_code})')
+        except Exception as err:
+            print(f'Warning: Error fetching bootstrap URL: {err}')
+
+        # Fallback to local bootstrap.url if remote fetch failed
+        if not url:
+            local_bootstrap_file = Path(__file__).parent.parent / 'bootstrap.url'
+            if local_bootstrap_file.is_file():
+                try:
+                    with open(local_bootstrap_file) as f:
+                        url = f.read().strip()
+                    print(f'Using local bootstrap URL: {url}')
+                except Exception as err:
+                    print(f'Warning: Error reading local bootstrap URL: {err}')
+
+        # Try to download the bootstrap bundle
+        if url:
+            try:
+                response = requests.get(url, timeout=30)
+                if response.status_code >= 200 and response.status_code < 300:
+                    importBundle(BytesIO(response.content))
+                else:
+                    startupError(f"Cannot load bootstrap bundle (response status: {response.status_code})")
+            except Exception as err:
+                startupError(f"Error downloading bootstrap bundle: {err}")
+        else:
+            startupError("No bootstrap URL available (remote and local sources failed)")
 
     sites_json = private_dir / 'sites.json'
     if not os.path.isfile(sites_json):
