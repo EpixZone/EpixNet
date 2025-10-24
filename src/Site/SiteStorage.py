@@ -313,9 +313,10 @@ class SiteStorage(object):
     @thread_pool_fs_read.wrap
     def walk(self, dir_inner_path, ignore=None):
         directory = self.getPath(dir_inner_path)
+        directory = str(directory).replace("\\", "/")  # Normalize to forward slashes
         for root, dirs, files in os.walk(directory):
             root = root.replace("\\", "/")
-            root_relative_path = re.sub(f'^{re.escape(str(directory))}', '', root).lstrip('/')
+            root_relative_path = re.sub(f'^{re.escape(directory)}', '', root).lstrip('/')
             for file_name in files:
                 if root_relative_path:  # Not root dir
                     file_relative_path = root_relative_path + "/" + file_name
@@ -405,6 +406,11 @@ class SiteStorage(object):
             inner_path = str(inner_path)
 
         inner_path = inner_path.replace("\\", "/")  # Windows separator fix
+
+        # Normalize "." to empty string (current directory)
+        if inner_path == ".":
+            inner_path = ""
+
         if not inner_path:
             return self.directory
 
