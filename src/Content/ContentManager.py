@@ -783,7 +783,7 @@ class ContentManager:
             signers_data = "%s:%s" % (new_content["signs_required"], ",".join(valid_signers))
             new_content["signers_sign"] = CryptEpix.sign(str(signers_data), privatekey)
             if not new_content["signers_sign"]:
-                self.log.info("Old style address, signers_sign is none")
+                self.log.warning("Failed to sign signers_sign - invalid private key format")
 
         self.log.info("Signing %s..." % inner_path)
 

@@ -108,9 +108,6 @@ def publicKeyToAddress(public_key):
 
 def sign(data: str, privatekey: str) -> str:
     """Sign data with privatekey, return base64 string signature"""
-    if privatekey.startswith("23") and len(privatekey) > 52:
-        return None  # Old style private key not supported
-
     # Handle different private key formats (same as privatekeyToAddress)
     try:
         if len(privatekey) == 64:
