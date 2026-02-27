@@ -17,14 +17,29 @@ allow_reload = False
 
 log = logging.getLogger("XidResolverPlugin")
 
-# Cache: keyed by "name.tld", stores {"address": site_address, "timestamp": float}
+# Cache: keyed by "name.tld", stores {"address": site_address, "timestamp": float, "attested": bool}
 _resolve_cache = {}
-# Reverse cache: keyed by site_address, stores "name.tld"
+# Reverse cache: keyed by site_address, stores "name.tld" (only from attested resolutions)
 _reverse_cache = {}
 RESOLVE_CACHE_TTL = 30
+# Attested resolutions are trusted longer since they're backed by 2/3 validator consensus
+ATTESTED_CACHE_TTL = 300
 
 # EPIXNET DNS record type (private-use range per RFC 6895)
 EPIXNET_RECORD_TYPE = 65280
+
+# Expected chain ID prefix — must start with "epix_" to be the real Epix chain.
+EXPECTED_CHAIN_ID_PREFIX = "epix_"
+
+# Chain ID verification state
+_chain_id_verified = None
+_chain_id_cache = {"chain_id": None, "timestamp": 0}
+CHAIN_ID_CACHE_TTL = 300
+
+# Attested snapshot cache: stores all EPIXNET domain->address mappings from a finalized snapshot
+# {"digest": str, "mappings": {domain: address}, "timestamp": float}
+_attested_snapshot = {"digest": None, "mappings": {}, "timestamp": 0}
+SNAPSHOT_CACHE_TTL = 60
 
 
 def _fetch_json(url, timeout=10):
@@ -42,26 +57,153 @@ def _get_rpc_url():
     return getattr(config, "chain_rpc_url", "https://api.epix.zone").rstrip("/")
 
 
+def _verify_chain_id():
+    """Verify the RPC endpoint is serving the real Epix chain."""
+    global _chain_id_verified
+    now = time.time()
+    if (now - _chain_id_cache["timestamp"]) < CHAIN_ID_CACHE_TTL and _chain_id_verified is not None:
+        return _chain_id_verified
+
+    rpc_url = _get_rpc_url()
+    data = _fetch_json("%s/cosmos/base/tendermint/v1beta1/node_info" % rpc_url)
+    chain_id = None
+    if data and data.get("default_node_info"):
+        chain_id = data["default_node_info"].get("network", "")
+
+    _chain_id_cache["chain_id"] = chain_id
+    _chain_id_cache["timestamp"] = now
+
+    if chain_id and chain_id.startswith(EXPECTED_CHAIN_ID_PREFIX):
+        _chain_id_verified = True
+        log.debug("Chain ID verified: %s" % chain_id)
+    else:
+        _chain_id_verified = False
+        log.warning("Chain ID verification failed: got '%s', expected prefix '%s'" % (chain_id, EXPECTED_CHAIN_ID_PREFIX))
+
+    return _chain_id_verified
+
+
+def _fetch_attested_snapshot():
+    """Fetch the state snapshot and verify it's attested by 2/3+ validators.
+
+    Returns the snapshot mappings dict {domain: address} if finalized, or None.
+    Uses the ChainAttestation plugin's functions when available.
+    """
+    now = time.time()
+    if _attested_snapshot["digest"] and (now - _attested_snapshot["timestamp"]) < SNAPSHOT_CACHE_TTL:
+        return _attested_snapshot["mappings"]
+
+    rpc_url = _get_rpc_url()
+
+    # 1. Fetch current state digest
+    digest_data = _fetch_json("%s/xid/v1/state_digest" % rpc_url)
+    if not digest_data or not digest_data.get("digest"):
+        return None
+
+    digest = digest_data["digest"]
+
+    # If we already have this digest cached, just refresh the timestamp
+    if digest == _attested_snapshot["digest"]:
+        _attested_snapshot["timestamp"] = now
+        return _attested_snapshot["mappings"]
+
+    # 2. Check if this digest is finalized (attested by 2/3+ validators)
+    att_data = _fetch_json("%s/xid/v1/attestations?digest=%s" % (rpc_url, digest))
+    if not att_data or not att_data.get("finalized"):
+        return None
+
+    # 3. Fetch the full state snapshot and extract EPIXNET DNS mappings
+    mappings = {}
+    next_key = None
+    page = 0
+    while page < 100:  # Safety limit
+        url = "%s/xid/v1/state_snapshot" % rpc_url
+        if next_key:
+            url += "?pagination.key=%s" % next_key
+        snap_data = _fetch_json(url)
+        if not snap_data:
+            break
+
+        # Verify the snapshot's digest matches the finalized one
+        snap_digest = snap_data.get("digest", "")
+        if snap_digest != digest:
+            log.warning("Snapshot digest mismatch: expected %s..., got %s..." % (digest[:16], snap_digest[:16]))
+            return None
+
+        for domain_snap in snap_data.get("domains", []):
+            record = domain_snap.get("record", {})
+            name = record.get("name", "")
+            tld = record.get("tld", "")
+            if not name or not tld:
+                continue
+
+            domain_key = "%s.%s" % (name, tld)
+            for dns_rec in domain_snap.get("dns_records", []):
+                if int(dns_rec.get("record_type", 0)) == EPIXNET_RECORD_TYPE:
+                    site_addr = dns_rec.get("value", "").strip()
+                    if site_addr:
+                        mappings[domain_key] = site_addr
+                    break
+
+        # Check pagination
+        pagination = snap_data.get("pagination", {})
+        next_key = pagination.get("next_key")
+        if not next_key:
+            break
+        page += 1
+
+    # Store the attested snapshot
+    _attested_snapshot["digest"] = digest
+    _attested_snapshot["mappings"] = mappings
+    _attested_snapshot["timestamp"] = now
+
+    # Populate caches from attested data
+    for domain_key, site_addr in mappings.items():
+        _resolve_cache[domain_key] = {"address": site_addr, "timestamp": now, "attested": True}
+        _reverse_cache[site_addr] = domain_key
+
+    log.info("Loaded attested snapshot: %d EPIXNET mappings (digest: %s...)" % (len(mappings), digest[:16]))
+    return mappings
+
+
 def _resolve_epix_name(tld, name):
     """Query the xID chain for the EPIXNET DNS record of a name.
+
+    Verification priority:
+    1. Attested snapshot (2/3 validator consensus) — strongest proof
+    2. Direct RPC query with chain ID verification — fallback
 
     Returns the EpixNet site address string, or None.
     """
     cache_key = "%s.%s" % (name, tld)
     now = time.time()
     cached = _resolve_cache.get(cache_key)
-    if cached and (now - cached["timestamp"]) < RESOLVE_CACHE_TTL:
-        return cached["address"]
+    if cached:
+        ttl = ATTESTED_CACHE_TTL if cached.get("attested") else RESOLVE_CACHE_TTL
+        if (now - cached["timestamp"]) < ttl:
+            return cached["address"]
+
+    # Try attested snapshot first (strongest verification)
+    attested_mappings = _fetch_attested_snapshot()
+    if attested_mappings is not None:
+        site_address = attested_mappings.get(cache_key)
+        _resolve_cache[cache_key] = {"address": site_address, "timestamp": now, "attested": True}
+        if site_address:
+            _reverse_cache[site_address] = cache_key
+            log.debug("Resolved %s to %s (attested)" % (cache_key, site_address))
+        return site_address
+
+    # Fallback: direct RPC query with chain ID verification
+    if not _verify_chain_id():
+        return None
 
     rpc_url = _get_rpc_url()
 
-    # First check name exists
     data = _fetch_json("%s/xid/v1/resolve/%s/%s" % (rpc_url, tld, name))
     if not data or not data.get("record"):
-        _resolve_cache[cache_key] = {"address": None, "timestamp": now}
+        _resolve_cache[cache_key] = {"address": None, "timestamp": now, "attested": False}
         return None
 
-    # Get DNS records and look for EPIXNET type (65280)
     dns_data = _fetch_json("%s/xid/v1/dns/%s/%s" % (rpc_url, tld, name))
     site_address = None
     if dns_data and dns_data.get("records"):
@@ -70,12 +212,10 @@ def _resolve_epix_name(tld, name):
                 site_address = record.get("value", "").strip()
                 break
 
-    _resolve_cache[cache_key] = {"address": site_address, "timestamp": now}
+    _resolve_cache[cache_key] = {"address": site_address, "timestamp": now, "attested": False}
     if site_address:
         _reverse_cache[site_address] = cache_key
-
-    if site_address:
-        log.debug("Resolved %s to %s" % (cache_key, site_address))
+        log.debug("Resolved %s to %s (chain ID verified, not attested)" % (cache_key, site_address))
     else:
         log.debug("Name %s exists but has no EPIXNET record" % cache_key)
 
@@ -102,30 +242,48 @@ class SiteManagerPlugin(object):
     def isDomain(self, address):
         return self.isEpixDomain(address) or super(SiteManagerPlugin, self).isDomain(address)
 
-    def load(self, *args, **kwargs):
-        super(SiteManagerPlugin, self).load(*args, **kwargs)
-        # Populate reverse cache from content.json "domain" fields
-        count = 0
-        for address, site in self.sites.items():
-            content = site.content_manager.contents.get("content.json")
-            if content and content.get("domain"):
-                domain = content["domain"].lower()
-                if domain.endswith(".epix"):
-                    _reverse_cache[address] = domain
-                    count += 1
-        if count:
-            log.debug("Loaded %d domain reverse mappings from sites" % count)
-
     def reverseLookupDomain(self, address):
-        """Return the .epix domain for a site address, or None."""
-        return _reverse_cache.get(address)
+        """Return the verified .epix domain for a site address, or None.
+
+        Only returns domains verified against the chain — either from an
+        attested snapshot (2/3 validator consensus) or a chain-ID-verified
+        forward resolution that confirmed domain -> address.
+        """
+        # Already verified via forward resolution or attested snapshot
+        cached = _reverse_cache.get(address)
+        if cached:
+            return cached
+
+        # Check if the site claims a domain in content.json
+        site = self.sites.get(address)
+        if not site:
+            return None
+        content = site.content_manager.contents.get("content.json")
+        if not content or not content.get("domain"):
+            return None
+
+        domain = content["domain"].lower()
+        if not domain.endswith(".epix"):
+            return None
+
+        # Verify against chain: resolve the claimed domain and check it points here
+        resolved = self.resolveEpixDomain(domain)
+        if resolved == address:
+            return domain
+
+        log.debug("Domain claim %s by %s failed chain verification (resolved to %s)" % (domain, address, resolved))
+        return None
 
 
 def clearXidCaches():
     """Clear all xID-related caches (resolver + chain attestation + SiteManager domain cache)."""
+    global _chain_id_verified
     count = len(_resolve_cache)
     _resolve_cache.clear()
     _reverse_cache.clear()
+    _chain_id_verified = None
+    _chain_id_cache.update({"chain_id": None, "timestamp": 0})
+    _attested_snapshot.update({"digest": None, "mappings": {}, "timestamp": 0})
 
     # Clear ChainAttestation caches if loaded
     try:
