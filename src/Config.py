@@ -69,7 +69,8 @@ class Config:
         self.keys_api_change_allowed = set([
             "tor", "fileserver_port", "language", "tor_use_bridges", "trackers_proxy", "trackers",
             "trackers_file", "open_browser", "log_level", "fileserver_ip_type", "ip_external", "offline",
-            "threads_fs_read", "threads_fs_write", "threads_crypt", "threads_db"
+            "threads_fs_read", "threads_fs_write", "threads_crypt", "threads_db",
+            "chain_rpc_url"
         ])
         self.keys_restart_need = set([
             "tor", "fileserver_port", "fileserver_ip_type", "threads_fs_read", "threads_fs_write", "threads_crypt", "threads_db"

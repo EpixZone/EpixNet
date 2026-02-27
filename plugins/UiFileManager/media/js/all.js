@@ -725,7 +725,7 @@
     };
 
     Text.prototype.emailLinks = function (text) {
-      return text.replace(/([a-zA-Z0-9]+)@zeroid.bit/g, "<a href='?to=$1' onclick='return Page.message_create.show(\"$1\")'>$1@zeroid.bit</a>");
+      return text;
     };
 
     Text.prototype.fixHtmlLinks = function (text) {
@@ -739,8 +739,7 @@
     Text.prototype.fixLink = function (link) {
       var back;
       if (window.is_proxy) {
-        back = link.replace(/http:\/\/(127.0.0.1|localhost):42222/, 'http://epix');
-        return back.replace(/http:\/\/zero\/([^\/]+\.bit)/, "http://$1");
+        return link.replace(/http:\/\/(127.0.0.1|localhost):42222/, 'http://epix');
       } else {
         return link.replace(/http:\/\/(127.0.0.1|localhost):42222/, '');
       }

@@ -514,7 +514,7 @@ class ContentManager:
         try:
             if not content:
                 content = self.site.storage.loadJson(inner_path)  # Read the file if no content specified
-            user_urn = "%s/%s" % (content["cert_auth_type"], content["cert_user_id"])  # web/nofish@zeroid.bit
+            user_urn = "%s/%s" % (content["cert_auth_type"], content["cert_user_id"])  # web/mud@epixid.epix
             cert_user_id = content["cert_user_id"]
         except Exception:  # Content.json not exist
             user_urn = "n-a/n-a"

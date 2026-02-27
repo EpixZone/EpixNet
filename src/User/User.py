@@ -170,7 +170,7 @@ class User(object):
         return site_data
 
     # Get cert for the site address
-    # Return: { "auth_address":.., "auth_privatekey":.., "auth_type": "web", "auth_user_name": "nofish", "cert_sign":.. } or None
+    # Return: { "auth_address":.., "auth_privatekey":.., "auth_type": "web", "auth_user_name": "mud", "cert_sign":.. } or None
     def getCert(self, address):
         site_data = self.getSiteData(address, create=False)
         if not site_data or "cert" not in site_data:
@@ -178,7 +178,7 @@ class User(object):
         return self.certs.get(site_data["cert"])
 
     # Get cert user name for the site address
-    # Return: user@certprovider.bit or None
+    # Return: user@certprovider.epix or None
     def getCertUserId(self, address):
         site_data = self.getSiteData(address, create=False)
         if not site_data or "cert" not in site_data:

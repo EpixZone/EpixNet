@@ -141,6 +141,30 @@ def get_sign_address_64(data: str, sign: str, lib_verify=None) -> Optional[str]:
         return None
 
 
+def keccak_format(data):
+    """Hash data with keccak256 for Ethereum-compatible signature verification"""
+    from Crypto.Hash import keccak
+    hash_obj = keccak.new(digest_bits=256)
+    hash_obj.update(data)
+    return hash_obj.digest()
+
+
+def verify_keccak(data: str, addresses: Union[str, Container[str]], sign: str) -> bool:
+    """Verify signature using keccak256 hash (for chain/ethsecp256k1 signatures)"""
+    if not sign:
+        return False
+    try:
+        publickey = sslcurve.recover(base64.b64decode(sign), data.encode(), hash=keccak_format)
+        sign_address = publicKeyToAddress(publickey)
+    except Exception:
+        return False
+
+    if isinstance(addresses, str):
+        return sign_address == addresses
+    else:
+        return sign_address in addresses
+
+
 def verify(*args, **kwargs):
     """Default verify, see verify64"""
     return verify64(*args, **kwargs)

@@ -879,7 +879,7 @@ class UiWebsocket(object):
 
             body += "<div style='background-color: #F7F7F7; margin-right: -30px'>"
             for domain in more_domains:
-                if not domain.endswith(".bit") and domain in cert_signers:
+                if domain in cert_signers:
                     provider_url_path = cert_signers[domain][0]
                 else:
                     provider_url_path = domain

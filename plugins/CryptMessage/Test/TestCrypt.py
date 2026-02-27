@@ -39,7 +39,7 @@ class TestCrypt:
         pub1 = ui_websocket.testAction("UserPublickey", 0)
 
         site_data = ui_websocket.user.getSiteData(ui_websocket.site.address)
-        site_data["cert"] = "zeroid.bit"
+        site_data["cert"] = "epixid.epix"
         pub2 = ui_websocket.testAction("UserPublickey", 0)
         assert pub1 != pub2
 

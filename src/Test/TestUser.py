@@ -38,8 +38,8 @@ class TestUser:
         assert cert_auth_address == "epix1lxfgsrns0uex5gtlvn3ta74adnam2cwjvpet4q"
 
         # Add cert
-        user.addCert(cert_auth_address, "zeroid.bit", "faketype", "fakeuser", "fakesign")
-        user.setCert(test_site_address, "zeroid.bit")
+        user.addCert(cert_auth_address, "epixid.epix", "faketype", "fakeuser", "fakesign")
+        user.setCert(test_site_address, "epixid.epix")
 
         # By using certificate the auth address should be same as the certificate provider
         assert user.getAuthAddress(test_site_address) == cert_auth_address

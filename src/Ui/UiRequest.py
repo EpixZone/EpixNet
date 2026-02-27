@@ -200,12 +200,11 @@ class UiRequest:
             ).encode("utf8")
             return iter([ret_error, ret_body])
 
-        # TODO: phase out .bit support
-        # Prepend .bit host for transparent proxy
+        # Prepend domain host for transparent proxy
         if self.isDomain(self.env.get("HTTP_HOST")):
             path = re.sub("^/", "/" + self.env.get("HTTP_HOST") + "/", path)
         path = re.sub("^http://epix[/]+", "/", path)  # Remove begining http://epix/ for chrome extension
-        path = re.sub("^http://", "/", path)  # Remove begining http for chrome extension .bit access
+        path = re.sub("^http://", "/", path)  # Remove begining http for chrome extension
 
         # Sanitize request url
         path = path.replace("\\", "/")
@@ -482,6 +481,12 @@ class UiRequest:
         if match:
             address = match.group("address")
             inner_path = match.group("inner_path").lstrip("/")
+
+            # Reverse lookup: if a raw address has a known .epix domain, redirect to it
+            if not self.isDomain(address):
+                domain = getattr(SiteManager.site_manager, "reverseLookupDomain", lambda a: None)(address)
+                if domain:
+                    return self.actionRedirect("/%s/%s" % (domain, inner_path))
 
             if not self.isWrapperNecessary(path):
                 return self.actionSiteMedia("/media" + path)  # Serve non-html files without wrapper
@@ -772,13 +777,6 @@ class UiRequest:
             path_parts = self.parsePath(path)
         except SecurityError as err:
             return self.error403(err)
-
-        if "domain" in path_parts:
-            addr = path_parts['address']
-            path = path_parts['inner_path']
-            query = self.env['QUERY_STRING']
-            raw = "/raw" if raw else ""
-            return self.actionRedirect(f"{raw}/{addr}/{path}?{query}")
 
         if not path_parts:
             return self.error404(path)

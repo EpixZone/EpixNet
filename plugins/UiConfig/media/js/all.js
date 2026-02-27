@@ -1577,7 +1577,7 @@
           }
         ]
       });
-      return section.items.push({
+      section.items.push({
         key: "threads_db",
         title: "Threads for database operations",
         type: "select",
@@ -1605,6 +1605,23 @@
             value: 10
           }
         ]
+      });
+      section = this.createSection("Epix Chain Config");
+      section.items.push({
+        key: "chain_rpc_url",
+        title: "Chain RPC URL",
+        type: "text",
+        placeholder: "https://api.epix.zone",
+        description: "Epix Chain REST API URL.",
+        value_pos: "fullwidth"
+      });
+      return section.items.push({
+        key: "xid_clear_cache",
+        title: "Clear xID Cache",
+        type: "button",
+        button_text: "Clear Cache",
+        description: "Clear cached xID name resolutions and chain attestation data.",
+        button_action: "xidClearCache"
       });
     };
 
@@ -1639,6 +1656,8 @@
     extend(ConfigView, superClass);
 
     function ConfigView() {
+      this.renderValueButton = bind(this.renderValueButton, this);
+      this.handleButtonClick = bind(this.handleButtonClick, this);
       this.renderValueSelect = bind(this.renderValueSelect, this);
       this.renderValueCheckbox = bind(this.renderValueCheckbox, this);
       this.renderValueTextarea = bind(this.renderValueTextarea, this);
@@ -1701,6 +1720,16 @@
       if (typeof item.isHidden === "function" ? item.isHidden() : void 0) {
         return null;
       }
+      if (item.type === "button") {
+        return h("div.config-item", {
+          key: item.title,
+          enterAnimation: Animation.slideDown,
+          exitAnimation: Animation.slideUpInout
+        }, [
+          h("div.title", [h("h3", item.title), h("div.description", item.description)]),
+          h("div.value.value-right", this.renderValueButton(item))
+        ]);
+      }
       return h("div.config-item", {
         key: item.title,
         enterAnimation: Animation.slideDown,
@@ -1752,6 +1781,26 @@
         placeholder: item.placeholder,
         oninput: this.handleInputChange
       });
+    };
+
+    ConfigView.prototype.handleButtonClick = function(e) {
+      var node, action;
+      node = e.currentTarget;
+      action = node.attributes.button_action.value;
+      node.classList.add("loading");
+      Page.cmd(action, [], function(res) {
+        node.classList.remove("loading");
+        Page.cmd("wrapperNotification", ["done", "Cache cleared!", 3000]);
+      });
+      return false;
+    };
+
+    ConfigView.prototype.renderValueButton = function(item) {
+      return h("a.button", {
+        href: "#" + item.key,
+        button_action: item.button_action,
+        onclick: this.handleButtonClick
+      }, item.button_text || "Run");
     };
 
     ConfigView.prototype.autosizeTextarea = function(e) {

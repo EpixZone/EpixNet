@@ -27,7 +27,7 @@ class TestContentUser:
 
         # Valid signer for banned user
         user_content = site.storage.loadJson("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json")
-        user_content["cert_user_id"] = "bad@zeroid.bit"
+        user_content["cert_user_id"] = "bad@epixid.epix"
 
         valid_signers = site.content_manager.getValidSigners("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
         assert '1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT' in valid_signers  # The site address
@@ -40,28 +40,28 @@ class TestContentUser:
 
         # Known user
         user_content["cert_auth_type"] = "web"
-        user_content["cert_user_id"] = "nofish@zeroid.bit"
+        user_content["cert_user_id"] = "mud@epixid.epix"
         rules = site.content_manager.getRules("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
         assert rules["max_size"] == 100000
         assert "1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C" in rules["signers"]
 
         # Unknown user
         user_content["cert_auth_type"] = "web"
-        user_content["cert_user_id"] = "noone@zeroid.bit"
+        user_content["cert_user_id"] = "noone@epixid.epix"
         rules = site.content_manager.getRules("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
         assert rules["max_size"] == 10000
         assert "1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C" in rules["signers"]
 
         # User with more size limit based on auth type
         user_content["cert_auth_type"] = "bitmsg"
-        user_content["cert_user_id"] = "noone@zeroid.bit"
+        user_content["cert_user_id"] = "noone@epixid.epix"
         rules = site.content_manager.getRules("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
         assert rules["max_size"] == 15000
         assert "1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C" in rules["signers"]
 
         # Banned user
         user_content["cert_auth_type"] = "web"
-        user_content["cert_user_id"] = "bad@zeroid.bit"
+        user_content["cert_user_id"] = "bad@epixid.epix"
         rules = site.content_manager.getRules("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
         assert "1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C" not in rules["signers"]
 
@@ -196,14 +196,14 @@ class TestContentUser:
         rules_content = site.content_manager.contents["data/users/content.json"]
 
         # Override valid cert signers for the test
-        rules_content["user_contents"]["cert_signers"]["zeroid.bit"] = [
+        rules_content["user_contents"]["cert_signers"]["epixid.epix"] = [
             "14wgQ4VDDZNoRMFF4yCDuTrBSHmYhL3bet",
             "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
         ]
 
         # Check valid cert signers
         rules = site.content_manager.getRules("data/users/1J6UrZMkarjVg5ax9W4qThir3BFUikbW6C/content.json", user_content)
-        assert rules["cert_signers"] == {"zeroid.bit": [
+        assert rules["cert_signers"] == {"epixid.epix": [
             "14wgQ4VDDZNoRMFF4yCDuTrBSHmYhL3bet",
             "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
         ]}
@@ -282,7 +282,7 @@ class TestContentUser:
         rules_content = site.content_manager.contents["data/users/content.json"]
 
         # Override valid cert signers for the test
-        rules_content["user_contents"]["cert_signers"]["zeroid.bit"] = [
+        rules_content["user_contents"]["cert_signers"]["epixid.epix"] = [
             "14wgQ4VDDZNoRMFF4yCDuTrBSHmYhL3bet",
             "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c"
         ]
