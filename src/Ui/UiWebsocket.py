@@ -1120,6 +1120,31 @@ class UiWebsocket(object):
         self.site.download(blind_includes=True)
 
     @flag.admin
+    def actionPeerAdd(self, to, ip, port, site_address=None):
+        port = int(port)
+        if site_address:
+            site = self.server.sites.get(site_address)
+            if not site:
+                # Site not loaded yet — use SiteManager to create it
+                site = SiteManager.site_manager.need(site_address)
+            if not site:
+                self.response(to, {"error": "Invalid site address: %s" % site_address})
+                return
+        else:
+            site = self.site
+
+        peer = site.addPeer(ip, port, return_peer=True, source="manual")
+        if peer:
+            site.worker_manager.onPeers()
+            site.updateWebsocket(peers_added=1)
+            # If site has bad files (missing content), trigger download
+            if site.bad_files:
+                gevent.spawn(site.update, announce=False)
+            self.response(to, {"ok": "Peer added: %s:%s" % (ip, port)})
+        else:
+            self.response(to, {"ok": "Peer already exists: %s:%s" % (ip, port)})
+
+    @flag.admin
     def actionSiteAdd(self, to, address):
         site_manager = SiteManager.site_manager
         if address in site_manager.sites:

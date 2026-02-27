@@ -71,6 +71,10 @@ class FileServer(ConnectionServer):
         self.files_parsing = {}
         self.ui_server = None
 
+        # Update peer blacklist now that the actual port is known
+        # (config.fileserver_port is 0 at module-import time when using random ports)
+        SiteManager.updatePeerBlacklist()
+
     def getRandomPort(self, ip, port_range_from, port_range_to):
         self.log.info("Getting random port in range %s-%s..." % (port_range_from, port_range_to))
         tried = []

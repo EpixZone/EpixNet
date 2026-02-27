@@ -225,3 +225,24 @@ if config.action == "main":  # Don't connect / add myself to peerlist
 else:
     peer_blacklist = []
 
+
+def updatePeerBlacklist():
+    """Update blacklist with current fileserver port and external IPs.
+
+    Must be called after FileServer binds its port, since the default
+    config.fileserver_port is 0 (random) at module-import time.
+
+    Mutates the list in-place so existing Site references stay valid.
+    """
+    port = config.fileserver_port
+    peer_blacklist[:] = [("127.0.0.1", port), ("::1", port)]
+    # Also block our own external IPs so we never add ourselves as a peer
+    for ip in getattr(config, "ip_local", None) or []:
+        entry = (str(ip), port)
+        if entry not in peer_blacklist:
+            peer_blacklist.append(entry)
+    for ip in getattr(config, "ip_external", None) or []:
+        entry = (str(ip), port)
+        if entry not in peer_blacklist:
+            peer_blacklist.append(entry)
+
