@@ -88,6 +88,10 @@ def _fetch_attested_snapshot():
 
     Returns the snapshot mappings dict {domain: address} if finalized, or None.
     Uses the ChainAttestation plugin's functions when available.
+
+    The snapshot is fetched first, then its digest is verified against attestations.
+    This avoids race conditions where the digest changes between separate RPC calls.
+    Retries up to 3 times if the digest changes mid-pagination.
     """
     now = time.time()
     if _attested_snapshot["digest"] and (now - _attested_snapshot["timestamp"]) < SNAPSHOT_CACHE_TTL:
@@ -95,41 +99,31 @@ def _fetch_attested_snapshot():
 
     rpc_url = _get_rpc_url()
 
-    # 1. Fetch current state digest
-    digest_data = _fetch_json("%s/xid/v1/state_digest" % rpc_url)
-    if not digest_data or not digest_data.get("digest"):
-        return None
-
-    digest = digest_data["digest"]
-
-    # If we already have this digest cached, just refresh the timestamp
-    if digest == _attested_snapshot["digest"]:
-        _attested_snapshot["timestamp"] = now
-        return _attested_snapshot["mappings"]
-
-    # 2. Check if this digest is finalized (attested by 2/3+ validators)
-    att_data = _fetch_json("%s/xid/v1/attestations?digest=%s" % (rpc_url, digest))
-    if not att_data or not att_data.get("finalized"):
-        return None
-
-    # 3. Fetch the full state snapshot and extract EPIXNET DNS mappings
-    mappings = {}
-    next_key = None
-    page = 0
-    while page < 100:  # Safety limit
-        url = "%s/xid/v1/state_snapshot" % rpc_url
-        if next_key:
-            url += "?pagination.key=%s" % next_key
-        snap_data = _fetch_json(url)
+    for attempt in range(3):
+        # 1. Fetch the first page of the snapshot to get the current digest
+        snap_data = _fetch_json("%s/xid/v1/state_snapshot" % rpc_url)
         if not snap_data:
-            break
-
-        # Verify the snapshot's digest matches the finalized one
-        snap_digest = snap_data.get("digest", "")
-        if snap_digest != digest:
-            log.warning("Snapshot digest mismatch: expected %s..., got %s..." % (digest[:16], snap_digest[:16]))
             return None
 
+        digest = snap_data.get("digest", "")
+        if not digest:
+            return None
+
+        # If we already have this digest cached, just refresh the timestamp
+        if digest == _attested_snapshot["digest"]:
+            _attested_snapshot["timestamp"] = now
+            return _attested_snapshot["mappings"]
+
+        # 2. Check if this digest is finalized (attested by 2/3+ validators)
+        att_data = _fetch_json("%s/xid/v1/attestations?digest=%s" % (rpc_url, digest))
+        if not att_data or not att_data.get("finalized"):
+            return None
+
+        # 3. Extract EPIXNET DNS mappings from already-fetched first page + remaining pages
+        mappings = {}
+        digest_changed = False
+
+        # Process first page (already fetched)
         for domain_snap in snap_data.get("domains", []):
             record = domain_snap.get("record", {})
             name = record.get("name", "")
@@ -145,25 +139,59 @@ def _fetch_attested_snapshot():
                         mappings[domain_key] = site_addr
                     break
 
-        # Check pagination
+        # Fetch remaining pages
         pagination = snap_data.get("pagination", {})
         next_key = pagination.get("next_key")
-        if not next_key:
-            break
-        page += 1
+        page = 1
+        while next_key and page < 100:
+            url = "%s/xid/v1/state_snapshot?pagination.key=%s" % (rpc_url, next_key)
+            snap_data = _fetch_json(url)
+            if not snap_data:
+                break
 
-    # Store the attested snapshot
-    _attested_snapshot["digest"] = digest
-    _attested_snapshot["mappings"] = mappings
-    _attested_snapshot["timestamp"] = now
+            # Verify digest hasn't changed mid-pagination
+            if snap_data.get("digest", "") != digest:
+                log.debug("Digest changed mid-pagination (attempt %d), retrying" % (attempt + 1))
+                digest_changed = True
+                break
 
-    # Populate caches from attested data
-    for domain_key, site_addr in mappings.items():
-        _resolve_cache[domain_key] = {"address": site_addr, "timestamp": now, "attested": True}
-        _reverse_cache[site_addr] = domain_key
+            for domain_snap in snap_data.get("domains", []):
+                record = domain_snap.get("record", {})
+                name = record.get("name", "")
+                tld = record.get("tld", "")
+                if not name or not tld:
+                    continue
 
-    log.info("Loaded attested snapshot: %d EPIXNET mappings (digest: %s...)" % (len(mappings), digest[:16]))
-    return mappings
+                domain_key = "%s.%s" % (name, tld)
+                for dns_rec in domain_snap.get("dns_records", []):
+                    if int(dns_rec.get("record_type", 0)) == EPIXNET_RECORD_TYPE:
+                        site_addr = dns_rec.get("value", "").strip()
+                        if site_addr:
+                            mappings[domain_key] = site_addr
+                        break
+
+            pagination = snap_data.get("pagination", {})
+            next_key = pagination.get("next_key")
+            page += 1
+
+        if digest_changed:
+            continue  # Retry from scratch
+
+        # Store the attested snapshot
+        _attested_snapshot["digest"] = digest
+        _attested_snapshot["mappings"] = mappings
+        _attested_snapshot["timestamp"] = now
+
+        # Populate caches from attested data
+        for domain_key, site_addr in mappings.items():
+            _resolve_cache[domain_key] = {"address": site_addr, "timestamp": now, "attested": True}
+            _reverse_cache[site_addr] = domain_key
+
+        log.info("Loaded attested snapshot: %d EPIXNET mappings (digest: %s...)" % (len(mappings), digest[:16]))
+        return mappings
+
+    log.warning("Failed to fetch consistent snapshot after 3 attempts")
+    return None
 
 
 def _resolve_epix_name(tld, name):
