@@ -12,9 +12,51 @@ log = logging.getLogger("EpixProxy")
 
 @PluginManager.registerTo("UiRequest")
 class UiRequestPlugin(object):
+    def _stripPort(self, host):
+        if not host:
+            return ""
+        if ":" in host:
+            return host.rsplit(":", 1)[0]
+        return host
+
+    def getHostWithoutPort(self):
+        # Base implementation assumes port is always present and breaks when
+        # HTTP_HOST has no port (e.g. "talk.epix" via PAC proxy).
+        return self._stripPort(self.env.get("HTTP_HOST", ""))
+
+    def isHostAllowed(self, host):
+        if getattr(config, "epix_proxy", "auto") != "off" and self.isDomain(self._stripPort(host)):
+            return True
+        return super().isHostAllowed(host)
+
+    def isProxyRequest(self):
+        if getattr(config, "epix_proxy", "auto") != "off" and self.isDomain(self._stripPort(self.env.get("HTTP_HOST"))):
+            return True
+        return super().isProxyRequest()
+
+    def actionWebsocket(self):
+        # Allow .epix origins for WebSocket connections routed via PAC proxy.
+        # The wrapper page loads from http://talk.epix but the WebSocket
+        # connects to ws://127.0.0.1:42222, so Origin won't match Host.
+        if getattr(config, "epix_proxy", "auto") != "off":
+            origin = self.env.get("HTTP_ORIGIN", "")
+            origin_host = origin.split("://", 1)[-1] if origin else ""
+            if origin_host and self.isDomain(origin_host):
+                self.server.allowed_ws_origins.add(origin_host)
+        return super().actionWebsocket()
+
     def route(self, path):
         if path == "/proxy.pac":
             return self.actionProxyPac()
+        # Chrome proxy-style requests send full URL as path, e.g.
+        # "http://talk.epix:42222/index.html". The base route strips
+        # "http://" but leaves the port, giving "/talk.epix:42222/...".
+        # Strip the port from the domain in the path so it resolves correctly.
+        if getattr(config, "epix_proxy", "auto") != "off":
+            import re
+            match = re.match(r"^http://([^/:]+):\d+(/.*)$", path)
+            if match and self.isDomain(match.group(1)):
+                path = "http://" + match.group(1) + match.group(2)
         return super().route(path)
 
     def actionProxyPac(self):
@@ -27,14 +69,6 @@ class UiRequestPlugin(object):
 """ % config.ui_port
         self.sendHeader(content_type="application/x-ns-proxy-autoconfig")
         return iter([pac_content.encode("utf8")])
-
-
-@PluginManager.registerTo("UiServer")
-class UiServerPlugin(object):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if getattr(config, "epix_proxy", "auto") != "off":
-            self.allow_trans_proxy = True
 
 
 @PluginManager.registerTo("Actions")
