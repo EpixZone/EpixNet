@@ -666,9 +666,16 @@ class UiRequest:
         scheme = self.env['wsgi.url_scheme']
         host = self.getHostWithoutPort()
 
+        # When accessed via proxy with a domain host, use the same port for
+        # site content so the PAC file can route it correctly.
+        if self.isProxyRequest() and self.isDomain(self.env.get("HTTP_HOST")):
+            site_file_port = config.ui_port
+        else:
+            site_file_port = config.ui_site_port
+
         return self.render(
             "src/Ui/template/wrapper.html",
-            site_file_server=f'{scheme}://{host}:{config.ui_site_port}',
+            site_file_server=f'{scheme}://{host}:{site_file_port}',
             server_url=server_url,
             inner_path=inner_path,
             file_url=xescape(file_url),
