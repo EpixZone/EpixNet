@@ -76,6 +76,7 @@ class ContentManager:
 
         # Rebuild hashfield from files on disk (tracks ALL files, not just optional)
         self.rebuildHashfield()
+        self.flagStaleFiles()
 
     def rebuildHashfield(self):
         """Rebuild hashfield from all files we actually have on disk.
@@ -109,6 +110,51 @@ class ContentManager:
                 sha512 = file_details.get("sha512")
                 if sha512 and self.site.storage.isFile(content_inner_dir + file_relative_path):
                     self.hashfield.appendHash(sha512)
+
+    def flagStaleFiles(self):
+        """Add files declared by any content.json but missing or size-mismatched on disk to bad_files.
+
+        Recovers from stuck states where a content.json update was processed without its
+        referenced files actually being downloaded (e.g. interrupted run).
+
+        Skips files whose disk mtime is newer than the declaring content.json's modified
+        time — these are unsigned local edits by a user we have signing rights for, and
+        re-downloading would overwrite their work.
+        """
+        if self.site.settings.get("own"):
+            return  # Own sites: local files may legitimately differ pre-sign
+
+        stale = []
+        for content_inner_path in list(dict.keys(self.contents)):
+            if not content_inner_path.endswith("content.json"):
+                continue
+            content = self.contents.get(content_inner_path)
+            if not content:
+                continue
+            content_modified = content.get("modified", 0)
+            content_inner_dir = helper.getDirname(content_inner_path)
+            for file_relative_path, file_details in content.get("files", {}).items():
+                declared_size = file_details.get("size")
+                if declared_size is None:
+                    continue
+                file_inner_path = content_inner_dir + file_relative_path
+                if not self.site.storage.isFile(file_inner_path):
+                    stale.append(file_inner_path)
+                    continue
+                if self.site.storage.getSize(file_inner_path) == declared_size:
+                    continue
+                try:
+                    file_mtime = os.path.getmtime(self.site.storage.getPath(file_inner_path))
+                except OSError:
+                    continue
+                if file_mtime > content_modified:
+                    continue  # Unsigned local edit ahead of content.json
+                stale.append(file_inner_path)
+
+        if stale:
+            self.log.warning("Flagging %s stale file(s) for re-download: %s", len(stale), stale[:10])
+            for path in stale:
+                self.site.bad_files[path] = self.site.bad_files.get(path, 0) + 1
 
     def getFileChanges(self, old_files, new_files):
         deleted = {key: val for key, val in old_files.items() if key not in new_files}

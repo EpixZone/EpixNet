@@ -30,6 +30,9 @@ class ContentDbDict(dict):
             if content is None:
                 raise IOError("File not found: %s" % key)
             dict.__setitem__(self, key, content)
+            # Sync the content.db row to disk: peers query content.db for listModified,
+            # and a divergence here makes us appear stale forever.
+            self.db.setContent(self.site, key, content, self.getItemSize(key))
         except IOError:
             if dict.get(self, key):
                 self.__delitem__(key)  # File not exists anymore

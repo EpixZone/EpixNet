@@ -197,7 +197,10 @@ class Site(object):
             self.log.debug("DownloadContent got %s" % inner_path)
             sub_s = time.time()
 
-        changed, deleted = self.content_manager.loadContent(inner_path, load_includes=False, force=bool(diffs))
+        # Always force the file-diff. needFile just wrote new content.json bytes; without force,
+        # a lazy-loaded self.contents could match disk on timestamp and skip the diff entirely,
+        # leaving the new files unflagged.
+        changed, deleted = self.content_manager.loadContent(inner_path, load_includes=False, force=True)
 
         if config.verbose:
             self.log.debug("DownloadContent %s: loadContent done in %.3fs" % (inner_path, time.time() - sub_s))
