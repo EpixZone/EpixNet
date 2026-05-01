@@ -4,6 +4,8 @@ import re
 import json
 import time
 
+import gevent
+
 from Config import config
 from Plugin import PluginManager
 from util.Flag import flag
@@ -46,15 +48,28 @@ _attested_root_cache = {"root": None, "timestamp": 0}
 ATTESTED_ROOT_CACHE_TTL = 60
 
 
-def _fetch_json(url, timeout=10):
+def _fetch_json(url, timeout=8):
+    """Fetch JSON with hard gevent.Timeout so a stuck call can't block the hub.
+
+    Logs duration at DEBUG so slow chain-RPC endpoints are visible in the log.
+    """
+    s = time.time()
+    result = None
+    status = "ok"
     try:
-        req = Request(url)
-        req.add_header("Accept", "application/json")
-        resp = urlopen(req, timeout=timeout)
-        return json.loads(resp.read().decode("utf-8"))
+        with gevent.Timeout(timeout, False):
+            req = Request(url)
+            req.add_header("Accept", "application/json")
+            resp = urlopen(req, timeout=timeout)
+            result = json.loads(resp.read().decode("utf-8"))
+        if result is None:
+            status = "timeout"
     except (URLError, ValueError, IOError) as e:
-        log.debug("xID RPC fetch failed for %s: %s" % (url, e))
-        return None
+        status = "error: %s" % e
+    elapsed = time.time() - s
+    if elapsed > 0.5 or status != "ok":
+        log.debug("RPC %s -> %s in %.3fs" % (url, status, elapsed))
+    return result
 
 
 def _get_rpc_url():
@@ -162,23 +177,44 @@ def _resolve_epix_name(tld, name):
     """
     cache_key = "%s.%s" % (name, tld)
     now = time.time()
+    overall_start = now
     cached = _resolve_cache.get(cache_key)
     if cached:
         ttl = ATTESTED_CACHE_TTL if cached.get("attested") else RESOLVE_CACHE_TTL
         if (now - cached["timestamp"]) < ttl:
+            log.debug("resolve %s: CACHE HIT (age=%.1fs, ttl=%ds, attested=%s) -> %s" % (
+                cache_key, now - cached["timestamp"], ttl,
+                cached.get("attested"), cached.get("address")))
             return cached.get("address")
+        log.debug("resolve %s: cache STALE (age=%.1fs > ttl=%ds), refetching" % (
+            cache_key, now - cached["timestamp"], ttl))
 
     rpc_url = _get_rpc_url()
 
     # Single RPC call: domain data + Merkle proof
+    t0 = time.time()
     proof_data = _fetch_json("%s/xid/v1/resolve_with_proof/%s/%s" % (rpc_url, tld, name))
+    log.debug("resolve %s: resolve_with_proof took %.3fs" % (cache_key, time.time() - t0))
+
+    # If the fetch failed entirely (network/timeout), serve stale cache rather
+    # than falling through to the 3-call fallback path which will likely also
+    # fail and add ~24s of blocking time.
+    if proof_data is None and cached and cached.get("address"):
+        log.debug(
+            "resolve %s: RPC fetch failed, serving STALE cache (age=%.1fs)" %
+            (cache_key, now - cached["timestamp"])
+        )
+        return cached["address"]
+
     if (proof_data and proof_data.get("domain") and proof_data.get("proof")
             and proof_data["domain"].get("record", {}).get("name")):
         domain = proof_data["domain"]
         proof = proof_data["proof"]
 
         # Try to verify against attested root
+        t1 = time.time()
         attested_root = _get_attested_root()
+        log.debug("resolve %s: get_attested_root took %.3fs" % (cache_key, time.time() - t1))
         attested = False
         if attested_root and _verify_merkle_proof(proof, attested_root):
             attested = True
@@ -211,20 +247,27 @@ def _resolve_epix_name(tld, name):
         }
         if site_address:
             _reverse_cache[site_address] = cache_key
-            log.debug("Resolved %s to %s (%s)" % (
-                cache_key, site_address, "attested" if attested else "proof unverified"))
+            log.debug("resolve %s: DONE in %.3fs -> %s (%s)" % (
+                cache_key, time.time() - overall_start, site_address,
+                "attested" if attested else "proof unverified"))
         return site_address
 
     # Fallback: direct RPC query with chain ID verification (no proof available)
+    log.debug("resolve %s: no proof_data, falling back to chain-ID-verified path" % cache_key)
     if not _verify_chain_id():
+        log.debug("resolve %s: chain ID verification failed, giving up" % cache_key)
         return None
 
+    t_fb = time.time()
     data = _fetch_json("%s/xid/v1/resolve/%s/%s" % (rpc_url, tld, name))
+    log.debug("resolve %s: fallback resolve took %.3fs" % (cache_key, time.time() - t_fb))
     if not data or not data.get("record"):
         _resolve_cache[cache_key] = {"address": None, "timestamp": now, "attested": False}
         return None
 
+    t_dns = time.time()
     dns_data = _fetch_json("%s/xid/v1/dns/%s/%s" % (rpc_url, tld, name))
+    log.debug("resolve %s: fallback dns took %.3fs" % (cache_key, time.time() - t_dns))
     site_address = None
     if dns_data and dns_data.get("records"):
         for record in dns_data["records"]:
@@ -233,7 +276,9 @@ def _resolve_epix_name(tld, name):
                 break
 
     # Also fetch peers in fallback path
+    t_peers = time.time()
     peers_data = _fetch_json("%s/xid/v1/epixnet/%s/%s" % (rpc_url, tld, name))
+    log.debug("resolve %s: fallback peers took %.3fs" % (cache_key, time.time() - t_peers))
     if peers_data and peers_data.get("peers"):
         active_peers = [p.get("address", "") for p in peers_data["peers"] if p.get("active")]
         if active_peers:
@@ -242,9 +287,11 @@ def _resolve_epix_name(tld, name):
     _resolve_cache[cache_key] = {"address": site_address, "timestamp": now, "attested": False}
     if site_address:
         _reverse_cache[site_address] = cache_key
-        log.debug("Resolved %s to %s (chain ID verified, no proof)" % (cache_key, site_address))
+        log.debug("resolve %s: DONE in %.3fs -> %s (chain ID verified, no proof)" % (
+            cache_key, time.time() - overall_start, site_address))
     else:
-        log.debug("Name %s exists but has no EPIXNET record" % cache_key)
+        log.debug("resolve %s: DONE in %.3fs but name has no EPIXNET record" % (
+            cache_key, time.time() - overall_start))
 
     return site_address
 

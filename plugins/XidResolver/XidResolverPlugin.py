@@ -1,8 +1,12 @@
 import hashlib
 import logging
 import json
+import os
 import re
 import time
+import atexit
+
+import gevent
 
 from Config import config
 from Plugin import PluginManager
@@ -28,12 +32,83 @@ log = logging.getLogger("XidResolverPlugin")
 _identity_cache = {}
 
 # How long to cache positive results (seconds)
-IDENTITY_CACHE_TTL = 300  # 5 minutes
+IDENTITY_CACHE_TTL = 30 * 24 * 60 * 60  # 30 days — revocation is handled via freshness check
 # How long to cache negative (not found) results
-NEGATIVE_CACHE_TTL = 60  # 1 minute
+NEGATIVE_CACHE_TTL = 30  # seconds — names are permanent on-chain, so negatives almost always indicate typos or transient state; recover fast
 # Grace period (seconds) for clock drift between chain block time and content modified timestamp.
 # Content modified within this window after revocation is still accepted.
 REVOCATION_GRACE_PERIOD = 60  # 1 minute
+
+# On-disk cache persistence ---------------------------------------------------
+_cache_save_pending = False
+_cache_loaded = False
+
+
+def _cache_path():
+    data_dir = getattr(config, "data_dir", None)
+    if not data_dir:
+        return None
+    return os.path.join(str(data_dir), "xid_cache.json")
+
+
+def _load_caches_from_disk():
+    """Populate in-memory caches from disk. Called lazily on first use."""
+    global _cache_loaded
+    if _cache_loaded:
+        return
+    _cache_loaded = True
+    path = _cache_path()
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        now = time.time()
+        for key, entry in (data.get("identity") or {}).items():
+            ttl = IDENTITY_CACHE_TTL if entry.get("name") else NEGATIVE_CACHE_TTL
+            if (now - entry.get("cached_at", 0)) < ttl:
+                _identity_cache[key] = entry
+        for key, entry in (data.get("xid_name") or {}).items():
+            # Use negative TTL for entries with no owner — these were cached
+            # as "not found" results, and we don't want stale negatives from a
+            # previous run (especially one with aggressive timeouts) to break
+            # signing for the entire IDENTITY_CACHE_TTL window.
+            ttl = IDENTITY_CACHE_TTL if entry.get("owner") else NEGATIVE_CACHE_TTL
+            if (now - entry.get("cached_at", 0)) < ttl:
+                _xid_name_cache[key] = entry
+        log.debug("Loaded xID cache: %d identity, %d name entries" %
+                  (len(_identity_cache), len(_xid_name_cache)))
+    except (IOError, ValueError) as e:
+        log.warning("Failed to load xID cache from %s: %s" % (path, e))
+
+
+def _save_caches_to_disk():
+    """Atomically persist caches to disk."""
+    global _cache_save_pending
+    _cache_save_pending = False
+    path = _cache_path()
+    if not path:
+        return
+    try:
+        payload = {"identity": _identity_cache, "xid_name": _xid_name_cache}
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except (IOError, OSError) as e:
+        log.warning("Failed to save xID cache to %s: %s" % (path, e))
+
+
+def _schedule_cache_save():
+    """Debounced save — coalesces rapid updates into one write 5s later."""
+    global _cache_save_pending
+    if _cache_save_pending:
+        return
+    _cache_save_pending = True
+    gevent.spawn_later(5, _save_caches_to_disk)
+
+
+atexit.register(_save_caches_to_disk)
 
 # ---------------------------------------------------------------------------
 # Chain attestation verification for xID resolution
@@ -43,8 +118,14 @@ _digest_cache = {"digest": None, "height": 0, "timestamp": 0}
 # Attestation finalization cache: digest -> {finalized, timestamp}
 _attestation_cache = {}
 
-DIGEST_CACHE_TTL = 15  # seconds
-ATTESTATION_CACHE_TTL = 5  # seconds
+DIGEST_CACHE_TTL = 60  # seconds
+ATTESTATION_CACHE_TTL = 60  # seconds
+# Pubkey cache: address -> {pubkey, cached_at}. Pubkeys never change for an
+# account, so a long TTL is safe; we only need to refresh if the account
+# rotates a key (rare). Negative results get a short TTL.
+_pubkey_cache = {}
+PUBKEY_CACHE_TTL = 24 * 60 * 60  # 24 hours
+PUBKEY_NEGATIVE_TTL = 5 * 60     # 5 minutes
 
 
 def _fetch_state_digest(rpc_url):
@@ -112,16 +193,21 @@ def _resolve_with_proof(rpc_url, tld, name):
     """Resolve an xID name using the resolve_with_proof endpoint and verify
     the Merkle proof against an attested state digest.
 
-    Returns (domain_data, verified) where domain_data is the DomainSnapshot dict
-    and verified is True if the proof was cryptographically verified against a
-    finalized state digest.
-
-    Returns (None, False) if the name is not found.
+    Returns (domain_data, verified, fetch_failed):
+      - domain_data: DomainSnapshot dict or None
+      - verified: True if Merkle proof matched a finalized state digest
+      - fetch_failed: True if the RPC call itself failed (timeout/network),
+        as opposed to the chain returning a "not found" response. Callers
+        should not negative-cache when fetch_failed=True.
     """
     data = _fetch_json("%s/xid/v1/resolve_with_proof/%s/%s" % (rpc_url, tld, name))
-    if not data or not data.get("domain"):
-        log.debug("_resolve_with_proof: no data for %s.%s" % (name, tld))
-        return None, False
+    if data is None:
+        # Network/timeout failure — distinct from "name not found"
+        log.debug("_resolve_with_proof: fetch FAILED for %s.%s" % (name, tld))
+        return None, False, True
+    if not data.get("domain"):
+        log.debug("_resolve_with_proof: name not found %s.%s" % (name, tld))
+        return None, False, False
 
     domain = data["domain"]
     proof = data.get("proof", {})
@@ -135,7 +221,7 @@ def _resolve_with_proof(rpc_url, tld, name):
 
     if not leaf_hash or not proof_root:
         log.warning("resolve_with_proof returned incomplete proof for %s.%s" % (name, tld))
-        return domain, False
+        return domain, False, False
 
     # Step 1: Verify the Merkle proof (leaf -> siblings -> root)
     if not _verify_merkle_proof(leaf_hash, leaf_index, siblings, proof_root):
@@ -143,7 +229,7 @@ def _resolve_with_proof(rpc_url, tld, name):
             "Merkle proof verification FAILED for %s.%s: "
             "recomputed root does not match proof root %s..." % (name, tld, proof_root[:16])
         )
-        return None, False
+        return None, False, False
 
     # Step 2: Verify the proof root matches the chain's state digest
     if proof_root != chain_root:
@@ -156,7 +242,8 @@ def _resolve_with_proof(rpc_url, tld, name):
     digest_info = _fetch_state_digest(rpc_url)
     if not digest_info:
         log.warning("Could not fetch state digest for attestation check")
-        return domain, False
+        # Digest fetch failed — treat as transient, don't poison cache
+        return domain, False, True
 
     attested_digest = digest_info["digest"]
 
@@ -176,20 +263,20 @@ def _resolve_with_proof(rpc_url, tld, name):
             "Proof root %s... does not match attested digest %s... for %s.%s" %
             (proof_root[:16], attested_digest[:16], name, tld)
         )
-        return domain, False
+        return domain, False, False
 
     if not _is_digest_finalized(rpc_url, attested_digest):
         log.warning(
             "State digest %s... not yet finalized (awaiting 2/3+ validator attestation)" %
             attested_digest[:16]
         )
-        return domain, False
+        return domain, False, False
 
     log.debug(
         "xID %s.%s verified: Merkle proof valid, digest %s... finalized at height %s" %
         (name, tld, attested_digest[:16], digest_info.get("height", "?"))
     )
-    return domain, True
+    return domain, True, False
 
 
 def _get_rpc_url():
@@ -197,16 +284,39 @@ def _get_rpc_url():
     return getattr(config, "chain_rpc_url", "https://api.epix.zone").rstrip("/")
 
 
-def _fetch_json(url, timeout=10):
-    """Fetch JSON from a URL, return parsed dict or None on error."""
+def _fetch_json(url, timeout=8):
+    """Fetch JSON from a URL, return parsed dict or None on error.
+
+    Wrapped in gevent.Timeout so a stuck socket-level read can't exceed
+    the requested timeout and stall the gevent hub. urllib.urlopen's
+    `timeout` only governs individual socket ops, not the full request,
+    so a slow trickling response could still block.
+
+    Logs duration at DEBUG when the call is slow or fails so we can spot
+    which RPC endpoint is the bottleneck.
+
+    Note: `None` always means the fetch failed (network/timeout). Callers
+    that need to distinguish "not found" from "fetch failed" must inspect
+    the returned dict — chain RPC returns `{}` or a body without expected
+    keys for "not found", which is different from `None`.
+    """
+    s = time.time()
+    result = None
+    status = "ok"
     try:
-        req = Request(url)
-        req.add_header("Accept", "application/json")
-        resp = urlopen(req, timeout=timeout, context=_ssl_context)
-        return json.loads(resp.read().decode("utf-8"))
+        with gevent.Timeout(timeout, False):
+            req = Request(url)
+            req.add_header("Accept", "application/json")
+            resp = urlopen(req, timeout=timeout, context=_ssl_context)
+            result = json.loads(resp.read().decode("utf-8"))
+        if result is None:
+            status = "timeout"
     except (URLError, ValueError, IOError) as e:
-        log.debug("xID RPC fetch failed for %s: %s" % (url, e))
-        return None
+        status = "error: %s" % e
+    elapsed = time.time() - s
+    if elapsed > 0.5 or status != "ok":
+        log.debug("RPC %s -> %s in %.3fs" % (url, status, elapsed))
+    return result
 
 
 def resolve_identity_xid(identity_address):
@@ -218,6 +328,7 @@ def resolve_identity_xid(identity_address):
     Returns dict with {name, tld, owner, active, revoked_at, revoked_at_time} or None if not found.
     Results are cached with TTL to avoid repeated API calls.
     """
+    _load_caches_from_disk()
     now = time.time()
 
     # Check cache
@@ -252,7 +363,11 @@ def resolve_identity_xid(identity_address):
             return None
 
         # Cross-verify: use resolve_with_proof to get chain-attested data
-        domain, verified = _resolve_with_proof(rpc_url, tld, name)
+        domain, verified, fetch_failed = _resolve_with_proof(rpc_url, tld, name)
+        if fetch_failed:
+            # Don't poison the cache on transient failures; let next call retry
+            log.debug("Reverse lookup verification failed transiently for %s, not caching" % identity_address)
+            return None
         if not domain or not verified:
             log.error(
                 "SECURITY: Reverse lookup for %s returned %s.%s but proof verification "
@@ -299,6 +414,7 @@ def resolve_identity_xid(identity_address):
         _identity_cache[identity_address] = entry
         # Also cache under "name.tld" key so _resolve_xid_name_profile benefits
         _identity_cache["%s.%s" % (name, tld)] = entry
+        _schedule_cache_save()
         return {
             "name": entry["name"],
             "tld": entry["tld"],
@@ -325,7 +441,7 @@ def invalidate_identity_cache(identity_address=None):
 
 # Cache for xID name resolution: "name.tld" -> {owner, identities, cached_at}
 _xid_name_cache = {}
-XID_NAME_CACHE_TTL = 300  # 5 minutes
+XID_NAME_CACHE_TTL = 30 * 24 * 60 * 60  # 30 days — revocation is handled via freshness check
 
 
 def _resolve_account_pubkey(address):
@@ -334,25 +450,28 @@ def _resolve_account_pubkey(address):
     Returns the base64-encoded compressed public key string, or None if not found.
     The key is only available after the account has broadcast at least one transaction.
     """
+    now = time.time()
+    cached = _pubkey_cache.get(address)
+    if cached:
+        ttl = PUBKEY_CACHE_TTL if cached.get("pubkey") else PUBKEY_NEGATIVE_TTL
+        if (now - cached["cached_at"]) < ttl:
+            return cached.get("pubkey")
+
     rpc_url = _get_rpc_url()
     url = "%s/cosmos/auth/v1beta1/accounts/%s" % (rpc_url, address)
-    log.debug("_resolve_account_pubkey: fetching %s" % url)
     data = _fetch_json(url)
-    if not data:
-        log.debug("_resolve_account_pubkey: no data for %s" % address)
-        return None
-    log.debug("_resolve_account_pubkey: response keys=%s" % list(data.keys()))
-    account = data.get("account", {})
-    log.debug("_resolve_account_pubkey: account keys=%s" % list(account.keys()))
-    # EthAccount wraps BaseAccount
-    base = account.get("base_account", account)
-    log.debug("_resolve_account_pubkey: base keys=%s" % list(base.keys()))
-    pub_key = base.get("pub_key") or base.get("public_key")
-    log.debug("_resolve_account_pubkey: pub_key=%s" % repr(pub_key))
-    if pub_key and isinstance(pub_key, dict):
-        # Protobuf Any: {"@type": "/.../ethsecp256k1.PubKey", "key": "<base64>"}
-        return pub_key.get("key")
-    return None
+    pubkey = None
+    if data:
+        account = data.get("account", {})
+        # EthAccount wraps BaseAccount
+        base = account.get("base_account", account)
+        pub_key = base.get("pub_key") or base.get("public_key")
+        if pub_key and isinstance(pub_key, dict):
+            # Protobuf Any: {"@type": "/.../ethsecp256k1.PubKey", "key": "<base64>"}
+            pubkey = pub_key.get("key")
+
+    _pubkey_cache[address] = {"pubkey": pubkey, "cached_at": now}
+    return pubkey
 
 
 def resolve_xid_name(name, tld="epix"):
@@ -367,6 +486,7 @@ def resolve_xid_name(name, tld="epix"):
     callers can perform temporal verification (accept old content signed before
     revocation).
     """
+    _load_caches_from_disk()
     cache_key = "%s.%s" % (name, tld)
     now = time.time()
 
@@ -379,12 +499,38 @@ def resolve_xid_name(name, tld="epix"):
     rpc_url = _get_rpc_url()
 
     # Use resolve_with_proof for chain-verified resolution
-    domain, verified = _resolve_with_proof(rpc_url, tld, name)
+    domain, verified, fetch_failed = _resolve_with_proof(rpc_url, tld, name)
+
+    if fetch_failed:
+        # Transient failure (timeout, network). If we have a stale-but-positive
+        # cached entry, serve that rather than breaking signing flows entirely.
+        # This is critical for write paths (signing, certs) — the alternative
+        # is "Private key invalid" errors any time the chain RPC hiccups.
+        if cached and cached.get("owner"):
+            log.debug(
+                "resolve_xid_name %s: transient RPC failure, using STALE cache "
+                "(age=%.1fs)" % (cache_key, now - cached["cached_at"])
+            )
+            return {"owner": cached["owner"], "identities": cached["identities"]}
+        # No fallback — return None but don't negative-cache
+        log.debug("resolve_xid_name %s: transient RPC failure, no cache fallback" % cache_key)
+        return None
+
     if not domain:
+        # Authoritative "not found" response — safe to negative-cache
         _xid_name_cache[cache_key] = {"owner": None, "cached_at": now}
         return None
 
     if not verified:
+        # Couldn't verify against chain (mismatched root, unfinalized digest, etc).
+        # Same fallback logic as fetch_failed: prefer stale-but-trusted data over
+        # nothing, since the alternative breaks signing.
+        if cached and cached.get("owner"):
+            log.debug(
+                "resolve_xid_name %s: verification failed, using STALE cache "
+                "(age=%.1fs)" % (cache_key, now - cached["cached_at"])
+            )
+            return {"owner": cached["owner"], "identities": cached["identities"]}
         log.error(
             "SECURITY: xID resolution for %s.%s could not be verified against chain. "
             "Rejecting unverified data to prevent rogue RPC attacks." % (name, tld)
@@ -415,6 +561,7 @@ def resolve_xid_name(name, tld="epix"):
         "identities": identities,
         "cached_at": now,
     }
+    _schedule_cache_save()
     return {"owner": owner, "identities": identities}
 
 
@@ -429,6 +576,7 @@ def _resolve_xid_name_profile(xid_directory):
     if len(parts) != 2 or not parts[0] or not parts[1]:
         return None
 
+    _load_caches_from_disk()
     name, tld = parts
     cache_key = "%s.%s" % (name, tld)
     now = time.time()
@@ -448,8 +596,11 @@ def _resolve_xid_name_profile(xid_directory):
             return None
 
     rpc_url = _get_rpc_url()
-    domain, verified = _resolve_with_proof(rpc_url, tld, name)
-    if not domain or not verified:
+    domain, verified, fetch_failed = _resolve_with_proof(rpc_url, tld, name)
+    if fetch_failed or not verified:
+        # Don't cache transient failures — let next call retry
+        return None
+    if not domain:
         _identity_cache[cache_key] = {"name": None, "cached_at": now}
         return None
 
@@ -463,6 +614,7 @@ def _resolve_xid_name_profile(xid_directory):
         "cached_at": now,
     }
     _identity_cache[cache_key] = entry
+    _schedule_cache_save()
     return {
         "name": name, "tld": tld,
         "owner": entry["owner"],
@@ -540,8 +692,11 @@ def resolve_site_xid(site):
     # this site's address, OR check if any linked identity's address matches
     # the site address (for sites owned directly by the xID owner).
     rpc_url = _get_rpc_url()
-    domain, verified = _resolve_with_proof(rpc_url, tld, name)
+    domain, verified, fetch_failed = _resolve_with_proof(rpc_url, tld, name)
 
+    if fetch_failed:
+        # Transient — don't cache, let next call retry
+        return None
     if not domain or not verified:
         log.warning(
             "Site %s claims xid_name '%s' but chain verification failed" %
@@ -744,6 +899,28 @@ class ContentManagerPlugin(object):
                 xid_name_only = xid_name
 
             xid_info = resolve_xid_name(xid_name_only, tld)
+            if not xid_info:
+                raise VerifyError("xID name '%s' not found on chain" % xid_name)
+
+        # Freshness check: if content was modified after our cache entry, the cache
+        # predates the signature and might miss a revocation that happened in between.
+        # Force a refetch so we have revocation data that post-dates the content.
+        tld_for_freshness = "epix"
+        name_parts = xid_name.rsplit(".", 1)
+        if len(name_parts) == 2:
+            xid_name_only, tld_for_freshness = name_parts
+        else:
+            xid_name_only = xid_name
+        cache_entry = _xid_name_cache.get("%s.%s" % (xid_name_only, tld_for_freshness))
+        content_modified = content.get("modified", 0)
+        cached_at = cache_entry.get("cached_at", 0) if cache_entry else 0
+        if content_modified > cached_at:
+            log.debug(
+                "xID freshness: content %s (modified=%s) newer than cache (cached_at=%s), refetching" %
+                (xid_name, content_modified, cached_at)
+            )
+            invalidate_xid_name_cache("%s.%s" % (xid_name_only, tld_for_freshness))
+            xid_info = resolve_xid_name(xid_name_only, tld_for_freshness)
             if not xid_info:
                 raise VerifyError("xID name '%s' not found on chain" % xid_name)
 
