@@ -822,6 +822,20 @@ class Site(object):
                     # Use hashfield from update response if available (saves round-trip)
                     if "hashfield_raw" in result:
                         peer.hashfield.replaceFromBytes(result["hashfield_raw"])
+                    # Credit inline-delivered files: the peer wrote them as part of
+                    # actionUpdate, so they're already at the peer — no actionPushFile needed.
+                    content_inner_dir = helper.getDirname(inner_path)
+                    for inline_relative_path in inline_files:
+                        inline_inner_path = content_inner_dir + inline_relative_path
+                        entry = self.push_pending.get(inline_inner_path)
+                        if not entry:
+                            continue
+                        entry["pushed_count"] = entry.get("pushed_count", 0) + 1
+                        if entry["pushed_count"] >= self.PUSH_TARGET:
+                            del self.push_pending[inline_inner_path]
+                            self.log.info("Push complete for %s (%d peers, inline)" % (
+                                inline_inner_path, entry["pushed_count"]
+                            ))
                     self.pushFilesToPeer(peer, inner_path, inline_files)
             else:
                 if result == {"exception": "Timeout"}:
