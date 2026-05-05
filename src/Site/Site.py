@@ -795,10 +795,25 @@ class Site(object):
                 self.log.debug("%s already received this update for %s, skipping" % (peer, inner_path))
                 continue
 
-            if peer.connection and peer.connection.last_ping_delay:  # Peer connected
-                timeout = 5 + int(file_size / 1024) + peer.connection.last_ping_delay
-            else:  # Peer not connected
-                timeout = 10 + int(file_size / 1024)
+            # A "connected" peer may hold a TCP-dead socket (NAT/firewall/router rebooted)
+            # that ConnectionServer cleanup only catches after 20min of idle. Detect this
+            # at publish time so we can budget appropriately.
+            conn = peer.connection
+            conn_fresh = bool(
+                conn and conn.connected and not conn.closed
+                and (time.time() - max(conn.last_recv_time, conn.last_message_time, conn.start_time)) < 60
+            )
+            if conn_fresh and conn.last_ping_delay:
+                # Floor at 10s — a stale ping_delay is not a credible RTT estimate.
+                timeout = max(10, 5 + int(file_size / 1024) + conn.last_ping_delay)
+            else:
+                # Stale or missing connection: drop the dead socket so peer.request →
+                # peer.connect can do a fresh getConnection. Budget covers a full TCP
+                # connect (up to 30s) + TLS handshake + handshake exchange.
+                if conn and not conn_fresh:
+                    conn.close("Stale connection before publish")
+                    peer.connection = None
+                timeout = 45 + int(file_size / 1024)
             result = {"exception": "Timeout"}
 
             for retry in range(2):
@@ -902,7 +917,22 @@ class Site(object):
         if len(peers) < limit * 2 and len(self.peers) > len(peers):  # Add more, non-connected peers if necessary
             peers += self.getRecentPeers(limit * 2)
 
-        peers = set(peers)
+        # Rank by connection freshness — peers with recent traffic are far more likely
+        # to actually accept a publish than ones with stale or missing sockets. Since
+        # publisher() pops from the end, place freshest peers last so they go first.
+        #
+        # TODO: same-IP dedup. PEX can register multiple Peer entries for one host on
+        # different ports (NAT remapping, restarts on a new ephemeral port). Phantoms
+        # currently self-clean via Peer.remove() once connection_error hits the limit,
+        # but they generate noisy [FAILED] lines until then. If we want to suppress
+        # that, prefer the freshest peer per IP here and skip the rest.
+        def _peer_freshness_key(p):
+            c = p.connection
+            if not c or not c.connected or c.closed:
+                return 0
+            return max(c.last_recv_time, c.last_message_time, c.start_time)
+
+        peers = sorted(set(peers), key=_peer_freshness_key)
 
         # Determine if our port is open — peers can connect back to download files
         port_open = bool(
