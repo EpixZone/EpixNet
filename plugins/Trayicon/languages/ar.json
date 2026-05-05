@@ -1,0 +1,14 @@
+{
+    "EpixNet Twitter": "EpixNet Twitter",
+    "EpixNet Reddit": "EpixNet Reddit",
+    "EpixNet Github": "EpixNet Github",
+    "Report bug/request feature": "الإبلاغ عن خطأ / طلب ميزة",
+    "!Open EpixNet": "!فتح EpixNet",
+    "Quit": "إنهاء",
+    "(active)": "(نشط)",
+    "(passive)": "(خامل)",
+    "Connections: %s": "الاتصالات: %s",
+    "Received: %.2f MB | Sent: %.2f MB": "تم الاستلام: %.2f MB | تم الإرسال: %.2f MB",
+    "Show console window": "إظهار نافذة وحدة التحكم",
+    "Start EpixNet when Windows starts": "تشغيل EpixNet عند بدء تشغيل ويندوز"
+}

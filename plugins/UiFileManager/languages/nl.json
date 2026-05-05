@@ -1,0 +1,20 @@
+{
+    "New file name:": "Nieuwe bestandsnaam:",
+    "Delete": "Verwijderen",
+    "Cancel": "Annuleren",
+    "Selected:": "Geselecteerd:",
+    "Delete and remove optional:": "Verwijderen en optionele bestanden verwijderen:",
+    " files": " bestanden",
+    " (modified)": " (gewijzigd)",
+    " (new)": " (nieuw)",
+    " (optional)": " (optioneel)",
+    " (ignored from content.json)": " (genegeerd uit content.json)",
+    "Total: ": "Totaal: ",
+    " dir, ": " map, ",
+    " file in ": " bestand in ",
+    "+ New": "+ Nieuw",
+    "Edit": "Bewerken",
+    "View": "Bekijken",
+    "Save": "Opslaan",
+    "Save: done!": "Opslaan: voltooid!"
+}

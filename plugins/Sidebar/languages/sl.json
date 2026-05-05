@@ -1,0 +1,87 @@
+{
+	"Peers": "Peerji",
+	"Connected": "Povezano",
+	"Connectable": "Povezljivo",
+	"Connectable peers": "Povezljivi peerji",
+
+	"Data transfer": "Prenos podatkov",
+	"Received": "Prejeto",
+	"Received bytes": "Prejeti bajti",
+	"Sent": "Poslano",
+	"Sent bytes": "Poslani bajti",
+
+	"Files": "Datoteke",
+	"Total": "Skupaj",
+	"Image": "Slika",
+	"Other": "Drugo",
+	"User data": "Uporabniški podatki",
+
+	"Size limit": "Omejitev velikosti",
+	"limit used": "porabljeno",
+	"free space": "prost prostor",
+	"Set": "Nastavi",
+
+	"Optional files": "Izbirne datoteke",
+	"Downloaded": "Preneseno",
+	"Download and help distribute all files": "Prenesi in pomagaj distribuirati vse datoteke",
+	"Total size": "Skupna velikost",
+	"Downloaded files": "Prenesene datoteke",
+
+	"Database": "Baza podatkov",
+	"search feeds": "iskanje virov",
+	"{feeds} query": "poizvedba {feeds}",
+	"Reload": "Ponovno naloži",
+	"Rebuild": "Ponovno zgradi",
+	"No database found": "Baza podatkov ni najdena",
+
+	"Identity address": "Naslov identitete",
+	"Certificate": "Certifikat",
+	"Disconnect": "Prekini povezavo",
+	"New": "Novo",
+	"Change": "Spremeni",
+
+	"Site control": "Upravljanje strani",
+	"Update": "Posodobi",
+	"Pause": "Začasno ustavi",
+	"Resume": "Nadaljuj",
+	"Delete": "Izbriši",
+	"Are you sure?": "Ali ste prepričani?",
+
+	"Site address": "Naslov strani",
+	"Donate": "Doniraj",
+
+	"Missing files": "Manjkajoče datoteke",
+	"{} try": "{} poskus",
+	"{} tries": "{} poskusi",
+	"+ {num_bad_files} more": "+ še {num_bad_files}",
+
+	"This is my site": "To je moja stran",
+	"Site title": "Naslov strani",
+	"Site description": "Opis strani",
+	"xID name": "Ime xID",
+	"e.g. mysite.epix": "npr. mysite.epix",
+	"Save site settings": "Shrani nastavitve strani",
+
+	"Content publishing": "Objava vsebine",
+	"Choose": "Izberi",
+	"Sign": "Podpiši",
+	"Publish": "Objavi",
+
+	"This function is disabled on this proxy": "Ta funkcija je onemogočena na tem proxyju",
+	"GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "Napaka pri prenosu GeoLite2 City baze podatkov: {}!<br>Ročno prenesite in razpakirajte v mapo data:<br>{}",
+	"Downloading GeoLite2 City database (one time only, ~20MB)...": "Prenašanje GeoLite2 City baze podatkov (samo enkrat, ~20MB)...",
+	"GeoLite2 City database downloaded!": "GeoLite2 City baza podatkov je prenesena!",
+
+	"Are you sure?": "Ali ste prepričani?",
+	"Site storage limit modified!": "Omejitev shrambe strani je spremenjena!",
+	"Database schema reloaded!": "Shema baze podatkov je ponovno naložena!",
+	"Database rebuilding....": "Obnavljanje baze podatkov...",
+	"Database rebuilt!": "Baza podatkov je obnovljena!",
+	"Site updated!": "Stran je posodobljena!",
+	"Delete this site": "Izbriši to stran",
+	"File write error: ": "Napaka pri zapisovanju datoteke: ",
+	"Site settings saved!": "Nastavitve strani so shranjene!",
+	"Enter your private key:": "Vnesite svoj zasebni ključ:",
+	" Signed!": " Podpisano!",
+	"WebGL not supported": "WebGL ni podprt"
+}

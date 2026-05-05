@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet Twitter",
+	"EpixNet Reddit": "EpixNet Reddit",
+	"EpixNet Github": "EpixNet Github",
+	"Report bug/request feature": "Rapportér fejl/forslag til funktion",
+	"!Open EpixNet": "!Åbn EpixNet",
+	"Quit": "Afslut",
+	"(active)": "(aktiv)",
+	"(passive)": "(passiv)",
+	"Connections: %s": "Forbindelser: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "Modtaget: %.2f MB | Sendt: %.2f MB",
+	"Show console window": "Vis konsolvindue",
+	"Start EpixNet when Windows starts": "Start EpixNet når Windows starter"
+}

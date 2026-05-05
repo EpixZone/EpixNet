@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet 트위터",
+	"EpixNet Reddit": "EpixNet 레딧",
+	"EpixNet Github": "EpixNet 깃허브",
+	"Report bug/request feature": "버그 신고 / 기능 요청",
+	"!Open EpixNet": "!EpixNet 열기",
+	"Quit": "종료",
+	"(active)": "(활성)",
+	"(passive)": "(비활성)",
+	"Connections: %s": "연결: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "수신: %.2f MB | 전송: %.2f MB",
+	"Show console window": "콘솔 창 표시",
+	"Start EpixNet when Windows starts": "Windows 시작 시 EpixNet 실행"
+}

@@ -1,0 +1,87 @@
+{
+	"Peers": "Вузли",
+	"Connected": "Підключено",
+	"Connectable": "Доступні для підключення",
+	"Connectable peers": "Вузли, доступні для підключення",
+
+	"Data transfer": "Передача даних",
+	"Received": "Отримано",
+	"Received bytes": "Отримані байти",
+	"Sent": "Надіслано",
+	"Sent bytes": "Надіслані байти",
+
+	"Files": "Файли",
+	"Total": "Всього",
+	"Image": "Зображення",
+	"Other": "Інше",
+	"User data": "Дані користувача",
+
+	"Size limit": "Ліміт розміру",
+	"limit used": "використано",
+	"free space": "вільне місце",
+	"Set": "Встановити",
+
+	"Optional files": "Додаткові файли",
+	"Downloaded": "Завантажено",
+	"Download and help distribute all files": "Завантажити та допомогти розповсюджувати всі файли",
+	"Total size": "Загальний розмір",
+	"Downloaded files": "Завантажені файли",
+
+	"Database": "База даних",
+	"search feeds": "пошук джерел",
+	"{feeds} query": "запит {feeds}",
+	"Reload": "Перезавантажити",
+	"Rebuild": "Перебудувати",
+	"No database found": "Базу даних не знайдено",
+
+	"Identity address": "Адреса ідентичності",
+	"Certificate": "Сертифікат",
+	"Disconnect": "Від’єднати",
+	"New": "Новий",
+	"Change": "Змінити",
+
+	"Site control": "Керування сайтом",
+	"Update": "Оновити",
+	"Pause": "Призупинити",
+	"Resume": "Продовжити",
+	"Delete": "Видалити",
+	"Are you sure?": "Ви впевнені?",
+
+	"Site address": "Адреса сайту",
+	"Donate": "Підтримати",
+
+	"Missing files": "Відсутні файли",
+	"{} try": "{} спроба",
+	"{} tries": "{} спроб",
+	"+ {num_bad_files} more": "+ ще {num_bad_files}",
+
+	"This is my site": "Це мій сайт",
+	"Site title": "Назва сайту",
+	"Site description": "Опис сайту",
+	"xID name": "Ім’я xID",
+	"e.g. mysite.epix": "напр. mysite.epix",
+	"Save site settings": "Зберегти налаштування сайту",
+
+	"Content publishing": "Публікація контенту",
+	"Choose": "Вибрати",
+	"Sign": "Підписати",
+	"Publish": "Опублікувати",
+
+	"This function is disabled on this proxy": "Ця функція вимкнена на цьому проксі",
+	"GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "Помилка завантаження бази GeoLite2 City: {}!<br>Завантажте вручну та розпакуйте в папку data:<br>{}",
+	"Downloading GeoLite2 City database (one time only, ~20MB)...": "Завантаження бази GeoLite2 City (лише один раз, ~20MB)...",
+	"GeoLite2 City database downloaded!": "Базу GeoLite2 City завантажено!",
+
+	"Are you sure?": "Ви впевнені?",
+	"Site storage limit modified!": "Ліміт сховища сайту змінено!",
+	"Database schema reloaded!": "Схему бази даних перезавантажено!",
+	"Database rebuilding....": "Базу даних перебудовується...",
+	"Database rebuilt!": "Базу даних перебудовано!",
+	"Site updated!": "Сайт оновлено!",
+	"Delete this site": "Видалити цей сайт",
+	"File write error: ": "Помилка запису файлу: ",
+	"Site settings saved!": "Налаштування сайту збережено!",
+	"Enter your private key:": "Введіть ваш приватний ключ:",
+	" Signed!": " Підписано!",
+	"WebGL not supported": "WebGL не підтримується"
+}

@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet Twitter",
+	"EpixNet Reddit": "EpixNet Reddit",
+	"EpixNet Github": "EpixNet Github",
+	"Report bug/request feature": "Сообщить об ошибке / предложить функцию",
+	"!Open EpixNet": "!Открыть EpixNet",
+	"Quit": "Выход",
+	"(active)": "(активно)",
+	"(passive)": "(неактивно)",
+	"Connections: %s": "Подключения: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "Получено: %.2f МБ | Отправлено: %.2f МБ",
+	"Show console window": "Показать окно консоли",
+	"Start EpixNet when Windows starts": "Запускать EpixNet при старте Windows"
+}

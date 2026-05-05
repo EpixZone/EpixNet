@@ -1,0 +1,87 @@
+{
+	"Peers": "همتایان",
+	"Connected": "متصل",
+	"Connectable": "قابل اتصال",
+	"Connectable peers": "همتایان قابل اتصال",
+
+	"Data transfer": "انتقال داده",
+	"Received": "دریافت‌شده",
+	"Received bytes": "بایت‌های دریافت‌شده",
+	"Sent": "ارسال‌شده",
+	"Sent bytes": "بایت‌های ارسال‌شده",
+
+	"Files": "فایل‌ها",
+	"Total": "مجموع",
+	"Image": "تصویر",
+	"Other": "سایر",
+	"User data": "داده‌های کاربر",
+
+	"Size limit": "محدودیت حجم",
+	"limit used": "استفاده‌شده",
+	"free space": "فضای خالی",
+	"Set": "تنظیم",
+
+	"Optional files": "فایل‌های اختیاری",
+	"Downloaded": "دانلودشده",
+	"Download and help distribute all files": "دانلود و کمک به توزیع همه فایل‌ها",
+	"Total size": "حجم کل",
+	"Downloaded files": "فایل‌های دانلودشده",
+
+	"Database": "پایگاه داده",
+	"search feeds": "جستجوی منابع",
+	"{feeds} query": "پرس‌وجوی {feeds}",
+	"Reload": "بارگذاری مجدد",
+	"Rebuild": "بازسازی",
+	"No database found": "پایگاه داده یافت نشد",
+
+	"Identity address": "آدرس هویت",
+	"Certificate": "گواهی",
+	"Disconnect": "قطع اتصال",
+	"New": "جدید",
+	"Change": "تغییر",
+
+	"Site control": "کنترل سایت",
+	"Update": "به‌روزرسانی",
+	"Pause": "توقف",
+	"Resume": "ادامه",
+	"Delete": "حذف",
+	"Are you sure?": "آیا مطمئن هستید؟",
+
+	"Site address": "آدرس سایت",
+	"Donate": "حمایت مالی",
+
+	"Missing files": "فایل‌های مفقود",
+	"{} try": "{} تلاش",
+	"{} tries": "{} تلاش",
+	"+ {num_bad_files} more": "+ {num_bad_files} مورد دیگر",
+
+	"This is my site": "این سایت من است",
+	"Site title": "عنوان سایت",
+	"Site description": "توضیحات سایت",
+	"xID name": "نام xID",
+	"e.g. mysite.epix": "مثال: mysite.epix",
+	"Save site settings": "ذخیره تنظیمات سایت",
+
+	"Content publishing": "انتشار محتوا",
+	"Choose": "انتخاب",
+	"Sign": "امضا",
+	"Publish": "انتشار",
+
+	"This function is disabled on this proxy": "این قابلیت در این پراکسی غیرفعال است",
+	"GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "خطا در دانلود پایگاه داده GeoLite2 City: {}!<br>لطفاً به‌صورت دستی دانلود کرده و در پوشه data استخراج کنید:<br>{}",
+	"Downloading GeoLite2 City database (one time only, ~20MB)...": "در حال دانلود پایگاه داده GeoLite2 City (فقط یک‌بار، حدود ۲۰ مگابایت)...",
+	"GeoLite2 City database downloaded!": "پایگاه داده GeoLite2 City دانلود شد!",
+
+	"Are you sure?": "آیا مطمئن هستید؟",
+	"Site storage limit modified!": "محدودیت فضای سایت تغییر کرد!",
+	"Database schema reloaded!": "طرح پایگاه داده مجدداً بارگذاری شد!",
+	"Database rebuilding....": "در حال بازسازی پایگاه داده...",
+	"Database rebuilt!": "پایگاه داده بازسازی شد!",
+	"Site updated!": "سایت به‌روزرسانی شد!",
+	"Delete this site": "حذف این سایت",
+	"File write error: ": "خطای نوشتن فایل: ",
+	"Site settings saved!": "تنظیمات سایت ذخیره شد!",
+	"Enter your private key:": "کلید خصوصی خود را وارد کنید:",
+	" Signed!": " امضا شد!",
+	"WebGL not supported": "WebGL پشتیبانی نمی‌شود"
+}

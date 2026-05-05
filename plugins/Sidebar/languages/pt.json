@@ -1,0 +1,87 @@
+{
+	"Peers": "Peers",
+	"Connected": "Conectado",
+	"Connectable": "Conectável",
+	"Connectable peers": "Peers conectáveis",
+
+	"Data transfer": "Transferência de dados",
+	"Received": "Recebido",
+	"Received bytes": "Bytes recebidos",
+	"Sent": "Enviado",
+	"Sent bytes": "Bytes enviados",
+
+	"Files": "Ficheiros",
+	"Total": "Total",
+	"Image": "Imagem",
+	"Other": "Outro",
+	"User data": "Dados do utilizador",
+
+	"Size limit": "Limite de tamanho",
+	"limit used": "usado",
+	"free space": "espaço livre",
+	"Set": "Definir",
+
+	"Optional files": "Ficheiros opcionais",
+	"Downloaded": "Transferido",
+	"Download and help distribute all files": "Transferir e ajudar a distribuir todos os ficheiros",
+	"Total size": "Tamanho total",
+	"Downloaded files": "Ficheiros transferidos",
+
+	"Database": "Base de dados",
+	"search feeds": "pesquisar feeds",
+	"{feeds} query": "consulta {feeds}",
+	"Reload": "Recarregar",
+	"Rebuild": "Reconstruir",
+	"No database found": "Base de dados não encontrada",
+
+	"Identity address": "Endereço de identidade",
+	"Certificate": "Certificado",
+	"Disconnect": "Desligar",
+	"New": "Novo",
+	"Change": "Alterar",
+
+	"Site control": "Controlo do site",
+	"Update": "Atualizar",
+	"Pause": "Pausar",
+	"Resume": "Retomar",
+	"Delete": "Eliminar",
+	"Are you sure?": "Tens a certeza?",
+
+	"Site address": "Endereço do site",
+	"Donate": "Doar",
+
+	"Missing files": "Ficheiros em falta",
+	"{} try": "{} tentativa",
+	"{} tries": "{} tentativas",
+	"+ {num_bad_files} more": "+ mais {num_bad_files}",
+
+	"This is my site": "Este é o meu site",
+	"Site title": "Título do site",
+	"Site description": "Descrição do site",
+	"xID name": "Nome xID",
+	"e.g. mysite.epix": "ex.: mysite.epix",
+	"Save site settings": "Guardar definições do site",
+
+	"Content publishing": "Publicação de conteúdo",
+	"Choose": "Escolher",
+	"Sign": "Assinar",
+	"Publish": "Publicar",
+
+	"This function is disabled on this proxy": "Esta função está desativada neste proxy",
+	"GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "Erro ao transferir a base de dados GeoLite2 City: {}!<br>Transfere manualmente e descompacta na pasta data:<br>{}",
+	"Downloading GeoLite2 City database (one time only, ~20MB)...": "A transferir base de dados GeoLite2 City (apenas uma vez, ~20MB)...",
+	"GeoLite2 City database downloaded!": "Base de dados GeoLite2 City transferida!",
+
+	"Are you sure?": "Tens a certeza?",
+	"Site storage limit modified!": "Limite de armazenamento do site alterado!",
+	"Database schema reloaded!": "Esquema da base de dados recarregado!",
+	"Database rebuilding....": "A reconstruir base de dados...",
+	"Database rebuilt!": "Base de dados reconstruída!",
+	"Site updated!": "Site atualizado!",
+	"Delete this site": "Eliminar este site",
+	"File write error: ": "Erro de escrita de ficheiro: ",
+	"Site settings saved!": "Definições do site guardadas!",
+	"Enter your private key:": "Introduz a tua chave privada:",
+	" Signed!": " Assinado!",
+	"WebGL not supported": "WebGL não suportado"
+}

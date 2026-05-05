@@ -1,0 +1,20 @@
+{
+    "New file name:": "اسم الملف الجديد:",
+    "Delete": "حذف",
+    "Cancel": "إلغاء",
+    "Selected:": "المحدد:",
+    "Delete and remove optional:": "حذف وإزالة الملفات الاختيارية:",
+    " files": " ملفات",
+    " (modified)": " (معدّل)",
+    " (new)": " (جديد)",
+    " (optional)": " (اختياري)",
+    " (ignored from content.json)": " (متجاهل من content.json)",
+    "Total: ": "الإجمالي: ",
+    " dir, ": " مجلد، ",
+    " file in ": " ملف في ",
+    "+ New": "+ جديد",
+    "Edit": "تعديل",
+    "View": "عرض",
+    "Save": "حفظ",
+    "Save: done!": "حفظ: تم!"
+}

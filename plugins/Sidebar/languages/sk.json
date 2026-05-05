@@ -1,0 +1,87 @@
+{
+	"Peers": "Peerovia",
+	"Connected": "Pripojené",
+	"Connectable": "Pripojiteľné",
+	"Connectable peers": "Pripojiteľní peerovia",
+
+	"Data transfer": "Prenos dát",
+	"Received": "Prijaté",
+	"Received bytes": "Prijaté bajty",
+	"Sent": "Odoslané",
+	"Sent bytes": "Odoslané bajty",
+
+	"Files": "Súbory",
+	"Total": "Celkom",
+	"Image": "Obrázok",
+	"Other": "Ostatné",
+	"User data": "Používateľské dáta",
+
+	"Size limit": "Limit veľkosti",
+	"limit used": "použité",
+	"free space": "voľné miesto",
+	"Set": "Nastaviť",
+
+	"Optional files": "Voliteľné súbory",
+	"Downloaded": "Stiahnuté",
+	"Download and help distribute all files": "Stiahnuť a pomôcť distribuovať všetky súbory",
+	"Total size": "Celková veľkosť",
+	"Downloaded files": "Stiahnuté súbory",
+
+	"Database": "Databáza",
+	"search feeds": "hľadať zdroje",
+	"{feeds} query": "dotaz {feeds}",
+	"Reload": "Znovu načítať",
+	"Rebuild": "Znovu vytvoriť",
+	"No database found": "Databáza nebola nájdená",
+
+	"Identity address": "Adresa identity",
+	"Certificate": "Certifikát",
+	"Disconnect": "Odpojiť",
+	"New": "Nový",
+	"Change": "Zmeniť",
+
+	"Site control": "Ovládanie stránky",
+	"Update": "Aktualizovať",
+	"Pause": "Pozastaviť",
+	"Resume": "Pokračovať",
+	"Delete": "Vymazať",
+	"Are you sure?": "Ste si istý?",
+
+	"Site address": "Adresa stránky",
+	"Donate": "Prispieť",
+
+	"Missing files": "Chýbajúce súbory",
+	"{} try": "{} pokus",
+	"{} tries": "{} pokusy",
+	"+ {num_bad_files} more": "+ ďalších {num_bad_files}",
+
+	"This is my site": "Toto je moja stránka",
+	"Site title": "Názov stránky",
+	"Site description": "Popis stránky",
+	"xID name": "xID meno",
+	"e.g. mysite.epix": "napr. mysite.epix",
+	"Save site settings": "Uložiť nastavenia stránky",
+
+	"Content publishing": "Publikovanie obsahu",
+	"Choose": "Vybrať",
+	"Sign": "Podpísať",
+	"Publish": "Publikovať",
+
+	"This function is disabled on this proxy": "Táto funkcia je na tomto proxy zakázaná",
+	"GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "Chyba pri sťahovaní databázy GeoLite2 City: {}!<br>Stiahnite manuálne a rozbaľte do priečinka data:<br>{}",
+	"Downloading GeoLite2 City database (one time only, ~20MB)...": "Sťahuje sa databáza GeoLite2 City (iba raz, ~20MB)...",
+	"GeoLite2 City database downloaded!": "Databáza GeoLite2 City bola stiahnutá!",
+
+	"Are you sure?": "Ste si istý?",
+	"Site storage limit modified!": "Limit úložiska stránky bol zmenený!",
+	"Database schema reloaded!": "Schéma databázy bola znovu načítaná!",
+	"Database rebuilding....": "Databáza sa znovu vytvára...",
+	"Database rebuilt!": "Databáza bola znovu vytvorená!",
+	"Site updated!": "Stránka bola aktualizovaná!",
+	"Delete this site": "Vymazať túto stránku",
+	"File write error: ": "Chyba zápisu súboru: ",
+	"Site settings saved!": "Nastavenia stránky boli uložené!",
+	"Enter your private key:": "Zadajte svoj súkromný kľúč:",
+	" Signed!": " Podpísané!",
+	"WebGL not supported": "WebGL nie je podporovaný"
+}

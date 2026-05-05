@@ -1,0 +1,87 @@
+{
+    "Peers": "الأقران",
+    "Connected": "متصل",
+    "Connectable": "قابل للاتصال",
+    "Connectable peers": "أقران قابلون للاتصال",
+
+    "Data transfer": "نقل البيانات",
+    "Received": "تم الاستلام",
+    "Received bytes": "البايتات المستلمة",
+    "Sent": "تم الإرسال",
+    "Sent bytes": "البايتات المرسلة",
+
+    "Files": "الملفات",
+    "Total": "الإجمالي",
+    "Image": "صورة",
+    "Other": "أخرى",
+    "User data": "بيانات المستخدم",
+
+    "Size limit": "حد الحجم",
+    "limit used": "المستخدم",
+    "free space": "المساحة الحرة",
+    "Set": "تعيين",
+
+    "Optional files": "ملفات اختيارية",
+    "Downloaded": "تم التنزيل",
+    "Download and help distribute all files": "قم بتنزيل جميع الملفات وساعد في توزيعها",
+    "Total size": "الحجم الإجمالي",
+    "Downloaded files": "الملفات التي تم تنزيلها",
+
+    "Database": "قاعدة البيانات",
+    "search feeds": "البحث في المصادر",
+    "{feeds} query": "استعلام {feeds}",
+    "Reload": "إعادة التحميل",
+    "Rebuild": "إعادة البناء",
+    "No database found": "لم يتم العثور على قاعدة بيانات",
+
+    "Identity address": "عنوان الهوية",
+    "Certificate": "الشهادة",
+    "Disconnect": "قطع الاتصال",
+    "New": "جديد",
+    "Change": "تغيير",
+
+    "Site control": "التحكم بالموقع",
+    "Update": "تحديث",
+    "Pause": "إيقاف مؤقت",
+    "Resume": "استئناف",
+    "Delete": "حذف",
+    "Are you sure?": "هل أنت متأكد؟",
+
+    "Site address": "عنوان الموقع",
+    "Donate": "تبرع",
+
+    "Missing files": "ملفات مفقودة",
+    "{} try": "{} محاولة",
+    "{} tries": "{} محاولات",
+    "+ {num_bad_files} more": "+ {num_bad_files} إضافية",
+
+    "This is my site": "هذا موقعي",
+    "Site title": "عنوان الموقع",
+    "Site description": "وصف الموقع",
+    "xID name": "اسم xID",
+    "e.g. mysite.epix": "مثال: mysite.epix",
+    "Save site settings": "حفظ إعدادات الموقع",
+
+    "Content publishing": "نشر المحتوى",
+    "Choose": "اختيار",
+    "Sign": "توقيع",
+    "Publish": "نشر",
+
+    "This function is disabled on this proxy": "هذه الوظيفة معطلة على هذا البروكسي",
+    "GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "خطأ في تنزيل قاعدة بيانات GeoLite2 City: {}!<br>يرجى التنزيل يدويًا وفك الضغط في مجلد البيانات:<br>{}",
+    "Downloading GeoLite2 City database (one time only, ~20MB)...": "جارٍ تنزيل قاعدة بيانات GeoLite2 City (مرة واحدة فقط، ~20 ميجابايت)...",
+    "GeoLite2 City database downloaded!": "تم تنزيل قاعدة بيانات GeoLite2 City!",
+
+    "Are you sure?": "هل أنت متأكد؟",
+    "Site storage limit modified!": "تم تعديل حد تخزين الموقع!",
+    "Database schema reloaded!": "تم إعادة تحميل مخطط قاعدة البيانات!",
+    "Database rebuilding....": "جارٍ إعادة بناء قاعدة البيانات...",
+    "Database rebuilt!": "تمت إعادة بناء قاعدة البيانات!",
+    "Site updated!": "تم تحديث الموقع!",
+    "Delete this site": "حذف هذا الموقع",
+    "File write error: ": "خطأ في كتابة الملف: ",
+    "Site settings saved!": "تم حفظ إعدادات الموقع!",
+    "Enter your private key:": "أدخل مفتاحك الخاص:",
+    " Signed!": " تم التوقيع!",
+    "WebGL not supported": "WebGL غير مدعوم"
+}

@@ -1,0 +1,20 @@
+{
+    "New file name:": "新文件名：",
+    "Delete": "删除",
+    "Cancel": "取消",
+    "Selected:": "已选择：",
+    "Delete and remove optional:": "删除并移除可选文件：",
+    " files": " 个文件",
+    " (modified)": "（已修改）",
+    " (new)": "（新建）",
+    " (optional)": "（可选）",
+    " (ignored from content.json)": "（已从 content.json 忽略）",
+    "Total: ": "总计：",
+    " dir, ": " 个文件夹，",
+    " file in ": " 个文件在 ",
+    "+ New": "+ 新建",
+    "Edit": "编辑",
+    "View": "查看",
+    "Save": "保存",
+    "Save: done!": "保存：完成！"
+}

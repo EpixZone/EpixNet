@@ -1,0 +1,20 @@
+{
+    "New file name:": "Nyt filnavn:",
+    "Delete": "Slet",
+    "Cancel": "Annuller",
+    "Selected:": "Valgt:",
+    "Delete and remove optional:": "Slet og fjern valgfri:",
+    " files": " filer",
+    " (modified)": " (ændret)",
+    " (new)": " (ny)",
+    " (optional)": " (valgfri)",
+    " (ignored from content.json)": " (ignoreret fra content.json)",
+    "Total: ": "I alt: ",
+    " dir, ": " mappe, ",
+    " file in ": " fil i ",
+    "+ New": "+ Ny",
+    "Edit": "Rediger",
+    "View": "Vis",
+    "Save": "Gem",
+    "Save: done!": "Gem: færdig!"
+}

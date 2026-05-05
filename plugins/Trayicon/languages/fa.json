@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet توییتر",
+	"EpixNet Reddit": "EpixNet ردیت",
+	"EpixNet Github": "EpixNet گیت‌هاب",
+	"Report bug/request feature": "گزارش باگ / درخواست قابلیت",
+	"!Open EpixNet": "!باز کردن EpixNet",
+	"Quit": "خروج",
+	"(active)": "(فعال)",
+	"(passive)": "(غیرفعال)",
+	"Connections: %s": "اتصال‌ها: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "دریافت: %.2f مگابایت | ارسال: %.2f مگابایت",
+	"Show console window": "نمایش پنجره کنسول",
+	"Start EpixNet when Windows starts": "اجرای EpixNet هنگام شروع ویندوز"
+}

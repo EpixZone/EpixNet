@@ -1,0 +1,20 @@
+{
+    "New file name:": "نام فایل جدید:",
+    "Delete": "حذف",
+    "Cancel": "لغو",
+    "Selected:": "انتخاب‌شده:",
+    "Delete and remove optional:": "حذف و پاک کردن فایل‌های اختیاری:",
+    " files": " فایل",
+    " (modified)": " (تغییر یافته)",
+    " (new)": " (جدید)",
+    " (optional)": " (اختیاری)",
+    " (ignored from content.json)": " (نادیده گرفته شده از content.json)",
+    "Total: ": "مجموع: ",
+    " dir, ": " پوشه، ",
+    " file in ": " فایل در ",
+    "+ New": "+ جدید",
+    "Edit": "ویرایش",
+    "View": "مشاهده",
+    "Save": "ذخیره",
+    "Save: done!": "ذخیره: انجام شد!"
+}

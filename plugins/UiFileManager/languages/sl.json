@@ -1,0 +1,20 @@
+{
+    "New file name:": "Novo ime datoteke:",
+    "Delete": "Izbriši",
+    "Cancel": "Prekliči",
+    "Selected:": "Izbrano:",
+    "Delete and remove optional:": "Izbriši in odstrani izbirne datoteke:",
+    " files": " datotek",
+    " (modified)": " (spremenjeno)",
+    " (new)": " (novo)",
+    " (optional)": " (izbirno)",
+    " (ignored from content.json)": " (zanemarjeno iz content.json)",
+    "Total: ": "Skupaj: ",
+    " dir, ": " mapa, ",
+    " file in ": " datoteka v ",
+    "+ New": "+ Novo",
+    "Edit": "Uredi",
+    "View": "Pogled",
+    "Save": "Shrani",
+    "Save: done!": "Shranjevanje: končano!"
+}

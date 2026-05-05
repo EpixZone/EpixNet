@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet Twitter",
+	"EpixNet Reddit": "EpixNet Reddit",
+	"EpixNet Github": "EpixNet Github",
+	"Report bug/request feature": "Fehler melden/Funktionswunsch",
+	"!Open EpixNet": "!EpixNet öffnen",
+	"Quit": "Beenden",
+	"(active)": "(aktiv)",
+	"(passive)": "(passiv)",
+	"Connections: %s": "Verbindungen: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "Empfangen: %.2f MB | Gesendet: %.2f MB",
+	"Show console window": "Konsolenfenster anzeigen",
+	"Start EpixNet when Windows starts": "EpixNet beim Windows-Start ausführen"
+}

@@ -1,0 +1,20 @@
+{
+    "New file name:": "Yeni dosya adı:",
+    "Delete": "Sil",
+    "Cancel": "İptal",
+    "Selected:": "Seçilen:",
+    "Delete and remove optional:": "Sil ve isteğe bağlı dosyaları kaldır:",
+    " files": " dosya",
+    " (modified)": " (değiştirildi)",
+    " (new)": " (yeni)",
+    " (optional)": " (isteğe bağlı)",
+    " (ignored from content.json)": " (content.json'dan yok sayıldı)",
+    "Total: ": "Toplam: ",
+    " dir, ": " klasör, ",
+    " file in ": " dosya içinde ",
+    "+ New": "+ Yeni",
+    "Edit": "Düzenle",
+    "View": "Görüntüle",
+    "Save": "Kaydet",
+    "Save: done!": "Kaydetme: tamamlandı!"
+}

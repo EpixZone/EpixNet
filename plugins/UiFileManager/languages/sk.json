@@ -1,0 +1,20 @@
+{
+    "New file name:": "Nový názov súboru:",
+    "Delete": "Vymazať",
+    "Cancel": "Zrušiť",
+    "Selected:": "Vybrané:",
+    "Delete and remove optional:": "Vymazať a odstrániť voliteľné súbory:",
+    " files": " súbory",
+    " (modified)": " (upravené)",
+    " (new)": " (nové)",
+    " (optional)": " (voliteľné)",
+    " (ignored from content.json)": " (ignorované z content.json)",
+    "Total: ": "Celkom: ",
+    " dir, ": " priečinok, ",
+    " file in ": " súbor v ",
+    "+ New": "+ Nový",
+    "Edit": "Upraviť",
+    "View": "Zobraziť",
+    "Save": "Uložiť",
+    "Save: done!": "Uloženie: dokončené!"
+}

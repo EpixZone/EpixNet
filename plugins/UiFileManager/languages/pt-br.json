@@ -1,0 +1,20 @@
+{
+    "New file name:": "Novo nome de arquivo:",
+    "Delete": "Excluir",
+    "Cancel": "Cancelar",
+    "Selected:": "Selecionado:",
+    "Delete and remove optional:": "Excluir e remover arquivos opcionais:",
+    " files": " arquivos",
+    " (modified)": " (modificado)",
+    " (new)": " (novo)",
+    " (optional)": " (opcional)",
+    " (ignored from content.json)": " (ignorado do content.json)",
+    "Total: ": "Total: ",
+    " dir, ": " pasta, ",
+    " file in ": " arquivo em ",
+    "+ New": "+ Novo",
+    "Edit": "Editar",
+    "View": "Ver",
+    "Save": "Salvar",
+    "Save: done!": "Salvar: concluído!"
+}

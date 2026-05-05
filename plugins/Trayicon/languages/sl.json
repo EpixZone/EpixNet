@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet Twitter",
+	"EpixNet Reddit": "EpixNet Reddit",
+	"EpixNet Github": "EpixNet Github",
+	"Report bug/request feature": "Prijavi napako / predlagaj funkcijo",
+	"!Open EpixNet": "!Odpri EpixNet",
+	"Quit": "Izhod",
+	"(active)": "(aktivno)",
+	"(passive)": "(neaktivno)",
+	"Connections: %s": "Povezave: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "Prejeto: %.2f MB | Poslano: %.2f MB",
+	"Show console window": "Prikaži konzolno okno",
+	"Start EpixNet when Windows starts": "Zaženi EpixNet ob zagonu Windows"
+}

@@ -1,0 +1,87 @@
+{
+	"Peers": "Peers",
+	"Connected": "Verbonden",
+	"Connectable": "Verbindbaar",
+	"Connectable peers": "Verbindbare peers",
+
+	"Data transfer": "Gegevensoverdracht",
+	"Received": "Ontvangen",
+	"Received bytes": "Ontvangen bytes",
+	"Sent": "Verzonden",
+	"Sent bytes": "Verzonden bytes",
+
+	"Files": "Bestanden",
+	"Total": "Totaal",
+	"Image": "Afbeelding",
+	"Other": "Overig",
+	"User data": "Gebruikersgegevens",
+
+	"Size limit": "Grootte limiet",
+	"limit used": "gebruikt",
+	"free space": "vrije ruimte",
+	"Set": "Instellen",
+
+	"Optional files": "Optionele bestanden",
+	"Downloaded": "Gedownload",
+	"Download and help distribute all files": "Download alle bestanden en help met verspreiden",
+	"Total size": "Totale grootte",
+	"Downloaded files": "Gedownloade bestanden",
+
+	"Database": "Database",
+	"search feeds": "feeds zoeken",
+	"{feeds} query": "{feeds} zoekopdracht",
+	"Reload": "Herladen",
+	"Rebuild": "Opnieuw opbouwen",
+	"No database found": "Geen database gevonden",
+
+	"Identity address": "Identiteitsadres",
+	"Certificate": "Certificaat",
+	"Disconnect": "Verbinding verbreken",
+	"New": "Nieuw",
+	"Change": "Wijzigen",
+
+	"Site control": "Sitebeheer",
+	"Update": "Bijwerken",
+	"Pause": "Pauzeren",
+	"Resume": "Hervatten",
+	"Delete": "Verwijderen",
+	"Are you sure?": "Weet je het zeker?",
+
+	"Site address": "Siteadres",
+	"Donate": "Doneren",
+
+	"Missing files": "Ontbrekende bestanden",
+	"{} try": "{} poging",
+	"{} tries": "{} pogingen",
+	"+ {num_bad_files} more": "+ nog {num_bad_files}",
+
+	"This is my site": "Dit is mijn site",
+	"Site title": "Sitetitel",
+	"Site description": "Sitebeschrijving",
+	"xID name": "xID-naam",
+	"e.g. mysite.epix": "bijv. mysite.epix",
+	"Save site settings": "Site-instellingen opslaan",
+
+	"Content publishing": "Inhoud publiceren",
+	"Choose": "Kiezen",
+	"Sign": "Ondertekenen",
+	"Publish": "Publiceren",
+
+	"This function is disabled on this proxy": "Deze functie is uitgeschakeld op deze proxy",
+	"GeoLite2 City database download error: {}!<br>Please download manually and unpack to data dir:<br>{}": "Fout bij downloaden van GeoLite2 City database: {}!<br>Download handmatig en pak uit in de data-map:<br>{}",
+	"Downloading GeoLite2 City database (one time only, ~20MB)...": "GeoLite2 City database wordt gedownload (eenmalig, ~20MB)...",
+	"GeoLite2 City database downloaded!": "GeoLite2 City database gedownload!",
+
+	"Are you sure?": "Weet je het zeker?",
+	"Site storage limit modified!": "Opslaglimiet van de site gewijzigd!",
+	"Database schema reloaded!": "Databaseschema opnieuw geladen!",
+	"Database rebuilding....": "Database wordt opnieuw opgebouwd...",
+	"Database rebuilt!": "Database opnieuw opgebouwd!",
+	"Site updated!": "Site bijgewerkt!",
+	"Delete this site": "Deze site verwijderen",
+	"File write error: ": "Bestandsschrijffout: ",
+	"Site settings saved!": "Site-instellingen opgeslagen!",
+	"Enter your private key:": "Voer je privésleutel in:",
+	" Signed!": " Ondertekend!",
+	"WebGL not supported": "WebGL wordt niet ondersteund"
+}

@@ -1,0 +1,14 @@
+{
+	"EpixNet Twitter": "EpixNet Twitter",
+	"EpixNet Reddit": "EpixNet Reddit",
+	"EpixNet Github": "EpixNet Github",
+	"Report bug/request feature": "Nahlásiť chybu / navrhnúť funkciu",
+	"!Open EpixNet": "!Otvoriť EpixNet",
+	"Quit": "Ukončiť",
+	"(active)": "(aktívne)",
+	"(passive)": "(neaktívne)",
+	"Connections: %s": "Pripojenia: %s",
+	"Received: %.2f MB | Sent: %.2f MB": "Prijaté: %.2f MB | Odoslané: %.2f MB",
+	"Show console window": "Zobraziť konzolové okno",
+	"Start EpixNet when Windows starts": "Spustiť EpixNet pri štarte Windows"
+}

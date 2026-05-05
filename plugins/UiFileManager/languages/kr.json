@@ -1,0 +1,20 @@
+{
+    "New file name:": "새 파일 이름:",
+    "Delete": "삭제",
+    "Cancel": "취소",
+    "Selected:": "선택됨:",
+    "Delete and remove optional:": "삭제 및 선택 파일 제거:",
+    " files": " 파일",
+    " (modified)": " (수정됨)",
+    " (new)": " (새로 생성됨)",
+    " (optional)": " (선택 사항)",
+    " (ignored from content.json)": " (content.json에서 무시됨)",
+    "Total: ": "총: ",
+    " dir, ": " 폴더, ",
+    " file in ": " 파일, ",
+    "+ New": "+ 새로 만들기",
+    "Edit": "편집",
+    "View": "보기",
+    "Save": "저장",
+    "Save: done!": "저장 완료!"
+}
