@@ -557,8 +557,10 @@ class Site(object):
             for inner_path, modified in res["modified_files"].items():  # Check if the peer has newer files than we
                 has_newer = int(modified) > my_modified.get(inner_path, 0)
                 has_older = int(modified) < my_modified.get(inner_path, 0)
-                # Reject files with no place in this site's content hierarchy (catches completely fabricated paths)
-                if self.content_manager.getFileInfo(inner_path) is False:
+                # Reject files with no place in this site's content hierarchy (catches completely fabricated paths).
+                # content.json files are exempt: they define the hierarchy itself and are never listed
+                # in their own "files" dict, so getFileInfo always returns False for them.
+                if not inner_path.endswith("content.json") and self.content_manager.getFileInfo(inner_path) is False:
                     continue
                 if inner_path not in self.bad_files and inner_path not in self.given_up_files and not self.content_manager.isArchived(inner_path, modified):
                     if has_newer:
