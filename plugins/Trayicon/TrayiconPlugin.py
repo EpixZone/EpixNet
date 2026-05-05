@@ -1,6 +1,7 @@
 import os
 import sys
 import atexit
+import time
 
 from Plugin import PluginManager
 from Config import config
@@ -206,6 +207,23 @@ class ActionsPlugin(object):
         # Run pystray in a real OS thread (pystray is not gevent compatible)
         self._icon_thread = threading.Thread(target=self.icon.run, name="Trayicon", daemon=True)
         self._icon_thread.start()
+
+        # Periodically rebuild the menu so dynamic labels (IP, connections,
+        # transfer) reflect the current server state.  The menu is built once
+        # by pystray at startup — before the file_server exists — so without
+        # this the labels stay frozen at their initial "no data" values.
+        def _menu_refresh_loop():
+            while self._icon_thread.is_alive():
+                time.sleep(5)
+                try:
+                    self.icon.update_menu()
+                except Exception:
+                    pass
+        self._menu_refresh_thread = threading.Thread(
+            target=_menu_refresh_loop, name="TrayiconMenuRefresh", daemon=True
+        )
+        self._menu_refresh_thread.start()
+
         super(ActionsPlugin, self).main()
         try:
             self.icon.stop()
