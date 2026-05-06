@@ -77,7 +77,7 @@ class UiWebsocketPlugin(object):
                             else:
                                 where = " WHERE %s > strftime('%%s', 'now', '-%s day')" % (date_field, day_limit)
                                 if "WHERE" in query_part:
-                                    query_part = re.sub("WHERE (.*?)(?=$| GROUP BY)", where+" AND (\\1)", query_part)
+                                    query_part = re.sub(r"WHERE (.*?)(?=$| GROUP BY)", where + r" AND (\1)", query_part, flags=re.DOTALL)
                                 else:
                                     query_part += where
                         query_parts[i] = query_part
