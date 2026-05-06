@@ -188,7 +188,9 @@ class SiteManager(object):
             site.settings["serving"] = True
         site.saveSettings()
         if all_file:  # Also download user files on first sync
-            site.download(check_size=True, blind_includes=True)
+            # Spawn download in background so callers (e.g. actionWrapper) can return
+            # immediately and the loading screen + progress bar are visible to the user.
+            gevent.spawn(site.download, check_size=True, blind_includes=True)
         return site
 
     # Return or create site and start download site files
