@@ -218,10 +218,10 @@ python epixnet.py
 ```cmd
 # Install Tor Browser or standalone Tor
 # Run EpixNet with Tor proxy
-python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151
+python epixnet.py --tor-proxy 127.0.0.1:9150 --tor-controller 127.0.0.1:9151
 
 # For full Tor anonymity
-python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151 --tor always
+python epixnet.py --tor-proxy 127.0.0.1:9150 --tor-controller 127.0.0.1:9151 --tor always
 ```
 
 ## Configuration
@@ -233,7 +233,7 @@ python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151 --t
 python3 epixnet.py
 
 # Custom port
-python3 epixnet.py --ui_port 42222
+python3 epixnet.py --ui-port 42222
 
 # Enable Tor
 python3 epixnet.py --tor always
@@ -242,7 +242,7 @@ python3 epixnet.py --tor always
 python3 epixnet.py --offline
 
 # Custom data directory
-python3 epixnet.py --data_dir /path/to/data
+python3 epixnet.py --data-dir /path/to/data
 
 # Debug mode
 python3 epixnet.py --debug
