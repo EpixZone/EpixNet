@@ -35,13 +35,19 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
 
 ## Quick Start
 
-### Prerequisites
+> [!NOTE]
+> **Jump to**
+> - **Installation on Linux:** [manual](#linux-prerequisites) | [Docker](#docker-installation) | [automated - bash script](#convenience-scripts)
+> - **Installation on Windows:** [manual](#windows-installation)
+> - **Post-installation:** [configuration](#configuration) | [usage](#usage)
+
+#### Linux Prerequisites
 
 - Python 3.8 or higher
 - Git (for cloning the repository)
 - Basic development tools (compiler, etc.)
 
-### Installation
+#### Linux Installation
 
 1. **Clone the repository**:
 
@@ -69,27 +75,16 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
    python3 epixnet.py
    ```
 
-5. **Access the dashboard**:
-   Open your browser and navigate to: `http://127.0.0.1:42222/`
+#### System Dependencies for Source Installation
 
-### Creating Your First Site
-
-1. Visit the EpixNet dashboard at `http://127.0.0.1:42222/`
-2. Click **⋮** > **"Create new, empty site"**
-3. You'll be redirected to your new site that only you can modify
-4. Find your site files in the `data/[your_site_address]` directory
-5. Edit your content, then drag the "0" button left and click **"Sign and publish"**
-
-### System Dependencies for Source Installation
-
-#### Ubuntu/Debian
+##### Ubuntu/Debian
 
 ```bash
 sudo apt update
 sudo apt install git pkg-config libffi-dev python3-pip python3-venv python3-dev build-essential libtool
 ```
 
-#### Fedora/CentOS/RHEL
+##### Fedora/CentOS/RHEL
 
 ```bash
 # Fedora
@@ -100,19 +95,19 @@ sudo yum install epel-release
 sudo yum install git python3 python3-wheel python3-devel gcc
 ```
 
-#### openSUSE
+##### openSUSE
 
 ```bash
 sudo zypper install python3-pip python3-setuptools python3-wheel python3-devel gcc
 ```
 
-#### Arch Linux
+##### Arch Linux
 
 ```bash
 sudo pacman -S git python-pip base-devel
 ```
 
-#### macOS
+##### macOS
 
 ```bash
 # Install Xcode command line tools
@@ -122,7 +117,7 @@ xcode-select --install
 brew install python3
 ```
 
-#### Android (Termux)
+##### Android (Termux)
 
 ```bash
 # Install Termux from F-Droid or Google Play
@@ -136,9 +131,9 @@ pkg install openssl-tool libcrypt clang
 pkg install tor
 ```
 
-### Docker Installation
+##### Docker Installation
 
-#### Using Docker Compose (Recommended)
+##### Using Docker Compose (Recommended)
 
 ```bash
 # Clone the repository
@@ -152,7 +147,7 @@ docker compose up -d epixnet
 docker compose up -d epixnet-tor
 ```
 
-#### Manual Docker Build
+##### Manual Docker Build
 
 ```bash
 # Build standard image
@@ -172,9 +167,9 @@ docker run --rm -it \
 
 **Note**: Replace `/path/to/data` with your desired data directory. This directory will contain your sites and private keys.
 
-### Convenience Scripts
+##### Convenience Scripts
 
-#### Automated Setup Script
+###### Automated Setup Script
 
 ```bash
 # Use the provided setup script
@@ -187,15 +182,15 @@ This script automatically:
 - Installs all dependencies
 - Starts EpixNet
 
-### Windows Installation
+#### Windows Installation
 
-#### Prerequisites
+##### Prerequisites
 
 1. **Install Python 3.8+** from [python.org](https://www.python.org/downloads/)
 2. **Install Git** from [git-scm.com](https://git-scm.com/downloads)
 3. **Install Visual Studio Build Tools** (for compiling dependencies)
 
-#### Installation Steps
+##### Installation Steps
 
 ```cmd
 # Clone the repository
@@ -213,7 +208,7 @@ pip install -r requirements.txt
 python epixnet.py
 ```
 
-#### With Tor Support
+##### With Tor Support
 
 ```cmd
 # Install Tor Browser or standalone Tor
@@ -226,7 +221,7 @@ python epixnet.py --tor_proxy 127.0.0.1:9150 --tor_controller 127.0.0.1:9151 --t
 
 ## Configuration
 
-### Command Line Options
+#### Command Line Options
 
 ```bash
 # Basic usage
@@ -248,28 +243,29 @@ python3 epixnet.py --data_dir /path/to/data
 python3 epixnet.py --debug
 ```
 
-### Configuration File
+#### Configuration File
 
 EpixNet creates a `epixnet.conf` file in your data directory where you can set persistent configuration options.
 
 ## Usage
 
-### Accessing Sites
+#### Accessing Sites
 
 - **Local dashboard**: `http://127.0.0.1:42222/`
 - **Specific site**: `http://127.0.0.1:42222/{site_address}/`
 - **Dashboard site**: `http://127.0.0.1:42222/epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t/`
 
-### Site Management
+#### Site Management
 
 - **Create new site**: Dashboard → ⋮ → "Create new, empty site"
 - **Clone existing site**: Visit site → Clone button
 - **Manage sites**: Dashboard shows all your sites and visited sites
 - **Site files**: Located in `data/{site_address}/` directory
+- **Publish file changes**: Visit site → drag the "0" button left and click "Sign and publish"
 
 ## Development
 
-### Architecture
+#### Architecture
 
 EpixNet is built with a modular plugin architecture:
 
@@ -278,7 +274,7 @@ EpixNet is built with a modular plugin architecture:
 - **UI Server**: Web interface for site management
 - **Plugins**: Extensible functionality (Tor, BitTorrent, etc.)
 
-### Key Technologies
+#### Key Technologies
 
 - **Python 3.8+**: Core runtime
 - **gevent**: Asynchronous networking
@@ -287,7 +283,7 @@ EpixNet is built with a modular plugin architecture:
 - **Cryptography**: Content signing and verification
 - **Tor**: Anonymous networking (optional)
 
-### Contributing
+#### Contributing
 
 We welcome contributions! Here's how you can help:
 
@@ -297,7 +293,7 @@ We welcome contributions! Here's how you can help:
 4. **Test on different platforms**: Help ensure compatibility
 5. **Create packages**: Help package EpixNet for more distributions
 
-### Current Limitations
+#### Current Limitations
 
 - No DHT support (relies on BitTorrent trackers)
 - No I2P integration
