@@ -666,9 +666,16 @@ class UiRequest:
         scheme = self.env['wsgi.url_scheme']
         host = self.getHostWithoutPort()
 
+        # Single-port mode (e.g. behind a reverse proxy): omit explicit port so
+        # the iframe URL stays on the same origin nginx is publishing.
+        if config.ui_site_port == config.ui_port:
+            site_file_server = f'{scheme}://{host}'
+        else:
+            site_file_server = f'{scheme}://{host}:{config.ui_site_port}'
+
         return self.render(
             "src/Ui/template/wrapper.html",
-            site_file_server=f'{scheme}://{host}:{config.ui_site_port}',
+            site_file_server=site_file_server,
             server_url=server_url,
             inner_path=inner_path,
             file_url=xescape(file_url),

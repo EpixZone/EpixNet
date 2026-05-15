@@ -94,8 +94,22 @@ class UiServer:
         from util import Platform
         Platform.setMaxfilesopened(config.max_files_opened)
 
+    # Honor X-Forwarded-Proto / X-Forwarded-Host from a trusted reverse proxy
+    # so wrapper-generated URLs use the public scheme/host, not the bind one.
+    @staticmethod
+    def applyForwardedHeaders(env):
+        if not config.ui_trans_proxy:
+            return
+        forwarded_proto = env.get("HTTP_X_FORWARDED_PROTO")
+        if forwarded_proto:
+            env["wsgi.url_scheme"] = forwarded_proto.split(",")[0].strip()
+        forwarded_host = env.get("HTTP_X_FORWARDED_HOST")
+        if forwarded_host:
+            env["HTTP_HOST"] = forwarded_host.split(",")[0].strip()
+
     # Handle WSGI request
     def handleRequest(self, env, start_response):
+        self.applyForwardedHeaders(env)
         path = bytes(env["PATH_INFO"], "raw-unicode-escape").decode("utf8")
         ui_request = UiRequest(self, env, start_response, is_data_request=False)
         if config.debug:  # Let the exception catched by werkezung
@@ -156,6 +170,7 @@ class UiServer:
         self.log.debug("Stopped.")
 
     def handleSiteRequest(self, env, start_response):
+        self.applyForwardedHeaders(env)
         path = bytes(env["PATH_INFO"], "raw-unicode-escape").decode("utf8")
         ui_request = UiRequest(self, env, start_response, is_data_request=True)
         try:
@@ -165,6 +180,10 @@ class UiServer:
             return ui_request.error500('Error while trying to serve site data')
 
     def startSiteServer(self):
+        # When ui_site_port equals ui_port, both UI and site content are served
+        # by the main WSGIServer (single-port mode, e.g. behind a reverse proxy).
+        if self.site_port == self.port:
+            return
         self.site_server = WSGIServer((self.ip, self.site_port), self.handleSiteRequest, log=self.log)
         self.site_server.serve_forever()
 
