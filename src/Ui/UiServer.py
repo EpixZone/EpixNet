@@ -182,7 +182,10 @@ class UiServer:
     def startSiteServer(self):
         # When ui_site_port equals ui_port, both UI and site content are served
         # by the main WSGIServer (single-port mode, e.g. behind a reverse proxy).
+        # Block forever instead of returning, so Actions.main's greenlet-count
+        # loop doesn't treat this as a finished server and shut down.
         if self.site_port == self.port:
+            gevent.event.Event().wait()
             return
         self.site_server = WSGIServer((self.ip, self.site_port), self.handleSiteRequest, log=self.log)
         self.site_server.serve_forever()
