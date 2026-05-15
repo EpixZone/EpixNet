@@ -412,7 +412,7 @@ class Config:
         self.parser.add_argument('--ui-ip-protect', help="Protect UI server from being accessed through third-party pages and on unauthorized cross-origin pages (enabled by default when serving on localhost IPs; doesn't work with non-local IPs, need testing with host names)", choices=['always', 'local', 'off'], default='local')
         self.parser.add_argument('--ui-ip', help='Web interface bind address', default="127.0.0.1", metavar='ip')
         self.parser.add_argument('--ui-port', help='Web interface bind port', default=42222, type=int, metavar='port')
-        self.parser.add_argument('--ui-site-port', help='Port for serving site content, defaults to ui_port+1', default=None, metavar='port')
+        self.parser.add_argument('--ui-site-port', help='Port for serving site content, defaults to ui_port+1', default=None, type=int, metavar='port')
         self.parser.add_argument('--ui-restrict', help='Restrict web access', default=False, metavar='ip', nargs='*')
         self.parser.add_argument('--ui-host', help='Allow access using this hosts', metavar='host', nargs='*')
         self.parser.add_argument('--ui-trans-proxy', help='Allow access using a transparent proxy', action='store_true')
