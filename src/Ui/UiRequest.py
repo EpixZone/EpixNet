@@ -550,7 +550,15 @@ class UiRequest:
         return server_url
 
     def getHostWithoutPort(self):
-        return ':'.join(self.env['HTTP_HOST'].split(':')[:-1])
+        host = self.env['HTTP_HOST']
+        # IPv6 literals: "[::1]:42222" or just "[::1]"
+        if host.startswith('['):
+            end = host.find(']')
+            return host[:end + 1] if end != -1 else host
+        # IPv4 / hostname: only strip the port if one is present.
+        if ':' in host:
+            return host.rsplit(':', 1)[0]
+        return host
 
     def processQueryString(self, site, query_string):
         match = re.search("epixnet_peers=(.*?)(&|$)", query_string)
