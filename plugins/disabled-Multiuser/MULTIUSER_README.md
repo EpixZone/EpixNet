@@ -3,8 +3,8 @@
 **Main Features:**  
 - Mode settings: access the entire network, or allow only listed sites.  
 - Adding existing sites can be allowed or blocked (`multiuser_no_new_sites`).  
-  - `True` → creation of new sites **allowed** (default)  
-  - `False` → creation of new sites **blocked**, in which case the user receives the following **error message**:  
+  - `True` → adding existing sites allowed (default) **allowed** (default)  
+  - `False` → adding existing sites allowed (default) **blocked**, in which case the user receives the following **error message**:  
     ```
     Not Found
     Adding new sites disabled on this proxy
