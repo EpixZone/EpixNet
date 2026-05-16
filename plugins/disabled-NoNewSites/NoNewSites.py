@@ -14,7 +14,9 @@
 ## epixnet. If not, see <https://www.gnu.org/licenses/>.
 ##
 
+import json
 import re
+import time
 from Plugin import PluginManager
 
 GATEWAY_BANNER_HTML = """
@@ -60,9 +62,13 @@ class NoNewSites(object):
             'Config',
             'Plugins',
             'Stats',
+            'Stats.json',
             'Benchmark',
         ]
-        match_reserved = re.match(f"/({'|'.join(reserved_names)})/?", path)
+        # Match either the reserved name on its own or with trailing slash —
+        # but not as a prefix of a longer name (e.g. "Stats" shouldn't swallow
+        # "Stats.json"). The (?=/|$) lookahead enforces that.
+        match_reserved = re.match(f"/({'|'.join(map(re.escape, reserved_names))})(?=/|$)", path)
         if not match_address and not match_reserved:
             self.sendHeader(500)
             return self.formatError("Plugin error", "No match for address found")
@@ -73,6 +79,39 @@ class NoNewSites(object):
             self.sendHeader(404)
             return self.formatError("Not Found", "Adding new sites disabled", details=False)
         return super(NoNewSites, self).actionWrapper(path, extra_headers)
+
+    # Lightweight public stats endpoint for the marketing site header.
+    # Avoids the full /Stats debug page (which iterates live sockets and
+    # crashes on closed file descriptors). Cached for 30s.
+    _stats_json_cache = {"at": 0, "body": None}
+
+    def actionStatsJson(self):
+        import main
+        from Config import config
+
+        now = time.time()
+        cache = NoNewSites._stats_json_cache
+        if cache["body"] is None or now - cache["at"] > 30:
+            try:
+                fs = main.file_server
+                payload = {
+                    "version": config.version,
+                    "sites": len(fs.sites) if hasattr(fs, "sites") else 0,
+                    "peers": len(fs.connections),
+                    "bytes_recv": fs.bytes_recv,
+                    "bytes_sent": fs.bytes_sent,
+                    "port_opened": bool(fs.port_opened),
+                }
+            except Exception as e:
+                payload = {"error": str(e)}
+            cache["body"] = json.dumps(payload).encode("utf8")
+            cache["at"] = now
+
+        # CORS is added by nginx (location = /Stats.json) so the marketing
+        # site can fetch this from a different origin. Keep it out of here
+        # so we don't end up with two Access-Control-Allow-Origin headers.
+        self.sendHeader(200, content_type="application/json")
+        return cache["body"]
 
     # Inject the public-gateway banner into every wrapper page.
     def renderWrapper(self, *args, **kwargs):
