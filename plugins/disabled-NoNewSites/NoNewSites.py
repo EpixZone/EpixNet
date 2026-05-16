@@ -131,7 +131,10 @@ class NoNewSites(object):
         # site can fetch this from a different origin. Keep it out of here
         # so we don't end up with two Access-Control-Allow-Origin headers.
         self.sendHeader(200, content_type="application/json")
-        return cache["body"]
+        # WSGI requires an iterable of bytes. Returning raw bytes makes
+        # gevent's pywsgi iterate byte-by-byte and crash with
+        # "TypeError: object of type 'int' has no len()".
+        return [cache["body"]]
 
     # Inject the public-gateway banner into every wrapper page.
     def renderWrapper(self, *args, **kwargs):
