@@ -94,10 +94,30 @@ class NoNewSites(object):
         if cache["body"] is None or now - cache["at"] > 30:
             try:
                 fs = main.file_server
+                sites = list(self.server.sites.values())
+
+                # Sum per-site peer counts. peers_total counts every peer this
+                # node has ever heard of for any site (the "known" pool).
+                # peers_connected counts peers we have an active connection
+                # to right now. Iterating site.peers (a dict) is safe — we
+                # never touch peer.connection.sock, so no Bad-fd risk like
+                # the upstream /Stats page has.
+                peers_total = 0
+                peers_connected = 0
+                for site in sites:
+                    site_peers = list(site.peers.values())
+                    peers_total += len(site_peers)
+                    for peer in site_peers:
+                        conn = peer.connection
+                        if conn and conn.connected:
+                            peers_connected += 1
+
                 payload = {
                     "version": config.version,
-                    "sites": len(fs.sites) if hasattr(fs, "sites") else 0,
-                    "peers": len(fs.connections),
+                    "sites": len(sites),
+                    "peers_total": peers_total,
+                    "peers_connected": peers_connected,
+                    "connections": len(fs.connections),
                     "bytes_recv": fs.bytes_recv,
                     "bytes_sent": fs.bytes_sent,
                     "port_opened": bool(fs.port_opened),
