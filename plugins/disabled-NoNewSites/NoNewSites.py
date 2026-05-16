@@ -17,11 +17,43 @@
 import re
 from Plugin import PluginManager
 
+GATEWAY_BANNER_HTML = """
+<style>
+/* Banner sits above the iframe but below the wrapper's UI chrome
+   (notifications z=999, fixbutton z=999, popups z=9999) so error/warning
+   toasts and the menu stay clickable on top of the banner area. */
+#epix-gateway-banner {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 1;
+    height: 38px;
+    background: #0d1117; color: #e6edf3;
+    font: 13px/38px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    text-align: center; padding: 0 16px;
+    box-sizing: border-box;
+}
+#epix-gateway-banner strong { color: #f0f6fc; font-weight: 600; }
+#epix-gateway-banner a {
+    color: #fff; background: #238636; text-decoration: none;
+    padding: 5px 12px; border-radius: 4px; margin-left: 10px;
+    font-weight: 600; transition: background 0.15s;
+}
+#epix-gateway-banner a:hover { background: #2ea043; }
+#inner-iframe { top: 38px !important; height: calc(100% - 38px) !important; }
+</style>
+<div id="epix-gateway-banner">
+    <strong>Public gateway - read-only.</strong>
+    Install EpixNet to use your own identity, browse the full network, and host sites.
+    <a href="https://epixnet.io/#download" target="_blank" rel="noopener">Get EpixNet</a>
+</div>
+</body>
+</html>
+"""
+
 # based on the code from Multiuser plugin
 @PluginManager.registerTo("UiRequest")
 class NoNewSites(object):
     def __init__(self, *args, **kwargs):
         return super(NoNewSites, self).__init__(*args, **kwargs)
+
     def actionWrapper(self, path, extra_headers=None):
         match_address = re.match("/(media/)?(?P<address>[A-Za-z0-9\._-]+)(?P<inner_path>/.*|$)", path)
         reserved_names = [
@@ -41,3 +73,19 @@ class NoNewSites(object):
             self.sendHeader(404)
             return self.formatError("Not Found", "Adding new sites disabled", details=False)
         return super(NoNewSites, self).actionWrapper(path, extra_headers)
+
+    # Inject the public-gateway banner into every wrapper page.
+    def renderWrapper(self, *args, **kwargs):
+        try:
+            import logging
+            body = super(NoNewSites, self).renderWrapper(*args, **kwargs)
+            logging.info("NoNewSites.renderWrapper: body type=%s len=%s" % (type(body).__name__, len(body) if body else 'n/a'))
+            if isinstance(body, bytes):
+                return re.sub(rb"</body>\s*</html>\s*$",
+                              GATEWAY_BANNER_HTML.encode("utf8"),
+                              body)
+            return re.sub(r"</body>\s*</html>\s*$", GATEWAY_BANNER_HTML, body)
+        except Exception as e:
+            import logging
+            logging.error("NoNewSites.renderWrapper FAILED: %r" % e)
+            return body
