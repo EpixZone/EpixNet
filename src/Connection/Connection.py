@@ -245,6 +245,14 @@ class Connection(object):
                     except StopIteration:
                         break
                     if not type(message) is dict:
+                        # First message on a fresh inbound connection that doesn't decode as a
+                        # msgpack map is almost always internet noise (port scanners, HTTP/TLS
+                        # probes). Drop silently instead of logging a scary "Socket error".
+                        if self.type == "in" and not self.handshake:
+                            if config.debug_socket:
+                                self.log("Non-protocol traffic, dropping. type: %s, content: %r, buffer: %r" % (type(message), message, buff[0:16]))
+                            self.close("Non-protocol traffic")
+                            return
                         if config.debug_socket:
                             self.log("Invalid message type: %s, content: %r, buffer: %r" % (type(message), message, buff[0:16]))
                         raise Exception("Invalid message type: %s" % type(message))
