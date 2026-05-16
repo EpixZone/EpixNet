@@ -34,6 +34,12 @@ class UiRequestPlugin(object):
     def actionUiMedia(self, path, *args, **kwargs):
         if path.startswith("/uimedia/plugins/uiconfig/"):
             file_path = path.replace("/uimedia/plugins/uiconfig/", plugin_dir + "/media/")
+            # Reject path traversal and missing files cleanly (avoid 500 on malformed URLs)
+            allowed_root = os.path.realpath(plugin_dir + "/media")
+            real_path = os.path.realpath(file_path)
+            if not real_path.startswith(allowed_root + os.sep) or not os.path.isfile(real_path):
+                return self.error404(path)
+
             if config.debug and (file_path.endswith("all.js") or file_path.endswith("all.css")):
                 # If debugging merge *.css to all.css and *.js to all.js
                 from Debug import DebugMedia
