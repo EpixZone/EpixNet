@@ -62,12 +62,12 @@ class NoNewSites(object):
             'Config',
             'Plugins',
             'Stats',
-            'Stats.json',
+            'StatsJson',
             'Benchmark',
         ]
         # Match either the reserved name on its own or with trailing slash —
         # but not as a prefix of a longer name (e.g. "Stats" shouldn't swallow
-        # "Stats.json"). The (?=/|$) lookahead enforces that.
+        # "StatsJson"). The (?=/|$) lookahead enforces that.
         match_reserved = re.match(f"/({'|'.join(map(re.escape, reserved_names))})(?=/|$)", path)
         if not match_address and not match_reserved:
             self.sendHeader(500)
@@ -127,7 +127,7 @@ class NoNewSites(object):
             cache["body"] = json.dumps(payload).encode("utf8")
             cache["at"] = now
 
-        # CORS is added by nginx (location = /Stats.json) so the marketing
+        # CORS is added by nginx (location = /StatsJson) so the marketing
         # site can fetch this from a different origin. Keep it out of here
         # so we don't end up with two Access-Control-Allow-Origin headers.
         self.sendHeader(200, content_type="application/json")
