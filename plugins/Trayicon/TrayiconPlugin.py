@@ -72,23 +72,59 @@ class ActionsPlugin(object):
                 super(ActionsPlugin, self).main()
                 return
 
+        # With --tor always, SocksProxy.monkeyPatch replaces socket.socket
+        # with socks.socksocket globally. Xlib (used by pystray's _xorg
+        # backend) connects to /tmp/.X11-unix/X* via AF_UNIX, which PySocks
+        # rejects. Temporarily restore the real socket while pystray imports
+        # and install a socket shim into the loaded Xlib modules so the
+        # tray thread's later Display() calls also bypass SOCKS. The global
+        # socket.socket is restored in `finally` so the rest of EpixNet
+        # keeps routing through Tor.
+        import socket as _socket_mod
+        _socks_patched = hasattr(_socket_mod, "socket_noproxy")
+        _saved_socket = _socket_mod.socket if _socks_patched else None
+        if _socks_patched:
+            _socket_mod.socket = _socket_mod.socket_noproxy
+
         try:
-            import pystray
-            import pystray._base
-            from PIL import Image
-        except ImportError as err:
-            print("Trayicon plugin: pystray or Pillow not installed (%s), skipping tray icon." % err)
-            super(ActionsPlugin, self).main()
-            return
-        except Exception as err:
-            # pystray's backend selection runs at import time and can raise
-            # backend-specific errors (e.g. Xlib.error.DisplayNameError on
-            # X11 systems, AppKit errors on broken macOS installs). Treat
-            # any import-time failure as "tray unavailable" rather than
-            # crashing the whole daemon.
-            print("Trayicon plugin: failed to initialize tray backend (%s), skipping tray icon." % err)
-            super(ActionsPlugin, self).main()
-            return
+            try:
+                import pystray
+                import pystray._base
+                from PIL import Image
+            except ImportError as err:
+                print("Trayicon plugin: pystray or Pillow not installed (%s), skipping tray icon." % err)
+                super(ActionsPlugin, self).main()
+                return
+            except Exception as err:
+                # pystray's backend selection runs at import time and can raise
+                # backend-specific errors (e.g. Xlib.error.DisplayNameError on
+                # X11 systems, AppKit errors on broken macOS installs). Treat
+                # any import-time failure as "tray unavailable" rather than
+                # crashing the whole daemon.
+                print("Trayicon plugin: failed to initialize tray backend (%s), skipping tray icon." % err)
+                super(ActionsPlugin, self).main()
+                return
+
+            # pystray._xorg opens the X display lazily inside Icon.__init__
+            # / Icon.run, in the trayicon thread — long after this function
+            # returns. Replace the `socket` module reference inside Xlib's
+            # loaded modules with a shim that exposes the un-proxied socket
+            # class, so those later X11 connections also bypass PySocks.
+            if _socks_patched:
+                class _UnproxiedSocketModule:
+                    def __getattr__(self, name):
+                        return getattr(_socket_mod, name)
+                _shim = _UnproxiedSocketModule()
+                _shim.socket = _socket_mod.socket_noproxy
+                for _modname in ("Xlib.support.unix_connect",
+                                 "Xlib.support.connect",
+                                 "Xlib.protocol.display"):
+                    _mod = sys.modules.get(_modname)
+                    if _mod is not None and hasattr(_mod, "socket"):
+                        _mod.socket = _shim
+        finally:
+            if _socks_patched:
+                _socket_mod.socket = _saved_socket
 
         # pystray runs on a real OS thread and uses queue.Queue for signaling.
         # gevent.monkey.patch_all() replaces queue.Queue with a cooperative
