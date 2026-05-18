@@ -19,6 +19,7 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
 - **Cryptographic authentication**: Password-less authorization using private/public key pairs
 - **Real-time synchronization**: Live updates across all peers when content changes
 - **Built-in database**: P2P synchronized SQLite database for dynamic content
+- **DHT peer discovery**: Trackerless peer discovery over the BitTorrent mainline DHT (enabled by default)
 - **Tor integration**: Full support for .onion hidden services (including onion-v3)
 - **Offline capability**: Access cached sites even without internet connection
 - **Clone protection**: One-click site cloning and forking
@@ -299,7 +300,6 @@ We welcome contributions! Here's how you can help:
 
 ### Current Limitations
 
-- No DHT support (relies on BitTorrent trackers)
 - No I2P integration
 - Limited spam protection mechanisms
 - No built-in encryption for local storage
