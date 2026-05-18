@@ -62,12 +62,31 @@ def _get_startup_folder():
 class ActionsPlugin(object):
 
     def main(self):
+        # On Linux/BSD pystray's _xorg backend opens an X11 connection at
+        # import time, which raises Xlib.error.DisplayNameError("") on
+        # headless boxes (SSH without forwarding, servers, containers, CI).
+        # Skip the tray icon up-front instead of crashing startup.
+        if sys.platform not in ("win32", "darwin"):
+            if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+                print("Trayicon plugin: no display detected (DISPLAY/WAYLAND_DISPLAY unset), skipping tray icon.")
+                super(ActionsPlugin, self).main()
+                return
+
         try:
             import pystray
             import pystray._base
             from PIL import Image
         except ImportError as err:
             print("Trayicon plugin: pystray or Pillow not installed (%s), skipping tray icon." % err)
+            super(ActionsPlugin, self).main()
+            return
+        except Exception as err:
+            # pystray's backend selection runs at import time and can raise
+            # backend-specific errors (e.g. Xlib.error.DisplayNameError on
+            # X11 systems, AppKit errors on broken macOS installs). Treat
+            # any import-time failure as "tray unavailable" rather than
+            # crashing the whole daemon.
+            print("Trayicon plugin: failed to initialize tray backend (%s), skipping tray icon." % err)
             super(ActionsPlugin, self).main()
             return
 
