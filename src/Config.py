@@ -245,7 +245,7 @@ class Config:
             path = MACOSX_DIR
         elif self.platform == 'windows':
             path = WINDOWS_DIR
-        elif self.platform in ('libredesktop', 'Linux'):
+        elif self.platform in ('libredesktop', 'Linux', 'linux'):
             path = LIBREDESKTOP_DIR
         else:
             raise RuntimeError(f'UNKNOWN PLATFORM: {self.platform}. Something must have went terribly wrong!')
