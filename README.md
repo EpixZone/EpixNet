@@ -35,13 +35,20 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
 
 ## Quick Start
 
-### Prerequisites
+> [!NOTE]
+> **Jump to**
+>
+> - **Installation on Linux:** [manual](#linux-installation) | [Docker](#docker-installation) | [automated - bash script](#convenience-scripts)
+> - **Installation on Windows:** [manual](#windows-installation)
+> - **Post-installation:** [first site](#creating-your-first-site) | [configuration](#configuration) | [usage](#usage)
+
+### Linux Prerequisites
 
 - Python 3.8 or higher
 - Git (for cloning the repository)
 - Basic development tools (compiler, etc.)
 
-### Installation
+### Linux Installation
 
 1. **Clone the repository**:
 
