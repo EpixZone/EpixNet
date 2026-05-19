@@ -50,12 +50,12 @@ class UiRequestPlugin(object):
         else:
             user = None
 
-        # Disable new site creation if --multiuser_no_new_sites enabled
+         # Disable new site creation if --multiuser_no_new_sites enabled "Adding new sites disabled on this proxy", details=True or False turn it False if You want block users to add new websites to your server!
         if config.multiuser_no_new_sites:
             path_parts = self.parsePath(path)
             if not self.server.site_manager.get(match.group("address")) and (not user or user.master_address not in local_master_addresses):
                 self.sendHeader(404)
-                return self.formatError("Not Found", "Adding new sites disabled on this proxy", details=False)
+                return self.formatError("Not Found", "Adding new sites disabled on this proxy", details=True)
 
         if user_created:
             if not extra_headers:
