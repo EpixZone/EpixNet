@@ -77,17 +77,6 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
    python3 epixnet.py
    ```
 
-5. **Access the dashboard**:
-   Open your browser and navigate to: `http://127.0.0.1:42222/`
-
-### Creating Your First Site
-
-1. Visit the EpixNet dashboard at `http://127.0.0.1:42222/`
-2. Click **⋮** > **"Create new, empty site"**
-3. You'll be redirected to your new site that only you can modify
-4. Find your site files in the `data/[your_site_address]` directory
-5. Edit your content, then drag the "0" button left and click **"Sign and publish"**
-
 ### System Dependencies for Source Installation
 
 #### Ubuntu/Debian
@@ -274,6 +263,7 @@ EpixNet creates a `epixnet.conf` file in your data directory where you can set p
 - **Clone existing site**: Visit site → Clone button
 - **Manage sites**: Dashboard shows all your sites and visited sites
 - **Site files**: Located in `data/{site_address}/` directory
+- **Publish changes**: Drag the site "0" button left and click "Sign and publish"
 
 ## Development
 
