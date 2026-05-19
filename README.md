@@ -41,7 +41,7 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
 >
 > - **Installation on Linux:** [manual](#linux-installation) | [Docker](#docker-installation) | [automated - bash script](#convenience-scripts)
 > - **Installation on Windows:** [manual](#windows-installation)
-> - **Post-installation:** [first site](#creating-your-first-site) | [configuration](#configuration) | [usage](#usage)
+> - **Post-installation:** [configuration](#configuration) | [usage](#usage)
 
 ### Linux Prerequisites
 
@@ -76,17 +76,6 @@ EpixNet is a Python-based implementation of a decentralized web platform where:
    ```bash
    python3 epixnet.py
    ```
-
-5. **Access the dashboard**:
-   Open your browser and navigate to: `http://127.0.0.1:42222/`
-
-### Creating Your First Site
-
-1. Visit the EpixNet dashboard at `http://127.0.0.1:42222/`
-2. Click **⋮** > **"Create new, empty site"**
-3. You'll be redirected to your new site that only you can modify
-4. Find your site files in the `data/[your_site_address]` directory
-5. Edit your content, then drag the "0" button left and click **"Sign and publish"**
 
 ### System Dependencies for Source Installation
 
@@ -270,10 +259,11 @@ EpixNet creates a `epixnet.conf` file in your data directory where you can set p
 
 ### Site Management
 
-- **Create new site**: Dashboard → ⋮ → "Create new, empty site"
+- **Create new site**: Dashboard → ⋮ → "Create new, empty site" — you become the sole owner and only you can modify it
 - **Clone existing site**: Visit site → Clone button
 - **Manage sites**: Dashboard shows all your sites and visited sites
 - **Site files**: Located in `data/{site_address}/` directory
+- **Publish changes**: Drag the site "0" button left and click "Sign and publish"
 
 ## Development
 
