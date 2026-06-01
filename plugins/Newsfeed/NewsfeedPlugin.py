@@ -9,10 +9,57 @@ from util.Flag import flag
 
 
 def sanitize_sql_field(field, fallback="date_added"):
-    """Ensure a field name is a safe SQL identifier (letters, digits, underscores only)."""
-    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', field):
+    """Ensure a field name is a safe SQL identifier.
+
+    Accepts simple identifiers (`foo`) and qualified column refs (`tbl.col`).
+    Rejects anything else (whitespace, operators, quotes, concatenation, etc.)
+    and returns the fallback. The fallback itself must also pass this regex.
+    """
+    if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?$', field):
         return field
     return fallback
+
+
+# Tokens that always terminate or comment-out a statement and have no
+# legitimate use inside a single-SELECT feed query.
+_FORBIDDEN_LITERALS = re.compile(r"(;|--|/\*|\*/)")
+
+# Mutation / admin / multi-statement keywords. These are only dangerous when
+# used as SQL statements — many (REPLACE, ABORT, BEGIN, END) are also valid
+# in expression / function-call position, so we only flag them when they are
+# NOT immediately followed by `(` (function call form).
+_FORBIDDEN_KEYWORDS = re.compile(
+    r"\b(ATTACH|DETACH|PRAGMA|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|VACUUM"
+    r"|REINDEX|ANALYZE|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b\s*(?!\()",
+    re.IGNORECASE,
+)
+
+
+def is_safe_feed_sql(sql):
+    """Reject SQL that could break out of a single SELECT statement context.
+
+    Returns True iff the string is safe to embed as a subquery / pass to
+    sqlite3.Cursor.execute() without enabling SQL injection or multi-
+    statement execution.
+
+    Rejects:
+      - statement terminators (`;`) and SQL comments (`--`, `/* */`),
+      - mutation/admin/transaction keywords (INSERT, UPDATE, DELETE, DROP,
+        ATTACH, PRAGMA, BEGIN, COMMIT, ...) in statement position,
+      - NUL bytes.
+
+    Allows function-call uses of keywords that share a name with a function
+    (e.g. REPLACE(col, 'x', 'y') is permitted because it's followed by `(`).
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return False
+    if "\x00" in sql:
+        return False
+    if _FORBIDDEN_LITERALS.search(sql):
+        return False
+    if _FORBIDDEN_KEYWORDS.search(sql):
+        return False
+    return True
 
 
 @PluginManager.registerTo("UiWebsocket")
@@ -64,18 +111,23 @@ class UiWebsocketPlugin(object):
                 s = time.time()
                 try:
                     query_raw, params = query_set
+                    if not is_safe_feed_sql(query_raw):
+                        self.log.error("%s feed query %s rejected: unsafe SQL" % (address, name))
+                        stats.append({"site": site.address, "feed_name": name, "error": "unsafe SQL"})
+                        continue
                     query_parts = re.split(r"UNION(?:\s+ALL|)", query_raw)
                     for i, query_part in enumerate(query_parts):
                         db_query = DbQuery(query_part)
                         if day_limit:
+                            # day_limit is int()-coerced at the top of the action
                             date_field = sanitize_sql_field(db_query.fields.get("date_added", "date_added"))
                             has_group_by = "GROUP BY" in query_part.upper()
                             if has_group_by:
                                 # Aggregate aliases can't go in WHERE; use HAVING
-                                having = " HAVING %s > strftime('%%s', 'now', '-%s day')" % (date_field, day_limit)
+                                having = " HAVING %s > strftime('%%s', 'now', '-%d day')" % (date_field, int(day_limit))
                                 query_part = query_part.rstrip() + having
                             else:
-                                where = " WHERE %s > strftime('%%s', 'now', '-%s day')" % (date_field, day_limit)
+                                where = " WHERE %s > strftime('%%s', 'now', '-%d day')" % (date_field, int(day_limit))
                                 if "WHERE" in query_part:
                                     query_part = re.sub(r"WHERE (.*?)(?=$| GROUP BY)", where + r" AND (\1)", query_part, flags=re.DOTALL)
                                 else:
@@ -87,7 +139,11 @@ class UiWebsocketPlugin(object):
                         query_params = map(helper.sqlquote, params)
                         query = query.replace(":params", ",".join(query_params))
 
-                    full_query = query + " ORDER BY date_added DESC LIMIT %s" % limit
+                    full_query = query + " ORDER BY date_added DESC LIMIT %d" % int(limit)
+                    if not is_safe_feed_sql(full_query):
+                        self.log.error("%s feed query %s rejected after rewrite: unsafe SQL" % (address, name))
+                        stats.append({"site": site.address, "feed_name": name, "error": "unsafe SQL"})
+                        continue
                     res = site.storage.query(full_query)
 
                 except Exception as err:  # Log error
@@ -165,31 +221,49 @@ class UiWebsocketPlugin(object):
             for name, query in feeds.items():
                 s = time.time()
                 try:
+                    # Reject feed queries that contain anything that could
+                    # break out of a SELECT subquery context.
+                    if not is_safe_feed_sql(query):
+                        self.log.error("%s feed query %s rejected: unsafe SQL" % (address, name))
+                        stats.append({"site": site.address, "feed_name": name, "error": "unsafe SQL"})
+                        continue
+
                     db_query = DbQuery(query)
 
                     params = []
-                    # Filters
-                    if search_text:
-                        body_field = sanitize_sql_field(db_query.fields.get("body", "body"), "body")
-                        title_field = sanitize_sql_field(db_query.fields.get("title", "title"), "title")
-                        db_query.wheres.append("(%s LIKE ? OR %s LIKE ?)" % (body_field, title_field))
-                        search_like = "%" + search_text.replace(" ", "%") + "%"
-                        params.append(search_like)
-                        params.append(search_like)
+                    # Type filter is on the literal SELECT, applied pre-wrap
                     if filters.get("type") and filters["type"] not in query:
                         continue
 
                     if day_limit:
+                        # day_limit is int()-coerced at the top of the action
                         search_date_field = sanitize_sql_field(db_query.fields.get("date_added", "date_added"))
                         db_query.wheres.append(
-                            "%s > strftime('%%s', 'now', '-%s day')" % (search_date_field, day_limit)
+                            "%s > strftime('%%s', 'now', '-%d day')" % (search_date_field, int(day_limit))
                         )
 
-                    # Order
-                    db_query.parts["ORDER BY"] = "date_added DESC"
-                    db_query.parts["LIMIT"] = str(limit)
-
-                    res = site.storage.query(str(db_query), params)
+                    # Search filter is applied on the outer SELECT aliases to avoid
+                    # ambiguous-column errors when the inner query joins multiple
+                    # tables that share `body`/`title` columns. The outer template
+                    # uses bound parameters for the search text and an int-coerced
+                    # LIMIT — no user-controlled string is interpolated.
+                    if search_text:
+                        inner_sql = str(db_query)
+                        if not is_safe_feed_sql(inner_sql):
+                            self.log.error("%s feed query %s rejected after rewrite: unsafe SQL" % (address, name))
+                            stats.append({"site": site.address, "feed_name": name, "error": "unsafe SQL"})
+                            continue
+                        outer_sql = "SELECT * FROM (\n%s\n) WHERE (body LIKE ? OR title LIKE ?) ORDER BY date_added DESC LIMIT %d" % (
+                            inner_sql, int(limit)
+                        )
+                        search_like = "%" + search_text.replace(" ", "%") + "%"
+                        params.append(search_like)
+                        params.append(search_like)
+                        res = site.storage.query(outer_sql, params)
+                    else:
+                        db_query.parts["ORDER BY"] = "date_added DESC"
+                        db_query.parts["LIMIT"] = "%d" % int(limit)
+                        res = site.storage.query(str(db_query), params)
                 except Exception as err:
                     self.log.error("%s feed query %s error: %s" % (address, name, Debug.formatException(err)))
                     stats.append({"site": site.address, "feed_name": name, "error": str(err), "query": query})
