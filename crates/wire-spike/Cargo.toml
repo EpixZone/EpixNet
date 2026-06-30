@@ -1,0 +1,15 @@
+[package]
+name = "wire-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase-0 spike: prove a Rust client can speak EpixNet's wire protocol
+# (msgpack-streamed handshake + getFile) against a LIVE Python node over loopback.
+# Uses rmpv (dynamic msgpack) directly — no decentnet decoder — so it validates
+# the raw wire format. Deleted once epix-protocol exists.
+
+[dependencies]
+rmpv = "1"
+serde_json = "1"
+epix-crypt = { path = "../epix-crypt" }

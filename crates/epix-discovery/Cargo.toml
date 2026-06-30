@@ -1,0 +1,17 @@
+[package]
+name = "epix-discovery"
+version = "0.1.0"
+edition = "2021"
+description = "Peer discovery for EpixNet: Epix tracker (epix://) announce over the wire protocol. BitTorrent trackers / DHT / PEX land here too."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-protocol = { path = "../epix-protocol" }
+epix-transport = { path = "../epix-transport" }
+rmpv = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time"] }
+epix-content = { path = "../epix-content" }
+serde_json = "1"

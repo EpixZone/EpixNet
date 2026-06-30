@@ -1,0 +1,13 @@
+[package]
+name = "epix-transport"
+version = "0.1.0"
+edition = "2021"
+description = "Transport abstraction (Transport trait + PeerStream) with a TCP impl. Tor/Reticulum slot in here later."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+tokio = { version = "1", features = ["net", "io-util"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }
