@@ -1,0 +1,22 @@
+[package]
+name = "epix-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Parallel download manager: pull a xite's files from peers, verify hashes, and store them."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-xite = { path = "../epix-xite" }
+epix-protocol = { path = "../epix-protocol" }
+epix-transport = { path = "../epix-transport" }
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+
+[dev-dependencies]
+epix-crypt = { path = "../epix-crypt" }
+epix-content = { path = "../epix-content" }
+epix-discovery = { path = "../epix-discovery" }
+epix-protocol = { path = "../epix-protocol" }
+serde_json = "1"
+rmpv = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

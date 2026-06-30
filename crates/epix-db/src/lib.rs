@@ -1,7 +1,7 @@
 //! `epix-db` — SQLite storage for EpixNet.
 //!
-//! A pooled [`Database`] (rusqlite + r2d2), per-site schemas applied from a
-//! site's `dbschema.json` ([`schema`]), and the global [`ContentDb`].
+//! A pooled [`Database`] (rusqlite + r2d2), per-xite schemas applied from a
+//! xite's `dbschema.json` ([`schema`]), and the global [`ContentDb`].
 
 pub mod content_db;
 pub mod schema;
@@ -51,7 +51,7 @@ impl Database {
         self.pool.get().map_err(|e| Error::Db(e.to_string()))
     }
 
-    /// Apply a per-site `dbschema.json` (create tables + indexes).
+    /// Apply a per-xite `dbschema.json` (create tables + indexes).
     pub fn apply_schema(&self, schema: &DbSchema) -> Result<()> {
         let conn = self.conn()?;
         schema::apply(&conn, schema)
@@ -96,22 +96,22 @@ mod tests {
     }
 
     #[test]
-    fn content_db_tracks_site_files() {
+    fn content_db_tracks_xite_files() {
         let cdb = ContentDb::open(Database::open_in_memory().unwrap()).unwrap();
-        let site = cdb.add_site("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t").unwrap();
-        // add_site is idempotent.
-        assert_eq!(site, cdb.add_site("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t").unwrap());
+        let xite = cdb.add_xite("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t").unwrap();
+        // add_xite is idempotent.
+        assert_eq!(xite, cdb.add_xite("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t").unwrap());
 
-        cdb.set_content(site, "content.json", 1777, 9120).unwrap();
-        cdb.set_content(site, "data/users/content.json", 1700, 50).unwrap();
-        assert_eq!(cdb.get_content(site, "content.json").unwrap(), Some((1777, 9120)));
-        assert_eq!(cdb.get_content(site, "missing.json").unwrap(), None);
+        cdb.set_content(xite, "content.json", 1777, 9120).unwrap();
+        cdb.set_content(xite, "data/users/content.json", 1700, 50).unwrap();
+        assert_eq!(cdb.get_content(xite, "content.json").unwrap(), Some((1777, 9120)));
+        assert_eq!(cdb.get_content(xite, "missing.json").unwrap(), None);
 
         // Upsert updates in place.
-        cdb.set_content(site, "content.json", 1888, 9200).unwrap();
-        assert_eq!(cdb.get_content(site, "content.json").unwrap(), Some((1888, 9200)));
+        cdb.set_content(xite, "content.json", 1888, 9200).unwrap();
+        assert_eq!(cdb.get_content(xite, "content.json").unwrap(), Some((1888, 9200)));
 
-        let listed = cdb.list_content(site).unwrap();
+        let listed = cdb.list_content(xite).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].0, "content.json");
     }

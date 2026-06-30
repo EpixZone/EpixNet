@@ -36,11 +36,11 @@ async fn spawn_mock_tracker(peer_ip: [u8; 4], peer_port: u16) -> std::net::Socke
                     // port little-endian, matching EpixNet packAddress.
                     let mut packed = peer_ip.to_vec();
                     packed.extend_from_slice(&peer_port.to_le_bytes());
-                    let site = vmap(vec![("ipv4", Value::Array(vec![Value::Binary(packed)]))]);
+                    let xite = vmap(vec![("ipv4", Value::Array(vec![Value::Binary(packed)]))]);
                     vmap(vec![
                         ("cmd", Value::from("response")),
                         ("to", Value::from(to)),
-                        ("peers", Value::Array(vec![site])),
+                        ("peers", Value::Array(vec![xite])),
                     ])
                 }
                 _ => vmap(vec![
@@ -73,7 +73,7 @@ async fn discovers_peers_via_epix_tracker() {
     assert_eq!(peers, vec![PeerAddr::parse("203.0.113.7:26959").unwrap()]);
 }
 
-/// Manual: query a real live Epix tracker for the Dashboard site's peers.
+/// Manual: query a real live Epix tracker for the Dashboard xite's peers.
 /// `cargo test -p epix-discovery -- --ignored live_tracker --nocapture`
 #[tokio::test]
 #[ignore]
@@ -89,7 +89,7 @@ async fn live_tracker_discovers_real_peers() {
     let peers = discover_via_epix_tracker(&TcpTransport, &tracker, &params)
         .await
         .expect("announce to live tracker");
-    println!("discovered {} real peers for the Dashboard site:", peers.len());
+    println!("discovered {} real peers for the Dashboard xite:", peers.len());
     for p in &peers {
         println!("  {p}");
     }

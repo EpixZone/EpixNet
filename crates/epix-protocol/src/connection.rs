@@ -109,12 +109,14 @@ impl Connection {
     }
 
     /// Download a whole file, following `location`/`size` across chunks.
-    pub async fn get_file(&mut self, site: &str, inner_path: &str) -> Result<Vec<u8>> {
+    pub async fn get_file(&mut self, xite: &str, inner_path: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut location = 0i64;
         loop {
             let params = vmap(vec![
-                ("site", Value::from(site)),
+                // "site" is the on-the-wire field name (the xite address) — kept
+                // verbatim because EpixNet peers parse this exact key.
+                ("site", Value::from(xite)),
                 ("inner_path", Value::from(inner_path)),
                 ("location", Value::from(location)),
             ]);

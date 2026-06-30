@@ -86,7 +86,7 @@ mod tests {
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let addr = epix_crypt::privatekey_to_address(priv_hex).unwrap();
         let mut content = json!({
-            "address": "epix1site",
+            "address": "epix1xite",
             "files": {"index.html": {"size": 10, "sha512": "ab"}},
             "modified": 1777992697,
             "sign": "stale",

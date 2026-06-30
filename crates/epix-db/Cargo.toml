@@ -2,7 +2,7 @@
 name = "epix-db"
 version = "0.1.0"
 edition = "2021"
-description = "EpixNet storage: pooled SQLite, per-site schema from dbschema.json, and the global ContentDb."
+description = "EpixNet storage: pooled SQLite, per-xite schema from dbschema.json, and the global ContentDb."
 
 [dependencies]
 epix-core = { path = "../epix-core" }

@@ -1,4 +1,4 @@
-//! Site / identity addresses (`epix1…` bech32), validated via `epix-crypt`.
+//! Xite / identity addresses (`epix1…` bech32), validated via `epix-crypt`.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
