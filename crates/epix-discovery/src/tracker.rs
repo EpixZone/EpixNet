@@ -1,4 +1,4 @@
-//! Epix tracker (`epix://`) announce: query a tracker peer for site peers.
+//! Epix tracker (`epix://`) announce: query a tracker peer for xite peers.
 
 use epix_core::{Error, PeerAddr, Result};
 use epix_protocol::{vget, vmap, Connection};
@@ -8,13 +8,13 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// Parameters for an `announce` request.
 pub struct AnnounceParams<'a> {
-    /// Site tracker hashes (`sha256(address)`) to query.
+    /// Xite tracker hashes (`sha256(address)`) to query.
     pub hashes: &'a [[u8; 32]],
     /// Our fileserver port (0 if not accepting inbound).
     pub port: u16,
     /// IP types we want back, e.g. `["ipv4", "ipv6"]`.
     pub need_types: &'a [&'a str],
-    /// Max peers per site.
+    /// Max peers per xite.
     pub need_num: i64,
 }
 
@@ -36,14 +36,14 @@ pub async fn announce(conn: &mut Connection, params: &AnnounceParams<'_>) -> Res
     ]);
 
     let res = conn.request("announce", request).await?;
-    let per_site = vget(&res, "peers")
+    let per_xite = vget(&res, "peers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::Protocol("announce response missing `peers`".into()))?;
 
     let mut peers = Vec::new();
-    for site in per_site {
+    for xite in per_xite {
         for key in ["ipv4", "ip4", "ipv6"] {
-            if let Some(list) = vget(site, key).and_then(|v| v.as_array()) {
+            if let Some(list) = vget(xite, key).and_then(|v| v.as_array()) {
                 for packed in list {
                     if let Value::Binary(bytes) = packed {
                         if let Some(p) = unpack_address(bytes) {

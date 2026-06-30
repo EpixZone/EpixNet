@@ -104,12 +104,12 @@ async fn download_and_verify_signed_content_over_loopback() {
 #[tokio::test]
 #[ignore]
 async fn live_node_handshake_and_getfile() {
-    let site = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+    let xite = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
     let addr: std::net::SocketAddr = "127.0.0.1:20790".parse().unwrap();
     let mut conn = Connection::connect(&TcpTransport, &PeerAddr::Ip(addr)).await.unwrap();
     let hs = conn.handshake().await.unwrap();
     println!("peer: {} rev {}", hs.version, hs.rev);
-    let bytes = conn.get_file(site, "content.json").await.unwrap();
+    let bytes = conn.get_file(xite, "content.json").await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let signs = json.get("signs").and_then(|s| s.as_object()).unwrap();
     let signer = signs.keys().next().unwrap();

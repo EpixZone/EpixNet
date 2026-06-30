@@ -1,4 +1,4 @@
-//! Per-site database schema, parsed from a site's `dbschema.json`.
+//! Per-xite database schema, parsed from a xite's `dbschema.json`.
 //!
 //! Mirrors EpixNet's format so existing zites' schemas apply unchanged:
 //! ```json

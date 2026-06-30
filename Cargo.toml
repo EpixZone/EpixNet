@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/wire-spike", "crates/xid-spike", "crates/reticulum-spike"]
+members = ["crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/wire-spike", "crates/xid-spike", "crates/reticulum-spike"]

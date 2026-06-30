@@ -501,6 +501,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-worker"
+version = "0.1.0"
+dependencies = [
+ "epix-content",
+ "epix-core",
+ "epix-crypt",
+ "epix-discovery",
+ "epix-protocol",
+ "epix-transport",
+ "epix-xite",
+ "rmpv",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "epix-xite"
+version = "0.1.0"
+dependencies = [
+ "epix-content",
+ "epix-core",
+ "epix-crypt",
+ "epix-discovery",
+ "epix-transport",
+ "hex",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

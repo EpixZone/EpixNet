@@ -1,4 +1,4 @@
-//! `epix-discovery` — finding peers for a site.
+//! `epix-discovery` — finding peers for a xite.
 //!
 //! The primary method on the live network is the **Epix tracker** (`epix://`):
 //! an `announce` request over the ordinary EpixNet wire protocol (so it reuses
@@ -9,7 +9,7 @@ pub mod tracker;
 
 use sha2::{Digest, Sha256};
 
-/// A site's tracker hash: `sha256(address)` (matches `Site.address_hash`).
+/// A xite's tracker hash: `sha256(address)` (matches the reference address_hash).
 pub fn address_hash(address: &str) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(address.as_bytes());
