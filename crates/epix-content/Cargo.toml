@@ -1,0 +1,13 @@
+[package]
+name = "epix-content"
+version = "0.1.0"
+edition = "2021"
+description = "content.json canonicalization, signing, and signature verification — byte-compatible with EpixNet's ContentManager."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-crypt = { path = "../epix-crypt" }
+serde_json = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

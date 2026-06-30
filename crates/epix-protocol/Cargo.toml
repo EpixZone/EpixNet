@@ -1,0 +1,19 @@
+[package]
+name = "epix-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "EpixNet wire protocol: msgpack framing, handshake, and the FileRequest command set over a PeerStream."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-transport = { path = "../epix-transport" }
+rmpv = "1"
+tokio = { version = "1", features = ["io-util"] }
+getrandom = "0.2"
+hex = "0.4"
+
+[dev-dependencies]
+epix-crypt = { path = "../epix-crypt" }
+epix-content = { path = "../epix-content" }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time"] }

@@ -1,0 +1,15 @@
+[package]
+name = "reticulum-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase-0 spike: prove a Reticulum Link can carry our msgpack frames between two
+# nodes — the seam that lets a wire connection over PeerStream run on mesh.
+# Two in-process nodes over a UDP loopback link. Deleted once epix-reticulum exists.
+
+[dependencies]
+reticulum = { path = "../../../Reticulum-rs" }
+tokio = { version = "1", features = ["full"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rmpv = "1"
