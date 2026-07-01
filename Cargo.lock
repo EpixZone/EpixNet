@@ -558,6 +558,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-dht-net"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "epix-core",
+ "epix-dht",
+ "epix-protocol",
+ "epix-transport",
+ "hex",
+ "rmpv",
+ "tokio",
+]
+
+[[package]]
 name = "epix-discovery"
 version = "0.1.0"
 dependencies = [
@@ -585,6 +599,7 @@ dependencies = [
 name = "epix-protocol"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "epix-content",
  "epix-core",
  "epix-crypt",
