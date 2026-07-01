@@ -483,6 +483,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-chain"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "epix-content"
 version = "0.1.0"
 dependencies = [
