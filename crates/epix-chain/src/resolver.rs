@@ -1,7 +1,7 @@
 //! `XidResolver` — chain-verified `.epix` name resolution.
 
 use crate::merkle::verify_proof;
-use crate::types::{DomainSnapshot, Identity};
+use crate::types::{DnsRecord, DomainSnapshot, Identity};
 use crate::{ChainError, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -147,13 +147,35 @@ fn parse_domain(name: &str, tld: &str, domain: &Value) -> Result<DomainSnapshot>
         })
         .unwrap_or_default();
 
+    let dns_records = domain
+        .get("dns_records")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    Some(DnsRecord {
+                        record_type: r.get("record_type").and_then(as_u32)?,
+                        value: r.get("value")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(DomainSnapshot {
         name: name.to_string(),
         tld: tld.to_string(),
         owner,
         content_root,
         identities,
+        dns_records,
     })
+}
+
+fn as_u32(v: &Value) -> Option<u32> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .map(|n| n as u32)
 }
 
 fn str_field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
