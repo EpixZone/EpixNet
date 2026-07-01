@@ -196,6 +196,22 @@ impl AppState {
         db.query_value(query, params).map_err(|e| e.to_string())
     }
 
+    /// Set (and persist) a site's Newsfeed follows.
+    pub async fn set_feed_follow(&self, address: &str, feeds: Value) {
+        self.user.write().await.set_feed_follow(address, feeds);
+        self.save_user().await;
+    }
+
+    /// A site's Newsfeed follows.
+    pub async fn feed_follow(&self, address: &str) -> Value {
+        self.user.read().await.feed_follow(address)
+    }
+
+    /// All follows across sites (`site_address -> feeds`), for feed aggregation.
+    pub async fn all_follows(&self) -> std::collections::HashMap<String, Value> {
+        self.user.read().await.follows.clone()
+    }
+
     pub async fn has_xite(&self, address: &str) -> bool {
         self.xites.read().await.contains_key(address)
     }
