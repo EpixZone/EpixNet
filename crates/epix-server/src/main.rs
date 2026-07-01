@@ -135,11 +135,19 @@ async fn serve(
             .await;
     }
 
+    // Assemble the UI command set through the plugin system. Real plugins
+    // (Sidebar, Stats, …) register here as they're built.
+    let plugins = epix_plugin::PluginRegistry::new();
+
     let bind: std::net::SocketAddr = BIND.parse().unwrap();
     println!("\n┌──────────────────────────────────────────────");
     println!("│ Epix node serving a xite cloned from the network");
+    println!("│ plugins: {:?}", plugins.names());
     println!("│ Open in your browser:");
     println!("│   http://{BIND}/{display}/");
     println!("└──────────────────────────────────────────────\n");
-    UiServer::new(state).serve(bind).await.expect("server");
+    UiServer::with_registry(state, plugins.command_registry())
+        .serve(bind)
+        .await
+        .expect("server");
 }

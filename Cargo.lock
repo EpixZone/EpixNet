@@ -560,6 +560,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "epix-ui",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "epix-protocol"
 version = "0.1.0"
 dependencies = [
@@ -580,6 +590,7 @@ version = "0.1.0"
 dependencies = [
  "epix-chain",
  "epix-core",
+ "epix-plugin",
  "epix-protocol",
  "epix-transport",
  "epix-ui",
