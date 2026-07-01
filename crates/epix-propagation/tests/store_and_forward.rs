@@ -3,10 +3,14 @@
 //! Runs over TCP here; because it rides `PeerServer`/`Connection`, the same
 //! service works unchanged over the Reticulum mesh.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use epix_core::PeerAddr;
-use epix_propagation::{announce_update, fetch_updates, PropagationService, PropagationStore};
+use epix_propagation::{
+    announce_update, fetch_updates, needs_sync, PropagationClient, PropagationService,
+    PropagationStore,
+};
 use epix_protocol::{Connection, PeerServer};
 use epix_transport::TcpTransport;
 use tokio::net::TcpListener;
@@ -49,4 +53,40 @@ async fn offline_peer_receives_stored_update() {
     assert_eq!(updates.len(), 1, "only the new version, not the duplicate");
     assert_eq!(updates[0].modified, 2000);
     assert_eq!(head3, 2);
+}
+
+/// The client-side flow a node runtime will drive: a cursor-tracking pull, then
+/// deciding which locally-hosted xites are stale and need a verified resync.
+#[tokio::test]
+async fn client_polls_and_decides_what_to_sync() {
+    let store = Arc::new(Mutex::new(PropagationStore::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(PeerServer::new(Arc::new(PropagationService::new(store.clone()))).serve(listener));
+
+    // A publisher announces newer versions of two xites.
+    let mut pubconn = Connection::connect(&TcpTransport, &PeerAddr::Ip(addr)).await.unwrap();
+    pubconn.handshake().await.unwrap();
+    announce_update(&mut pubconn, "hosted.epix", 200).await.unwrap();
+    announce_update(&mut pubconn, "elsewhere.epix", 999).await.unwrap();
+
+    // A node that hosts `hosted.epix` at an older version (and doesn't host the
+    // other) polls, then decides what to resync.
+    let mut node = Connection::connect(&TcpTransport, &PeerAddr::Ip(addr)).await.unwrap();
+    node.handshake().await.unwrap();
+    let mut client = PropagationClient::new();
+    let updates = client.poll(&mut node).await.unwrap();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(client.cursor(), 2, "cursor advanced to head");
+
+    let local = HashMap::from([("hosted.epix".to_string(), 100)]);
+    let to_sync = needs_sync(&updates, &local);
+    assert_eq!(to_sync.len(), 1, "only the hosted, newer xite");
+    assert_eq!(to_sync[0].xite, "hosted.epix");
+    assert_eq!(to_sync[0].modified, 200);
+
+    // Polling again from the advanced cursor yields nothing new.
+    let again = client.poll(&mut node).await.unwrap();
+    assert!(again.is_empty());
+    assert_eq!(client.cursor(), 2);
 }

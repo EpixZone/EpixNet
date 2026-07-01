@@ -16,7 +16,7 @@
 //! stored notification gets a seq, a peer remembers the `head` it last saw, and
 //! asks for everything `after` it. No clocks, no ambiguity, idempotent.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -194,9 +194,68 @@ pub async fn fetch_updates(
     Ok((updates, head))
 }
 
+/// Client-side propagation: remembers the pull cursor for one propagation node
+/// so each [`poll`](PropagationClient::poll) returns only what's new since last
+/// time. The node runtime holds one of these per propagation peer and drives it
+/// on connect / on a timer.
+#[derive(Debug, Default)]
+pub struct PropagationClient {
+    cursor: u64,
+}
+
+impl PropagationClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cursor to resume from (persist across restarts to avoid re-pulling).
+    pub fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Resume from a previously persisted cursor.
+    pub fn with_cursor(cursor: u64) -> Self {
+        Self { cursor }
+    }
+
+    /// Pull notifications newer than the cursor and advance it.
+    pub async fn poll(&mut self, conn: &mut Connection) -> Result<Vec<Notification>> {
+        let (updates, head) = fetch_updates(conn, self.cursor).await?;
+        self.cursor = head;
+        Ok(updates)
+    }
+}
+
+/// Of `notifications`, the xites we already host (present in `local` as
+/// `address -> modified`) that advanced to a newer version — i.e. what the
+/// worker should re-sync. Notifications for xites we don't host are ignored; a
+/// node keeps *its* xites fresh, and the resync still verifies signatures.
+pub fn needs_sync(
+    notifications: &[Notification],
+    local: &HashMap<String, i64>,
+) -> Vec<Notification> {
+    notifications
+        .iter()
+        .filter(|n| local.get(&n.xite).is_some_and(|&have| n.modified > have))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn needs_sync_picks_hosted_and_newer_only() {
+        let local = HashMap::from([("a.epix".to_string(), 1), ("c.epix".to_string(), 5)]);
+        let notifications = vec![
+            Notification { xite: "a.epix".into(), modified: 2 }, // hosted, newer -> sync
+            Notification { xite: "b.epix".into(), modified: 9 }, // not hosted -> ignore
+            Notification { xite: "c.epix".into(), modified: 5 }, // hosted, not newer -> ignore
+        ];
+        let out = needs_sync(&notifications, &local);
+        assert_eq!(out, vec![Notification { xite: "a.epix".into(), modified: 2 }]);
+    }
 
     #[test]
     fn store_is_idempotent_and_cursored() {
