@@ -6,6 +6,8 @@
 
 pub mod connection;
 pub mod msg;
+pub mod server;
 
 pub use connection::{Connection, HandshakeInfo};
 pub use msg::{vget, vmap};
+pub use server::{PeerServer, RequestHandler};

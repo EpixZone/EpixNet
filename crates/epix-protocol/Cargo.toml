@@ -8,9 +8,10 @@ description = "EpixNet wire protocol: msgpack framing, handshake, and the FileRe
 epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
 rmpv = "1"
-tokio = { version = "1", features = ["io-util"] }
+tokio = { version = "1", features = ["io-util", "net", "rt"] }
 getrandom = "0.2"
 hex = "0.4"
+async-trait = "0.1"
 
 [dev-dependencies]
 epix-crypt = { path = "../epix-crypt" }

@@ -1,0 +1,18 @@
+[package]
+name = "epix-dht-net"
+version = "0.1.0"
+edition = "2021"
+description = "Binds epix-dht to the wire: DHT RPCs over peer Connections (server handler + dial-on-demand client)."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-dht = { path = "../epix-dht" }
+epix-protocol = { path = "../epix-protocol" }
+epix-transport = { path = "../epix-transport" }
+async-trait = "0.1"
+rmpv = "1"
+hex = "0.4"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
