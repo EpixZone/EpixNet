@@ -17,7 +17,8 @@ pub struct WsSession {
 }
 
 impl WsSession {
-    fn address(&self) -> Result<&str, String> {
+    /// The xite address bound to this connection, or an error if none.
+    pub fn address(&self) -> Result<&str, String> {
         self.xite.as_deref().ok_or_else(|| "no xite bound to this connection".to_string())
     }
 }

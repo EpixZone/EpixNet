@@ -30,10 +30,20 @@ use std::sync::Arc;
 static UIMEDIA: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../ui/media");
 const WRAPPER_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/wrapper.html"));
 
+/// Plugins' contributions to `/uimedia/*`: bytes appended to the base
+/// `all.js`/`all.css`, plus extra static files (keyed by path under `/uimedia/`).
+#[derive(Default, Clone)]
+pub struct MediaBundle {
+    pub append_js: Vec<u8>,
+    pub append_css: Vec<u8>,
+    pub files: std::collections::HashMap<String, Vec<u8>>,
+}
+
 #[derive(Clone)]
 struct Ctx {
     state: Arc<AppState>,
     registry: Arc<CommandRegistry>,
+    media: Arc<MediaBundle>,
 }
 
 /// The UI server.
@@ -47,7 +57,18 @@ impl UiServer {
     }
 
     pub fn with_registry(state: Arc<AppState>, registry: CommandRegistry) -> Self {
-        Self { ctx: Ctx { state, registry: Arc::new(registry) } }
+        Self::with_registry_and_media(state, registry, MediaBundle::default())
+    }
+
+    /// Build the server with plugin-contributed `/uimedia` content.
+    pub fn with_registry_and_media(
+        state: Arc<AppState>,
+        registry: CommandRegistry,
+        media: MediaBundle,
+    ) -> Self {
+        Self {
+            ctx: Ctx { state, registry: Arc::new(registry), media: Arc::new(media) },
+        }
     }
 
     pub fn router(&self) -> Router {
@@ -76,14 +97,26 @@ async fn redirect_to_slash(Path(address): Path<String>) -> Redirect {
     Redirect::permanent(&format!("/{address}/"))
 }
 
-/// Serve `/uimedia/*` from the embedded wrapper runtime.
-async fn serve_uimedia(Path(path): Path<String>) -> Response {
+/// Serve `/uimedia/*` from the embedded wrapper runtime, with plugin
+/// contributions: `all.js`/`all.css` get each plugin's client code appended,
+/// and plugins can add extra files (e.g. the sidebar's `globe/*`).
+async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    let ct = content_type(&path);
+    // Base bundle + appended plugin JS/CSS.
+    if path == "all.js" || path == "all.css" {
+        if let Some(file) = UIMEDIA.get_file(&path) {
+            let mut body = file.contents().to_vec();
+            let append = if path == "all.js" { &ctx.media.append_js } else { &ctx.media.append_css };
+            body.extend_from_slice(append);
+            return ([(header::CONTENT_TYPE, ct)], body).into_response();
+        }
+    }
+    // Plugin-provided static files (e.g. globe assets).
+    if let Some(bytes) = ctx.media.files.get(&path) {
+        return ([(header::CONTENT_TYPE, ct)], bytes.clone()).into_response();
+    }
     match UIMEDIA.get_file(&path) {
-        Some(file) => (
-            [(header::CONTENT_TYPE, content_type(&path))],
-            file.contents().to_vec(),
-        )
-            .into_response(),
+        Some(file) => ([(header::CONTENT_TYPE, ct)], file.contents().to_vec()).into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
