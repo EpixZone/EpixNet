@@ -9,6 +9,7 @@ epix-core = { path = "../epix-core" }
 epix-xite = { path = "../epix-xite" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
+epix-db = { path = "../epix-db" }
 sha2 = "0.10"
 hex = "0.4"
 axum = { version = "0.7", features = ["ws"] }

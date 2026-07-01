@@ -2,6 +2,7 @@
 //! settings + stats), the local user identity, and node metadata.
 
 use epix_core::PeerAddr;
+use epix_db::{Database, DbSchema};
 use epix_peer::{PeerCounts, Peers};
 use epix_user::User;
 use epix_xite::{content_stats, XiteSettings, XiteStorage};
@@ -29,6 +30,8 @@ struct ManagedXite {
     storage: XiteStorage,
     content: Option<Value>,
     settings: XiteSettings,
+    /// Per-xite database (built from dbschema.json), if the xite has one.
+    db: Option<Database>,
     /// Known peers (from discovery/PEX/DHT/announces).
     peers: Peers,
     /// Total bytes transferred for this xite this run.
@@ -103,12 +106,14 @@ impl AppState {
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
         }
+        let db = build_xite_db(&entry.storage);
         self.xites.write().await.insert(
             address,
             ManagedXite {
                 storage: entry.storage,
                 content: entry.content,
                 settings,
+                db,
                 peers: Peers::new(),
                 bytes_recv: 0,
                 bytes_sent: 0,
@@ -179,6 +184,16 @@ impl AppState {
     /// Bytes transferred for a xite this run (recv, sent).
     pub async fn transfer(&self, address: &str) -> (u64, u64) {
         self.xites.read().await.get(address).map(|x| (x.bytes_recv, x.bytes_sent)).unwrap_or((0, 0))
+    }
+
+    /// Run a `dbQuery` against a xite's database. `params` is the JSON value the
+    /// WS command carries (object = named binds, array = positional). Errors if
+    /// the xite has no `dbschema.json`.
+    pub async fn db_query(&self, address: &str, query: &str, params: &Value) -> Result<Vec<Value>, String> {
+        // Clone the pooled DB handle out of the lock so the query doesn't hold it.
+        let db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+        let db = db.ok_or_else(|| "xite has no database".to_string())?;
+        db.query_value(query, params).map_err(|e| e.to_string())
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -276,6 +291,19 @@ impl AppState {
     }
 }
 
+/// Build a xite's database from its `dbschema.json` (if present): open an
+/// in-memory db, create the tables, and populate from the xite's JSON data
+/// files. `None` if the xite has no schema or building fails.
+fn build_xite_db(storage: &XiteStorage) -> Option<Database> {
+    let bytes = storage.read("dbschema.json").ok()?;
+    let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;
+    let db = Database::open_in_memory().ok()?;
+    db.apply_schema(&schema).ok()?;
+    // Best-effort populate; a malformed data file shouldn't sink the whole db.
+    let _ = db.populate(&schema, storage.root());
+    Some(db)
+}
+
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
 /// become counts, and the signatures are stripped (matches `formatSiteInfo`).
 fn summarize_content(content: &Value) -> Value {
@@ -362,6 +390,45 @@ mod tests {
 
         assert_eq!(info["size_limit"], 10);
         assert_eq!(info["next_size_limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn db_query_returns_real_rows_from_the_xite_db() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage
+            .write(
+                "data/alice/data.json",
+                br#"{ "posts": [ {"post_id":1,"title":"Hello"}, {"post_id":2,"title":"World"} ] }"#,
+            )
+            .unwrap();
+
+        let addr = "1BlogAddress";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+
+        let rows = state
+            .db_query(addr, "SELECT post_id, title FROM post ORDER BY post_id", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], "Hello");
+        assert_eq!(rows[1]["post_id"], 2);
+
+        // Named params bind.
+        let one = state
+            .db_query(addr, "SELECT title FROM post WHERE post_id = :id", &json!({"id": 2}))
+            .await
+            .unwrap();
+        assert_eq!(one[0]["title"], "World");
     }
 
     #[tokio::test]

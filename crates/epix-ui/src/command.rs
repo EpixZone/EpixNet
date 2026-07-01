@@ -89,7 +89,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(simple("userGetSettings", json!({}))),
         Arc::new(simple("userSetSettings", json!("ok"))),
         Arc::new(simple("optionalLimitStats", json!({ "limit": "10%", "used": 0, "free": 0 }))),
-        Arc::new(simple("dbQuery", json!([]))),
+        Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(simple("serverErrors", json!([]))),
         Arc::new(simple("announcerStats", json!({}))),
@@ -215,6 +215,34 @@ impl WsCommand for SiteInfo {
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?;
         Ok(s.state.site_info(address).await)
+    }
+}
+
+/// `dbQuery(query, params)` — run a read query against the xite's database.
+/// ZeroFrame passes `[query, params]`; we also accept a bare string or
+/// `{query, params}`.
+struct DbQuery;
+#[async_trait]
+impl WsCommand for DbQuery {
+    fn name(&self) -> &'static str {
+        "dbQuery"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let (query, params) = match p {
+            Value::Array(a) => (
+                a.first().and_then(|v| v.as_str()).ok_or("dbQuery: missing query")?,
+                a.get(1).cloned().unwrap_or(Value::Null),
+            ),
+            Value::String(q) => (q.as_str(), Value::Null),
+            Value::Object(o) => (
+                o.get("query").and_then(|v| v.as_str()).ok_or("dbQuery: missing query")?,
+                o.get("params").cloned().unwrap_or(Value::Null),
+            ),
+            _ => return Err("dbQuery: invalid params".into()),
+        };
+        let rows = s.state.db_query(address, query, &params).await?;
+        Ok(Value::Array(rows))
     }
 }
 

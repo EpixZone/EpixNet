@@ -540,9 +540,11 @@ dependencies = [
  "epix-core",
  "r2d2",
  "r2d2_sqlite",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -679,6 +681,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "epix-core",
+ "epix-db",
  "epix-peer",
  "epix-user",
  "epix-xite",
