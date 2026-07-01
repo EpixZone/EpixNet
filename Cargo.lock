@@ -612,6 +612,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-reticulum"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "epix-core",
+ "epix-transport",
+ "rand_core 0.6.4",
+ "reticulum",
+ "tokio",
+]
+
+[[package]]
 name = "epix-server"
 version = "0.1.0"
 dependencies = [

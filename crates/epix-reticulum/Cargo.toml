@@ -1,0 +1,16 @@
+[package]
+name = "epix-reticulum"
+version = "0.1.0"
+edition = "2021"
+description = "Reticulum mesh transport: a Link->PeerStream adapter so the wire protocol runs over LoRa/BLE/TCP mesh."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-transport = { path = "../epix-transport" }
+reticulum = { path = "../../../Reticulum-rs" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["sync", "rt", "io-util", "macros", "time"] }
+
+[dev-dependencies]
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+tokio = { version = "1", features = ["full"] }
