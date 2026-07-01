@@ -5,12 +5,16 @@
 //! has been finalized by 2/3+ validators. A malicious or buggy RPC cannot forge
 //! a resolution — a tampered proof is rejected.
 
+mod attestation;
 mod merkle;
 mod resolver;
 mod types;
+mod vrf;
 
+pub use attestation::{ChainAttestation, StateDigest};
 pub use resolver::{XidResolver, DEFAULT_RPC_URL};
 pub use types::{DomainSnapshot, Identity};
+pub use vrf::{combine_beacons, derive_random, Beacon, Vrf};
 
 use thiserror::Error;
 
