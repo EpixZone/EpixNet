@@ -2,6 +2,7 @@
 //! settings + stats), the local user identity, and node metadata.
 
 use epix_core::PeerAddr;
+use epix_db::{Database, DbSchema};
 use epix_peer::{PeerCounts, Peers};
 use epix_user::User;
 use epix_xite::{content_stats, XiteSettings, XiteStorage};
@@ -29,6 +30,8 @@ struct ManagedXite {
     storage: XiteStorage,
     content: Option<Value>,
     settings: XiteSettings,
+    /// Per-xite database (built from dbschema.json), if the xite has one.
+    db: Option<Database>,
     /// Known peers (from discovery/PEX/DHT/announces).
     peers: Peers,
     /// Total bytes transferred for this xite this run.
@@ -50,6 +53,13 @@ pub struct AppState {
     /// Persisted per-user global settings (theme, etc.). Must persist across a
     /// connection or xites that reload on a settings change loop forever.
     global_settings: RwLock<Value>,
+    /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
+    filters: RwLock<Value>,
+    filters_path: Option<PathBuf>,
+}
+
+fn empty_filters() -> Value {
+    json!({ "mutes": {}, "siteblocks": {} })
 }
 
 fn now_secs() -> i64 {
@@ -66,6 +76,8 @@ impl AppState {
             user_path: None,
             nonce_counter: AtomicU64::new(1),
             global_settings: RwLock::new(json!({ "theme": "light" })),
+            filters: RwLock::new(empty_filters()),
+            filters_path: None,
         })
     }
 
@@ -76,6 +88,11 @@ impl AppState {
         let _ = std::fs::create_dir_all(&dir);
         let user_path = dir.join("users.json");
         let user = User::load_or_create(&user_path).unwrap_or_else(|_| User::generate());
+        let filters_path = dir.join("filters.json");
+        let filters = std::fs::read(&filters_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(empty_filters);
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -83,6 +100,8 @@ impl AppState {
             user_path: Some(user_path),
             nonce_counter: AtomicU64::new(1),
             global_settings: RwLock::new(json!({ "theme": "light" })),
+            filters: RwLock::new(filters),
+            filters_path: Some(filters_path),
         })
     }
 
@@ -103,12 +122,14 @@ impl AppState {
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
         }
+        let db = build_xite_db(&entry.storage);
         self.xites.write().await.insert(
             address,
             ManagedXite {
                 storage: entry.storage,
                 content: entry.content,
                 settings,
+                db,
                 peers: Peers::new(),
                 bytes_recv: 0,
                 bytes_sent: 0,
@@ -179,6 +200,90 @@ impl AppState {
     /// Bytes transferred for a xite this run (recv, sent).
     pub async fn transfer(&self, address: &str) -> (u64, u64) {
         self.xites.read().await.get(address).map(|x| (x.bytes_recv, x.bytes_sent)).unwrap_or((0, 0))
+    }
+
+    /// Run a `dbQuery` against a xite's database. `params` is the JSON value the
+    /// WS command carries (object = named binds, array = positional). Errors if
+    /// the xite has no `dbschema.json`.
+    pub async fn db_query(&self, address: &str, query: &str, params: &Value) -> Result<Vec<Value>, String> {
+        // Clone the pooled DB handle out of the lock so the query doesn't hold it.
+        let db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+        let db = db.ok_or_else(|| "xite has no database".to_string())?;
+        db.query_value(query, params).map_err(|e| e.to_string())
+    }
+
+    /// Set (and persist) a site's Newsfeed follows.
+    pub async fn set_feed_follow(&self, address: &str, feeds: Value) {
+        self.user.write().await.set_feed_follow(address, feeds);
+        self.save_user().await;
+    }
+
+    /// A site's Newsfeed follows.
+    pub async fn feed_follow(&self, address: &str) -> Value {
+        self.user.read().await.feed_follow(address)
+    }
+
+    /// All follows across sites (`site_address -> feeds`), for feed aggregation.
+    pub async fn all_follows(&self) -> std::collections::HashMap<String, Value> {
+        self.user.read().await.follows.clone()
+    }
+
+    // --- ContentFilter: mutes + siteblocks -----------------------------------
+
+    async fn save_filters(&self) {
+        if let Some(path) = &self.filters_path {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&*self.filters.read().await) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
+    }
+
+    /// Mute an author. `auth_address -> {cert_user_id, reason, date_added}`.
+    pub async fn mute_add(&self, auth_address: &str, cert_user_id: &str, reason: &str) {
+        {
+            let mut f = self.filters.write().await;
+            f["mutes"][auth_address] =
+                json!({ "cert_user_id": cert_user_id, "reason": reason, "date_added": now_secs() });
+        }
+        self.save_filters().await;
+    }
+
+    pub async fn mute_remove(&self, auth_address: &str) {
+        if let Some(m) = self.filters.write().await["mutes"].as_object_mut() {
+            m.remove(auth_address);
+        }
+        self.save_filters().await;
+    }
+
+    /// The mute map (`auth_address -> info`).
+    pub async fn mute_list(&self) -> Value {
+        self.filters.read().await["mutes"].clone()
+    }
+
+    /// Block a site. `site_address -> {reason, date_added}`.
+    pub async fn siteblock_add(&self, site_address: &str, reason: &str) {
+        {
+            let mut f = self.filters.write().await;
+            f["siteblocks"][site_address] = json!({ "reason": reason, "date_added": now_secs() });
+        }
+        self.save_filters().await;
+    }
+
+    pub async fn siteblock_remove(&self, site_address: &str) {
+        if let Some(m) = self.filters.write().await["siteblocks"].as_object_mut() {
+            m.remove(site_address);
+        }
+        self.save_filters().await;
+    }
+
+    /// The siteblock map (`site_address -> info`).
+    pub async fn siteblock_list(&self) -> Value {
+        self.filters.read().await["siteblocks"].clone()
+    }
+
+    /// Whether a site is blocked.
+    pub async fn siteblock_get(&self, site_address: &str) -> Value {
+        self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -276,6 +381,19 @@ impl AppState {
     }
 }
 
+/// Build a xite's database from its `dbschema.json` (if present): open an
+/// in-memory db, create the tables, and populate from the xite's JSON data
+/// files. `None` if the xite has no schema or building fails.
+fn build_xite_db(storage: &XiteStorage) -> Option<Database> {
+    let bytes = storage.read("dbschema.json").ok()?;
+    let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;
+    let db = Database::open_in_memory().ok()?;
+    db.apply_schema(&schema).ok()?;
+    // Best-effort populate; a malformed data file shouldn't sink the whole db.
+    let _ = db.populate(&schema, storage.root());
+    Some(db)
+}
+
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
 /// become counts, and the signatures are stripped (matches `formatSiteInfo`).
 fn summarize_content(content: &Value) -> Value {
@@ -362,6 +480,45 @@ mod tests {
 
         assert_eq!(info["size_limit"], 10);
         assert_eq!(info["next_size_limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn db_query_returns_real_rows_from_the_xite_db() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage
+            .write(
+                "data/alice/data.json",
+                br#"{ "posts": [ {"post_id":1,"title":"Hello"}, {"post_id":2,"title":"World"} ] }"#,
+            )
+            .unwrap();
+
+        let addr = "1BlogAddress";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+
+        let rows = state
+            .db_query(addr, "SELECT post_id, title FROM post ORDER BY post_id", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["title"], "Hello");
+        assert_eq!(rows[1]["post_id"], 2);
+
+        // Named params bind.
+        let one = state
+            .db_query(addr, "SELECT title FROM post WHERE post_id = :id", &json!({"id": 2}))
+            .await
+            .unwrap();
+        assert_eq!(one[0]["title"], "World");
     }
 
     #[tokio::test]

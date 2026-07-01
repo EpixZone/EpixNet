@@ -19,6 +19,7 @@
 //! xite later; when present, the cert's auth address is the identity shown.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -58,6 +59,10 @@ pub struct User {
     pub master_address: String,
     #[serde(default)]
     pub sites: HashMap<String, SiteAuth>,
+    /// Newsfeed follows: `site_address -> {feed_name: [query, params]}`. Each
+    /// site's feeds are queried against that site's own database.
+    #[serde(default)]
+    pub follows: HashMap<String, Value>,
 }
 
 impl User {
@@ -73,7 +78,18 @@ impl User {
             master_seed: master_seed.to_string(),
             master_address,
             sites: HashMap::new(),
+            follows: HashMap::new(),
         })
+    }
+
+    /// Set the Newsfeed follows for a site (`{feed_name: [query, params]}`).
+    pub fn set_feed_follow(&mut self, address: &str, feeds: Value) {
+        self.follows.insert(address.to_string(), feeds);
+    }
+
+    /// The Newsfeed follows for a site (empty object if none).
+    pub fn feed_follow(&self, address: &str) -> Value {
+        self.follows.get(address).cloned().unwrap_or_else(|| Value::Object(Default::default()))
     }
 
     /// The BIP32-ish child index for a xite: the address bytes as a big-endian
