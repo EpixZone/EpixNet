@@ -53,6 +53,13 @@ pub struct AppState {
     /// Persisted per-user global settings (theme, etc.). Must persist across a
     /// connection or xites that reload on a settings change loop forever.
     global_settings: RwLock<Value>,
+    /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
+    filters: RwLock<Value>,
+    filters_path: Option<PathBuf>,
+}
+
+fn empty_filters() -> Value {
+    json!({ "mutes": {}, "siteblocks": {} })
 }
 
 fn now_secs() -> i64 {
@@ -69,6 +76,8 @@ impl AppState {
             user_path: None,
             nonce_counter: AtomicU64::new(1),
             global_settings: RwLock::new(json!({ "theme": "light" })),
+            filters: RwLock::new(empty_filters()),
+            filters_path: None,
         })
     }
 
@@ -79,6 +88,11 @@ impl AppState {
         let _ = std::fs::create_dir_all(&dir);
         let user_path = dir.join("users.json");
         let user = User::load_or_create(&user_path).unwrap_or_else(|_| User::generate());
+        let filters_path = dir.join("filters.json");
+        let filters = std::fs::read(&filters_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(empty_filters);
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -86,6 +100,8 @@ impl AppState {
             user_path: Some(user_path),
             nonce_counter: AtomicU64::new(1),
             global_settings: RwLock::new(json!({ "theme": "light" })),
+            filters: RwLock::new(filters),
+            filters_path: Some(filters_path),
         })
     }
 
@@ -210,6 +226,64 @@ impl AppState {
     /// All follows across sites (`site_address -> feeds`), for feed aggregation.
     pub async fn all_follows(&self) -> std::collections::HashMap<String, Value> {
         self.user.read().await.follows.clone()
+    }
+
+    // --- ContentFilter: mutes + siteblocks -----------------------------------
+
+    async fn save_filters(&self) {
+        if let Some(path) = &self.filters_path {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&*self.filters.read().await) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
+    }
+
+    /// Mute an author. `auth_address -> {cert_user_id, reason, date_added}`.
+    pub async fn mute_add(&self, auth_address: &str, cert_user_id: &str, reason: &str) {
+        {
+            let mut f = self.filters.write().await;
+            f["mutes"][auth_address] =
+                json!({ "cert_user_id": cert_user_id, "reason": reason, "date_added": now_secs() });
+        }
+        self.save_filters().await;
+    }
+
+    pub async fn mute_remove(&self, auth_address: &str) {
+        if let Some(m) = self.filters.write().await["mutes"].as_object_mut() {
+            m.remove(auth_address);
+        }
+        self.save_filters().await;
+    }
+
+    /// The mute map (`auth_address -> info`).
+    pub async fn mute_list(&self) -> Value {
+        self.filters.read().await["mutes"].clone()
+    }
+
+    /// Block a site. `site_address -> {reason, date_added}`.
+    pub async fn siteblock_add(&self, site_address: &str, reason: &str) {
+        {
+            let mut f = self.filters.write().await;
+            f["siteblocks"][site_address] = json!({ "reason": reason, "date_added": now_secs() });
+        }
+        self.save_filters().await;
+    }
+
+    pub async fn siteblock_remove(&self, site_address: &str) {
+        if let Some(m) = self.filters.write().await["siteblocks"].as_object_mut() {
+            m.remove(site_address);
+        }
+        self.save_filters().await;
+    }
+
+    /// The siteblock map (`site_address -> info`).
+    pub async fn siteblock_list(&self) -> Value {
+        self.filters.read().await["siteblocks"].clone()
+    }
+
+    /// Whether a site is blocked.
+    pub async fn siteblock_get(&self, site_address: &str) -> Value {
+        self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {

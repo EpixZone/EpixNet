@@ -99,7 +99,14 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(FeedFollow),
         Arc::new(FeedListFollow),
         Arc::new(simple("FilterIncludeList", json!([]))),
-        Arc::new(simple("muteList", json!([]))),
+        Arc::new(simple("filterIncludeList", json!([]))),
+        Arc::new(MuteAdd),
+        Arc::new(MuteRemove),
+        Arc::new(MuteList),
+        Arc::new(SiteblockAdd),
+        Arc::new(SiteblockRemove),
+        Arc::new(SiteblockList),
+        Arc::new(SiteblockGet),
         // Stateful — persist global settings so theme changes don't reload-loop.
         Arc::new(UserGetGlobalSettings),
         Arc::new(UserSetGlobalSettings),
@@ -391,11 +398,133 @@ fn sqlquote(v: &Value) -> String {
     }
 }
 
+// ---- ContentFilter: mute + siteblock lists ---------------------------------
+
+/// Read a positional-or-named string arg from the command params.
+fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
+    p.get(key)
+        .or_else(|| p.as_array().and_then(|a| a.get(idx)))
+        .and_then(|v| v.as_str())
+        .or_else(|| p.as_str())
+}
+
+struct MuteAdd;
+#[async_trait]
+impl WsCommand for MuteAdd {
+    fn name(&self) -> &'static str {
+        "muteAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let auth = arg_str(p, "auth_address", 0).ok_or("muteAdd: auth_address required")?;
+        let cert = arg_str(p, "cert_user_id", 1).unwrap_or("");
+        let reason = arg_str(p, "reason", 2).unwrap_or("");
+        s.state.mute_add(auth, cert, reason).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+struct MuteRemove;
+#[async_trait]
+impl WsCommand for MuteRemove {
+    fn name(&self) -> &'static str {
+        "muteRemove"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let auth = arg_str(p, "auth_address", 0).ok_or("muteRemove: auth_address required")?;
+        s.state.mute_remove(auth).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+struct MuteList;
+#[async_trait]
+impl WsCommand for MuteList {
+    fn name(&self) -> &'static str {
+        "muteList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.mute_list().await)
+    }
+}
+
+struct SiteblockAdd;
+#[async_trait]
+impl WsCommand for SiteblockAdd {
+    fn name(&self) -> &'static str {
+        "siteblockAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = arg_str(p, "site_address", 0).ok_or("siteblockAdd: site_address required")?;
+        let reason = arg_str(p, "reason", 1).unwrap_or("");
+        s.state.siteblock_add(site, reason).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+struct SiteblockRemove;
+#[async_trait]
+impl WsCommand for SiteblockRemove {
+    fn name(&self) -> &'static str {
+        "siteblockRemove"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = arg_str(p, "site_address", 0).ok_or("siteblockRemove: site_address required")?;
+        s.state.siteblock_remove(site).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+struct SiteblockList;
+#[async_trait]
+impl WsCommand for SiteblockList {
+    fn name(&self) -> &'static str {
+        "siteblockList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.siteblock_list().await)
+    }
+}
+
+struct SiteblockGet;
+#[async_trait]
+impl WsCommand for SiteblockGet {
+    fn name(&self) -> &'static str {
+        "siteblockGet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = arg_str(p, "site_address", 0).ok_or("siteblockGet: site_address required")?;
+        Ok(s.state.siteblock_get(site).await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn content_filter_mutes_and_siteblocks() {
+        let state = AppState::new("test");
+        let session = WsSession { state: state.clone(), xite: Some("1site".into()) };
+
+        MuteAdd
+            .handle(&session, &json!(["1AuthorAddr", "bob@zeroid.bit", "spam"]))
+            .await
+            .unwrap();
+        let list = MuteList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list["1AuthorAddr"]["cert_user_id"], "bob@zeroid.bit");
+        assert_eq!(list["1AuthorAddr"]["reason"], "spam");
+
+        MuteRemove.handle(&session, &json!(["1AuthorAddr"])).await.unwrap();
+        assert!(MuteList.handle(&session, &Value::Null).await.unwrap().as_object().unwrap().is_empty());
+
+        SiteblockAdd.handle(&session, &json!(["1BadSite", "malware"])).await.unwrap();
+        assert_eq!(SiteblockGet.handle(&session, &json!(["1BadSite"])).await.unwrap()["reason"], "malware");
+        assert_eq!(SiteblockGet.handle(&session, &json!(["1GoodSite"])).await.unwrap(), Value::Bool(false));
+        let blocks = SiteblockList.handle(&session, &Value::Null).await.unwrap();
+        assert!(blocks["1BadSite"].is_object());
+    }
 
     #[test]
     fn feed_sql_safety() {
