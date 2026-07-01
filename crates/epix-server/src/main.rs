@@ -28,7 +28,7 @@ async fn main() {
     // 0. If already cloned + verified, skip the network fetch (fast restarts).
     if xite.load_content().unwrap_or(false) && xite.files_needed().is_empty() {
         println!("· {address} already cloned + verified — serving from cache");
-        serve(address, display, data_dir, xite.content.clone()).await;
+        serve(address, display, data_dir, xite.content.clone(), 0).await;
         return;
     }
 
@@ -80,7 +80,7 @@ async fn main() {
     );
 
     // 4. Serve it.
-    serve(address, display, data_dir, xite.content.clone()).await;
+    serve(address, display, data_dir, xite.content.clone(), report.bytes).await;
 }
 
 /// Turn a CLI argument into `(xite_address, display_name)`: pass `epix1…`
@@ -110,6 +110,7 @@ async fn serve(
     display: String,
     data_dir: std::path::PathBuf,
     content: Option<serde_json::Value>,
+    bytes_recv: u64,
 ) {
     let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
     // Serve under the raw address and (if resolved from a name) the .epix name,
@@ -133,6 +134,23 @@ async fn serve(
                 },
             )
             .await;
+    }
+
+    // Populate the peer registry (best-effort announce) + record the clone's
+    // transfer, so siteInfo/the sidebar show real peer counts and bytes.
+    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+    let peers = epix_xite::announce(
+        transport.as_ref(),
+        &address,
+        &[PeerAddr::parse(TRACKER).unwrap()],
+        0,
+    )
+    .await;
+    state.add_peers(&address, peers.clone()).await;
+    state.add_transfer(&address, bytes_recv, 0).await;
+    if display != address {
+        state.add_peers(&display, peers).await;
+        state.add_transfer(&display, bytes_recv, 0).await;
     }
 
     // Assemble the UI command set through the plugin system. Real plugins

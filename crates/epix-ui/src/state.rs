@@ -1,6 +1,8 @@
 //! Shared server state: the xites this node serves (with their runtime
 //! settings + stats), the local user identity, and node metadata.
 
+use epix_core::PeerAddr;
+use epix_peer::{PeerCounts, Peers};
 use epix_user::User;
 use epix_xite::{content_stats, XiteSettings, XiteStorage};
 use serde_json::{json, Value};
@@ -27,6 +29,15 @@ struct ManagedXite {
     storage: XiteStorage,
     content: Option<Value>,
     settings: XiteSettings,
+    /// Known peers (from discovery/PEX/DHT/announces).
+    peers: Peers,
+    /// Total bytes transferred for this xite this run.
+    bytes_recv: u64,
+    bytes_sent: u64,
+    /// Live worker accounting.
+    tasks_active: usize,
+    started_task_num: usize,
+    workers: usize,
 }
 
 /// Server-wide state shared across all HTTP/WebSocket handlers.
@@ -94,8 +105,80 @@ impl AppState {
         }
         self.xites.write().await.insert(
             address,
-            ManagedXite { storage: entry.storage, content: entry.content, settings },
+            ManagedXite {
+                storage: entry.storage,
+                content: entry.content,
+                settings,
+                peers: Peers::new(),
+                bytes_recv: 0,
+                bytes_sent: 0,
+                tasks_active: 0,
+                started_task_num: 0,
+                workers: 0,
+            },
         );
+    }
+
+    /// Add discovered peers to a xite, syncing `settings.peers` to the count.
+    pub async fn add_peers(&self, address: &str, addrs: impl IntoIterator<Item = PeerAddr>) {
+        let mut xites = self.xites.write().await;
+        if let Some(x) = xites.get_mut(address) {
+            x.peers.add_many(addrs, now_secs());
+            x.settings.peers = x.peers.len() as i64;
+        }
+    }
+
+    /// Mark a peer connected/disconnected for a xite.
+    pub async fn set_peer_connected(&self, address: &str, addr: &PeerAddr, connected: bool) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.peers.set_connected(addr, connected, now_secs());
+        }
+    }
+
+    /// Record transferred bytes for a xite (and against the peer if known).
+    pub async fn record_transfer(&self, address: &str, addr: &PeerAddr, recv: u64, sent: u64) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.bytes_recv += recv;
+            x.bytes_sent += sent;
+            x.peers.record_transfer(addr, recv, sent);
+        }
+    }
+
+    /// Add to a xite's transfer totals (no per-peer attribution).
+    pub async fn add_transfer(&self, address: &str, recv: u64, sent: u64) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.bytes_recv += recv;
+            x.bytes_sent += sent;
+        }
+    }
+
+    /// Update live worker accounting for a xite.
+    pub async fn set_worker_stats(&self, address: &str, active: usize, workers: usize, started_delta: usize) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.tasks_active = active;
+            x.workers = workers;
+            x.started_task_num += started_delta;
+        }
+    }
+
+    /// Peer counts (connected/connectable/onion/local/total) for the sidebar.
+    pub async fn peer_counts(&self, address: &str) -> PeerCounts {
+        self.xites.read().await.get(address).map(|x| x.peers.counts()).unwrap_or_default()
+    }
+
+    /// Connectable peer addresses for a xite (best reputation first).
+    pub async fn connectable_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.peers.connectable(limit))
+            .unwrap_or_default()
+    }
+
+    /// Bytes transferred for a xite this run (recv, sent).
+    pub async fn transfer(&self, address: &str) -> (u64, u64) {
+        self.xites.read().await.get(address).map(|x| (x.bytes_recv, x.bytes_sent)).unwrap_or((0, 0))
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -152,6 +235,13 @@ impl AppState {
         let next_size_limit = next_size_limit(settings.size);
         let content = entry.content.as_ref().map(summarize_content).unwrap_or(Value::Null);
 
+        // peers = max(settings, known) + self (we serve it), matching formatSiteInfo.
+        let known_peers = entry.peers.len() as i64;
+        let mut peers = settings.peers.max(known_peers);
+        if settings.serving {
+            peers += 1;
+        }
+
         json!({
             "auth_address": auth_address,
             "cert_user_id": cert_user_id,
@@ -164,10 +254,10 @@ impl AppState {
             "bad_files": settings.cache.bad_files.len(),
             "size_limit": size_limit,
             "next_size_limit": next_size_limit,
-            "peers": settings.peers.max(1),
-            "started_task_num": 0,
-            "tasks": 0,
-            "workers": 0,
+            "peers": peers.max(1),
+            "started_task_num": entry.started_task_num,
+            "tasks": entry.tasks_active,
+            "workers": entry.workers,
             "content": content,
         })
     }

@@ -586,6 +586,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-peer"
+version = "0.1.0"
+dependencies = [
+ "epix-core",
+]
+
+[[package]]
 name = "epix-plugin"
 version = "0.1.0"
 dependencies = [
@@ -672,6 +679,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "epix-core",
+ "epix-peer",
  "epix-user",
  "epix-xite",
  "futures-util",

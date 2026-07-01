@@ -1,0 +1,8 @@
+[package]
+name = "epix-peer"
+version = "0.1.0"
+edition = "2021"
+description = "Per-xite peer registry: discovered peers with connection state, byte stats, and the connected/connectable/onion/local counts the UI reports."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
