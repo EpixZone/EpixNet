@@ -1,0 +1,16 @@
+[package]
+name = "epix-propagation"
+version = "0.1.0"
+edition = "2021"
+description = "In-process store-and-forward propagation of xite update notifications over the wire protocol (TCP or Reticulum mesh)."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-protocol = { path = "../epix-protocol" }
+async-trait = "0.1"
+rmpv = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+epix-transport = { path = "../epix-transport" }
+tokio = { version = "1", features = ["full"] }

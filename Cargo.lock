@@ -596,6 +596,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-propagation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "epix-core",
+ "epix-protocol",
+ "epix-transport",
+ "rmpv",
+ "tokio",
+]
+
+[[package]]
 name = "epix-protocol"
 version = "0.1.0"
 dependencies = [
