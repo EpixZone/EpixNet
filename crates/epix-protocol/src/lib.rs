@@ -10,4 +10,4 @@ pub mod server;
 
 pub use connection::{Connection, HandshakeInfo};
 pub use msg::{vget, vmap};
-pub use server::{PeerServer, RequestHandler};
+pub use server::{serve_stream, PeerServer, RequestHandler};
