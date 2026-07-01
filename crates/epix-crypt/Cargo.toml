@@ -9,6 +9,8 @@ k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 sha2 = "0.10"
 sha3 = "0.10"
 hmac = "0.12"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 bech32 = "0.9"
 bs58 = { version = "0.5", features = ["check"] }
 base64 = "0.22"

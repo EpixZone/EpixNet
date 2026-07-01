@@ -19,7 +19,21 @@ use k256::{FieldBytes, ProjectivePoint, Scalar, U256};
 use sha2::{Digest, Sha256, Sha512};
 use sha3::Keccak256;
 
+pub mod ecies;
+
 type HmacSha512 = Hmac<Sha512>;
+
+/// Compressed SEC1 pubkey (33 bytes) for a private key — EpixNet's `eccPrivToPub`.
+pub fn private_to_compressed_pubkey(privatekey: &str) -> Result<Vec<u8>, String> {
+    Ok(compressed_pubkey(&priv_to_scalar(privatekey)?))
+}
+
+/// The epix1 address for a SEC1 pubkey (compressed or uncompressed) —
+/// EpixNet's `eccPubToAddr`.
+pub fn pubkey_to_address(pubkey: &[u8]) -> Result<String, String> {
+    let pk = k256::PublicKey::from_sec1_bytes(pubkey).map_err(|e| e.to_string())?;
+    public_key_to_address(pk.to_encoded_point(false).as_bytes())
+}
 
 /// Reduce 32 big-endian bytes into a secp256k1 scalar (mod curve order n),
 /// matching Python's `BN(bytes) % order`.

@@ -127,6 +127,15 @@ impl User {
         })
     }
 
+    /// The per-xite CryptMessage **encryption** private key (WIF), derived like
+    /// EpixNet: `hd_privatekey(master_seed, auth_index(address) + 1000 + index)`.
+    /// Distinct from the auth key so message encryption and identity don't share
+    /// a key.
+    pub fn encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {
+        let crypt_index = Self::address_auth_index(address) + 1000 + index;
+        epix_crypt::hd_privatekey(&self.master_seed, crypt_index)
+    }
+
     /// The cert user id (`name@provider`) for `address`, if a cert is selected.
     pub fn cert_user_id(&self, address: &str) -> Option<String> {
         self.sites.get(address)?.cert.as_ref().map(Cert::user_id)

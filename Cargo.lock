@@ -520,9 +520,11 @@ dependencies = [
 name = "epix-crypt"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "base64",
  "bech32",
  "bs58",
+ "cbc",
  "getrandom 0.2.17",
  "hex",
  "hmac",
@@ -694,6 +696,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "base64",
  "epix-core",
  "epix-crypt",
  "epix-db",

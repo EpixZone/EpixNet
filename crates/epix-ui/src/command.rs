@@ -5,6 +5,7 @@
 
 use crate::state::AppState;
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -90,6 +91,15 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteSign),
         Arc::new(SitePublish),
         Arc::new(FileWrite),
+        // CryptMessage
+        Arc::new(UserPublickey),
+        Arc::new(EciesEncrypt),
+        Arc::new(EciesDecrypt),
+        Arc::new(AesEncrypt),
+        Arc::new(AesDecrypt),
+        Arc::new(EcdsaVerify),
+        Arc::new(EccPrivToPub),
+        Arc::new(EccPubToAddr),
         Arc::new(simple("userGetSettings", json!({}))),
         Arc::new(simple("userSetSettings", json!("ok"))),
         Arc::new(simple("optionalLimitStats", json!({ "limit": "10%", "used": 0, "free": 0 }))),
@@ -337,32 +347,193 @@ fn sign_privatekey(p: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Minimal standard-base64 decode (no deps).
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    const INV: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut lut = [255u8; 256];
-    for (i, c) in INV.iter().enumerate() {
-        lut[*c as usize] = i as u8;
-    }
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut bits = 0;
-    for &c in s.as_bytes() {
-        if c == b'=' || c == b'\n' || c == b'\r' {
-            continue;
-        }
-        let v = lut[c as usize];
-        if v == 255 {
-            return None;
-        }
-        acc = (acc << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+fn b64_encode(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+// ---- CryptMessage: ECIES + AES + ECC helpers -------------------------------
+
+/// The public key to encrypt to: an explicit base64 SEC1 key, or the user's own
+/// per-xite encrypt key when the arg is an index (int) / absent.
+async fn resolve_pubkey(s: &WsSession, address: &str, arg: Option<&Value>) -> Result<Vec<u8>, String> {
+    match arg {
+        Some(Value::String(b64)) => b64_decode(b64).ok_or("eciesEncrypt: bad public key".into()),
+        other => {
+            let index = other.and_then(|v| v.as_u64()).unwrap_or(0);
+            s.state.user_encrypt_publickey(address, index).await
         }
     }
-    Some(out)
+}
+
+/// The private key to decrypt with: an explicit WIF/hex, or the user's own
+/// per-xite encrypt key when the arg is an index (int) / absent.
+async fn resolve_privkey(s: &WsSession, address: &str, arg: Option<&Value>) -> Result<String, String> {
+    match arg {
+        Some(Value::String(pk)) if !pk.is_empty() => Ok(pk.clone()),
+        other => {
+            let index = other.and_then(|v| v.as_u64()).unwrap_or(0);
+            s.state.user_encrypt_privatekey(address, index).await
+        }
+    }
+}
+
+/// `userPublickey(index)` — the user's encrypt public key (base64) for this xite.
+struct UserPublickey;
+#[async_trait]
+impl WsCommand for UserPublickey {
+    fn name(&self) -> &'static str {
+        "userPublickey"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let index = p.as_array().and_then(|a| a.first()).or(Some(p)).and_then(|v| v.as_u64()).unwrap_or(0);
+        let pk = s.state.user_encrypt_publickey(&address, index).await?;
+        Ok(Value::from(b64_encode(&pk)))
+    }
+}
+
+/// `eciesEncrypt(text, publickey=0, return_aes_key=false)`.
+struct EciesEncrypt;
+#[async_trait]
+impl WsCommand for EciesEncrypt {
+    fn name(&self) -> &'static str {
+        "eciesEncrypt"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let a = p.as_array();
+        let text = a.and_then(|a| a.first()).and_then(|v| v.as_str()).ok_or("eciesEncrypt: text required")?;
+        let pubkey = resolve_pubkey(s, &address, a.and_then(|a| a.get(1))).await?;
+        let return_key = a.and_then(|a| a.get(2)).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let (blob, k_enc) = epix_crypt::ecies::ecies_encrypt(text.as_bytes(), &pubkey)?;
+        if return_key {
+            Ok(json!([b64_encode(&blob), b64_encode(&k_enc)]))
+        } else {
+            Ok(Value::from(b64_encode(&blob)))
+        }
+    }
+}
+
+/// `eciesDecrypt(param, privatekey=0)` — `param` is one base64 blob or a list.
+struct EciesDecrypt;
+#[async_trait]
+impl WsCommand for EciesDecrypt {
+    fn name(&self) -> &'static str {
+        "eciesDecrypt"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let a = p.as_array();
+        let param = a.and_then(|a| a.first()).ok_or("eciesDecrypt: param required")?;
+        let privatekey = resolve_privkey(s, &address, a.and_then(|a| a.get(1))).await?;
+
+        let decode_one = |b64: &str| -> Value {
+            b64_decode(b64)
+                .and_then(|blob| epix_crypt::ecies::ecies_decrypt(&blob, &privatekey).ok())
+                .and_then(|pt| String::from_utf8(pt).ok())
+                .map(Value::from)
+                .unwrap_or(Value::Null)
+        };
+
+        match param {
+            Value::Array(items) => {
+                Ok(Value::Array(items.iter().filter_map(|v| v.as_str()).map(decode_one).collect()))
+            }
+            Value::String(b64) => Ok(decode_one(b64)),
+            _ => Err("eciesDecrypt: invalid param".into()),
+        }
+    }
+}
+
+/// `aesEncrypt(text, key=null)` → `[key_b64, iv_b64, ciphertext_b64]`.
+struct AesEncrypt;
+#[async_trait]
+impl WsCommand for AesEncrypt {
+    fn name(&self) -> &'static str {
+        "aesEncrypt"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let a = p.as_array();
+        let text = a.and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("");
+        let key = match a.and_then(|a| a.get(1)).and_then(|v| v.as_str()) {
+            Some(b64) => b64_decode(b64).ok_or("aesEncrypt: bad key")?,
+            None => epix_crypt::ecies::aes_new_key().to_vec(),
+        };
+        let iv = epix_crypt::ecies::aes_new_iv();
+        let ct = epix_crypt::ecies::aes_encrypt(text.as_bytes(), &key, &iv)?;
+        Ok(json!([b64_encode(&key), b64_encode(&iv), b64_encode(&ct)]))
+    }
+}
+
+/// `aesDecrypt(iv, ciphertext, key)` → decrypted text (or null on failure).
+struct AesDecrypt;
+#[async_trait]
+impl WsCommand for AesDecrypt {
+    fn name(&self) -> &'static str {
+        "aesDecrypt"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let a = p.as_array().ok_or("aesDecrypt: expected [iv, ciphertext, key]")?;
+        let get = |i: usize| a.get(i).and_then(|v| v.as_str()).and_then(b64_decode);
+        let (iv, ct, key) = (
+            get(0).ok_or("aesDecrypt: iv")?,
+            get(1).ok_or("aesDecrypt: ciphertext")?,
+            get(2).ok_or("aesDecrypt: key")?,
+        );
+        Ok(epix_crypt::ecies::aes_decrypt(&ct, &key, &iv)
+            .ok()
+            .and_then(|pt| String::from_utf8(pt).ok())
+            .map(Value::from)
+            .unwrap_or(Value::Null))
+    }
+}
+
+/// `ecdsaVerify(data, address, signature)` → bool.
+struct EcdsaVerify;
+#[async_trait]
+impl WsCommand for EcdsaVerify {
+    fn name(&self) -> &'static str {
+        "ecdsaVerify"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let a = p.as_array().ok_or("ecdsaVerify: expected [data, address, signature]")?;
+        let data = a.first().and_then(|v| v.as_str()).ok_or("ecdsaVerify: data")?;
+        let address = a.get(1).and_then(|v| v.as_str()).ok_or("ecdsaVerify: address")?;
+        let sig = a.get(2).and_then(|v| v.as_str()).ok_or("ecdsaVerify: signature")?;
+        Ok(Value::from(epix_crypt::verify(data, address, sig)))
+    }
+}
+
+/// `eccPrivToPub(privatekey)` → base64 compressed public key.
+struct EccPrivToPub;
+#[async_trait]
+impl WsCommand for EccPrivToPub {
+    fn name(&self) -> &'static str {
+        "eccPrivToPub"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let pk = p.as_array().and_then(|a| a.first()).or(Some(p)).and_then(|v| v.as_str()).ok_or("eccPrivToPub: privatekey")?;
+        Ok(Value::from(b64_encode(&epix_crypt::private_to_compressed_pubkey(pk)?)))
+    }
+}
+
+/// `eccPubToAddr(publickey_hex)` → epix1 address.
+struct EccPubToAddr;
+#[async_trait]
+impl WsCommand for EccPubToAddr {
+    fn name(&self) -> &'static str {
+        "eccPubToAddr"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let hexkey = p.as_array().and_then(|a| a.first()).or(Some(p)).and_then(|v| v.as_str()).ok_or("eccPubToAddr: publickey")?;
+        let bytes = hex::decode(hexkey).map_err(|e| e.to_string())?;
+        Ok(Value::from(epix_crypt::pubkey_to_address(&bytes)?))
+    }
 }
 
 // ---- Newsfeed: aggregate followed sites' feeds -----------------------------
@@ -613,6 +784,37 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn cryptmessage_commands_round_trip() {
+        let state = AppState::new("test");
+        let addr = "1CryptSite";
+        let session = WsSession { state: state.clone(), xite: Some(addr.into()) };
+
+        // ECIES to my own key (index 0), then decrypt with my own key.
+        let enc = EciesEncrypt.handle(&session, &json!(["secret 🔒", 0])).await.unwrap();
+        let ct = enc.as_str().unwrap().to_string();
+        let dec = EciesDecrypt.handle(&session, &json!([ct, 0])).await.unwrap();
+        assert_eq!(dec, "secret 🔒");
+
+        // AES round trip: aesEncrypt -> [key, iv, ct]; aesDecrypt([iv, ct, key]).
+        let aes = AesEncrypt.handle(&session, &json!(["aes data"])).await.unwrap();
+        let a = aes.as_array().unwrap();
+        let dec = AesDecrypt.handle(&session, &json!([a[1], a[2], a[0]])).await.unwrap();
+        assert_eq!(dec, "aes data");
+
+        // ECC helpers + ecdsaVerify against a real signature.
+        let pk = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(pk).unwrap();
+        let sig = epix_crypt::sign("hello", pk).unwrap();
+        assert_eq!(EcdsaVerify.handle(&session, &json!(["hello", address, sig])).await.unwrap(), true);
+
+        // eccPrivToPub (base64 compressed) -> hex -> eccPubToAddr == address.
+        let pub_b64 = EccPrivToPub.handle(&session, &json!([pk])).await.unwrap();
+        let pub_bytes = b64_decode(pub_b64.as_str().unwrap()).unwrap();
+        let derived = EccPubToAddr.handle(&session, &json!([hex::encode(&pub_bytes)])).await.unwrap();
+        assert_eq!(derived, address);
+    }
 
     #[tokio::test]
     async fn content_filter_mutes_and_siteblocks() {

@@ -234,6 +234,17 @@ impl AppState {
         self.user.read().await.follows.clone()
     }
 
+    /// The user's CryptMessage encryption private key (WIF) for a xite.
+    pub async fn user_encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {
+        self.user.read().await.encrypt_privatekey(address, index)
+    }
+
+    /// The user's CryptMessage encryption public key (compressed SEC1) for a xite.
+    pub async fn user_encrypt_publickey(&self, address: &str, index: u64) -> Result<Vec<u8>, String> {
+        let pk = self.user.read().await.encrypt_privatekey(address, index)?;
+        epix_crypt::private_to_compressed_pubkey(&pk)
+    }
+
     // --- ContentFilter: mutes + siteblocks -----------------------------------
 
     async fn save_filters(&self) {
