@@ -15,7 +15,7 @@ const BIND: &str = "127.0.0.1:43110";
 async fn main() {
     // Accept a raw `epix1…` xite address, or a `.epix` name to resolve on-chain.
     let arg = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
-    let address = resolve_target(&arg).await;
+    let (address, display) = resolve_target(&arg).await;
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
     let data_dir = std::env::temp_dir().join("epix-data").join(&address);
@@ -28,7 +28,7 @@ async fn main() {
     // 0. If already cloned + verified, skip the network fetch (fast restarts).
     if xite.load_content().unwrap_or(false) && xite.files_needed().is_empty() {
         println!("· {address} already cloned + verified — serving from cache");
-        serve(address, data_dir, xite.content.clone()).await;
+        serve(address, display, data_dir, xite.content.clone()).await;
         return;
     }
 
@@ -80,14 +80,15 @@ async fn main() {
     );
 
     // 4. Serve it.
-    serve(address, data_dir, xite.content.clone()).await;
+    serve(address, display, data_dir, xite.content.clone()).await;
 }
 
-/// Turn a CLI argument into a xite address: pass `epix1…` through; resolve a
-/// `.epix` name (or bare label, defaulting to the `epix` tld) on the chain.
-async fn resolve_target(arg: &str) -> String {
+/// Turn a CLI argument into `(xite_address, display_name)`: pass `epix1…`
+/// through; resolve a `.epix` name (or bare label, defaulting to `epix`) on the
+/// chain — the display name is the `.epix` name so URLs read as `dashboard.epix`.
+async fn resolve_target(arg: &str) -> (String, String) {
     if arg.starts_with("epix1") && !arg.contains('.') {
-        return arg.to_string();
+        return (arg.to_string(), arg.to_string());
     }
     let (name, tld) = arg.rsplit_once('.').unwrap_or((arg, "epix"));
     println!("· resolving {name}.{tld} on the Epix chain …");
@@ -101,26 +102,44 @@ async fn resolve_target(arg: &str) -> String {
         .unwrap_or_else(|| panic!("{name}.{tld} has no EpixNet xite address record"))
         .to_string();
     println!("  {name}.{tld} → {address} (chain-verified)");
-    address
+    (address, format!("{name}.{tld}"))
 }
 
-async fn serve(address: String, data_dir: std::path::PathBuf, content: Option<serde_json::Value>) {
+async fn serve(
+    address: String,
+    display: String,
+    data_dir: std::path::PathBuf,
+    content: Option<serde_json::Value>,
+) {
     let state = AppState::new(env!("CARGO_PKG_VERSION"));
+    // Serve under the raw address and (if resolved from a name) the .epix name,
+    // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
     state
         .add_xite(
             &address,
             XiteEntry {
                 storage: XiteStorage::new(&data_dir),
-                content,
+                content: content.clone(),
             },
         )
         .await;
+    if display != address {
+        state
+            .add_xite(
+                &display,
+                XiteEntry {
+                    storage: XiteStorage::new(&data_dir),
+                    content,
+                },
+            )
+            .await;
+    }
 
     let bind: std::net::SocketAddr = BIND.parse().unwrap();
     println!("\n┌──────────────────────────────────────────────");
     println!("│ Epix node serving a xite cloned from the network");
     println!("│ Open in your browser:");
-    println!("│   http://{BIND}/{address}/");
+    println!("│   http://{BIND}/{display}/");
     println!("└──────────────────────────────────────────────\n");
     UiServer::new(state).serve(bind).await.expect("server");
 }

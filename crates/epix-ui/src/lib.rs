@@ -16,7 +16,7 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
@@ -55,6 +55,7 @@ impl UiServer {
             .route("/", get(health))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/uimedia/*path", get(serve_uimedia))
+            .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
             .route("/:address/*path", get(serve_file))
             .with_state(self.ctx.clone())
@@ -68,6 +69,11 @@ impl UiServer {
 
 async fn health() -> &'static str {
     "Epix UI server"
+}
+
+/// `/{address}` → `/{address}/` (so a xite URL works without the trailing slash).
+async fn redirect_to_slash(Path(address): Path<String>) -> Redirect {
+    Redirect::permanent(&format!("/{address}/"))
 }
 
 /// Serve `/uimedia/*` from the embedded wrapper runtime.
