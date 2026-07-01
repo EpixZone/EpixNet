@@ -139,6 +139,7 @@ async fn serve(
     // Populate the peer registry (best-effort announce) + record the clone's
     // transfer, so siteInfo/the sidebar show real peer counts and bytes.
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+    state.set_transport(transport.clone()).await;
     let peers = epix_xite::announce(
         transport.as_ref(),
         &address,

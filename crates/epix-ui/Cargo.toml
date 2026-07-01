@@ -10,6 +10,8 @@ epix-xite = { path = "../epix-xite" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
 epix-db = { path = "../epix-db" }
+epix-protocol = { path = "../epix-protocol" }
+epix-transport = { path = "../epix-transport" }
 sha2 = "0.10"
 hex = "0.4"
 axum = { version = "0.7", features = ["ws"] }
@@ -20,6 +22,7 @@ async-trait = "0.1"
 include_dir = "0.7"
 
 [dev-dependencies]
+epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

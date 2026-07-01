@@ -87,6 +87,9 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(simple("permissionDetails", json!(""))),
         Arc::new(simple("configSet", json!("ok"))),
         Arc::new(simple("siteListModifiedFiles", json!({ "modified_files": [] }))),
+        Arc::new(SiteSign),
+        Arc::new(SitePublish),
+        Arc::new(FileWrite),
         Arc::new(simple("userGetSettings", json!({}))),
         Arc::new(simple("userSetSettings", json!("ok"))),
         Arc::new(simple("optionalLimitStats", json!({ "limit": "10%", "used": 0, "free": 0 }))),
@@ -253,6 +256,113 @@ impl WsCommand for DbQuery {
         let rows = s.state.db_query(address, query, &params).await?;
         Ok(Value::Array(rows))
     }
+}
+
+// ---- publish / sign --------------------------------------------------------
+
+/// `fileWrite(inner_path, content_base64)` — write a file into the xite.
+struct FileWrite;
+#[async_trait]
+impl WsCommand for FileWrite {
+    fn name(&self) -> &'static str {
+        "fileWrite"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let a = p.as_array();
+        let inner_path = a
+            .and_then(|a| a.first())
+            .or_else(|| p.get("inner_path"))
+            .and_then(|v| v.as_str())
+            .ok_or("fileWrite: inner_path required")?;
+        let b64 = a
+            .and_then(|a| a.get(1))
+            .or_else(|| p.get("content_base64"))
+            .and_then(|v| v.as_str())
+            .ok_or("fileWrite: content_base64 required")?;
+        let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
+        s.state.write_file(&address, inner_path, &bytes).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteSign(privatekey, inner_path)` — rebuild + sign content.json.
+struct SiteSign;
+#[async_trait]
+impl WsCommand for SiteSign {
+    fn name(&self) -> &'static str {
+        "siteSign"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let privatekey = sign_privatekey(p).ok_or("siteSign: privatekey required")?;
+        s.state.sign_xite(&address, &privatekey).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `sitePublish(privatekey, inner_path, sign)` — sign (unless told not to) then
+/// push the content.json to peers.
+struct SitePublish;
+#[async_trait]
+impl WsCommand for SitePublish {
+    fn name(&self) -> &'static str {
+        "sitePublish"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = p
+            .get("inner_path")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str())
+            .unwrap_or("content.json")
+            .to_string();
+        // Sign first if a private key is supplied (JS omits it to publish an
+        // already-signed file).
+        if let Some(pk) = sign_privatekey(p) {
+            s.state.sign_xite(&address, &pk).await?;
+        }
+        let published = s.state.publish(&address, &inner_path).await?;
+        Ok(json!(format!("Published to {published} peers.")))
+    }
+}
+
+/// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON
+/// null means "use the site's own key", which we don't hold — treated as none).
+fn sign_privatekey(p: &Value) -> Option<String> {
+    p.get("privatekey")
+        .or_else(|| p.as_array().and_then(|a| a.first()))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// Minimal standard-base64 decode (no deps).
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    const INV: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut lut = [255u8; 256];
+    for (i, c) in INV.iter().enumerate() {
+        lut[*c as usize] = i as u8;
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for &c in s.as_bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' {
+            continue;
+        }
+        let v = lut[c as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 // ---- Newsfeed: aggregate followed sites' feeds -----------------------------

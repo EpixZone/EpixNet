@@ -1,11 +1,13 @@
 //! Shared server state: the xites this node serves (with their runtime
 //! settings + stats), the local user identity, and node metadata.
 
-use epix_core::PeerAddr;
+use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{PeerCounts, Peers};
+use epix_protocol::Connection;
+use epix_transport::Transport;
 use epix_user::User;
-use epix_xite::{content_stats, XiteSettings, XiteStorage};
+use epix_xite::{content_stats, Xite, XiteSettings, XiteStorage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -56,6 +58,8 @@ pub struct AppState {
     /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
     filters: RwLock<Value>,
     filters_path: Option<PathBuf>,
+    /// Transport used to publish updates to peers (set by the node).
+    transport: RwLock<Option<Arc<dyn Transport>>>,
 }
 
 fn empty_filters() -> Value {
@@ -78,6 +82,7 @@ impl AppState {
             global_settings: RwLock::new(json!({ "theme": "light" })),
             filters: RwLock::new(empty_filters()),
             filters_path: None,
+            transport: RwLock::new(None),
         })
     }
 
@@ -102,6 +107,7 @@ impl AppState {
             global_settings: RwLock::new(json!({ "theme": "light" })),
             filters: RwLock::new(filters),
             filters_path: Some(filters_path),
+            transport: RwLock::new(None),
         })
     }
 
@@ -284,6 +290,88 @@ impl AppState {
     /// Whether a site is blocked.
     pub async fn siteblock_get(&self, site_address: &str) -> Value {
         self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
+    }
+
+    // --- publish / sign ------------------------------------------------------
+
+    /// The transport used to publish updates to peers.
+    pub async fn set_transport(&self, transport: Arc<dyn Transport>) {
+        *self.transport.write().await = Some(transport);
+    }
+
+    /// Write a file into a xite's storage (`fileWrite`).
+    pub async fn write_file(&self, address: &str, inner_path: &str, bytes: &[u8]) -> Result<(), String> {
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())
+    }
+
+    /// Sign a xite's content.json with `privatekey` (rebuilds the files map,
+    /// bumps `modified` past the previous value), updating the managed content
+    /// + settings. Returns the signed content.json bytes. The key must own the
+    /// xite. This is `siteSign`.
+    pub async fn sign_xite(&self, address: &str, privatekey: &str) -> Result<Vec<u8>, String> {
+        let (storage, content) = {
+            let x = self.xites.read().await;
+            let e = x.get(address).ok_or("unknown xite")?;
+            (e.storage.clone(), e.content.clone())
+        };
+        let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
+        let mut xite = Xite::new(addr, storage);
+        xite.content = content;
+
+        let prev = xite
+            .content
+            .as_ref()
+            .and_then(|c| c.get("modified"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let modified = (now_secs() as f64).max(prev + 1.0);
+
+        xite.sign(privatekey, modified).map_err(|e| e.to_string())?;
+        let signed = xite.content.clone();
+        let bytes = xite.storage.read("content.json").map_err(|e| e.to_string())?;
+
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(content) = &signed {
+                x.settings.apply_content_stats(&content_stats(content));
+                x.settings.own = true;
+            }
+            x.content = signed;
+        }
+        Ok(bytes)
+    }
+
+    /// Publish `inner_path` to the xite's connectable peers via the `update`
+    /// command. Returns how many peers accepted it. `sitePublish`.
+    pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
+        let body = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .and_then(|x| x.storage.read(inner_path).ok())
+            .ok_or("nothing to publish")?;
+        let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
+        let peers = self.connectable_peers(address, 20).await;
+
+        let mut published = 0;
+        for peer in peers {
+            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else { continue };
+            if conn.handshake().await.is_err() {
+                continue;
+            }
+            if conn.update(address, inner_path, &body).await.is_ok() {
+                self.set_peer_connected(address, &peer, true).await;
+                published += 1;
+            }
+        }
+        Ok(published)
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -519,6 +607,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    #[tokio::test]
+    async fn file_write_then_site_sign_produces_owned_signed_content() {
+        // A key that owns the xite (address == the xite address).
+        let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();
+
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(&owner_addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+
+        // Write a file, then sign.
+        state.write_file(&owner_addr, "index.html", b"<h1>hi</h1>").await.unwrap();
+        let bytes = state.sign_xite(&owner_addr, owner).await.unwrap();
+
+        // The written content.json is signed by the owner and lists the file.
+        let content: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(content["signs"].get(&owner_addr).is_some(), "signed by owner");
+        assert_eq!(content["files"]["index.html"]["size"], 11);
+        assert!(content["modified"].as_f64().unwrap() > 0.0);
+
+        // siteInfo now reflects ownership + the real file count.
+        let info = state.site_info(&owner_addr).await;
+        assert_eq!(info["settings"]["own"], true);
+        assert_eq!(info["content"]["files"], 1);
+
+        // A non-owner key is refused.
+        let other = "22c824485fe256587c3809b5f7c99864d7339e9fba061a016834cecc454e01f8";
+        assert!(state.sign_xite(&owner_addr, other).await.is_err());
     }
 
     #[tokio::test]
