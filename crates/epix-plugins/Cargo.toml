@@ -1,0 +1,16 @@
+[package]
+name = "epix-plugins"
+version = "0.1.0"
+edition = "2021"
+description = "The standard EpixNet plugins (Sidebar, …) as Rust structs over the epix-plugin seams."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-ui = { path = "../epix-ui" }
+epix-plugin = { path = "../epix-plugin" }
+epix-peer = { path = "../epix-peer" }
+async-trait = "0.1"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

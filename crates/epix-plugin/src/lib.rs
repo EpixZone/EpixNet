@@ -10,7 +10,7 @@
 //! discovery, worker priority, new FileRequest commands) hang off the same
 //! [`Plugin`] trait as additional methods.
 
-use epix_ui::{CommandRegistry, WsCommand};
+use epix_ui::{CommandRegistry, MediaBundle, WsCommand};
 use std::sync::Arc;
 
 /// A unit of extension. Every hook method defaults to a no-op; a plugin
@@ -21,6 +21,24 @@ pub trait Plugin: Send + Sync {
 
     /// WebSocket commands this plugin adds to the EpixFrame API.
     fn ws_commands(&self) -> Vec<Arc<dyn WsCommand>> {
+        Vec::new()
+    }
+
+    /// Client JS appended to `/uimedia/all.js` — the plugin's wrapper-side code
+    /// (e.g. the sidebar drag handle + rendering). Concatenated after the base
+    /// bundle, exactly like EpixNet's `actionUiMedia` append.
+    fn append_js(&self) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Client CSS appended to `/uimedia/all.css`.
+    fn append_css(&self) -> Option<&'static [u8]> {
+        None
+    }
+
+    /// Extra static media served under `/uimedia/`, as `(path, bytes)` — e.g.
+    /// `("globe/world.jpg", …)` for the sidebar's WebGL globe.
+    fn media_files(&self) -> Vec<(&'static str, &'static [u8])> {
         Vec::new()
     }
 
@@ -64,6 +82,27 @@ impl PluginRegistry {
             }
         }
         registry
+    }
+
+    /// Assemble every plugin's `/uimedia` contributions into one bundle. Append
+    /// order follows registration order (a newline separates each plugin's JS/CSS
+    /// so concatenation can't glue two statements together).
+    pub fn media_bundle(&self) -> MediaBundle {
+        let mut bundle = MediaBundle::default();
+        for plugin in &self.plugins {
+            if let Some(js) = plugin.append_js() {
+                bundle.append_js.push(b'\n');
+                bundle.append_js.extend_from_slice(js);
+            }
+            if let Some(css) = plugin.append_css() {
+                bundle.append_css.push(b'\n');
+                bundle.append_css.extend_from_slice(css);
+            }
+            for (path, bytes) in plugin.media_files() {
+                bundle.files.insert(path.to_string(), bytes.to_vec());
+            }
+        }
+        bundle
     }
 }
 

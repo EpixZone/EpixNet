@@ -153,9 +153,9 @@ async fn serve(
         state.add_transfer(&display, bytes_recv, 0).await;
     }
 
-    // Assemble the UI command set through the plugin system. Real plugins
-    // (Sidebar, Stats, …) register here as they're built.
-    let plugins = epix_plugin::PluginRegistry::new();
+    // Assemble the UI command set + media through the plugin system.
+    let mut plugins = epix_plugin::PluginRegistry::new();
+    plugins.register(std::sync::Arc::new(epix_plugins::SidebarPlugin));
 
     let bind: std::net::SocketAddr = BIND.parse().unwrap();
     println!("\n┌──────────────────────────────────────────────");
@@ -164,7 +164,7 @@ async fn serve(
     println!("│ Open in your browser:");
     println!("│   http://{BIND}/{display}/");
     println!("└──────────────────────────────────────────────\n");
-    UiServer::with_registry(state, plugins.command_registry())
+    UiServer::with_registry_and_media(state, plugins.command_registry(), plugins.media_bundle())
         .serve(bind)
         .await
         .expect("server");
