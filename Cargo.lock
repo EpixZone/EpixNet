@@ -602,7 +602,10 @@ dependencies = [
  "async-trait",
  "epix-core",
  "epix-protocol",
+ "epix-reticulum",
  "epix-transport",
+ "rand_core 0.6.4",
+ "reticulum",
  "rmpv",
  "tokio",
 ]
