@@ -84,7 +84,10 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(simple("channelJoin", json!("ok"))),
         Arc::new(simple("channelJoinAllsite", json!("ok"))),
         Arc::new(simple("announcerInfo", json!({ "stats": {} }))),
-        Arc::new(simple("permissionAdd", json!("ok"))),
+        Arc::new(PermissionAdd),
+        Arc::new(MergerSiteList),
+        Arc::new(MergerSiteAdd),
+        Arc::new(MergerSiteDelete),
         Arc::new(simple("permissionDetails", json!(""))),
         Arc::new(simple("configSet", json!("ok"))),
         Arc::new(simple("siteListModifiedFiles", json!({ "modified_files": [] }))),
@@ -173,7 +176,12 @@ impl WsCommand for FileGet {
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .ok_or("fileGet: missing inner_path")?;
-        match s.state.read_file(address, inner_path).await {
+        // A `merged-<type>/<address>/<path>` file reads from the merged site.
+        let (target, inner) = match AppState::split_merged_path(inner_path) {
+            Some((addr, inner)) => (addr, inner),
+            None => (address.to_string(), inner_path.to_string()),
+        };
+        match s.state.read_file(&target, &inner).await {
             Some(bytes) => Ok(Value::from(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(Value::Null),
         }
@@ -680,6 +688,77 @@ fn sqlquote(v: &Value) -> String {
     }
 }
 
+// ---- MergerSite ------------------------------------------------------------
+
+/// `permissionAdd(permission)` — grant a permission to the current xite (e.g.
+/// `Merger:ZeroMe`, which makes it a merger site).
+struct PermissionAdd;
+#[async_trait]
+impl WsCommand for PermissionAdd {
+    fn name(&self) -> &'static str {
+        "permissionAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let permission = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or("permissionAdd: permission required")?;
+        s.state.add_permission(&address, permission).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `mergerSiteList(query_site_info)` — the sites merged into this merger site.
+struct MergerSiteList;
+#[async_trait]
+impl WsCommand for MergerSiteList {
+    fn name(&self) -> &'static str {
+        "mergerSiteList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let query_info = p
+            .as_bool()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        s.state.merger_list(&address, query_info).await
+    }
+}
+
+/// `mergerSiteAdd(addresses)` — accept sites into this merger. (Cloning the
+/// merged sites into the node is a follow-up; this validates the merger role.)
+struct MergerSiteAdd;
+#[async_trait]
+impl WsCommand for MergerSiteAdd {
+    fn name(&self) -> &'static str {
+        "mergerSiteAdd"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        if s.state.merger_types(&address).await.is_empty() {
+            return Err("Not a merger site".into());
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `mergerSiteDelete(address)` — remove a merged site from this merger.
+struct MergerSiteDelete;
+#[async_trait]
+impl WsCommand for MergerSiteDelete {
+    fn name(&self) -> &'static str {
+        "mergerSiteDelete"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        if s.state.merger_types(&address).await.is_empty() {
+            return Err("Not a merger site".into());
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
 // ---- ContentFilter: mute + siteblock lists ---------------------------------
 
 /// Read a positional-or-named string arg from the command params.
@@ -784,6 +863,42 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn merger_site_lists_and_routes_merged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+
+        // A merger site granted `Merger:ZeroMe`.
+        let merger = "1Merger";
+        state.add_xite(merger, XiteEntry { storage: XiteStorage::new(dir.path().join("m")), content: None }).await;
+        state.add_permission(merger, "Merger:ZeroMe").await;
+
+        // A merged site of that type, with a file.
+        let merged = "1Merged";
+        let mstore = XiteStorage::new(dir.path().join("d"));
+        mstore.write("data.txt", b"merged file").unwrap();
+        state
+            .add_xite(merged, XiteEntry { storage: mstore, content: Some(json!({ "merged_type": "ZeroMe" })) })
+            .await;
+        // A site of a different merged type is excluded.
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path().join("o")), content: Some(json!({ "merged_type": "OtherApp" })) })
+            .await;
+
+        let session = WsSession { state: state.clone(), xite: Some(merger.into()) };
+        let list = MergerSiteList.handle(&session, &json!([false])).await.unwrap();
+        assert_eq!(list["1Merged"], "ZeroMe");
+        assert!(list.get("1Other").is_none(), "different merged type excluded");
+
+        // fileGet routes a merged-<type>/<address>/<path> read to the merged site.
+        let f = FileGet.handle(&session, &json!("merged-ZeroMe/1Merged/data.txt")).await.unwrap();
+        assert_eq!(f, "merged file");
+
+        // A non-merger site can't list.
+        let s2 = WsSession { state, xite: Some(merged.into()) };
+        assert!(MergerSiteList.handle(&s2, &json!([false])).await.is_err());
+    }
 
     #[tokio::test]
     async fn cryptmessage_commands_round_trip() {

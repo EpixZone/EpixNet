@@ -303,6 +303,74 @@ impl AppState {
         self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
     }
 
+    // --- MergerSite ----------------------------------------------------------
+
+    /// Grant a permission to a xite (e.g. `Merger:ZeroMe`). Idempotent.
+    pub async fn add_permission(&self, address: &str, permission: &str) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if !x.settings.permissions.iter().any(|p| p == permission) {
+                x.settings.permissions.push(permission.to_string());
+            }
+        }
+    }
+
+    /// The merger types a site declares (`Merger:<type>` permissions).
+    pub async fn merger_types(&self, address: &str) -> Vec<String> {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| {
+                x.settings
+                    .permissions
+                    .iter()
+                    .filter_map(|p| p.strip_prefix("Merger:").map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `mergerSiteList`: the served sites whose content.json `merged_type` is one
+    /// this merger accepts. `address -> merged_type`, or `-> siteInfo` when
+    /// `query_site_info`.
+    pub async fn merger_list(&self, address: &str, query_site_info: bool) -> Result<Value, String> {
+        let merger_types = self.merger_types(address).await;
+        if merger_types.is_empty() {
+            return Err("Not a merger site".into());
+        }
+        // Collect matches under the read lock, then build the response (siteInfo
+        // re-locks, so don't hold the lock across it).
+        let matches: Vec<(String, String)> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter_map(|(addr, x)| {
+                    let mt = x.content.as_ref()?.get("merged_type")?.as_str()?.to_string();
+                    merger_types.contains(&mt).then(|| (addr.clone(), mt))
+                })
+                .collect()
+        };
+
+        let mut ret = serde_json::Map::new();
+        for (addr, merged_type) in matches {
+            let value = if query_site_info { self.site_info(&addr).await } else { json!(merged_type) };
+            ret.insert(addr, value);
+        }
+        Ok(Value::Object(ret))
+    }
+
+    /// The merged site + inner path for a `merged-<type>/<address>/<path>` path,
+    /// if it is one (else `None`).
+    pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
+        let rest = inner_path.strip_prefix("merged-")?;
+        // merged-<type>/<address>/<inner_path>
+        let mut parts = rest.splitn(3, '/');
+        let _type = parts.next()?;
+        let address = parts.next()?.to_string();
+        let inner = parts.next().unwrap_or("").to_string();
+        Some((address, inner))
+    }
+
     // --- publish / sign ------------------------------------------------------
 
     /// The transport used to publish updates to peers.
