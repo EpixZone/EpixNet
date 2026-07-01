@@ -672,15 +672,28 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "epix-core",
+ "epix-user",
  "epix-xite",
  "futures-util",
+ "hex",
  "include_dir",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "epix-user"
+version = "0.1.0"
+dependencies = [
+ "epix-crypt",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -710,6 +723,7 @@ dependencies = [
  "epix-discovery",
  "epix-transport",
  "hex",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

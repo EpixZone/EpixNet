@@ -1,10 +1,12 @@
 //! `epix-xite` — xite lifecycle: storage, content.json, and peer announcing.
 
 pub mod announcer;
+pub mod settings;
 pub mod xite;
 pub mod storage;
 
 pub use announcer::announce;
+pub use settings::{content_stats, Cache, ContentStats, XiteSettings};
 pub use xite::{FileEntry, Xite};
 pub use storage::XiteStorage;
 

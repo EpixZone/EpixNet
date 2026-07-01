@@ -214,33 +214,7 @@ impl WsCommand for SiteInfo {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?;
-        let content = s.state.content(address).await.unwrap_or(Value::Null);
-        let short = if address.len() > 6 { &address[..6] } else { address };
-        Ok(json!({
-            "address": address,
-            "address_short": short,
-            "address_hash": "",
-            "auth_address": "",
-            "auth_key": "",
-            "cert_user_id": Value::Null,
-            "content": content,
-            "content_updated": Value::Null,
-            "bad_files": 0,
-            "size_limit": 10,
-            "next_size_limit": 10,
-            "peers": 1,
-            "started_task_num": 0,
-            "tasks": 0,
-            "workers": 0,
-            "event": Value::Null,
-            "settings": {
-                "permissions": ["ADMIN"],
-                "serving": true,
-                "own": true,
-                "size": 0,
-                "modified": 0,
-            },
-        }))
+        Ok(s.state.site_info(address).await)
     }
 }
 

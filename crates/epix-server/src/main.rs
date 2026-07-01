@@ -111,7 +111,7 @@ async fn serve(
     data_dir: std::path::PathBuf,
     content: Option<serde_json::Value>,
 ) {
-    let state = AppState::new(env!("CARGO_PKG_VERSION"));
+    let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
     // Serve under the raw address and (if resolved from a name) the .epix name,
     // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
     state
