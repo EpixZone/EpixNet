@@ -8,13 +8,14 @@ use epix_ui::{AppState, UiServer, XiteEntry};
 use epix_xite::{Xite, XiteStorage};
 use std::sync::Arc;
 
-const DASH: &str = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
 const TRACKER: &str = "145.223.69.23:26959";
 const BIND: &str = "127.0.0.1:43110";
 
 #[tokio::main]
 async fn main() {
-    let address = std::env::args().nth(1).unwrap_or_else(|| DASH.to_string());
+    // Accept a raw `epix1…` xite address, or a `.epix` name to resolve on-chain.
+    let arg = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
+    let address = resolve_target(&arg).await;
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
     let data_dir = std::env::temp_dir().join("epix-data").join(&address);
@@ -80,6 +81,27 @@ async fn main() {
 
     // 4. Serve it.
     serve(address, data_dir, xite.content.clone()).await;
+}
+
+/// Turn a CLI argument into a xite address: pass `epix1…` through; resolve a
+/// `.epix` name (or bare label, defaulting to the `epix` tld) on the chain.
+async fn resolve_target(arg: &str) -> String {
+    if arg.starts_with("epix1") && !arg.contains('.') {
+        return arg.to_string();
+    }
+    let (name, tld) = arg.rsplit_once('.').unwrap_or((arg, "epix"));
+    println!("· resolving {name}.{tld} on the Epix chain …");
+    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
+    let domain = resolver
+        .resolve(name, tld)
+        .await
+        .unwrap_or_else(|e| panic!("could not resolve {name}.{tld}: {e}"));
+    let address = domain
+        .xite_address()
+        .unwrap_or_else(|| panic!("{name}.{tld} has no EpixNet xite address record"))
+        .to_string();
+    println!("  {name}.{tld} → {address} (chain-verified)");
+    address
 }
 
 async fn serve(address: String, data_dir: std::path::PathBuf, content: Option<serde_json::Value>) {

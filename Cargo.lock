@@ -578,6 +578,7 @@ dependencies = [
 name = "epix-server"
 version = "0.1.0"
 dependencies = [
+ "epix-chain",
  "epix-core",
  "epix-protocol",
  "epix-transport",
