@@ -29,7 +29,13 @@ impl PeerServer {
         Self { handler, version: "EpixRS".into(), rev: 8192 }
     }
 
-    /// Serve inbound connections until the listener errors.
+    /// The server's advertised version and revision, for driving
+    /// [`serve_stream`] on transports other than TCP.
+    pub fn banner(&self) -> (String, i64) {
+        (self.version.clone(), self.rev)
+    }
+
+    /// Serve inbound TCP connections until the listener errors.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
         loop {
             let (sock, addr) = listener.accept().await?;
@@ -38,25 +44,38 @@ impl PeerServer {
             let version = self.version.clone();
             let rev = self.rev;
             tokio::spawn(async move {
-                let peer = PeerAddr::Ip(addr);
-                let mut stream: epix_transport::PeerStream = Box::pin(sock);
-                let mut buf = Vec::new();
-                while let Ok(req) = read_msg(&mut stream, &mut buf).await {
-                    let cmd = vget(&req, "cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let req_id = vget(&req, "req_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let params = vget(&req, "params").cloned().unwrap_or(Value::Nil);
-
-                    let body = if cmd == "handshake" {
-                        handshake_response(&version, rev)
-                    } else {
-                        handler.handle(&peer, &cmd, &params).await
-                    };
-
-                    if send_msg(&mut stream, &response(req_id, body)).await.is_err() {
-                        break;
-                    }
-                }
+                let stream: epix_transport::PeerStream = Box::pin(sock);
+                serve_stream(handler, PeerAddr::Ip(addr), stream, &version, rev).await;
             });
+        }
+    }
+}
+
+/// Run the request/response loop over one already-established peer stream,
+/// whatever transport it came from (TCP, Reticulum mesh, …). Reads framed
+/// requests, answers the handshake itself, dispatches the rest to `handler`,
+/// and returns when the peer disconnects.
+pub async fn serve_stream(
+    handler: Arc<dyn RequestHandler>,
+    peer: PeerAddr,
+    mut stream: epix_transport::PeerStream,
+    version: &str,
+    rev: i64,
+) {
+    let mut buf = Vec::new();
+    while let Ok(req) = read_msg(&mut stream, &mut buf).await {
+        let cmd = vget(&req, "cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let req_id = vget(&req, "req_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let params = vget(&req, "params").cloned().unwrap_or(Value::Nil);
+
+        let body = if cmd == "handshake" {
+            handshake_response(version, rev)
+        } else {
+            handler.handle(&peer, &cmd, &params).await
+        };
+
+        if send_msg(&mut stream, &response(req_id, body)).await.is_err() {
+            break;
         }
     }
 }

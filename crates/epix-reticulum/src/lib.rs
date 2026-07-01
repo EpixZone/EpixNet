@@ -18,7 +18,9 @@
 //!
 //! [`PeerStream`]: epix_transport::PeerStream
 
+mod server;
 mod transport;
+pub use server::ReticulumServer;
 pub use transport::ReticulumTransport;
 
 use std::pin::Pin;
