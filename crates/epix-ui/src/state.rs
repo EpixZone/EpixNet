@@ -420,6 +420,90 @@ impl AppState {
         std::fs::metadata(path).ok().map(|m| m.len())
     }
 
+    /// Ensure the pieces covering `[offset, offset+size)` of a big file are
+    /// present, downloading only the missing ones from peers and verifying each
+    /// against the piecemap before writing it into the sparse file. A no-op for
+    /// files that aren't big files. This is true piecewise Bigfile download.
+    pub async fn bigfile_fetch_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<(), String> {
+        let content = self.content(address).await;
+        let entry = content
+            .as_ref()
+            .and_then(|c| c.get("files_optional"))
+            .and_then(|o| o.get(inner_path));
+        let Some(entry) = entry else { return Ok(()) }; // not optional -> nothing to do
+        let Some(piecemap_path) = entry.get("piecemap").and_then(|v| v.as_str()).map(String::from)
+        else {
+            return Ok(()); // not a big file
+        };
+        let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024) as u64;
+        let total = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
+        if piece_size == 0 || total == 0 || size == 0 {
+            return Ok(());
+        }
+
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+
+        // The piecemap is itself a (small) optional file — fetch it if missing.
+        if !storage.exists(&piecemap_path) {
+            self.file_need(address, &piecemap_path).await?;
+        }
+        let pm_bytes = storage.read(&piecemap_path).map_err(|e| e.to_string())?;
+        let file_name = inner_path.rsplit('/').next().unwrap_or(inner_path);
+        let hashes = epix_xite::parse_piecemap(&pm_bytes, file_name).ok_or("malformed piecemap")?;
+
+        ensure_sparse_file(&storage, inner_path, total)?;
+
+        let last_byte = (offset + size - 1).min(total - 1);
+        let (first, last) = (offset / piece_size, last_byte / piece_size);
+        let transport = self.transport.read().await.clone();
+        let peers = self.connectable_peers(address, 20).await;
+
+        for i in first..=last {
+            let poff = i * piece_size;
+            let plen = piece_size.min(total - poff);
+            let expected = hashes.get(i as usize).ok_or("piece index past piecemap")?;
+            if piece_present(&storage, inner_path, poff, plen, expected) {
+                continue;
+            }
+            let transport = transport.clone().ok_or("no transport")?;
+            let mut got = false;
+            for peer in &peers {
+                let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else { continue };
+                if conn.handshake().await.is_err() {
+                    continue;
+                }
+                let Ok(data) = conn.get_file_range(address, inner_path, poff, plen).await else {
+                    continue;
+                };
+                if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
+                    write_at(&storage, inner_path, poff, &data)?;
+                    self.set_peer_connected(address, peer, true).await;
+                    if let Some(x) = self.xites.write().await.get_mut(address) {
+                        x.settings.optional_downloaded += plen as i64;
+                    }
+                    got = true;
+                    break;
+                }
+            }
+            if !got {
+                return Err(format!("could not fetch piece {i} of {inner_path}"));
+            }
+        }
+        Ok(())
+    }
+
     /// Read a byte range from a xite file (for streaming big files / HTTP Range).
     /// Returns up to `length` bytes starting at `offset`.
     pub async fn read_file_range(
@@ -800,6 +884,49 @@ fn build_xite_db(storage: &XiteStorage) -> Option<(Database, DbSchema)> {
         let _ = db.populate(&schema, storage.root());
     }
     Some((db, schema))
+}
+
+/// Create (or right-size) a file at `size` bytes so pieces can be written into
+/// it sparsely at their offsets.
+fn ensure_sparse_file(storage: &XiteStorage, inner_path: &str, size: u64) -> Result<(), String> {
+    let path = storage.path(inner_path).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let wrong_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX) != size;
+    if wrong_size {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        f.set_len(size).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Write `data` at `offset` in an existing file.
+fn write_at(storage: &XiteStorage, inner_path: &str, offset: u64, data: &[u8]) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+    let path = storage.path(inner_path).map_err(|e| e.to_string())?;
+    let mut f = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| e.to_string())?;
+    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    f.write_all(data).map_err(|e| e.to_string())
+}
+
+/// Whether the piece at `offset` (length `len`) is present and matches `hash`.
+fn piece_present(storage: &XiteStorage, inner_path: &str, offset: u64, len: u64, hash: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(path) = storage.path(inner_path) else { return false };
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; len as usize];
+    if f.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    XiteStorage::hash_bytes(&buf) == hash
 }
 
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`

@@ -108,6 +108,49 @@ impl Connection {
         Ok(vget(&resp, "body").and_then(|v| v.as_str()) == Some("Pong!"))
     }
 
+    /// Download exactly `size` bytes starting at `offset` (`getFile` with
+    /// `read_bytes`), for pulling a single big-file piece. Returns fewer bytes
+    /// only if the file ends early.
+    pub async fn get_file_range(
+        &mut self,
+        xite: &str,
+        inner_path: &str,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>> {
+        const CHUNK: u64 = 1024 * 512; // FILE_BUFF: the peer caps a response here
+        let mut out = Vec::new();
+        let mut location = offset;
+        let end = offset + size;
+        while (out.len() as u64) < size {
+            let read_bytes = (end - location).min(CHUNK);
+            let params = vmap(vec![
+                ("site", Value::from(xite)),
+                ("inner_path", Value::from(inner_path)),
+                ("location", Value::from(location as i64)),
+                ("read_bytes", Value::from(read_bytes as i64)),
+            ]);
+            let resp = self.request("getFile", params).await?;
+            let body = vget(&resp, "body")
+                .ok_or_else(|| Error::Protocol("getFile response has no body".into()))?;
+            let chunk: &[u8] = match body {
+                Value::Binary(b) => b.as_slice(),
+                Value::String(s) => s.as_bytes(),
+                other => return Err(Error::Protocol(format!("getFile body has type {other:?}"))),
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            out.extend_from_slice(chunk);
+            location += chunk.len() as u64;
+            if (chunk.len() as u64) < read_bytes {
+                break; // short read → end of file
+            }
+        }
+        out.truncate(size as usize);
+        Ok(out)
+    }
+
     /// Publish an updated `content.json` to the peer (`update` FileRequest). The
     /// peer verifies `body`'s signature before accepting, so a bad update is
     /// rejected on their side. `body` is the raw content.json bytes.

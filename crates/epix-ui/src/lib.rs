@@ -188,6 +188,8 @@ async fn serve_file(
             if start < total {
                 let end = end.unwrap_or(total - 1).min(total - 1);
                 let len = (end - start + 1) as usize;
+                // Big file: pull only the pieces this range needs (no-op otherwise).
+                let _ = ctx.state.bigfile_fetch_range(&address, &path, start, len as u64).await;
                 if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
                     return (
                         StatusCode::PARTIAL_CONTENT,
