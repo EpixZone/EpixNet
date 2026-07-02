@@ -71,6 +71,8 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteblockIgnoreAddSite",
     "siteblockList",
     "siteblockRemove",
+    "userList",
+    "userLogin",
     "userLogout",
     "userSelectForm",
     "userSet",
@@ -254,7 +256,8 @@ impl CommandRegistry {
 }
 
 fn default_commands() -> Vec<Arc<dyn WsCommand>> {
-    vec![
+    #[allow(unused_mut)]
+    let mut cmds: Vec<Arc<dyn WsCommand>> = vec![
         Arc::new(Ping),
         Arc::new(ServerInfo),
         Arc::new(SiteInfo),
@@ -339,7 +342,17 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(UserSetGlobalSettings),
         Arc::new(WrapperNonce),
         Arc::new(FileGet),
-    ]
+    ];
+    // Multiuser: identity login/switch commands (desktop only).
+    #[cfg(feature = "multiuser")]
+    {
+        cmds.push(Arc::new(UserShowMasterSeed));
+        cmds.push(Arc::new(UserList));
+        cmds.push(Arc::new(UserLogin));
+        cmds.push(Arc::new(UserSet));
+        cmds.push(Arc::new(UserLogout));
+    }
+    cmds
 }
 
 struct UserGetGlobalSettings;
@@ -1580,6 +1593,83 @@ impl WsCommand for MergerSiteDelete {
         if s.state.merger_types(&address).await.is_empty() {
             return Err("Not a merger site".into());
         }
+        Ok(Value::from("ok"))
+    }
+}
+
+// ---- Multiuser: identity login / switch ------------------------------------
+
+/// `userShowMasterSeed()` - reveal the active identity's master seed.
+#[cfg(feature = "multiuser")]
+struct UserShowMasterSeed;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserShowMasterSeed {
+    fn name(&self) -> &'static str {
+        "userShowMasterSeed"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!({ "master_seed": s.state.multiuser_current_seed().await }))
+    }
+}
+
+/// `userList()` - master addresses of every known identity (active first).
+#[cfg(feature = "multiuser")]
+struct UserList;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserList {
+    fn name(&self) -> &'static str {
+        "userList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!(s.state.multiuser_list().await))
+    }
+}
+
+/// `userLogin(master_seed)` - add/select an identity from a master seed.
+#[cfg(feature = "multiuser")]
+struct UserLogin;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserLogin {
+    fn name(&self) -> &'static str {
+        "userLogin"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let seed = arg_str(p, "master_seed", 0).ok_or("master_seed required")?;
+        let addr = s.state.multiuser_login(seed).await?;
+        Ok(json!({ "master_address": addr }))
+    }
+}
+
+/// `userSet(master_address)` - switch the active identity.
+#[cfg(feature = "multiuser")]
+struct UserSet;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserSet {
+    fn name(&self) -> &'static str {
+        "userSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let addr = arg_str(p, "master_address", 0).ok_or("master_address required")?;
+        s.state.multiuser_select(addr).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `userLogout()` - revert to the primary identity.
+#[cfg(feature = "multiuser")]
+struct UserLogout;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserLogout {
+    fn name(&self) -> &'static str {
+        "userLogout"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        s.state.multiuser_logout().await?;
         Ok(Value::from("ok"))
     }
 }

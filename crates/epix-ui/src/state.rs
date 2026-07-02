@@ -119,6 +119,13 @@ pub struct AppState {
     /// Path to the persisted peer database (`peers.json`), so known peers survive
     /// restarts (the PeerDb plugin). None for in-memory nodes.
     peers_path: Option<PathBuf>,
+    /// Multiuser: extra identities keyed by master_address, persisted alongside
+    /// the active `user`. Lets the operator log in with another master seed and
+    /// switch between identities. Feature-gated (desktop only).
+    #[cfg(feature = "multiuser")]
+    multi_users: RwLock<HashMap<String, User>>,
+    #[cfg(feature = "multiuser")]
+    multi_users_path: Option<PathBuf>,
 }
 
 /// A server-pushed UI event.
@@ -171,6 +178,10 @@ impl AppState {
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
             peers_path: None,
+            #[cfg(feature = "multiuser")]
+            multi_users: RwLock::new(HashMap::new()),
+            #[cfg(feature = "multiuser")]
+            multi_users_path: None,
         })
     }
 
@@ -205,6 +216,17 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        // Multiuser: load the extra-identities store, seeding it with the active
+        // user so it is always listed.
+        #[cfg(feature = "multiuser")]
+        let multi_users: HashMap<String, User> = {
+            let mut m: HashMap<String, User> = std::fs::read(dir.join("users_multi.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            m.insert(user.master_address.clone(), user.clone());
+            m
+        };
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -230,6 +252,10 @@ impl AppState {
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
             peers_path: Some(dir.join("peers.json")),
+            #[cfg(feature = "multiuser")]
+            multi_users: RwLock::new(multi_users),
+            #[cfg(feature = "multiuser")]
+            multi_users_path: Some(dir.join("users_multi.json")),
         })
     }
 
@@ -1902,6 +1928,98 @@ impl AppState {
         if let Some(path) = &self.user_path {
             let _ = self.user.read().await.save(path);
         }
+        // Multiuser: keep the active identity's full state mirrored in the store,
+        // so its certs/follows are not lost when the operator switches identity.
+        #[cfg(feature = "multiuser")]
+        self.multiuser_sync_active().await;
+    }
+
+    // --- Multiuser: multiple master-seed identities ------------------------
+
+    /// Master addresses of every known identity (the active one first).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_list(&self) -> Vec<String> {
+        let active = self.user.read().await.master_address.clone();
+        let mut out = vec![active.clone()];
+        for addr in self.multi_users.read().await.keys() {
+            if *addr != active {
+                out.push(addr.clone());
+            }
+        }
+        out
+    }
+
+    /// The active identity's master seed (`userShowMasterSeed`).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_current_seed(&self) -> String {
+        self.user.read().await.master_seed.clone()
+    }
+
+    /// Add (or look up) an identity from a master seed and make it active.
+    /// Returns its master_address (`responseUserLogin`).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_login(&self, master_seed: &str) -> Result<String, String> {
+        let incoming = User::from_seed(master_seed.trim())?;
+        let addr = incoming.master_address.clone();
+        // Keep an existing richer copy (with certs/follows) if we already know it.
+        {
+            let mut store = self.multi_users.write().await;
+            store.entry(addr.clone()).or_insert(incoming);
+        }
+        self.multiuser_select(&addr).await?;
+        Ok(addr)
+    }
+
+    /// Switch the active identity to a known master_address (`userSet`).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_select(&self, master_address: &str) -> Result<(), String> {
+        // Persist the currently-active identity into the store first.
+        self.multiuser_sync_active().await;
+        let target = self
+            .multi_users
+            .read()
+            .await
+            .get(master_address)
+            .cloned()
+            .ok_or_else(|| format!("unknown user: {master_address}"))?;
+        *self.user.write().await = target;
+        self.save_user().await;
+        self.persist_multi_users().await;
+        Ok(())
+    }
+
+    /// Log out of an added identity: revert to the primary (first-listed) one.
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_logout(&self) -> Result<(), String> {
+        let primary = {
+            let store = self.multi_users.read().await;
+            let active = self.user.read().await.master_address.clone();
+            store.keys().find(|a| **a != active).cloned()
+        };
+        match primary {
+            Some(addr) => self.multiuser_select(&addr).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Copy the active identity's full state into the store (so switching keeps
+    /// its certs/follows).
+    #[cfg(feature = "multiuser")]
+    async fn multiuser_sync_active(&self) {
+        let active = self.user.read().await.clone();
+        self.multi_users.write().await.insert(active.master_address.clone(), active);
+        self.persist_multi_users().await;
+    }
+
+    /// Write the extra-identities store to disk.
+    #[cfg(feature = "multiuser")]
+    async fn persist_multi_users(&self) {
+        if let Some(path) = &self.multi_users_path {
+            let store = self.multi_users.read().await;
+            if let Ok(bytes) = serde_json::to_vec_pretty(&*store) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
     }
 }
 
@@ -2441,6 +2559,34 @@ mod tests {
         let s = AppState::with_data_dir("test", dir.path());
         s.add_xite("1Site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
         assert_eq!(s.peer_counts("1Site").await.total, 2);
+    }
+
+    #[cfg(feature = "multiuser")]
+    #[tokio::test]
+    async fn multiuser_login_switch_and_persist() {
+        let dir = tempdir().unwrap();
+        // A second identity from a known seed.
+        let seed = "5f5e100000000000000000000000000000000000000000000000000000000001";
+        let (primary, alt) = {
+            let s = AppState::with_data_dir("test", dir.path());
+            let primary = s.multiuser_current_seed().await;
+            let alt = s.multiuser_login(seed).await.unwrap();
+            // Active identity is now the alt one; both are listed.
+            assert_eq!(s.multiuser_current_seed().await, seed);
+            assert!(s.multiuser_list().await.contains(&alt));
+            assert_eq!(s.multiuser_list().await.len(), 2);
+            (primary, alt)
+        };
+        // A fresh node over the same dir remembers both; switching works.
+        let s = AppState::with_data_dir("test", dir.path());
+        assert!(s.multiuser_list().await.contains(&alt));
+        s.multiuser_select(&alt).await.unwrap();
+        assert_eq!(s.multiuser_current_seed().await, seed);
+        // Logout reverts to the primary identity.
+        s.multiuser_logout().await.unwrap();
+        assert_eq!(s.multiuser_current_seed().await, primary);
+        // Selecting an unknown user errors.
+        assert!(s.multiuser_select("epix1nope").await.is_err());
     }
 
     #[tokio::test]

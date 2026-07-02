@@ -38,6 +38,8 @@ getrandom = { version = "0.2", optional = true }
 # on mobile (a phone's UI is already local to the device); enable for a shared
 # or exposed desktop node.
 ui-password = ["dep:getrandom"]
+# Multiuser: multiple master-seed identities with login/switch. Desktop only.
+multiuser = []
 
 [dev-dependencies]
 rmpv = "1"
