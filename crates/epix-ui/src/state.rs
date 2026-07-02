@@ -158,7 +158,10 @@ impl AppState {
         // A xite starts with no permissions. ADMIN (and other permissions) are
         // granted only when the xite requests one and the user approves the
         // wrapper's grant prompt; those grants are restored here from disk.
-        if let Some(granted) = self.grants.read().await.get(&address) {
+        // Grants are keyed by the signed content address so a site served under
+        // both its raw address and a `.epix` alias shares one grant.
+        let canonical = canonical_address(entry.content.as_ref(), &address);
+        if let Some(granted) = self.grants.read().await.get(&canonical) {
             settings.permissions = granted.clone();
         }
         if let Some(content) = &entry.content {
@@ -710,16 +713,26 @@ impl AppState {
     // --- MergerSite ----------------------------------------------------------
 
     /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:ZeroMe`). Idempotent.
-    /// The grant is persisted so it survives restarts.
+    /// The grant is keyed by the signed content address (so every alias of the
+    /// same site shares it) and persisted so it survives restarts.
     pub async fn add_permission(&self, address: &str, permission: &str) {
-        if let Some(x) = self.xites.write().await.get_mut(address) {
-            if !x.settings.permissions.iter().any(|p| p == permission) {
+        let mut xites = self.xites.write().await;
+        let canonical = xites
+            .get(address)
+            .map(|x| canonical_address(x.content.as_ref(), address))
+            .unwrap_or_else(|| address.to_string());
+        // Apply to every served alias that shares this canonical address.
+        for (key, x) in xites.iter_mut() {
+            if canonical_address(x.content.as_ref(), key) == canonical
+                && !x.settings.permissions.iter().any(|p| p == permission)
+            {
                 x.settings.permissions.push(permission.to_string());
             }
         }
+        drop(xites);
         {
             let mut grants = self.grants.write().await;
-            let entry = grants.entry(address.to_string()).or_default();
+            let entry = grants.entry(canonical).or_default();
             if !entry.iter().any(|p| p == permission) {
                 entry.push(permission.to_string());
             }
@@ -727,12 +740,21 @@ impl AppState {
         self.save_grants().await;
     }
 
-    /// Revoke a permission from a xite. Persisted.
+    /// Revoke a permission from a xite (and every alias of the same site).
+    /// Persisted.
     pub async fn remove_permission(&self, address: &str, permission: &str) {
-        if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.permissions.retain(|p| p != permission);
+        let mut xites = self.xites.write().await;
+        let canonical = xites
+            .get(address)
+            .map(|x| canonical_address(x.content.as_ref(), address))
+            .unwrap_or_else(|| address.to_string());
+        for (key, x) in xites.iter_mut() {
+            if canonical_address(x.content.as_ref(), key) == canonical {
+                x.settings.permissions.retain(|p| p != permission);
+            }
         }
-        if let Some(entry) = self.grants.write().await.get_mut(address) {
+        drop(xites);
+        if let Some(entry) = self.grants.write().await.get_mut(&canonical) {
             entry.retain(|p| p != permission);
         }
         self.save_grants().await;
@@ -1308,6 +1330,17 @@ fn piece_present(storage: &XiteStorage, inner_path: &str, offset: u64, len: u64,
 
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
 /// become counts, and the signatures are stripped (matches `formatSiteInfo`).
+/// The address a permission grant is keyed by: the xite's signed content
+/// address when known (so a site served under both its raw address and a
+/// `.epix` alias shares one grant), otherwise the serving key.
+fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
+    content
+        .and_then(|c| c.get("address"))
+        .and_then(Value::as_str)
+        .unwrap_or(serving_key)
+        .to_string()
+}
+
 fn summarize_content(content: &Value) -> Value {
     let mut c = content.clone();
     if let Value::Object(map) = &mut c {
@@ -1692,5 +1725,30 @@ mod tests {
         // A xite that was never granted anything stays unprivileged.
         s.add_xite("other.epix", XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
         assert!(!s.site_has_admin("other.epix").await);
+    }
+
+    #[tokio::test]
+    async fn grant_is_shared_across_a_sites_aliases() {
+        let dir = tempdir().unwrap();
+        let content = json!({ "address": "epix1dash", "files": {}, "signs": {"epix1dash": "x"} });
+        let store = || XiteStorage::new(dir.path());
+
+        // First run: same site served under a raw address and a .epix alias.
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            s.add_xite("epix1dash", XiteEntry { storage: store(), content: Some(content.clone()) }).await;
+            s.add_xite("dashboard.epix", XiteEntry { storage: store(), content: Some(content.clone()) }).await;
+            // Granting via the alias grants the raw address too.
+            s.add_permission("dashboard.epix", "ADMIN").await;
+            assert!(s.site_has_admin("dashboard.epix").await);
+            assert!(s.site_has_admin("epix1dash").await, "grant applies to the raw alias");
+        }
+        // Second run: the grant is restored for both aliases from the single
+        // canonical entry in permissions.json.
+        let s = AppState::with_data_dir("test", dir.path());
+        s.add_xite("epix1dash", XiteEntry { storage: store(), content: Some(content.clone()) }).await;
+        s.add_xite("dashboard.epix", XiteEntry { storage: store(), content: Some(content) }).await;
+        assert!(s.site_has_admin("epix1dash").await);
+        assert!(s.site_has_admin("dashboard.epix").await);
     }
 }
