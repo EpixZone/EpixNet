@@ -256,7 +256,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalLimitSet),
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
-        Arc::new(simple("serverErrors", json!([]))),
+        Arc::new(ServerErrors),
         Arc::new(ChartGetPeerLocations),
         Arc::new(AnnouncerStats),
         Arc::new(SiteList),
@@ -348,6 +348,19 @@ impl WsCommand for Ping {
     }
     async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(Value::from("Pong!"))
+    }
+}
+
+/// `serverErrors` — recent node log lines for the dashboard console, each
+/// `[date_added, level, message]`.
+struct ServerErrors;
+#[async_trait]
+impl WsCommand for ServerErrors {
+    fn name(&self) -> &'static str {
+        "serverErrors"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(Value::Array(s.state.server_errors().await))
     }
 }
 

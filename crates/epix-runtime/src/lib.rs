@@ -143,13 +143,25 @@ async fn connection_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Du
     // Re-snapshot the chart so connection stats reflect the warmed pool instead
     // of the empty startup snapshot.
     state.collect_chart().await;
+    let mut last = state.connection_stats().await.total;
+    if last > 0 {
+        state.log("INFO", format!("Connected to {last} peers")).await;
+    }
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await;
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
-            _ = tick.tick() => state.manage_connections().await,
+            _ = tick.tick() => {
+                state.manage_connections().await;
+                // Log only when the connection count changes (avoid spam).
+                let now = state.connection_stats().await.total;
+                if now != last {
+                    state.log("INFO", format!("Peer connections: {now}")).await;
+                    last = now;
+                }
+            }
         }
     }
 }

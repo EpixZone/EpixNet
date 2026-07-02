@@ -99,6 +99,9 @@ pub struct AppState {
     /// survives restarts.
     config: RwLock<serde_json::Map<String, Value>>,
     config_path: Option<PathBuf>,
+    /// Recent log lines for the dashboard console (`serverErrors`): each is
+    /// `[date_added, level, message]`, newest last, capped.
+    logs: RwLock<std::collections::VecDeque<Value>>,
 }
 
 /// A server-pushed UI event.
@@ -147,6 +150,7 @@ impl AppState {
             events: tokio::sync::broadcast::channel(256).0,
             config: RwLock::new(serde_json::Map::new()),
             config_path: None,
+            logs: RwLock::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -202,6 +206,7 @@ impl AppState {
             events: tokio::sync::broadcast::channel(256).0,
             config: RwLock::new(config),
             config_path: Some(config_path),
+            logs: RwLock::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -304,6 +309,7 @@ impl AppState {
             all.extend(peers);
         }
         self.add_peers(address, all.clone()).await;
+        self.log("INFO", format!("Announced {address}: {} peers", all.len())).await;
         // Push the fresh peer count + tracker status to any connected UI.
         self.push_site_info(address).await;
         self.push_announcer_info().await;
@@ -1029,6 +1035,28 @@ impl AppState {
     }
 
     // --- Server-pushed UI events --------------------------------------------
+
+    // --- Console log buffer -------------------------------------------------
+
+    /// Maximum log lines kept for the console.
+    const LOG_CAPACITY: usize = 300;
+
+    /// Record a log line for the dashboard console (`serverErrors`) and echo it
+    /// to stdout. `level` is `INFO`/`WARNING`/`ERROR`.
+    pub async fn log(&self, level: &str, message: impl Into<String>) {
+        let message = message.into();
+        println!("[{level}] {message}");
+        let mut logs = self.logs.write().await;
+        logs.push_back(json!([now_secs() as f64, level, message]));
+        while logs.len() > Self::LOG_CAPACITY {
+            logs.pop_front();
+        }
+    }
+
+    /// The recent log lines (`serverErrors`): `[[date_added, level, message], …]`.
+    pub async fn server_errors(&self) -> Vec<Value> {
+        self.logs.read().await.iter().cloned().collect()
+    }
 
     /// Subscribe to server-pushed UI events (one receiver per WS connection).
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<UiEvent> {
@@ -1912,6 +1940,20 @@ mod tests {
         let stats = state.optional_limit_stats().await;
         assert!(stats["used"].is_number() && stats["free"].is_number());
         assert_eq!(stats["limit"], "10%");
+    }
+
+    #[tokio::test]
+    async fn log_buffer_feeds_server_errors() {
+        let state = AppState::new("test");
+        state.log("INFO", "started").await;
+        state.log("WARNING", "slow peer").await;
+        let lines = state.server_errors().await;
+        assert_eq!(lines.len(), 2);
+        // Each line is [date_added, level, message], newest last.
+        assert_eq!(lines[0][1], "INFO");
+        assert_eq!(lines[0][2], "started");
+        assert_eq!(lines[1][1], "WARNING");
+        assert!(lines[1][0].as_f64().unwrap() > 0.0);
     }
 
     #[tokio::test]

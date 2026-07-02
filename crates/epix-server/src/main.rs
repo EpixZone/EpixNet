@@ -199,7 +199,7 @@ async fn serve(
             if let Some(geoip) = geoip {
                 state.set_geoip(geoip).await;
                 state.push_notification("done", "World map ready", 4000);
-                println!("· geolocation database ready — world map enabled");
+                state.log("INFO", "Geolocation database ready — world map enabled").await;
             }
         });
     }
@@ -255,6 +255,7 @@ async fn serve(
     println!("│ Open in your browser:");
     println!("│   http://{BIND}/{display}/");
     println!("└──────────────────────────────────────────────\n");
+    state.log("INFO", format!("Serving {display} ({} bytes received)", bytes_recv)).await;
     UiServer::with_registry_and_media(state, plugins.command_registry(), plugins.media_bundle())
         .serve(bind)
         .await
