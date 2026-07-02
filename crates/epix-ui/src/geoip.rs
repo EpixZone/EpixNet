@@ -4,7 +4,7 @@
 //! and resolves an IP to `{lat, lon, city, country}` — the shape the Stats
 //! page's `chartGetPeerLocations` returns.
 
-use maxminddb::{geoip2, Reader};
+use maxminddb::{geoip2, Mmap, Reader};
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -17,15 +17,16 @@ pub struct Loc {
     pub country: Option<String>,
 }
 
-/// An open geolocation database.
+/// An open geolocation database (memory-mapped, so opening is near-instant and
+/// the OS pages in only the parts a lookup touches).
 pub struct GeoIp {
-    reader: Reader<Vec<u8>>,
+    reader: Reader<Mmap>,
 }
 
 impl GeoIp {
-    /// Open a `.mmdb` file (loaded into memory).
+    /// Memory-map a `.mmdb` file.
     pub fn open(path: impl AsRef<Path>) -> Option<Self> {
-        Reader::open_readfile(path).ok().map(|reader| Self { reader })
+        Reader::open_mmap(path).ok().map(|reader| Self { reader })
     }
 
     /// Ensure the database exists at `mmdb_path` (decompressing `gz` into it on

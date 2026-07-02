@@ -117,11 +117,25 @@ async fn serve(
     bytes_recv: u64,
 ) {
     let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
-    // Bundled IP geolocation db (DB-IP City Lite, CC-BY-4.0), shipped gzipped
-    // and expanded once into the data dir so the world map works offline.
-    let mmdb = data_dir.join("geoip-city.mmdb");
-    if let Some(geoip) = epix_ui::geoip::GeoIp::ensure(GEOIP_CITY_GZ, &mmdb) {
-        state.set_geoip(geoip).await;
+    // Load the bundled IP geolocation db (DB-IP City Lite, CC-BY-4.0) off the
+    // startup path: first run expands the ~62MB gzip to disk, so do it in the
+    // background. The node serves and connects to peers immediately; the world
+    // map returns empty until the db is ready, then fills in.
+    {
+        let state = state.clone();
+        let mmdb = data_dir.join("geoip-city.mmdb");
+        tokio::spawn(async move {
+            let geoip = tokio::task::spawn_blocking(move || {
+                epix_ui::geoip::GeoIp::ensure(GEOIP_CITY_GZ, &mmdb)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(geoip) = geoip {
+                state.set_geoip(geoip).await;
+                println!("· geolocation database ready — world map enabled");
+            }
+        });
     }
     // Serve under the raw address and (if resolved from a name) the .epix name,
     // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
