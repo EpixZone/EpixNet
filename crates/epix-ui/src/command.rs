@@ -320,6 +320,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AesEncrypt),
         Arc::new(AesDecrypt),
         Arc::new(EcdsaVerify),
+        Arc::new(EcdsaSign),
         Arc::new(EccPrivToPub),
         Arc::new(EccPubToAddr),
         Arc::new(simple("userGetSettings", json!({}))),
@@ -1215,18 +1216,71 @@ impl WsCommand for AesDecrypt {
         "aesDecrypt"
     }
     async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
-        let a = p.as_array().ok_or("aesDecrypt: expected [iv, ciphertext, key]")?;
-        let get = |i: usize| a.get(i).and_then(|v| v.as_str()).and_then(b64_decode);
-        let (iv, ct, key) = (
-            get(0).ok_or("aesDecrypt: iv")?,
-            get(1).ok_or("aesDecrypt: ciphertext")?,
-            get(2).ok_or("aesDecrypt: key")?,
-        );
-        Ok(epix_crypt::ecies::aes_decrypt(&ct, &key, &iv)
-            .ok()
-            .and_then(|pt| String::from_utf8(pt).ok())
-            .map(Value::from)
-            .unwrap_or(Value::Null))
+        let a = p.as_array().ok_or("aesDecrypt: expected params array")?;
+        // Single form: [iv, ciphertext, key] (all strings).
+        if a.len() == 3 && a.iter().all(|v| v.is_string()) {
+            let get = |i: usize| a.get(i).and_then(|v| v.as_str()).and_then(b64_decode);
+            let (iv, ct, key) = (
+                get(0).ok_or("aesDecrypt: iv")?,
+                get(1).ok_or("aesDecrypt: ciphertext")?,
+                get(2).ok_or("aesDecrypt: key")?,
+            );
+            return Ok(aes_try_keys(&iv, &ct, std::slice::from_ref(&key)));
+        }
+        // Batch form: [ [[iv, ciphertext], …], [key, …] ]. For each ciphertext,
+        // try every key and return the text of the first that decrypts (or null).
+        let items = a.first().and_then(|v| v.as_array()).ok_or("aesDecrypt: encrypted_texts")?;
+        let keys: Vec<Vec<u8>> = a
+            .get(1)
+            .and_then(|v| v.as_array())
+            .ok_or("aesDecrypt: keys")?
+            .iter()
+            .filter_map(|k| k.as_str().and_then(b64_decode))
+            .collect();
+        let mut out = Vec::with_capacity(items.len());
+        for pair in items {
+            let iv = pair.get(0).and_then(|v| v.as_str()).and_then(b64_decode);
+            let ct = pair.get(1).and_then(|v| v.as_str()).and_then(b64_decode);
+            match (iv, ct) {
+                (Some(iv), Some(ct)) => out.push(aes_try_keys(&iv, &ct, &keys)),
+                _ => out.push(Value::Null),
+            }
+        }
+        Ok(Value::Array(out))
+    }
+}
+
+/// Try each key against `(iv, ciphertext)`, returning the first valid-UTF-8
+/// plaintext as a JSON string, else `Null`.
+fn aes_try_keys(iv: &[u8], ct: &[u8], keys: &[Vec<u8>]) -> Value {
+    for key in keys {
+        if let Ok(pt) = epix_crypt::ecies::aes_decrypt(ct, key, iv) {
+            if let Ok(text) = String::from_utf8(pt) {
+                return Value::from(text);
+            }
+        }
+    }
+    Value::Null
+}
+
+/// `ecdsaSign(data, privatekey?)` - sign `data`. With no key, the user's auth
+/// private key for the bound site is used.
+struct EcdsaSign;
+#[async_trait]
+impl WsCommand for EcdsaSign {
+    fn name(&self) -> &'static str {
+        "ecdsaSign"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let data = arg_str(p, "data", 0).ok_or("ecdsaSign: data required")?;
+        let privatekey = match arg_str(p, "privatekey", 1) {
+            Some(pk) => pk.to_string(),
+            None => {
+                let address = s.address()?.to_string();
+                s.state.user_auth_privatekey(&address).await?
+            }
+        };
+        Ok(Value::from(epix_crypt::sign(data, &privatekey)?))
     }
 }
 
@@ -1815,6 +1869,49 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn aes_decrypt_handles_single_and_batch_forms() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state, Some("1site".into()));
+        let iv = [7u8; 16];
+        let key1 = [1u8; 32];
+        let key2 = [2u8; 32];
+        let ct1 = epix_crypt::ecies::aes_encrypt(b"hello", &key1, &iv).unwrap();
+        let ct2 = epix_crypt::ecies::aes_encrypt(b"world", &key2, &iv).unwrap();
+
+        // Single form: [iv, ct, key].
+        let single = AesDecrypt
+            .handle(&session, &json!([b64_encode(&iv), b64_encode(&ct1), b64_encode(&key1)]))
+            .await
+            .unwrap();
+        assert_eq!(single, json!("hello"));
+
+        // Batch form: two ciphertexts, two candidate keys; each finds its key.
+        let batch = AesDecrypt
+            .handle(
+                &session,
+                &json!([
+                    [[b64_encode(&iv), b64_encode(&ct1)], [b64_encode(&iv), b64_encode(&ct2)]],
+                    [b64_encode(&key1), b64_encode(&key2)]
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch, json!(["hello", "world"]));
+    }
+
+    #[tokio::test]
+    async fn ecdsa_sign_then_verify_roundtrips() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state, Some("1site".into()));
+        // Sign with the user's auth key for the site (no explicit privatekey).
+        let sig = EcdsaSign.handle(&session, &json!(["a message"])).await.unwrap();
+        let sig = sig.as_str().unwrap();
+        // The signer address is the user's auth address for this site.
+        let address = session.state.user_auth_address("1site").await.unwrap();
+        assert!(epix_crypt::verify("a message", &address, sig));
+    }
 
     #[tokio::test]
     async fn config_set_saves_and_notifies_on_language() {

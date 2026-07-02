@@ -791,6 +791,17 @@ impl AppState {
         self.user.read().await.encrypt_privatekey(address, index)
     }
 
+    /// The user's auth (identity) private key (WIF) for a xite - used by
+    /// `ecdsaSign` when no explicit key is given.
+    pub async fn user_auth_privatekey(&self, address: &str) -> Result<String, String> {
+        self.user.write().await.site_data(address).map(|d| d.auth_privatekey.clone())
+    }
+
+    /// The user's auth (identity) address for a xite.
+    pub async fn user_auth_address(&self, address: &str) -> Result<String, String> {
+        self.user.write().await.auth_address(address)
+    }
+
     /// The user's CryptMessage encryption public key (compressed SEC1) for a xite.
     pub async fn user_encrypt_publickey(&self, address: &str, index: u64) -> Result<Vec<u8>, String> {
         let pk = self.user.read().await.encrypt_privatekey(address, index)?;
