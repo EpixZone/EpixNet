@@ -415,13 +415,20 @@ impl AppState {
             .and_then(|c| c.get("modified"))
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0);
+        // Peers key files by the signed content address, so fetch/verify under
+        // that even when serving under a `.epix` alias.
+        let canonical = canonical_address(view.content.as_ref(), address);
 
         for peer in &peers {
-            let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else { continue };
-            if conn.handshake().await.is_err() {
-                continue;
-            }
-            let Ok(bytes) = conn.get_file(address, "content.json").await else { continue };
+            // Bound each peer attempt so a slow/unresponsive peer doesn't stall
+            // the whole update.
+            let fetched = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
+                conn.handshake().await.ok()?;
+                conn.get_file(&canonical, "content.json").await.ok()
+            })
+            .await;
+            let Ok(Some(bytes)) = fetched else { continue };
             let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
                 continue;
             };
@@ -433,7 +440,7 @@ impl AppState {
 
             // Verify + apply the newer content.json, then sync its changed files.
             let mut xite = Xite::new(
-                Address::parse(address.to_string()).map_err(|e| e.to_string())?,
+                Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
                 view.storage.clone(),
             );
             xite.set_content(&bytes).map_err(|e| e.to_string())?; // checks signature + writes
@@ -578,7 +585,10 @@ impl AppState {
             let e = x.get(address).ok_or("unknown xite")?;
             (e.storage.clone(), e.content.clone())
         };
-        let mut xite = Xite::new(Address::parse(address.to_string()).map_err(|e| e.to_string())?, storage);
+        // Parse the signed content address, so a `.epix` alias (not a valid
+        // address itself) still yields a usable Xite.
+        let canonical = canonical_address(content.as_ref(), address);
+        let mut xite = Xite::new(Address::parse(canonical).map_err(|e| e.to_string())?, storage);
         xite.content = content;
         Ok(xite)
     }

@@ -738,12 +738,25 @@ impl WsCommand for SiteUpdate {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = p
-            .as_str()
+            .get("address")
+            .and_then(|v| v.as_str())
+            .or_else(|| p.as_str())
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .map(String::from)
             .unwrap_or(s.address()?.to_string());
-        let _ = s.state.resync_xite(&address).await;
-        Ok(Value::from("ok"))
+        // Run in the background (like EpixNet's updateThread) so this returns
+        // immediately and the progress notifications can flow while the sync runs.
+        let state = s.state.clone();
+        tokio::spawn(async move {
+            state.push_notification("info", "Updating site content…", 0);
+            match state.resync_xite(&address).await {
+                Ok(true) => state.push_notification("done", "Site updated", 5000),
+                Ok(false) => state.push_notification("info", "Site content is up to date", 5000),
+                Err(e) => state.push_notification("error", &format!("Update failed: {e}"), 0),
+            }
+            state.push_site_info(&address).await; // refresh readouts
+        });
+        Ok(Value::from("Updated"))
     }
 }
 
