@@ -802,6 +802,15 @@ impl AppState {
         self.user.write().await.auth_address(address)
     }
 
+    /// The configured Epix chain RPC URL (Vrf / XidResolver), or the default.
+    pub async fn chain_rpc_url(&self) -> String {
+        self.config_get("chain_rpc_url")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| epix_chain::DEFAULT_RPC_URL.to_string())
+    }
+
     /// The user's CryptMessage encryption public key (compressed SEC1) for a xite.
     pub async fn user_encrypt_publickey(&self, address: &str, index: u64) -> Result<Vec<u8>, String> {
         let pk = self.user.read().await.encrypt_privatekey(address, index)?;

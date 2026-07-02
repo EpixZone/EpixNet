@@ -15,6 +15,7 @@ epix-transport = { path = "../epix-transport" }
 epix-propagation = { path = "../epix-propagation" }
 epix-worker = { path = "../epix-worker" }
 epix-crypt = { path = "../epix-crypt" }
+epix-chain = { path = "../epix-chain" }
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"

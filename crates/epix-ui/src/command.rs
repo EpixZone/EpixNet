@@ -321,6 +321,13 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AesDecrypt),
         Arc::new(EcdsaVerify),
         Arc::new(EcdsaSign),
+        // Chain: Vrf randomness + XidResolver.
+        Arc::new(VrfGetBeacon),
+        Arc::new(VrfLatestBeacon),
+        Arc::new(VrfMultiBlockBeacon),
+        Arc::new(VrfDeriveRandom),
+        Arc::new(VrfInvalidateCache),
+        Arc::new(XidResolveName),
         Arc::new(EccPrivToPub),
         Arc::new(EccPubToAddr),
         Arc::new(simple("userGetSettings", json!({}))),
@@ -1284,6 +1291,124 @@ impl WsCommand for EcdsaSign {
     }
 }
 
+// ---- Chain: Vrf randomness beacon + XidResolver ----------------------------
+
+/// Read a positional-or-named integer arg.
+fn arg_u64(p: &Value, key: &str, idx: usize) -> Option<u64> {
+    p.get(key)
+        .or_else(|| p.as_array().and_then(|a| a.get(idx)))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+}
+
+/// Serialize a Vrf beacon for the wire.
+fn beacon_json(b: &epix_chain::Beacon) -> Value {
+    json!({
+        "height": b.height,
+        "beacon": b.beacon,
+        "proposer": b.proposer,
+        "timestamp": b.timestamp,
+    })
+}
+
+/// `vrfGetBeacon(height)` - the randomness beacon at a block height.
+struct VrfGetBeacon;
+#[async_trait]
+impl WsCommand for VrfGetBeacon {
+    fn name(&self) -> &'static str {
+        "vrfGetBeacon"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let height = arg_u64(p, "height", 0).ok_or("vrfGetBeacon: height required")?;
+        let vrf = epix_chain::Vrf::new(s.state.chain_rpc_url().await);
+        match vrf.beacon(height).await {
+            Ok(b) => Ok(beacon_json(&b)),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+}
+
+/// `vrfLatestBeacon()` - the most recent finalized beacon.
+struct VrfLatestBeacon;
+#[async_trait]
+impl WsCommand for VrfLatestBeacon {
+    fn name(&self) -> &'static str {
+        "vrfLatestBeacon"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let vrf = epix_chain::Vrf::new(s.state.chain_rpc_url().await);
+        match vrf.latest_beacon().await {
+            Ok(b) => Ok(beacon_json(&b)),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+}
+
+/// `vrfMultiBlockBeacon(end_height, blocks)` - a beacon combined over a window.
+struct VrfMultiBlockBeacon;
+#[async_trait]
+impl WsCommand for VrfMultiBlockBeacon {
+    fn name(&self) -> &'static str {
+        "vrfMultiBlockBeacon"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let end = arg_u64(p, "end_height", 0).ok_or("vrfMultiBlockBeacon: end_height required")?;
+        let blocks = arg_u64(p, "blocks", 1).unwrap_or(1);
+        let vrf = epix_chain::Vrf::new(s.state.chain_rpc_url().await);
+        match vrf.multi_block_beacon(end, blocks).await {
+            Ok(combined) => Ok(json!({ "beacon": combined })),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+}
+
+/// `vrfDeriveRandom(beacon, seed, count)` - deterministic values from a beacon.
+/// Pure (no RPC): `sha256(beacon ‖ seed ‖ i)` per the reference derivation.
+struct VrfDeriveRandom;
+#[async_trait]
+impl WsCommand for VrfDeriveRandom {
+    fn name(&self) -> &'static str {
+        "vrfDeriveRandom"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let beacon = arg_str(p, "beacon", 0).ok_or("vrfDeriveRandom: beacon required")?;
+        let seed = arg_str(p, "seed", 1).unwrap_or("");
+        let count = arg_u64(p, "count", 2).unwrap_or(1) as usize;
+        Ok(json!(epix_chain::derive_random(beacon, seed, count)))
+    }
+}
+
+/// `vrfInvalidateCache()` - the node builds a fresh Vrf client per request, so
+/// there is no persistent cache to clear; a successful no-op.
+struct VrfInvalidateCache;
+#[async_trait]
+impl WsCommand for VrfInvalidateCache {
+    fn name(&self) -> &'static str {
+        "vrfInvalidateCache"
+    }
+    async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `xidResolveName(name, tld)` - resolve a chain name to its attested snapshot
+/// (owner, identities, DNS records) via the Merkle-proof-verified resolver.
+struct XidResolveName;
+#[async_trait]
+impl WsCommand for XidResolveName {
+    fn name(&self) -> &'static str {
+        "xidResolveName"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let name = arg_str(p, "name", 0).ok_or("xidResolveName: name required")?;
+        let tld = arg_str(p, "tld", 1).unwrap_or("epix");
+        let resolver = epix_chain::XidResolver::new(s.state.chain_rpc_url().await);
+        match resolver.resolve(name, tld).await {
+            Ok(snap) => Ok(serde_json::to_value(snap).unwrap_or(Value::Null)),
+            Err(e) => Ok(json!({ "error": e.to_string() })),
+        }
+    }
+}
+
 /// `ecdsaVerify(data, address, signature)` → bool.
 struct EcdsaVerify;
 #[async_trait]
@@ -1899,6 +2024,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch, json!(["hello", "world"]));
+    }
+
+    #[tokio::test]
+    async fn vrf_derive_random_wires_through_the_command() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state, Some("1site".into()));
+        let out = VrfDeriveRandom
+            .handle(&session, &json!(["deadbeef", "myseed", 3]))
+            .await
+            .unwrap();
+        // Returns `count` deterministic values, matching the pure derivation.
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(out, json!(epix_chain::derive_random("deadbeef", "myseed", 3)));
     }
 
     #[tokio::test]
