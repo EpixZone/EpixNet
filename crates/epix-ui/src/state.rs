@@ -1,11 +1,13 @@
 //! Shared server state: the xites this node serves (with their runtime
 //! settings + stats), the local user identity, and node metadata.
 
-use epix_core::PeerAddr;
+use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{PeerCounts, Peers};
+use epix_protocol::Connection;
+use epix_transport::Transport;
 use epix_user::User;
-use epix_xite::{content_stats, XiteSettings, XiteStorage};
+use epix_xite::{content_stats, Xite, XiteSettings, XiteStorage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -56,6 +58,8 @@ pub struct AppState {
     /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
     filters: RwLock<Value>,
     filters_path: Option<PathBuf>,
+    /// Transport used to publish updates to peers (set by the node).
+    transport: RwLock<Option<Arc<dyn Transport>>>,
 }
 
 fn empty_filters() -> Value {
@@ -78,6 +82,7 @@ impl AppState {
             global_settings: RwLock::new(json!({ "theme": "light" })),
             filters: RwLock::new(empty_filters()),
             filters_path: None,
+            transport: RwLock::new(None),
         })
     }
 
@@ -102,6 +107,7 @@ impl AppState {
             global_settings: RwLock::new(json!({ "theme": "light" })),
             filters: RwLock::new(filters),
             filters_path: Some(filters_path),
+            transport: RwLock::new(None),
         })
     }
 
@@ -228,6 +234,17 @@ impl AppState {
         self.user.read().await.follows.clone()
     }
 
+    /// The user's CryptMessage encryption private key (WIF) for a xite.
+    pub async fn user_encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {
+        self.user.read().await.encrypt_privatekey(address, index)
+    }
+
+    /// The user's CryptMessage encryption public key (compressed SEC1) for a xite.
+    pub async fn user_encrypt_publickey(&self, address: &str, index: u64) -> Result<Vec<u8>, String> {
+        let pk = self.user.read().await.encrypt_privatekey(address, index)?;
+        epix_crypt::private_to_compressed_pubkey(&pk)
+    }
+
     // --- ContentFilter: mutes + siteblocks -----------------------------------
 
     async fn save_filters(&self) {
@@ -284,6 +301,156 @@ impl AppState {
     /// Whether a site is blocked.
     pub async fn siteblock_get(&self, site_address: &str) -> Value {
         self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
+    }
+
+    // --- MergerSite ----------------------------------------------------------
+
+    /// Grant a permission to a xite (e.g. `Merger:ZeroMe`). Idempotent.
+    pub async fn add_permission(&self, address: &str, permission: &str) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if !x.settings.permissions.iter().any(|p| p == permission) {
+                x.settings.permissions.push(permission.to_string());
+            }
+        }
+    }
+
+    /// The merger types a site declares (`Merger:<type>` permissions).
+    pub async fn merger_types(&self, address: &str) -> Vec<String> {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| {
+                x.settings
+                    .permissions
+                    .iter()
+                    .filter_map(|p| p.strip_prefix("Merger:").map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `mergerSiteList`: the served sites whose content.json `merged_type` is one
+    /// this merger accepts. `address -> merged_type`, or `-> siteInfo` when
+    /// `query_site_info`.
+    pub async fn merger_list(&self, address: &str, query_site_info: bool) -> Result<Value, String> {
+        let merger_types = self.merger_types(address).await;
+        if merger_types.is_empty() {
+            return Err("Not a merger site".into());
+        }
+        // Collect matches under the read lock, then build the response (siteInfo
+        // re-locks, so don't hold the lock across it).
+        let matches: Vec<(String, String)> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter_map(|(addr, x)| {
+                    let mt = x.content.as_ref()?.get("merged_type")?.as_str()?.to_string();
+                    merger_types.contains(&mt).then(|| (addr.clone(), mt))
+                })
+                .collect()
+        };
+
+        let mut ret = serde_json::Map::new();
+        for (addr, merged_type) in matches {
+            let value = if query_site_info { self.site_info(&addr).await } else { json!(merged_type) };
+            ret.insert(addr, value);
+        }
+        Ok(Value::Object(ret))
+    }
+
+    /// The merged site + inner path for a `merged-<type>/<address>/<path>` path,
+    /// if it is one (else `None`).
+    pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
+        let rest = inner_path.strip_prefix("merged-")?;
+        // merged-<type>/<address>/<inner_path>
+        let mut parts = rest.splitn(3, '/');
+        let _type = parts.next()?;
+        let address = parts.next()?.to_string();
+        let inner = parts.next().unwrap_or("").to_string();
+        Some((address, inner))
+    }
+
+    // --- publish / sign ------------------------------------------------------
+
+    /// The transport used to publish updates to peers.
+    pub async fn set_transport(&self, transport: Arc<dyn Transport>) {
+        *self.transport.write().await = Some(transport);
+    }
+
+    /// Write a file into a xite's storage (`fileWrite`).
+    pub async fn write_file(&self, address: &str, inner_path: &str, bytes: &[u8]) -> Result<(), String> {
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())
+    }
+
+    /// Sign a xite's content.json with `privatekey` (rebuilds the files map,
+    /// bumps `modified` past the previous value), updating the managed content
+    /// + settings. Returns the signed content.json bytes. The key must own the
+    /// xite. This is `siteSign`.
+    pub async fn sign_xite(&self, address: &str, privatekey: &str) -> Result<Vec<u8>, String> {
+        let (storage, content) = {
+            let x = self.xites.read().await;
+            let e = x.get(address).ok_or("unknown xite")?;
+            (e.storage.clone(), e.content.clone())
+        };
+        let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
+        let mut xite = Xite::new(addr, storage);
+        xite.content = content;
+
+        let prev = xite
+            .content
+            .as_ref()
+            .and_then(|c| c.get("modified"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let modified = (now_secs() as f64).max(prev + 1.0);
+
+        xite.sign(privatekey, modified).map_err(|e| e.to_string())?;
+        let signed = xite.content.clone();
+        let bytes = xite.storage.read("content.json").map_err(|e| e.to_string())?;
+
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(content) = &signed {
+                x.settings.apply_content_stats(&content_stats(content));
+                x.settings.own = true;
+            }
+            x.content = signed;
+        }
+        Ok(bytes)
+    }
+
+    /// Publish `inner_path` to the xite's connectable peers via the `update`
+    /// command. Returns how many peers accepted it. `sitePublish`.
+    pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
+        let body = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .and_then(|x| x.storage.read(inner_path).ok())
+            .ok_or("nothing to publish")?;
+        let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
+        let peers = self.connectable_peers(address, 20).await;
+
+        let mut published = 0;
+        for peer in peers {
+            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else { continue };
+            if conn.handshake().await.is_err() {
+                continue;
+            }
+            if conn.update(address, inner_path, &body).await.is_ok() {
+                self.set_peer_connected(address, &peer, true).await;
+                published += 1;
+            }
+        }
+        Ok(published)
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -519,6 +686,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    #[tokio::test]
+    async fn file_write_then_site_sign_produces_owned_signed_content() {
+        // A key that owns the xite (address == the xite address).
+        let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();
+
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(&owner_addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+
+        // Write a file, then sign.
+        state.write_file(&owner_addr, "index.html", b"<h1>hi</h1>").await.unwrap();
+        let bytes = state.sign_xite(&owner_addr, owner).await.unwrap();
+
+        // The written content.json is signed by the owner and lists the file.
+        let content: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(content["signs"].get(&owner_addr).is_some(), "signed by owner");
+        assert_eq!(content["files"]["index.html"]["size"], 11);
+        assert!(content["modified"].as_f64().unwrap() > 0.0);
+
+        // siteInfo now reflects ownership + the real file count.
+        let info = state.site_info(&owner_addr).await;
+        assert_eq!(info["settings"]["own"], true);
+        assert_eq!(info["content"]["files"], 1);
+
+        // A non-owner key is refused.
+        let other = "22c824485fe256587c3809b5f7c99864d7339e9fba061a016834cecc454e01f8";
+        assert!(state.sign_xite(&owner_addr, other).await.is_err());
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 use crate::storage::XiteStorage;
 use epix_core::{Address, Error, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,5 +75,58 @@ impl Xite {
             .into_iter()
             .filter(|f| !self.storage.verify(&f.inner_path, &f.sha512))
             .collect()
+    }
+
+    /// Sign the root content.json with `privatekey`: rebuild the `files` map by
+    /// hashing every file under the root (except content.json files, which are
+    /// their own signed units), set `modified` (must exceed the previous value),
+    /// stamp the address, sign, and write.
+    ///
+    /// The key must own the xite (its address must equal the xite address),
+    /// otherwise the resulting signature wouldn't verify.
+    pub fn sign(&mut self, privatekey: &str, modified: f64) -> Result<()> {
+        let signer =
+            epix_crypt::privatekey_to_address(privatekey).map_err(Error::Crypt)?;
+        if signer != self.address.as_str() {
+            return Err(Error::Crypt(format!(
+                "private key address {signer} does not own xite {}",
+                self.address.as_str()
+            )));
+        }
+
+        let mut content = self.content.clone().unwrap_or_else(|| json!({}));
+
+        // Files already declared optional stay optional; everything else on disk
+        // (minus content.json units) becomes a required file with size + hash.
+        let optional: std::collections::HashSet<String> = content
+            .get("files_optional")
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut files = serde_json::Map::new();
+        for inner in self.storage.list_files() {
+            if inner == "content.json" || inner.ends_with("/content.json") || optional.contains(&inner) {
+                continue;
+            }
+            let bytes = self.storage.read(&inner)?;
+            files.insert(
+                inner,
+                json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) }),
+            );
+        }
+
+        let map = content.as_object_mut().ok_or_else(|| {
+            Error::Protocol("content.json is not a JSON object".into())
+        })?;
+        map.insert("files".into(), Value::Object(files));
+        map.insert("modified".into(), json!(modified));
+        map.insert("address".into(), json!(self.address.as_str()));
+
+        epix_content::sign(&mut content, privatekey)?;
+        let bytes = serde_json::to_vec(&content).map_err(Error::from)?;
+        self.storage.write("content.json", &bytes)?;
+        self.content = Some(content);
+        Ok(())
     }
 }

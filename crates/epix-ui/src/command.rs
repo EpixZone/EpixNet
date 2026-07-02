@@ -5,6 +5,7 @@
 
 use crate::state::AppState;
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,10 +84,25 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(simple("channelJoin", json!("ok"))),
         Arc::new(simple("channelJoinAllsite", json!("ok"))),
         Arc::new(simple("announcerInfo", json!({ "stats": {} }))),
-        Arc::new(simple("permissionAdd", json!("ok"))),
+        Arc::new(PermissionAdd),
+        Arc::new(MergerSiteList),
+        Arc::new(MergerSiteAdd),
+        Arc::new(MergerSiteDelete),
         Arc::new(simple("permissionDetails", json!(""))),
         Arc::new(simple("configSet", json!("ok"))),
         Arc::new(simple("siteListModifiedFiles", json!({ "modified_files": [] }))),
+        Arc::new(SiteSign),
+        Arc::new(SitePublish),
+        Arc::new(FileWrite),
+        // CryptMessage
+        Arc::new(UserPublickey),
+        Arc::new(EciesEncrypt),
+        Arc::new(EciesDecrypt),
+        Arc::new(AesEncrypt),
+        Arc::new(AesDecrypt),
+        Arc::new(EcdsaVerify),
+        Arc::new(EccPrivToPub),
+        Arc::new(EccPubToAddr),
         Arc::new(simple("userGetSettings", json!({}))),
         Arc::new(simple("userSetSettings", json!("ok"))),
         Arc::new(simple("optionalLimitStats", json!({ "limit": "10%", "used": 0, "free": 0 }))),
@@ -160,7 +176,12 @@ impl WsCommand for FileGet {
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .ok_or("fileGet: missing inner_path")?;
-        match s.state.read_file(address, inner_path).await {
+        // A `merged-<type>/<address>/<path>` file reads from the merged site.
+        let (target, inner) = match AppState::split_merged_path(inner_path) {
+            Some((addr, inner)) => (addr, inner),
+            None => (address.to_string(), inner_path.to_string()),
+        };
+        match s.state.read_file(&target, &inner).await {
             Some(bytes) => Ok(Value::from(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(Value::Null),
         }
@@ -252,6 +273,274 @@ impl WsCommand for DbQuery {
         };
         let rows = s.state.db_query(address, query, &params).await?;
         Ok(Value::Array(rows))
+    }
+}
+
+// ---- publish / sign --------------------------------------------------------
+
+/// `fileWrite(inner_path, content_base64)` — write a file into the xite.
+struct FileWrite;
+#[async_trait]
+impl WsCommand for FileWrite {
+    fn name(&self) -> &'static str {
+        "fileWrite"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let a = p.as_array();
+        let inner_path = a
+            .and_then(|a| a.first())
+            .or_else(|| p.get("inner_path"))
+            .and_then(|v| v.as_str())
+            .ok_or("fileWrite: inner_path required")?;
+        let b64 = a
+            .and_then(|a| a.get(1))
+            .or_else(|| p.get("content_base64"))
+            .and_then(|v| v.as_str())
+            .ok_or("fileWrite: content_base64 required")?;
+        let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
+        s.state.write_file(&address, inner_path, &bytes).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteSign(privatekey, inner_path)` — rebuild + sign content.json.
+struct SiteSign;
+#[async_trait]
+impl WsCommand for SiteSign {
+    fn name(&self) -> &'static str {
+        "siteSign"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let privatekey = sign_privatekey(p).ok_or("siteSign: privatekey required")?;
+        s.state.sign_xite(&address, &privatekey).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `sitePublish(privatekey, inner_path, sign)` — sign (unless told not to) then
+/// push the content.json to peers.
+struct SitePublish;
+#[async_trait]
+impl WsCommand for SitePublish {
+    fn name(&self) -> &'static str {
+        "sitePublish"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = p
+            .get("inner_path")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str())
+            .unwrap_or("content.json")
+            .to_string();
+        // Sign first if a private key is supplied (JS omits it to publish an
+        // already-signed file).
+        if let Some(pk) = sign_privatekey(p) {
+            s.state.sign_xite(&address, &pk).await?;
+        }
+        let published = s.state.publish(&address, &inner_path).await?;
+        Ok(json!(format!("Published to {published} peers.")))
+    }
+}
+
+/// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON
+/// null means "use the site's own key", which we don't hold — treated as none).
+fn sign_privatekey(p: &Value) -> Option<String> {
+    p.get("privatekey")
+        .or_else(|| p.as_array().and_then(|a| a.first()))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+fn b64_encode(b: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
+// ---- CryptMessage: ECIES + AES + ECC helpers -------------------------------
+
+/// The public key to encrypt to: an explicit base64 SEC1 key, or the user's own
+/// per-xite encrypt key when the arg is an index (int) / absent.
+async fn resolve_pubkey(s: &WsSession, address: &str, arg: Option<&Value>) -> Result<Vec<u8>, String> {
+    match arg {
+        Some(Value::String(b64)) => b64_decode(b64).ok_or("eciesEncrypt: bad public key".into()),
+        other => {
+            let index = other.and_then(|v| v.as_u64()).unwrap_or(0);
+            s.state.user_encrypt_publickey(address, index).await
+        }
+    }
+}
+
+/// The private key to decrypt with: an explicit WIF/hex, or the user's own
+/// per-xite encrypt key when the arg is an index (int) / absent.
+async fn resolve_privkey(s: &WsSession, address: &str, arg: Option<&Value>) -> Result<String, String> {
+    match arg {
+        Some(Value::String(pk)) if !pk.is_empty() => Ok(pk.clone()),
+        other => {
+            let index = other.and_then(|v| v.as_u64()).unwrap_or(0);
+            s.state.user_encrypt_privatekey(address, index).await
+        }
+    }
+}
+
+/// `userPublickey(index)` — the user's encrypt public key (base64) for this xite.
+struct UserPublickey;
+#[async_trait]
+impl WsCommand for UserPublickey {
+    fn name(&self) -> &'static str {
+        "userPublickey"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let index = p.as_array().and_then(|a| a.first()).or(Some(p)).and_then(|v| v.as_u64()).unwrap_or(0);
+        let pk = s.state.user_encrypt_publickey(&address, index).await?;
+        Ok(Value::from(b64_encode(&pk)))
+    }
+}
+
+/// `eciesEncrypt(text, publickey=0, return_aes_key=false)`.
+struct EciesEncrypt;
+#[async_trait]
+impl WsCommand for EciesEncrypt {
+    fn name(&self) -> &'static str {
+        "eciesEncrypt"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let a = p.as_array();
+        let text = a.and_then(|a| a.first()).and_then(|v| v.as_str()).ok_or("eciesEncrypt: text required")?;
+        let pubkey = resolve_pubkey(s, &address, a.and_then(|a| a.get(1))).await?;
+        let return_key = a.and_then(|a| a.get(2)).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let (blob, k_enc) = epix_crypt::ecies::ecies_encrypt(text.as_bytes(), &pubkey)?;
+        if return_key {
+            Ok(json!([b64_encode(&blob), b64_encode(&k_enc)]))
+        } else {
+            Ok(Value::from(b64_encode(&blob)))
+        }
+    }
+}
+
+/// `eciesDecrypt(param, privatekey=0)` — `param` is one base64 blob or a list.
+struct EciesDecrypt;
+#[async_trait]
+impl WsCommand for EciesDecrypt {
+    fn name(&self) -> &'static str {
+        "eciesDecrypt"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let a = p.as_array();
+        let param = a.and_then(|a| a.first()).ok_or("eciesDecrypt: param required")?;
+        let privatekey = resolve_privkey(s, &address, a.and_then(|a| a.get(1))).await?;
+
+        let decode_one = |b64: &str| -> Value {
+            b64_decode(b64)
+                .and_then(|blob| epix_crypt::ecies::ecies_decrypt(&blob, &privatekey).ok())
+                .and_then(|pt| String::from_utf8(pt).ok())
+                .map(Value::from)
+                .unwrap_or(Value::Null)
+        };
+
+        match param {
+            Value::Array(items) => {
+                Ok(Value::Array(items.iter().filter_map(|v| v.as_str()).map(decode_one).collect()))
+            }
+            Value::String(b64) => Ok(decode_one(b64)),
+            _ => Err("eciesDecrypt: invalid param".into()),
+        }
+    }
+}
+
+/// `aesEncrypt(text, key=null)` → `[key_b64, iv_b64, ciphertext_b64]`.
+struct AesEncrypt;
+#[async_trait]
+impl WsCommand for AesEncrypt {
+    fn name(&self) -> &'static str {
+        "aesEncrypt"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let a = p.as_array();
+        let text = a.and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("");
+        let key = match a.and_then(|a| a.get(1)).and_then(|v| v.as_str()) {
+            Some(b64) => b64_decode(b64).ok_or("aesEncrypt: bad key")?,
+            None => epix_crypt::ecies::aes_new_key().to_vec(),
+        };
+        let iv = epix_crypt::ecies::aes_new_iv();
+        let ct = epix_crypt::ecies::aes_encrypt(text.as_bytes(), &key, &iv)?;
+        Ok(json!([b64_encode(&key), b64_encode(&iv), b64_encode(&ct)]))
+    }
+}
+
+/// `aesDecrypt(iv, ciphertext, key)` → decrypted text (or null on failure).
+struct AesDecrypt;
+#[async_trait]
+impl WsCommand for AesDecrypt {
+    fn name(&self) -> &'static str {
+        "aesDecrypt"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let a = p.as_array().ok_or("aesDecrypt: expected [iv, ciphertext, key]")?;
+        let get = |i: usize| a.get(i).and_then(|v| v.as_str()).and_then(b64_decode);
+        let (iv, ct, key) = (
+            get(0).ok_or("aesDecrypt: iv")?,
+            get(1).ok_or("aesDecrypt: ciphertext")?,
+            get(2).ok_or("aesDecrypt: key")?,
+        );
+        Ok(epix_crypt::ecies::aes_decrypt(&ct, &key, &iv)
+            .ok()
+            .and_then(|pt| String::from_utf8(pt).ok())
+            .map(Value::from)
+            .unwrap_or(Value::Null))
+    }
+}
+
+/// `ecdsaVerify(data, address, signature)` → bool.
+struct EcdsaVerify;
+#[async_trait]
+impl WsCommand for EcdsaVerify {
+    fn name(&self) -> &'static str {
+        "ecdsaVerify"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let a = p.as_array().ok_or("ecdsaVerify: expected [data, address, signature]")?;
+        let data = a.first().and_then(|v| v.as_str()).ok_or("ecdsaVerify: data")?;
+        let address = a.get(1).and_then(|v| v.as_str()).ok_or("ecdsaVerify: address")?;
+        let sig = a.get(2).and_then(|v| v.as_str()).ok_or("ecdsaVerify: signature")?;
+        Ok(Value::from(epix_crypt::verify(data, address, sig)))
+    }
+}
+
+/// `eccPrivToPub(privatekey)` → base64 compressed public key.
+struct EccPrivToPub;
+#[async_trait]
+impl WsCommand for EccPrivToPub {
+    fn name(&self) -> &'static str {
+        "eccPrivToPub"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let pk = p.as_array().and_then(|a| a.first()).or(Some(p)).and_then(|v| v.as_str()).ok_or("eccPrivToPub: privatekey")?;
+        Ok(Value::from(b64_encode(&epix_crypt::private_to_compressed_pubkey(pk)?)))
+    }
+}
+
+/// `eccPubToAddr(publickey_hex)` → epix1 address.
+struct EccPubToAddr;
+#[async_trait]
+impl WsCommand for EccPubToAddr {
+    fn name(&self) -> &'static str {
+        "eccPubToAddr"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let hexkey = p.as_array().and_then(|a| a.first()).or(Some(p)).and_then(|v| v.as_str()).ok_or("eccPubToAddr: publickey")?;
+        let bytes = hex::decode(hexkey).map_err(|e| e.to_string())?;
+        Ok(Value::from(epix_crypt::pubkey_to_address(&bytes)?))
     }
 }
 
@@ -399,6 +688,77 @@ fn sqlquote(v: &Value) -> String {
     }
 }
 
+// ---- MergerSite ------------------------------------------------------------
+
+/// `permissionAdd(permission)` — grant a permission to the current xite (e.g.
+/// `Merger:ZeroMe`, which makes it a merger site).
+struct PermissionAdd;
+#[async_trait]
+impl WsCommand for PermissionAdd {
+    fn name(&self) -> &'static str {
+        "permissionAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let permission = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or("permissionAdd: permission required")?;
+        s.state.add_permission(&address, permission).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `mergerSiteList(query_site_info)` — the sites merged into this merger site.
+struct MergerSiteList;
+#[async_trait]
+impl WsCommand for MergerSiteList {
+    fn name(&self) -> &'static str {
+        "mergerSiteList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let query_info = p
+            .as_bool()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        s.state.merger_list(&address, query_info).await
+    }
+}
+
+/// `mergerSiteAdd(addresses)` — accept sites into this merger. (Cloning the
+/// merged sites into the node is a follow-up; this validates the merger role.)
+struct MergerSiteAdd;
+#[async_trait]
+impl WsCommand for MergerSiteAdd {
+    fn name(&self) -> &'static str {
+        "mergerSiteAdd"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        if s.state.merger_types(&address).await.is_empty() {
+            return Err("Not a merger site".into());
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `mergerSiteDelete(address)` — remove a merged site from this merger.
+struct MergerSiteDelete;
+#[async_trait]
+impl WsCommand for MergerSiteDelete {
+    fn name(&self) -> &'static str {
+        "mergerSiteDelete"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        if s.state.merger_types(&address).await.is_empty() {
+            return Err("Not a merger site".into());
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
 // ---- ContentFilter: mute + siteblock lists ---------------------------------
 
 /// Read a positional-or-named string arg from the command params.
@@ -503,6 +863,73 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn merger_site_lists_and_routes_merged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+
+        // A merger site granted `Merger:ZeroMe`.
+        let merger = "1Merger";
+        state.add_xite(merger, XiteEntry { storage: XiteStorage::new(dir.path().join("m")), content: None }).await;
+        state.add_permission(merger, "Merger:ZeroMe").await;
+
+        // A merged site of that type, with a file.
+        let merged = "1Merged";
+        let mstore = XiteStorage::new(dir.path().join("d"));
+        mstore.write("data.txt", b"merged file").unwrap();
+        state
+            .add_xite(merged, XiteEntry { storage: mstore, content: Some(json!({ "merged_type": "ZeroMe" })) })
+            .await;
+        // A site of a different merged type is excluded.
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path().join("o")), content: Some(json!({ "merged_type": "OtherApp" })) })
+            .await;
+
+        let session = WsSession { state: state.clone(), xite: Some(merger.into()) };
+        let list = MergerSiteList.handle(&session, &json!([false])).await.unwrap();
+        assert_eq!(list["1Merged"], "ZeroMe");
+        assert!(list.get("1Other").is_none(), "different merged type excluded");
+
+        // fileGet routes a merged-<type>/<address>/<path> read to the merged site.
+        let f = FileGet.handle(&session, &json!("merged-ZeroMe/1Merged/data.txt")).await.unwrap();
+        assert_eq!(f, "merged file");
+
+        // A non-merger site can't list.
+        let s2 = WsSession { state, xite: Some(merged.into()) };
+        assert!(MergerSiteList.handle(&s2, &json!([false])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cryptmessage_commands_round_trip() {
+        let state = AppState::new("test");
+        let addr = "1CryptSite";
+        let session = WsSession { state: state.clone(), xite: Some(addr.into()) };
+
+        // ECIES to my own key (index 0), then decrypt with my own key.
+        let enc = EciesEncrypt.handle(&session, &json!(["secret 🔒", 0])).await.unwrap();
+        let ct = enc.as_str().unwrap().to_string();
+        let dec = EciesDecrypt.handle(&session, &json!([ct, 0])).await.unwrap();
+        assert_eq!(dec, "secret 🔒");
+
+        // AES round trip: aesEncrypt -> [key, iv, ct]; aesDecrypt([iv, ct, key]).
+        let aes = AesEncrypt.handle(&session, &json!(["aes data"])).await.unwrap();
+        let a = aes.as_array().unwrap();
+        let dec = AesDecrypt.handle(&session, &json!([a[1], a[2], a[0]])).await.unwrap();
+        assert_eq!(dec, "aes data");
+
+        // ECC helpers + ecdsaVerify against a real signature.
+        let pk = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(pk).unwrap();
+        let sig = epix_crypt::sign("hello", pk).unwrap();
+        assert_eq!(EcdsaVerify.handle(&session, &json!(["hello", address, sig])).await.unwrap(), true);
+
+        // eccPrivToPub (base64 compressed) -> hex -> eccPubToAddr == address.
+        let pub_b64 = EccPrivToPub.handle(&session, &json!([pk])).await.unwrap();
+        let pub_bytes = b64_decode(pub_b64.as_str().unwrap()).unwrap();
+        let derived = EccPubToAddr.handle(&session, &json!([hex::encode(&pub_bytes)])).await.unwrap();
+        assert_eq!(derived, address);
+    }
 
     #[tokio::test]
     async fn content_filter_mutes_and_siteblocks() {

@@ -108,6 +108,18 @@ impl Connection {
         Ok(vget(&resp, "body").and_then(|v| v.as_str()) == Some("Pong!"))
     }
 
+    /// Publish an updated `content.json` to the peer (`update` FileRequest). The
+    /// peer verifies `body`'s signature before accepting, so a bad update is
+    /// rejected on their side. `body` is the raw content.json bytes.
+    pub async fn update(&mut self, xite: &str, inner_path: &str, body: &[u8]) -> Result<Value> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            ("inner_path", Value::from(inner_path)),
+            ("body", Value::Binary(body.to_vec())),
+        ]);
+        self.request("update", params).await
+    }
+
     /// Download a whole file, following `location`/`size` across chunks.
     pub async fn get_file(&mut self, xite: &str, inner_path: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();

@@ -62,6 +62,24 @@ impl XiteStorage {
             Err(_) => false,
         }
     }
+
+    /// Every file under the root as an `inner_path` (relative, forward slashes).
+    pub fn list_files(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(rel) = p.strip_prefix(&self.root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
