@@ -578,7 +578,9 @@ impl WsCommand for PluginList {
             .plugin_states()
             .await
             .into_iter()
-            .map(|(name, enabled)| json!({ "name": name, "enabled": enabled, "source": "builtin" }))
+            .map(|(name, enabled, default_enabled)| {
+                json!({ "name": name, "enabled": enabled, "default_enabled": default_enabled, "source": "builtin" })
+            })
             .collect();
         Ok(json!({ "plugins": plugins }))
     }

@@ -326,15 +326,16 @@ fn plugin_description(name: &str) -> &'static str {
 /// Render the plugin manager page, styled like EpixNet's (light theme, gradient
 /// header, sliding toggle switches). The toggle is a link (`/Plugins?toggle=…`)
 /// so it works without JS/WebSocket.
-fn render_plugins_page(states: &[(String, bool)], homepage: &str) -> String {
+fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
-    for (name, enabled) in states {
+    for (name, enabled, default_enabled) in states {
         let checked = if *enabled { "checked" } else { "" };
+        let default_txt = if *default_enabled { "enabled" } else { "disabled" };
         rows.push_str(&format!(
             "<div class='plugin'>\
                <div class='title'><h3>{name}</h3>\
-                 <div class='description'>{descr}</div></div>\
+                 <div class='description'>{descr} <span class='default'>(default: {default_txt})</span></div></div>\
                <a class='value value-right checkbox {checked}' href='/Plugins?toggle={name}' \
                   title='{action} {name}'><div class='checkbox-skin'></div></a>\
              </div>",
@@ -371,7 +372,7 @@ async fn serve_config_page(
             .await
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| default.to_string());
-        values.push((*key, *label, val));
+        values.push((*key, *label, val, *default));
     }
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, &homepage))
@@ -379,21 +380,23 @@ async fn serve_config_page(
 }
 
 /// Render the settings page, styled like EpixNet's Config page.
-fn render_config_page(values: &[(&str, &str, String)], homepage: &str) -> String {
+fn render_config_page(values: &[(&str, &str, String, &str)], homepage: &str) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
     let mut fields = String::new();
-    for (key, label, val) in values {
+    for (key, label, val, default) in values {
         fields.push_str(&format!(
             "<div class='config-item'>\
-               <div class='title'><h3>{label}</h3></div>\
+               <div class='title'><h3>{label}</h3>\
+                 <div class='description'><span class='default'>(default: {default})</span></div></div>\
                <div class='value value-right'>\
                  <input class='input-text' name='{key}' value='{val}' spellcheck='false'></div>\
              </div>",
             label = esc(label),
             key = esc(key),
             val = esc(val),
+            default = esc(default),
         ));
     }
     let body = format!(
@@ -513,6 +516,7 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
           .plugin .title,.config-item .title{{display:inline-block}}\
           .plugin .title h3,.config-item .title h3{{font-size:20px;font-weight:lighter;margin:0;line-height:32px}}\
           .plugin .description{{font-size:14px;color:#777;line-height:22px;margin-top:2px}}\
+          .default{{color:#aaa;font-size:12px}}\
           .value-right{{right:0;position:absolute;top:16px}}\
           .checkbox{{display:inline-block;cursor:pointer}}\
           .checkbox-skin{{background:#CCC;width:50px;height:24px;border-radius:15px;transition:all .3s ease-in-out;display:inline-block}}\

@@ -317,15 +317,15 @@ impl AppState {
             .collect()
     }
 
-    /// All loaded plugins with their enabled state (`[(name, enabled)]`), for the
-    /// plugin manager.
-    pub async fn plugin_states(&self) -> Vec<(String, bool)> {
+    /// All loaded plugins with their current + default enabled state
+    /// (`[(name, enabled, default_enabled)]`), for the plugin manager.
+    pub async fn plugin_states(&self) -> Vec<(String, bool, bool)> {
         let (disabled, enabled) = self.plugin_overrides().await;
         self.plugins
             .read()
             .await
             .iter()
-            .map(|n| (n.clone(), effective_enabled(n, &disabled, &enabled)))
+            .map(|n| (n.clone(), effective_enabled(n, &disabled, &enabled), !is_default_disabled(n)))
             .collect()
     }
 
@@ -3299,10 +3299,16 @@ mod tests {
         assert!(!state.plugin_enabled("Sidebar").await);
 
         let states: std::collections::HashMap<_, _> =
-            state.plugin_states().await.into_iter().collect();
+            state.plugin_states().await.into_iter().map(|(n, en, _def)| (n, en)).collect();
         assert_eq!(states["NoNewSites"], true);
         assert_eq!(states["Multiuser"], false);
         assert_eq!(states["Sidebar"], false);
+        // The reported default is on for Sidebar, off for the disabled-by-default set.
+        let defaults: std::collections::HashMap<_, _> =
+            state.plugin_states().await.into_iter().map(|(n, _en, def)| (n, def)).collect();
+        assert_eq!(defaults["Sidebar"], true);
+        assert_eq!(defaults["NoNewSites"], false);
+        assert_eq!(defaults["UiPassword"], false);
         // serverInfo.plugins excludes the disabled ones.
         let live = state.plugins().await;
         assert!(live.contains(&"NoNewSites".to_string()));
@@ -3326,7 +3332,10 @@ mod tests {
             assert_eq!(s.plugins().await, vec!["Stats".to_string()]);
             assert_eq!(
                 s.plugin_states().await,
-                vec![("Sidebar".to_string(), false), ("Stats".to_string(), true)]
+                vec![
+                    ("Sidebar".to_string(), false, true),
+                    ("Stats".to_string(), true, true)
+                ]
             );
         }
         // The disabled state persists across a restart (config.json).
