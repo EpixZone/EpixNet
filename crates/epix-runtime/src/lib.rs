@@ -90,10 +90,16 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.connection_interval,
         )));
-        // Inbound file server: let peers pull our files (seeding).
+        // Inbound file server: let peers pull our files (seeding), and try to
+        // open that port through the home router with UPnP so it's reachable.
         #[cfg(feature = "inbound-seeding")]
         if let Some(port) = self.config.fileserver_port {
             self.handles.push(tokio::spawn(seed_loop(
+                self.state.clone(),
+                port,
+                self.shutdown.clone(),
+            )));
+            self.handles.push(tokio::spawn(upnp_loop(
                 self.state.clone(),
                 port,
                 self.shutdown.clone(),
@@ -279,4 +285,73 @@ async fn seed_loop(state: Arc<AppState>, port: u16, shutdown: Arc<Notify>) {
         _ = shutdown.notified() => {}
         _ = server.serve(listener) => {}
     }
+}
+
+/// Keep the fileserver `port` mapped through the home router with UPnP so peers
+/// on the internet can reach us, refreshing the lease before it expires and
+/// removing the mapping on shutdown. Best effort - many networks have no UPnP
+/// gateway, in which case the node still serves on the LAN and to manually
+/// forwarded ports.
+#[cfg(feature = "inbound-seeding")]
+async fn upnp_loop(state: Arc<AppState>, port: u16, shutdown: Arc<Notify>) {
+    use igd_next::aio::tokio::search_gateway;
+    use igd_next::{PortMappingProtocol, SearchOptions};
+    use std::net::SocketAddr;
+
+    let Some(local_ip) = local_ipv4() else {
+        state.log("INFO", "UPnP: no local IPv4 address; skipping port mapping").await;
+        return;
+    };
+    let local = SocketAddr::new(local_ip, port);
+
+    let gateway = match search_gateway(SearchOptions::default()).await {
+        Ok(g) => g,
+        Err(e) => {
+            state
+                .log("INFO", format!("UPnP: no gateway found ({e}); port {port} not auto-forwarded"))
+                .await;
+            return;
+        }
+    };
+    let ext_ip = gateway.get_external_ip().await.ok().map(|ip| ip.to_string());
+    const LEASE: u32 = 3600; // 1 hour; refreshed before it expires
+    let mut announced = false;
+
+    loop {
+        match gateway
+            .add_port(PortMappingProtocol::TCP, port, local, LEASE, "EpixNet fileserver")
+            .await
+        {
+            Ok(()) => {
+                state.set_port_status(true, ext_ip.clone()).await;
+                if !announced {
+                    let ip = ext_ip.clone().unwrap_or_else(|| "?".into());
+                    state.log("INFO", format!("UPnP: opened port {port} (external {ip}:{port})")).await;
+                    announced = true;
+                }
+            }
+            Err(e) => {
+                state.set_port_status(false, ext_ip.clone()).await;
+                state.log("INFO", format!("UPnP: could not map port {port} ({e})")).await;
+            }
+        }
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tokio::time::sleep(Duration::from_secs((LEASE * 4 / 5) as u64)) => {}
+        }
+    }
+    // Remove the mapping on shutdown (best effort).
+    let _ = gateway.remove_port(PortMappingProtocol::TCP, port).await;
+    state.set_port_status(false, None).await;
+}
+
+/// The node's primary local IPv4 address (the source IP for outbound traffic),
+/// used as the internal target of the UPnP port mapping. Connecting the UDP
+/// socket only sets the default route - no packets are sent.
+#[cfg(feature = "inbound-seeding")]
+fn local_ipv4() -> Option<std::net::IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    ip.is_ipv4().then_some(ip)
 }
