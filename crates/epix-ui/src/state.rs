@@ -1186,6 +1186,67 @@ impl AppState {
         }
     }
 
+    /// Enforce the optional-files cap (`OptionalManager`): if downloaded optional
+    /// files exceed the limit, delete the oldest un-pinned ones until back under.
+    /// Returns the bytes freed. Called periodically by the runtime.
+    pub async fn enforce_optional_limit(&self) -> i64 {
+        let limit = self.optional_limit_bytes().await;
+        if limit <= 0 {
+            return 0;
+        }
+        // One scan of all downloaded optional files. "Downloaded" is judged by
+        // the on-disk file matching the declared size (cheaper than re-hashing).
+        // `used` counts every downloaded optional file; `candidates` are the
+        // un-pinned ones we may delete, oldest first.
+        let mut used: i64 = 0;
+        let mut candidates: Vec<(String, String, i64, u64)> = Vec::new();
+        {
+            let xites = self.xites.read().await;
+            for (addr, x) in xites.iter() {
+                let Some(files_opt) =
+                    x.content.as_ref().and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
+                else {
+                    continue;
+                };
+                for (inner, meta) in files_opt {
+                    let size = meta.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let Ok(path) = x.storage.path(inner) else { continue };
+                    let Ok(md) = std::fs::metadata(&path) else { continue };
+                    if md.len() as i64 != size {
+                        continue; // not fully downloaded
+                    }
+                    used += size;
+                    if x.pinned.contains(inner) {
+                        continue; // pinned files are never evicted
+                    }
+                    let mtime = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    candidates.push((addr.clone(), inner.clone(), size, mtime));
+                }
+            }
+        }
+        if used <= limit {
+            return 0;
+        }
+        // Oldest first.
+        candidates.sort_by_key(|c| c.3);
+        let mut freed = 0i64;
+        for (addr, inner, size, _) in candidates {
+            if used <= limit {
+                break;
+            }
+            if self.optional_file_delete(&addr, &inner).await.is_ok() {
+                used -= size;
+                freed += size;
+            }
+        }
+        freed
+    }
+
     // --- MergerSite ----------------------------------------------------------
 
     /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:ZeroMe`). Idempotent.
@@ -2568,6 +2629,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    #[tokio::test]
+    async fn optional_limit_evicts_oldest_unpinned_and_keeps_pinned() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        // Three 1000-byte optional files.
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            storage.write(name, &vec![0u8; 1000]).unwrap();
+        }
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let content = json!({
+            "address": addr,
+            "files": {},
+            "files_optional": {
+                "a.bin": { "size": 1000, "sha512": "a" },
+                "b.bin": { "size": 1000, "sha512": "b" },
+                "c.bin": { "size": 1000, "sha512": "c" },
+            }
+        });
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_pin(addr, "a.bin", true).await;
+
+        // ~2791-byte cap: 3000 downloaded > cap, so eviction runs.
+        state.set_optional_limit("0.0000026").await;
+        let limit = state.optional_limit_bytes().await;
+        assert!(limit > 1000 && limit < 3000, "limit was {limit}");
+
+        let freed = state.enforce_optional_limit().await;
+        assert!(freed > 0, "expected some bytes freed");
+        // The pinned file is never evicted.
+        assert!(dir.path().join("a.bin").exists());
+        // Usage is back under the cap.
+        let remaining: i64 = ["a.bin", "b.bin", "c.bin"]
+            .iter()
+            .filter(|n| dir.path().join(n).exists())
+            .count() as i64
+            * 1000;
+        assert!(remaining <= limit, "remaining {remaining} > limit {limit}");
     }
 
     #[tokio::test]

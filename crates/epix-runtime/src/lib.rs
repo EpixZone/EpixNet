@@ -237,6 +237,11 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
                 for address in state.xite_addresses().await {
                     let _ = state.resync_xite(&address).await;
                 }
+                // OptionalManager: keep optional files under the size cap.
+                let freed = state.enforce_optional_limit().await;
+                if freed > 0 {
+                    state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
+                }
             }
         }
     }
