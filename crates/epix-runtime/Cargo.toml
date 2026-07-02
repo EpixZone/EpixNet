@@ -10,14 +10,18 @@ epix-ui = { path = "../epix-ui" }
 epix-xite = { path = "../epix-xite" }
 epix-discovery = { path = "../epix-discovery" }
 epix-transport = { path = "../epix-transport" }
+epix-protocol = { path = "../epix-protocol" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 rmpv = "1"
 socket2 = "0.5"
 
 [features]
-default = ["local-discovery"]
+default = ["local-discovery", "inbound-seeding"]
 # LAN peer discovery over UDP broadcast (AnnounceLocal). Off on mobile.
 local-discovery = []
+# Inbound file server so peers can pull our files (seeding). Off on mobile,
+# which should not accept inbound connections.
+inbound-seeding = []
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }

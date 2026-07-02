@@ -18,6 +18,7 @@ epix-crypt = { path = "../epix-crypt" }
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+rmpv = "1"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
 serde = { version = "1", features = ["derive"] }
@@ -33,7 +34,6 @@ tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 getrandom = { version = "0.2", optional = true }
 sha3 = { version = "0.10", optional = true }
-rmpv = { version = "1", optional = true }
 
 [features]
 # UiPassword: a cookie-session login gate over the whole UI. Off by default and
@@ -44,10 +44,9 @@ ui-password = ["dep:getrandom"]
 multiuser = []
 # Benchmark: a /Benchmark diagnostics page timing the node's crypto/hash/pack
 # hot paths (shows off the Rust perf win). Off by default.
-benchmark = ["dep:getrandom", "dep:sha3", "dep:rmpv"]
+benchmark = ["dep:getrandom", "dep:sha3"]
 
 [dev-dependencies]
-rmpv = "1"
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full"] }

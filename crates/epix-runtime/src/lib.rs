@@ -31,6 +31,9 @@ pub struct RuntimeConfig {
     pub resync_interval: Duration,
     pub chart_interval: Duration,
     pub connection_interval: Duration,
+    /// TCP port for the inbound file server (seeding). `None` disables it (the
+    /// node stays download-only). Ignored without the `inbound-seeding` feature.
+    pub fileserver_port: Option<u16>,
 }
 
 impl Default for RuntimeConfig {
@@ -40,6 +43,7 @@ impl Default for RuntimeConfig {
             resync_interval: Duration::from_secs(5 * 60),
             chart_interval: Duration::from_secs(5 * 60),
             connection_interval: Duration::from_secs(60),
+            fileserver_port: None,
         }
     }
 }
@@ -86,11 +90,21 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.connection_interval,
         )));
-        // AnnounceLocal: discover peers on the LAN over UDP broadcast.
+        // Inbound file server: let peers pull our files (seeding).
+        #[cfg(feature = "inbound-seeding")]
+        if let Some(port) = self.config.fileserver_port {
+            self.handles.push(tokio::spawn(seed_loop(
+                self.state.clone(),
+                port,
+                self.shutdown.clone(),
+            )));
+        }
+        // AnnounceLocal: discover peers on the LAN over UDP broadcast. When the
+        // file server is up, advertise its port so discovered peers can reach us.
         #[cfg(feature = "local-discovery")]
         self.handles.push(tokio::spawn(local::local_discovery_loop(
             self.state.clone(),
-            0, // this node does not accept incoming P2P connections
+            self.config.fileserver_port.unwrap_or(0),
             self.shutdown.clone(),
             Duration::from_secs(5 * 60),
         )));
@@ -228,5 +242,25 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
                 }
             }
         }
+    }
+}
+
+/// Serve inbound file requests (seeding) on `port` until shutdown. Peers connect
+/// with the ordinary wire protocol and pull files via `getFile`.
+#[cfg(feature = "inbound-seeding")]
+async fn seed_loop(state: Arc<AppState>, port: u16, shutdown: Arc<Notify>) {
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            state.log("ERROR", format!("File server bind on port {port} failed: {e}")).await;
+            return;
+        }
+    };
+    let handler = Arc::new(epix_ui::fileserve::FileService::new(state.clone()));
+    let server = epix_protocol::PeerServer::new(handler);
+    state.log("INFO", format!("Seeding files on port {port}")).await;
+    tokio::select! {
+        _ = shutdown.notified() => {}
+        _ = server.serve(listener) => {}
     }
 }

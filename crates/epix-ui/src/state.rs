@@ -1800,6 +1800,25 @@ impl AppState {
     }
 
     /// Read a file from a served xite's storage.
+    /// Serve one chunk of a local file to a peer (`getFile`): the bytes from
+    /// `offset` up to `length`, plus the file's total size. `None` if the xite or
+    /// file is not present here. Used by the inbound file server (seeding).
+    pub async fn serve_file_chunk(
+        &self,
+        address: &str,
+        inner_path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Option<(Vec<u8>, u64)> {
+        let path = {
+            let xites = self.xites.read().await;
+            xites.get(address)?.storage.path(inner_path).ok()?
+        };
+        let total = std::fs::metadata(&path).ok()?.len();
+        let chunk = self.read_file_range(address, inner_path, offset, length).await?;
+        Some((chunk, total))
+    }
+
     pub async fn read_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
         // FilePack: `<pack>.zip/<inner>` or `<pack>.tar.gz/<inner>` serves a file
         // from inside the archive.
