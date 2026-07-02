@@ -120,12 +120,14 @@ impl ChartDb {
     }
 
     /// Run a read-only chart query (the `chartDbQuery` command). Only SELECT is
-    /// allowed, matching the Python action.
-    pub fn query(&self, sql: &str) -> Result<Vec<Value>, String> {
+    /// allowed, matching the Python action. `params` is bound by name (a
+    /// list-valued param expands `IN :key` into a placeholder list), so the
+    /// Stats page's `type_id IN :type_ids` query works.
+    pub fn query(&self, sql: &str, params: &Value) -> Result<Vec<Value>, String> {
         if !sql.trim_start().to_uppercase().starts_with("SELECT") {
             return Err("Only SELECT query supported".to_string());
         }
-        self.db.query(sql, &[]).map_err(|e| e.to_string())
+        self.db.query_value(sql, params).map_err(|e| e.to_string())
     }
 }
 

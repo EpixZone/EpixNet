@@ -383,12 +383,21 @@ impl WsCommand for ChartDbQuery {
         "chartDbQuery"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let query = p
-            .as_str()
-            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
-            .or_else(|| p.get("query").and_then(|v| v.as_str()))
-            .ok_or("chartDbQuery: query required")?;
-        match s.state.chart_query(query).await {
+        // Accept `"SELECT …"`, `["SELECT …", params]`, or `{query, params}`.
+        let (query, params) = match p {
+            Value::String(q) => (Some(q.as_str()), Value::Null),
+            Value::Array(a) => (
+                a.first().and_then(|v| v.as_str()),
+                a.get(1).cloned().unwrap_or(Value::Null),
+            ),
+            Value::Object(o) => (
+                o.get("query").and_then(|v| v.as_str()),
+                o.get("params").cloned().unwrap_or(Value::Null),
+            ),
+            _ => (None, Value::Null),
+        };
+        let query = query.ok_or("chartDbQuery: query required")?;
+        match s.state.chart_query(query, &params).await {
             Ok(rows) => Ok(Value::Array(rows)),
             Err(e) => Ok(json!({ "error": e })),
         }
