@@ -14,14 +14,16 @@ epix-protocol = { path = "../epix-protocol" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 rmpv = "1"
 socket2 = "0.5"
+igd-next = { version = "0.16", features = ["aio_tokio"], optional = true }
 
 [features]
 default = ["local-discovery", "inbound-seeding"]
 # LAN peer discovery over UDP broadcast (AnnounceLocal). Off on mobile.
 local-discovery = []
-# Inbound file server so peers can pull our files (seeding). Off on mobile,
-# which should not accept inbound connections.
-inbound-seeding = []
+# Inbound file server so peers can pull our files (seeding), plus UPnP port
+# mapping so the fileserver port is reachable through a home router. Off on
+# mobile, which should not accept inbound connections or poke router ports.
+inbound-seeding = ["dep:igd-next"]
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }

@@ -734,13 +734,20 @@ impl WsCommand for ServerInfo {
             .await
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "en".to_string());
+        // Fileserver reachability (UPnP): the external IP as a string when the
+        // port is open, else false - matching EpixNet's serverInfo shape.
+        let (port_opened, ip_external) = s.state.port_status().await;
+        let ip_external = match ip_external {
+            Some(ip) if port_opened => json!(ip),
+            _ => json!(false),
+        };
         Ok(json!({
             "version": s.state.version,
             "rev": 8192,
             "platform": std::env::consts::OS,
             "dist_type": "standalone",
-            "ip_external": false,
-            "port_opened": false,
+            "ip_external": ip_external,
+            "port_opened": port_opened,
             "fileserver_ip": "127.0.0.1",
             "fileserver_port": 15441,
             "tor_enabled": false,
@@ -2306,6 +2313,29 @@ mod tests {
         // The signer address is the user's auth address for this site.
         let address = session.state.user_auth_address("1site").await.unwrap();
         assert!(epix_crypt::verify("a message", &address, sig));
+    }
+
+    #[tokio::test]
+    async fn server_info_reflects_upnp_port_status() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state.clone(), Some("1site".into()));
+
+        // Closed by default: port_opened false, ip_external false.
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["port_opened"], false);
+        assert_eq!(info["ip_external"], false);
+
+        // Once UPnP opens the port, serverInfo shows it + the external IP string.
+        state.set_port_status(true, Some("203.0.113.7".into())).await;
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["port_opened"], true);
+        assert_eq!(info["ip_external"], "203.0.113.7");
+
+        // If we learn the IP but the port isn't open, ip_external stays false.
+        state.set_port_status(false, Some("203.0.113.7".into())).await;
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["port_opened"], false);
+        assert_eq!(info["ip_external"], false);
     }
 
     #[tokio::test]

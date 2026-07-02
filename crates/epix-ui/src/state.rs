@@ -122,6 +122,11 @@ pub struct AppState {
     /// Path to the persisted optional-file pins (`pins.json`), so a pinned file
     /// stays pinned across restarts (OptionalManager). None for in-memory nodes.
     pins_path: Option<PathBuf>,
+    /// UPnP: whether the fileserver port is currently open to the internet, and
+    /// the node's external IP if known. Set by the runtime's UPnP loop; read by
+    /// `serverInfo`. Default closed / unknown.
+    port_opened: RwLock<bool>,
+    ip_external: RwLock<Option<String>>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -181,6 +186,8 @@ impl AppState {
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
             peers_path: None,
+            port_opened: RwLock::new(false),
+            ip_external: RwLock::new(None),
             pins_path: None,
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
@@ -257,6 +264,8 @@ impl AppState {
             log_streams: RwLock::new(Vec::new()),
             peers_path: Some(dir.join("peers.json")),
             pins_path: Some(dir.join("pins.json")),
+            port_opened: RwLock::new(false),
+            ip_external: RwLock::new(None),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -710,6 +719,18 @@ impl AppState {
     /// The addresses of all served xites.
     pub async fn xite_addresses(&self) -> Vec<String> {
         self.xites.read().await.keys().cloned().collect()
+    }
+
+    /// Record the fileserver's reachability (UPnP): whether the port is open to
+    /// the internet and the node's external IP, if known.
+    pub async fn set_port_status(&self, opened: bool, ip_external: Option<String>) {
+        *self.port_opened.write().await = opened;
+        *self.ip_external.write().await = ip_external;
+    }
+
+    /// The fileserver's reachability for `serverInfo`: `(port_opened, ip_external)`.
+    pub async fn port_status(&self) -> (bool, Option<String>) {
+        (*self.port_opened.read().await, self.ip_external.read().await.clone())
     }
 
     /// The node's homepage xite - where the standalone admin pages' "back"
