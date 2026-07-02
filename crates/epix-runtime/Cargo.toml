@@ -1,0 +1,23 @@
+[package]
+name = "epix-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "The persistent node runtime: supervised background loops (announce + re-sync) over the app state."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-ui = { path = "../epix-ui" }
+epix-xite = { path = "../epix-xite" }
+epix-transport = { path = "../epix-transport" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+epix-protocol = { path = "../epix-protocol" }
+epix-crypt = { path = "../epix-crypt" }
+epix-content = { path = "../epix-content" }
+async-trait = "0.1"
+rmpv = "1"
+hex = "0.4"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

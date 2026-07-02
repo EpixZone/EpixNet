@@ -197,6 +197,82 @@ impl AppState {
         }
     }
 
+    /// The addresses of all served xites.
+    pub async fn xite_addresses(&self) -> Vec<String> {
+        self.xites.read().await.keys().cloned().collect()
+    }
+
+    /// Replace a xite's content.json, refreshing its stats and rebuilding its db.
+    pub async fn update_content(&self, address: &str, content: Option<Value>) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(c) = &content {
+                x.settings.apply_content_stats(&content_stats(c));
+            }
+            x.content = content;
+            let (db, schema) = match build_xite_db(&x.storage) {
+                Some((db, schema)) => (Some(db), Some(schema)),
+                None => (None, None),
+            };
+            x.db = db;
+            x.db_schema = schema;
+        }
+    }
+
+    /// Check a xite for a newer content.json among its peers and, if found,
+    /// verify it and download the changed files (updating live worker stats).
+    /// Returns true if an update was applied. This is the node's re-sync step.
+    pub async fn resync_xite(&self, address: &str) -> Result<bool, String> {
+        let transport = self.transport.read().await.clone().ok_or("no transport")?;
+        let peers = self.connectable_peers(address, 10).await;
+        if peers.is_empty() {
+            return Ok(false);
+        }
+        let view = self.xite_view(address).await?;
+        let local_modified = view
+            .content
+            .as_ref()
+            .and_then(|c| c.get("modified"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+
+        for peer in &peers {
+            let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else { continue };
+            if conn.handshake().await.is_err() {
+                continue;
+            }
+            let Ok(bytes) = conn.get_file(address, "content.json").await else { continue };
+            let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
+                continue;
+            };
+            let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            self.set_peer_connected(address, peer, true).await;
+            if new_modified <= local_modified {
+                return Ok(false); // already current
+            }
+
+            // Verify + apply the newer content.json, then sync its changed files.
+            let mut xite = Xite::new(
+                Address::parse(address.to_string()).map_err(|e| e.to_string())?,
+                view.storage.clone(),
+            );
+            xite.set_content(&bytes).map_err(|e| e.to_string())?; // checks signature + writes
+            self.update_content(address, xite.content.clone()).await;
+
+            let needed = xite.files_needed().len();
+            let workers = peers.len().min(8);
+            self.set_worker_stats(address, needed, workers, needed).await;
+            let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.set_worker_stats(address, 0, 0, 0).await;
+            self.add_transfer(address, report.bytes, 0).await;
+            // Data files may have changed — rebuild the db view.
+            self.update_content(address, xite.content).await;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Peer counts (connected/connectable/onion/local/total) for the sidebar.
     pub async fn peer_counts(&self, address: &str) -> PeerCounts {
         self.xites.read().await.get(address).map(|x| x.peers.counts()).unwrap_or_default()

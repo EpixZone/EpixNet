@@ -13,6 +13,7 @@ epix-db = { path = "../epix-db" }
 epix-protocol = { path = "../epix-protocol" }
 epix-transport = { path = "../epix-transport" }
 epix-propagation = { path = "../epix-propagation" }
+epix-worker = { path = "../epix-worker" }
 epix-crypt = { path = "../epix-crypt" }
 base64 = "0.22"
 sha2 = "0.10"

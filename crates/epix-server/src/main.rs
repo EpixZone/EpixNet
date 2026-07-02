@@ -156,13 +156,22 @@ async fn serve(
     // Fill any merger site's aggregate db from the merged sites we serve.
     state.rebuild_merger_dbs().await;
 
+    // Bring the node to life: supervised loops re-announce to trackers and
+    // re-sync each xite (picking up published updates) in the background.
+    let mut runtime = epix_runtime::NodeRuntime::new(
+        state.clone(),
+        transport.clone(),
+        vec![PeerAddr::parse(TRACKER).unwrap()],
+    );
+    runtime.start();
+
     // Assemble the UI command set + media through the plugin system.
     let mut plugins = epix_plugin::PluginRegistry::new();
     plugins.register(std::sync::Arc::new(epix_plugins::SidebarPlugin));
 
     let bind: std::net::SocketAddr = BIND.parse().unwrap();
     println!("\n┌──────────────────────────────────────────────");
-    println!("│ Epix node serving a xite cloned from the network");
+    println!("│ Epix node — live (announce + re-sync loops running)");
     println!("│ plugins: {:?}", plugins.names());
     println!("│ Open in your browser:");
     println!("│   http://{BIND}/{display}/");

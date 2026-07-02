@@ -665,6 +665,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "epix-content",
+ "epix-core",
+ "epix-crypt",
+ "epix-protocol",
+ "epix-transport",
+ "epix-ui",
+ "epix-xite",
+ "hex",
+ "rmpv",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "epix-server"
 version = "0.1.0"
 dependencies = [
@@ -673,6 +692,7 @@ dependencies = [
  "epix-plugin",
  "epix-plugins",
  "epix-protocol",
+ "epix-runtime",
  "epix-transport",
  "epix-ui",
  "epix-worker",
@@ -705,6 +725,7 @@ dependencies = [
  "epix-protocol",
  "epix-transport",
  "epix-user",
+ "epix-worker",
  "epix-xite",
  "futures-util",
  "hex",
