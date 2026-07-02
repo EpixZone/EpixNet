@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn applies_dbschema_json_and_queries() {
         let json = r#"{
-            "db_name": "TestZite", "db_file": "db/db.db", "version": 1,
+            "db_name": "TestXite", "db_file": "db/db.db", "version": 1,
             "tables": {
                 "post": {
                     "cols": [["post_id","INTEGER"],["title","TEXT"],["date_added","INTEGER"]],
@@ -120,7 +120,7 @@ mod tests {
             }
         }"#;
         let schema = DbSchema::from_json(json).unwrap();
-        assert_eq!(schema.db_name, "TestZite");
+        assert_eq!(schema.db_name, "TestXite");
         assert_eq!(schema.tables["post"].cols.len(), 3);
 
         let db = Database::open_in_memory().unwrap();
