@@ -262,13 +262,13 @@ async fn serve(
     let mut plugins = epix_plugin::PluginRegistry::new();
     plugins.register(std::sync::Arc::new(epix_plugins::SidebarPlugin));
 
-    // Report loaded plugins + feature-plugins the dashboard menu gates on and we
-    // support (the built-in Stats page). serverInfo.plugins drives those menu
-    // items.
+    // Report every built-in plugin so the Plugins page lists them all, plus any
+    // dynamically registered plugin (e.g. Sidebar). serverInfo.plugins drives
+    // the dashboard menu items that gate on a plugin name.
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
-    plugin_names.push("Stats".to_string());
-    plugin_names.push("UiPluginManager".to_string());
-    plugin_names.push("UiConfig".to_string());
+    plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
+    plugin_names.sort();
+    plugin_names.dedup();
     state.set_plugins(plugin_names).await;
 
     let bind: std::net::SocketAddr = BIND.parse().unwrap();

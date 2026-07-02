@@ -120,6 +120,41 @@ impl UiServer {
     }
 }
 
+/// The built-in plugins/features this node ships, for the Plugins page and
+/// `serverInfo.plugins`. The always-on ones are listed unconditionally; the
+/// feature-gated ones appear only when compiled in.
+pub fn builtin_plugins() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut plugins = vec![
+        "Cors",
+        "PeerDb",
+        "Notification",
+        "FilePack",
+        "UiFileManager",
+        "AnnounceLocal",
+        "AnnounceShare",
+        "AnnounceBitTorrent",
+        "NoNewSites",
+        "ContentFilter",
+        "MergerSite",
+        "OptionalManager",
+        "Newsfeed",
+        "CryptMessage",
+        "Chart",
+        "Bigfile",
+        "Stats",
+        "UiConfig",
+        "UiPluginManager",
+    ];
+    #[cfg(feature = "ui-password")]
+    plugins.push("UiPassword");
+    #[cfg(feature = "multiuser")]
+    plugins.push("Multiuser");
+    #[cfg(feature = "benchmark")]
+    plugins.push("Benchmark");
+    plugins
+}
+
 async fn health() -> &'static str {
     "Epix UI server"
 }
@@ -265,6 +300,25 @@ fn plugin_description(name: &str) -> &'static str {
         "Stats" => "Network stats charts and the peer world map on the dashboard.",
         "UiPluginManager" => "This plugin manager page.",
         "UiConfig" => "The node configuration page.",
+        "Cors" => "Cross-site file access via a Cors:<address> permission grant.",
+        "PeerDb" => "Remembers known peers across restarts.",
+        "Notification" => "Per-site notification subscriptions, muting, and counts.",
+        "FilePack" => "Serves files from inside .tar.gz / .zip archives.",
+        "UiFileManager" => "Browse a xite's files from the dashboard.",
+        "AnnounceLocal" => "Finds peers on the local network over UDP broadcast.",
+        "AnnounceShare" => "Remembers working trackers and reuses them across restarts.",
+        "AnnounceBitTorrent" => "Announces to HTTP(S) and UDP BitTorrent trackers.",
+        "NoNewSites" => "Locks the node's site set: blocks adding and deleting sites.",
+        "ContentFilter" => "Mute authors and block sites (enforced on serve + db).",
+        "MergerSite" => "Aggregates merged sites into one database.",
+        "OptionalManager" => "Manages optional (on-demand) files and the size limit.",
+        "Newsfeed" => "Cross-site news feed from followed sites.",
+        "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for zites.",
+        "Chart" => "Collects the time-series data behind the Stats charts.",
+        "Bigfile" => "Piecewise download of large files with piecefield exchange.",
+        "UiPassword" => "Password-protects the whole UI with a login gate.",
+        "Multiuser" => "Multiple master-seed identities with login/switch.",
+        "Benchmark" => "A /Benchmark page timing the node's crypto/hash/pack hot paths.",
         _ => "Built-in plugin.",
     }
 }
@@ -272,15 +326,16 @@ fn plugin_description(name: &str) -> &'static str {
 /// Render the plugin manager page, styled like EpixNet's (light theme, gradient
 /// header, sliding toggle switches). The toggle is a link (`/Plugins?toggle=…`)
 /// so it works without JS/WebSocket.
-fn render_plugins_page(states: &[(String, bool)], homepage: &str) -> String {
+fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
-    for (name, enabled) in states {
+    for (name, enabled, default_enabled) in states {
         let checked = if *enabled { "checked" } else { "" };
+        let default_txt = if *default_enabled { "enabled" } else { "disabled" };
         rows.push_str(&format!(
             "<div class='plugin'>\
                <div class='title'><h3>{name}</h3>\
-                 <div class='description'>{descr}</div></div>\
+                 <div class='description'>{descr} <span class='default'>(default: {default_txt})</span></div></div>\
                <a class='value value-right checkbox {checked}' href='/Plugins?toggle={name}' \
                   title='{action} {name}'><div class='checkbox-skin'></div></a>\
              </div>",
@@ -317,7 +372,7 @@ async fn serve_config_page(
             .await
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| default.to_string());
-        values.push((*key, *label, val));
+        values.push((*key, *label, val, *default));
     }
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, &homepage))
@@ -325,21 +380,23 @@ async fn serve_config_page(
 }
 
 /// Render the settings page, styled like EpixNet's Config page.
-fn render_config_page(values: &[(&str, &str, String)], homepage: &str) -> String {
+fn render_config_page(values: &[(&str, &str, String, &str)], homepage: &str) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
     let mut fields = String::new();
-    for (key, label, val) in values {
+    for (key, label, val, default) in values {
         fields.push_str(&format!(
             "<div class='config-item'>\
-               <div class='title'><h3>{label}</h3></div>\
+               <div class='title'><h3>{label}</h3>\
+                 <div class='description'><span class='default'>(default: {default})</span></div></div>\
                <div class='value value-right'>\
                  <input class='input-text' name='{key}' value='{val}' spellcheck='false'></div>\
              </div>",
             label = esc(label),
             key = esc(key),
             val = esc(val),
+            default = esc(default),
         ));
     }
     let body = format!(
@@ -459,6 +516,7 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
           .plugin .title,.config-item .title{{display:inline-block}}\
           .plugin .title h3,.config-item .title h3{{font-size:20px;font-weight:lighter;margin:0;line-height:32px}}\
           .plugin .description{{font-size:14px;color:#777;line-height:22px;margin-top:2px}}\
+          .default{{color:#aaa;font-size:12px}}\
           .value-right{{right:0;position:absolute;top:16px}}\
           .checkbox{{display:inline-block;cursor:pointer}}\
           .checkbox-skin{{background:#CCC;width:50px;height:24px;border-radius:15px;transition:all .3s ease-in-out;display:inline-block}}\
