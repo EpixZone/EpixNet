@@ -1,4 +1,4 @@
-//! `epix-plugin` — the extension system.
+//! `epix-plugin` - the extension system.
 //!
 //! EpixNet extends the engine by monkeypatching Python classes at runtime. Here
 //! that becomes an explicit, compile-time-checked hook system: a [`Plugin`]
@@ -24,7 +24,7 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
-    /// Client JS appended to `/uimedia/all.js` — the plugin's wrapper-side code
+    /// Client JS appended to `/uimedia/all.js` - the plugin's wrapper-side code
     /// (e.g. the sidebar drag handle + rendering). Concatenated after the base
     /// bundle, exactly like EpixNet's `actionUiMedia` append.
     fn append_js(&self) -> Option<&'static [u8]> {
@@ -36,7 +36,7 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Extra static media served under `/uimedia/`, as `(path, bytes)` — e.g.
+    /// Extra static media served under `/uimedia/`, as `(path, bytes)` - e.g.
     /// `("globe/world.jpg", …)` for the sidebar's WebGL globe.
     fn media_files(&self) -> Vec<(&'static str, &'static [u8])> {
         Vec::new()

@@ -1,4 +1,4 @@
-//! `epix-protocol` — the EpixNet wire protocol over a `PeerStream`.
+//! `epix-protocol` - the EpixNet wire protocol over a `PeerStream`.
 //!
 //! Provides the msgpack framing ([`msg`]) and a client [`Connection`] that
 //! performs the handshake and the FileRequest command set (`ping`, `getFile`,

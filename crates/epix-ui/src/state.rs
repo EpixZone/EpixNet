@@ -23,6 +23,14 @@ const DEFAULT_SIZE_LIMIT_MB: i64 = 10;
 /// How many warm peer connections the node keeps for live connection stats.
 const CONNECTION_POOL_MAX: usize = 8;
 
+/// Editable node config keys shown on the Config page: `(key, label, default)`.
+pub const CONFIG_SCHEMA: &[(&str, &str, &str)] = &[
+    ("language", "Interface language", "en"),
+    ("chain_rpc_url", "Chain RPC URL", "https://api.epix.zone"),
+    ("chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone"),
+    ("chain_block_explorer_url", "Block explorer URL", "https://scan.epix.zone"),
+];
+
 /// The input to [`AppState::add_xite`]: a xite's storage and (if loaded) its
 /// verified content.json. Settings/stats are derived from these.
 pub struct XiteEntry {
@@ -245,7 +253,7 @@ impl AppState {
     }
 
     /// Enable/disable a plugin at runtime (persisted). Takes effect on the next
-    /// page load / command — no restart.
+    /// page load / command - no restart.
     pub async fn set_plugin_enabled(&self, name: &str, enabled: bool) {
         let mut disabled = self.disabled_plugins().await;
         disabled.retain(|n| n != name);
@@ -269,6 +277,19 @@ impl AppState {
     /// A node config value set via `configSet` (e.g. `language`).
     pub async fn config_get(&self, key: &str) -> Option<Value> {
         self.config.read().await.get(key).cloned()
+    }
+
+    /// `configList` - the editable config keys with current value + default.
+    pub async fn config_list(&self) -> Value {
+        let mut back = serde_json::Map::new();
+        for (key, _label, default) in CONFIG_SCHEMA {
+            let value = self.config_get(key).await.unwrap_or_else(|| json!(default));
+            back.insert(
+                key.to_string(),
+                json!({ "value": value, "default": default, "pending": false }),
+            );
+        }
+        Value::Object(back)
     }
 
     /// Set a node config value (`configSet`), persisted to `data_dir/config.json`.
@@ -498,7 +519,7 @@ impl AppState {
                 .map_err(|e| e.to_string())?;
             self.set_worker_stats(address, 0, 0, 0).await;
             self.add_transfer(address, report.bytes, 0).await;
-            // Data files may have changed — rebuild the db view.
+            // Data files may have changed - rebuild the db view.
             self.update_content(address, xite.content).await;
             return Ok(true);
         }
@@ -763,7 +784,7 @@ impl AppState {
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
 
-        // The piecemap is itself a (small) optional file — fetch it if missing.
+        // The piecemap is itself a (small) optional file - fetch it if missing.
         if !storage.exists(&piecemap_path) {
             self.file_need(address, &piecemap_path).await?;
         }
@@ -985,7 +1006,7 @@ impl AppState {
         *self.geoip.write().await = Some(Arc::new(geoip));
     }
 
-    /// `chartGetPeerLocations` — geolocate every distinct clearnet peer IP we
+    /// `chartGetPeerLocations` - geolocate every distinct clearnet peer IP we
     /// know across all served xites, for the dashboard's world map. Returns
     /// `[{lat, lon, city, country, ping}]`. Empty if no geolocation db is loaded.
     pub async fn peer_locations(&self) -> Vec<Value> {
@@ -1022,7 +1043,7 @@ impl AppState {
         out
     }
 
-    /// `sidebarGetPeers` — peer positions for the sidebar's WebGL globe, as a
+    /// `sidebarGetPeers` - peer positions for the sidebar's WebGL globe, as a
     /// flat `[lat, lon, height, …]` array (the globe's `magnitude` format).
     /// Height is derived from ping (log-scaled around the average), matching
     /// EpixNet: connected peers rise with latency, unpinged peers sit slightly
@@ -1126,7 +1147,7 @@ impl AppState {
         }
     }
 
-    /// `serverErrors` — only the ERROR-level log lines, `[[date_added, level,
+    /// `serverErrors` - only the ERROR-level log lines, `[[date_added, level,
     /// message], …]`. Matches EpixNet's error logger (level ERROR), so the
     /// dashboard's warning badge lights up for real errors, not routine INFO
     /// activity. The full activity log is in the sidebar console
@@ -1141,7 +1162,7 @@ impl AppState {
             .collect()
     }
 
-    /// `consoleLogRead` — recent lines for the sidebar console as formatted
+    /// `consoleLogRead` - recent lines for the sidebar console as formatted
     /// strings, plus the byte-position metadata the panel displays.
     pub async fn console_log_read(&self) -> Value {
         let lines: Vec<Value> =
@@ -1150,7 +1171,7 @@ impl AppState {
         json!({ "lines": lines, "pos_start": 0, "pos_end": n * 80, "num_found": n })
     }
 
-    /// `consoleLogStream` — open a live log stream; returns its id. New lines
+    /// `consoleLogStream` - open a live log stream; returns its id. New lines
     /// arrive as `logLineAdd` events tagged with this id.
     pub async fn console_log_stream_open(&self) -> i64 {
         let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
@@ -1158,7 +1179,7 @@ impl AppState {
         id
     }
 
-    /// `consoleLogStreamRemove` — stop a live log stream.
+    /// `consoleLogStreamRemove` - stop a live log stream.
     pub async fn console_log_stream_remove(&self, id: i64) {
         self.log_streams.write().await.retain(|s| *s != id);
     }
@@ -1193,7 +1214,7 @@ impl AppState {
     }
 
     /// Push a wrapper notification (`["info"|"done"|"error", message,
-    /// timeout_ms]`). Ungated — notifications reach every connection.
+    /// timeout_ms]`). Ungated - notifications reach every connection.
     pub fn push_notification(&self, kind: &str, message: &str, timeout_ms: i64) {
         self.push_event("notification", json!([kind, message, timeout_ms]), None, None);
     }
@@ -1430,7 +1451,7 @@ impl AppState {
         self.user.read().await.site_privatekey(address)
     }
 
-    /// The content rules for `inner_path` — chiefly the `signers` allowed to
+    /// The content rules for `inner_path` - chiefly the `signers` allowed to
     /// sign it (the sidebar checks these before prompting for a key). For the
     /// root content.json that's the xite's own address (or its declared
     /// `signers`); for a user content, the user's auth address. `fileRules`.
@@ -1562,7 +1583,7 @@ impl AppState {
     }
 
     /// Set the known peer count for a xite (from discovery), persisting nothing
-    /// here — it's derived runtime state.
+    /// here - it's derived runtime state.
     pub async fn set_peer_count(&self, address: &str, peers: i64) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.peers = peers;
@@ -1576,7 +1597,7 @@ impl AppState {
         }
     }
 
-    /// Build the `siteInfo` response for a xite — EpixNet's `formatSiteInfo`.
+    /// Build the `siteInfo` response for a xite - EpixNet's `formatSiteInfo`.
     /// Returns `Null` if the xite isn't served here.
     pub async fn site_info(&self, address: &str) -> Value {
         let xites = self.xites.read().await;
@@ -1627,7 +1648,7 @@ impl AppState {
         })
     }
 
-    /// `siteList` — one siteInfo per served xite, for the dashboard's Sites
+    /// `siteList` - one siteInfo per served xite, for the dashboard's Sites
     /// panel. A xite served under both its raw address and a `.epix` alias is a
     /// single site, so we collapse entries that share the same signed content
     /// address (the alias points at the same storage + content).

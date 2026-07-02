@@ -1,4 +1,4 @@
-//! `epix-discovery` — finding peers for a xite.
+//! `epix-discovery` - finding peers for a xite.
 //!
 //! The primary method on the live network is the **Epix tracker** (`epix://`):
 //! an `announce` request over the ordinary EpixNet wire protocol (so it reuses

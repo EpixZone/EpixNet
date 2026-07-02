@@ -1,10 +1,10 @@
-//! `epix-propagation` — offline-first store-and-forward for xite updates.
+//! `epix-propagation` - offline-first store-and-forward for xite updates.
 //!
 //! When a xite is updated, its owner announces a small notification (`xite`
 //! address + `modified` version) to propagation nodes. A propagation node holds
 //! recent notifications so a peer that was **offline** at publish time can pull
 //! what it missed the next time it connects. The receiver then runs a normal
-//! `epix-worker` sync, which verifies content.json signatures — so a
+//! `epix-worker` sync, which verifies content.json signatures - so a
 //! propagation relay is untrusted and cannot forge an update; it can only hint
 //! that one exists.
 //!
@@ -227,7 +227,7 @@ impl PropagationClient {
 }
 
 /// Of `notifications`, the xites we already host (present in `local` as
-/// `address -> modified`) that advanced to a newer version — i.e. what the
+/// `address -> modified`) that advanced to a newer version - i.e. what the
 /// worker should re-sync. Notifications for xites we don't host are ignored; a
 /// node keeps *its* xites fresh, and the resync still verifies signatures.
 pub fn needs_sync(

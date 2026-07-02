@@ -43,7 +43,7 @@ async fn chain_attestation_matches_finalized_state() {
     assert!(att.is_finalized(&state.digest).await.expect("finality"));
 
     // Content carrying the real digest verifies; a bogus digest is rejected as
-    // a mismatch — same accept/reject decision as the Python plugin.
+    // a mismatch - same accept/reject decision as the Python plugin.
     att.verify_digest(&state.digest).await.expect("real digest verifies");
     let bogus = "0".repeat(64);
     assert!(matches!(

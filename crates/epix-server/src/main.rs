@@ -37,7 +37,7 @@ async fn main() {
 
     // 0. If already cloned + verified, skip the network fetch (fast restarts).
     if xite.load_content().unwrap_or(false) && xite.files_needed().is_empty() {
-        println!("· {address} already cloned + verified — serving from cache");
+        println!("· {address} already cloned + verified - serving from cache");
         serve(address, display, data_dir, xite.content.clone(), 0).await;
         return;
     }
@@ -53,7 +53,7 @@ async fn main() {
     .await;
     println!("  found {} peers", peers.len());
     if peers.is_empty() {
-        eprintln!("no peers found — is the network reachable?");
+        eprintln!("no peers found - is the network reachable?");
         std::process::exit(1);
     }
 
@@ -78,7 +78,7 @@ async fn main() {
 
     // 3. Sync every file, verifying each hash.
     let needed = xite.files_needed().len();
-    println!("· content.json verified — downloading {needed} files …");
+    println!("· content.json verified - downloading {needed} files …");
     let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8)
         .await
         .expect("sync");
@@ -95,7 +95,7 @@ async fn main() {
 
 /// Turn a CLI argument into `(xite_address, display_name, from_cache)`: pass
 /// `epix1…` through; resolve a `.epix` name (or bare label, defaulting to
-/// `epix`) — from the on-disk resolve cache if we have it (instant, re-verified
+/// `epix`) - from the on-disk resolve cache if we have it (instant, re-verified
 /// later), otherwise on the chain. The display name is the `.epix` name so URLs
 /// read as `dashboard.epix`.
 async fn resolve_target(arg: &str) -> (String, String, bool) {
@@ -199,7 +199,7 @@ async fn serve(
             if let Some(geoip) = geoip {
                 state.set_geoip(geoip).await;
                 state.push_notification("done", "World map ready", 4000);
-                state.log("INFO", "Geolocation database ready — world map enabled").await;
+                state.log("INFO", "Geolocation database ready - world map enabled").await;
             }
         });
     }
@@ -254,11 +254,12 @@ async fn serve(
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.push("Stats".to_string());
     plugin_names.push("UiPluginManager".to_string());
+    plugin_names.push("UiConfig".to_string());
     state.set_plugins(plugin_names).await;
 
     let bind: std::net::SocketAddr = BIND.parse().unwrap();
     println!("\n┌──────────────────────────────────────────────");
-    println!("│ Epix node — live (announce + re-sync loops running)");
+    println!("│ Epix node - live (announce + re-sync loops running)");
     println!("│ plugins: {:?}", plugins.names());
     println!("│ Open in your browser:");
     println!("│   http://{BIND}/{display}/");

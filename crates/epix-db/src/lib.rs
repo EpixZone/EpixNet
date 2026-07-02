@@ -1,4 +1,4 @@
-//! `epix-db` — SQLite storage for EpixNet.
+//! `epix-db` - SQLite storage for EpixNet.
 //!
 //! A pooled [`Database`] (rusqlite + r2d2), per-xite schemas applied from a
 //! xite's `dbschema.json` ([`schema`]), and the global [`ContentDb`].
@@ -30,8 +30,8 @@ impl Database {
         Self::from_manager(mgr, 8)
     }
 
-    /// A private in-memory database (pool size 1 so the single connection — and
-    /// thus the data — is shared across all `conn()` calls). For tests.
+    /// A private in-memory database (pool size 1 so the single connection - and
+    /// thus the data - is shared across all `conn()` calls). For tests.
     pub fn open_in_memory() -> Result<Self> {
         Self::from_manager(SqliteConnectionManager::memory(), 1)
     }

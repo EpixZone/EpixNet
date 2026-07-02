@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 pub const ID_LEN: usize = 32;
 pub const BITS: usize = ID_LEN * 8;
 
-/// A 256-bit identifier — both node IDs and lookup keys live in the same space.
+/// A 256-bit identifier - both node IDs and lookup keys live in the same space.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub [u8; ID_LEN]);
 
@@ -15,7 +15,7 @@ impl NodeId {
         NodeId(bytes)
     }
 
-    /// Derive an id by hashing bytes — e.g. a xite address → its lookup key, or
+    /// Derive an id by hashing bytes - e.g. a xite address → its lookup key, or
     /// a peer identity → its node id.
     pub fn hash(data: &[u8]) -> Self {
         NodeId(Sha256::digest(data).into())

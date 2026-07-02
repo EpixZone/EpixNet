@@ -1,6 +1,6 @@
 //! Inbound peer server: accept connections, answer the handshake, and dispatch
 //! requests to a [`RequestHandler`]. This is the serving counterpart to
-//! [`crate::Connection`] — the same framing, the other direction. Handlers plug
+//! [`crate::Connection`] - the same framing, the other direction. Handlers plug
 //! in `getFile`, DHT RPCs, etc.
 
 use crate::msg::{read_msg, send_msg, vget, vmap};

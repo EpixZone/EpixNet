@@ -1,8 +1,8 @@
-//! `epix-dht` — a private Kademlia DHT for EpixNet peer discovery.
+//! `epix-dht` - a private Kademlia DHT for EpixNet peer discovery.
 //!
 //! The core query is `site → its peers`: a directed lookup that works for rare
 //! sites and survives tracker bans. Unlike BitTorrent's mainline DHT this is a
-//! private keyspace and runs over [`crate::rpc::RpcClient`] — which, in the real
+//! private keyspace and runs over [`crate::rpc::RpcClient`] - which, in the real
 //! node, rides the peer `Connection` (epix-protocol), so it works over **TCP,
 //! Tor, and Reticulum mesh** alike.
 

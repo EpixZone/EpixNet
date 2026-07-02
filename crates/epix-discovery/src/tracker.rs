@@ -69,7 +69,7 @@ pub async fn discover_via_epix_tracker(
 }
 
 /// Unpack a 6-byte (ipv4) or 18-byte (ipv6) compact peer address.
-/// Port is little-endian — EpixNet packs it with native-endian `struct.pack("H")`.
+/// Port is little-endian - EpixNet packs it with native-endian `struct.pack("H")`.
 fn unpack_address(packed: &[u8]) -> Option<PeerAddr> {
     match packed.len() {
         6 => {

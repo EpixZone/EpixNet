@@ -1,6 +1,6 @@
 //! Multiple DHT nodes over real TCP: each runs a PeerServer serving `kad` RPCs,
 //! and looks up via a dial-on-demand WireRpcClient. Announce on one node, find
-//! it from another — the whole DHT-over-connections path.
+//! it from another - the whole DHT-over-connections path.
 
 use epix_core::PeerAddr;
 use epix_dht::{site_key, Contact, Node, NodeId};

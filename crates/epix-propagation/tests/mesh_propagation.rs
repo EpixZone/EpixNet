@@ -73,7 +73,7 @@ async fn run() {
         .expect("dial propagation node over mesh");
     conn.handshake().await.expect("handshake over mesh");
 
-    // Announce a xite update over the mesh — the node stores it.
+    // Announce a xite update over the mesh - the node stores it.
     let seq = announce_update(&mut conn, "mesh.epix", 4242)
         .await
         .expect("announce over mesh");

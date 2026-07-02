@@ -74,7 +74,7 @@ impl Xite {
         self.files_under("files")
     }
 
-    /// Optional files (`files_optional`) — declared but not auto-downloaded.
+    /// Optional files (`files_optional`) - declared but not auto-downloaded.
     pub fn optional_files(&self) -> Vec<FileEntry> {
         self.files_under("files_optional")
     }

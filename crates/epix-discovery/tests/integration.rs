@@ -96,7 +96,7 @@ async fn live_tracker_discovers_real_peers() {
     assert!(!peers.is_empty(), "expected at least one peer from the live tracker");
 }
 
-/// Capstone: the full real-network path — discover peers via the tracker, then
+/// Capstone: the full real-network path - discover peers via the tracker, then
 /// connect to a discovered peer and download + verify the Dashboard content.json.
 /// No local node involved.
 /// `cargo test -p epix-discovery -- --ignored live_full --nocapture`

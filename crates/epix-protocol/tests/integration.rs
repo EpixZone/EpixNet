@@ -1,6 +1,6 @@
 //! End-to-end: a `Connection` (over `TcpTransport`) handshakes with a mock
 //! EpixNet peer, downloads a signed content.json, and `epix-content` verifies
-//! the signature — exercising transport + protocol + content + crypto together.
+//! the signature - exercising transport + protocol + content + crypto together.
 //!
 //! Also includes an `#[ignore]`d test against a real local node on :20790.
 

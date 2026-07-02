@@ -1,6 +1,6 @@
 //! Exercises the `epix-transport::Transport` impl end to end: a client learns
 //! the server's destination from an announce, then `dial(PeerAddr::Rns(hash))`
-//! opens a mesh link and streams bytes — the same call site TCP uses.
+//! opens a mesh link and streams bytes - the same call site TCP uses.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,7 +84,7 @@ async fn run() {
     );
     let client = ReticulumTransport::new(client_rns);
 
-    // Dial by destination hash — the transport waits for the announce, links, streams.
+    // Dial by destination hash - the transport waits for the announce, links, streams.
     let mut stream = client
         .dial(&PeerAddr::Rns(hash))
         .await

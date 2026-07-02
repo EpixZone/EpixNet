@@ -1,8 +1,8 @@
 //! The network-stats chart database, mirroring EpixNet's Chart plugin.
 //!
 //! A background collector snapshots node metrics into a small SQLite database
-//! with three tables — `type` (metric id -> name), `site` (site id -> address),
-//! and `data` (timestamped values) — and the dashboard's Stats page reads it
+//! with three tables - `type` (metric id -> name), `site` (site id -> address),
+//! and `data` (timestamped values) - and the dashboard's Stats page reads it
 //! through the `chartDbQuery` command. `date_added` is stored as unix seconds
 //! (the page divides and buckets by it), matching the Python collector.
 

@@ -1,4 +1,4 @@
-//! `epix-ui` — the local UI server.
+//! `epix-ui` - the local UI server.
 //!
 //! Serves the wrapper (`GET /{address}/`), the wrapper runtime assets
 //! (`/uimedia/*`, embedded at build time), a xite's own files
@@ -89,6 +89,7 @@ impl UiServer {
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/uimedia/*path", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page))
+            .route("/Config", get(serve_config_page))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
             .route("/:address/*path", get(serve_file))
@@ -133,7 +134,7 @@ async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Resp
             return ([(header::CONTENT_TYPE, ct)], body).into_response();
         }
     }
-    // Plugin-provided static files (e.g. globe assets) — only for enabled plugins.
+    // Plugin-provided static files (e.g. globe assets) - only for enabled plugins.
     for pm in &ctx.media.plugins {
         if let Some(bytes) = pm.files.get(&path) {
             if pm.name.is_empty() || ctx.state.plugin_enabled(&pm.name).await {
@@ -198,7 +199,7 @@ struct PluginsQuery {
     toggle: Option<String>,
 }
 
-/// `GET /Plugins` — the plugin manager page. `?toggle=<name>` flips a plugin's
+/// `GET /Plugins` - the plugin manager page. `?toggle=<name>` flips a plugin's
 /// enabled state (persisted) and redirects back; the change takes effect on the
 /// next page load, no restart.
 async fn serve_plugins_page(State(ctx): State<Ctx>, Query(q): Query<PluginsQuery>) -> Response {
@@ -212,45 +213,130 @@ async fn serve_plugins_page(State(ctx): State<Ctx>, Query(q): Query<PluginsQuery
         .into_response()
 }
 
-/// Render the plugin manager page from the loaded plugins + their enabled state.
+/// A short description for a known built-in plugin/feature.
+fn plugin_description(name: &str) -> &'static str {
+    match name {
+        "Sidebar" => "Slide-out site info panel with peers, transfer stats, and the world globe.",
+        "Stats" => "Network stats charts and the peer world map on the dashboard.",
+        "UiPluginManager" => "This plugin manager page.",
+        "UiConfig" => "The node configuration page.",
+        _ => "Built-in plugin.",
+    }
+}
+
+/// Render the plugin manager page, styled like EpixNet's (light theme, gradient
+/// header, sliding toggle switches). The toggle is a link (`/Plugins?toggle=…`)
+/// so it works without JS/WebSocket.
 fn render_plugins_page(states: &[(String, bool)]) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
     for (name, enabled) in states {
-        let (badge, badge_cls) =
-            if *enabled { ("Enabled", "on") } else { ("Disabled", "off") };
-        let action = if *enabled { "Disable" } else { "Enable" };
+        let checked = if *enabled { "checked" } else { "" };
         rows.push_str(&format!(
             "<div class='plugin'>\
-               <div class='info'><span class='name'>{name}</span>\
-                 <span class='badge {badge_cls}'>{badge}</span></div>\
-               <a class='btn {badge_cls}' href='/Plugins?toggle={name}'>{action}</a>\
+               <div class='title'><h3>{name}</h3>\
+                 <div class='description'>{descr}</div></div>\
+               <a class='value value-right checkbox {checked}' href='/Plugins?toggle={name}' \
+                  title='{action} {name}'><div class='checkbox-skin'></div></a>\
              </div>",
             name = esc(name),
+            descr = esc(plugin_description(name)),
+            action = if *enabled { "Disable" } else { "Enable" },
         ));
     }
     if rows.is_empty() {
-        rows.push_str("<div class='empty'>No plugins loaded.</div>");
+        rows.push_str("<div class='description'>No plugins loaded.</div>");
     }
+    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"))
+}
+
+/// `GET /Config` - the node settings page. `?save=1&<key>=<value>` persists the
+/// changed keys (via configSet) and redirects back.
+async fn serve_config_page(
+    State(ctx): State<Ctx>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if params.contains_key("save") {
+        for (key, _label, _default) in crate::state::CONFIG_SCHEMA {
+            if let Some(val) = params.get(*key) {
+                ctx.state.config_set(key, Value::from(val.as_str())).await;
+            }
+        }
+        return Redirect::to("/Config").into_response();
+    }
+    let mut values = Vec::new();
+    for (key, label, default) in crate::state::CONFIG_SCHEMA {
+        let val = ctx
+            .state
+            .config_get(key)
+            .await
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| default.to_string());
+        values.push((*key, *label, val));
+    }
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values)).into_response()
+}
+
+/// Render the settings page, styled like EpixNet's Config page.
+fn render_config_page(values: &[(&str, &str, String)]) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let mut fields = String::new();
+    for (key, label, val) in values {
+        fields.push_str(&format!(
+            "<div class='config-item'>\
+               <div class='title'><h3>{label}</h3></div>\
+               <div class='value value-right'>\
+                 <input class='input-text' name='{key}' value='{val}' spellcheck='false'></div>\
+             </div>",
+            label = esc(label),
+            key = esc(key),
+            val = esc(val),
+        ));
+    }
+    let body = format!(
+        "<form method='get' action='/Config'>\
+           <div class='config'>{fields}</div>\
+           <input type='hidden' name='save' value='1'>\
+           <button class='button' type='submit'>Save</button>\
+         </form>"
+    );
+    page_shell("Configuration", "Configuration", "", &body)
+}
+
+/// Shared page shell for the server-rendered admin pages, styled to match
+/// EpixNet (light theme, gradient header, sliding toggles, config inputs).
+fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str) -> String {
+    let sub = if subtitle.is_empty() {
+        String::new()
+    } else {
+        format!("<p class='sub'>{subtitle}</p>")
+    };
     format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>Plugins</title>\
+        "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
          <meta name='viewport' content='width=device-width, initial-scale=1'>\
          <style>\
-          body{{background:#25272e;color:#dfe1e8;font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:40px 16px}}\
-          .wrap{{max-width:640px;margin:0 auto}}\
-          h1{{font-weight:600;font-size:22px;margin:0 0 4px}}\
-          .sub{{color:#8b8f9c;margin:0 0 24px;font-size:13px}}\
-          .plugin{{display:flex;align-items:center;justify-content:space-between;background:#2d2f38;border:1px solid #3a3d48;border-radius:10px;padding:14px 16px;margin-bottom:10px}}\
-          .name{{font-weight:600}}\
-          .badge{{margin-left:10px;font-size:11px;padding:2px 8px;border-radius:20px}}\
-          .badge.on{{background:#1f5133;color:#7ee2a8}} .badge.off{{background:#4a2b2b;color:#e29a9a}}\
-          .btn{{text-decoration:none;font-size:13px;padding:7px 14px;border-radius:8px;color:#fff}}\
-          .btn.on{{background:#8a3d3d}} .btn.off{{background:#2f7d52}}\
-          .empty{{color:#8b8f9c}}\
-         </style></head><body><div class='wrap'>\
-         <h1>Plugins</h1>\
-         <p class='sub'>Enable or disable plugins. Changes apply on the next page load — no restart.</p>\
-         {rows}</div></body></html>"
+          body{{background:#EDF2F5;font-family:Roboto,'Segoe UI',Arial,'Helvetica Neue',sans-serif;margin:0;padding:0;color:#333}}\
+          h1{{background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;padding:16px 30px;margin:0;font-weight:200;font-size:30px}}\
+          .content{{max-width:800px;margin:auto;background:#fff;padding:40px 30px 120px;box-sizing:border-box;min-height:100vh}}\
+          .sub{{color:#666;font-size:15px;margin:0 0 26px}}\
+          .plugin,.config-item{{position:relative;padding:16px 0;border-bottom:1px solid #f0f2f5}}\
+          .plugin .title,.config-item .title{{display:inline-block}}\
+          .plugin .title h3,.config-item .title h3{{font-size:20px;font-weight:lighter;margin:0;line-height:32px}}\
+          .plugin .description{{font-size:14px;color:#777;line-height:22px;margin-top:2px}}\
+          .value-right{{right:0;position:absolute;top:16px}}\
+          .checkbox{{display:inline-block;cursor:pointer}}\
+          .checkbox-skin{{background:#CCC;width:50px;height:24px;border-radius:15px;transition:all .3s ease-in-out;display:inline-block}}\
+          .checkbox-skin:before{{content:'';position:relative;width:20px;height:20px;background:#fff;display:block;border-radius:100%;margin:2px 0 0 2px;transition:all .5s cubic-bezier(.785,.135,.15,.86)}}\
+          .checkbox.checked .checkbox-skin{{background:#2ECC71}}\
+          .checkbox.checked .checkbox-skin:before{{margin-left:27px}}\
+          .input-text{{padding:8px 18px;border:1px solid #CCC;border-radius:3px;font-size:15px;box-sizing:border-box;min-width:280px;font-family:'Segoe UI',Arial,sans-serif}}\
+          .input-text:focus{{border-color:#3396ff;outline:none}}\
+          .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer}}\
+          a{{color:#9760F9;text-decoration:none}}\
+         </style></head><body>\
+         <h1>{heading}</h1><div class='content'>{sub}{body}</div></body></html>"
     )
 }
 
@@ -386,7 +472,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                             break;
                         }
                     }
-                    // Lagged: dropped some events under load — keep going.
+                    // Lagged: dropped some events under load - keep going.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

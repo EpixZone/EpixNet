@@ -1,4 +1,4 @@
-//! `epix-dht-net` — binds `epix-dht` to the wire.
+//! `epix-dht-net` - binds `epix-dht` to the wire.
 //!
 //! The DHT logic in `epix-dht` talks to an abstract `RpcClient`; here that
 //! becomes real: [`WireRpcClient`] dials peers on demand and sends DHT RPCs over

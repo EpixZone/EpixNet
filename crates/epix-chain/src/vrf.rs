@@ -1,4 +1,4 @@
-//! `Vrf` — verifiable randomness from the Epix chain's per-block random beacon.
+//! `Vrf` - verifiable randomness from the Epix chain's per-block random beacon.
 //!
 //! Every block carries a random beacon (produced during its `EndBlock`).
 //! Applications get unbiasable randomness by deriving values from a beacon plus
@@ -15,7 +15,7 @@
 //! "every proposer across the whole range colludes".
 //!
 //! [`derive_random`] and [`combine_beacons`] are pure and match the Python
-//! implementation byte-for-byte — the encoding (the beacon **hex string** is
+//! implementation byte-for-byte - the encoding (the beacon **hex string** is
 //! hashed as UTF-8 bytes, not decoded; the index as its decimal ASCII) is the
 //! easy-to-get-wrong part, so it is pinned by known-answer tests below.
 
@@ -41,7 +41,7 @@ pub struct Beacon {
 /// Derive `count` deterministic 32-byte hex random values from a beacon + seed.
 ///
 /// `value[i] = SHA256(beacon_hex_utf8 || seed_utf8 || decimal(i)_utf8)`. Pure
-/// and publicly verifiable — this is the primitive dapps rely on.
+/// and publicly verifiable - this is the primitive dapps rely on.
 pub fn derive_random(beacon_hex: &str, seed: &str, count: usize) -> Vec<String> {
     (0..count)
         .map(|i| {
@@ -142,7 +142,7 @@ impl Vrf {
     }
 
     /// A combined beacon over `blocks` consecutive blocks ending at
-    /// `end_height` — every proposer in the range contributes entropy.
+    /// `end_height` - every proposer in the range contributes entropy.
     pub async fn multi_block_beacon(&self, end_height: u64, blocks: u64) -> Result<String> {
         if !(1..=256).contains(&blocks) {
             return Err(ChainError::Malformed("blocks must be between 1 and 256".into()));

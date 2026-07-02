@@ -1,4 +1,4 @@
-//! `epix-user` — the local user identity.
+//! `epix-user` - the local user identity.
 //!
 //! A user is a **master seed** plus, per xite, a derived identity key. When a
 //! xite is first visited the user gets a fresh auth key for it, derived from the
@@ -120,7 +120,7 @@ impl User {
         Ok(&self.sites[address])
     }
 
-    /// The auth address shown for `address` — the cert's if one is selected,
+    /// The auth address shown for `address` - the cert's if one is selected,
     /// otherwise the xite's own derived auth address.
     pub fn auth_address(&mut self, address: &str) -> Result<String, String> {
         let site = self.site_data(address)?;

@@ -28,7 +28,7 @@ impl WireRpcClient {
         if let Some(conn) = self.pool.lock().await.get(addr) {
             return Ok(conn.clone());
         }
-        // Dial outside the pool lock; another task may race us — double-check.
+        // Dial outside the pool lock; another task may race us - double-check.
         let mut conn = Connection::connect(self.transport.as_ref(), addr)
             .await
             .map_err(|e| e.to_string())?;
@@ -55,7 +55,7 @@ impl RpcClient for WireRpcClient {
         match result {
             Ok(resp) => Ok(decode_response(&resp)),
             Err(e) => {
-                // The connection may be dead — drop it so the next call redials.
+                // The connection may be dead - drop it so the next call redials.
                 self.drop_connection(&to.addr).await;
                 Err(e.to_string())
             }

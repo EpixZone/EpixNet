@@ -237,7 +237,7 @@ mod tests {
         assert!(pool.ping_for(&peer).await.is_some(), "ping recorded");
         assert!(stats.ping_avg >= 0 && stats.ping_min >= 0);
 
-        // ensure is idempotent — no duplicate connection to the same peer.
+        // ensure is idempotent - no duplicate connection to the same peer.
         pool.ensure(transport, &[peer.clone()]).await;
         assert_eq!(pool.stats().await.total, 1);
     }

@@ -1,7 +1,7 @@
-//! `epix-worker` — parallel file download manager.
+//! `epix-worker` - parallel file download manager.
 //!
 //! Given a xite (with verified content.json) and a set of peers, download every
-//! needed file concurrently — one worker per peer pulling from a shared queue —
+//! needed file concurrently - one worker per peer pulling from a shared queue -
 //! verifying each file's hash before it is written to the xite's storage.
 
 use epix_core::{PeerAddr, Result};
@@ -61,7 +61,7 @@ pub async fn sync_files(
             let mut conn = match connect(transport.as_ref(), &peer).await {
                 Some(c) => c,
                 None => {
-                    // Couldn't use this peer — leave the queue for other workers.
+                    // Couldn't use this peer - leave the queue for other workers.
                     return;
                 }
             };

@@ -79,12 +79,12 @@ fn main() {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    println!("✓ fetched proof — leaf_index={leaf_index}, {} siblings", siblings.len());
+    println!("✓ fetched proof - leaf_index={leaf_index}, {} siblings", siblings.len());
 
     // Step 2: Merkle proof
     let ok = verify_merkle_proof(leaf_hash, leaf_index, &siblings, proof_root).expect("merkle");
     assert!(ok, "Merkle proof verification FAILED (recomputed root != proof root)");
-    println!("✓ Merkle proof valid — recomputed root == {}", &proof_root[..16]);
+    println!("✓ Merkle proof valid - recomputed root == {}", &proof_root[..16]);
 
     // Step 3: proof root == attested state digest
     let digest_info = get_json(&client, &format!("{rpc}/xid/v1/state_digest")).expect("state_digest");

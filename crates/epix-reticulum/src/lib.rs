@@ -4,14 +4,14 @@
 //! BLE, packet radio, TCP, serial…). The EpixNet wire protocol, on the other
 //! hand, is a byte stream: msgpack messages framed over a [`PeerStream`]
 //! (`AsyncRead` + `AsyncWrite`). [`ReticulumStream`] is the adapter between the
-//! two — it presents a Reticulum `Link` as a byte stream, so the *entire*
+//! two - it presents a Reticulum `Link` as a byte stream, so the *entire*
 //! FileRequest command set (handshake, getFile, the DHT `kad` RPCs, …) runs
 //! over mesh with no protocol changes.
 //!
 //! Direction of travel:
-//! - **write** — bytes are chunked to the link MTU, turned into encrypted data
+//! - **write** - bytes are chunked to the link MTU, turned into encrypted data
 //!   packets ([`Link::data_packet`]), and sent on the transport.
-//! - **read** — the link's inbound `Data` events are concatenated back into a
+//! - **read** - the link's inbound `Data` events are concatenated back into a
 //!   byte stream. Because a `Link` delivers packets reliably and in order, the
 //!   reassembled stream is faithful; the reader neither knows nor cares that it
 //!   arrived as packets.
@@ -39,7 +39,7 @@ const CHUNK: usize = 1024;
 
 /// A Reticulum [`Link`] presented as a byte stream.
 ///
-/// Construct one per link — the client side wraps its out-link
+/// Construct one per link - the client side wraps its out-link
 /// ([`Transport::find_out_link`]), the server side wraps the matching in-link
 /// ([`Transport::find_in_link`]). Both are full duplex.
 pub struct ReticulumStream {
@@ -51,7 +51,7 @@ pub struct ReticulumStream {
 
 impl ReticulumStream {
     /// Wrap `link` (identified by `link_id`) as a byte stream. `events` is the
-    /// link-event stream this link's data arrives on — `in_link_events()` for a
+    /// link-event stream this link's data arrives on - `in_link_events()` for a
     /// server-side in-link, `out_link_events()` for a client-side out-link.
     pub fn wrap(
         transport: Arc<Transport>,

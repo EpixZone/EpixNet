@@ -2,7 +2,7 @@
 //!
 //! A big file's `<file>.piecemap.msgpack` is msgpack of
 //! `{ file_name: { "sha512_pieces": [<32-byte hash>, …], "piece_size": N } }`.
-//! Each piece hash is the raw first 32 bytes of the piece's SHA-512 — the same
+//! Each piece hash is the raw first 32 bytes of the piece's SHA-512 - the same
 //! value [`XiteStorage::hash_bytes`](crate::XiteStorage::hash_bytes) produces in
 //! hex, so a downloaded piece is verified by comparing hex to hex.
 

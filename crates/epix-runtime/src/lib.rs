@@ -1,12 +1,12 @@
-//! `epix-runtime` — the persistent node runtime.
+//! `epix-runtime` - the persistent node runtime.
 //!
 //! Turns a served [`AppState`] into a live node by running supervised background
 //! loops, replacing EpixNet's gevent greenlets with `tokio::spawn` tasks whose
 //! handles the runtime owns:
 //!
-//! - **announce** — periodically re-announce to trackers and fold the results
+//! - **announce** - periodically re-announce to trackers and fold the results
 //!   into each xite's peer registry, so peer lists stay fresh.
-//! - **re-sync** — periodically check each xite for a newer content.json among
+//! - **re-sync** - periodically check each xite for a newer content.json among
 //!   its peers and, if found, verify + download the changed files (updating the
 //!   live worker stats the sidebar shows).
 //!
@@ -128,7 +128,7 @@ async fn announce_loop(
 /// the announce loop shortly after startup), then settles into `period`.
 async fn connection_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
     // Retry every few seconds until the pool has a connection, so the count
-    // shows soon after the background announce populates peers — rather than
+    // shows soon after the background announce populates peers - rather than
     // waiting a full period after the empty first attempt.
     for _ in 0..10 {
         state.manage_connections().await;

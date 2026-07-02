@@ -1,4 +1,4 @@
-//! The `Emitter` trait — the seam that keeps the runtime UI/platform-agnostic.
+//! The `Emitter` trait - the seam that keeps the runtime UI/platform-agnostic.
 //!
 //! Mirrors Ratspeak's design: core logic emits named events with a JSON payload;
 //! each shell (Tauri, GeckoView/JNI, WKWebView/Swift, or a test harness) provides

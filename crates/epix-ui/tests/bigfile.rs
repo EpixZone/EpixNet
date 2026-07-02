@@ -40,7 +40,7 @@ impl RequestHandler for FileServe {
     }
 }
 
-/// Raw (binary) SHA-512/256 of `data` — the piecemap's per-piece hash format.
+/// Raw (binary) SHA-512/256 of `data` - the piecemap's per-piece hash format.
 fn raw_hash(data: &[u8]) -> Vec<u8> {
     hex::decode(XiteStorage::hash_bytes(data)).unwrap()
 }
@@ -93,7 +93,7 @@ async fn piecewise_download_pulls_only_needed_pieces() {
     state.set_transport(Arc::new(TcpTransport)).await;
     state.add_peers(&xite, [PeerAddr::Ip(peer_addr)]).await;
 
-    // Fetch just the second piece's window — only piece 1 should download.
+    // Fetch just the second piece's window - only piece 1 should download.
     state.bigfile_fetch_range(&xite, "movie.mp4", piece_size, 100).await.unwrap();
     let chunk = state.read_file_range(&xite, "movie.mp4", piece_size, 100).await.unwrap();
     assert_eq!(chunk, &big[piece_size as usize..piece_size as usize + 100]);
@@ -101,7 +101,7 @@ async fn piecewise_download_pulls_only_needed_pieces() {
     let piece0 = state.read_file_range(&xite, "movie.mp4", 0, piece_size as usize).await.unwrap();
     assert!(piece0.iter().all(|&b| b == 0), "unrequested piece stays a hole");
 
-    // Now fetch the whole range — every piece present, file matches the source.
+    // Now fetch the whole range - every piece present, file matches the source.
     state.bigfile_fetch_range(&xite, "movie.mp4", 0, big.len() as u64).await.unwrap();
     let whole = std::fs::read(cli_dir.path().join("movie.mp4")).unwrap();
     assert_eq!(whole, big, "reassembled big file matches the source byte-for-byte");

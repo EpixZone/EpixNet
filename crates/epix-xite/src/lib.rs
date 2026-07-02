@@ -1,4 +1,4 @@
-//! `epix-xite` — xite lifecycle: storage, content.json, and peer announcing.
+//! `epix-xite` - xite lifecycle: storage, content.json, and peer announcing.
 
 pub mod announcer;
 pub mod settings;
