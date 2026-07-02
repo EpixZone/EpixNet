@@ -248,6 +248,13 @@ async fn serve(
     let mut plugins = epix_plugin::PluginRegistry::new();
     plugins.register(std::sync::Arc::new(epix_plugins::SidebarPlugin));
 
+    // Report loaded plugins + feature-plugins the dashboard menu gates on and we
+    // support (the built-in Stats page). serverInfo.plugins drives those menu
+    // items.
+    let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
+    plugin_names.push("Stats".to_string());
+    state.set_plugins(plugin_names).await;
+
     let bind: std::net::SocketAddr = BIND.parse().unwrap();
     println!("\n┌──────────────────────────────────────────────");
     println!("│ Epix node — live (announce + re-sync loops running)");

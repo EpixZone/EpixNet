@@ -99,6 +99,9 @@ pub struct AppState {
     /// survives restarts.
     config: RwLock<serde_json::Map<String, Value>>,
     config_path: Option<PathBuf>,
+    /// Names of loaded plugins/features, reported in `serverInfo` (the dashboard
+    /// menu shows plugin-gated items like Stats from this).
+    plugins: RwLock<Vec<String>>,
     /// Recent log lines for the dashboard console (`serverErrors`): each is
     /// `[date_added, level, message]`, newest last, capped.
     logs: RwLock<std::collections::VecDeque<Value>>,
@@ -153,6 +156,7 @@ impl AppState {
             events: tokio::sync::broadcast::channel(256).0,
             config: RwLock::new(serde_json::Map::new()),
             config_path: None,
+            plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
         })
@@ -210,9 +214,20 @@ impl AppState {
             events: tokio::sync::broadcast::channel(256).0,
             config: RwLock::new(config),
             config_path: Some(config_path),
+            plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
         })
+    }
+
+    /// Set the loaded plugin/feature names reported in `serverInfo`.
+    pub async fn set_plugins(&self, names: Vec<String>) {
+        *self.plugins.write().await = names;
+    }
+
+    /// The loaded plugin/feature names (`serverInfo.plugins`).
+    pub async fn plugins(&self) -> Vec<String> {
+        self.plugins.read().await.clone()
     }
 
     /// A node config value set via `configSet` (e.g. `language`).
