@@ -41,26 +41,45 @@ pub fn from_sql(v: ValueRef) -> Value {
     }
 }
 
-/// Get (or create) the `json_id` for a data file's relative path.
-fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str) -> Result<i64> {
+/// Get (or create) the `json_id` for a data file's relative path. `site` is the
+/// merged-site address for version-3 (merger) schemas, ignored otherwise.
+fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, site: &str) -> Result<i64> {
     let rel_path = rel_path.replace('\\', "/");
-    if schema.version == 1 {
-        conn.execute("INSERT OR IGNORE INTO json (path) VALUES (?1)", [&rel_path]).map_err(db_err)?;
-        conn.query_row("SELECT json_id FROM json WHERE path = ?1", [&rel_path], |r| r.get(0))
+    match schema.version {
+        1 => {
+            conn.execute("INSERT OR IGNORE INTO json (path) VALUES (?1)", [&rel_path])
+                .map_err(db_err)?;
+            conn.query_row("SELECT json_id FROM json WHERE path = ?1", [&rel_path], |r| r.get(0))
+                .map_err(db_err)
+        }
+        3 => {
+            let (dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path.as_str()));
+            conn.execute(
+                "INSERT OR IGNORE INTO json (site, directory, file_name) VALUES (?1, ?2, ?3)",
+                [site, dir, name],
+            )
+            .map_err(db_err)?;
+            conn.query_row(
+                "SELECT json_id FROM json WHERE site = ?1 AND directory = ?2 AND file_name = ?3",
+                [site, dir, name],
+                |r| r.get(0),
+            )
             .map_err(db_err)
-    } else {
-        let (dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path.as_str()));
-        conn.execute(
-            "INSERT OR IGNORE INTO json (directory, file_name) VALUES (?1, ?2)",
-            [dir, name],
-        )
-        .map_err(db_err)?;
-        conn.query_row(
-            "SELECT json_id FROM json WHERE directory = ?1 AND file_name = ?2",
-            [dir, name],
-            |r| r.get(0),
-        )
-        .map_err(db_err)
+        }
+        _ => {
+            let (dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path.as_str()));
+            conn.execute(
+                "INSERT OR IGNORE INTO json (directory, file_name) VALUES (?1, ?2)",
+                [dir, name],
+            )
+            .map_err(db_err)?;
+            conn.query_row(
+                "SELECT json_id FROM json WHERE directory = ?1 AND file_name = ?2",
+                [dir, name],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
+        }
     }
 }
 
@@ -104,7 +123,14 @@ fn allowed_cols(schema: &DbSchema, entry: &ToTable) -> Vec<String> {
 }
 
 /// Route one already-loaded data file's JSON into the db per the matching maps.
-pub fn update_json(conn: &Connection, schema: &DbSchema, rel_path: &str, data: &Value) -> Result<bool> {
+/// `site` tags the rows for a version-3 merger db (empty for a normal site).
+pub fn update_json(
+    conn: &Connection,
+    schema: &DbSchema,
+    rel_path: &str,
+    data: &Value,
+    site: &str,
+) -> Result<bool> {
     let mut matched = false;
     for (pattern, map) in &schema.maps {
         let re = Regex::new(&format!("^(?:{pattern})")).map_err(|e| Error::Db(e.to_string()))?;
@@ -112,7 +138,7 @@ pub fn update_json(conn: &Connection, schema: &DbSchema, rel_path: &str, data: &
             continue;
         }
         matched = true;
-        let jid = json_id(conn, schema, rel_path)?;
+        let jid = json_id(conn, schema, rel_path, site)?;
 
         // to_keyvalue
         for key in &map.to_keyvalue {
@@ -185,6 +211,12 @@ pub fn update_json(conn: &Connection, schema: &DbSchema, rel_path: &str, data: &
 /// that match a map. `db_dir` is the xite's content root; paths are matched
 /// relative to it (forward slashes), like EpixNet.
 pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<usize> {
+    populate_site(conn, schema, db_dir, "")
+}
+
+/// Like [`populate`], but tags every row with `site` — for a version-3 merger
+/// db aggregating data from several merged sites (call once per merged site).
+pub fn populate_site(conn: &Connection, schema: &DbSchema, db_dir: &Path, site: &str) -> Result<usize> {
     let mut count = 0;
     let mut stack = vec![db_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -202,7 +234,7 @@ pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<u
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let Ok(data) = serde_json::from_slice::<Value>(&bytes) else { continue };
-            if update_json(conn, schema, &rel_str, &data)? {
+            if update_json(conn, schema, &rel_str, &data, site)? {
                 count += 1;
             }
         }

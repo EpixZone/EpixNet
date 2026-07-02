@@ -225,6 +225,41 @@ fn render_sidebar(address: &str, info: &Value, counts: PeerCounts, recv: u64, se
          <a href='#Delete' class='button' id='button-delete'>Delete</a></li>",
     );
 
+    // "This is my site" — claim ownership (the JS calls siteSetOwned).
+    let owned = info["settings"]["own"].as_bool().unwrap_or(false);
+    let checked = if owned { "checked='checked'" } else { "" };
+    b.push_str(&format!(
+        "<h2 class='owned-title'>This is my site</h2>\
+         <input type='checkbox' class='checkbox' id='checkbox-owned' {checked}/>\
+         <div class='checkbox-skin'></div>",
+    ));
+
+    // Owner settings + content publishing (only for owned sites).
+    if owned {
+        let description = content.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let xid_name = content.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+        b.push_str("<div class='settings-owned'><ul class='fields'>");
+        b.push_str(&format!(
+            "<li><label for='settings-title'>Site title</label>\
+             <input type='text' class='text' value=\"{}\" id='settings-title'/></li>\
+             <li><label for='settings-description'>Site description</label>\
+             <input type='text' class='text' value=\"{}\" id='settings-description'/></li>\
+             <li><label for='settings-xid-name'>xID name <small class='label-right'>e.g. mysite.epix</small></label>\
+             <input type='text' class='text' value=\"{}\" id='settings-xid-name' placeholder='name.epix'/></li>\
+             <li><a href='#Save' class='button' id='button-settings'>Save site settings</a></li>",
+            esc(title), esc(description), esc(xid_name),
+        ));
+        // Content publishing — sign + publish a content.json.
+        b.push_str(
+            "<li><label>Content publishing</label>\
+             <div class='flex'>\
+              <input type='text' class='text' value='content.json' id='input-contents'/>\
+              <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>Sign and publish</a>\
+             </div></li>",
+        );
+        b.push_str("</ul></div>");
+    }
+
     b.push_str("</ul></div>");
     b
 }
@@ -239,8 +274,8 @@ mod tests {
             "auth_address": "epix1abcauthaddress",
             "cert_user_id": Value::Null,
             "size_limit": 10,
-            "settings": { "size": 2_097_152 }, // 2 MB
-            "content": { "title": "My Xite", "files": 7 },
+            "settings": { "size": 2_097_152, "own": true }, // 2 MB, owned
+            "content": { "title": "My Xite", "description": "desc", "files": 7 },
         });
         let counts = PeerCounts { total: 5, connected: 2, connectable: 4, onion: 1, local: 1 };
         let html = render_sidebar("1abc.epix", &info, counts, 1_048_576, 524_288);
@@ -253,5 +288,18 @@ mod tests {
         assert!(html.contains("value='10'"), "size limit");
         assert!(html.contains("epix1abcauthaddress"), "identity");
         assert!(html.contains("button-update"));
+        // Owner sections (owned site).
+        assert!(html.contains("This is my site"));
+        assert!(html.contains("checkbox-owned"));
+        assert!(html.contains("checked='checked'"));
+        assert!(html.contains("id='settings-title'"));
+        assert!(html.contains("button-sign-publish"), "sign + publish button");
+
+        // Not owned: checkbox present but unchecked, no publish section.
+        let mut info2 = info.clone();
+        info2["settings"]["own"] = json!(false);
+        let html2 = render_sidebar("1abc.epix", &info2, counts, 0, 0);
+        assert!(html2.contains("checkbox-owned") && !html2.contains("checked='checked'"));
+        assert!(!html2.contains("button-sign-publish"));
     }
 }
