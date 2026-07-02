@@ -95,6 +95,10 @@ pub struct AppState {
     /// connection subscribes and forwards matching messages to its socket, so
     /// the dashboard updates live instead of waiting for its next poll.
     events: tokio::sync::broadcast::Sender<UiEvent>,
+    /// Node config set via `configSet` (e.g. `language`). Persisted so it
+    /// survives restarts.
+    config: RwLock<serde_json::Map<String, Value>>,
+    config_path: Option<PathBuf>,
 }
 
 /// A server-pushed UI event.
@@ -141,6 +145,8 @@ impl AppState {
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
             events: tokio::sync::broadcast::channel(256).0,
+            config: RwLock::new(serde_json::Map::new()),
+            config_path: None,
         })
     }
 
@@ -170,6 +176,11 @@ impl AppState {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "10%".to_string());
+        let config_path = dir.join("config.json");
+        let config = std::fs::read(&config_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -189,7 +200,31 @@ impl AppState {
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
             events: tokio::sync::broadcast::channel(256).0,
+            config: RwLock::new(config),
+            config_path: Some(config_path),
         })
+    }
+
+    /// A node config value set via `configSet` (e.g. `language`).
+    pub async fn config_get(&self, key: &str) -> Option<Value> {
+        self.config.read().await.get(key).cloned()
+    }
+
+    /// Set a node config value (`configSet`), persisted to `data_dir/config.json`.
+    pub async fn config_set(&self, key: &str, value: Value) {
+        {
+            let mut cfg = self.config.write().await;
+            if value.is_null() {
+                cfg.remove(key);
+            } else {
+                cfg.insert(key.to_string(), value);
+            }
+        }
+        if let Some(path) = &self.config_path {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&*self.config.read().await) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
     }
 
     pub async fn global_settings(&self) -> Value {
