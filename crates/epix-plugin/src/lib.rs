@@ -154,7 +154,7 @@ mod tests {
             xite: None,
         };
         let out = commands
-            .dispatch(&session, "helloPlugin", &json!({ "name": "epix" }))
+            .dispatch(&session, "helloPlugin", &json!({ "name": "epix" }), 1)
             .await
             .unwrap();
         assert_eq!(out["greeting"], "hello, epix");

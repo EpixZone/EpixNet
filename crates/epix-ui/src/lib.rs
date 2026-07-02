@@ -134,6 +134,10 @@ async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> R
         .unwrap_or(&address)
         .to_string();
     let nonce = ctx.state.wrapper_nonce();
+    // The xite's real permissions (empty until the user grants one). This is
+    // only the wrapper's initial value; the authoritative list arrives over the
+    // WebSocket via siteInfo.
+    let permissions = ctx.state.site_permissions(&address).await;
 
     // wrapper_key == address for this single-user local node.
     let vars: Vec<(&str, String)> = vec![
@@ -153,7 +157,7 @@ async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> R
         ("wrapper_key", address.clone()),
         ("ajax_key", address.clone()),
         ("postmessage_nonce_security", "false".into()),
-        ("permissions", json!(["ADMIN"]).to_string()),
+        ("permissions", json!(permissions).to_string()),
         ("show_loadingscreen", "false".into()),
         ("sandbox_permissions", String::new()),
         ("server_url", String::new()),
@@ -278,7 +282,7 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
     let id = req.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-    match ctx.registry.dispatch(session, cmd, &params).await {
+    match ctx.registry.dispatch(session, cmd, &params, id).await {
         Ok(result) => json!({"cmd": "response", "to": id, "result": result}).to_string(),
         Err(error) => json!({"cmd": "response", "to": id, "error": error}).to_string(),
     }

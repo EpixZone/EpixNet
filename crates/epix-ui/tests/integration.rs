@@ -83,10 +83,20 @@ async fn handles_epixframe_websocket_commands() {
     let site = call(&mut ws, "siteInfo", 3).await;
     assert_eq!(site["result"]["address"], "epix1xite");
     assert_eq!(site["result"]["content"]["title"], "Test Xite");
-    assert_eq!(site["result"]["settings"]["permissions"][0], "ADMIN");
+    // A xite holds no permissions until the user grants one.
+    assert!(site["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+
+    // An admin command from the inner page (small id) is refused...
+    let denied = call(&mut ws, "siteList", 4).await;
+    assert_eq!(denied["to"], 4);
+    assert!(denied["error"].as_str().unwrap().contains("permission"));
+
+    // ...but the trusted wrapper chrome (id >= 1_000_000) may run it.
+    let allowed = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(allowed["result"].is_array());
 
     // Unimplemented commands return null (logged), not a hard error.
-    let unknown = call(&mut ws, "bogusCommand", 4).await;
-    assert_eq!(unknown["to"], 4);
+    let unknown = call(&mut ws, "bogusCommand", 5).await;
+    assert_eq!(unknown["to"], 5);
     assert!(unknown["result"].is_null());
 }
