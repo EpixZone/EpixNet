@@ -487,6 +487,7 @@ impl WsCommand for ServerInfo {
             m.entry("use_system_theme").or_insert(json!(false));
         }
         let connections = s.state.connection_stats().await.total;
+        let plugins = s.state.plugins().await;
         let language = s
             .state
             .config_get("language")
@@ -516,7 +517,7 @@ impl WsCommand for ServerInfo {
             "connections": connections,
             "timecorrection": 0.0,
             "lib_verify_best": "sslcrypto",
-            "plugins": [],
+            "plugins": plugins,
             "plugins_rev": {},
             "user_settings": user_settings,
             "language": language,
