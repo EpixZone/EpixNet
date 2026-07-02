@@ -440,8 +440,11 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
     let fixbutton = if homepage.is_empty() {
         String::new()
     } else {
-        format!("<a class='fixbutton' href='/{homepage}/' title='Back to the dashboard'></a>")
+        format!("<a class='fixbutton' draggable='false' href='/{homepage}/' title='Back to the dashboard'></a>")
     };
+    // Rubber-band drag: on these standalone pages the fixbutton is not a sidebar
+    // handle, so a drag attempt gives way a little then springs back.
+    let script = if homepage.is_empty() { "" } else { FIXBUTTON_DRAG_JS };
     format!(
         "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
          <meta name='viewport' content='width=device-width, initial-scale=1'>\
@@ -467,12 +470,35 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
           .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer}}\
           a{{color:#9760F9;text-decoration:none}}\
           .fixbutton{{position:fixed;right:23px;top:9px;width:48px;height:48px;z-index:999;border-radius:50%;background:#000 url('/uimedia/img/logo.png') center/48px no-repeat;display:block;transition:box-shadow .3s,transform .15s}}\
+          .fixbutton{{-webkit-user-select:none;user-select:none;-webkit-user-drag:none}}\
           .fixbutton:hover{{box-shadow:0 5px 30px rgba(0,0,0,.3)}}\
-          .fixbutton:active{{transform:translateY(1px)}}\
          </style></head><body>\
-         {fixbutton}<h1>{heading}</h1><div class='content'>{sub}{body}</div></body></html>"
+         {fixbutton}<h1>{heading}</h1><div class='content'>{sub}{body}</div>{script}</body></html>"
     )
 }
+
+/// A drag on the standalone-page fixbutton follows the pointer a little (damped
+/// and capped) then springs back with a slight overshoot, so it's clear the
+/// button is click-to-dashboard, not a draggable sidebar handle. A real drag
+/// suppresses the click so it doesn't navigate.
+const FIXBUTTON_DRAG_JS: &str = "<script>(function(){\
+var b=document.querySelector('.fixbutton');if(!b)return;\
+var sx=0,sy=0,drag=false,moved=0;\
+function pt(e){return e.touches&&e.touches[0]?e.touches[0]:e;}\
+function down(e){var p=pt(e);sx=p.clientX;sy=p.clientY;drag=true;moved=0;b.style.transition='none';}\
+function move(e){if(!drag)return;var p=pt(e),dx=p.clientX-sx,dy=p.clientY-sy;\
+moved=Math.max(moved,Math.abs(dx)+Math.abs(dy));var c=16;\
+var rx=Math.max(-c,Math.min(c,dx*0.4)),ry=Math.max(-c,Math.min(c,dy*0.4));\
+b.style.transform='translate('+rx+'px,'+ry+'px)';}\
+function up(){if(!drag)return;drag=false;\
+b.style.transition='transform .55s cubic-bezier(.18,.89,.32,1.28)';\
+b.style.transform='translate(0,0)';if(moved>5){b._dragged=true;}}\
+b.addEventListener('mousedown',down);\
+window.addEventListener('mousemove',move);window.addEventListener('mouseup',up);\
+b.addEventListener('touchstart',down,{passive:true});\
+window.addEventListener('touchmove',move,{passive:true});window.addEventListener('touchend',up);\
+b.addEventListener('click',function(e){if(b._dragged){e.preventDefault();b._dragged=false;}});\
+})();</script>";
 
 /// Replace known `{name}` tokens; JS braces (not a known name) are left intact.
 fn render(template: &str, vars: &[(&str, String)]) -> String {
