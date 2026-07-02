@@ -11,8 +11,12 @@ use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn call(ws: &mut Ws, cmd: &str, id: i64) -> Value {
+    call_params(ws, cmd, json!({}), id).await
+}
+
+async fn call_params(ws: &mut Ws, cmd: &str, params: Value, id: i64) -> Value {
     ws.send(Message::Text(
-        json!({ "cmd": cmd, "id": id, "params": {} }).to_string(),
+        json!({ "cmd": cmd, "id": id, "params": params }).to_string(),
     ))
     .await
     .unwrap();
@@ -38,6 +42,8 @@ async fn start_server() -> (std::net::SocketAddr, tempfile::TempDir) {
             },
         )
         .await;
+    // Seed the chart db so the Stats page has data to query.
+    state.collect_chart().await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -94,6 +100,12 @@ async fn handles_epixframe_websocket_commands() {
     // ...but the trusted wrapper chrome (id >= 1_000_000) may run it.
     let allowed = call(&mut ws, "siteList", 1_000_001).await;
     assert!(allowed["result"].is_array());
+
+    // The Stats page reads the chart db via chartDbQuery (also admin-gated).
+    let types = call_params(&mut ws, "chartDbQuery", json!("SELECT * FROM type"), 1_000_002).await;
+    let names: Vec<&str> =
+        types["result"].as_array().unwrap().iter().filter_map(|r| r["name"].as_str()).collect();
+    assert!(names.contains(&"size") && names.contains(&"peer"));
 
     // Unimplemented commands return null (logged), not a hard error.
     let unknown = call(&mut ws, "bogusCommand", 5).await;

@@ -73,6 +73,9 @@ pub struct AppState {
     /// restarts.
     grants: RwLock<HashMap<String, Vec<String>>>,
     grants_path: Option<PathBuf>,
+    /// Network-stats chart database (feeds the dashboard's Stats page). A
+    /// background collector snapshots node metrics into it.
+    chart: Arc<crate::chart::ChartDb>,
 }
 
 fn empty_filters() -> Value {
@@ -99,6 +102,7 @@ impl AppState {
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
+            chart: Arc::new(crate::chart::ChartDb::memory().expect("in-memory chart db")),
         })
     }
 
@@ -119,6 +123,9 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let chart = crate::chart::ChartDb::file(dir.join("chart.db"))
+            .or_else(crate::chart::ChartDb::memory)
+            .expect("chart db");
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -132,6 +139,7 @@ impl AppState {
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
+            chart: Arc::new(chart),
         })
     }
 
@@ -759,6 +767,87 @@ impl AppState {
         }
     }
 
+    // --- Network-stats chart -------------------------------------------------
+
+    /// Run a `chartDbQuery` (SELECT-only) against the chart database.
+    pub async fn chart_query(&self, sql: &str) -> Result<Vec<Value>, String> {
+        self.chart.query(sql)
+    }
+
+    /// Snapshot current node metrics into the chart db: one global datapoint
+    /// set plus a per-xite set. Called at startup and periodically by the
+    /// runtime so the dashboard's Stats page has data to draw.
+    pub async fn collect_chart(&self) {
+        use crate::chart::Metric;
+        let now = now_secs();
+        let xites = self.xites.read().await;
+
+        let mut size = 0i64;
+        let mut size_optional = 0i64;
+        let mut optional_used = 0i64;
+        let mut bytes_recv = 0f64;
+        let mut bytes_sent = 0f64;
+        let mut connected = 0f64;
+        let mut connected_onion = 0f64;
+        let mut unique_peers = std::collections::HashSet::new();
+        let mut onion_peers = std::collections::HashSet::new();
+        let mut content = std::collections::HashSet::new();
+        for (addr, x) in xites.iter() {
+            size += x.settings.size;
+            size_optional += x.settings.size_optional;
+            optional_used += x.settings.optional_downloaded;
+            bytes_recv += x.bytes_recv as f64;
+            bytes_sent += x.bytes_sent as f64;
+            let counts = x.peers.counts();
+            connected += counts.connected as f64;
+            connected_onion += counts.onion as f64;
+            for p in x.peers.peers() {
+                let key = p.addr.to_string();
+                if p.is_onion() {
+                    onion_peers.insert(key.clone());
+                }
+                unique_peers.insert(key);
+            }
+            // Count distinct sites by signed content address (alias + raw key
+            // point at the same content), matching site_list.
+            match x.content.as_ref().and_then(|c| c.get("address")).and_then(Value::as_str) {
+                Some(a) => { content.insert(a.to_string()); }
+                None => { content.insert(addr.clone()); }
+            }
+        }
+
+        let global = [
+            Metric::now("peer", unique_peers.len() as f64),
+            Metric::now("peer_onion", onion_peers.len() as f64),
+            Metric::now("connection", connected),
+            Metric::now("connection_onion", connected_onion),
+            Metric::now("connection_in", 0.0),
+            Metric::now("connection_ping_avg", 0.0),
+            Metric::now("connection_ping_min", 0.0),
+            Metric::now("size", size as f64),
+            Metric::now("size_optional", size_optional as f64),
+            Metric::now("optional_used", optional_used as f64),
+            Metric::now("optional_limit", 0.0),
+            Metric::now("content", content.len() as f64),
+            Metric::change("file_bytes_recv", bytes_recv),
+            Metric::change("file_bytes_sent", bytes_sent),
+        ];
+        self.chart.record(now, None, &global);
+
+        for (addr, x) in xites.iter() {
+            let Some(site_id) = self.chart.site_id(addr) else { continue };
+            let site = [
+                Metric::now("site_size", x.settings.size as f64),
+                Metric::now("site_size_optional", x.settings.size_optional as f64),
+                Metric::now("site_optional_downloaded", x.settings.optional_downloaded as f64),
+                Metric::now("site_peer", x.peers.len() as f64),
+                Metric::change("site_bytes_recv", x.bytes_recv as f64),
+                Metric::change("site_bytes_sent", x.bytes_sent as f64),
+            ];
+            self.chart.record(now, Some(site_id), &site);
+        }
+    }
+
     /// The merger types a site declares (`Merger:<type>` permissions).
     pub async fn merger_types(&self, address: &str) -> Vec<String> {
         self.xites
@@ -1250,6 +1339,47 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn chart_collect_then_query_returns_datapoints() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                "1SizeXite",
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": "1SizeXite", "files": { "a": { "size": 500 } } })),
+                },
+            )
+            .await;
+
+        state.collect_chart().await;
+
+        // The type table is populated with the metric names the Stats page reads.
+        let types = state.chart_query("SELECT * FROM type").await.unwrap();
+        let names: Vec<&str> = types.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"size"));
+        assert!(names.contains(&"connection"));
+        assert!(names.contains(&"peer"));
+
+        // The site table has our xite.
+        let sites = state.chart_query("SELECT * FROM site").await.unwrap();
+        assert!(sites.iter().any(|s| s["address"] == "1SizeXite"));
+
+        // The global `size` datapoint reflects the xite's content size (500).
+        let rows = state
+            .chart_query(
+                "SELECT value FROM data WHERE type_id = (SELECT type_id FROM type WHERE name='size') AND site_id IS NULL",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["value"], 500);
+
+        // Non-SELECT statements are rejected.
+        assert!(state.chart_query("DELETE FROM data").await.is_err());
+    }
 
     fn sample_content() -> Value {
         json!({

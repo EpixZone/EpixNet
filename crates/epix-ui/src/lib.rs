@@ -6,6 +6,7 @@
 //! `/EpixNet-Internal/Websocket?wrapper_key=…`. Commands are dispatched through
 //! the [`CommandRegistry`], which the plugin system extends.
 
+pub mod chart;
 pub mod command;
 pub mod state;
 

@@ -84,6 +84,17 @@ impl Database {
         populate::query(&conn, sql, params)
     }
 
+    /// Run a write statement, returning `last_insert_rowid`.
+    pub fn execute(&self, sql: &str, params: &[Value]) -> Result<i64> {
+        let conn = self.conn()?;
+        populate::execute(&conn, sql, params)
+    }
+
+    /// Run several statements with no params (DDL/schema setup).
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.conn()?.execute_batch(sql).map_err(|e| Error::Db(e.to_string()))
+    }
+
     /// Run a read query whose params are a JSON value (object = named binds,
     /// array = positional). The shape the `dbQuery` WS command passes.
     pub fn query_value(&self, sql: &str, params: &Value) -> Result<Vec<Value>> {

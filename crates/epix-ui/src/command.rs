@@ -220,8 +220,10 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(simple("serverErrors", json!([]))),
+        Arc::new(simple("chartGetPeerLocations", json!([]))),
         Arc::new(AnnouncerStats),
         Arc::new(SiteList),
+        Arc::new(ChartDbQuery),
         Arc::new(simple("notificationQuery", json!([]))),
         Arc::new(FeedQuery),
         Arc::new(FeedFollow),
@@ -368,6 +370,28 @@ impl WsCommand for SiteInfo {
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?;
         Ok(s.state.site_info(address).await)
+    }
+}
+
+/// `chartDbQuery(query, params)` — run a read-only query against the node's
+/// network-stats chart database (the dashboard's Stats page). ZeroFrame passes
+/// either a bare query string or `[query, params]`.
+struct ChartDbQuery;
+#[async_trait]
+impl WsCommand for ChartDbQuery {
+    fn name(&self) -> &'static str {
+        "chartDbQuery"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let query = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .or_else(|| p.get("query").and_then(|v| v.as_str()))
+            .ok_or("chartDbQuery: query required")?;
+        match s.state.chart_query(query).await {
+            Ok(rows) => Ok(Value::Array(rows)),
+            Err(e) => Ok(json!({ "error": e })),
+        }
     }
 }
 
