@@ -1502,6 +1502,12 @@ impl AppState {
         self.push_event("notification", json!([kind, message, timeout_ms]), None, None);
     }
 
+    /// Enforce chart-db retention (drop old datapoints, reclaim space). Called
+    /// periodically by the runtime so `chart.db` does not grow without bound.
+    pub async fn archive_chart(&self) {
+        self.chart.archive(now_secs());
+    }
+
     /// Snapshot current node metrics into the chart db: one global datapoint
     /// set plus a per-xite set. Called at startup and periodically by the
     /// runtime so the dashboard's Stats page has data to draw.
