@@ -133,9 +133,14 @@ pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
 fn create_meta_tables(conn: &Connection, schema: &DbSchema) -> Result<()> {
     let db = |e: rusqlite::Error| Error::Db(e.to_string());
 
-    // Base identity columns for a data file, by schema version.
+    // Base identity columns for a data file, by schema version. Version 3 adds
+    // a `site` column so a merger site's db can aggregate rows from many sites.
     let (id_cols, unique) = match schema.version {
         1 => ("path VARCHAR(255)", "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(path)"),
+        3 => (
+            "site VARCHAR(255), directory VARCHAR(255), file_name VARCHAR(255)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(site, directory, file_name)",
+        ),
         _ => (
             "directory VARCHAR(255), file_name VARCHAR(255)",
             "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(directory, file_name)",

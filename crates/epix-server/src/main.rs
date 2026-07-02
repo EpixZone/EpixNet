@@ -153,6 +153,8 @@ async fn serve(
         state.add_peers(&display, peers).await;
         state.add_transfer(&display, bytes_recv, 0).await;
     }
+    // Fill any merger site's aggregate db from the merged sites we serve.
+    state.rebuild_merger_dbs().await;
 
     // Assemble the UI command set + media through the plugin system.
     let mut plugins = epix_plugin::PluginRegistry::new();

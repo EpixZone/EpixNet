@@ -34,6 +34,8 @@ struct ManagedXite {
     settings: XiteSettings,
     /// Per-xite database (built from dbschema.json), if the xite has one.
     db: Option<Database>,
+    /// The parsed dbschema (kept for merger-db rebuilds).
+    db_schema: Option<DbSchema>,
     /// Known peers (from discovery/PEX/DHT/announces).
     peers: Peers,
     /// Total bytes transferred for this xite this run.
@@ -128,7 +130,10 @@ impl AppState {
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
         }
-        let db = build_xite_db(&entry.storage);
+        let (db, db_schema) = match build_xite_db(&entry.storage) {
+            Some((db, schema)) => (Some(db), Some(schema)),
+            None => (None, None),
+        };
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -136,6 +141,7 @@ impl AppState {
                 content: entry.content,
                 settings,
                 db,
+                db_schema,
                 peers: Peers::new(),
                 bytes_recv: 0,
                 bytes_sent: 0,
@@ -359,6 +365,55 @@ impl AppState {
         Ok(Value::Object(ret))
     }
 
+    /// Fill every merger site's version-3 database from its merged sites: for
+    /// each merger, populate its db from each served site whose `merged_type`
+    /// the merger accepts, tagging rows with the merged site's address. Call
+    /// after the merged sites are served (or when they change).
+    pub async fn rebuild_merger_dbs(&self) {
+        // Snapshot the merged sites (address, content dir, merged_type)…
+        let merged: Vec<(String, std::path::PathBuf, String)> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter_map(|(addr, x)| {
+                    let mt = x.content.as_ref()?.get("merged_type")?.as_str()?.to_string();
+                    Some((addr.clone(), x.storage.root().to_path_buf(), mt))
+                })
+                .collect()
+        };
+        // …and the merger sites with a version-3 db (handle + schema + accepted types).
+        let mergers: Vec<(Database, DbSchema, Vec<String>)> = {
+            let xites = self.xites.read().await;
+            xites
+                .values()
+                .filter_map(|x| {
+                    let schema = x.db_schema.clone()?;
+                    if schema.version != 3 {
+                        return None;
+                    }
+                    let db = x.db.clone()?;
+                    let types: Vec<String> = x
+                        .settings
+                        .permissions
+                        .iter()
+                        .filter_map(|p| p.strip_prefix("Merger:").map(String::from))
+                        .collect();
+                    if types.is_empty() {
+                        return None;
+                    }
+                    Some((db, schema, types))
+                })
+                .collect()
+        };
+        for (db, schema, types) in mergers {
+            for (merged_addr, merged_dir, merged_type) in &merged {
+                if types.contains(merged_type) {
+                    let _ = db.populate_site(&schema, merged_dir, merged_addr);
+                }
+            }
+        }
+    }
+
     /// The merged site + inner path for a `merged-<type>/<address>/<path>` path,
     /// if it is one (else `None`).
     pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
@@ -376,6 +431,13 @@ impl AppState {
     /// The transport used to publish updates to peers.
     pub async fn set_transport(&self, transport: Arc<dyn Transport>) {
         *self.transport.write().await = Some(transport);
+    }
+
+    /// Mark a xite owned/not (`siteSetOwned`). Signing still requires the key.
+    pub async fn set_owned(&self, address: &str, owned: bool) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.own = owned;
+        }
     }
 
     /// Write a file into a xite's storage (`fileWrite`).
@@ -436,6 +498,11 @@ impl AppState {
             .get(address)
             .and_then(|x| x.storage.read(inner_path).ok())
             .ok_or("nothing to publish")?;
+        // The version we're publishing, for the offline-peer propagation hint.
+        let modified = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|c| c.get("modified").and_then(|v| v.as_i64()))
+            .unwrap_or(0);
         let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
         let peers = self.connectable_peers(address, 20).await;
 
@@ -448,6 +515,9 @@ impl AppState {
             if conn.update(address, inner_path, &body).await.is_ok() {
                 self.set_peer_connected(address, &peer, true).await;
                 published += 1;
+                // Live-hook: tell the peer (acting as a propagation node) about
+                // the new version so peers that are offline now can pull it later.
+                let _ = epix_propagation::announce_update(&mut conn, address, modified).await;
             }
         }
         Ok(published)
@@ -551,14 +621,17 @@ impl AppState {
 /// Build a xite's database from its `dbschema.json` (if present): open an
 /// in-memory db, create the tables, and populate from the xite's JSON data
 /// files. `None` if the xite has no schema or building fails.
-fn build_xite_db(storage: &XiteStorage) -> Option<Database> {
+fn build_xite_db(storage: &XiteStorage) -> Option<(Database, DbSchema)> {
     let bytes = storage.read("dbschema.json").ok()?;
     let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;
     let db = Database::open_in_memory().ok()?;
     db.apply_schema(&schema).ok()?;
-    // Best-effort populate; a malformed data file shouldn't sink the whole db.
-    let _ = db.populate(&schema, storage.root());
-    Some(db)
+    // A version-3 merger db is filled from its merged sites (rebuild_merger_dbs),
+    // not from its own files; everything else populates from its own tree.
+    if schema.version != 3 {
+        let _ = db.populate(&schema, storage.root());
+    }
+    Some((db, schema))
 }
 
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
@@ -718,6 +791,56 @@ mod tests {
         // A non-owner key is refused.
         let other = "22c824485fe256587c3809b5f7c99864d7339e9fba061a016834cecc454e01f8";
         assert!(state.sign_xite(&owner_addr, other).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn v3_merger_db_aggregates_merged_sites() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+
+        // A merger site: version-3 schema + Merger:ZeroMe permission, no own data.
+        let merger = "1Merger";
+        let mstore = XiteStorage::new(dir.path().join("merger"));
+        mstore
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Merger","db_file":"db.db","version":3,
+                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
+        state.add_permission(merger, "Merger:ZeroMe").await;
+
+        // Two merged sites of that type, each with a post.
+        for (addr, title) in [("1SiteA", "from A"), ("1SiteB", "from B")] {
+            let s = XiteStorage::new(dir.path().join(addr));
+            s.write(
+                "data/u/data.json",
+                format!(r#"{{ "posts": [ {{"post_id":1,"title":"{title}"}} ] }}"#).as_bytes(),
+            )
+            .unwrap();
+            state
+                .add_xite(addr, XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
+                .await;
+        }
+
+        state.rebuild_merger_dbs().await;
+
+        // One query over the merger db returns rows from BOTH sites, tagged with
+        // their site via the json table (the point of a version-3 merger db).
+        let rows = state
+            .db_query(
+                merger,
+                "SELECT json.site AS site, post.title AS title FROM post LEFT JOIN json USING (json_id) ORDER BY json.site",
+                &Value::Null,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["site"], "1SiteA");
+        assert_eq!(rows[0]["title"], "from A");
+        assert_eq!(rows[1]["site"], "1SiteB");
     }
 
     #[tokio::test]

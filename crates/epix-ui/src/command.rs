@@ -94,6 +94,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteSign),
         Arc::new(SitePublish),
         Arc::new(FileWrite),
+        Arc::new(SiteSetOwned),
         // CryptMessage
         Arc::new(UserPublickey),
         Arc::new(EciesEncrypt),
@@ -300,6 +301,25 @@ impl WsCommand for FileWrite {
             .ok_or("fileWrite: content_base64 required")?;
         let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
         s.state.write_file(&address, inner_path, &bytes).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteSetOwned(owned)` — claim/relinquish ownership (reveals the owner
+/// sidebar sections; signing still needs the key).
+struct SiteSetOwned;
+#[async_trait]
+impl WsCommand for SiteSetOwned {
+    fn name(&self) -> &'static str {
+        "siteSetOwned"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let owned = p
+            .as_bool()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        s.state.set_owned(&address, owned).await;
         Ok(Value::from("ok"))
     }
 }

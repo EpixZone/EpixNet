@@ -66,6 +66,18 @@ impl Database {
         populate::populate(&conn, schema, db_dir.as_ref())
     }
 
+    /// Populate a version-3 merger db from one merged site's files, tagging the
+    /// rows with `site`. Call once per merged site.
+    pub fn populate_site(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+        site: &str,
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        populate::populate_site(&conn, schema, db_dir.as_ref(), site)
+    }
+
     /// Run a read query, returning rows as JSON objects.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
         let conn = self.conn()?;

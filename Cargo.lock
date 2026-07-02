@@ -701,6 +701,7 @@ dependencies = [
  "epix-crypt",
  "epix-db",
  "epix-peer",
+ "epix-propagation",
  "epix-protocol",
  "epix-transport",
  "epix-user",
