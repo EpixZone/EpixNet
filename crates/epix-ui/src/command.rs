@@ -141,6 +141,19 @@ impl WsSession {
         Ok((bound, inner_path.to_string()))
     }
 
+    /// Resolve an `inner_path` for a file/optional command to its real target
+    /// `(address, inner_path)`, applying both cross-origin routings: a
+    /// `cors-<address>/…` prefix (Cors permission) and a
+    /// `merged-<type>/<address>/…` prefix (MergerSite). So fileGet, fileRules,
+    /// fileNeed, and optionalFileInfo all reach a merged/cors site the same way.
+    pub async fn resolve_target(&self, inner_path: &str) -> Result<(String, String), String> {
+        let (address, inner) = self.cors_target(inner_path).await?;
+        match AppState::split_merged_path(&inner) {
+            Some((addr, inner)) => Ok((addr, inner)),
+            None => Ok((address, inner)),
+        }
+    }
+
     /// Whether this connection has joined `channel`.
     pub fn in_channel(&self, channel: &str) -> bool {
         self.channels.lock().unwrap().contains(channel)
@@ -431,13 +444,8 @@ impl WsCommand for FileGet {
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .ok_or("fileGet: missing inner_path")?;
-        // `cors-<address>/<path>` routes to another site (Cors permission).
-        let (address, inner_path) = s.cors_target(inner_path).await?;
-        // A `merged-<type>/<address>/<path>` file reads from the merged site.
-        let (target, inner) = match AppState::split_merged_path(&inner_path) {
-            Some((addr, inner)) => (addr, inner),
-            None => (address, inner_path),
-        };
+        // Route `cors-…` (Cors permission) and `merged-…` (MergerSite) paths.
+        let (target, inner) = s.resolve_target(inner_path).await?;
         match s.state.read_file(&target, &inner).await {
             Some(bytes) => Ok(Value::from(String::from_utf8_lossy(&bytes).into_owned())),
             None => Ok(Value::Null),
@@ -944,7 +952,7 @@ impl WsCommand for FileRules {
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .unwrap_or("content.json");
-        let (address, inner_path) = s.cors_target(inner_path).await?;
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
         Ok(s.state.file_rules(&address, &inner_path).await)
     }
 }
@@ -1445,9 +1453,9 @@ impl WsCommand for FileNeed {
         "fileNeed"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let inner_path = arg_str(p, "inner_path", 0).ok_or("fileNeed: inner_path required")?;
-        s.state.file_need(&address, inner_path).await?;
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        s.state.file_need(&address, &inner_path).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -1474,9 +1482,9 @@ impl WsCommand for OptionalFileInfo {
         "optionalFileInfo"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileInfo: inner_path required")?;
-        s.state.optional_file_info(&address, inner_path).await
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        s.state.optional_file_info(&address, &inner_path).await
     }
 }
 
@@ -1619,8 +1627,27 @@ impl WsCommand for MergerSiteList {
     }
 }
 
-/// `mergerSiteAdd(addresses)` - accept sites into this merger. (Cloning the
-/// merged sites into the node is a follow-up; this validates the merger role.)
+/// Collect one or more addresses from a param (string or array).
+fn arg_addresses(p: &Value) -> Vec<String> {
+    match p {
+        Value::String(a) => vec![a.clone()],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => p
+            .get("addresses")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .or_else(|| p.get("address").and_then(|v| v.as_str()).map(|s| vec![s.to_string()]))
+            .unwrap_or_default(),
+    }
+}
+
+/// `mergerSiteAdd(addresses)` - accept sites into this merger. Links any of the
+/// requested sites already present on the node into the merger database.
+/// (Cloning a not-yet-present site from the network awaits the on-demand clone
+/// flow.)
 struct MergerSiteAdd;
 #[async_trait]
 impl WsCommand for MergerSiteAdd {
@@ -1632,22 +1659,28 @@ impl WsCommand for MergerSiteAdd {
         if s.state.merger_types(&address).await.is_empty() {
             return Err("Not a merger site".into());
         }
+        // Re-link present mergeable sites into every merger's database.
+        s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
     }
 }
 
-/// `mergerSiteDelete(address)` - remove a merged site from this merger.
+/// `mergerSiteDelete(address)` - remove a merged site from the node.
 struct MergerSiteDelete;
 #[async_trait]
 impl WsCommand for MergerSiteDelete {
     fn name(&self) -> &'static str {
         "mergerSiteDelete"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
         if s.state.merger_types(&address).await.is_empty() {
             return Err("Not a merger site".into());
         }
+        for target in arg_addresses(p) {
+            s.state.remove_xite(&target).await;
+        }
+        s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
     }
 }
