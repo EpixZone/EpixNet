@@ -218,7 +218,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(MergerSiteList),
         Arc::new(MergerSiteAdd),
         Arc::new(MergerSiteDelete),
-        Arc::new(simple("configSet", json!("ok"))),
+        Arc::new(ConfigSet),
         Arc::new(simple("siteListModifiedFiles", json!({ "modified_files": [] }))),
         Arc::new(SiteSign),
         Arc::new(SitePublish),
@@ -351,6 +351,42 @@ impl WsCommand for Ping {
     }
 }
 
+/// `configSet(key, value)` — persist a node config value. Mirrors EpixNet's
+/// actionConfigSet: saves it, and for `language` pushes the "language changed"
+/// notification the dashboard expects.
+struct ConfigSet;
+#[async_trait]
+impl WsCommand for ConfigSet {
+    fn name(&self) -> &'static str {
+        "configSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        // Accept [key, value] or {key, value}.
+        let (key, value) = match p {
+            Value::Array(a) => (
+                a.first().and_then(|v| v.as_str()),
+                a.get(1).cloned().unwrap_or(Value::Null),
+            ),
+            Value::Object(o) => (
+                o.get("key").and_then(|v| v.as_str()),
+                o.get("value").cloned().unwrap_or(Value::Null),
+            ),
+            _ => (None, Value::Null),
+        };
+        let key = key.ok_or("configSet: key required")?;
+        s.state.config_set(key, value).await;
+        if key == "language" {
+            s.state.push_notification(
+                "done",
+                "You have successfully changed the web interface's language!<br>\
+                 Due to the browser's caching, the full change may take a moment.",
+                10000,
+            );
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
 struct ServerInfo;
 #[async_trait]
 impl WsCommand for ServerInfo {
@@ -365,6 +401,12 @@ impl WsCommand for ServerInfo {
             m.entry("use_system_theme").or_insert(json!(false));
         }
         let connections = s.state.connection_stats().await.total;
+        let language = s
+            .state
+            .config_get("language")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "en".to_string());
         Ok(json!({
             "version": s.state.version,
             "rev": 8192,
@@ -391,7 +433,7 @@ impl WsCommand for ServerInfo {
             "plugins": [],
             "plugins_rev": {},
             "user_settings": user_settings,
-            "language": "en",
+            "language": language,
         }))
     }
 }
@@ -1358,6 +1400,30 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn config_set_saves_and_notifies_on_language() {
+        let state = AppState::new("test");
+        let mut events = state.subscribe_events();
+        let session = WsSession::new(state.clone(), Some("1site".into()));
+
+        ConfigSet.handle(&session, &json!(["language", "de"])).await.unwrap();
+        // Saved.
+        assert_eq!(state.config_get("language").await, Some(json!("de")));
+        // serverInfo reflects it.
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["language"], "de");
+        // A notification was pushed.
+        let ev = events.try_recv().unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "notification");
+        assert_eq!(payload["params"][0], "done");
+
+        // A non-language key saves but pushes nothing.
+        ConfigSet.handle(&session, &json!(["fileserver_port", 26552])).await.unwrap();
+        assert_eq!(state.config_get("fileserver_port").await, Some(json!(26552)));
+        assert!(events.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn channel_join_records_subscriptions() {
