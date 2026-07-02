@@ -301,7 +301,11 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AnnouncerStats),
         Arc::new(SiteList),
         Arc::new(ChartDbQuery),
-        Arc::new(simple("notificationQuery", json!([]))),
+        Arc::new(NotificationQuery),
+        Arc::new(NotificationSubscribe),
+        Arc::new(NotificationList),
+        Arc::new(NotificationMute),
+        Arc::new(NotificationMuteStatus),
         Arc::new(FeedQuery),
         Arc::new(FeedFollow),
         Arc::new(FeedListFollow),
@@ -401,6 +405,85 @@ impl WsCommand for ConfigList {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(s.state.config_list().await)
+    }
+}
+
+/// `notificationSubscribe(subscriptions)` - save the current site's notification
+/// queries (`{name: [query, params]}`).
+struct NotificationSubscribe;
+#[async_trait]
+impl WsCommand for NotificationSubscribe {
+    fn name(&self) -> &'static str {
+        "notificationSubscribe"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        let subs = p
+            .get("subscriptions")
+            .cloned()
+            .or_else(|| p.as_array().and_then(|a| a.first()).cloned())
+            .unwrap_or_else(|| p.clone());
+        s.state.notification_subscribe(&site, subs).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `notificationList()` - the current site's notification subscriptions.
+struct NotificationList;
+#[async_trait]
+impl WsCommand for NotificationList {
+    fn name(&self) -> &'static str {
+        "notificationList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        Ok(s.state.notification_list(&site).await)
+    }
+}
+
+/// `notificationMute(muted, site_address=None)` - global or per-site mute.
+struct NotificationMute;
+#[async_trait]
+impl WsCommand for NotificationMute {
+    fn name(&self) -> &'static str {
+        "notificationMute"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let muted = p
+            .get("muted")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let site = p
+            .get("site_address")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str());
+        s.state.notification_mute(muted, site).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `notificationMuteStatus()` - `{global_muted, site_mutes}`.
+struct NotificationMuteStatus;
+#[async_trait]
+impl WsCommand for NotificationMuteStatus {
+    fn name(&self) -> &'static str {
+        "notificationMuteStatus"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.notification_mute_status().await)
+    }
+}
+
+/// `notificationQuery()` - notification counts across subscribed sites.
+struct NotificationQuery;
+#[async_trait]
+impl WsCommand for NotificationQuery {
+    fn name(&self) -> &'static str {
+        "notificationQuery"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.notification_query().await)
     }
 }
 

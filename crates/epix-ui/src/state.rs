@@ -284,6 +284,91 @@ impl AppState {
         self.config.read().await.get(key).cloned()
     }
 
+    // --- Notification plugin -------------------------------------------------
+
+    /// `notificationSubscribe` - save a site's notification queries
+    /// (`{name: [query, params]}`), persisted per site.
+    pub async fn notification_subscribe(&self, site: &str, subscriptions: Value) {
+        let mut all = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
+        if let Value::Object(m) = &mut all {
+            m.insert(site.to_string(), subscriptions);
+        }
+        self.config_set("notifications", all).await;
+    }
+
+    /// `notificationList` - a site's saved notification subscriptions.
+    pub async fn notification_list(&self, site: &str) -> Value {
+        self.config_get("notifications")
+            .await
+            .and_then(|v| v.get(site).cloned())
+            .unwrap_or_else(|| json!({}))
+    }
+
+    /// `notificationMute` - global (site = None) or per-site mute.
+    pub async fn notification_mute(&self, muted: bool, site: Option<&str>) {
+        match site {
+            None => self.config_set("notification_muted", json!(muted)).await,
+            Some(addr) => {
+                let mut mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+                if let Value::Object(m) = &mut mutes {
+                    m.insert(addr.to_string(), json!(muted));
+                }
+                self.config_set("notification_site_muted", mutes).await;
+            }
+        }
+    }
+
+    /// `notificationMuteStatus` - `{global_muted, site_mutes}`.
+    pub async fn notification_mute_status(&self) -> Value {
+        let global = self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false);
+        let site_mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        json!({ "global_muted": global, "site_mutes": site_mutes })
+    }
+
+    /// `notificationQuery` - run every subscribed site's notification queries and
+    /// return the row counts (`{results, num, sites, muted}`).
+    pub async fn notification_query(&self) -> Value {
+        if self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false) {
+            return json!({ "results": [], "num": 0, "sites": 0, "muted": true });
+        }
+        let subs = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
+        let site_muted = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        let mut results = Vec::new();
+        let mut num = 0i64;
+        let mut sites = 0i64;
+        if let Value::Object(by_site) = &subs {
+            for (address, site_subs) in by_site {
+                if site_muted.get(address).and_then(|v| v.as_bool()).unwrap_or(false) {
+                    continue;
+                }
+                let Value::Object(queries) = site_subs else { continue };
+                let mut any = false;
+                for (name, spec) in queries {
+                    let (query, params) = match spec {
+                        Value::Array(a) => (
+                            a.first().and_then(|v| v.as_str()).unwrap_or(""),
+                            a.get(1).cloned().unwrap_or(Value::Null),
+                        ),
+                        Value::String(q) => (q.as_str(), Value::Null),
+                        _ => continue,
+                    };
+                    if let Ok(rows) = self.db_query(address, query, &params).await {
+                        let count = rows.len() as i64;
+                        if count > 0 {
+                            num += count;
+                            any = true;
+                            results.push(json!({ "address": address, "name": name, "count": count }));
+                        }
+                    }
+                }
+                if any {
+                    sites += 1;
+                }
+            }
+        }
+        json!({ "results": results, "num": num, "sites": sites, "muted": false })
+    }
+
     /// `configList` - the editable config keys with current value + default.
     pub async fn config_list(&self) -> Value {
         let mut back = serde_json::Map::new();
@@ -2166,6 +2251,24 @@ mod tests {
         while events.try_recv().is_ok() {}
         state.log("INFO", "after removal").await;
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notification_subscribe_list_and_mute() {
+        let state = AppState::new("test");
+        state.notification_subscribe("1Chat", json!({ "unread": ["SELECT * FROM message WHERE seen=0", null] })).await;
+        assert_eq!(state.notification_list("1Chat").await["unread"][0], "SELECT * FROM message WHERE seen=0");
+        assert_eq!(state.notification_list("1Other").await, json!({}));
+
+        // Global mute reflected in status + query.
+        state.notification_mute(true, None).await;
+        assert_eq!(state.notification_mute_status().await["global_muted"], true);
+        assert_eq!(state.notification_query().await["muted"], true);
+
+        // Per-site mute.
+        state.notification_mute(false, None).await;
+        state.notification_mute(true, Some("1Chat")).await;
+        assert_eq!(state.notification_mute_status().await["site_mutes"]["1Chat"], true);
     }
 
     #[tokio::test]
