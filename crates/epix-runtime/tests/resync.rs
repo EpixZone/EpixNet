@@ -84,7 +84,11 @@ async fn runtime_resyncs_a_published_update() {
     let mut runtime = NodeRuntime::with_config(
         state.clone(),
         vec![],
-        RuntimeConfig { announce_interval: Duration::from_secs(3600), resync_interval: Duration::from_millis(100) },
+        RuntimeConfig {
+            announce_interval: Duration::from_secs(3600),
+            resync_interval: Duration::from_millis(100),
+            chart_interval: Duration::from_secs(3600),
+        },
     );
     runtime.start();
 

@@ -26,6 +26,7 @@ use tokio::time::{interval, MissedTickBehavior};
 pub struct RuntimeConfig {
     pub announce_interval: Duration,
     pub resync_interval: Duration,
+    pub chart_interval: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -33,6 +34,7 @@ impl Default for RuntimeConfig {
         Self {
             announce_interval: Duration::from_secs(20 * 60),
             resync_interval: Duration::from_secs(5 * 60),
+            chart_interval: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -69,6 +71,11 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.resync_interval,
         )));
+        self.handles.push(tokio::spawn(chart_loop(
+            self.state.clone(),
+            self.shutdown.clone(),
+            self.config.chart_interval,
+        )));
     }
 
     /// Signal the loops to stop and wait for them.
@@ -99,6 +106,21 @@ async fn announce_loop(
                     state.announce_to_trackers(&address, &trackers).await;
                 }
             }
+        }
+    }
+}
+
+/// Snapshot node metrics into the chart db so the dashboard's Stats page has
+/// data. Collects once immediately, then every `period`.
+async fn chart_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
+    state.collect_chart().await;
+    let mut tick = interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await; // consume the immediate first tick
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tick.tick() => state.collect_chart().await,
         }
     }
 }

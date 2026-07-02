@@ -264,6 +264,14 @@ pub fn query(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Value
     collect(&mut stmt, rusqlite::params_from_iter(sql_params.iter()))
 }
 
+/// Run a write statement with positional params, returning the row id inserted
+/// by the statement (`last_insert_rowid`).
+pub fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<i64> {
+    let sql_params: Vec<SqlValue> = params.iter().map(to_sql).collect();
+    conn.execute(sql, rusqlite::params_from_iter(sql_params.iter())).map_err(db_err)?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Run a read query whose params are a JSON value: an object binds by name
 /// (`{"post_id": 1}` -> `:post_id`), an array binds positionally, null/absent
 /// means no params. This is the shape the `dbQuery` WS command receives.
