@@ -358,18 +358,39 @@ impl WsCommand for ServerInfo {
         "serverInfo"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        // user_settings drives the theme menu; give it theme + use_system_theme.
+        let mut user_settings = s.state.global_settings().await;
+        if let Value::Object(m) = &mut user_settings {
+            m.entry("theme").or_insert(json!("light"));
+            m.entry("use_system_theme").or_insert(json!(false));
+        }
+        let connections = s.state.connection_stats().await.total;
         Ok(json!({
             "version": s.state.version,
             "rev": 8192,
             "platform": std::env::consts::OS,
+            "dist_type": "standalone",
             "ip_external": false,
+            "port_opened": false,
+            "fileserver_ip": "127.0.0.1",
+            "fileserver_port": 15441,
             "tor_enabled": false,
             "tor_status": "Disabled",
+            "tor_has_meek_bridges": false,
+            "tor_use_bridges": false,
             "ui_ip": "127.0.0.1",
             "ui_port": 43110,
             "debug": false,
             "offline": false,
+            "multiuser": false,
+            "multiuser_admin": false,
+            "master_address": "",
+            "connections": connections,
+            "timecorrection": 0.0,
+            "lib_verify_best": "sslcrypto",
             "plugins": [],
+            "plugins_rev": {},
+            "user_settings": user_settings,
             "language": "en",
         }))
     }
