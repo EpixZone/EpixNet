@@ -1096,26 +1096,52 @@ impl AppState {
 
         let last_byte = (offset + size - 1).min(total - 1);
         let (first, last) = (offset / piece_size, last_byte / piece_size);
-        let transport = self.transport.read().await.clone();
+        let transport = self.transport.read().await.clone().ok_or("no transport")?;
         let peers = self.connectable_peers(address, 20).await;
+        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // One connection per peer, reused across the piecefield query and every
+        // piece fetch (instead of reconnecting per piece). Keyed by peer string.
+        let mut conns: std::collections::HashMap<String, Connection> = std::collections::HashMap::new();
+        // Ensure a live connection to `peer` exists in `conns`; returns false if
+        // it can't be established.
+        async fn ensure_conn(
+            conns: &mut std::collections::HashMap<String, Connection>,
+            transport: &Arc<dyn Transport>,
+            peer: &PeerAddr,
+        ) -> bool {
+            let key = peer.to_string();
+            if conns.contains_key(&key) {
+                return true;
+            }
+            if let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await {
+                if conn.handshake().await.is_ok() {
+                    conns.insert(key, conn);
+                    return true;
+                }
+            }
+            false
+        }
 
         // Piece-aware peer selection (Bigfile piecefields): for a multi-piece
-        // fetch, ask each peer up front which pieces of this file it holds, so we
-        // skip peers that don't have a given piece. `sha512` keys the piecefield.
-        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // fetch, ask each peer up front which pieces of this file it holds so we
+        // skip peers that don't have a given piece.
         let mut peer_pf: std::collections::HashMap<String, epix_xite::Piecefield> =
             std::collections::HashMap::new();
         if last > first {
-            if let Some(t) = &transport {
-                for peer in &peers {
-                    if let Ok(mut conn) = Connection::connect(t.as_ref(), peer).await {
-                        if conn.handshake().await.is_ok() {
-                            if let Ok(map) = conn.get_piecefields(address).await {
-                                if let Some(bytes) = map.get(&sha512) {
-                                    peer_pf.insert(peer.to_string(), epix_xite::Piecefield::unpack(bytes));
-                                }
-                            }
+            for peer in &peers {
+                if !ensure_conn(&mut conns, &transport, peer).await {
+                    continue;
+                }
+                let conn = conns.get_mut(&peer.to_string()).unwrap();
+                match conn.get_piecefields(address).await {
+                    Ok(map) => {
+                        if let Some(bytes) = map.get(&sha512) {
+                            peer_pf.insert(peer.to_string(), epix_xite::Piecefield::unpack(bytes));
                         }
+                    }
+                    Err(_) => {
+                        conns.remove(&peer.to_string()); // broken connection
                     }
                 }
             }
@@ -1128,7 +1154,6 @@ impl AppState {
             if piece_present(&storage, inner_path, poff, plen, expected) {
                 continue;
             }
-            let transport = transport.clone().ok_or("no transport")?;
             let mut got = false;
             for peer in &peers {
                 // Skip peers we know (from their piecefield) don't have this piece.
@@ -1137,12 +1162,16 @@ impl AppState {
                         continue;
                     }
                 }
-                let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else { continue };
-                if conn.handshake().await.is_err() {
+                if !ensure_conn(&mut conns, &transport, peer).await {
                     continue;
                 }
-                let Ok(data) = conn.get_file_range(address, inner_path, poff, plen).await else {
-                    continue;
+                let conn = conns.get_mut(&peer.to_string()).unwrap();
+                let data = match conn.get_file_range(address, inner_path, poff, plen).await {
+                    Ok(data) => data,
+                    Err(_) => {
+                        conns.remove(&peer.to_string()); // drop a broken connection
+                        continue;
+                    }
                 };
                 if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
                     write_at(&storage, inner_path, poff, &data)?;
