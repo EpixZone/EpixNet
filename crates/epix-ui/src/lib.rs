@@ -357,45 +357,70 @@ async fn serve_config_page(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if params.contains_key("save") {
-        for (key, _label, _default) in crate::state::CONFIG_SCHEMA {
-            if let Some(val) = params.get(*key) {
+        for (key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
+            if *kind == "bool" {
+                // An unchecked checkbox isn't submitted, so absence means false.
+                let on = params.get(*key).map(|v| v == "on" || v == "true").unwrap_or(false);
+                ctx.state.config_set(key, Value::from(if on { "true" } else { "false" })).await;
+            } else if let Some(val) = params.get(*key) {
                 ctx.state.config_set(key, Value::from(val.as_str())).await;
             }
         }
         return Redirect::to("/Config").into_response();
     }
     let mut values = Vec::new();
-    for (key, label, default) in crate::state::CONFIG_SCHEMA {
+    for (key, label, default, kind) in crate::state::CONFIG_SCHEMA {
         let val = ctx
             .state
             .config_get(key)
             .await
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| default.to_string());
-        values.push((*key, *label, val, *default));
+        values.push((*key, *label, val, *default, *kind));
     }
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, &homepage))
         .into_response()
 }
 
-/// Render the settings page, styled like EpixNet's Config page.
-fn render_config_page(values: &[(&str, &str, String, &str)], homepage: &str) -> String {
+/// Render the settings page, styled like EpixNet's Config page, with a widget
+/// per config kind (checkbox for bool, dropdown for select, else a text input).
+fn render_config_page(values: &[(&str, &str, String, &str, &str)], homepage: &str) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
     let mut fields = String::new();
-    for (key, label, val, default) in values {
+    for (key, label, val, default, kind) in values {
+        let widget = if *kind == "bool" {
+            let checked = if matches!(val.as_str(), "true" | "on" | "1") { "checked" } else { "" };
+            format!(
+                "<label class='checkbox'><input type='checkbox' name='{key}' {checked}/>\
+                 <div class='checkbox-skin'></div></label>",
+                key = esc(key),
+            )
+        } else if let Some(opts) = kind.strip_prefix("select:") {
+            let options: String = opts
+                .split('|')
+                .map(|o| {
+                    let sel = if o == val { "selected" } else { "" };
+                    format!("<option value='{o}' {sel}>{o}</option>", o = esc(o))
+                })
+                .collect();
+            format!("<select class='input-text' name='{key}'>{options}</select>", key = esc(key))
+        } else {
+            format!(
+                "<input class='input-text' name='{key}' value='{val}' spellcheck='false'>",
+                key = esc(key),
+                val = esc(val),
+            )
+        };
         fields.push_str(&format!(
             "<div class='config-item'>\
                <div class='title'><h3>{label}</h3>\
                  <div class='description'><span class='default'>(default: {default})</span></div></div>\
-               <div class='value value-right'>\
-                 <input class='input-text' name='{key}' value='{val}' spellcheck='false'></div>\
+               <div class='value value-right'>{widget}</div>\
              </div>",
             label = esc(label),
-            key = esc(key),
-            val = esc(val),
             default = esc(default),
         ));
     }

@@ -29,6 +29,18 @@ fn is_default_disabled(name: &str) -> bool {
     DEFAULT_DISABLED_PLUGINS.contains(&name)
 }
 
+/// Severity rank of a log level, for the `log_level` minimum-level filter.
+/// Unknown levels rank as INFO so they aren't silently dropped.
+fn log_rank(level: &str) -> u8 {
+    match level.to_ascii_uppercase().as_str() {
+        "DEBUG" => 0,
+        "INFO" => 1,
+        "WARN" | "WARNING" => 2,
+        "ERROR" => 3,
+        _ => 1,
+    }
+}
+
 /// A plugin's effective enabled state: an explicit override wins, else the
 /// default (on, except for the default-disabled set).
 fn effective_enabled(name: &str, disabled: &[String], enabled: &[String]) -> bool {
@@ -44,12 +56,22 @@ fn effective_enabled(name: &str, disabled: &[String], enabled: &[String]) -> boo
 /// How many warm peer connections the node keeps for live connection stats.
 const CONNECTION_POOL_MAX: usize = 8;
 
-/// Editable node config keys shown on the Config page: `(key, label, default)`.
-pub const CONFIG_SCHEMA: &[(&str, &str, &str)] = &[
-    ("language", "Interface language", "en"),
-    ("chain_rpc_url", "Chain RPC URL", "https://api.epix.zone"),
-    ("chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone"),
-    ("chain_block_explorer_url", "Block explorer URL", "https://scan.epix.zone"),
+/// Editable node config keys shown on the Config page:
+/// `(key, label, default, kind)`. `kind` drives the input widget: `"text"`,
+/// `"bool"`, or `"select:opt1|opt2|…"`. Mirrors EpixNet's editable config set,
+/// minus the Tor and gevent-thread keys that don't apply to this node.
+pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str)] = &[
+    ("language", "Interface language", "en", "text"),
+    ("fileserver_port", "FileServer port for seeding (0 to disable)", "26552", "text"),
+    ("open_browser", "Open the browser on start", "true", "bool"),
+    ("offline", "Offline mode (no peer networking)", "false", "bool"),
+    ("trackers", "Peer trackers (comma-separated)", "145.223.69.23:26959", "text"),
+    ("ip_external", "External IP override (blank = auto-detect via UPnP)", "", "text"),
+    ("log_level", "Log level", "INFO", "select:DEBUG|INFO|WARNING|ERROR"),
+    ("fileserver_ip_type", "FileServer IP type", "ipv4", "select:ipv4|ipv6|dual"),
+    ("chain_rpc_url", "Chain RPC URL", "https://api.epix.zone", "text"),
+    ("chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
+    ("chain_block_explorer_url", "Block explorer URL", "https://scan.epix.zone", "text"),
 ];
 
 /// The input to [`AppState::add_xite`]: a xite's storage and (if loaded) its
@@ -524,7 +546,7 @@ impl AppState {
     /// `configList` - the editable config keys with current value + default.
     pub async fn config_list(&self) -> Value {
         let mut back = serde_json::Map::new();
-        for (key, _label, default) in CONFIG_SCHEMA {
+        for (key, _label, default, _kind) in CONFIG_SCHEMA {
             let value = self.config_get(key).await.unwrap_or_else(|| json!(default));
             back.insert(
                 key.to_string(),
@@ -799,6 +821,15 @@ impl AppState {
     /// The fileserver (seeding) port, 0 if seeding is disabled.
     pub async fn fileserver_port(&self) -> u16 {
         *self.fileserver_port.read().await
+    }
+
+    /// The configured minimum log level (config `log_level`), default `INFO`.
+    pub async fn log_level(&self) -> String {
+        self.config_get("log_level")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "INFO".to_string())
     }
 
     /// The node's homepage xite - where the standalone admin pages' "back"
@@ -1695,6 +1726,10 @@ impl AppState {
     /// `level` is `INFO`/`WARNING`/`ERROR`. Feeds both `serverErrors` (tuples)
     /// and any open sidebar-console stream (`logLineAdd`, formatted strings).
     pub async fn log(&self, level: &str, message: impl Into<String>) {
+        // Honour the configured minimum log level (config `log_level`).
+        if log_rank(level) < log_rank(&self.log_level().await) {
+            return;
+        }
         let message = message.into();
         println!("[{level}] {message}");
         let line = json!([now_secs() as f64, level, message]);
@@ -2976,6 +3011,21 @@ mod tests {
         };
         state.siteblock_add(&hashed, "hashed").await;
         assert_eq!(state.siteblock_reason("1HashBlocked").await.as_deref(), Some("hashed"));
+    }
+
+    #[tokio::test]
+    async fn log_level_filters_below_the_configured_minimum() {
+        let state = AppState::new("test");
+        state.config_set("log_level", json!("ERROR")).await;
+        state.log("INFO", "an info line").await; // below ERROR -> dropped
+        state.log("DEBUG", "a debug line").await; // dropped
+        state.log("ERROR", "a real error").await; // kept
+        assert_eq!(state.console_log_read().await["num_found"], 1);
+
+        // Lowering the threshold lets INFO through again.
+        state.config_set("log_level", json!("INFO")).await;
+        state.log("INFO", "now visible").await;
+        assert_eq!(state.console_log_read().await["num_found"], 2);
     }
 
     #[tokio::test]
