@@ -89,6 +89,7 @@ async fn runtime_resyncs_a_published_update() {
             resync_interval: Duration::from_millis(100),
             chart_interval: Duration::from_secs(3600),
             connection_interval: Duration::from_secs(3600),
+            fileserver_port: None,
         },
     );
     runtime.start();

@@ -241,7 +241,19 @@ async fn serve(
 
     // Bring the node to life: supervised loops re-announce to trackers and
     // re-sync each xite (picking up published updates) in the background.
-    let mut runtime = epix_runtime::NodeRuntime::new(state.clone(), trackers);
+    // If `fileserver_port` is configured, also seed files to peers.
+    let fileserver_port = state
+        .config_get("fileserver_port")
+        .await
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u16);
+    if let Some(port) = fileserver_port {
+        state.log("INFO", format!("File seeding enabled on port {port}")).await;
+    }
+    let runtime_config =
+        epix_runtime::RuntimeConfig { fileserver_port, ..Default::default() };
+    let mut runtime =
+        epix_runtime::NodeRuntime::with_config(state.clone(), trackers, runtime_config);
     runtime.start();
 
     // Assemble the UI command set + media through the plugin system.
