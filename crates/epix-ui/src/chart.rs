@@ -119,6 +119,23 @@ impl ChartDb {
         }
     }
 
+    /// Enforce retention so the chart db does not grow without bound: drop
+    /// per-site datapoints older than one month and global datapoints older than
+    /// six months, then reclaim the space. Mirrors EpixNet's `ChartDb.archive`
+    /// retention (without its downsampling of old rows).
+    pub fn archive(&self, now: i64) {
+        const MONTH: i64 = 60 * 60 * 24 * 30;
+        let _ = self.db.execute(
+            "DELETE FROM data WHERE site_id IS NOT NULL AND date_added < ?",
+            &[Value::from(now - MONTH)],
+        );
+        let _ = self.db.execute(
+            "DELETE FROM data WHERE site_id IS NULL AND date_added < ?",
+            &[Value::from(now - 6 * MONTH)],
+        );
+        let _ = self.db.execute_batch("VACUUM");
+    }
+
     /// Run a read-only chart query (the `chartDbQuery` command). Only SELECT is
     /// allowed, matching the Python action. `params` is bound by name (a
     /// list-valued param expands `IN :key` into a placeholder list), so the
@@ -143,4 +160,32 @@ fn load_ids(db: &Database, sql: &str) -> HashMap<String, i64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn archive_enforces_retention_windows() {
+        let db = ChartDb::memory().unwrap();
+        let now: i64 = 2_000_000_000;
+        let day = 60 * 60 * 24;
+        let site = db.site_id("1Site");
+        // Old global (7 months) + old per-site (2 months) should be dropped;
+        // recent points of each kind should stay.
+        db.record(now - day * 210, None, &[Metric::now("a", 1.0)]);
+        db.record(now - day * 60, site, &[Metric::now("a", 2.0)]);
+        db.record(now - day * 2, None, &[Metric::now("a", 3.0)]);
+        db.record(now - day * 2, site, &[Metric::now("a", 4.0)]);
+        assert_eq!(count(&db), 4);
+
+        db.archive(now);
+        assert_eq!(count(&db), 2);
+    }
+
+    fn count(db: &ChartDb) -> i64 {
+        db.query("SELECT COUNT(*) AS n FROM data", &json!({})).unwrap()[0]["n"].as_i64().unwrap()
+    }
 }

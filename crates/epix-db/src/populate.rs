@@ -211,12 +211,25 @@ pub fn update_json(
 /// that match a map. `db_dir` is the xite's content root; paths are matched
 /// relative to it (forward slashes), like EpixNet.
 pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<usize> {
-    populate_site(conn, schema, db_dir, "")
+    populate_site_filtered(conn, schema, db_dir, "", &[])
 }
 
 /// Like [`populate`], but tags every row with `site` - for a version-3 merger
 /// db aggregating data from several merged sites (call once per merged site).
 pub fn populate_site(conn: &Connection, schema: &DbSchema, db_dir: &Path, site: &str) -> Result<usize> {
+    populate_site_filtered(conn, schema, db_dir, site, &[])
+}
+
+/// Like [`populate_site`], but skips any data file whose path contains one of
+/// `exclude` - the ContentFilter mute enforcement point (muted authors'
+/// `data/<auth_address>/…` files are left out of the database).
+pub fn populate_site_filtered(
+    conn: &Connection,
+    schema: &DbSchema,
+    db_dir: &Path,
+    site: &str,
+    exclude: &[String],
+) -> Result<usize> {
     let mut count = 0;
     let mut stack = vec![db_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -232,6 +245,9 @@ pub fn populate_site(conn: &Connection, schema: &DbSchema, db_dir: &Path, site: 
             }
             let Ok(rel) = path.strip_prefix(db_dir) else { continue };
             let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !exclude.is_empty() && exclude.iter().any(|e| rel_str.contains(e.as_str())) {
+                continue;
+            }
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let Ok(data) = serde_json::from_slice::<Value>(&bytes) else { continue };
             if update_json(conn, schema, &rel_str, &data, site)? {

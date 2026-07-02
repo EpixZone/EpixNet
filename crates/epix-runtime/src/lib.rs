@@ -203,13 +203,24 @@ async fn connection_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Du
 /// data. Collects once immediately, then every `period`.
 async fn chart_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
     state.collect_chart().await;
+    // Enforce retention once at startup, then roughly once a day (the collector
+    // runs far more often, so archive only every Nth tick).
+    state.archive_chart().await;
+    let archive_every = (Duration::from_secs(24 * 60 * 60).as_secs() / period.as_secs().max(1)).max(1);
+    let mut ticks: u64 = 0;
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
-            _ = tick.tick() => state.collect_chart().await,
+            _ = tick.tick() => {
+                state.collect_chart().await;
+                ticks += 1;
+                if ticks % archive_every == 0 {
+                    state.archive_chart().await;
+                }
+            }
         }
     }
 }
@@ -225,6 +236,11 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
             _ = tick.tick() => {
                 for address in state.xite_addresses().await {
                     let _ = state.resync_xite(&address).await;
+                }
+                // OptionalManager: keep optional files under the size cap.
+                let freed = state.enforce_optional_limit().await;
+                if freed > 0 {
+                    state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
                 }
             }
         }
