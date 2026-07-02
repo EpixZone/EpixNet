@@ -1099,6 +1099,28 @@ impl AppState {
         let transport = self.transport.read().await.clone();
         let peers = self.connectable_peers(address, 20).await;
 
+        // Piece-aware peer selection (Bigfile piecefields): for a multi-piece
+        // fetch, ask each peer up front which pieces of this file it holds, so we
+        // skip peers that don't have a given piece. `sha512` keys the piecefield.
+        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let mut peer_pf: std::collections::HashMap<String, epix_xite::Piecefield> =
+            std::collections::HashMap::new();
+        if last > first {
+            if let Some(t) = &transport {
+                for peer in &peers {
+                    if let Ok(mut conn) = Connection::connect(t.as_ref(), peer).await {
+                        if conn.handshake().await.is_ok() {
+                            if let Ok(map) = conn.get_piecefields(address).await {
+                                if let Some(bytes) = map.get(&sha512) {
+                                    peer_pf.insert(peer.to_string(), epix_xite::Piecefield::unpack(bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for i in first..=last {
             let poff = i * piece_size;
             let plen = piece_size.min(total - poff);
@@ -1109,6 +1131,12 @@ impl AppState {
             let transport = transport.clone().ok_or("no transport")?;
             let mut got = false;
             for peer in &peers {
+                // Skip peers we know (from their piecefield) don't have this piece.
+                if let Some(pf) = peer_pf.get(&peer.to_string()) {
+                    if !pf.get(i as usize) {
+                        continue;
+                    }
+                }
                 let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else { continue };
                 if conn.handshake().await.is_err() {
                     continue;
@@ -1131,6 +1159,54 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    /// Which pieces of each big file we hold, keyed by the file's `sha512`
+    /// (`getPiecefields`). A big file is one with a `piecemap` + `piece_size` in
+    /// content.json; a piece counts as held when the on-disk bytes verify against
+    /// the piecemap. Files without their piecemap on disk are skipped.
+    pub async fn our_piecefields(&self, address: &str) -> std::collections::HashMap<String, Vec<u8>> {
+        let mut out = std::collections::HashMap::new();
+        let content = self.content(address).await;
+        let Some(files_opt) = content
+            .as_ref()
+            .and_then(|c| c.get("files_optional"))
+            .and_then(|o| o.as_object())
+        else {
+            return out;
+        };
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return out;
+        };
+        for (inner_path, entry) in files_opt {
+            let (Some(sha512), Some(piecemap_path)) = (
+                entry.get("sha512").and_then(|v| v.as_str()),
+                entry.get("piecemap").and_then(|v| v.as_str()),
+            ) else {
+                continue; // not a big file
+            };
+            let piece_size =
+                entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024) as u64;
+            let total = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
+            if piece_size == 0 || total == 0 || !storage.exists(piecemap_path) {
+                continue;
+            }
+            let Ok(pm_bytes) = storage.read(piecemap_path) else { continue };
+            let file_name = inner_path.rsplit('/').next().unwrap_or(inner_path);
+            let Some(hashes) = epix_xite::parse_piecemap(&pm_bytes, file_name) else { continue };
+            let piece_num = total.div_ceil(piece_size);
+            let mut pf = epix_xite::Piecefield::new();
+            for i in 0..piece_num {
+                let poff = i * piece_size;
+                let plen = piece_size.min(total - poff);
+                let present = hashes
+                    .get(i as usize)
+                    .is_some_and(|h| piece_present(&storage, inner_path, poff, plen, h));
+                pf.set(i as usize, present);
+            }
+            out.insert(sha512.to_string(), pf.pack());
+        }
+        out
     }
 
     /// Read a byte range from a xite file (for streaming big files / HTTP Range).

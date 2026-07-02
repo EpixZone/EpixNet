@@ -167,6 +167,26 @@ impl Connection {
         self.request("update", params).await
     }
 
+    /// Ask which pieces of each big file the peer holds (`getPiecefields`).
+    /// Returns `sha512 -> packed piecefield bytes`; the caller unpacks with
+    /// `epix_xite::Piecefield` (kept out of the protocol layer to avoid a cycle).
+    pub async fn get_piecefields(
+        &mut self,
+        xite: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+        let params = vmap(vec![("site", Value::from(xite))]);
+        let resp = self.request("getPiecefields", params).await?;
+        let mut out = std::collections::HashMap::new();
+        if let Some(Value::Map(entries)) = vget(&resp, "piecefields_packed") {
+            for (k, v) in entries {
+                if let (Some(sha), Value::Binary(bytes)) = (k.as_str(), v) {
+                    out.insert(sha.to_string(), bytes.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Download a whole file, following `location`/`size` across chunks.
     pub async fn get_file(&mut self, xite: &str, inner_path: &str) -> Result<Vec<u8>> {
         let mut out = Vec::new();
