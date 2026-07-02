@@ -84,22 +84,28 @@ impl WsCommand for SidebarGetPeers {
     }
 }
 
-/// `siteSetSizeLimit` - set the per-xite size limit (MB).
+/// `siteSetLimit` - set the per-xite size limit (MB). The sidebar's "Set" button
+/// sends the input value positionally, as a string.
 struct SiteSetSizeLimit;
 
 #[async_trait]
 impl WsCommand for SiteSetSizeLimit {
     fn name(&self) -> &'static str {
-        "siteSetSizeLimit"
+        "siteSetLimit"
     }
 
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        let limit = p
+        let raw = p
             .get("size_limit")
             .or_else(|| p.as_array().and_then(|a| a.first()))
-            .and_then(|v| v.as_i64())
+            .or(Some(p))
             .ok_or("size_limit required")?;
+        // Accept a number or a numeric string (the button posts a string).
+        let limit = raw
+            .as_i64()
+            .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            .ok_or("size_limit must be a number")?;
         s.state.set_size_limit(&address, limit).await;
         Ok(Value::String("ok".into()))
     }

@@ -307,12 +307,19 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteRecoverPrivatekey),
         Arc::new(UserSetSitePrivatekey),
         Arc::new(SiteUpdate),
-        Arc::new(simple("sitePause", json!("ok"))),
-        Arc::new(simple("siteResume", json!("ok"))),
-        Arc::new(simple("siteDelete", json!("ok"))),
-        Arc::new(simple("siteSetAutodownloadoptional", json!("ok"))),
-        Arc::new(simple("dbReload", json!("ok"))),
-        Arc::new(simple("dbRebuild", json!("ok"))),
+        Arc::new(SiteServing { cmd: "sitePause", serving: false }),
+        Arc::new(SiteServing { cmd: "siteResume", serving: true }),
+        Arc::new(SiteDelete),
+        Arc::new(SiteSetAutodownloadoptional),
+        Arc::new(DbRebuild { cmd: "dbReload" }),
+        Arc::new(DbRebuild { cmd: "dbRebuild" }),
+        Arc::new(SiteFavourite { cmd: "siteFavourite", favorite: true }),
+        Arc::new(SiteFavourite { cmd: "siteUnfavourite", favorite: false }),
+        Arc::new(PeerAdd),
+        Arc::new(ServerShowdirectory),
+        Arc::new(XidClearCache),
+        Arc::new(NotificationDismiss),
+        Arc::new(SiteblockIgnoreAddSite),
         // CryptMessage
         Arc::new(UserPublickey),
         Arc::new(EciesEncrypt),
@@ -694,6 +701,17 @@ impl WsCommand for ServerInfo {
         }
         let connections = s.state.connection_stats().await.total;
         let plugins = s.state.plugins().await;
+        // Multiuser: when the feature is built, report the active identity so the
+        // wrapper UI shows the identity switcher. The desktop operator is admin.
+        #[cfg(feature = "multiuser")]
+        let (multiuser, multiuser_admin, master_address) = (
+            true,
+            true,
+            s.state.multiuser_list().await.first().cloned().unwrap_or_default(),
+        );
+        #[cfg(not(feature = "multiuser"))]
+        let (multiuser, multiuser_admin, master_address): (bool, bool, String) =
+            (false, false, String::new());
         let language = s
             .state
             .config_get("language")
@@ -717,9 +735,9 @@ impl WsCommand for ServerInfo {
             "ui_port": 43110,
             "debug": false,
             "offline": false,
-            "multiuser": false,
-            "multiuser_admin": false,
-            "master_address": "",
+            "multiuser": multiuser,
+            "multiuser_admin": multiuser_admin,
+            "master_address": master_address,
             "connections": connections,
             "timecorrection": 0.0,
             "lib_verify_best": "sslcrypto",
@@ -1707,6 +1725,211 @@ impl WsCommand for UserLogout {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         s.state.multiuser_logout().await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+// ---- Site management actions (sidebar controls) ----------------------------
+
+/// The target xite for a site action: an explicit `address` param, else the
+/// bound xite.
+fn target_address(s: &WsSession, p: &Value) -> Result<String, String> {
+    match arg_str(p, "address", 0) {
+        Some(a) => Ok(a.to_string()),
+        None => Ok(s.address()?.to_string()),
+    }
+}
+
+/// `sitePause`/`siteResume` - stop or resume re-syncing a xite.
+struct SiteServing {
+    cmd: &'static str,
+    serving: bool,
+}
+#[async_trait]
+impl WsCommand for SiteServing {
+    fn name(&self) -> &'static str {
+        self.cmd
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = target_address(s, p)?;
+        if s.state.set_serving(&address, self.serving).await {
+            Ok(Value::from("ok"))
+        } else {
+            Err(format!("Unknown site: {address}"))
+        }
+    }
+}
+
+/// `siteDelete` - remove a xite from the node and delete its files.
+struct SiteDelete;
+#[async_trait]
+impl WsCommand for SiteDelete {
+    fn name(&self) -> &'static str {
+        "siteDelete"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = target_address(s, p)?;
+        if s.state.remove_xite(&address).await {
+            Ok(Value::from("ok"))
+        } else {
+            Err(format!("Unknown site: {address}"))
+        }
+    }
+}
+
+/// `siteSetAutodownloadoptional` - toggle auto-downloading optional files.
+struct SiteSetAutodownloadoptional;
+#[async_trait]
+impl WsCommand for SiteSetAutodownloadoptional {
+    fn name(&self) -> &'static str {
+        "siteSetAutodownloadoptional"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let on = p
+            .get("owned")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        s.state.set_autodownloadoptional(&address, on).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `dbReload`/`dbRebuild` - rebuild the xite's database from its files.
+struct DbRebuild {
+    cmd: &'static str,
+}
+#[async_trait]
+impl WsCommand for DbRebuild {
+    fn name(&self) -> &'static str {
+        self.cmd
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = target_address(s, p)?;
+        if s.state.rebuild_xite_db(&address).await {
+            Ok(Value::from("ok"))
+        } else {
+            Err(format!("Unknown site: {address}"))
+        }
+    }
+}
+
+/// `siteFavourite`/`siteUnfavourite` - toggle the sidebar favourite star.
+struct SiteFavourite {
+    cmd: &'static str,
+    favorite: bool,
+}
+#[async_trait]
+impl WsCommand for SiteFavourite {
+    fn name(&self) -> &'static str {
+        self.cmd
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = target_address(s, p)?;
+        if s.state.set_favorite(&address, self.favorite).await {
+            Ok(Value::from("ok"))
+        } else {
+            Err(format!("Unknown site: {address}"))
+        }
+    }
+}
+
+/// `peerAdd(ip, port, site_address?)` - add a peer to a xite's known set.
+struct PeerAdd;
+#[async_trait]
+impl WsCommand for PeerAdd {
+    fn name(&self) -> &'static str {
+        "peerAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ip = arg_str(p, "ip", 0).ok_or("ip required")?;
+        let port = p
+            .get("port")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .ok_or("port required")?;
+        let address = match arg_str(p, "site_address", 2) {
+            Some(a) => a.to_string(),
+            None => s.address()?.to_string(),
+        };
+        s.state.add_peer_ipport(&address, ip, port as u16).await?;
+        Ok(Value::from("updated"))
+    }
+}
+
+/// `serverShowdirectory(directory, address?)` - open a xite's folder (or the
+/// data dir) in the OS file manager. Local, desktop-oriented.
+struct ServerShowdirectory;
+#[async_trait]
+impl WsCommand for ServerShowdirectory {
+    fn name(&self) -> &'static str {
+        "serverShowdirectory"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let directory = arg_str(p, "directory", 0).unwrap_or("backup");
+        let path = if directory == "backup" {
+            s.state.data_dir().ok_or("no data directory")?
+        } else {
+            let address = match arg_str(p, "address", 1) {
+                Some(a) => a.to_string(),
+                None => s.address()?.to_string(),
+            };
+            s.state.xite_root(&address).await.ok_or_else(|| format!("Unknown site: {address}"))?
+        };
+        open_path(&path);
+        Ok(Value::from("ok"))
+    }
+}
+
+/// Open a filesystem path in the OS file manager (best effort).
+fn open_path(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let program = "xdg-open";
+    let _ = std::process::Command::new(program).arg(path).spawn();
+}
+
+/// `xidClearCache` - clear the xID resolver cache. The node's resolver cache is
+/// per-process at the chain layer; clearing it here is a successful no-op.
+struct XidClearCache;
+#[async_trait]
+impl WsCommand for XidClearCache {
+    fn name(&self) -> &'static str {
+        "xidClearCache"
+    }
+    async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `notificationDismiss(center)` - remember a dismissed notification banner.
+struct NotificationDismiss;
+#[async_trait]
+impl WsCommand for NotificationDismiss {
+    fn name(&self) -> &'static str {
+        "notificationDismiss"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let center = arg_str(p, "center", 0).ok_or("center required")?;
+        s.state.notification_dismiss(center).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteblockIgnoreAddSite(site_address)` - unblock a site so it can be added.
+struct SiteblockIgnoreAddSite;
+#[async_trait]
+impl WsCommand for SiteblockIgnoreAddSite {
+    fn name(&self) -> &'static str {
+        "siteblockIgnoreAddSite"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = arg_str(p, "site_address", 0).ok_or("site_address required")?;
+        s.state.siteblock_remove(address).await;
         Ok(Value::from("ok"))
     }
 }
