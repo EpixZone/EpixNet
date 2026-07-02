@@ -1,0 +1,8 @@
+IP geolocation data for the dashboard's world map is provided by DB-IP
+(DB-IP City Lite database), licensed under the Creative Commons
+Attribution 4.0 International License (CC-BY-4.0).
+
+  IP Geolocation by DB-IP: https://db-ip.com
+
+The database (dbip-city-lite.mmdb.gz) is redistributed here under that
+license. It is in MaxMind DB format and read with the maxminddb crate.

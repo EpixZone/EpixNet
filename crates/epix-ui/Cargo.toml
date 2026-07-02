@@ -24,6 +24,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 include_dir = "0.7"
+libc = "0.2"
+maxminddb = { version = "0.24", features = ["mmap"] }
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
 [dev-dependencies]
 rmpv = "1"

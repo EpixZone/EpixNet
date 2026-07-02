@@ -11,6 +11,10 @@ use std::sync::Arc;
 const TRACKER: &str = "145.223.69.23:26959";
 const BIND: &str = "127.0.0.1:43110";
 
+/// Bundled peer-geolocation database for the dashboard's world map: DB-IP City
+/// Lite (CC-BY-4.0), shipped gzipped and expanded into the data dir at runtime.
+const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
+
 #[tokio::main]
 async fn main() {
     // Accept a raw `epix1…` xite address, or a `.epix` name to resolve on-chain.
@@ -113,6 +117,26 @@ async fn serve(
     bytes_recv: u64,
 ) {
     let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
+    // Load the bundled IP geolocation db (DB-IP City Lite, CC-BY-4.0) off the
+    // startup path: first run expands the ~62MB gzip to disk, so do it in the
+    // background. The node serves and connects to peers immediately; the world
+    // map returns empty until the db is ready, then fills in.
+    {
+        let state = state.clone();
+        let mmdb = data_dir.join("geoip-city.mmdb");
+        tokio::spawn(async move {
+            let geoip = tokio::task::spawn_blocking(move || {
+                epix_ui::geoip::GeoIp::ensure(GEOIP_CITY_GZ, &mmdb)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(geoip) = geoip {
+                state.set_geoip(geoip).await;
+                println!("· geolocation database ready — world map enabled");
+            }
+        });
+    }
     // Serve under the raw address and (if resolved from a name) the .epix name,
     // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
     state
