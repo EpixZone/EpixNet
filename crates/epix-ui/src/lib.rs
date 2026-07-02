@@ -173,11 +173,54 @@ fn render(template: &str, vars: &[(&str, String)]) -> String {
 }
 
 /// Serve a xite's own file (the inner iframe content + its assets).
-async fn serve_file(State(ctx): State<Ctx>, Path((address, path)): Path<(String, String)>) -> Response {
+async fn serve_file(
+    State(ctx): State<Ctx>,
+    Path((address, path)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let ct = content_type(&path).to_string();
+    // Range request → 206 Partial Content, streamed from disk (big files seek
+    // in the browser without loading the whole file).
+    if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        if let (Some(total), Some((start, end))) =
+            (ctx.state.file_size(&address, &path).await, parse_range(range))
+        {
+            if start < total {
+                let end = end.unwrap_or(total - 1).min(total - 1);
+                let len = (end - start + 1) as usize;
+                if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
+                    return (
+                        StatusCode::PARTIAL_CONTENT,
+                        [
+                            (header::CONTENT_TYPE, ct),
+                            (header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}")),
+                            (header::ACCEPT_RANGES, "bytes".to_string()),
+                        ],
+                        bytes,
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
     match ctx.state.read_file(&address, &path).await {
-        Some(bytes) => ([(header::CONTENT_TYPE, content_type(&path))], bytes).into_response(),
+        Some(bytes) => (
+            [(header::CONTENT_TYPE, ct), (header::ACCEPT_RANGES, "bytes".to_string())],
+            bytes,
+        )
+            .into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+/// Parse an HTTP `Range: bytes=start-end` (single range). `end` is optional.
+fn parse_range(header: &str) -> Option<(u64, Option<u64>)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    let (start, end) = spec.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end = end.trim();
+    let end = if end.is_empty() { None } else { Some(end.parse().ok()?) };
+    Some((start, end))
 }
 
 fn content_type(path: &str) -> &'static str {
