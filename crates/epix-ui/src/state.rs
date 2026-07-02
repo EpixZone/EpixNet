@@ -671,6 +671,14 @@ impl AppState {
         self.xites.read().await.keys().cloned().collect()
     }
 
+    /// The node's homepage xite - where the standalone admin pages' "back"
+    /// button returns to. Prefers a human-readable alias (e.g. `dashboard.epix`)
+    /// over the canonical address, else the first served xite.
+    pub async fn homepage(&self) -> Option<String> {
+        let xites = self.xites.read().await;
+        xites.keys().find(|k| k.contains('.')).or_else(|| xites.keys().next()).cloned()
+    }
+
     /// Replace a xite's content.json, refreshing its stats and rebuilding its db.
     pub async fn update_content(&self, address: &str, content: Option<Value>) {
         let muted = self.muted_authors().await;

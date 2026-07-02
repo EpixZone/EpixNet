@@ -253,7 +253,8 @@ async fn serve_plugins_page(State(ctx): State<Ctx>, Query(q): Query<PluginsQuery
         return Redirect::to("/Plugins").into_response();
     }
     let states = ctx.state.plugin_states().await;
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_plugins_page(&states))
+    let homepage = ctx.state.homepage().await.unwrap_or_default();
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_plugins_page(&states, &homepage))
         .into_response()
 }
 
@@ -271,7 +272,7 @@ fn plugin_description(name: &str) -> &'static str {
 /// Render the plugin manager page, styled like EpixNet's (light theme, gradient
 /// header, sliding toggle switches). The toggle is a link (`/Plugins?toggle=…`)
 /// so it works without JS/WebSocket.
-fn render_plugins_page(states: &[(String, bool)]) -> String {
+fn render_plugins_page(states: &[(String, bool)], homepage: &str) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
     for (name, enabled) in states {
@@ -291,7 +292,7 @@ fn render_plugins_page(states: &[(String, bool)]) -> String {
     if rows.is_empty() {
         rows.push_str("<div class='description'>No plugins loaded.</div>");
     }
-    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"))
+    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"), homepage)
 }
 
 /// `GET /Config` - the node settings page. `?save=1&<key>=<value>` persists the
@@ -318,11 +319,13 @@ async fn serve_config_page(
             .unwrap_or_else(|| default.to_string());
         values.push((*key, *label, val));
     }
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values)).into_response()
+    let homepage = ctx.state.homepage().await.unwrap_or_default();
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, &homepage))
+        .into_response()
 }
 
 /// Render the settings page, styled like EpixNet's Config page.
-fn render_config_page(values: &[(&str, &str, String)]) -> String {
+fn render_config_page(values: &[(&str, &str, String)], homepage: &str) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
@@ -346,7 +349,7 @@ fn render_config_page(values: &[(&str, &str, String)]) -> String {
            <button class='button' type='submit'>Save</button>\
          </form>"
     );
-    page_shell("Configuration", "Configuration", "", &body)
+    page_shell("Configuration", "Configuration", "", &body, homepage)
 }
 
 /// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
@@ -420,16 +423,24 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value]) -> String 
           .size{{float:right;color:#999;font-size:13px}}</style>\
          <div class='files'>{rows}</div>"
     );
-    page_shell("Files", &heading, "", &body)
+    // From the file browser, the fixbutton returns to the xite being browsed.
+    page_shell("Files", &heading, "", &body, address)
 }
 
 /// Shared page shell for the server-rendered admin pages, styled to match
 /// EpixNet (light theme, gradient header, sliding toggles, config inputs).
-fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str) -> String {
+fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: &str) -> String {
     let sub = if subtitle.is_empty() {
         String::new()
     } else {
         format!("<p class='sub'>{subtitle}</p>")
+    };
+    // The corner fixbutton (like the wrapper's): click to return to the
+    // dashboard. Hidden when there is no homepage xite to go back to.
+    let fixbutton = if homepage.is_empty() {
+        String::new()
+    } else {
+        format!("<a class='fixbutton' href='/{homepage}/' title='Back to the dashboard'></a>")
     };
     format!(
         "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
@@ -455,8 +466,11 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str) -> String 
           .input-text:focus{{border-color:#3396ff;outline:none}}\
           .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer}}\
           a{{color:#9760F9;text-decoration:none}}\
+          .fixbutton{{position:fixed;right:23px;top:9px;width:48px;height:48px;z-index:999;border-radius:50%;background:#000 url('/uimedia/img/logo.png') center/48px no-repeat;display:block;transition:box-shadow .3s,transform .15s}}\
+          .fixbutton:hover{{box-shadow:0 5px 30px rgba(0,0,0,.3)}}\
+          .fixbutton:active{{transform:translateY(1px)}}\
          </style></head><body>\
-         <h1>{heading}</h1><div class='content'>{sub}{body}</div></body></html>"
+         {fixbutton}<h1>{heading}</h1><div class='content'>{sub}{body}</div></body></html>"
     )
 }
 
