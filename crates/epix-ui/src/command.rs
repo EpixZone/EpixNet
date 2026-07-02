@@ -128,7 +128,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         // Dashboard polling / lists — benign empty values.
         Arc::new(simple("serverErrors", json!([]))),
         Arc::new(AnnouncerStats),
-        Arc::new(simple("siteList", json!([]))),
+        Arc::new(SiteList),
         Arc::new(simple("notificationQuery", json!([]))),
         Arc::new(FeedQuery),
         Arc::new(FeedFollow),
@@ -275,6 +275,18 @@ impl WsCommand for SiteInfo {
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?;
         Ok(s.state.site_info(address).await)
+    }
+}
+
+/// `siteList` — every served xite's siteInfo, for the dashboard's Sites panel.
+struct SiteList;
+#[async_trait]
+impl WsCommand for SiteList {
+    fn name(&self) -> &'static str {
+        "siteList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(Value::Array(s.state.site_list().await))
     }
 }
 

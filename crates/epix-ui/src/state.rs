@@ -1049,6 +1049,33 @@ impl AppState {
         })
     }
 
+    /// `siteList` — one siteInfo per served xite, for the dashboard's Sites
+    /// panel. A xite served under both its raw address and a `.epix` alias is a
+    /// single site, so we collapse entries that share the same signed content
+    /// address (the alias points at the same storage + content).
+    pub async fn site_list(&self) -> Vec<Value> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for address in self.xite_addresses().await {
+            let info = self.site_info(&address).await;
+            if info.is_null() {
+                continue;
+            }
+            // Prefer the signed address to dedupe alias/raw pairs; fall back to
+            // the serving key when there is no verified content yet.
+            let dedupe_key = info
+                .get("content")
+                .and_then(|c| c.get("address"))
+                .and_then(Value::as_str)
+                .unwrap_or(&address)
+                .to_string();
+            if seen.insert(dedupe_key) {
+                out.push(info);
+            }
+        }
+        out
+    }
+
     /// A fresh wrapper nonce (monotonic; sufficient for a local single-user node).
     pub fn wrapper_nonce(&self) -> String {
         let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
@@ -1208,6 +1235,32 @@ mod tests {
 
         assert_eq!(info["size_limit"], 10);
         assert_eq!(info["next_size_limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn site_list_returns_one_entry_per_site_collapsing_aliases() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        // Same signed content served under a raw address and a `.epix` alias.
+        let content = json!({ "address": "1HeLLo", "modified": 1.0, "files": {}, "signs": {"1HeLLo": "x"} });
+        state
+            .add_xite("1HeLLo", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) })
+            .await;
+        state
+            .add_xite("hello.epix", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
+            .await;
+        // A second, distinct site.
+        let other = json!({ "address": "1Other", "modified": 1.0, "files": {}, "signs": {"1Other": "x"} });
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(other) })
+            .await;
+
+        let list = state.site_list().await;
+        assert_eq!(list.len(), 2, "alias collapses; two distinct sites remain");
+        let addrs: std::collections::HashSet<_> =
+            list.iter().map(|s| s["content"]["address"].as_str().unwrap()).collect();
+        assert!(addrs.contains("1HeLLo"));
+        assert!(addrs.contains("1Other"));
     }
 
     #[tokio::test]
