@@ -257,6 +257,9 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(ServerErrors),
+        Arc::new(ConsoleLogRead),
+        Arc::new(ConsoleLogStream),
+        Arc::new(ConsoleLogStreamRemove),
         Arc::new(ChartGetPeerLocations),
         Arc::new(AnnouncerStats),
         Arc::new(SiteList),
@@ -361,6 +364,50 @@ impl WsCommand for ServerErrors {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(Value::Array(s.state.server_errors().await))
+    }
+}
+
+/// `consoleLogRead` — recent log lines for the sidebar console (formatted
+/// strings + byte-position metadata).
+struct ConsoleLogRead;
+#[async_trait]
+impl WsCommand for ConsoleLogRead {
+    fn name(&self) -> &'static str {
+        "consoleLogRead"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.console_log_read().await)
+    }
+}
+
+/// `consoleLogStream` — open a live log stream; returns `{stream_id}`. New lines
+/// arrive as `logLineAdd` events.
+struct ConsoleLogStream;
+#[async_trait]
+impl WsCommand for ConsoleLogStream {
+    fn name(&self) -> &'static str {
+        "consoleLogStream"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!({ "stream_id": s.state.console_log_stream_open().await }))
+    }
+}
+
+/// `consoleLogStreamRemove(stream_id)` — stop a live log stream.
+struct ConsoleLogStreamRemove;
+#[async_trait]
+impl WsCommand for ConsoleLogStreamRemove {
+    fn name(&self) -> &'static str {
+        "consoleLogStreamRemove"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let id = p
+            .get("stream_id")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_i64())
+            .ok_or("consoleLogStreamRemove: stream_id required")?;
+        s.state.console_log_stream_remove(id).await;
+        Ok(Value::from("ok"))
     }
 }
 

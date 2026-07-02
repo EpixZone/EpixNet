@@ -102,6 +102,9 @@ pub struct AppState {
     /// Recent log lines for the dashboard console (`serverErrors`): each is
     /// `[date_added, level, message]`, newest last, capped.
     logs: RwLock<std::collections::VecDeque<Value>>,
+    /// Open sidebar-console log streams (`consoleLogStream`); new log lines are
+    /// pushed to each as `logLineAdd` events.
+    log_streams: RwLock<Vec<i64>>,
 }
 
 /// A server-pushed UI event.
@@ -151,6 +154,7 @@ impl AppState {
             config: RwLock::new(serde_json::Map::new()),
             config_path: None,
             logs: RwLock::new(std::collections::VecDeque::new()),
+            log_streams: RwLock::new(Vec::new()),
         })
     }
 
@@ -207,6 +211,7 @@ impl AppState {
             config: RwLock::new(config),
             config_path: Some(config_path),
             logs: RwLock::new(std::collections::VecDeque::new()),
+            log_streams: RwLock::new(Vec::new()),
         })
     }
 
@@ -1041,21 +1046,60 @@ impl AppState {
     /// Maximum log lines kept for the console.
     const LOG_CAPACITY: usize = 300;
 
-    /// Record a log line for the dashboard console (`serverErrors`) and echo it
-    /// to stdout. `level` is `INFO`/`WARNING`/`ERROR`.
+    /// Record a log line for the dashboard console and echo it to stdout.
+    /// `level` is `INFO`/`WARNING`/`ERROR`. Feeds both `serverErrors` (tuples)
+    /// and any open sidebar-console stream (`logLineAdd`, formatted strings).
     pub async fn log(&self, level: &str, message: impl Into<String>) {
         let message = message.into();
         println!("[{level}] {message}");
-        let mut logs = self.logs.write().await;
-        logs.push_back(json!([now_secs() as f64, level, message]));
-        while logs.len() > Self::LOG_CAPACITY {
-            logs.pop_front();
+        let line = json!([now_secs() as f64, level, message]);
+        {
+            let mut logs = self.logs.write().await;
+            logs.push_back(line.clone());
+            while logs.len() > Self::LOG_CAPACITY {
+                logs.pop_front();
+            }
+        }
+        // Stream to any open sidebar console(s).
+        let streams = self.log_streams.read().await;
+        if !streams.is_empty() {
+            let formatted = format_log_line(&line);
+            for id in streams.iter() {
+                self.push_event(
+                    "logLineAdd",
+                    json!({ "stream_id": id, "lines": [formatted] }),
+                    None,
+                    None,
+                );
+            }
         }
     }
 
     /// The recent log lines (`serverErrors`): `[[date_added, level, message], …]`.
     pub async fn server_errors(&self) -> Vec<Value> {
         self.logs.read().await.iter().cloned().collect()
+    }
+
+    /// `consoleLogRead` — recent lines for the sidebar console as formatted
+    /// strings, plus the byte-position metadata the panel displays.
+    pub async fn console_log_read(&self) -> Value {
+        let lines: Vec<Value> =
+            self.logs.read().await.iter().map(|l| json!(format_log_line(l))).collect();
+        let n = lines.len();
+        json!({ "lines": lines, "pos_start": 0, "pos_end": n * 80, "num_found": n })
+    }
+
+    /// `consoleLogStream` — open a live log stream; returns its id. New lines
+    /// arrive as `logLineAdd` events tagged with this id.
+    pub async fn console_log_stream_open(&self) -> i64 {
+        let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
+        self.log_streams.write().await.push(id);
+        id
+    }
+
+    /// `consoleLogStreamRemove` — stop a live log stream.
+    pub async fn console_log_stream_remove(&self, id: i64) {
+        self.log_streams.write().await.retain(|s| *s != id);
     }
 
     /// Subscribe to server-pushed UI events (one receiver per WS connection).
@@ -1648,6 +1692,16 @@ fn free_space(path: Option<&std::path::Path>) -> i64 {
     }
 }
 
+/// Format a `[date_added, level, message]` log tuple as the sidebar console's
+/// `[HH:MM:SS] LEVEL Module text` string (UTC time-of-day; module = `Node`).
+fn format_log_line(line: &Value) -> String {
+    let secs = line.get(0).and_then(Value::as_f64).unwrap_or(0.0) as i64;
+    let level = line.get(1).and_then(Value::as_str).unwrap_or("INFO");
+    let msg = line.get(2).and_then(Value::as_str).unwrap_or("");
+    let tod = secs.rem_euclid(86400);
+    format!("[{:02}:{:02}:{:02}] {} Node {}", tod / 3600, (tod % 3600) / 60, tod % 60, level, msg)
+}
+
 /// The address a permission grant is keyed by: the xite's signed content
 /// address when known (so a site served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
@@ -1954,6 +2008,35 @@ mod tests {
         assert_eq!(lines[0][2], "started");
         assert_eq!(lines[1][1], "WARNING");
         assert!(lines[1][0].as_f64().unwrap() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn console_stream_returns_id_and_pushes_loglineadd() {
+        let state = AppState::new("test");
+        // Opening a stream returns a real id (was null before -> UI crash).
+        let sid = state.console_log_stream_open().await;
+        let mut events = state.subscribe_events();
+
+        // A new log line streams as logLineAdd with the matching stream_id.
+        state.log("INFO", "hello world").await;
+        let ev = events.try_recv().unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "logLineAdd");
+        assert_eq!(payload["params"]["stream_id"], sid);
+        let line = payload["params"]["lines"][0].as_str().unwrap();
+        assert!(line.contains("INFO Node hello world"));
+        assert!(line.starts_with('['));
+
+        // consoleLogRead returns the formatted line too.
+        let read = state.console_log_read().await;
+        assert_eq!(read["num_found"], 1);
+        assert!(read["lines"][0].as_str().unwrap().contains("hello world"));
+
+        // After removing the stream, no more logLineAdd is pushed.
+        state.console_log_stream_remove(sid).await;
+        while events.try_recv().is_ok() {}
+        state.log("INFO", "after removal").await;
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
