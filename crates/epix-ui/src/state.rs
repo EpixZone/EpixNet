@@ -97,12 +97,16 @@ pub struct AppState {
     events: tokio::sync::broadcast::Sender<UiEvent>,
 }
 
-/// A server-pushed UI event. `target` routes it: `None` goes to every
-/// connection (global events like `setServerInfo`/`notification`), `Some(addr)`
-/// only to connections bound to that xite (so `setSiteInfo` for one alias does
-/// not overwrite another's readouts).
+/// A server-pushed UI event.
+///
+/// - `channel` gates by subscription: `Some("siteChanged")` reaches only
+///   connections that joined that channel; `None` is ungated (notifications).
+/// - `target` routes by xite: `Some(addr)` only to connections bound to that
+///   xite (so `setSiteInfo` for one alias does not overwrite another's), `None`
+///   is any xite.
 #[derive(Clone)]
 pub struct UiEvent {
+    pub channel: Option<String>,
     pub target: Option<String>,
     pub payload: String,
 }
@@ -971,32 +975,34 @@ impl AppState {
         self.events.subscribe()
     }
 
-    /// Push an unsolicited `{cmd, params}` event. `target` = `None` reaches every
-    /// connection; `Some(addr)` only connections bound to that xite. No-op if
-    /// nothing is listening.
-    fn push_event(&self, cmd: &str, params: Value, target: Option<String>) {
+    /// Push an unsolicited `{cmd, params}` event. `channel` gates by
+    /// subscription (`None` = ungated); `target` gates by xite (`None` = any).
+    /// No-op if nothing is listening.
+    fn push_event(&self, cmd: &str, params: Value, channel: Option<&str>, target: Option<String>) {
         let payload = json!({ "cmd": cmd, "params": params, "to": Value::Null }).to_string();
-        let _ = self.events.send(UiEvent { target, payload });
+        let _ = self.events.send(UiEvent { channel: channel.map(str::to_string), target, payload });
     }
 
-    /// Push the latest `siteInfo` for a xite (`setSiteInfo`), only to that
-    /// xite's connections, so the dashboard's peer/connection/content readouts
-    /// update the moment they change.
+    /// Push the latest `siteInfo` for a xite (`setSiteInfo`) on the `siteChanged`
+    /// channel, only to that xite's connections, so the dashboard's
+    /// peer/connection/content readouts update the moment they change.
     pub async fn push_site_info(&self, address: &str) {
         let info = self.site_info(address).await;
         if !info.is_null() {
-            self.push_event("setSiteInfo", info, Some(address.to_string()));
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
         }
     }
 
-    /// Push the latest tracker stats (`setAnnouncerInfo`) to all connections.
+    /// Push the latest tracker stats (`setAnnouncerInfo`) on `announcerChanged`.
     pub async fn push_announcer_info(&self) {
-        self.push_event("setAnnouncerInfo", json!({ "stats": self.announcer_stats().await }), None);
+        let params = json!({ "stats": self.announcer_stats().await });
+        self.push_event("setAnnouncerInfo", params, Some("announcerChanged"), None);
     }
 
-    /// Push a wrapper notification (`["info"|"done"|"error", message, timeout_ms]`).
+    /// Push a wrapper notification (`["info"|"done"|"error", message,
+    /// timeout_ms]`). Ungated — notifications reach every connection.
     pub fn push_notification(&self, kind: &str, message: &str, timeout_ms: i64) {
-        self.push_event("notification", json!([kind, message, timeout_ms]), None);
+        self.push_event("notification", json!([kind, message, timeout_ms]), None, None);
     }
 
     /// Snapshot current node metrics into the chart db: one global datapoint
@@ -1857,18 +1863,19 @@ mod tests {
             .await;
         let mut rx = state.subscribe_events();
 
-        // A site event is targeted at that address.
+        // A site event is on the siteChanged channel, targeted at that address.
         state.push_site_info("1site").await;
         let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.channel.as_deref(), Some("siteChanged"));
         assert_eq!(ev.target.as_deref(), Some("1site"));
         let payload: Value = serde_json::from_str(&ev.payload).unwrap();
         assert_eq!(payload["cmd"], "setSiteInfo");
         assert_eq!(payload["params"]["address"], "1site");
 
-        // A notification is global (no target).
+        // A notification is ungated + global (no channel, no target).
         state.push_notification("done", "hi", 1000);
         let ev = rx.try_recv().unwrap();
-        assert!(ev.target.is_none());
+        assert!(ev.channel.is_none() && ev.target.is_none());
         assert_eq!(serde_json::from_str::<Value>(&ev.payload).unwrap()["cmd"], "notification");
     }
 

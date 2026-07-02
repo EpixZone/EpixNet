@@ -149,10 +149,7 @@ mod tests {
         // …and the plugin's command was added.
         assert!(commands.has("helloPlugin"));
 
-        let session = WsSession {
-            state: AppState::new("test"),
-            xite: None,
-        };
+        let session = WsSession::new(AppState::new("test"), None);
         let out = commands
             .dispatch(&session, "helloPlugin", &json!({ "name": "epix" }), 1)
             .await

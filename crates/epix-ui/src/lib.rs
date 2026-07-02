@@ -265,7 +265,7 @@ async fn ws_upgrade(State(ctx): State<Ctx>, Query(q): Query<WsQuery>, ws: WebSoc
 
 async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
     use futures_util::{SinkExt, StreamExt};
-    let session = WsSession { state: ctx.state.clone(), xite };
+    let session = WsSession::new(ctx.state.clone(), xite);
     let mut events = ctx.state.subscribe_events();
     let (mut sink, mut stream) = socket.split();
     loop {
@@ -287,12 +287,18 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             event = events.recv() => {
                 match event {
                     Ok(ev) => {
-                        // Route site-specific events only to that xite's socket.
-                        let deliver = match &ev.target {
+                        // Deliver only if the connection joined the event's
+                        // channel (ungated events always pass) and it is for this
+                        // connection's xite (untargeted events always pass).
+                        let channel_ok = match &ev.channel {
+                            None => true,
+                            Some(ch) => session.in_channel(ch),
+                        };
+                        let target_ok = match &ev.target {
                             None => true,
                             Some(addr) => session.xite.as_deref() == Some(addr.as_str()),
                         };
-                        if deliver && sink.send(Message::Text(ev.payload)).await.is_err() {
+                        if channel_ok && target_ok && sink.send(Message::Text(ev.payload)).await.is_err() {
                             break;
                         }
                     }
