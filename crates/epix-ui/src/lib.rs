@@ -434,6 +434,8 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str) -> String 
     format!(
         "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
          <meta name='viewport' content='width=device-width, initial-scale=1'>\
+         <link rel='icon' type='image/x-icon' href='/uimedia/img/favicon.ico'>\
+         <link rel='apple-touch-icon' href='/uimedia/img/apple-touch-icon.png'>\
          <style>\
           body{{background:#EDF2F5;font-family:Roboto,'Segoe UI',Arial,'Helvetica Neue',sans-serif;margin:0;padding:0;color:#333}}\
           h1{{background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;padding:16px 30px;margin:0;font-weight:200;font-size:30px}}\
