@@ -11,6 +11,10 @@ use std::sync::Arc;
 const TRACKER: &str = "145.223.69.23:26959";
 const BIND: &str = "127.0.0.1:43110";
 
+/// Bundled peer-geolocation database for the dashboard's world map: DB-IP City
+/// Lite (CC-BY-4.0), shipped gzipped and expanded into the data dir at runtime.
+const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
+
 #[tokio::main]
 async fn main() {
     // Accept a raw `epix1…` xite address, or a `.epix` name to resolve on-chain.
@@ -113,6 +117,12 @@ async fn serve(
     bytes_recv: u64,
 ) {
     let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
+    // Bundled IP geolocation db (DB-IP City Lite, CC-BY-4.0), shipped gzipped
+    // and expanded once into the data dir so the world map works offline.
+    let mmdb = data_dir.join("geoip-city.mmdb");
+    if let Some(geoip) = epix_ui::geoip::GeoIp::ensure(GEOIP_CITY_GZ, &mmdb) {
+        state.set_geoip(geoip).await;
+    }
     // Serve under the raw address and (if resolved from a name) the .epix name,
     // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
     state

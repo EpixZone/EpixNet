@@ -217,10 +217,11 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalFilePin { pin: true }),
         Arc::new(OptionalFilePin { pin: false }),
         Arc::new(OptionalLimitStats),
+        Arc::new(OptionalLimitSet),
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(simple("serverErrors", json!([]))),
-        Arc::new(simple("chartGetPeerLocations", json!([]))),
+        Arc::new(ChartGetPeerLocations),
         Arc::new(AnnouncerStats),
         Arc::new(SiteList),
         Arc::new(ChartDbQuery),
@@ -401,6 +402,18 @@ impl WsCommand for ChartDbQuery {
             Ok(rows) => Ok(Value::Array(rows)),
             Err(e) => Ok(json!({ "error": e })),
         }
+    }
+}
+
+/// `chartGetPeerLocations` — geolocated peer positions for the world map.
+struct ChartGetPeerLocations;
+#[async_trait]
+impl WsCommand for ChartGetPeerLocations {
+    fn name(&self) -> &'static str {
+        "chartGetPeerLocations"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(Value::Array(s.state.peer_locations().await))
     }
 }
 
@@ -1026,7 +1039,7 @@ impl WsCommand for OptionalFilePin {
     }
 }
 
-/// `optionalLimitStats` — optional-file storage usage.
+/// `optionalLimitStats` — optional-file storage usage (`{limit, used, free}`).
 struct OptionalLimitStats;
 #[async_trait]
 impl WsCommand for OptionalLimitStats {
@@ -1034,8 +1047,22 @@ impl WsCommand for OptionalLimitStats {
         "optionalLimitStats"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
-        Ok(s.state.optional_limit_stats(&address).await)
+        Ok(s.state.optional_limit_stats().await)
+    }
+}
+
+/// `optionalLimitSet(limit)` — set the optional-files cap (`"10%"` or a GB
+/// number).
+struct OptionalLimitSet;
+#[async_trait]
+impl WsCommand for OptionalLimitSet {
+    fn name(&self) -> &'static str {
+        "optionalLimitSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let limit = arg_str(p, "limit", 0).ok_or("optionalLimitSet: limit required")?;
+        s.state.set_optional_limit(limit).await;
+        Ok(Value::from("ok"))
     }
 }
 

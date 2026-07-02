@@ -76,6 +76,14 @@ pub struct AppState {
     /// Network-stats chart database (feeds the dashboard's Stats page). A
     /// background collector snapshots node metrics into it.
     chart: Arc<crate::chart::ChartDb>,
+    /// The optional-files size cap (`optionalLimitStats`/`optionalLimitSet`).
+    /// Either a percentage of free disk (e.g. `"10%"`) or a GB number
+    /// (e.g. `"5"`). Persisted so it survives restarts.
+    optional_limit: RwLock<String>,
+    optional_limit_path: Option<PathBuf>,
+    /// IP geolocation database for the world map (`chartGetPeerLocations`), set
+    /// once the node has extracted its bundled `.mmdb`.
+    geoip: RwLock<Option<Arc<crate::geoip::GeoIp>>>,
 }
 
 fn empty_filters() -> Value {
@@ -103,6 +111,9 @@ impl AppState {
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
             chart: Arc::new(crate::chart::ChartDb::memory().expect("in-memory chart db")),
+            optional_limit: RwLock::new("10%".to_string()),
+            optional_limit_path: None,
+            geoip: RwLock::new(None),
         })
     }
 
@@ -126,6 +137,12 @@ impl AppState {
         let chart = crate::chart::ChartDb::file(dir.join("chart.db"))
             .or_else(crate::chart::ChartDb::memory)
             .expect("chart db");
+        let optional_limit_path = dir.join("optional_limit");
+        let optional_limit = std::fs::read_to_string(&optional_limit_path)
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "10%".to_string());
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -140,6 +157,9 @@ impl AppState {
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
             chart: Arc::new(chart),
+            optional_limit: RwLock::new(optional_limit),
+            optional_limit_path: Some(optional_limit_path),
+            geoip: RwLock::new(None),
         })
     }
 
@@ -698,16 +718,40 @@ impl AppState {
         }
     }
 
-    /// Optional-file storage stats. `optionalLimitStats`.
-    pub async fn optional_limit_stats(&self, address: &str) -> Value {
-        let (used, limit) = self
-            .xites
-            .read()
-            .await
-            .get(address)
-            .map(|x| (x.settings.optional_downloaded, x.settings.size_optional))
-            .unwrap_or((0, 0));
-        json!({ "limit": "10%", "used": used, "free": (limit - used).max(0) })
+    /// Optional-file storage stats. `optionalLimitStats`. `used` is the total
+    /// optional bytes downloaded across every served xite; `free` is real free
+    /// disk space (what the `%` limit is measured against).
+    pub async fn optional_limit_stats(&self) -> Value {
+        let used: i64 =
+            self.xites.read().await.values().map(|x| x.settings.optional_downloaded).sum();
+        json!({
+            "limit": self.optional_limit.read().await.clone(),
+            "used": used,
+            "free": free_space(self.optional_limit_path.as_deref()),
+        })
+    }
+
+    /// Set the optional-files cap (`optionalLimitSet`), persisted.
+    pub async fn set_optional_limit(&self, limit: &str) {
+        let limit = limit.trim().to_string();
+        if let Some(path) = &self.optional_limit_path {
+            let _ = std::fs::write(path, &limit);
+        }
+        *self.optional_limit.write().await = limit;
+    }
+
+    /// The optional-files cap in bytes: a `%` value is that fraction of free
+    /// disk, otherwise the number is read as gigabytes (matching EpixNet's
+    /// `getOptionalLimitBytes`).
+    pub async fn optional_limit_bytes(&self) -> i64 {
+        let limit = self.optional_limit.read().await.clone();
+        let digits: String = limit.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+        let n: f64 = digits.parse().unwrap_or(0.0);
+        if limit.trim_end().ends_with('%') {
+            (free_space(self.optional_limit_path.as_deref()) as f64 * (n / 100.0)) as i64
+        } else {
+            (n * 1024.0 * 1024.0 * 1024.0) as i64
+        }
     }
 
     // --- MergerSite ----------------------------------------------------------
@@ -797,12 +841,47 @@ impl AppState {
         self.chart.query(sql, params)
     }
 
+    /// Install the geolocation database (used by the world map).
+    pub async fn set_geoip(&self, geoip: crate::geoip::GeoIp) {
+        *self.geoip.write().await = Some(Arc::new(geoip));
+    }
+
+    /// `chartGetPeerLocations` — geolocate every distinct clearnet peer IP we
+    /// know across all served xites, for the dashboard's world map. Returns
+    /// `[{lat, lon, city, country, ping}]`. Empty if no geolocation db is loaded.
+    pub async fn peer_locations(&self) -> Vec<Value> {
+        let Some(geoip) = self.geoip.read().await.clone() else { return Vec::new() };
+        // Best ping seen per IP (ms), across xites.
+        let mut pings: HashMap<std::net::IpAddr, Option<i64>> = HashMap::new();
+        for x in self.xites.read().await.values() {
+            for p in x.peers.peers() {
+                if let PeerAddr::Ip(sa) = &p.addr {
+                    pings.entry(sa.ip()).or_insert(None);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (ip, ping) in pings {
+            if let Some(loc) = geoip.locate(ip) {
+                out.push(json!({
+                    "lat": loc.lat,
+                    "lon": loc.lon,
+                    "city": loc.city,
+                    "country": loc.country,
+                    "ping": ping,
+                }));
+            }
+        }
+        out
+    }
+
     /// Snapshot current node metrics into the chart db: one global datapoint
     /// set plus a per-xite set. Called at startup and periodically by the
     /// runtime so the dashboard's Stats page has data to draw.
     pub async fn collect_chart(&self) {
         use crate::chart::Metric;
         let now = now_secs();
+        let optional_limit = self.optional_limit_bytes().await;
         let xites = self.xites.read().await;
 
         let mut size = 0i64;
@@ -850,7 +929,7 @@ impl AppState {
             Metric::now("size", size as f64),
             Metric::now("size_optional", size_optional as f64),
             Metric::now("optional_used", optional_used as f64),
-            Metric::now("optional_limit", 0.0),
+            Metric::now("optional_limit", optional_limit as f64),
             Metric::now("content", content.len() as f64),
             Metric::change("file_bytes_recv", bytes_recv),
             Metric::change("file_bytes_sent", bytes_sent),
@@ -1331,6 +1410,30 @@ fn piece_present(storage: &XiteStorage, inner_path: &str, offset: u64, len: u64,
 
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
 /// become counts, and the signatures are stripped (matches `formatSiteInfo`).
+/// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
+/// current directory). Uses `statvfs` on unix.
+fn free_space(path: Option<&std::path::Path>) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = path.and_then(|p| p.parent()).unwrap_or_else(|| std::path::Path::new("."));
+        let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return 0 };
+        // SAFETY: statvfs writes into the zeroed struct; we read it only on success.
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c.as_ptr(), &mut stat) == 0 {
+                return stat.f_bavail.saturating_mul(stat.f_frsize as _) as i64;
+            }
+        }
+        0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
+}
+
 /// The address a permission grant is keyed by: the xite's signed content
 /// address when known (so a site served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
@@ -1620,8 +1723,35 @@ mod tests {
         state.optional_file_delete(addr, "big.mp4").await.unwrap();
         assert_eq!(state.optional_file_info(addr, "big.mp4").await.unwrap()["is_downloaded"], false);
 
-        let stats = state.optional_limit_stats(addr).await;
+        let stats = state.optional_limit_stats().await;
         assert!(stats["used"].is_number() && stats["free"].is_number());
+        assert_eq!(stats["limit"], "10%");
+    }
+
+    #[tokio::test]
+    async fn peer_locations_empty_without_geoip_db() {
+        // No geolocation db loaded → the world map query returns [] rather than
+        // erroring, so the Stats page renders an empty map.
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state.add_xite("1x", XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
+        assert!(state.peer_locations().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn optional_limit_persists_and_computes_bytes() {
+        let dir = tempdir().unwrap();
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            assert_eq!(s.optional_limit_stats().await["limit"], "10%");
+            // A percentage cap is a fraction of real free disk space (non-zero).
+            assert!(s.optional_limit_bytes().await > 0);
+            s.set_optional_limit("5").await; // 5 GB
+            assert_eq!(s.optional_limit_bytes().await, 5 * 1024 * 1024 * 1024);
+        }
+        // The new cap is restored on restart.
+        let s = AppState::with_data_dir("test", dir.path());
+        assert_eq!(s.optional_limit_stats().await["limit"], "5");
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
 
 pub mod chart;
 pub mod command;
+pub mod geoip;
 pub mod state;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
