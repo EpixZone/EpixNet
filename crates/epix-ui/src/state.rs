@@ -284,6 +284,36 @@ impl AppState {
         self.config.read().await.get(key).cloned()
     }
 
+    // --- AnnounceShare: persisted working trackers --------------------------
+
+    /// The trackers remembered from previous announces (`epix://…` addresses).
+    pub async fn shared_trackers(&self) -> Vec<PeerAddr> {
+        self.config_get("shared_trackers")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|s| PeerAddr::parse(s).ok())
+            .collect()
+    }
+
+    /// Remember a tracker that answered, so it is reused (and shared) later.
+    async fn add_shared_tracker(&self, tracker: &str) {
+        let mut list: Vec<String> = self
+            .config_get("shared_trackers")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !list.iter().any(|t| t == tracker) {
+            list.push(tracker.to_string());
+            self.config_set("shared_trackers", json!(list)).await;
+        }
+    }
+
     // --- Notification plugin -------------------------------------------------
 
     /// `notificationSubscribe` - save a site's notification queries
@@ -513,6 +543,11 @@ impl AppState {
         for tracker in trackers {
             let peers = epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(tracker), 0).await;
             self.record_tracker(&tracker.to_string(), peers.len()).await;
+            // AnnounceShare: remember a tracker that answered, so it is reused
+            // (and shared) across restarts.
+            if !peers.is_empty() {
+                self.add_shared_tracker(&tracker.to_string()).await;
+            }
             all.extend(peers);
         }
         self.add_peers(address, all.clone()).await;

@@ -5,7 +5,10 @@
 //! [`epix_protocol::Connection`]). BitTorrent trackers, the mainline DHT, PEX,
 //! and local discovery will be added alongside it.
 
+pub mod bittorrent;
 pub mod tracker;
+
+pub use bittorrent::announce_bittorrent;
 
 use sha2::{Digest, Sha256};
 

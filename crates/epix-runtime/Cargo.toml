@@ -8,8 +8,16 @@ description = "The persistent node runtime: supervised background loops (announc
 epix-core = { path = "../epix-core" }
 epix-ui = { path = "../epix-ui" }
 epix-xite = { path = "../epix-xite" }
+epix-discovery = { path = "../epix-discovery" }
 epix-transport = { path = "../epix-transport" }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+rmpv = "1"
+socket2 = "0.5"
+
+[features]
+default = ["local-discovery"]
+# LAN peer discovery over UDP broadcast (AnnounceLocal). Off on mobile.
+local-discovery = []
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }
