@@ -48,11 +48,11 @@ impl Xite {
         Ok(())
     }
 
-    /// All files declared in content.json.
-    pub fn files(&self) -> Vec<FileEntry> {
+    /// Files declared under a content.json node (`files` or `files_optional`).
+    fn files_under(&self, node: &str) -> Vec<FileEntry> {
         self.content
             .as_ref()
-            .and_then(|c| c.get("files"))
+            .and_then(|c| c.get(node))
             .and_then(|f| f.as_object())
             .map(|files| {
                 files
@@ -69,7 +69,25 @@ impl Xite {
             .unwrap_or_default()
     }
 
-    /// Declared files that are missing on disk or fail their hash.
+    /// All required files declared in content.json (`files`).
+    pub fn files(&self) -> Vec<FileEntry> {
+        self.files_under("files")
+    }
+
+    /// Optional files (`files_optional`) — declared but not auto-downloaded.
+    pub fn optional_files(&self) -> Vec<FileEntry> {
+        self.files_under("files_optional")
+    }
+
+    /// Info for one file by inner path (required or optional).
+    pub fn file_info(&self, inner_path: &str) -> Option<FileEntry> {
+        self.files()
+            .into_iter()
+            .chain(self.optional_files())
+            .find(|f| f.inner_path == inner_path)
+    }
+
+    /// Required files that are missing on disk or fail their hash.
     pub fn files_needed(&self) -> Vec<FileEntry> {
         self.files()
             .into_iter()

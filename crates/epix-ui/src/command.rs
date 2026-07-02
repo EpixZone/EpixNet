@@ -106,7 +106,14 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(EccPubToAddr),
         Arc::new(simple("userGetSettings", json!({}))),
         Arc::new(simple("userSetSettings", json!("ok"))),
-        Arc::new(simple("optionalLimitStats", json!({ "limit": "10%", "used": 0, "free": 0 }))),
+        // OptionalManager
+        Arc::new(FileNeed),
+        Arc::new(OptionalFileList),
+        Arc::new(OptionalFileInfo),
+        Arc::new(OptionalFileDelete),
+        Arc::new(OptionalFilePin { pin: true }),
+        Arc::new(OptionalFilePin { pin: false }),
+        Arc::new(OptionalLimitStats),
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(simple("serverErrors", json!([]))),
@@ -705,6 +712,95 @@ fn sqlquote(v: &Value) -> String {
         Value::Bool(b) => (*b as i64).to_string(),
         Value::String(s) => format!("'{}'", s.replace('\'', "''")),
         _ => "null".into(),
+    }
+}
+
+// ---- OptionalManager -------------------------------------------------------
+
+/// `fileNeed(inner_path)` — download a file (optional or required) on demand.
+struct FileNeed;
+#[async_trait]
+impl WsCommand for FileNeed {
+    fn name(&self) -> &'static str {
+        "fileNeed"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = arg_str(p, "inner_path", 0).ok_or("fileNeed: inner_path required")?;
+        s.state.file_need(&address, inner_path).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `optionalFileList(address, orderby, limit, filter)` — this xite's optional files.
+struct OptionalFileList;
+#[async_trait]
+impl WsCommand for OptionalFileList {
+    fn name(&self) -> &'static str {
+        "optionalFileList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let filter = p.get("filter").and_then(|v| v.as_str()).unwrap_or("downloaded");
+        Ok(Value::Array(s.state.optional_file_list(&address, filter).await?))
+    }
+}
+
+/// `optionalFileInfo(inner_path)`.
+struct OptionalFileInfo;
+#[async_trait]
+impl WsCommand for OptionalFileInfo {
+    fn name(&self) -> &'static str {
+        "optionalFileInfo"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileInfo: inner_path required")?;
+        s.state.optional_file_info(&address, inner_path).await
+    }
+}
+
+/// `optionalFileDelete(inner_path)`.
+struct OptionalFileDelete;
+#[async_trait]
+impl WsCommand for OptionalFileDelete {
+    fn name(&self) -> &'static str {
+        "optionalFileDelete"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileDelete: inner_path required")?;
+        s.state.optional_file_delete(&address, inner_path).await
+    }
+}
+
+/// `optionalFilePin` / `optionalFileUnpin`.
+struct OptionalFilePin {
+    pin: bool,
+}
+#[async_trait]
+impl WsCommand for OptionalFilePin {
+    fn name(&self) -> &'static str {
+        if self.pin { "optionalFilePin" } else { "optionalFileUnpin" }
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = arg_str(p, "inner_path", 0).ok_or("inner_path required")?;
+        s.state.set_pin(&address, inner_path, self.pin).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `optionalLimitStats` — optional-file storage usage.
+struct OptionalLimitStats;
+#[async_trait]
+impl WsCommand for OptionalLimitStats {
+    fn name(&self) -> &'static str {
+        "optionalLimitStats"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        Ok(s.state.optional_limit_stats(&address).await)
     }
 }
 

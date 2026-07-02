@@ -45,6 +45,8 @@ struct ManagedXite {
     tasks_active: usize,
     started_task_num: usize,
     workers: usize,
+    /// Optional files the user pinned (kept even when clearing space).
+    pinned: std::collections::HashSet<String>,
 }
 
 /// Server-wide state shared across all HTTP/WebSocket handlers.
@@ -148,6 +150,7 @@ impl AppState {
                 tasks_active: 0,
                 started_task_num: 0,
                 workers: 0,
+                pinned: std::collections::HashSet::new(),
             },
         );
     }
@@ -307,6 +310,171 @@ impl AppState {
     /// Whether a site is blocked.
     pub async fn siteblock_get(&self, site_address: &str) -> Value {
         self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
+    }
+
+    // --- OptionalManager -----------------------------------------------------
+
+    /// Reconstruct a `Xite` view (address + storage + content) for file ops.
+    async fn xite_view(&self, address: &str) -> Result<Xite, String> {
+        let (storage, content) = {
+            let x = self.xites.read().await;
+            let e = x.get(address).ok_or("unknown xite")?;
+            (e.storage.clone(), e.content.clone())
+        };
+        let mut xite = Xite::new(Address::parse(address.to_string()).map_err(|e| e.to_string())?, storage);
+        xite.content = content;
+        Ok(xite)
+    }
+
+    /// Download a file (required or optional) on demand from peers, verifying
+    /// its hash before writing. `fileNeed`. Returns true if present after.
+    pub async fn file_need(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        let xite = self.xite_view(address).await?;
+        let info = xite.file_info(inner_path).ok_or("file not declared in content.json")?;
+        if xite.storage.verify(inner_path, &info.sha512) {
+            return Ok(true); // already have it
+        }
+        let transport = self.transport.read().await.clone().ok_or("no transport")?;
+        let peers = self.connectable_peers(address, 20).await;
+        for peer in peers {
+            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else { continue };
+            if conn.handshake().await.is_err() {
+                continue;
+            }
+            let Ok(bytes) = conn.get_file(address, inner_path).await else { continue };
+            if XiteStorage::hash_bytes(&bytes) == info.sha512 {
+                xite.storage.write(inner_path, &bytes).map_err(|e| e.to_string())?;
+                self.set_peer_connected(address, &peer, true).await;
+                // Count optional bytes downloaded.
+                if xite.optional_files().iter().any(|f| f.inner_path == inner_path) {
+                    if let Some(x) = self.xites.write().await.get_mut(address) {
+                        x.settings.optional_downloaded += info.size;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        Err("could not fetch the file from any peer".into())
+    }
+
+    /// List optional files with their state. `filter` = "downloaded" (default)
+    /// or anything else for all. `optionalFileList`.
+    pub async fn optional_file_list(&self, address: &str, filter: &str) -> Result<Vec<Value>, String> {
+        let xite = self.xite_view(address).await?;
+        let pinned = self.xites.read().await.get(address).map(|x| x.pinned.clone()).unwrap_or_default();
+        let only_downloaded = filter == "downloaded";
+        Ok(xite
+            .optional_files()
+            .into_iter()
+            .filter_map(|f| {
+                let is_downloaded = xite.storage.verify(&f.inner_path, &f.sha512);
+                if only_downloaded && !is_downloaded {
+                    return None;
+                }
+                Some(json!({
+                    "inner_path": f.inner_path,
+                    "size": f.size,
+                    "sha512": f.sha512,
+                    "is_downloaded": is_downloaded,
+                    "is_pinned": pinned.contains(&f.inner_path),
+                }))
+            })
+            .collect())
+    }
+
+    /// Info for one optional file, or null. `optionalFileInfo`. For a big file
+    /// (>1MB with a `piecemap`) it also carries the piece layout (Bigfile).
+    pub async fn optional_file_info(&self, address: &str, inner_path: &str) -> Result<Value, String> {
+        let mut info = self
+            .optional_file_list(address, "all")
+            .await?
+            .into_iter()
+            .find(|f| f["inner_path"] == inner_path)
+            .unwrap_or(Value::Null);
+
+        if let Value::Object(map) = &mut info {
+            let size = map["size"].as_i64().unwrap_or(0);
+            if size > 1024 * 1024 {
+                let content = self.content(address).await;
+                let entry =
+                    content.as_ref().and_then(|c| c.get("files_optional")).and_then(|o| o.get(inner_path));
+                if let Some(entry) = entry {
+                    let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024);
+                    let piece_num = (size + piece_size - 1) / piece_size.max(1);
+                    map.insert("is_bigfile".into(), json!(true));
+                    map.insert("piece_size".into(), json!(piece_size));
+                    map.insert("piece_num".into(), json!(piece_num));
+                    if let Some(pm) = entry.get("piecemap").and_then(|v| v.as_str()) {
+                        map.insert("piecemap".into(), json!(pm));
+                    }
+                }
+            }
+        }
+        Ok(info)
+    }
+
+    /// On-disk size of a xite file (for HTTP Range / Content-Range).
+    pub async fn file_size(&self, address: &str, inner_path: &str) -> Option<u64> {
+        let storage = self.xites.read().await.get(address)?.storage.clone();
+        let path = storage.path(inner_path).ok()?;
+        std::fs::metadata(path).ok().map(|m| m.len())
+    }
+
+    /// Read a byte range from a xite file (for streaming big files / HTTP Range).
+    /// Returns up to `length` bytes starting at `offset`.
+    pub async fn read_file_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        offset: u64,
+        length: usize,
+    ) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let storage = self.xites.read().await.get(address)?.storage.clone();
+        let path = storage.path(inner_path).ok()?;
+        let mut f = std::fs::File::open(path).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = vec![0u8; length];
+        let n = f.read(&mut buf).ok()?;
+        buf.truncate(n);
+        Some(buf)
+    }
+
+    /// Delete a downloaded optional file. `optionalFileDelete`.
+    pub async fn optional_file_delete(&self, address: &str, inner_path: &str) -> Result<Value, String> {
+        let xite = self.xite_view(address).await?;
+        let info = xite.file_info(inner_path).ok_or("file not declared")?;
+        if let Ok(path) = xite.storage.path(inner_path) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.optional_downloaded = (x.settings.optional_downloaded - info.size).max(0);
+            x.pinned.remove(inner_path);
+        }
+        Ok(Value::from("ok"))
+    }
+
+    /// Pin/unpin an optional file. `optionalFilePin` / `optionalFileUnpin`.
+    pub async fn set_pin(&self, address: &str, inner_path: &str, pinned: bool) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if pinned {
+                x.pinned.insert(inner_path.to_string());
+            } else {
+                x.pinned.remove(inner_path);
+            }
+        }
+    }
+
+    /// Optional-file storage stats. `optionalLimitStats`.
+    pub async fn optional_limit_stats(&self, address: &str) -> Value {
+        let (used, limit) = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| (x.settings.optional_downloaded, x.settings.size_optional))
+            .unwrap_or((0, 0));
+        json!({ "limit": "10%", "used": used, "free": (limit - used).max(0) })
     }
 
     // --- MergerSite ----------------------------------------------------------
@@ -791,6 +959,79 @@ mod tests {
         // A non-owner key is refused.
         let other = "22c824485fe256587c3809b5f7c99864d7339e9fba061a016834cecc454e01f8";
         assert!(state.sign_xite(&owner_addr, other).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn optional_file_lifecycle() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let data = b"an optional file's contents";
+        let content = json!({
+            "files": {},
+            "files_optional": { "big.mp4": { "size": data.len(), "sha512": XiteStorage::hash_bytes(data) } },
+        });
+        let addr =
+            &epix_crypt::privatekey_to_address("11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7").unwrap();
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        // Declared but not downloaded.
+        let all = state.optional_file_list(addr, "all").await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0]["is_downloaded"], false);
+        assert!(state.optional_file_list(addr, "downloaded").await.unwrap().is_empty());
+
+        // "Download" it (write matching bytes); now it counts as downloaded, and
+        // fileNeed returns true without touching the network.
+        state.write_file(addr, "big.mp4", data).await.unwrap();
+        assert!(state.file_need(addr, "big.mp4").await.unwrap());
+        let info = state.optional_file_info(addr, "big.mp4").await.unwrap();
+        assert_eq!(info["is_downloaded"], true);
+        assert_eq!(info["size"], data.len());
+
+        // Pin, then delete.
+        state.set_pin(addr, "big.mp4", true).await;
+        assert_eq!(state.optional_file_info(addr, "big.mp4").await.unwrap()["is_pinned"], true);
+        state.optional_file_delete(addr, "big.mp4").await.unwrap();
+        assert_eq!(state.optional_file_info(addr, "big.mp4").await.unwrap()["is_downloaded"], false);
+
+        let stats = state.optional_limit_stats(addr).await;
+        assert!(stats["used"].is_number() && stats["free"].is_number());
+    }
+
+    #[tokio::test]
+    async fn bigfile_info_and_range_read() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let big = vec![7u8; 2 * 1024 * 1024 + 5]; // just over 2 MB
+        let content = json!({
+            "files": {},
+            "files_optional": { "movie.mp4": {
+                "size": big.len(), "sha512": XiteStorage::hash_bytes(&big),
+                "piecemap": "movie.mp4.piecemap.msgpack", "piece_size": 1024 * 1024,
+            } },
+        });
+        let addr =
+            &epix_crypt::privatekey_to_address("11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7").unwrap();
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.write_file(addr, "movie.mp4", &big).await.unwrap();
+
+        // optionalFileInfo carries the Bigfile piece layout.
+        let info = state.optional_file_info(addr, "movie.mp4").await.unwrap();
+        assert_eq!(info["is_bigfile"], true);
+        assert_eq!(info["piece_size"], 1024 * 1024);
+        assert_eq!(info["piece_num"], 3); // ceil((2MB+5)/1MB)
+        assert_eq!(info["piecemap"], "movie.mp4.piecemap.msgpack");
+
+        // Range read returns exactly the requested window from the right offset.
+        let chunk = state.read_file_range(addr, "movie.mp4", 1024 * 1024, 128).await.unwrap();
+        assert_eq!(chunk.len(), 128);
+        assert!(chunk.iter().all(|&b| b == 7));
+
+        // A small optional file is not a bigfile.
+        let small = json!({ "files_optional": { "a.txt": { "size": 10, "sha512": "x" } } });
+        state.add_xite("small", XiteEntry { storage: XiteStorage::new(dir.path().join("s")), content: Some(small) }).await;
     }
 
     #[tokio::test]
