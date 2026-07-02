@@ -20,6 +20,27 @@ use tokio::sync::RwLock;
 /// Default per-xite size limit, in MB (matches EpixNet's `config.size_limit`).
 const DEFAULT_SIZE_LIMIT_MB: i64 = 10;
 
+/// Plugins that ship disabled by default, matching the plugins EpixNet keeps
+/// `disabled-` (that we have): they are off until the operator turns them on.
+const DEFAULT_DISABLED_PLUGINS: &[&str] = &["NoNewSites", "UiPassword", "Multiuser"];
+
+/// Whether a plugin is off unless explicitly enabled.
+fn is_default_disabled(name: &str) -> bool {
+    DEFAULT_DISABLED_PLUGINS.contains(&name)
+}
+
+/// A plugin's effective enabled state: an explicit override wins, else the
+/// default (on, except for the default-disabled set).
+fn effective_enabled(name: &str, disabled: &[String], enabled: &[String]) -> bool {
+    if disabled.iter().any(|n| n == name) {
+        return false;
+    }
+    if enabled.iter().any(|n| n == name) {
+        return true;
+    }
+    !is_default_disabled(name)
+}
+
 /// How many warm peer connections the node keeps for live connection stats.
 const CONNECTION_POOL_MAX: usize = 8;
 
@@ -286,36 +307,68 @@ impl AppState {
     /// The loaded plugin/feature names that are currently enabled
     /// (`serverInfo.plugins`). A disabled plugin is hidden from feature checks.
     pub async fn plugins(&self) -> Vec<String> {
-        let disabled = self.disabled_plugins().await;
-        self.plugins.read().await.iter().filter(|n| !disabled.contains(*n)).cloned().collect()
+        let (disabled, enabled) = self.plugin_overrides().await;
+        self.plugins
+            .read()
+            .await
+            .iter()
+            .filter(|n| effective_enabled(n, &disabled, &enabled))
+            .cloned()
+            .collect()
     }
 
     /// All loaded plugins with their enabled state (`[(name, enabled)]`), for the
     /// plugin manager.
     pub async fn plugin_states(&self) -> Vec<(String, bool)> {
-        let disabled = self.disabled_plugins().await;
-        self.plugins.read().await.iter().map(|n| (n.clone(), !disabled.contains(n))).collect()
+        let (disabled, enabled) = self.plugin_overrides().await;
+        self.plugins
+            .read()
+            .await
+            .iter()
+            .map(|n| (n.clone(), effective_enabled(n, &disabled, &enabled)))
+            .collect()
     }
 
-    /// Whether a plugin is currently enabled (unknown plugins default enabled).
+    /// Whether a plugin is currently enabled. Most default enabled; the plugins
+    /// EpixNet ships `disabled-` (NoNewSites, UiPassword, Multiuser) default off
+    /// until explicitly turned on.
     pub async fn plugin_enabled(&self, name: &str) -> bool {
-        !self.disabled_plugins().await.iter().any(|n| n == name)
+        let (disabled, enabled) = self.plugin_overrides().await;
+        effective_enabled(name, &disabled, &enabled)
     }
 
-    /// Enable/disable a plugin at runtime (persisted). Takes effect on the next
-    /// page load / command - no restart.
+    /// Enable/disable a plugin at runtime (persisted). Only stores an override
+    /// when the choice differs from the plugin's default, so config stays minimal.
+    /// Takes effect on the next page load / command - no restart.
     pub async fn set_plugin_enabled(&self, name: &str, enabled: bool) {
-        let mut disabled = self.disabled_plugins().await;
+        let (mut disabled, mut enabled_list) = self.plugin_overrides().await;
         disabled.retain(|n| n != name);
-        if !enabled {
-            disabled.push(name.to_string());
+        enabled_list.retain(|n| n != name);
+        let default_on = !is_default_disabled(name);
+        if enabled != default_on {
+            if enabled {
+                enabled_list.push(name.to_string());
+            } else {
+                disabled.push(name.to_string());
+            }
         }
         self.config_set("plugins_disabled", json!(disabled)).await;
+        self.config_set("plugins_enabled", json!(enabled_list)).await;
+    }
+
+    /// The persisted `(plugins_disabled, plugins_enabled)` override lists.
+    async fn plugin_overrides(&self) -> (Vec<String>, Vec<String>) {
+        (self.config_str_list("plugins_disabled").await, self.config_str_list("plugins_enabled").await)
     }
 
     /// The persisted list of disabled plugin names.
     async fn disabled_plugins(&self) -> Vec<String> {
-        self.config_get("plugins_disabled")
+        self.config_str_list("plugins_disabled").await
+    }
+
+    /// Read a config value as a list of strings.
+    async fn config_str_list(&self, key: &str) -> Vec<String> {
+        self.config_get(key)
             .await
             .and_then(|v| {
                 v.as_array()
@@ -3220,6 +3273,41 @@ mod tests {
         assert_eq!(s.multiuser_current_seed().await, primary);
         // Selecting an unknown user errors.
         assert!(s.multiuser_select("epix1nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn default_disabled_plugins_start_off_and_toggle() {
+        let state = AppState::new("test");
+        state
+            .set_plugins(vec![
+                "Sidebar".into(),
+                "NoNewSites".into(),
+                "UiPassword".into(),
+                "Multiuser".into(),
+            ])
+            .await;
+        // Default-on plugin is on; the EpixNet-disabled set starts off.
+        assert!(state.plugin_enabled("Sidebar").await);
+        assert!(!state.plugin_enabled("NoNewSites").await);
+        assert!(!state.plugin_enabled("UiPassword").await);
+        assert!(!state.plugin_enabled("Multiuser").await);
+
+        // Turning a default-disabled plugin on, and a default-on plugin off.
+        state.set_plugin_enabled("NoNewSites", true).await;
+        state.set_plugin_enabled("Sidebar", false).await;
+        assert!(state.plugin_enabled("NoNewSites").await);
+        assert!(!state.plugin_enabled("Sidebar").await);
+
+        let states: std::collections::HashMap<_, _> =
+            state.plugin_states().await.into_iter().collect();
+        assert_eq!(states["NoNewSites"], true);
+        assert_eq!(states["Multiuser"], false);
+        assert_eq!(states["Sidebar"], false);
+        // serverInfo.plugins excludes the disabled ones.
+        let live = state.plugins().await;
+        assert!(live.contains(&"NoNewSites".to_string()));
+        assert!(!live.contains(&"Sidebar".to_string()));
+        assert!(!live.contains(&"Multiuser".to_string()));
     }
 
     #[tokio::test]
