@@ -120,6 +120,41 @@ impl UiServer {
     }
 }
 
+/// The built-in plugins/features this node ships, for the Plugins page and
+/// `serverInfo.plugins`. The always-on ones are listed unconditionally; the
+/// feature-gated ones appear only when compiled in.
+pub fn builtin_plugins() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut plugins = vec![
+        "Cors",
+        "PeerDb",
+        "Notification",
+        "FilePack",
+        "UiFileManager",
+        "AnnounceLocal",
+        "AnnounceShare",
+        "AnnounceBitTorrent",
+        "NoNewSites",
+        "ContentFilter",
+        "MergerSite",
+        "OptionalManager",
+        "Newsfeed",
+        "CryptMessage",
+        "Chart",
+        "Bigfile",
+        "Stats",
+        "UiConfig",
+        "UiPluginManager",
+    ];
+    #[cfg(feature = "ui-password")]
+    plugins.push("UiPassword");
+    #[cfg(feature = "multiuser")]
+    plugins.push("Multiuser");
+    #[cfg(feature = "benchmark")]
+    plugins.push("Benchmark");
+    plugins
+}
+
 async fn health() -> &'static str {
     "Epix UI server"
 }
@@ -265,6 +300,25 @@ fn plugin_description(name: &str) -> &'static str {
         "Stats" => "Network stats charts and the peer world map on the dashboard.",
         "UiPluginManager" => "This plugin manager page.",
         "UiConfig" => "The node configuration page.",
+        "Cors" => "Cross-site file access via a Cors:<address> permission grant.",
+        "PeerDb" => "Remembers known peers across restarts.",
+        "Notification" => "Per-site notification subscriptions, muting, and counts.",
+        "FilePack" => "Serves files from inside .tar.gz / .zip archives.",
+        "UiFileManager" => "Browse a xite's files from the dashboard.",
+        "AnnounceLocal" => "Finds peers on the local network over UDP broadcast.",
+        "AnnounceShare" => "Remembers working trackers and reuses them across restarts.",
+        "AnnounceBitTorrent" => "Announces to HTTP(S) and UDP BitTorrent trackers.",
+        "NoNewSites" => "Locks the node's site set: blocks adding and deleting sites.",
+        "ContentFilter" => "Mute authors and block sites (enforced on serve + db).",
+        "MergerSite" => "Aggregates merged sites into one database.",
+        "OptionalManager" => "Manages optional (on-demand) files and the size limit.",
+        "Newsfeed" => "Cross-site news feed from followed sites.",
+        "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for zites.",
+        "Chart" => "Collects the time-series data behind the Stats charts.",
+        "Bigfile" => "Piecewise download of large files with piecefield exchange.",
+        "UiPassword" => "Password-protects the whole UI with a login gate.",
+        "Multiuser" => "Multiple master-seed identities with login/switch.",
+        "Benchmark" => "A /Benchmark page timing the node's crypto/hash/pack hot paths.",
         _ => "Built-in plugin.",
     }
 }
