@@ -25,6 +25,8 @@ async-trait = "0.1"
 include_dir = "0.7"
 
 [dev-dependencies]
+rmpv = "1"
+async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
