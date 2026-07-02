@@ -1145,6 +1145,17 @@ impl AppState {
         }
     }
 
+    /// Push `setSiteInfo` tagged with an `event` (`["updating"|"updated", true]`),
+    /// so the dashboard's site row shows the spinner + "Updating…"/"Updated!"
+    /// inline (matching EpixNet's `updateWebsocket(updating/updated)`).
+    pub async fn push_site_info_event(&self, address: &str, event: &str) {
+        let mut info = self.site_info(address).await;
+        if let Value::Object(m) = &mut info {
+            m.insert("event".to_string(), json!([event, true]));
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
+    }
+
     /// Push the latest tracker stats (`setAnnouncerInfo`) on `announcerChanged`.
     pub async fn push_announcer_info(&self) {
         let params = json!({ "stats": self.announcer_stats().await });

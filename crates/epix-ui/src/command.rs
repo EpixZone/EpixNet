@@ -93,11 +93,20 @@ pub struct WsSession {
     /// Channels this connection has joined (`channelJoin`), e.g. `siteChanged`.
     /// Server-pushed events are delivered only for joined channels.
     pub channels: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Channels joined via `channelJoinAllsite`: for these, the connection
+    /// receives events for *every* xite, not just its bound one (the dashboard
+    /// uses this so its Sites panel updates for all sites).
+    pub allsite_channels: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl WsSession {
     pub fn new(state: Arc<AppState>, xite: Option<String>) -> Self {
-        Self { state, xite, channels: std::sync::Mutex::new(std::collections::HashSet::new()) }
+        Self {
+            state,
+            xite,
+            channels: std::sync::Mutex::new(std::collections::HashSet::new()),
+            allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
     }
 
     /// The xite address bound to this connection, or an error if none.
@@ -110,29 +119,46 @@ impl WsSession {
         self.channels.lock().unwrap().contains(channel)
     }
 
+    /// Whether this connection joined `channel` for *all* sites.
+    pub fn in_allsite(&self, channel: &str) -> bool {
+        self.allsite_channels.lock().unwrap().contains(channel)
+    }
+
     /// Record joined channel(s) from a `channelJoin`/`channelJoinAllsite` param
     /// (accepts `{channels: [...]}`, `{channel: "…"}`, a bare string, or array).
-    pub fn join_channels(&self, params: &Value) {
-        let mut set = self.channels.lock().unwrap();
-        let mut add = |v: &Value| {
-            if let Some(s) = v.as_str() {
-                set.insert(s.to_string());
-            }
-        };
-        match params {
-            Value::String(_) => add(params),
-            Value::Array(a) => a.iter().for_each(&mut add),
-            Value::Object(o) => {
-                if let Some(Value::Array(a)) = o.get("channels") {
-                    a.iter().for_each(&mut add);
-                }
-                if let Some(v) = o.get("channel") {
-                    add(v);
-                }
-            }
-            _ => {}
+    /// `allsite` also marks them as all-site subscriptions.
+    pub fn join_channels(&self, params: &Value, allsite: bool) {
+        let names = channel_names(params);
+        self.channels.lock().unwrap().extend(names.iter().cloned());
+        if allsite {
+            self.allsite_channels.lock().unwrap().extend(names);
         }
     }
+}
+
+/// Extract channel names from a `channelJoin`/`channelJoinAllsite` param
+/// (`{channels: [...]}`, `{channel: "…"}`, a bare string, or array).
+fn channel_names(params: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |v: &Value| {
+        if let Some(s) = v.as_str() {
+            out.push(s.to_string());
+        }
+    };
+    match params {
+        Value::String(_) => add(params),
+        Value::Array(a) => a.iter().for_each(&mut add),
+        Value::Object(o) => {
+            if let Some(Value::Array(a)) = o.get("channels") {
+                a.iter().for_each(&mut add);
+            }
+            if let Some(v) = o.get("channel") {
+                add(v);
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 #[async_trait]
@@ -576,7 +602,7 @@ impl WsCommand for ChannelJoin {
         self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        s.join_channels(p);
+        s.join_channels(p, self.cmd == "channelJoinAllsite");
         Ok(Value::from("ok"))
     }
 }
@@ -745,16 +771,14 @@ impl WsCommand for SiteUpdate {
             .map(String::from)
             .unwrap_or(s.address()?.to_string());
         // Run in the background (like EpixNet's updateThread) so this returns
-        // immediately and the progress notifications can flow while the sync runs.
+        // immediately. Progress shows inline on the dashboard's site row via
+        // setSiteInfo events (`updating` -> spinner, `updated` -> done), not a
+        // popup notification.
         let state = s.state.clone();
         tokio::spawn(async move {
-            state.push_notification("info", "Updating site content…", 0);
-            match state.resync_xite(&address).await {
-                Ok(true) => state.push_notification("done", "Site updated", 5000),
-                Ok(false) => state.push_notification("info", "Site content is up to date", 5000),
-                Err(e) => state.push_notification("error", &format!("Update failed: {e}"), 0),
-            }
-            state.push_site_info(&address).await; // refresh readouts
+            state.push_site_info_event(&address, "updating").await;
+            let _ = state.resync_xite(&address).await;
+            state.push_site_info_event(&address, "updated").await;
         });
         Ok(Value::from("Updated"))
     }
@@ -1512,12 +1536,17 @@ mod tests {
         assert!(session.in_channel("serverChanged"));
         assert!(!session.in_channel("announcerChanged"));
 
-        // channelJoinAllsite's {channel: "…"} form also records.
+        // channelJoin is site-scoped: not an all-site subscription.
+        assert!(!session.in_allsite("siteChanged"));
+
+        // channelJoinAllsite's {channel: "…"} form records + marks all-site, so
+        // the connection receives that channel's events for every xite.
         ChannelJoin { cmd: "channelJoinAllsite" }
-            .handle(&session, &json!({ "channel": "announcerChanged" }))
+            .handle(&session, &json!({ "channel": "siteChanged" }))
             .await
             .unwrap();
-        assert!(session.in_channel("announcerChanged"));
+        assert!(session.in_channel("siteChanged"));
+        assert!(session.in_allsite("siteChanged"));
     }
 
     #[tokio::test]
