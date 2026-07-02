@@ -1703,6 +1703,12 @@ impl AppState {
 
     /// Read a file from a served xite's storage.
     pub async fn read_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
+        // FilePack: `<pack>.zip/<inner>` or `<pack>.tar.gz/<inner>` serves a file
+        // from inside the archive.
+        if let Some((archive, within)) = split_archive_path(inner_path) {
+            let bytes = self.xites.read().await.get(address)?.storage.read(&archive).ok()?;
+            return read_from_archive(&archive, &bytes, &within);
+        }
         let xites = self.xites.read().await;
         xites.get(address)?.storage.read(inner_path).ok()
     }
@@ -1710,6 +1716,35 @@ impl AppState {
     /// A clone of a xite's content.json, if loaded.
     pub async fn content(&self, address: &str) -> Option<Value> {
         self.xites.read().await.get(address)?.content.clone()
+    }
+
+    /// `UiFileManager` - list a directory inside a xite as
+    /// `[{name, is_dir, size}]`, sorted (directories first). `None` if the xite
+    /// or path is unknown.
+    pub async fn list_dir(&self, address: &str, inner_path: &str) -> Option<Vec<Value>> {
+        let root = self.xites.read().await.get(address)?.storage.root().to_path_buf();
+        let dir = if inner_path.is_empty() { root.clone() } else { root.join(inner_path) };
+        // Stay within the xite root.
+        if !dir.starts_with(&root) {
+            return None;
+        }
+        let mut entries: Vec<Value> = Vec::new();
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let meta = entry.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            entries.push(json!({ "name": name, "is_dir": is_dir, "size": size }));
+        }
+        entries.sort_by(|a, b| {
+            let ad = a["is_dir"].as_bool().unwrap_or(false);
+            let bd = b["is_dir"].as_bool().unwrap_or(false);
+            bd.cmp(&ad).then_with(|| {
+                a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+            })
+        });
+        Some(entries)
     }
 
     /// Set the known peer count for a xite (from discovery), persisting nothing
@@ -1880,6 +1915,45 @@ fn piece_present(storage: &XiteStorage, inner_path: &str, offset: u64, len: u64,
 
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
 /// become counts, and the signatures are stripped (matches `formatSiteInfo`).
+/// Split a FilePack path into `(archive_inner_path, path_within_archive)` if it
+/// points inside a `.zip` or `.tar.gz` archive, e.g.
+/// `data.zip/img/a.jpg` -> `("data.zip", "img/a.jpg")`.
+fn split_archive_path(inner_path: &str) -> Option<(String, String)> {
+    for marker in [".tar.gz/", ".zip/"] {
+        if let Some(pos) = inner_path.find(marker) {
+            let split = pos + marker.len() - 1; // keep the extension, drop the slash
+            return Some((inner_path[..split].to_string(), inner_path[split + 1..].to_string()));
+        }
+    }
+    None
+}
+
+/// Read `within` out of an in-memory `.zip` or `.tar.gz` archive.
+fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if archive_path.ends_with(".zip") {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+        let mut file = zip.by_name(within).ok()?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).ok()?;
+        Some(out)
+    } else {
+        // .tar.gz
+        let gz = flate2::read::GzDecoder::new(bytes);
+        let mut tar = tar::Archive::new(gz);
+        for entry in tar.entries().ok()? {
+            let mut entry = entry.ok()?;
+            let path = entry.path().ok()?;
+            if path.to_string_lossy() == within {
+                let mut out = Vec::new();
+                entry.read_to_end(&mut out).ok()?;
+                return Some(out);
+            }
+        }
+        None
+    }
+}
+
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
 /// current directory). Uses `statvfs` on unix.
 fn free_space(path: Option<&std::path::Path>) -> i64 {
@@ -2269,6 +2343,34 @@ mod tests {
         state.notification_mute(false, None).await;
         state.notification_mute(true, Some("1Chat")).await;
         assert_eq!(state.notification_mute_status().await["site_mutes"]["1Chat"], true);
+    }
+
+    #[tokio::test]
+    async fn filepack_reads_from_tar_gz() {
+        use std::io::Write;
+        // Build a small .tar.gz containing dir/hello.txt.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let data = b"hi from the pack";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, "dir/hello.txt", &data[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let archive = gz.finish().unwrap();
+
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("pack.tar.gz", &archive).unwrap();
+        let state = AppState::new("test");
+        state.add_xite("1Pack", XiteEntry { storage, content: None }).await;
+
+        let out = state.read_file("1Pack", "pack.tar.gz/dir/hello.txt").await;
+        assert_eq!(out.as_deref(), Some(&b"hi from the pack"[..]));
+        // A missing entry is None, not an error.
+        assert!(state.read_file("1Pack", "pack.tar.gz/nope.txt").await.is_none());
     }
 
     #[tokio::test]

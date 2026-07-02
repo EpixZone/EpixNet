@@ -90,6 +90,7 @@ impl UiServer {
             .route("/uimedia/*path", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
+            .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
             .route("/:address/*path", get(serve_file))
@@ -303,6 +304,80 @@ fn render_config_page(values: &[(&str, &str, String)]) -> String {
          </form>"
     );
     page_shell("Configuration", "Configuration", "", &body)
+}
+
+/// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
+/// directory inside a xite with links to navigate and open files.
+async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    let (address, inner) = match path.split_once('/') {
+        Some((a, i)) => (a.to_string(), i.trim_end_matches('/').to_string()),
+        None => (path.clone(), String::new()),
+    };
+    let Some(entries) = ctx.state.list_dir(&address, &inner).await else {
+        return (StatusCode::NOT_FOUND, "unknown xite or path").into_response();
+    };
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries))
+        .into_response()
+}
+
+/// Render the file browser for a xite directory.
+fn render_file_manager(address: &str, inner: &str, entries: &[Value]) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let human = |n: u64| {
+        if n >= 1 << 20 {
+            format!("{:.1} MB", n as f64 / (1 << 20) as f64)
+        } else if n >= 1 << 10 {
+            format!("{:.1} kB", n as f64 / (1 << 10) as f64)
+        } else {
+            format!("{n} B")
+        }
+    };
+    let mut rows = String::new();
+    // Parent link.
+    if !inner.is_empty() {
+        let parent = inner.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        rows.push_str(&format!(
+            "<div class='row'><a class='name dir' href='/list/{address}/{parent}'>../</a></div>",
+            address = esc(address),
+            parent = esc(parent),
+        ));
+    }
+    for e in entries {
+        let name = e["name"].as_str().unwrap_or("");
+        let is_dir = e["is_dir"].as_bool().unwrap_or(false);
+        let child = if inner.is_empty() { name.to_string() } else { format!("{inner}/{name}") };
+        if is_dir {
+            rows.push_str(&format!(
+                "<div class='row'><a class='name dir' href='/list/{address}/{child}'>{name}/</a></div>",
+                address = esc(address),
+                child = esc(&child),
+                name = esc(name),
+            ));
+        } else {
+            let size = human(e["size"].as_u64().unwrap_or(0));
+            rows.push_str(&format!(
+                "<div class='row'><a class='name' href='/{address}/{child}'>{name}</a>\
+                 <span class='size'>{size}</span></div>",
+                address = esc(address),
+                child = esc(&child),
+                name = esc(name),
+            ));
+        }
+    }
+    let heading = if inner.is_empty() {
+        format!("Files: {}", esc(address))
+    } else {
+        format!("Files: {}/{}", esc(address), esc(inner))
+    };
+    let body = format!(
+        "<style>.row{{padding:8px 0;border-bottom:1px solid #f0f2f5}}\
+          .name{{font-size:16px}} .name.dir{{font-weight:600}}\
+          .size{{float:right;color:#999;font-size:13px}}</style>\
+         <div class='files'>{rows}</div>"
+    );
+    page_shell("Files", &heading, "", &body)
 }
 
 /// Shared page shell for the server-rendered admin pages, styled to match
