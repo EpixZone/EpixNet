@@ -263,13 +263,43 @@ async fn ws_upgrade(State(ctx): State<Ctx>, Query(q): Query<WsQuery>, ws: WebSoc
     ws.on_upgrade(move |socket| handle_ws(socket, ctx, xite))
 }
 
-async fn handle_ws(mut socket: WebSocket, ctx: Ctx, xite: Option<String>) {
+async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
+    use futures_util::{SinkExt, StreamExt};
     let session = WsSession { state: ctx.state.clone(), xite };
-    while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(text) = msg {
-            let reply = handle_text(&ctx, &session, &text).await;
-            if socket.send(Message::Text(reply)).await.is_err() {
-                break;
+    let mut events = ctx.state.subscribe_events();
+    let (mut sink, mut stream) = socket.split();
+    loop {
+        tokio::select! {
+            // Xite -> server requests.
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let reply = handle_text(&ctx, &session, &text).await;
+                        if sink.send(Message::Text(reply)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {} // ignore non-text frames (ping/pong/binary)
+                    _ => break, // stream closed or errored
+                }
+            }
+            // Server -> xite pushed events (setSiteInfo, setAnnouncerInfo, …).
+            event = events.recv() => {
+                match event {
+                    Ok(ev) => {
+                        // Route site-specific events only to that xite's socket.
+                        let deliver = match &ev.target {
+                            None => true,
+                            Some(addr) => session.xite.as_deref() == Some(addr.as_str()),
+                        };
+                        if deliver && sink.send(Message::Text(ev.payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Lagged: dropped some events under load — keep going.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
     }
