@@ -90,6 +90,25 @@ pub struct AppState {
     /// A small pool of warm peer connections, so the dashboard's connection
     /// stats reflect real live links.
     conn_pool: crate::conn_pool::ConnectionPool,
+    /// Broadcast channel for server-pushed UI events (`setSiteInfo`,
+    /// `setServerInfo`, `setAnnouncerInfo`, `notification`). Each WebSocket
+    /// connection subscribes and forwards matching messages to its socket, so
+    /// the dashboard updates live instead of waiting for its next poll.
+    events: tokio::sync::broadcast::Sender<UiEvent>,
+}
+
+/// A server-pushed UI event.
+///
+/// - `channel` gates by subscription: `Some("siteChanged")` reaches only
+///   connections that joined that channel; `None` is ungated (notifications).
+/// - `target` routes by xite: `Some(addr)` only to connections bound to that
+///   xite (so `setSiteInfo` for one alias does not overwrite another's), `None`
+///   is any xite.
+#[derive(Clone)]
+pub struct UiEvent {
+    pub channel: Option<String>,
+    pub target: Option<String>,
+    pub payload: String,
 }
 
 fn empty_filters() -> Value {
@@ -121,6 +140,7 @@ impl AppState {
             optional_limit_path: None,
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
+            events: tokio::sync::broadcast::channel(256).0,
         })
     }
 
@@ -168,6 +188,7 @@ impl AppState {
             optional_limit_path: Some(optional_limit_path),
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
+            events: tokio::sync::broadcast::channel(256).0,
         })
     }
 
@@ -231,13 +252,26 @@ impl AppState {
     /// folding the peers found into the xite's registry. Returns all peers.
     pub async fn announce_to_trackers(&self, address: &str, trackers: &[PeerAddr]) -> Vec<PeerAddr> {
         let Some(transport) = self.transport.read().await.clone() else { return Vec::new() };
+        // Trackers key peers by the signed content address, so a `.epix` alias
+        // must announce under that (not the display name) to find the same
+        // peers as the raw address.
+        let key = {
+            let xites = self.xites.read().await;
+            xites
+                .get(address)
+                .map(|x| canonical_address(x.content.as_ref(), address))
+                .unwrap_or_else(|| address.to_string())
+        };
         let mut all = Vec::new();
         for tracker in trackers {
-            let peers = epix_xite::announce(transport.as_ref(), address, std::slice::from_ref(tracker), 0).await;
+            let peers = epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(tracker), 0).await;
             self.record_tracker(&tracker.to_string(), peers.len()).await;
             all.extend(peers);
         }
         self.add_peers(address, all.clone()).await;
+        // Push the fresh peer count + tracker status to any connected UI.
+        self.push_site_info(address).await;
+        self.push_announcer_info().await;
         all
     }
 
@@ -913,11 +947,18 @@ impl AppState {
 
         // Mark peers we hold a live connection to as connected.
         let connected = self.conn_pool.connected_addrs().await;
-        let mut xites = self.xites.write().await;
-        for x in xites.values_mut() {
-            for addr in &connected {
-                x.peers.set_connected(addr, true, now_secs());
+        let addresses: Vec<String> = {
+            let mut xites = self.xites.write().await;
+            for x in xites.values_mut() {
+                for addr in &connected {
+                    x.peers.set_connected(addr, true, now_secs());
+                }
             }
+            xites.keys().cloned().collect()
+        };
+        // Push the updated connection/peer counts to any connected UI.
+        for address in addresses {
+            self.push_site_info(&address).await;
         }
     }
 
@@ -925,6 +966,43 @@ impl AppState {
     /// ping avg/min) for the chart collector.
     pub async fn connection_stats(&self) -> crate::conn_pool::ConnectionStats {
         self.conn_pool.stats().await
+    }
+
+    // --- Server-pushed UI events --------------------------------------------
+
+    /// Subscribe to server-pushed UI events (one receiver per WS connection).
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<UiEvent> {
+        self.events.subscribe()
+    }
+
+    /// Push an unsolicited `{cmd, params}` event. `channel` gates by
+    /// subscription (`None` = ungated); `target` gates by xite (`None` = any).
+    /// No-op if nothing is listening.
+    fn push_event(&self, cmd: &str, params: Value, channel: Option<&str>, target: Option<String>) {
+        let payload = json!({ "cmd": cmd, "params": params, "to": Value::Null }).to_string();
+        let _ = self.events.send(UiEvent { channel: channel.map(str::to_string), target, payload });
+    }
+
+    /// Push the latest `siteInfo` for a xite (`setSiteInfo`) on the `siteChanged`
+    /// channel, only to that xite's connections, so the dashboard's
+    /// peer/connection/content readouts update the moment they change.
+    pub async fn push_site_info(&self, address: &str) {
+        let info = self.site_info(address).await;
+        if !info.is_null() {
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
+    }
+
+    /// Push the latest tracker stats (`setAnnouncerInfo`) on `announcerChanged`.
+    pub async fn push_announcer_info(&self) {
+        let params = json!({ "stats": self.announcer_stats().await });
+        self.push_event("setAnnouncerInfo", params, Some("announcerChanged"), None);
+    }
+
+    /// Push a wrapper notification (`["info"|"done"|"error", message,
+    /// timeout_ms]`). Ungated — notifications reach every connection.
+    pub fn push_notification(&self, kind: &str, message: &str, timeout_ms: i64) {
+        self.push_event("notification", json!([kind, message, timeout_ms]), None, None);
     }
 
     /// Snapshot current node metrics into the chart db: one global datapoint
@@ -1774,6 +1852,31 @@ mod tests {
         let stats = state.optional_limit_stats().await;
         assert!(stats["used"].is_number() && stats["free"].is_number());
         assert_eq!(stats["limit"], "10%");
+    }
+
+    #[tokio::test]
+    async fn pushed_events_route_by_target() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("1site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(json!({ "address": "1site", "files": {} })) })
+            .await;
+        let mut rx = state.subscribe_events();
+
+        // A site event is on the siteChanged channel, targeted at that address.
+        state.push_site_info("1site").await;
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.channel.as_deref(), Some("siteChanged"));
+        assert_eq!(ev.target.as_deref(), Some("1site"));
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "setSiteInfo");
+        assert_eq!(payload["params"]["address"], "1site");
+
+        // A notification is ungated + global (no channel, no target).
+        state.push_notification("done", "hi", 1000);
+        let ev = rx.try_recv().unwrap();
+        assert!(ev.channel.is_none() && ev.target.is_none());
+        assert_eq!(serde_json::from_str::<Value>(&ev.payload).unwrap()["cmd"], "notification");
     }
 
     #[tokio::test]

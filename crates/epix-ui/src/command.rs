@@ -90,12 +90,48 @@ pub struct WsSession {
     pub state: Arc<AppState>,
     /// The xite address this WebSocket connection is bound to (if any).
     pub xite: Option<String>,
+    /// Channels this connection has joined (`channelJoin`), e.g. `siteChanged`.
+    /// Server-pushed events are delivered only for joined channels.
+    pub channels: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl WsSession {
+    pub fn new(state: Arc<AppState>, xite: Option<String>) -> Self {
+        Self { state, xite, channels: std::sync::Mutex::new(std::collections::HashSet::new()) }
+    }
+
     /// The xite address bound to this connection, or an error if none.
     pub fn address(&self) -> Result<&str, String> {
         self.xite.as_deref().ok_or_else(|| "no xite bound to this connection".to_string())
+    }
+
+    /// Whether this connection has joined `channel`.
+    pub fn in_channel(&self, channel: &str) -> bool {
+        self.channels.lock().unwrap().contains(channel)
+    }
+
+    /// Record joined channel(s) from a `channelJoin`/`channelJoinAllsite` param
+    /// (accepts `{channels: [...]}`, `{channel: "…"}`, a bare string, or array).
+    pub fn join_channels(&self, params: &Value) {
+        let mut set = self.channels.lock().unwrap();
+        let mut add = |v: &Value| {
+            if let Some(s) = v.as_str() {
+                set.insert(s.to_string());
+            }
+        };
+        match params {
+            Value::String(_) => add(params),
+            Value::Array(a) => a.iter().for_each(&mut add),
+            Value::Object(o) => {
+                if let Some(Value::Array(a)) = o.get("channels") {
+                    a.iter().for_each(&mut add);
+                }
+                if let Some(v) = o.get("channel") {
+                    add(v);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -173,8 +209,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(Ping),
         Arc::new(ServerInfo),
         Arc::new(SiteInfo),
-        Arc::new(simple("channelJoin", json!("ok"))),
-        Arc::new(simple("channelJoinAllsite", json!("ok"))),
+        Arc::new(ChannelJoin { cmd: "channelJoin" }),
+        Arc::new(ChannelJoin { cmd: "channelJoinAllsite" }),
         Arc::new(simple("announcerInfo", json!({ "stats": {} }))),
         Arc::new(PermissionAdd),
         Arc::new(PermissionRemove),
@@ -402,6 +438,23 @@ impl WsCommand for ChartDbQuery {
             Ok(rows) => Ok(Value::Array(rows)),
             Err(e) => Ok(json!({ "error": e })),
         }
+    }
+}
+
+/// `channelJoin` / `channelJoinAllsite` — subscribe the connection to server
+/// push channels (`siteChanged`, `serverChanged`, `announcerChanged`), so it
+/// receives the matching `setSiteInfo`/`setServerInfo`/`setAnnouncerInfo` events.
+struct ChannelJoin {
+    cmd: &'static str,
+}
+#[async_trait]
+impl WsCommand for ChannelJoin {
+    fn name(&self) -> &'static str {
+        self.cmd
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        s.join_channels(p);
+        Ok(Value::from("ok"))
     }
 }
 
@@ -1286,6 +1339,28 @@ mod tests {
     use epix_xite::XiteStorage;
 
     #[tokio::test]
+    async fn channel_join_records_subscriptions() {
+        let session = WsSession::new(AppState::new("test"), Some("1site".into()));
+        assert!(!session.in_channel("siteChanged"));
+
+        // The wrapper form: {channels: [...]}.
+        ChannelJoin { cmd: "channelJoin" }
+            .handle(&session, &json!({ "channels": ["siteChanged", "serverChanged"] }))
+            .await
+            .unwrap();
+        assert!(session.in_channel("siteChanged"));
+        assert!(session.in_channel("serverChanged"));
+        assert!(!session.in_channel("announcerChanged"));
+
+        // channelJoinAllsite's {channel: "…"} form also records.
+        ChannelJoin { cmd: "channelJoinAllsite" }
+            .handle(&session, &json!({ "channel": "announcerChanged" }))
+            .await
+            .unwrap();
+        assert!(session.in_channel("announcerChanged"));
+    }
+
+    #[tokio::test]
     async fn admin_commands_are_gated_until_granted() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
@@ -1294,7 +1369,7 @@ mod tests {
             .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
             .await;
         let registry = CommandRegistry::with_defaults();
-        let session = WsSession { state: state.clone(), xite: Some(addr.into()) };
+        let session = WsSession::new(state.clone(), Some(addr.into()));
 
         // Inner page (small id), no ADMIN yet: an admin command is refused.
         let denied = registry.dispatch(&session, "siteList", &json!([]), 5).await;
@@ -1335,7 +1410,7 @@ mod tests {
             .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path().join("o")), content: Some(json!({ "merged_type": "OtherApp" })) })
             .await;
 
-        let session = WsSession { state: state.clone(), xite: Some(merger.into()) };
+        let session = WsSession::new(state.clone(), Some(merger.into()));
         let list = MergerSiteList.handle(&session, &json!([false])).await.unwrap();
         assert_eq!(list["1Merged"], "ZeroMe");
         assert!(list.get("1Other").is_none(), "different merged type excluded");
@@ -1345,7 +1420,7 @@ mod tests {
         assert_eq!(f, "merged file");
 
         // A non-merger site can't list.
-        let s2 = WsSession { state, xite: Some(merged.into()) };
+        let s2 = WsSession::new(state, Some(merged.into()));
         assert!(MergerSiteList.handle(&s2, &json!([false])).await.is_err());
     }
 
@@ -1353,7 +1428,7 @@ mod tests {
     async fn cryptmessage_commands_round_trip() {
         let state = AppState::new("test");
         let addr = "1CryptSite";
-        let session = WsSession { state: state.clone(), xite: Some(addr.into()) };
+        let session = WsSession::new(state.clone(), Some(addr.into()));
 
         // ECIES to my own key (index 0), then decrypt with my own key.
         let enc = EciesEncrypt.handle(&session, &json!(["secret 🔒", 0])).await.unwrap();
@@ -1383,7 +1458,7 @@ mod tests {
     #[tokio::test]
     async fn content_filter_mutes_and_siteblocks() {
         let state = AppState::new("test");
-        let session = WsSession { state: state.clone(), xite: Some("1site".into()) };
+        let session = WsSession::new(state.clone(), Some("1site".into()));
 
         MuteAdd
             .handle(&session, &json!(["1AuthorAddr", "bob@zeroid.bit", "spam"]))
@@ -1456,7 +1531,7 @@ mod tests {
             )
             .await;
 
-        let session = WsSession { state, xite: Some(site.to_string()) };
+        let session = WsSession::new(state, Some(site.to_string()));
         // day_limit = 0 so ancient test timestamps aren't filtered.
         let out = FeedQuery.handle(&session, &json!([10, 0])).await.unwrap();
 
