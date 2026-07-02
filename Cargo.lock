@@ -771,6 +771,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64",
+ "epix-chain",
  "epix-core",
  "epix-crypt",
  "epix-db",
