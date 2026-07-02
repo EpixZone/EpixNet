@@ -278,16 +278,34 @@ pub fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<i64> {
 pub fn query_value(conn: &Connection, sql: &str, params: &Value) -> Result<Vec<Value>> {
     match params {
         Value::Object(map) => {
-            let named: Vec<(String, SqlValue)> = map
-                .iter()
-                .map(|(k, v)| {
-                    let key = if k.starts_with(':') { k.clone() } else { format!(":{k}") };
-                    (key, to_sql(v))
-                })
-                .collect();
+            // A list-valued param expands `IN :key` into `IN (:key__0, :key__1,
+            // …)`, binding each element (matching EpixNet's DbCursor). This is
+            // what the Stats page's chartDbQuery relies on for `type_id IN
+            // :type_ids`.
+            let mut sql = sql.to_string();
+            let mut named: Vec<(String, SqlValue)> = Vec::new();
+            for (k, v) in map {
+                let base = k.strip_prefix(':').unwrap_or(k);
+                match v {
+                    Value::Array(items) => {
+                        let placeholders: Vec<String> =
+                            (0..items.len()).map(|i| format!(":{base}__{i}")).collect();
+                        // Replace `:key` when followed by `)`, whitespace, or end.
+                        let re = Regex::new(&format!(r":{}([)\s]|$)", regex::escape(base)))
+                            .map_err(|e| Error::Db(e.to_string()))?;
+                        sql = re
+                            .replace_all(&sql, format!("({})$1", placeholders.join(", ")))
+                            .into_owned();
+                        for (i, item) in items.iter().enumerate() {
+                            named.push((format!(":{base}__{i}"), to_sql(item)));
+                        }
+                    }
+                    _ => named.push((format!(":{base}"), to_sql(v))),
+                }
+            }
             let refs: Vec<(&str, &dyn rusqlite::ToSql)> =
                 named.iter().map(|(k, v)| (k.as_str(), v as &dyn rusqlite::ToSql)).collect();
-            let mut stmt = conn.prepare(sql).map_err(db_err)?;
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
             collect(&mut stmt, refs.as_slice())
         }
         Value::Array(arr) => query(conn, sql, arr),

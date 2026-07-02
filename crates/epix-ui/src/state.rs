@@ -791,9 +791,10 @@ impl AppState {
 
     // --- Network-stats chart -------------------------------------------------
 
-    /// Run a `chartDbQuery` (SELECT-only) against the chart database.
-    pub async fn chart_query(&self, sql: &str) -> Result<Vec<Value>, String> {
-        self.chart.query(sql)
+    /// Run a `chartDbQuery` (SELECT-only) against the chart database, binding
+    /// `params` by name.
+    pub async fn chart_query(&self, sql: &str, params: &Value) -> Result<Vec<Value>, String> {
+        self.chart.query(sql, params)
     }
 
     /// Snapshot current node metrics into the chart db: one global datapoint
@@ -1390,28 +1391,47 @@ mod tests {
         state.collect_chart().await;
 
         // The type table is populated with the metric names the Stats page reads.
-        let types = state.chart_query("SELECT * FROM type").await.unwrap();
+        let types = state.chart_query("SELECT * FROM type", &Value::Null).await.unwrap();
         let names: Vec<&str> = types.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"size"));
         assert!(names.contains(&"connection"));
         assert!(names.contains(&"peer"));
 
         // The site table has our xite.
-        let sites = state.chart_query("SELECT * FROM site").await.unwrap();
+        let sites = state.chart_query("SELECT * FROM site", &Value::Null).await.unwrap();
         assert!(sites.iter().any(|s| s["address"] == "1SizeXite"));
 
         // The global `size` datapoint reflects the xite's content size (500).
         let rows = state
             .chart_query(
                 "SELECT value FROM data WHERE type_id = (SELECT type_id FROM type WHERE name='size') AND site_id IS NULL",
+                &Value::Null,
             )
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["value"], 500);
 
+        // The Stats page's chart query binds a list param: `type_id IN
+        // :type_ids` expands to a placeholder list and returns the latest value
+        // per requested type. Look up the ids for `size` and `peer`.
+        let type_ids: Vec<i64> = types
+            .iter()
+            .filter(|t| matches!(t["name"].as_str(), Some("size") | Some("peer")))
+            .filter_map(|t| t["type_id"].as_i64())
+            .collect();
+        assert_eq!(type_ids.len(), 2);
+        let latest = state
+            .chart_query(
+                "SELECT type_id, value FROM data WHERE type_id IN :type_ids AND site_id IS NULL",
+                &json!({ "type_ids": type_ids }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.len(), 2, "list param expands and both types match");
+
         // Non-SELECT statements are rejected.
-        assert!(state.chart_query("DELETE FROM data").await.is_err());
+        assert!(state.chart_query("DELETE FROM data", &Value::Null).await.is_err());
     }
 
     fn sample_content() -> Value {
