@@ -110,6 +110,8 @@ async fn announce_loop(
         for address in state.xite_addresses().await {
             state.announce_to_trackers(&address, &trackers).await;
         }
+        // Persist the freshly discovered peers so they survive a restart.
+        state.persist_peers().await;
     };
     announce().await;
     let mut tick = interval(period);

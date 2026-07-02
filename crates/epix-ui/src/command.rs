@@ -105,6 +105,24 @@ impl WsSession {
         self.xite.as_deref().ok_or_else(|| "no xite bound to this connection".to_string())
     }
 
+    /// Resolve a possibly cross-origin `inner_path` to `(address, inner_path)`.
+    /// A `cors-<address>/<path>` prefix routes to `<address>` when the bound site
+    /// holds the `Cors:<address>` permission (the Cors plugin); otherwise the
+    /// bound site + path is returned unchanged.
+    pub async fn cors_target(&self, inner_path: &str) -> Result<(String, String), String> {
+        let bound = self.address()?.to_string();
+        if let Some(rest) = inner_path.strip_prefix("cors-") {
+            if let Some((addr, inner)) = rest.split_once('/') {
+                let perm = format!("Cors:{addr}");
+                if self.state.site_permissions(&bound).await.iter().any(|p| *p == perm) {
+                    return Ok((addr.to_string(), inner.to_string()));
+                }
+                return Err(format!("This site has no permission to access site {addr}"));
+            }
+        }
+        Ok((bound, inner_path.to_string()))
+    }
+
     /// Whether this connection has joined `channel`.
     pub fn in_channel(&self, channel: &str) -> bool {
         self.channels.lock().unwrap().contains(channel)
@@ -239,6 +257,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SitePublish),
         Arc::new(FileWrite),
         Arc::new(FileRules),
+        Arc::new(CorsPermission),
         Arc::new(SiteSetOwned),
         Arc::new(SiteRecoverPrivatekey),
         Arc::new(UserSetSitePrivatekey),
@@ -341,16 +360,17 @@ impl WsCommand for FileGet {
         "fileGet"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?;
         // params may be a bare inner_path string or an object with `inner_path`.
         let inner_path = p
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .ok_or("fileGet: missing inner_path")?;
+        // `cors-<address>/<path>` routes to another site (Cors permission).
+        let (address, inner_path) = s.cors_target(inner_path).await?;
         // A `merged-<type>/<address>/<path>` file reads from the merged site.
-        let (target, inner) = match AppState::split_merged_path(inner_path) {
+        let (target, inner) = match AppState::split_merged_path(&inner_path) {
             Some((addr, inner)) => (addr, inner),
-            None => (address.to_string(), inner_path.to_string()),
+            None => (address, inner_path),
         };
         match s.state.read_file(&target, &inner).await {
             Some(bytes) => Ok(Value::from(String::from_utf8_lossy(&bytes).into_owned())),
@@ -763,13 +783,47 @@ impl WsCommand for FileRules {
         "fileRules"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let inner_path = p
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .unwrap_or("content.json");
-        Ok(s.state.file_rules(&address, inner_path).await)
+        let (address, inner_path) = s.cors_target(inner_path).await?;
+        Ok(s.state.file_rules(&address, &inner_path).await)
+    }
+}
+
+/// `corsPermission(address)` - grant this site read access to another site's
+/// files (the `Cors:<address>` permission), so it can load `cors-<address>/…`.
+struct CorsPermission;
+#[async_trait]
+impl WsCommand for CorsPermission {
+    fn name(&self) -> &'static str {
+        "corsPermission"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        // Accept a single address or a list.
+        let addresses: Vec<String> = match p {
+            Value::String(a) => vec![a.clone()],
+            Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            Value::Object(o) => o
+                .get("address")
+                .map(|v| match v {
+                    Value::String(a) => vec![a.clone()],
+                    Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                    _ => vec![],
+                })
+                .unwrap_or_default(),
+            _ => vec![],
+        };
+        if addresses.is_empty() {
+            return Err("corsPermission: address required".into());
+        }
+        for addr in addresses {
+            s.state.add_permission(&site, &format!("Cors:{addr}")).await;
+        }
+        Ok(Value::from("ok"))
     }
 }
 
@@ -1580,6 +1634,31 @@ mod tests {
             .await
             .unwrap();
         assert!(session.in_channel("announcerChanged"));
+    }
+
+    #[tokio::test]
+    async fn cors_routes_only_with_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("1A", XiteEntry { storage: XiteStorage::new(dir.path().join("a")), content: None })
+            .await;
+        let session = WsSession::new(state.clone(), Some("1A".into()));
+
+        // No Cors permission: a cors- path is rejected.
+        assert!(session.cors_target("cors-1B/data.json").await.is_err());
+        // A normal path resolves to the bound site.
+        assert_eq!(
+            session.cors_target("index.html").await.unwrap(),
+            ("1A".to_string(), "index.html".to_string())
+        );
+
+        // Grant Cors:1B (as corsPermission does), then the cors- path routes to 1B.
+        CorsPermission.handle(&session, &json!("1B")).await.unwrap();
+        assert_eq!(
+            session.cors_target("cors-1B/data.json").await.unwrap(),
+            ("1B".to_string(), "data.json".to_string())
+        );
     }
 
     #[tokio::test]

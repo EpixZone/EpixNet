@@ -116,6 +116,9 @@ pub struct AppState {
     /// Open sidebar-console log streams (`consoleLogStream`); new log lines are
     /// pushed to each as `logLineAdd` events.
     log_streams: RwLock<Vec<i64>>,
+    /// Path to the persisted peer database (`peers.json`), so known peers survive
+    /// restarts (the PeerDb plugin). None for in-memory nodes.
+    peers_path: Option<PathBuf>,
 }
 
 /// A server-pushed UI event.
@@ -167,6 +170,7 @@ impl AppState {
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
+            peers_path: None,
         })
     }
 
@@ -225,6 +229,7 @@ impl AppState {
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
+            peers_path: Some(dir.join("peers.json")),
         })
     }
 
@@ -337,6 +342,13 @@ impl AppState {
             Some((db, schema)) => (Some(db), Some(schema)),
             None => (None, None),
         };
+        // Restore any peers persisted by the PeerDb plugin, keyed by the signed
+        // content address.
+        let mut peers = Peers::new();
+        let saved = self.load_persisted_peers(&canonical);
+        if !saved.is_empty() {
+            peers.add_many(saved, now_secs());
+        }
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -345,7 +357,7 @@ impl AppState {
                 settings,
                 db,
                 db_schema,
-                peers: Peers::new(),
+                peers,
                 bytes_recv: 0,
                 bytes_sent: 0,
                 tasks_active: 0,
@@ -362,6 +374,39 @@ impl AppState {
         if let Some(x) = xites.get_mut(address) {
             x.peers.add_many(addrs, now_secs());
             x.settings.peers = x.peers.len() as i64;
+        }
+    }
+
+    // --- PeerDb: persist known peers across restarts ------------------------
+
+    /// Load the peers persisted for a site (by signed content address).
+    fn load_persisted_peers(&self, canonical: &str) -> Vec<PeerAddr> {
+        let Some(path) = &self.peers_path else { return Vec::new() };
+        let map: serde_json::Map<String, Value> = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        map.get(canonical)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(|s| PeerAddr::parse(s).ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Persist every served xite's peers to `peers.json` (keyed by signed content
+    /// address, so aliases share one list). Called periodically by the runtime.
+    pub async fn persist_peers(&self) {
+        let Some(path) = &self.peers_path else { return };
+        let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (key, x) in self.xites.read().await.iter() {
+            let canonical = canonical_address(x.content.as_ref(), key);
+            if x.peers.len() == 0 {
+                continue;
+            }
+            let list: Vec<Value> = x.peers.peers().map(|p| json!(p.addr.to_string())).collect();
+            map.insert(canonical, Value::Array(list));
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let _ = std::fs::write(path, bytes);
         }
     }
 
@@ -2121,6 +2166,25 @@ mod tests {
         while events.try_recv().is_ok() {}
         state.log("INFO", "after removal").await;
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn peers_persist_across_restart() {
+        let dir = tempdir().unwrap();
+        let content = json!({ "address": "1Site", "files": {} });
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            s.add_xite("1Site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) }).await;
+            s.add_peers("1Site", vec![
+                PeerAddr::parse("1.2.3.4:15441").unwrap(),
+                PeerAddr::parse("5.6.7.8:15441").unwrap(),
+            ]).await;
+            s.persist_peers().await;
+        }
+        // A fresh node over the same data dir restores the peers on add_xite.
+        let s = AppState::with_data_dir("test", dir.path());
+        s.add_xite("1Site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
+        assert_eq!(s.peer_counts("1Site").await.total, 2);
     }
 
     #[tokio::test]
