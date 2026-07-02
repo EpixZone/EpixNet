@@ -1075,9 +1075,19 @@ impl AppState {
         }
     }
 
-    /// The recent log lines (`serverErrors`): `[[date_added, level, message], …]`.
+    /// `serverErrors` — only the ERROR-level log lines, `[[date_added, level,
+    /// message], …]`. Matches EpixNet's error logger (level ERROR), so the
+    /// dashboard's warning badge lights up for real errors, not routine INFO
+    /// activity. The full activity log is in the sidebar console
+    /// (`consoleLogRead`/`consoleLogStream`), which keeps every level.
     pub async fn server_errors(&self) -> Vec<Value> {
-        self.logs.read().await.iter().cloned().collect()
+        self.logs
+            .read()
+            .await
+            .iter()
+            .filter(|l| matches!(l.get(1).and_then(Value::as_str), Some("ERROR") | Some("CRITICAL")))
+            .cloned()
+            .collect()
     }
 
     /// `consoleLogRead` — recent lines for the sidebar console as formatted
@@ -1997,17 +2007,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_buffer_feeds_server_errors() {
+    async fn server_errors_returns_only_error_level() {
         let state = AppState::new("test");
         state.log("INFO", "started").await;
         state.log("WARNING", "slow peer").await;
-        let lines = state.server_errors().await;
-        assert_eq!(lines.len(), 2);
-        // Each line is [date_added, level, message], newest last.
-        assert_eq!(lines[0][1], "INFO");
-        assert_eq!(lines[0][2], "started");
-        assert_eq!(lines[1][1], "WARNING");
-        assert!(lines[1][0].as_f64().unwrap() > 0.0);
+        state.log("ERROR", "sync failed").await;
+        // serverErrors is ERROR-only, so the warning badge ignores routine logs.
+        let errors = state.server_errors().await;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0][1], "ERROR");
+        assert_eq!(errors[0][2], "sync failed");
+        assert!(errors[0][0].as_f64().unwrap() > 0.0);
+        // The sidebar console still sees all three levels.
+        assert_eq!(state.console_log_read().await["num_found"], 3);
     }
 
     #[tokio::test]
