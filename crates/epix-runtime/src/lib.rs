@@ -95,35 +95,53 @@ impl NodeRuntime {
 }
 
 /// Re-announce every xite to the trackers (recording per-tracker stats).
+/// Announces once immediately (so peers populate right after startup without
+/// blocking the server bind), then every `period`.
 async fn announce_loop(
     state: Arc<AppState>,
     trackers: Vec<PeerAddr>,
     shutdown: Arc<Notify>,
     period: Duration,
 ) {
+    let announce = || async {
+        if trackers.is_empty() {
+            return;
+        }
+        for address in state.xite_addresses().await {
+            state.announce_to_trackers(&address, &trackers).await;
+        }
+    };
+    announce().await;
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
-            _ = tick.tick() => {
-                if trackers.is_empty() { continue; }
-                for address in state.xite_addresses().await {
-                    state.announce_to_trackers(&address, &trackers).await;
-                }
-            }
+            _ = tick.tick() => announce().await,
         }
     }
 }
 
 /// Keep a small pool of warm peer connections open + pinged, so the dashboard's
-/// connection stats reflect real live links. Runs once immediately, then every
-/// `period`.
+/// connection stats reflect real live links. Warms up quickly (peers arrive from
+/// the announce loop shortly after startup), then settles into `period`.
 async fn connection_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
-    // Warm the pool, then re-snapshot the chart so its connection stats reflect
-    // the freshly established links instead of the empty startup snapshot.
-    state.manage_connections().await;
+    // Retry every few seconds until the pool has a connection, so the count
+    // shows soon after the background announce populates peers — rather than
+    // waiting a full period after the empty first attempt.
+    for _ in 0..10 {
+        state.manage_connections().await;
+        if state.connection_stats().await.total > 0 {
+            break;
+        }
+        tokio::select! {
+            _ = shutdown.notified() => return,
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+        }
+    }
+    // Re-snapshot the chart so connection stats reflect the warmed pool instead
+    // of the empty startup snapshot.
     state.collect_chart().await;
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);

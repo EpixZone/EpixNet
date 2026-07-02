@@ -59,48 +59,59 @@ impl ConnectionPool {
     }
 
     /// Open connections to `peers` we are not already connected to, up to the
-    /// pool's cap. Clearnet + onion only (mesh peers are skipped here). Dialing
-    /// happens without holding the pool lock.
+    /// pool's cap. Clearnet + onion only (mesh peers are skipped here). Peers are
+    /// dialed concurrently, so one slow/unreachable peer does not hold up the
+    /// rest, and the pool lock is not held while dialing.
     pub async fn ensure(&self, transport: Arc<dyn Transport>, peers: &[PeerAddr]) {
-        let (have, mut room) = {
+        let (have, room) = {
             let conns = self.conns.lock().await;
             (conns.keys().cloned().collect::<Vec<_>>(), self.max.saturating_sub(conns.len()))
         };
-        for addr in peers {
-            if room == 0 {
-                break;
-            }
-            if have.contains(addr) || matches!(addr, PeerAddr::Rns(_)) {
-                continue;
-            }
-            let onion = matches!(addr, PeerAddr::Onion { .. });
-            let dialed = tokio::time::timeout(DIAL_TIMEOUT, async {
-                let mut conn = Connection::connect(transport.as_ref(), addr).await.ok()?;
-                conn.handshake().await.ok()?;
-                Some(conn)
-            })
-            .await
-            .ok()
-            .flatten();
-            let Some(conn) = dialed else { continue };
+        if room == 0 {
+            return;
+        }
+        // Try a few more than `room` so some failures still fill the slots.
+        let to_dial: Vec<PeerAddr> = peers
+            .iter()
+            .filter(|a| !have.contains(a) && !matches!(a, PeerAddr::Rns(_)))
+            .take(room * 3)
+            .cloned()
+            .collect();
+        let mut set = tokio::task::JoinSet::new();
+        for addr in to_dial {
+            let transport = transport.clone();
+            set.spawn(async move {
+                let onion = matches!(addr, PeerAddr::Onion { .. });
+                let conn = tokio::time::timeout(DIAL_TIMEOUT, async {
+                    let mut conn = Connection::connect(transport.as_ref(), &addr).await.ok()?;
+                    conn.handshake().await.ok()?;
+                    Some(conn)
+                })
+                .await
+                .ok()
+                .flatten();
+                conn.map(|conn| (addr, onion, conn))
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            let Ok(Some((addr, onion, conn))) = res else { continue };
             let mut conns = self.conns.lock().await;
-            if conns.len() >= self.max || conns.contains_key(addr) {
+            if conns.len() >= self.max || conns.contains_key(&addr) {
                 continue;
             }
             conns.insert(
-                addr.clone(),
+                addr,
                 PeerConn {
                     conn: Arc::new(Mutex::new(conn)),
                     last_ping_ms: Arc::new(AtomicI64::new(-1)),
                     onion,
                 },
             );
-            room -= 1;
         }
     }
 
-    /// Ping every held connection, updating its ping and dropping any that fail.
-    /// The pool lock is not held while pinging.
+    /// Ping every held connection concurrently, updating each ping and dropping
+    /// any that fail. The pool lock is not held while pinging.
     pub async fn ping_all(&self) {
         let entries: Vec<(PeerAddr, Arc<Mutex<Connection>>, Arc<AtomicI64>)> = {
             let conns = self.conns.lock().await;
@@ -109,18 +120,25 @@ impl ConnectionPool {
                 .map(|(a, c)| (a.clone(), c.conn.clone(), c.last_ping_ms.clone()))
                 .collect()
         };
-        let mut dead = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
         for (addr, conn, last_ping) in entries {
-            let start = Instant::now();
-            let mut guard = conn.lock().await;
-            let ok = matches!(
-                tokio::time::timeout(PING_TIMEOUT, guard.ping()).await,
-                Ok(Ok(true))
-            );
-            drop(guard);
-            if ok {
-                last_ping.store(start.elapsed().as_millis() as i64, Ordering::Relaxed);
-            } else {
+            set.spawn(async move {
+                let start = Instant::now();
+                let mut guard = conn.lock().await;
+                let ok = matches!(
+                    tokio::time::timeout(PING_TIMEOUT, guard.ping()).await,
+                    Ok(Ok(true))
+                );
+                drop(guard);
+                if ok {
+                    last_ping.store(start.elapsed().as_millis() as i64, Ordering::Relaxed);
+                }
+                (addr, ok)
+            });
+        }
+        let mut dead = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok((addr, false)) = res {
                 dead.push(addr);
             }
         }
