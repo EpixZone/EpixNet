@@ -67,6 +67,12 @@ pub struct AppState {
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
+    /// Permissions the user has explicitly granted per xite (`address -> [perm]`),
+    /// e.g. ADMIN or `Merger:<type>`. A xite gets no permission until it requests
+    /// one and the user approves the grant prompt; persisted so a grant survives
+    /// restarts.
+    grants: RwLock<HashMap<String, Vec<String>>>,
+    grants_path: Option<PathBuf>,
 }
 
 fn empty_filters() -> Value {
@@ -91,6 +97,8 @@ impl AppState {
             filters_path: None,
             transport: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
+            grants: RwLock::new(HashMap::new()),
+            grants_path: None,
         })
     }
 
@@ -106,6 +114,11 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_else(empty_filters);
+        let grants_path = dir.join("permissions.json");
+        let grants = std::fs::read(&grants_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -117,6 +130,8 @@ impl AppState {
             filters_path: Some(filters_path),
             transport: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
+            grants: RwLock::new(grants),
+            grants_path: Some(grants_path),
         })
     }
 
@@ -132,8 +147,12 @@ impl AppState {
     pub async fn add_xite(&self, address: impl Into<String>, entry: XiteEntry) {
         let address = address.into();
         let mut settings = XiteSettings::new(now_secs());
-        // The local node administers what it serves.
-        settings.permissions.push("ADMIN".to_string());
+        // A xite starts with no permissions. ADMIN (and other permissions) are
+        // granted only when the xite requests one and the user approves the
+        // wrapper's grant prompt; those grants are restored here from disk.
+        if let Some(granted) = self.grants.read().await.get(&address) {
+            settings.permissions = granted.clone();
+        }
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
         }
@@ -682,11 +701,60 @@ impl AppState {
 
     // --- MergerSite ----------------------------------------------------------
 
-    /// Grant a permission to a xite (e.g. `Merger:ZeroMe`). Idempotent.
+    /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:ZeroMe`). Idempotent.
+    /// The grant is persisted so it survives restarts.
     pub async fn add_permission(&self, address: &str, permission: &str) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             if !x.settings.permissions.iter().any(|p| p == permission) {
                 x.settings.permissions.push(permission.to_string());
+            }
+        }
+        {
+            let mut grants = self.grants.write().await;
+            let entry = grants.entry(address.to_string()).or_default();
+            if !entry.iter().any(|p| p == permission) {
+                entry.push(permission.to_string());
+            }
+        }
+        self.save_grants().await;
+    }
+
+    /// Revoke a permission from a xite. Persisted.
+    pub async fn remove_permission(&self, address: &str, permission: &str) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.permissions.retain(|p| p != permission);
+        }
+        if let Some(entry) = self.grants.write().await.get_mut(address) {
+            entry.retain(|p| p != permission);
+        }
+        self.save_grants().await;
+    }
+
+    /// The permissions currently held by a xite (empty if it is not served).
+    pub async fn site_permissions(&self, address: &str) -> Vec<String> {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.permissions.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether a xite holds ADMIN.
+    pub async fn site_has_admin(&self, address: &str) -> bool {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.permissions.iter().any(|p| p == "ADMIN"))
+            .unwrap_or(false)
+    }
+
+    /// Persist the per-xite permission grants to `data_dir/permissions.json`.
+    async fn save_grants(&self) {
+        if let Some(path) = &self.grants_path {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&*self.grants.read().await) {
+                let _ = std::fs::write(path, bytes);
             }
         }
     }
@@ -1223,7 +1291,8 @@ mod tests {
         assert_eq!(info["settings"]["size"], 350);
         assert_eq!(info["settings"]["size_optional"], 9000);
         assert_eq!(info["content_updated"], 1777992697.0);
-        assert!(info["settings"]["permissions"].as_array().unwrap().iter().any(|p| p == "ADMIN"));
+        // A freshly served xite holds no permissions until the user grants one.
+        assert!(info["settings"]["permissions"].as_array().unwrap().is_empty());
 
         // content.json summarized: counts, signs stripped, title kept.
         assert_eq!(info["content"]["files"], 2);
@@ -1473,5 +1542,25 @@ mod tests {
             s.site_info(addr).await["auth_address"].as_str().unwrap().to_string()
         };
         assert_eq!(a1, a2, "auth address is stable across restarts");
+    }
+
+    #[tokio::test]
+    async fn granted_permission_persists_across_restart() {
+        let dir = tempdir().unwrap();
+        let addr = "dashboard.epix";
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
+            assert!(!s.site_has_admin(addr).await, "no permission before a grant");
+            s.add_permission(addr, "ADMIN").await;
+            assert!(s.site_has_admin(addr).await);
+        }
+        // A fresh node over the same data dir restores the grant.
+        let s = AppState::with_data_dir("test", dir.path());
+        s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
+        assert!(s.site_has_admin(addr).await, "ADMIN grant survives restart");
+        // A xite that was never granted anything stays unprivileged.
+        s.add_xite("other.epix", XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
+        assert!(!s.site_has_admin("other.epix").await);
     }
 }

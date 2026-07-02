@@ -10,6 +10,81 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The wrapper chrome (all.js) numbers its own WebSocket commands from this
+/// base; the inner site page numbers from 1. Commands at or above this id are
+/// treated as coming from the trusted wrapper and may run ADMIN actions.
+const WRAPPER_ID_BASE: i64 = 1_000_000;
+
+/// Commands that require the ADMIN permission, mirroring EpixNet's
+/// `@flag.admin` set. An inner site page can only run these once the user has
+/// granted that site ADMIN through the wrapper's permission prompt.
+const ADMIN_COMMANDS: &[&str] = &[
+    "announcerStats",
+    "certList",
+    "certSet",
+    "channelJoinAllsite",
+    "chartDbQuery",
+    "chartGetPeerLocations",
+    "configList",
+    "configSet",
+    "consoleLogRead",
+    "consoleLogStream",
+    "consoleLogStreamRemove",
+    "dbRebuild",
+    "dbReload",
+    "feedQuery",
+    "muteList",
+    "notificationDismiss",
+    "notificationMute",
+    "notificationMuteStatus",
+    "notificationQuery",
+    "optionalLimitSet",
+    "optionalLimitStats",
+    "peerAdd",
+    "permissionAdd",
+    "permissionDetails",
+    "permissionRemove",
+    "pluginConfigSet",
+    "pluginList",
+    "serverErrors",
+    "serverGetWrapperNonce",
+    "serverPortcheck",
+    "serverShowdirectory",
+    "serverShutdown",
+    "serverUpdate",
+    "sidebarGetHtmlTag",
+    "sidebarGetPeers",
+    "siteAdd",
+    "siteDelete",
+    "siteFavourite",
+    "siteList",
+    "sitePause",
+    "siteRecoverPrivatekey",
+    "siteResume",
+    "siteSetAutodownloadoptional",
+    "siteSetLimit",
+    "siteSetOwned",
+    "siteSetSettingsValue",
+    "siteUnfavourite",
+    "siteblockAdd",
+    "siteblockGet",
+    "siteblockIgnoreAddSite",
+    "siteblockList",
+    "siteblockRemove",
+    "userLogout",
+    "userSelectForm",
+    "userSet",
+    "userSetGlobalSettings",
+    "userSetSitePrivatekey",
+    "userShowMasterSeed",
+    "xidClearCache",
+];
+
+/// Whether a command requires ADMIN.
+pub fn is_admin_command(cmd: &str) -> bool {
+    ADMIN_COMMANDS.contains(&cmd)
+}
+
 /// Per-connection context handed to every command.
 pub struct WsSession {
     pub state: Arc<AppState>,
@@ -58,12 +133,29 @@ impl CommandRegistry {
         self.commands.contains_key(cmd)
     }
 
+    /// Dispatch one command. `req_id` is the request id from the xite: the
+    /// trusted wrapper chrome sends `id >= 1_000_000` (which the model treats as
+    /// ADMIN), while an inner site page sends small ids and is only as
+    /// privileged as the permissions the user has granted that site.
     pub async fn dispatch(
         &self,
         session: &WsSession,
         cmd: &str,
         params: &Value,
+        req_id: i64,
     ) -> Result<Value, String> {
+        // Gate ADMIN-only commands. A command is allowed when it comes from the
+        // wrapper (elevated id) or the bound site actually holds ADMIN.
+        if is_admin_command(cmd) {
+            let elevated = req_id >= WRAPPER_ID_BASE;
+            let has_admin = match &session.xite {
+                Some(addr) => session.state.site_has_admin(addr).await,
+                None => false,
+            };
+            if !elevated && !has_admin {
+                return Err(format!("You don't have permission to run {cmd}"));
+            }
+        }
         match self.commands.get(cmd) {
             Some(command) => command.handle(session, params).await,
             None => {
@@ -85,10 +177,11 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(simple("channelJoinAllsite", json!("ok"))),
         Arc::new(simple("announcerInfo", json!({ "stats": {} }))),
         Arc::new(PermissionAdd),
+        Arc::new(PermissionRemove),
+        Arc::new(PermissionDetails),
         Arc::new(MergerSiteList),
         Arc::new(MergerSiteAdd),
         Arc::new(MergerSiteDelete),
-        Arc::new(simple("permissionDetails", json!(""))),
         Arc::new(simple("configSet", json!("ok"))),
         Arc::new(simple("siteListModifiedFiles", json!({ "modified_files": [] }))),
         Arc::new(SiteSign),
@@ -934,6 +1027,49 @@ impl WsCommand for PermissionAdd {
     }
 }
 
+/// `permissionRemove(permission)` — revoke a permission from the current xite.
+struct PermissionRemove;
+#[async_trait]
+impl WsCommand for PermissionRemove {
+    fn name(&self) -> &'static str {
+        "permissionRemove"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let permission = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or("permissionRemove: permission required")?;
+        s.state.remove_permission(&address, permission).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `permissionDetails(permission)` — the human-readable description the wrapper
+/// shows in the grant prompt. ADMIN carries an explicit trust warning.
+struct PermissionDetails;
+#[async_trait]
+impl WsCommand for PermissionDetails {
+    fn name(&self) -> &'static str {
+        "permissionDetails"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let permission = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let details = match permission {
+            "ADMIN" => "Allow this xite to administrate your Epix node \
+                <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>",
+            "NOSANDBOX" => "Allow this xite to run any code on your machine \
+                <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>",
+            p if p.starts_with("Merger:") => "Allow this xite to read and list other xites of a given type",
+            _ => "",
+        };
+        Ok(Value::from(details))
+    }
+}
+
 /// `mergerSiteList(query_site_info)` — the sites merged into this merger site.
 struct MergerSiteList;
 #[async_trait]
@@ -1088,6 +1224,34 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn admin_commands_are_gated_until_granted() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1SomeXite";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession { state: state.clone(), xite: Some(addr.into()) };
+
+        // Inner page (small id), no ADMIN yet: an admin command is refused.
+        let denied = registry.dispatch(&session, "siteList", &json!([]), 5).await;
+        assert!(denied.is_err(), "siteList must be denied without ADMIN");
+        assert!(denied.unwrap_err().contains("permission"));
+
+        // The trusted wrapper (elevated id) may run it even without a site grant.
+        assert!(registry.dispatch(&session, "siteList", &json!([]), 1_000_001).await.is_ok());
+
+        // Granting the site ADMIN (as the wrapper does after the user confirms)
+        // then lets the inner page run admin commands too.
+        state.add_permission(addr, "ADMIN").await;
+        assert!(registry.dispatch(&session, "siteList", &json!([]), 6).await.is_ok());
+
+        // A non-admin command is always allowed for the bound site.
+        assert!(registry.dispatch(&session, "siteInfo", &json!([]), 7).await.is_ok());
+    }
 
     #[tokio::test]
     async fn merger_site_lists_and_routes_merged_files() {
