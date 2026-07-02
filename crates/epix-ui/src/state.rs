@@ -503,7 +503,8 @@ impl AppState {
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
         }
-        let (db, db_schema) = match build_xite_db(&entry.storage) {
+        let muted = self.muted_authors().await;
+        let (db, db_schema) = match build_xite_db(&entry.storage, &muted) {
             Some((db, schema)) => (Some(db), Some(schema)),
             None => (None, None),
         };
@@ -672,12 +673,13 @@ impl AppState {
 
     /// Replace a xite's content.json, refreshing its stats and rebuilding its db.
     pub async fn update_content(&self, address: &str, content: Option<Value>) {
+        let muted = self.muted_authors().await;
         if let Some(x) = self.xites.write().await.get_mut(address) {
             if let Some(c) = &content {
                 x.settings.apply_content_stats(&content_stats(c));
             }
             x.content = content;
-            let (db, schema) = match build_xite_db(&x.storage) {
+            let (db, schema) = match build_xite_db(&x.storage, &muted) {
                 Some((db, schema)) => (Some(db), Some(schema)),
                 None => (None, None),
             };
@@ -827,6 +829,8 @@ impl AppState {
                 json!({ "cert_user_id": cert_user_id, "reason": reason, "date_added": now_secs() });
         }
         self.save_filters().await;
+        // Rebuild dbs so the muted author's content drops out (ContentFilter).
+        self.rebuild_all_dbs().await;
     }
 
     pub async fn mute_remove(&self, auth_address: &str) {
@@ -834,6 +838,16 @@ impl AppState {
             m.remove(auth_address);
         }
         self.save_filters().await;
+        // Rebuild dbs so the un-muted author's content comes back.
+        self.rebuild_all_dbs().await;
+    }
+
+    /// Rebuild every served xite's database (e.g. after a mute change), so the
+    /// mute filter is re-applied across all sites.
+    async fn rebuild_all_dbs(&self) {
+        for address in self.xite_addresses().await {
+            self.rebuild_xite_db(&address).await;
+        }
     }
 
     /// The mute map (`auth_address -> info`).
@@ -865,6 +879,35 @@ impl AppState {
     /// Whether a site is blocked.
     pub async fn siteblock_get(&self, site_address: &str) -> Value {
         self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
+    }
+
+    /// The block reason for a site, if it is blocked (`ContentFilter` enforcement
+    /// point). Checks both the plain address and its `sha256` hash, matching
+    /// EpixNet's hashed-address blocklists.
+    pub async fn siteblock_reason(&self, site_address: &str) -> Option<String> {
+        let hashed = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(site_address.as_bytes()))
+        };
+        let f = self.filters.read().await;
+        let blocks = &f["siteblocks"];
+        for key in [site_address, hashed.as_str()] {
+            if let Some(info) = blocks.get(key) {
+                return Some(
+                    info.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string(),
+                );
+            }
+        }
+        None
+    }
+
+    /// The muted authors' auth-addresses (`ContentFilter` enforcement point).
+    /// Content signed by these is excluded when (re)building a xite's database.
+    pub async fn muted_authors(&self) -> Vec<String> {
+        self.filters.read().await["mutes"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     // --- OptionalManager -----------------------------------------------------
@@ -1919,9 +1962,10 @@ impl AppState {
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
     /// Returns false if the xite isn't served here.
     pub async fn rebuild_xite_db(&self, address: &str) -> bool {
+        let muted = self.muted_authors().await;
         let mut xites = self.xites.write().await;
         let Some(x) = xites.get_mut(address) else { return false };
-        let (db, schema) = match build_xite_db(&x.storage) {
+        let (db, schema) = match build_xite_db(&x.storage, &muted) {
             Some((db, schema)) => (Some(db), Some(schema)),
             None => (None, None),
         };
@@ -2165,15 +2209,16 @@ impl AppState {
 /// Build a xite's database from its `dbschema.json` (if present): open an
 /// in-memory db, create the tables, and populate from the xite's JSON data
 /// files. `None` if the xite has no schema or building fails.
-fn build_xite_db(storage: &XiteStorage) -> Option<(Database, DbSchema)> {
+fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, DbSchema)> {
     let bytes = storage.read("dbschema.json").ok()?;
     let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;
     let db = Database::open_in_memory().ok()?;
     db.apply_schema(&schema).ok()?;
     // A version-3 merger db is filled from its merged sites (rebuild_merger_dbs),
-    // not from its own files; everything else populates from its own tree.
+    // not from its own files; everything else populates from its own tree -
+    // skipping muted authors' data files (ContentFilter enforcement).
     if schema.version != 3 {
-        let _ = db.populate(&schema, storage.root());
+        let _ = db.populate_filtered(&schema, storage.root(), muted);
     }
     Some((db, schema))
 }
@@ -2517,6 +2562,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    #[tokio::test]
+    async fn muting_an_author_drops_their_rows_from_the_db() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage.write("data/alice/data.json", br#"{ "posts": [ {"post_id":1,"title":"a"} ] }"#).unwrap();
+        storage.write("data/mallory/data.json", br#"{ "posts": [ {"post_id":2,"title":"spam"} ] }"#).unwrap();
+
+        let addr = "1MuteBlog";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+        // Both authors' posts present initially.
+        assert_eq!(state.db_query(addr, "SELECT COUNT(*) AS n FROM post", &Value::Null).await.unwrap()[0]["n"], 2);
+
+        // Muting mallory rebuilds the db without their data file.
+        state.mute_add("mallory", "mallory@cert", "spam").await;
+        let rows = state.db_query(addr, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "a");
+
+        // Un-muting brings it back.
+        state.mute_remove("mallory").await;
+        assert_eq!(state.db_query(addr, "SELECT COUNT(*) AS n FROM post", &Value::Null).await.unwrap()[0]["n"], 2);
+    }
+
+    #[tokio::test]
+    async fn siteblock_reason_matches_plain_and_hashed_address() {
+        let state = AppState::new("test");
+        assert!(state.siteblock_reason("1BadSite").await.is_none());
+        state.siteblock_add("1BadSite", "malware").await;
+        assert_eq!(state.siteblock_reason("1BadSite").await.as_deref(), Some("malware"));
+
+        // A hashed-address block also matches.
+        let hashed = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest("1HashBlocked".as_bytes()))
+        };
+        state.siteblock_add(&hashed, "hashed").await;
+        assert_eq!(state.siteblock_reason("1HashBlocked").await.as_deref(), Some("hashed"));
     }
 
     #[tokio::test]

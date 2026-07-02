@@ -166,9 +166,35 @@ async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Resp
 }
 
 /// Serve the wrapper page for a xite (`GET /{address}/`).
+/// The page shown in place of a blocked site (ContentFilter).
+fn blocklisted_html(address: &str, reason: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let reason_html = if reason.is_empty() {
+        String::new()
+    } else {
+        format!("<p>Reason: {}</p>", esc(reason))
+    };
+    format!(
+        "<!doctype html><html><head><meta charset='utf-8'><title>Site blocked</title></head>\
+         <body style='font-family:Segoe UI,Helvetica,Arial;background:#323C4D;color:#fff;text-align:center;padding-top:15%'>\
+         <h1>This site is blocked</h1><p style='opacity:.7'>{}</p>{}</body></html>",
+        esc(address),
+        reason_html,
+    )
+}
+
 async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> Response {
     if !ctx.state.has_xite(&address).await {
         return (StatusCode::NOT_FOUND, "unknown xite").into_response();
+    }
+    // ContentFilter: a blocked site is not served - show the block page instead.
+    if let Some(reason) = ctx.state.siteblock_reason(&address).await {
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            blocklisted_html(&address, &reason),
+        )
+            .into_response();
     }
     let content = ctx.state.content(&address).await;
     let title = content

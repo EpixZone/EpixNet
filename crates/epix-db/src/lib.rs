@@ -66,6 +66,18 @@ impl Database {
         populate::populate(&conn, schema, db_dir.as_ref())
     }
 
+    /// Populate, skipping data files whose path contains one of `exclude`
+    /// (ContentFilter mute enforcement - muted authors' files are left out).
+    pub fn populate_filtered(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+        exclude: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        populate::populate_site_filtered(&conn, schema, db_dir.as_ref(), "", exclude)
+    }
+
     /// Populate a version-3 merger db from one merged site's files, tagging the
     /// rows with `site`. Call once per merged site.
     pub fn populate_site(
