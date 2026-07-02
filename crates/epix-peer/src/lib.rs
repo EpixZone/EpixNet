@@ -1,4 +1,4 @@
-//! `epix-peer` — the per-xite peer registry.
+//! `epix-peer` - the per-xite peer registry.
 //!
 //! A xite knows a set of peers, discovered from trackers / PEX / the DHT /
 //! Reticulum announces. Each [`Peer`] carries its address, a live connection
@@ -57,7 +57,7 @@ impl Peer {
     }
 
     /// Can we dial it? IP peers with a real listen port, plus all onion/RNS
-    /// peers. An IP peer with port 0 only ever dialed us — not connectable.
+    /// peers. An IP peer with port 0 only ever dialed us - not connectable.
     pub fn is_connectable(&self) -> bool {
         match &self.addr {
             PeerAddr::Ip(sa) => sa.port() != 0,

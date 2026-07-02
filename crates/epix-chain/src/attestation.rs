@@ -1,9 +1,9 @@
-//! `ChainAttestation` — trust whole-state chain-attested content.
+//! `ChainAttestation` - trust whole-state chain-attested content.
 //!
 //! Some `content.json` files opt out of per-name Merkle proofs and instead
 //! carry a `state_digest`. Such content is trusted **iff** that digest equals
 //! the chain's *current* state digest **and** that digest is finalized by 2/3+
-//! validators. There are no signatures to check — validator consensus *is* the
+//! validators. There are no signatures to check - validator consensus *is* the
 //! proof. (Contrast [`XidResolver`](crate::XidResolver), which proves a single
 //! name with a Merkle path.)
 //!

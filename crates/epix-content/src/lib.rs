@@ -1,4 +1,4 @@
-//! `epix-content` — content.json canonicalization, signing, and verification.
+//! `epix-content` - content.json canonicalization, signing, and verification.
 //!
 //! The signed payload is `content` minus its `sign`/`signs` fields, serialized
 //! via [`canonical::dumps_sorted`] (Python-compatible), then signed/recovered

@@ -44,7 +44,7 @@ pub async fn read_msg(stream: &mut PeerStream, buf: &mut Vec<u8>) -> Result<Valu
                 buf.drain(..consumed);
                 return Ok(value);
             }
-            // Truncated mid-value — read more and retry.
+            // Truncated mid-value - read more and retry.
             Err(e) if is_truncation(&e) => {}
             Err(e) => return Err(Error::Protocol(format!("msgpack decode: {e}"))),
         }

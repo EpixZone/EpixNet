@@ -80,7 +80,7 @@ impl Connection {
                 }
                 return Ok(resp);
             }
-            // Not ours — keep reading (a well-behaved peer answers our req_id).
+            // Not ours - keep reading (a well-behaved peer answers our req_id).
         }
     }
 
@@ -173,7 +173,7 @@ impl Connection {
         let mut location = 0i64;
         loop {
             let params = vmap(vec![
-                // "site" is the on-the-wire field name (the xite address) — kept
+                // "site" is the on-the-wire field name (the xite address) - kept
                 // verbatim because EpixNet peers parse this exact key.
                 ("site", Value::from(xite)),
                 ("inner_path", Value::from(inner_path)),

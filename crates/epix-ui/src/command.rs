@@ -1,6 +1,6 @@
 //! The EpixFrame WebSocket command API: a trait-based registry that xites call.
 //!
-//! This is the seam the plugin system extends — each command is a [`WsCommand`],
+//! This is the seam the plugin system extends - each command is a [`WsCommand`],
 //! and plugins register additional commands into the [`CommandRegistry`].
 
 use crate::state::AppState;
@@ -171,11 +171,13 @@ pub trait WsCommand: Send + Sync {
 /// Maps command names to handlers. Plugins register more.
 pub struct CommandRegistry {
     commands: HashMap<&'static str, Arc<dyn WsCommand>>,
+    /// Which plugin a command belongs to (built-ins are absent = always on).
+    command_plugin: HashMap<&'static str, String>,
 }
 
 impl CommandRegistry {
     pub fn empty() -> Self {
-        Self { commands: HashMap::new() }
+        Self { commands: HashMap::new(), command_plugin: HashMap::new() }
     }
 
     /// The built-in command set (enough for the wrapper + a xite to load).
@@ -189,6 +191,13 @@ impl CommandRegistry {
 
     pub fn register(&mut self, command: Arc<dyn WsCommand>) {
         self.commands.insert(command.name(), command);
+    }
+
+    /// Register a command owned by `plugin`; it is only dispatched while that
+    /// plugin is enabled.
+    pub fn register_for_plugin(&mut self, plugin: &str, command: Arc<dyn WsCommand>) {
+        self.command_plugin.insert(command.name(), plugin.to_string());
+        self.register(command);
     }
 
     pub fn has(&self, cmd: &str) -> bool {
@@ -216,6 +225,12 @@ impl CommandRegistry {
             };
             if !elevated && !has_admin {
                 return Err(format!("You don't have permission to run {cmd}"));
+            }
+        }
+        // A command from a disabled plugin behaves as if unregistered.
+        if let Some(plugin) = self.command_plugin.get(cmd) {
+            if !session.state.plugin_enabled(plugin).await {
+                return Ok(Value::Null);
             }
         }
         match self.commands.get(cmd) {
@@ -281,8 +296,11 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalLimitStats),
         Arc::new(OptionalLimitSet),
         Arc::new(DbQuery),
-        // Dashboard polling / lists — benign empty values.
+        // Dashboard polling / lists - benign empty values.
         Arc::new(ServerErrors),
+        Arc::new(ConfigList),
+        Arc::new(PluginList),
+        Arc::new(PluginConfigSet),
         Arc::new(ConsoleLogRead),
         Arc::new(ConsoleLogStream),
         Arc::new(ConsoleLogStreamRemove),
@@ -303,7 +321,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteblockRemove),
         Arc::new(SiteblockList),
         Arc::new(SiteblockGet),
-        // Stateful — persist global settings so theme changes don't reload-loop.
+        // Stateful - persist global settings so theme changes don't reload-loop.
         Arc::new(UserGetGlobalSettings),
         Arc::new(UserSetGlobalSettings),
         Arc::new(WrapperNonce),
@@ -380,7 +398,63 @@ impl WsCommand for Ping {
     }
 }
 
-/// `serverErrors` — recent node log lines for the dashboard console, each
+/// `configList` - editable node config keys with value + default.
+struct ConfigList;
+#[async_trait]
+impl WsCommand for ConfigList {
+    fn name(&self) -> &'static str {
+        "configList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.config_list().await)
+    }
+}
+
+/// `pluginList` - loaded plugins with their enabled state.
+struct PluginList;
+#[async_trait]
+impl WsCommand for PluginList {
+    fn name(&self) -> &'static str {
+        "pluginList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let plugins: Vec<Value> = s
+            .state
+            .plugin_states()
+            .await
+            .into_iter()
+            .map(|(name, enabled)| json!({ "name": name, "enabled": enabled, "source": "builtin" }))
+            .collect();
+        Ok(json!({ "plugins": plugins }))
+    }
+}
+
+/// `pluginConfigSet(plugin, enabled)` - enable/disable a plugin at runtime
+/// (persisted, no restart).
+struct PluginConfigSet;
+#[async_trait]
+impl WsCommand for PluginConfigSet {
+    fn name(&self) -> &'static str {
+        "pluginConfigSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let name = p
+            .get("plugin")
+            .or_else(|| p.get("name"))
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("pluginConfigSet: plugin required")?;
+        let enabled = p
+            .get("enabled")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        s.state.set_plugin_enabled(name, enabled).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `serverErrors` - recent node log lines for the dashboard console, each
 /// `[date_added, level, message]`.
 struct ServerErrors;
 #[async_trait]
@@ -393,7 +467,7 @@ impl WsCommand for ServerErrors {
     }
 }
 
-/// `consoleLogRead` — recent log lines for the sidebar console (formatted
+/// `consoleLogRead` - recent log lines for the sidebar console (formatted
 /// strings + byte-position metadata).
 struct ConsoleLogRead;
 #[async_trait]
@@ -406,7 +480,7 @@ impl WsCommand for ConsoleLogRead {
     }
 }
 
-/// `consoleLogStream` — open a live log stream; returns `{stream_id}`. New lines
+/// `consoleLogStream` - open a live log stream; returns `{stream_id}`. New lines
 /// arrive as `logLineAdd` events.
 struct ConsoleLogStream;
 #[async_trait]
@@ -419,7 +493,7 @@ impl WsCommand for ConsoleLogStream {
     }
 }
 
-/// `consoleLogStreamRemove(stream_id)` — stop a live log stream.
+/// `consoleLogStreamRemove(stream_id)` - stop a live log stream.
 struct ConsoleLogStreamRemove;
 #[async_trait]
 impl WsCommand for ConsoleLogStreamRemove {
@@ -437,7 +511,7 @@ impl WsCommand for ConsoleLogStreamRemove {
     }
 }
 
-/// `configSet(key, value)` — persist a node config value. Mirrors EpixNet's
+/// `configSet(key, value)` - persist a node config value. Mirrors EpixNet's
 /// actionConfigSet: saves it, and for `language` pushes the "language changed"
 /// notification the dashboard expects.
 struct ConfigSet;
@@ -525,7 +599,7 @@ impl WsCommand for ServerInfo {
     }
 }
 
-/// `announcerStats` — per-tracker announce status for the dashboard.
+/// `announcerStats` - per-tracker announce status for the dashboard.
 struct AnnouncerStats;
 #[async_trait]
 impl WsCommand for AnnouncerStats {
@@ -560,7 +634,7 @@ impl WsCommand for SiteInfo {
     }
 }
 
-/// `chartDbQuery(query, params)` — run a read-only query against the node's
+/// `chartDbQuery(query, params)` - run a read-only query against the node's
 /// network-stats chart database (the dashboard's Stats page). ZeroFrame passes
 /// either a bare query string or `[query, params]`.
 struct ChartDbQuery;
@@ -591,7 +665,7 @@ impl WsCommand for ChartDbQuery {
     }
 }
 
-/// `channelJoin` / `channelJoinAllsite` — subscribe the connection to server
+/// `channelJoin` / `channelJoinAllsite` - subscribe the connection to server
 /// push channels (`siteChanged`, `serverChanged`, `announcerChanged`), so it
 /// receives the matching `setSiteInfo`/`setServerInfo`/`setAnnouncerInfo` events.
 struct ChannelJoin {
@@ -608,7 +682,7 @@ impl WsCommand for ChannelJoin {
     }
 }
 
-/// `chartGetPeerLocations` — geolocated peer positions for the world map.
+/// `chartGetPeerLocations` - geolocated peer positions for the world map.
 struct ChartGetPeerLocations;
 #[async_trait]
 impl WsCommand for ChartGetPeerLocations {
@@ -620,7 +694,7 @@ impl WsCommand for ChartGetPeerLocations {
     }
 }
 
-/// `siteList` — every served xite's siteInfo, for the dashboard's Sites panel.
+/// `siteList` - every served xite's siteInfo, for the dashboard's Sites panel.
 struct SiteList;
 #[async_trait]
 impl WsCommand for SiteList {
@@ -632,7 +706,7 @@ impl WsCommand for SiteList {
     }
 }
 
-/// `dbQuery(query, params)` — run a read query against the xite's database.
+/// `dbQuery(query, params)` - run a read query against the xite's database.
 /// ZeroFrame passes `[query, params]`; we also accept a bare string or
 /// `{query, params}`.
 struct DbQuery;
@@ -662,7 +736,7 @@ impl WsCommand for DbQuery {
 
 // ---- publish / sign --------------------------------------------------------
 
-/// `fileWrite(inner_path, content_base64)` — write a file into the xite.
+/// `fileWrite(inner_path, content_base64)` - write a file into the xite.
 struct FileWrite;
 #[async_trait]
 impl WsCommand for FileWrite {
@@ -688,7 +762,7 @@ impl WsCommand for FileWrite {
     }
 }
 
-/// `siteSetOwned(owned)` — claim/relinquish ownership (reveals the owner
+/// `siteSetOwned(owned)` - claim/relinquish ownership (reveals the owner
 /// sidebar sections; signing still needs the key).
 struct SiteSetOwned;
 #[async_trait]
@@ -707,7 +781,7 @@ impl WsCommand for SiteSetOwned {
     }
 }
 
-/// `fileRules(inner_path)` — content rules (signers) for a path.
+/// `fileRules(inner_path)` - content rules (signers) for a path.
 struct FileRules;
 #[async_trait]
 impl WsCommand for FileRules {
@@ -725,7 +799,7 @@ impl WsCommand for FileRules {
     }
 }
 
-/// `siteRecoverPrivatekey()` — recover the site key from the master seed.
+/// `siteRecoverPrivatekey()` - recover the site key from the master seed.
 struct SiteRecoverPrivatekey;
 #[async_trait]
 impl WsCommand for SiteRecoverPrivatekey {
@@ -738,7 +812,7 @@ impl WsCommand for SiteRecoverPrivatekey {
     }
 }
 
-/// `userSetSitePrivatekey(privatekey)` — save the site key (marks owned).
+/// `userSetSitePrivatekey(privatekey)` - save the site key (marks owned).
 struct UserSetSitePrivatekey;
 #[async_trait]
 impl WsCommand for UserSetSitePrivatekey {
@@ -756,7 +830,7 @@ impl WsCommand for UserSetSitePrivatekey {
     }
 }
 
-/// `siteUpdate(address)` — force a re-sync now.
+/// `siteUpdate(address)` - force a re-sync now.
 struct SiteUpdate;
 #[async_trait]
 impl WsCommand for SiteUpdate {
@@ -785,7 +859,7 @@ impl WsCommand for SiteUpdate {
     }
 }
 
-/// `siteSign(privatekey, inner_path)` — rebuild + sign content.json.
+/// `siteSign(privatekey, inner_path)` - rebuild + sign content.json.
 struct SiteSign;
 #[async_trait]
 impl WsCommand for SiteSign {
@@ -803,7 +877,7 @@ impl WsCommand for SiteSign {
     }
 }
 
-/// `sitePublish(privatekey, inner_path, sign)` — sign (unless told not to) then
+/// `sitePublish(privatekey, inner_path, sign)` - sign (unless told not to) then
 /// push the content.json to peers.
 struct SitePublish;
 #[async_trait]
@@ -835,7 +909,7 @@ impl WsCommand for SitePublish {
 }
 
 /// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON
-/// null means "use the site's own key", which we don't hold — treated as none).
+/// null means "use the site's own key", which we don't hold - treated as none).
 fn sign_privatekey(p: &Value) -> Option<String> {
     p.get("privatekey")
         .or_else(|| p.as_array().and_then(|a| a.first()))
@@ -878,7 +952,7 @@ async fn resolve_privkey(s: &WsSession, address: &str, arg: Option<&Value>) -> R
     }
 }
 
-/// `userPublickey(index)` — the user's encrypt public key (base64) for this xite.
+/// `userPublickey(index)` - the user's encrypt public key (base64) for this xite.
 struct UserPublickey;
 #[async_trait]
 impl WsCommand for UserPublickey {
@@ -916,7 +990,7 @@ impl WsCommand for EciesEncrypt {
     }
 }
 
-/// `eciesDecrypt(param, privatekey=0)` — `param` is one base64 blob or a list.
+/// `eciesDecrypt(param, privatekey=0)` - `param` is one base64 blob or a list.
 struct EciesDecrypt;
 #[async_trait]
 impl WsCommand for EciesDecrypt {
@@ -1035,7 +1109,7 @@ impl WsCommand for EccPubToAddr {
 
 // ---- Newsfeed: aggregate followed sites' feeds -----------------------------
 
-/// `feedFollow(feeds)` — save `{feed_name: [query, params]}` for the current site.
+/// `feedFollow(feeds)` - save `{feed_name: [query, params]}` for the current site.
 struct FeedFollow;
 #[async_trait]
 impl WsCommand for FeedFollow {
@@ -1050,7 +1124,7 @@ impl WsCommand for FeedFollow {
     }
 }
 
-/// `feedListFollow()` — the current site's follows.
+/// `feedListFollow()` - the current site's follows.
 struct FeedListFollow;
 #[async_trait]
 impl WsCommand for FeedListFollow {
@@ -1062,7 +1136,7 @@ impl WsCommand for FeedListFollow {
     }
 }
 
-/// `feedQuery(limit, day_limit)` — run each followed site's feed queries against
+/// `feedQuery(limit, day_limit)` - run each followed site's feed queries against
 /// that site's db and merge the rows by `date_added` (newest first).
 struct FeedQuery;
 #[async_trait]
@@ -1179,7 +1253,7 @@ fn sqlquote(v: &Value) -> String {
 
 // ---- OptionalManager -------------------------------------------------------
 
-/// `fileNeed(inner_path)` — download a file (optional or required) on demand.
+/// `fileNeed(inner_path)` - download a file (optional or required) on demand.
 struct FileNeed;
 #[async_trait]
 impl WsCommand for FileNeed {
@@ -1194,7 +1268,7 @@ impl WsCommand for FileNeed {
     }
 }
 
-/// `optionalFileList(address, orderby, limit, filter)` — this xite's optional files.
+/// `optionalFileList(address, orderby, limit, filter)` - this xite's optional files.
 struct OptionalFileList;
 #[async_trait]
 impl WsCommand for OptionalFileList {
@@ -1253,7 +1327,7 @@ impl WsCommand for OptionalFilePin {
     }
 }
 
-/// `optionalLimitStats` — optional-file storage usage (`{limit, used, free}`).
+/// `optionalLimitStats` - optional-file storage usage (`{limit, used, free}`).
 struct OptionalLimitStats;
 #[async_trait]
 impl WsCommand for OptionalLimitStats {
@@ -1265,7 +1339,7 @@ impl WsCommand for OptionalLimitStats {
     }
 }
 
-/// `optionalLimitSet(limit)` — set the optional-files cap (`"10%"` or a GB
+/// `optionalLimitSet(limit)` - set the optional-files cap (`"10%"` or a GB
 /// number).
 struct OptionalLimitSet;
 #[async_trait]
@@ -1282,7 +1356,7 @@ impl WsCommand for OptionalLimitSet {
 
 // ---- MergerSite ------------------------------------------------------------
 
-/// `permissionAdd(permission)` — grant a permission to the current xite (e.g.
+/// `permissionAdd(permission)` - grant a permission to the current xite (e.g.
 /// `Merger:ZeroMe`, which makes it a merger site).
 struct PermissionAdd;
 #[async_trait]
@@ -1301,7 +1375,7 @@ impl WsCommand for PermissionAdd {
     }
 }
 
-/// `permissionRemove(permission)` — revoke a permission from the current xite.
+/// `permissionRemove(permission)` - revoke a permission from the current xite.
 struct PermissionRemove;
 #[async_trait]
 impl WsCommand for PermissionRemove {
@@ -1319,7 +1393,7 @@ impl WsCommand for PermissionRemove {
     }
 }
 
-/// `permissionDetails(permission)` — the human-readable description the wrapper
+/// `permissionDetails(permission)` - the human-readable description the wrapper
 /// shows in the grant prompt. ADMIN carries an explicit trust warning.
 struct PermissionDetails;
 #[async_trait]
@@ -1344,7 +1418,7 @@ impl WsCommand for PermissionDetails {
     }
 }
 
-/// `mergerSiteList(query_site_info)` — the sites merged into this merger site.
+/// `mergerSiteList(query_site_info)` - the sites merged into this merger site.
 struct MergerSiteList;
 #[async_trait]
 impl WsCommand for MergerSiteList {
@@ -1361,7 +1435,7 @@ impl WsCommand for MergerSiteList {
     }
 }
 
-/// `mergerSiteAdd(addresses)` — accept sites into this merger. (Cloning the
+/// `mergerSiteAdd(addresses)` - accept sites into this merger. (Cloning the
 /// merged sites into the node is a follow-up; this validates the merger role.)
 struct MergerSiteAdd;
 #[async_trait]
@@ -1378,7 +1452,7 @@ impl WsCommand for MergerSiteAdd {
     }
 }
 
-/// `mergerSiteDelete(address)` — remove a merged site from this merger.
+/// `mergerSiteDelete(address)` - remove a merged site from this merger.
 struct MergerSiteDelete;
 #[async_trait]
 impl WsCommand for MergerSiteDelete {

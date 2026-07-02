@@ -24,13 +24,13 @@ async fn offline_peer_receives_stored_update() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(PeerServer::new(Arc::new(PropagationService::new(store.clone()))).serve(listener));
 
-    // Publisher B announces an update — peer C is not connected at this point.
+    // Publisher B announces an update - peer C is not connected at this point.
     let mut b = Connection::connect(&TcpTransport, &PeerAddr::Ip(addr)).await.unwrap();
     b.handshake().await.unwrap();
     let seq = announce_update(&mut b, "1abc.epix", 1000).await.unwrap();
     assert_eq!(seq, 1);
 
-    // C connects later and pulls from the start — it receives B's stored update.
+    // C connects later and pulls from the start - it receives B's stored update.
     let mut c = Connection::connect(&TcpTransport, &PeerAddr::Ip(addr)).await.unwrap();
     c.handshake().await.unwrap();
     let (updates, head) = fetch_updates(&mut c, 0).await.unwrap();

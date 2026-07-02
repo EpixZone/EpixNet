@@ -105,7 +105,7 @@ fn our_signatures_round_trip_and_interop() {
         // Not asserted: EpixNet verify recovers-by-address, so byte-identity is
         // a bonus, not a compat requirement.
         if sd == t.sig_dbl_b64 && sk == t.sig_keccak_b64 {
-            // byte-identical — great
+            // byte-identical - great
         }
     }
 }

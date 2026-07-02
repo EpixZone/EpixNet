@@ -4,8 +4,8 @@
 //! (self-contained: morphdom, the drag handle, the WebGL globe loader) and its
 //! globe assets are served under `/uimedia/globe/`. Server side, it answers
 //! `sidebarGetHtmlTag` by rendering the panel HTML from the **real** site
-//! runtime — peer counts, transfer totals, file/size stats, size limit, and the
-//! derived identity — plus the action commands the panel's buttons call.
+//! runtime - peer counts, transfer totals, file/size stats, size limit, and the
+//! derived identity - plus the action commands the panel's buttons call.
 
 use async_trait::async_trait;
 use epix_peer::PeerCounts;
@@ -49,7 +49,7 @@ impl Plugin for SidebarPlugin {
     }
 }
 
-/// `sidebarGetHtmlTag` — render the panel for the current xite.
+/// `sidebarGetHtmlTag` - render the panel for the current xite.
 struct SidebarGetHtmlTag;
 
 #[async_trait]
@@ -67,7 +67,7 @@ impl WsCommand for SidebarGetHtmlTag {
     }
 }
 
-/// `sidebarGetPeers` — peer positions for the WebGL globe, as the flat
+/// `sidebarGetPeers` - peer positions for the WebGL globe, as the flat
 /// `[lat, lon, height, …]` array the globe's `magnitude` format expects.
 struct SidebarGetPeers;
 
@@ -84,7 +84,7 @@ impl WsCommand for SidebarGetPeers {
     }
 }
 
-/// `siteSetSizeLimit` — set the per-xite size limit (MB).
+/// `siteSetSizeLimit` - set the per-xite size limit (MB).
 struct SiteSetSizeLimit;
 
 #[async_trait]
@@ -225,7 +225,7 @@ fn render_sidebar(address: &str, info: &Value, counts: PeerCounts, recv: u64, se
          <a href='#Delete' class='button' id='button-delete'>Delete</a></li>",
     );
 
-    // "This is my site" — claim ownership. The owner panel below is always in
+    // "This is my site" - claim ownership. The owner panel below is always in
     // the DOM; the checkbox reveals it via CSS (#checkbox-owned:checked ~
     // .settings-owned), matching EpixNet, so it shows the moment you check it.
     let owned = info["settings"]["own"].as_bool().unwrap_or(false);

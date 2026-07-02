@@ -1,5 +1,5 @@
 //! [`ReticulumTransport`]: the `epix-transport` [`Transport`] backed by a
-//! Reticulum node. This is what plugs mesh into the stack — the wire protocol,
+//! Reticulum node. This is what plugs mesh into the stack - the wire protocol,
 //! the DHT's `kad` RPCs, and the worker all dial through the same trait, so
 //! `dial(PeerAddr::Rns(hash))` yields a `PeerStream` exactly like TCP does.
 //!

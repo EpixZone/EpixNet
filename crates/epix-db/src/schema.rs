@@ -1,7 +1,7 @@
 //! Per-xite database schema, parsed from a xite's `dbschema.json`.
 //!
 //! Mirrors EpixNet's format so existing xites' schemas apply unchanged: `tables`
-//! define SQL tables, and `maps` say how JSON data files populate them —
+//! define SQL tables, and `maps` say how JSON data files populate them -
 //! matched by a regex on the file's path relative to the db dir, then routed via
 //! `to_table` (rows), `to_keyvalue` (key/value pairs), and `to_json_table`
 //! (columns on the per-file `json` row).

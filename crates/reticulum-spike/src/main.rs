@@ -122,5 +122,5 @@ async fn main() {
     assert_eq!(cmd, Some("ping"), "decoded frame: {decoded:?}");
     assert_eq!(payload, frame(), "payload survived the link byte-for-byte");
     println!("✓ decoded msgpack frame intact: cmd={cmd:?}");
-    println!("\n🎉 RETICULUM MESH LINK CONFIRMED — our wire frames travel over a Reticulum Link.");
+    println!("\n🎉 RETICULUM MESH LINK CONFIRMED - our wire frames travel over a Reticulum Link.");
 }

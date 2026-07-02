@@ -1,9 +1,9 @@
-//! `epix-chain` — the Epix chain layer.
+//! `epix-chain` - the Epix chain layer.
 //!
 //! Resolves `.epix` names to their on-chain records, **chain-verified**: every
 //! answer is checked with a Merkle inclusion proof against a state digest that
 //! has been finalized by 2/3+ validators. A malicious or buggy RPC cannot forge
-//! a resolution — a tampered proof is rejected.
+//! a resolution - a tampered proof is rejected.
 
 mod attestation;
 mod merkle;

@@ -214,7 +214,7 @@ pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<u
     populate_site(conn, schema, db_dir, "")
 }
 
-/// Like [`populate`], but tags every row with `site` — for a version-3 merger
+/// Like [`populate`], but tags every row with `site` - for a version-3 merger
 /// db aggregating data from several merged sites (call once per merged site).
 pub fn populate_site(conn: &Connection, schema: &DbSchema, db_dir: &Path, site: &str) -> Result<usize> {
     let mut count = 0;

@@ -27,7 +27,7 @@ impl DomainSnapshot {
     }
 
     /// The EpixNet **xite address** this name points to, from its `EPIXNET`
-    /// DNS record — the address to clone and serve when visiting `name.tld`.
+    /// DNS record - the address to clone and serve when visiting `name.tld`.
     pub fn xite_address(&self) -> Option<&str> {
         self.dns_records
             .iter()

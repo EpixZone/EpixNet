@@ -2,7 +2,7 @@
 //! `PeerServer`. Where `PeerServer` accepts TCP connections, this accepts
 //! inbound Reticulum links, wraps each as a [`ReticulumStream`], and runs the
 //! same request/response loop (`serve_stream`) over it. With both, a node can
-//! dial *and* be dialed over mesh — the wire protocol is fully bidirectional
+//! dial *and* be dialed over mesh - the wire protocol is fully bidirectional
 //! over Reticulum.
 
 use std::sync::Arc;

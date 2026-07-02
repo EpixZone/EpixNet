@@ -1,8 +1,8 @@
-//! `epix-transport` — the byte-stream abstraction beneath the wire protocol.
+//! `epix-transport` - the byte-stream abstraction beneath the wire protocol.
 //!
 //! `epix-protocol`'s connection runs over a [`PeerStream`], so the same
 //! msgpack/FileRequest logic works over TCP today and Tor / Reticulum mesh
-//! later — each is just another [`Transport`] that yields a `PeerStream`.
+//! later - each is just another [`Transport`] that yields a `PeerStream`.
 
 use async_trait::async_trait;
 use epix_core::{Error, PeerAddr, Result};

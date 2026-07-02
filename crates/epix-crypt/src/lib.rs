@@ -4,7 +4,7 @@
 //! Scheme summary (see EpixNet/src/Crypt/CryptEpix.py):
 //! - Address: Keccak256(64-byte uncompressed pubkey X‖Y) → last 20 bytes →
 //!   bech32 with HRP `epix` (`epix1…`).
-//! - WIF: base58check(`0x80` ‖ priv32) — no compression flag byte.
+//! - WIF: base58check(`0x80` ‖ priv32) - no compression flag byte.
 //! - Signing: recoverable ECDSA. `dbl` path hashes with the Bitcoin
 //!   "Signed Message" magic then double-SHA256; `keccak` path is bare Keccak256.
 //!   Serialized as `[27+recid] ‖ r(32) ‖ s(32)`, base64.
@@ -23,12 +23,12 @@ pub mod ecies;
 
 type HmacSha512 = Hmac<Sha512>;
 
-/// Compressed SEC1 pubkey (33 bytes) for a private key — EpixNet's `eccPrivToPub`.
+/// Compressed SEC1 pubkey (33 bytes) for a private key - EpixNet's `eccPrivToPub`.
 pub fn private_to_compressed_pubkey(privatekey: &str) -> Result<Vec<u8>, String> {
     Ok(compressed_pubkey(&priv_to_scalar(privatekey)?))
 }
 
-/// The epix1 address for a SEC1 pubkey (compressed or uncompressed) —
+/// The epix1 address for a SEC1 pubkey (compressed or uncompressed) -
 /// EpixNet's `eccPubToAddr`.
 pub fn pubkey_to_address(pubkey: &[u8]) -> Result<String, String> {
     let pk = k256::PublicKey::from_sec1_bytes(pubkey).map_err(|e| e.to_string())?;
@@ -56,7 +56,7 @@ fn uncompressed_pubkey(scalar: &Scalar) -> Vec<u8> {
     pubkey_point(scalar).to_encoded_point(false).as_bytes().to_vec()
 }
 
-/// `derive_child(seed, child)` — exact port of sslcrypto's openssl backend.
+/// `derive_child(seed, child)` - exact port of sslcrypto's openssl backend.
 ///
 /// ```text
 /// h     = HMAC-SHA512("Bitcoin seed", seed)
@@ -151,7 +151,7 @@ fn priv_to_scalar(privatekey: &str) -> Result<Scalar, String> {
     Ok(scalar_from_be_reduced(&bytes))
 }
 
-/// `privatekeyToAddress` — accepts 64-hex or WIF.
+/// `privatekeyToAddress` - accepts 64-hex or WIF.
 pub fn privatekey_to_address(privatekey: &str) -> Result<String, String> {
     let s = priv_to_scalar(privatekey)?;
     let pubkey = uncompressed_pubkey(&s);

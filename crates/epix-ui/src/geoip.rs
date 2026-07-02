@@ -1,7 +1,7 @@
 //! Peer IP geolocation for the dashboard's world map.
 //!
 //! Reads any MaxMind-DB-format `.mmdb` (we bundle DB-IP City Lite, CC-BY-4.0)
-//! and resolves an IP to `{lat, lon, city, country}` — the shape the Stats
+//! and resolves an IP to `{lat, lon, city, country}` - the shape the Stats
 //! page's `chartGetPeerLocations` returns.
 
 use maxminddb::{geoip2, Mmap, Reader};

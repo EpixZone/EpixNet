@@ -1,4 +1,4 @@
-//! `epix-plugins` — the standard EpixNet plugins as Rust structs.
+//! `epix-plugins` - the standard EpixNet plugins as Rust structs.
 //!
 //! Each plugin implements [`epix_plugin::Plugin`], contributing WebSocket
 //! commands and/or `/uimedia` client code. Register them on a

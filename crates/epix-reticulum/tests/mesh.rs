@@ -1,7 +1,7 @@
-//! Two Reticulum nodes over a UDP interface (loopback, no shared IP routing —
+//! Two Reticulum nodes over a UDP interface (loopback, no shared IP routing -
 //! this is the RNS link itself, standing in for LoRa/BLE). A client dials the
 //! server's destination, and a request/response round-trip flows as a byte
-//! stream through [`ReticulumStream`] — proving the wire protocol can ride mesh.
+//! stream through [`ReticulumStream`] - proving the wire protocol can ride mesh.
 
 use std::sync::Arc;
 use std::time::Duration;

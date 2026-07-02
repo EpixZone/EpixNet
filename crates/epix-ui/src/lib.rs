@@ -1,4 +1,4 @@
-//! `epix-ui` — the local UI server.
+//! `epix-ui` - the local UI server.
 //!
 //! Serves the wrapper (`GET /{address}/`), the wrapper runtime assets
 //! (`/uimedia/*`, embedded at build time), a xite's own files
@@ -33,13 +33,22 @@ use std::sync::Arc;
 static UIMEDIA: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../ui/media");
 const WRAPPER_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/wrapper.html"));
 
-/// Plugins' contributions to `/uimedia/*`: bytes appended to the base
-/// `all.js`/`all.css`, plus extra static files (keyed by path under `/uimedia/`).
+/// One plugin's `/uimedia/*` contributions.
 #[derive(Default, Clone)]
-pub struct MediaBundle {
+pub struct PluginMedia {
+    /// Plugin name; empty for base (always-on) contributions.
+    pub name: String,
     pub append_js: Vec<u8>,
     pub append_css: Vec<u8>,
     pub files: std::collections::HashMap<String, Vec<u8>>,
+}
+
+/// Plugins' contributions to `/uimedia/*`, kept per-plugin so a disabled plugin
+/// can be excluded at request time (append_js/css concatenated onto the base
+/// bundle, plus extra static files keyed by path under `/uimedia/`).
+#[derive(Default, Clone)]
+pub struct MediaBundle {
+    pub plugins: Vec<PluginMedia>,
 }
 
 #[derive(Clone)]
@@ -79,6 +88,8 @@ impl UiServer {
             .route("/", get(health))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/uimedia/*path", get(serve_uimedia))
+            .route("/Plugins", get(serve_plugins_page))
+            .route("/Config", get(serve_config_page))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
             .route("/:address/*path", get(serve_file))
@@ -105,18 +116,31 @@ async fn redirect_to_slash(Path(address): Path<String>) -> Redirect {
 /// and plugins can add extra files (e.g. the sidebar's `globe/*`).
 async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
     let ct = content_type(&path);
-    // Base bundle + appended plugin JS/CSS.
+    // Base bundle + each *enabled* plugin's appended JS/CSS (assembled per
+    // request, so enabling/disabling a plugin takes effect on the next reload).
     if path == "all.js" || path == "all.css" {
         if let Some(file) = UIMEDIA.get_file(&path) {
             let mut body = file.contents().to_vec();
-            let append = if path == "all.js" { &ctx.media.append_js } else { &ctx.media.append_css };
-            body.extend_from_slice(append);
+            for pm in &ctx.media.plugins {
+                if !pm.name.is_empty() && !ctx.state.plugin_enabled(&pm.name).await {
+                    continue;
+                }
+                let append = if path == "all.js" { &pm.append_js } else { &pm.append_css };
+                if !append.is_empty() {
+                    body.push(b'\n');
+                    body.extend_from_slice(append);
+                }
+            }
             return ([(header::CONTENT_TYPE, ct)], body).into_response();
         }
     }
-    // Plugin-provided static files (e.g. globe assets).
-    if let Some(bytes) = ctx.media.files.get(&path) {
-        return ([(header::CONTENT_TYPE, ct)], bytes.clone()).into_response();
+    // Plugin-provided static files (e.g. globe assets) - only for enabled plugins.
+    for pm in &ctx.media.plugins {
+        if let Some(bytes) = pm.files.get(&path) {
+            if pm.name.is_empty() || ctx.state.plugin_enabled(&pm.name).await {
+                return ([(header::CONTENT_TYPE, ct)], bytes.clone()).into_response();
+            }
+        }
     }
     match UIMEDIA.get_file(&path) {
         Some(file) => ([(header::CONTENT_TYPE, ct)], file.contents().to_vec()).into_response(),
@@ -168,6 +192,152 @@ async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> R
     ];
     let html = render(WRAPPER_HTML, &vars);
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+#[derive(Deserialize)]
+struct PluginsQuery {
+    toggle: Option<String>,
+}
+
+/// `GET /Plugins` - the plugin manager page. `?toggle=<name>` flips a plugin's
+/// enabled state (persisted) and redirects back; the change takes effect on the
+/// next page load, no restart.
+async fn serve_plugins_page(State(ctx): State<Ctx>, Query(q): Query<PluginsQuery>) -> Response {
+    if let Some(name) = q.toggle {
+        let enabled = ctx.state.plugin_enabled(&name).await;
+        ctx.state.set_plugin_enabled(&name, !enabled).await;
+        return Redirect::to("/Plugins").into_response();
+    }
+    let states = ctx.state.plugin_states().await;
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_plugins_page(&states))
+        .into_response()
+}
+
+/// A short description for a known built-in plugin/feature.
+fn plugin_description(name: &str) -> &'static str {
+    match name {
+        "Sidebar" => "Slide-out site info panel with peers, transfer stats, and the world globe.",
+        "Stats" => "Network stats charts and the peer world map on the dashboard.",
+        "UiPluginManager" => "This plugin manager page.",
+        "UiConfig" => "The node configuration page.",
+        _ => "Built-in plugin.",
+    }
+}
+
+/// Render the plugin manager page, styled like EpixNet's (light theme, gradient
+/// header, sliding toggle switches). The toggle is a link (`/Plugins?toggle=…`)
+/// so it works without JS/WebSocket.
+fn render_plugins_page(states: &[(String, bool)]) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut rows = String::new();
+    for (name, enabled) in states {
+        let checked = if *enabled { "checked" } else { "" };
+        rows.push_str(&format!(
+            "<div class='plugin'>\
+               <div class='title'><h3>{name}</h3>\
+                 <div class='description'>{descr}</div></div>\
+               <a class='value value-right checkbox {checked}' href='/Plugins?toggle={name}' \
+                  title='{action} {name}'><div class='checkbox-skin'></div></a>\
+             </div>",
+            name = esc(name),
+            descr = esc(plugin_description(name)),
+            action = if *enabled { "Disable" } else { "Enable" },
+        ));
+    }
+    if rows.is_empty() {
+        rows.push_str("<div class='description'>No plugins loaded.</div>");
+    }
+    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"))
+}
+
+/// `GET /Config` - the node settings page. `?save=1&<key>=<value>` persists the
+/// changed keys (via configSet) and redirects back.
+async fn serve_config_page(
+    State(ctx): State<Ctx>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if params.contains_key("save") {
+        for (key, _label, _default) in crate::state::CONFIG_SCHEMA {
+            if let Some(val) = params.get(*key) {
+                ctx.state.config_set(key, Value::from(val.as_str())).await;
+            }
+        }
+        return Redirect::to("/Config").into_response();
+    }
+    let mut values = Vec::new();
+    for (key, label, default) in crate::state::CONFIG_SCHEMA {
+        let val = ctx
+            .state
+            .config_get(key)
+            .await
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| default.to_string());
+        values.push((*key, *label, val));
+    }
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values)).into_response()
+}
+
+/// Render the settings page, styled like EpixNet's Config page.
+fn render_config_page(values: &[(&str, &str, String)]) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let mut fields = String::new();
+    for (key, label, val) in values {
+        fields.push_str(&format!(
+            "<div class='config-item'>\
+               <div class='title'><h3>{label}</h3></div>\
+               <div class='value value-right'>\
+                 <input class='input-text' name='{key}' value='{val}' spellcheck='false'></div>\
+             </div>",
+            label = esc(label),
+            key = esc(key),
+            val = esc(val),
+        ));
+    }
+    let body = format!(
+        "<form method='get' action='/Config'>\
+           <div class='config'>{fields}</div>\
+           <input type='hidden' name='save' value='1'>\
+           <button class='button' type='submit'>Save</button>\
+         </form>"
+    );
+    page_shell("Configuration", "Configuration", "", &body)
+}
+
+/// Shared page shell for the server-rendered admin pages, styled to match
+/// EpixNet (light theme, gradient header, sliding toggles, config inputs).
+fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str) -> String {
+    let sub = if subtitle.is_empty() {
+        String::new()
+    } else {
+        format!("<p class='sub'>{subtitle}</p>")
+    };
+    format!(
+        "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
+         <meta name='viewport' content='width=device-width, initial-scale=1'>\
+         <style>\
+          body{{background:#EDF2F5;font-family:Roboto,'Segoe UI',Arial,'Helvetica Neue',sans-serif;margin:0;padding:0;color:#333}}\
+          h1{{background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;padding:16px 30px;margin:0;font-weight:200;font-size:30px}}\
+          .content{{max-width:800px;margin:auto;background:#fff;padding:40px 30px 120px;box-sizing:border-box;min-height:100vh}}\
+          .sub{{color:#666;font-size:15px;margin:0 0 26px}}\
+          .plugin,.config-item{{position:relative;padding:16px 0;border-bottom:1px solid #f0f2f5}}\
+          .plugin .title,.config-item .title{{display:inline-block}}\
+          .plugin .title h3,.config-item .title h3{{font-size:20px;font-weight:lighter;margin:0;line-height:32px}}\
+          .plugin .description{{font-size:14px;color:#777;line-height:22px;margin-top:2px}}\
+          .value-right{{right:0;position:absolute;top:16px}}\
+          .checkbox{{display:inline-block;cursor:pointer}}\
+          .checkbox-skin{{background:#CCC;width:50px;height:24px;border-radius:15px;transition:all .3s ease-in-out;display:inline-block}}\
+          .checkbox-skin:before{{content:'';position:relative;width:20px;height:20px;background:#fff;display:block;border-radius:100%;margin:2px 0 0 2px;transition:all .5s cubic-bezier(.785,.135,.15,.86)}}\
+          .checkbox.checked .checkbox-skin{{background:#2ECC71}}\
+          .checkbox.checked .checkbox-skin:before{{margin-left:27px}}\
+          .input-text{{padding:8px 18px;border:1px solid #CCC;border-radius:3px;font-size:15px;box-sizing:border-box;min-width:280px;font-family:'Segoe UI',Arial,sans-serif}}\
+          .input-text:focus{{border-color:#3396ff;outline:none}}\
+          .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer}}\
+          a{{color:#9760F9;text-decoration:none}}\
+         </style></head><body>\
+         <h1>{heading}</h1><div class='content'>{sub}{body}</div></body></html>"
+    )
 }
 
 /// Replace known `{name}` tokens; JS braces (not a known name) are left intact.
@@ -307,7 +477,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                             break;
                         }
                     }
-                    // Lagged: dropped some events under load — keep going.
+                    // Lagged: dropped some events under load - keep going.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

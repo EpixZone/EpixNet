@@ -1,4 +1,4 @@
-//! `XidResolver` — chain-verified `.epix` name resolution.
+//! `XidResolver` - chain-verified `.epix` name resolution.
 
 use crate::merkle::verify_proof;
 use crate::types::{DnsRecord, DomainSnapshot, Identity};
@@ -77,12 +77,12 @@ impl XidResolver {
             .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        // Step 1 — Merkle proof.
+        // Step 1 - Merkle proof.
         if !verify_proof(leaf_hash, leaf_index, &siblings, proof_root)? {
             return Err(ChainError::MerkleInvalid);
         }
 
-        // Step 2 — proof root must equal the current attested state digest.
+        // Step 2 - proof root must equal the current attested state digest.
         let digest_info = self
             .get_json(&format!("{}/xid/v1/state_digest", self.rpc_url))
             .await?;
@@ -91,7 +91,7 @@ impl XidResolver {
             return Err(ChainError::DigestMismatch);
         }
 
-        // Step 3 — digest must be finalized by validators.
+        // Step 3 - digest must be finalized by validators.
         let att = self
             .get_json(&format!("{}/xid/v1/attestations?digest={attested}", self.rpc_url))
             .await?;

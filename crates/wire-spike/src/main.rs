@@ -80,7 +80,7 @@ fn main() {
     assert_eq!(cmd, "response", "expected handshake response, got {resp:?}");
     assert_eq!(to, Some(0), "handshake response 'to' must echo req_id 0");
     println!(
-        "✓ handshake OK — peer version={:?} protocol={:?} rev={:?} fileserver_port={:?}",
+        "✓ handshake OK - peer version={:?} protocol={:?} rev={:?} fileserver_port={:?}",
         get(&resp, "version").and_then(|v| v.as_str()),
         get(&resp, "protocol").and_then(|v| v.as_str()),
         get(&resp, "rev").and_then(|v| v.as_u64()),
@@ -131,7 +131,7 @@ fn main() {
     println!("  matches requested site: {}", caddr == site);
 
     // Sanity: the signer addresses in content.json are valid epix1 addresses
-    // (full signature verification needs the canonical-dump step — deferred to
+    // (full signature verification needs the canonical-dump step - deferred to
     // the content-layer work; epix-crypt already proven byte-identical).
     if let Some(obj) = json.get("signs").and_then(|s| s.as_object()) {
         for k in obj.keys() {
@@ -140,9 +140,9 @@ fn main() {
             )
             .is_ok()
                 && k.starts_with("epix1");
-            println!("  signer {k} — epix1 address well-formed: {ok}");
+            println!("  signer {k} - epix1 address well-formed: {ok}");
         }
     }
 
-    println!("\n🎉 WIRE INTEROP CONFIRMED — Rust client spoke EpixNet's protocol end to end.");
+    println!("\n🎉 WIRE INTEROP CONFIRMED - Rust client spoke EpixNet's protocol end to end.");
 }
