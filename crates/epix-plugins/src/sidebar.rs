@@ -225,40 +225,35 @@ fn render_sidebar(address: &str, info: &Value, counts: PeerCounts, recv: u64, se
          <a href='#Delete' class='button' id='button-delete'>Delete</a></li>",
     );
 
-    // "This is my site" — claim ownership (the JS calls siteSetOwned).
+    // "This is my site" — claim ownership. The owner panel below is always in
+    // the DOM; the checkbox reveals it via CSS (#checkbox-owned:checked ~
+    // .settings-owned), matching EpixNet, so it shows the moment you check it.
     let owned = info["settings"]["own"].as_bool().unwrap_or(false);
     let checked = if owned { "checked='checked'" } else { "" };
+    let description = content.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let xid_name = content.get("domain").and_then(|v| v.as_str()).unwrap_or("");
     b.push_str(&format!(
         "<h2 class='owned-title'>This is my site</h2>\
          <input type='checkbox' class='checkbox' id='checkbox-owned' {checked}/>\
-         <div class='checkbox-skin'></div>",
+         <div class='checkbox-skin'></div>\
+         <div class='settings-owned'>\
+          <li><label for='settings-title'>Site title</label>\
+           <input type='text' class='text' value=\"{title}\" id='settings-title'/></li>\
+          <li><label for='settings-description'>Site description</label>\
+           <input type='text' class='text' value=\"{desc}\" id='settings-description'/></li>\
+          <li><label for='settings-xid-name'>xID name <small class='label-right'>e.g. mysite.epix</small></label>\
+           <input type='text' class='text' value=\"{xid}\" id='settings-xid-name' placeholder='name.epix'/></li>\
+          <li><a href='#Save' class='button' id='button-settings'>Save site settings</a></li>\
+          <li><label>Content publishing</label>\
+           <div class='flex'>\
+            <input type='text' class='text' value='content.json' id='input-contents'/>\
+            <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>Sign and publish</a>\
+           </div></li>\
+         </div>",
+        title = esc(title),
+        desc = esc(description),
+        xid = esc(xid_name),
     ));
-
-    // Owner settings + content publishing (only for owned sites).
-    if owned {
-        let description = content.get("description").and_then(|v| v.as_str()).unwrap_or("");
-        let xid_name = content.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-        b.push_str("<div class='settings-owned'><ul class='fields'>");
-        b.push_str(&format!(
-            "<li><label for='settings-title'>Site title</label>\
-             <input type='text' class='text' value=\"{}\" id='settings-title'/></li>\
-             <li><label for='settings-description'>Site description</label>\
-             <input type='text' class='text' value=\"{}\" id='settings-description'/></li>\
-             <li><label for='settings-xid-name'>xID name <small class='label-right'>e.g. mysite.epix</small></label>\
-             <input type='text' class='text' value=\"{}\" id='settings-xid-name' placeholder='name.epix'/></li>\
-             <li><a href='#Save' class='button' id='button-settings'>Save site settings</a></li>",
-            esc(title), esc(description), esc(xid_name),
-        ));
-        // Content publishing — sign + publish a content.json.
-        b.push_str(
-            "<li><label>Content publishing</label>\
-             <div class='flex'>\
-              <input type='text' class='text' value='content.json' id='input-contents'/>\
-              <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>Sign and publish</a>\
-             </div></li>",
-        );
-        b.push_str("</ul></div>");
-    }
 
     b.push_str("</ul></div>");
     b
@@ -295,11 +290,13 @@ mod tests {
         assert!(html.contains("id='settings-title'"));
         assert!(html.contains("button-sign-publish"), "sign + publish button");
 
-        // Not owned: checkbox present but unchecked, no publish section.
+        // Not owned: the owner panel is still in the DOM (CSS hides it), but the
+        // checkbox is unchecked.
         let mut info2 = info.clone();
         info2["settings"]["own"] = json!(false);
         let html2 = render_sidebar("1abc.epix", &info2, counts, 0, 0);
         assert!(html2.contains("checkbox-owned") && !html2.contains("checked='checked'"));
-        assert!(!html2.contains("button-sign-publish"));
+        assert!(html2.contains("button-sign-publish"), "owner panel always present; CSS toggles it");
+        assert!(html2.contains("class='settings-owned'"));
     }
 }
