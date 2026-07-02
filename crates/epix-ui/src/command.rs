@@ -94,7 +94,17 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteSign),
         Arc::new(SitePublish),
         Arc::new(FileWrite),
+        Arc::new(FileRules),
         Arc::new(SiteSetOwned),
+        Arc::new(SiteRecoverPrivatekey),
+        Arc::new(UserSetSitePrivatekey),
+        Arc::new(SiteUpdate),
+        Arc::new(simple("sitePause", json!("ok"))),
+        Arc::new(simple("siteResume", json!("ok"))),
+        Arc::new(simple("siteDelete", json!("ok"))),
+        Arc::new(simple("siteSetAutodownloadoptional", json!("ok"))),
+        Arc::new(simple("dbReload", json!("ok"))),
+        Arc::new(simple("dbRebuild", json!("ok"))),
         // CryptMessage
         Arc::new(UserPublickey),
         Arc::new(EciesEncrypt),
@@ -117,8 +127,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(simple("serverErrors", json!([]))),
-        Arc::new(simple("announcerStats", json!({}))),
-        Arc::new(simple("siteList", json!([]))),
+        Arc::new(AnnouncerStats),
+        Arc::new(SiteList),
         Arc::new(simple("notificationQuery", json!([]))),
         Arc::new(FeedQuery),
         Arc::new(FeedFollow),
@@ -233,6 +243,18 @@ impl WsCommand for ServerInfo {
     }
 }
 
+/// `announcerStats` — per-tracker announce status for the dashboard.
+struct AnnouncerStats;
+#[async_trait]
+impl WsCommand for AnnouncerStats {
+    fn name(&self) -> &'static str {
+        "announcerStats"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.announcer_stats().await)
+    }
+}
+
 struct WrapperNonce;
 #[async_trait]
 impl WsCommand for WrapperNonce {
@@ -253,6 +275,18 @@ impl WsCommand for SiteInfo {
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?;
         Ok(s.state.site_info(address).await)
+    }
+}
+
+/// `siteList` — every served xite's siteInfo, for the dashboard's Sites panel.
+struct SiteList;
+#[async_trait]
+impl WsCommand for SiteList {
+    fn name(&self) -> &'static str {
+        "siteList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(Value::Array(s.state.site_list().await))
     }
 }
 
@@ -331,6 +365,73 @@ impl WsCommand for SiteSetOwned {
     }
 }
 
+/// `fileRules(inner_path)` — content rules (signers) for a path.
+struct FileRules;
+#[async_trait]
+impl WsCommand for FileRules {
+    fn name(&self) -> &'static str {
+        "fileRules"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = p
+            .as_str()
+            .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .unwrap_or("content.json");
+        Ok(s.state.file_rules(&address, inner_path).await)
+    }
+}
+
+/// `siteRecoverPrivatekey()` — recover the site key from the master seed.
+struct SiteRecoverPrivatekey;
+#[async_trait]
+impl WsCommand for SiteRecoverPrivatekey {
+    fn name(&self) -> &'static str {
+        "siteRecoverPrivatekey"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        Ok(s.state.recover_privatekey(&address).await)
+    }
+}
+
+/// `userSetSitePrivatekey(privatekey)` — save the site key (marks owned).
+struct UserSetSitePrivatekey;
+#[async_trait]
+impl WsCommand for UserSetSitePrivatekey {
+    fn name(&self) -> &'static str {
+        "userSetSitePrivatekey"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let pk = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or("userSetSitePrivatekey: privatekey required")?;
+        s.state.set_site_privatekey(&address, pk).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteUpdate(address)` — force a re-sync now.
+struct SiteUpdate;
+#[async_trait]
+impl WsCommand for SiteUpdate {
+    fn name(&self) -> &'static str {
+        "siteUpdate"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = p
+            .as_str()
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .map(String::from)
+            .unwrap_or(s.address()?.to_string());
+        let _ = s.state.resync_xite(&address).await;
+        Ok(Value::from("ok"))
+    }
+}
+
 /// `siteSign(privatekey, inner_path)` — rebuild + sign content.json.
 struct SiteSign;
 #[async_trait]
@@ -340,7 +441,10 @@ impl WsCommand for SiteSign {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        let privatekey = sign_privatekey(p).ok_or("siteSign: privatekey required")?;
+        let privatekey = match sign_privatekey(p) {
+            Some(pk) => pk,
+            None => s.state.site_privatekey(&address).await.ok_or("siteSign: privatekey required")?,
+        };
         s.state.sign_xite(&address, &privatekey).await?;
         Ok(Value::from("ok"))
     }
@@ -362,9 +466,14 @@ impl WsCommand for SitePublish {
             .and_then(|v| v.as_str())
             .unwrap_or("content.json")
             .to_string();
-        // Sign first if a private key is supplied (JS omits it to publish an
-        // already-signed file).
-        if let Some(pk) = sign_privatekey(p) {
+        // Sign first with the given key, or the saved site key; if neither, the
+        // file is assumed already signed.
+        let key = sign_privatekey(p);
+        let key = match key {
+            Some(pk) => Some(pk),
+            None => s.state.site_privatekey(&address).await,
+        };
+        if let Some(pk) = key {
             s.state.sign_xite(&address, &pk).await?;
         }
         let published = s.state.publish(&address, &inner_path).await?;

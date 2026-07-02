@@ -14,7 +14,6 @@
 //! stops cleanly.
 
 use epix_core::PeerAddr;
-use epix_transport::Transport;
 use epix_ui::AppState;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,10 +37,10 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Owns the node's background loops.
+/// Owns the node's background loops. The announce/re-sync work uses the
+/// transport already set on the [`AppState`].
 pub struct NodeRuntime {
     state: Arc<AppState>,
-    transport: Arc<dyn Transport>,
     trackers: Vec<PeerAddr>,
     config: RuntimeConfig,
     shutdown: Arc<Notify>,
@@ -49,24 +48,18 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn new(state: Arc<AppState>, transport: Arc<dyn Transport>, trackers: Vec<PeerAddr>) -> Self {
-        Self::with_config(state, transport, trackers, RuntimeConfig::default())
+    pub fn new(state: Arc<AppState>, trackers: Vec<PeerAddr>) -> Self {
+        Self::with_config(state, trackers, RuntimeConfig::default())
     }
 
-    pub fn with_config(
-        state: Arc<AppState>,
-        transport: Arc<dyn Transport>,
-        trackers: Vec<PeerAddr>,
-        config: RuntimeConfig,
-    ) -> Self {
-        Self { state, transport, trackers, config, shutdown: Arc::new(Notify::new()), handles: Vec::new() }
+    pub fn with_config(state: Arc<AppState>, trackers: Vec<PeerAddr>, config: RuntimeConfig) -> Self {
+        Self { state, trackers, config, shutdown: Arc::new(Notify::new()), handles: Vec::new() }
     }
 
     /// Spawn the background loops. Idempotent per instance (call once).
     pub fn start(&mut self) {
         self.handles.push(tokio::spawn(announce_loop(
             self.state.clone(),
-            self.transport.clone(),
             self.trackers.clone(),
             self.shutdown.clone(),
             self.config.announce_interval,
@@ -87,10 +80,9 @@ impl NodeRuntime {
     }
 }
 
-/// Re-announce every xite to the trackers and fold in the peers found.
+/// Re-announce every xite to the trackers (recording per-tracker stats).
 async fn announce_loop(
     state: Arc<AppState>,
-    transport: Arc<dyn Transport>,
     trackers: Vec<PeerAddr>,
     shutdown: Arc<Notify>,
     period: Duration,
@@ -104,8 +96,7 @@ async fn announce_loop(
             _ = tick.tick() => {
                 if trackers.is_empty() { continue; }
                 for address in state.xite_addresses().await {
-                    let peers = epix_xite::announce(transport.as_ref(), &address, &trackers, 0).await;
-                    state.add_peers(&address, peers).await;
+                    state.announce_to_trackers(&address, &trackers).await;
                 }
             }
         }

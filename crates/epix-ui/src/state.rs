@@ -64,6 +64,9 @@ pub struct AppState {
     filters_path: Option<PathBuf>,
     /// Transport used to publish updates to peers (set by the node).
     transport: RwLock<Option<Arc<dyn Transport>>>,
+    /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
+    /// dashboard's Trackers panel.
+    tracker_stats: RwLock<HashMap<String, Value>>,
 }
 
 fn empty_filters() -> Value {
@@ -87,6 +90,7 @@ impl AppState {
             filters: RwLock::new(empty_filters()),
             filters_path: None,
             transport: RwLock::new(None),
+            tracker_stats: RwLock::new(HashMap::new()),
         })
     }
 
@@ -112,6 +116,7 @@ impl AppState {
             filters: RwLock::new(filters),
             filters_path: Some(filters_path),
             transport: RwLock::new(None),
+            tracker_stats: RwLock::new(HashMap::new()),
         })
     }
 
@@ -162,6 +167,44 @@ impl AppState {
             x.peers.add_many(addrs, now_secs());
             x.settings.peers = x.peers.len() as i64;
         }
+    }
+
+    /// Announce a xite to each tracker in turn, recording per-tracker stats and
+    /// folding the peers found into the xite's registry. Returns all peers.
+    pub async fn announce_to_trackers(&self, address: &str, trackers: &[PeerAddr]) -> Vec<PeerAddr> {
+        let Some(transport) = self.transport.read().await.clone() else { return Vec::new() };
+        let mut all = Vec::new();
+        for tracker in trackers {
+            let peers = epix_xite::announce(transport.as_ref(), address, std::slice::from_ref(tracker), 0).await;
+            self.record_tracker(&tracker.to_string(), peers.len()).await;
+            all.extend(peers);
+        }
+        self.add_peers(address, all.clone()).await;
+        all
+    }
+
+    /// Record a completed announce to `tracker` (found `num_added` peers).
+    async fn record_tracker(&self, tracker: &str, num_added: usize) {
+        let key = format!("epix://{tracker}");
+        let mut stats = self.tracker_stats.write().await;
+        let entry = stats.entry(key).or_insert_with(|| {
+            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0 })
+        });
+        let obj = entry.as_object_mut().expect("tracker stat object");
+        let bump = |o: &mut serde_json::Map<String, Value>, k: &str, by: i64| {
+            let v = o.get(k).and_then(|v| v.as_i64()).unwrap_or(0) + by;
+            o.insert(k.to_string(), json!(v));
+        };
+        obj.insert("status".into(), json!("announced"));
+        obj.insert("time_request".into(), json!(now_secs()));
+        bump(obj, "num_request", 1);
+        bump(obj, "num_success", 1);
+        bump(obj, "num_added", num_added as i64);
+    }
+
+    /// Per-tracker announce stats for the dashboard. `announcerStats`.
+    pub async fn announcer_stats(&self) -> Value {
+        Value::Object(self.tracker_stats.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     }
 
     /// Mark a peer connected/disconnected for a xite.
@@ -768,6 +811,80 @@ impl AppState {
         }
     }
 
+    /// Try to recover a xite's private key from the user's master seed via its
+    /// `address_index` (only works for sites this user created). `"ok"` on
+    /// success (key saved + marked owned), else `{error}`. `siteRecoverPrivatekey`.
+    pub async fn recover_privatekey(&self, address: &str) -> Value {
+        if self.user.read().await.site_privatekey(address).is_some() {
+            return json!({ "error": "This site already has a saved private key" });
+        }
+        let content = self.content(address).await;
+        let Some(index) = content.as_ref().and_then(|c| c.get("address_index")).and_then(|v| v.as_u64())
+        else {
+            return json!({ "error": "No address_index in content.json" });
+        };
+        let seed = self.user.read().await.master_seed.clone();
+        let privatekey = match epix_crypt::hd_privatekey(&seed, index) {
+            Ok(p) => p,
+            Err(e) => return json!({ "error": e }),
+        };
+        match epix_crypt::privatekey_to_address(&privatekey) {
+            Ok(derived) if derived == address => {
+                let _ = self.user.write().await.set_site_privatekey(address, &privatekey);
+                self.save_user().await;
+                self.set_owned(address, true).await;
+                json!("ok")
+            }
+            _ => json!({ "error": "Unable to deliver private key for this site from current user's master_seed" }),
+        }
+    }
+
+    /// Save a xite's private key directly (`userSetSitePrivatekey`), marking it
+    /// owned.
+    pub async fn set_site_privatekey(&self, address: &str, privatekey: &str) -> Result<(), String> {
+        self.user.write().await.set_site_privatekey(address, privatekey)?;
+        self.set_owned(address, true).await;
+        Ok(())
+    }
+
+    /// The saved private key for a xite (used to auto-sign on publish).
+    pub async fn site_privatekey(&self, address: &str) -> Option<String> {
+        self.user.read().await.site_privatekey(address)
+    }
+
+    /// The content rules for `inner_path` — chiefly the `signers` allowed to
+    /// sign it (the sidebar checks these before prompting for a key). For the
+    /// root content.json that's the xite's own address (or its declared
+    /// `signers`); for a user content, the user's auth address. `fileRules`.
+    pub async fn file_rules(&self, address: &str, inner_path: &str) -> Value {
+        let content = self.content(address).await;
+        let signers = if inner_path.starts_with("data/users/") {
+            // User content: signed by the user's own auth key for this xite.
+            let auth = self.user.write().await.auth_address(address).unwrap_or_default();
+            vec![Value::from(auth)]
+        } else {
+            content
+                .as_ref()
+                .and_then(|c| c.get("signers"))
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_else(|| vec![Value::from(address)])
+        };
+        let signers_required = content
+            .as_ref()
+            .and_then(|c| c.get("signers_required"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+        json!({
+            "signers": signers,
+            "signers_required": signers_required,
+            "user_contents": content.as_ref().and_then(|c| c.get("user_contents")).cloned().unwrap_or(Value::Null),
+            "cert_signers": {},
+            "max_size": 10 * 1024 * 1024,
+            "files_allowed": ".*",
+        })
+    }
+
     /// Write a file into a xite's storage (`fileWrite`).
     pub async fn write_file(&self, address: &str, inner_path: &str, bytes: &[u8]) -> Result<(), String> {
         let storage = self
@@ -932,6 +1049,33 @@ impl AppState {
         })
     }
 
+    /// `siteList` — one siteInfo per served xite, for the dashboard's Sites
+    /// panel. A xite served under both its raw address and a `.epix` alias is a
+    /// single site, so we collapse entries that share the same signed content
+    /// address (the alias points at the same storage + content).
+    pub async fn site_list(&self) -> Vec<Value> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for address in self.xite_addresses().await {
+            let info = self.site_info(&address).await;
+            if info.is_null() {
+                continue;
+            }
+            // Prefer the signed address to dedupe alias/raw pairs; fall back to
+            // the serving key when there is no verified content yet.
+            let dedupe_key = info
+                .get("content")
+                .and_then(|c| c.get("address"))
+                .and_then(Value::as_str)
+                .unwrap_or(&address)
+                .to_string();
+            if seen.insert(dedupe_key) {
+                out.push(info);
+            }
+        }
+        out
+    }
+
     /// A fresh wrapper nonce (monotonic; sufficient for a local single-user node).
     pub fn wrapper_nonce(&self) -> String {
         let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
@@ -1091,6 +1235,32 @@ mod tests {
 
         assert_eq!(info["size_limit"], 10);
         assert_eq!(info["next_size_limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn site_list_returns_one_entry_per_site_collapsing_aliases() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        // Same signed content served under a raw address and a `.epix` alias.
+        let content = json!({ "address": "1HeLLo", "modified": 1.0, "files": {}, "signs": {"1HeLLo": "x"} });
+        state
+            .add_xite("1HeLLo", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) })
+            .await;
+        state
+            .add_xite("hello.epix", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
+            .await;
+        // A second, distinct site.
+        let other = json!({ "address": "1Other", "modified": 1.0, "files": {}, "signs": {"1Other": "x"} });
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(other) })
+            .await;
+
+        let list = state.site_list().await;
+        assert_eq!(list.len(), 2, "alias collapses; two distinct sites remain");
+        let addrs: std::collections::HashSet<_> =
+            list.iter().map(|s| s["content"]["address"].as_str().unwrap()).collect();
+        assert!(addrs.contains("1HeLLo"));
+        assert!(addrs.contains("1Other"));
     }
 
     #[tokio::test]

@@ -50,6 +50,9 @@ pub struct SiteAuth {
     pub auth_privatekey: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert: Option<Cert>,
+    /// The xite's own private key, once saved/recovered (owners only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privatekey: Option<String>,
 }
 
 /// The local user: master seed + per-xite identities.
@@ -111,7 +114,7 @@ impl User {
             let auth_address = epix_crypt::privatekey_to_address(&auth_privatekey)?;
             self.sites.insert(
                 address.to_string(),
-                SiteAuth { auth_address, auth_privatekey, cert: None },
+                SiteAuth { auth_address, auth_privatekey, cert: None, privatekey: None },
             );
         }
         Ok(&self.sites[address])
@@ -134,6 +137,20 @@ impl User {
     pub fn encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {
         let crypt_index = Self::address_auth_index(address) + 1000 + index;
         epix_crypt::hd_privatekey(&self.master_seed, crypt_index)
+    }
+
+    /// Save the xite's own private key (from recovery or user input).
+    pub fn set_site_privatekey(&mut self, address: &str, privatekey: &str) -> Result<(), String> {
+        self.site_data(address)?;
+        if let Some(site) = self.sites.get_mut(address) {
+            site.privatekey = Some(privatekey.to_string());
+        }
+        Ok(())
+    }
+
+    /// The saved xite private key, if any.
+    pub fn site_privatekey(&self, address: &str) -> Option<String> {
+        self.sites.get(address).and_then(|s| s.privatekey.clone())
     }
 
     /// The cert user id (`name@provider`) for `address`, if a cert is selected.

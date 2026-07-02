@@ -140,17 +140,11 @@ async fn serve(
     // transfer, so siteInfo/the sidebar show real peer counts and bytes.
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;
-    let peers = epix_xite::announce(
-        transport.as_ref(),
-        &address,
-        &[PeerAddr::parse(TRACKER).unwrap()],
-        0,
-    )
-    .await;
-    state.add_peers(&address, peers.clone()).await;
+    let trackers = vec![PeerAddr::parse(TRACKER).unwrap()];
+    state.announce_to_trackers(&address, &trackers).await;
     state.add_transfer(&address, bytes_recv, 0).await;
     if display != address {
-        state.add_peers(&display, peers).await;
+        state.announce_to_trackers(&display, &trackers).await;
         state.add_transfer(&display, bytes_recv, 0).await;
     }
     // Fill any merger site's aggregate db from the merged sites we serve.
@@ -158,11 +152,7 @@ async fn serve(
 
     // Bring the node to life: supervised loops re-announce to trackers and
     // re-sync each xite (picking up published updates) in the background.
-    let mut runtime = epix_runtime::NodeRuntime::new(
-        state.clone(),
-        transport.clone(),
-        vec![PeerAddr::parse(TRACKER).unwrap()],
-    );
+    let mut runtime = epix_runtime::NodeRuntime::new(state.clone(), trackers);
     runtime.start();
 
     // Assemble the UI command set + media through the plugin system.
