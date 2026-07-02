@@ -294,9 +294,14 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                             None => true,
                             Some(ch) => session.in_channel(ch),
                         };
-                        let target_ok = match &ev.target {
-                            None => true,
-                            Some(addr) => session.xite.as_deref() == Some(addr.as_str()),
+                        let target_ok = match (&ev.target, &ev.channel) {
+                            (None, _) => true,
+                            // Bound xite matches, or the connection joined this
+                            // channel for all sites (channelJoinAllsite).
+                            (Some(addr), channel) => {
+                                session.xite.as_deref() == Some(addr.as_str())
+                                    || channel.as_deref().is_some_and(|ch| session.in_allsite(ch))
+                            }
                         };
                         if channel_ok && target_ok && sink.send(Message::Text(ev.payload)).await.is_err() {
                             break;
