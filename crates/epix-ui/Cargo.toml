@@ -31,6 +31,13 @@ flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+getrandom = { version = "0.2", optional = true }
+
+[features]
+# UiPassword: a cookie-session login gate over the whole UI. Off by default and
+# on mobile (a phone's UI is already local to the device); enable for a shared
+# or exposed desktop node.
+ui-password = ["dep:getrandom"]
 
 [dev-dependencies]
 rmpv = "1"

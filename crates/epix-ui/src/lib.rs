@@ -11,6 +11,8 @@ pub mod command;
 pub mod conn_pool;
 pub mod geoip;
 pub mod state;
+#[cfg(feature = "ui-password")]
+pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
 pub use state::{AppState, XiteEntry};
@@ -84,7 +86,7 @@ impl UiServer {
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/uimedia/*path", get(serve_uimedia))
@@ -93,8 +95,17 @@ impl UiServer {
             .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
-            .route("/:address/*path", get(serve_file))
-            .with_state(self.ctx.clone())
+            .route("/:address/*path", get(serve_file));
+        // UiPassword: mount the login/logout routes and the session gate.
+        #[cfg(feature = "ui-password")]
+        let router = router
+            .route("/Login", get(serve_login).post(serve_login_post))
+            .route("/Logout", get(serve_logout))
+            .layer(axum::middleware::from_fn_with_state(
+                self.ctx.clone(),
+                ui_password_gate,
+            ));
+        router.with_state(self.ctx.clone())
     }
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
@@ -570,4 +581,128 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
         Ok(result) => json!({"cmd": "response", "to": id, "result": result}).to_string(),
         Err(error) => json!({"cmd": "response", "to": id, "error": error}).to_string(),
     }
+}
+
+// ---- UiPassword: session gate + login/logout routes ------------------------
+
+/// Middleware: when a UI password is configured, require a valid `session_id`
+/// cookie on every request except the login page and favicon. Unauthenticated
+/// requests get the login page.
+#[cfg(feature = "ui-password")]
+async fn ui_password_gate(
+    State(ctx): State<Ctx>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if ctx.state.ui_password().await.is_none() {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    if path == "/Login" || path.ends_with("favicon.ico") {
+        return next.run(request).await;
+    }
+    let cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    if uipassword::session_valid(&uipassword::cookie_session_id(cookie)) {
+        return next.run(request).await;
+    }
+    login_page(false)
+}
+
+/// Render the login page as an HTML response.
+#[cfg(feature = "ui-password")]
+fn login_page(bad_password: bool) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        uipassword::login_html(bad_password),
+    )
+        .into_response()
+}
+
+/// `GET /Login` - show the login form.
+#[cfg(feature = "ui-password")]
+async fn serve_login() -> Response {
+    login_page(false)
+}
+
+/// `POST /Login` - check the password; on success set the session cookie and
+/// redirect home, otherwise re-show the form with the error state.
+#[cfg(feature = "ui-password")]
+async fn serve_login_post(State(ctx): State<Ctx>, body: String) -> Response {
+    let password = form_field(&body, "password");
+    match ctx.state.ui_password().await {
+        Some(expected) if password == expected => {
+            let sid = uipassword::session_create();
+            let cookie = format!("session_id={sid}; path=/; max-age=2592000");
+            (
+                StatusCode::SEE_OTHER,
+                [(header::LOCATION, "/".to_string()), (header::SET_COOKIE, cookie)],
+            )
+                .into_response()
+        }
+        _ => login_page(true),
+    }
+}
+
+/// `GET /Logout` - drop the current session and clear the cookie.
+#[cfg(feature = "ui-password")]
+async fn serve_logout(headers: header::HeaderMap) -> Response {
+    let cookie = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
+    uipassword::session_delete(&uipassword::cookie_session_id(cookie));
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/".to_string()),
+            (
+                header::SET_COOKIE,
+                "session_id=deleted; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// Pull a single field out of an `application/x-www-form-urlencoded` body.
+#[cfg(feature = "ui-password")]
+fn form_field(body: &str, key: &str) -> String {
+    for pair in body.split('&') {
+        if let Some(val) = pair.strip_prefix(&format!("{key}=")) {
+            return percent_decode(val);
+        }
+    }
+    String::new()
+}
+
+/// Minimal form-value decode: `+` to space and `%XX` escapes.
+#[cfg(feature = "ui-password")]
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

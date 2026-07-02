@@ -284,6 +284,22 @@ impl AppState {
         self.config.read().await.get(key).cloned()
     }
 
+    // --- NoNewSites: refuse to clone/add new sites when set -----------------
+
+    /// Whether the operator has disabled adding new sites to this node.
+    pub async fn no_new_sites(&self) -> bool {
+        self.config_get("no_new_sites").await.and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// The configured UI password, if any (UiPassword). Empty/unset means the
+    /// login gate is off.
+    pub async fn ui_password(&self) -> Option<String> {
+        self.config_get("ui_password")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+    }
+
     // --- AnnounceShare: persisted working trackers --------------------------
 
     /// The trackers remembered from previous announces (`epix://…` addresses).

@@ -17,3 +17,10 @@ epix-plugins = { path = "../epix-plugins" }
 epix-runtime = { path = "../epix-runtime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
+
+[features]
+# Desktop bundles the auth/login plugins that a mobile build leaves off (the
+# phone UI is already local to the device). Build a mobile node with
+# `--no-default-features`.
+default = ["desktop"]
+desktop = ["epix-ui/ui-password"]

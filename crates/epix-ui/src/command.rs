@@ -85,6 +85,13 @@ pub fn is_admin_command(cmd: &str) -> bool {
     ADMIN_COMMANDS.contains(&cmd)
 }
 
+/// Commands that create or clone a new site - blocked by NoNewSites.
+const NEW_SITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
+
+/// Commands that remove a site - also blocked by NoNewSites, so an operator can
+/// lock the node's site set (no adds and no deletes) with one switch.
+const DELETE_SITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
+
 /// Per-connection context handed to every command.
 pub struct WsSession {
     pub state: Arc<AppState>,
@@ -218,6 +225,15 @@ impl CommandRegistry {
             if !elevated && !has_admin {
                 return Err(format!("You don't have permission to run {cmd}"));
             }
+        }
+        // NoNewSites: when the operator sets `no_new_sites`, lock the node's site
+        // set - refuse commands that add/clone a new site or delete an existing
+        // one.
+        if NEW_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
+            return Err("Adding new sites is disabled on this node".into());
+        }
+        if DELETE_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
+            return Err("Deleting sites is disabled on this node".into());
         }
         // A command from a disabled plugin behaves as if unregistered.
         if let Some(plugin) = self.command_plugin.get(cmd) {
