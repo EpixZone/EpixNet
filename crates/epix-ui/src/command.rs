@@ -145,11 +145,13 @@ pub trait WsCommand: Send + Sync {
 /// Maps command names to handlers. Plugins register more.
 pub struct CommandRegistry {
     commands: HashMap<&'static str, Arc<dyn WsCommand>>,
+    /// Which plugin a command belongs to (built-ins are absent = always on).
+    command_plugin: HashMap<&'static str, String>,
 }
 
 impl CommandRegistry {
     pub fn empty() -> Self {
-        Self { commands: HashMap::new() }
+        Self { commands: HashMap::new(), command_plugin: HashMap::new() }
     }
 
     /// The built-in command set (enough for the wrapper + a xite to load).
@@ -163,6 +165,13 @@ impl CommandRegistry {
 
     pub fn register(&mut self, command: Arc<dyn WsCommand>) {
         self.commands.insert(command.name(), command);
+    }
+
+    /// Register a command owned by `plugin`; it is only dispatched while that
+    /// plugin is enabled.
+    pub fn register_for_plugin(&mut self, plugin: &str, command: Arc<dyn WsCommand>) {
+        self.command_plugin.insert(command.name(), plugin.to_string());
+        self.register(command);
     }
 
     pub fn has(&self, cmd: &str) -> bool {
@@ -190,6 +199,12 @@ impl CommandRegistry {
             };
             if !elevated && !has_admin {
                 return Err(format!("You don't have permission to run {cmd}"));
+            }
+        }
+        // A command from a disabled plugin behaves as if unregistered.
+        if let Some(plugin) = self.command_plugin.get(cmd) {
+            if !session.state.plugin_enabled(plugin).await {
+                return Ok(Value::Null);
             }
         }
         match self.commands.get(cmd) {
@@ -257,6 +272,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(DbQuery),
         // Dashboard polling / lists — benign empty values.
         Arc::new(ServerErrors),
+        Arc::new(PluginList),
+        Arc::new(PluginConfigSet),
         Arc::new(ConsoleLogRead),
         Arc::new(ConsoleLogStream),
         Arc::new(ConsoleLogStreamRemove),
@@ -351,6 +368,50 @@ impl WsCommand for Ping {
     }
     async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(Value::from("Pong!"))
+    }
+}
+
+/// `pluginList` — loaded plugins with their enabled state.
+struct PluginList;
+#[async_trait]
+impl WsCommand for PluginList {
+    fn name(&self) -> &'static str {
+        "pluginList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let plugins: Vec<Value> = s
+            .state
+            .plugin_states()
+            .await
+            .into_iter()
+            .map(|(name, enabled)| json!({ "name": name, "enabled": enabled, "source": "builtin" }))
+            .collect();
+        Ok(json!({ "plugins": plugins }))
+    }
+}
+
+/// `pluginConfigSet(plugin, enabled)` — enable/disable a plugin at runtime
+/// (persisted, no restart).
+struct PluginConfigSet;
+#[async_trait]
+impl WsCommand for PluginConfigSet {
+    fn name(&self) -> &'static str {
+        "pluginConfigSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let name = p
+            .get("plugin")
+            .or_else(|| p.get("name"))
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("pluginConfigSet: plugin required")?;
+        let enabled = p
+            .get("enabled")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        s.state.set_plugin_enabled(name, enabled).await;
+        Ok(Value::from("ok"))
     }
 }
 

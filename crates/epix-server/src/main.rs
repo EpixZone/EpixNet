@@ -253,6 +253,7 @@ async fn serve(
     // items.
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.push("Stats".to_string());
+    plugin_names.push("UiPluginManager".to_string());
     state.set_plugins(plugin_names).await;
 
     let bind: std::net::SocketAddr = BIND.parse().unwrap();

@@ -10,7 +10,7 @@
 //! discovery, worker priority, new FileRequest commands) hang off the same
 //! [`Plugin`] trait as additional methods.
 
-use epix_ui::{CommandRegistry, MediaBundle, WsCommand};
+use epix_ui::{CommandRegistry, MediaBundle, PluginMedia, WsCommand};
 use std::sync::Arc;
 
 /// A unit of extension. Every hook method defaults to a no-op; a plugin
@@ -73,36 +73,36 @@ impl PluginRegistry {
     }
 
     /// Build the UI command registry: built-in commands plus every plugin's
-    /// commands. Later plugins override earlier ones on a name clash.
+    /// commands, each tagged with its plugin so a disabled plugin's commands are
+    /// not dispatched. Later plugins override earlier ones on a name clash.
     pub fn command_registry(&self) -> CommandRegistry {
         let mut registry = CommandRegistry::with_defaults();
         for plugin in &self.plugins {
             for command in plugin.ws_commands() {
-                registry.register(command);
+                registry.register_for_plugin(plugin.name(), command);
             }
         }
         registry
     }
 
-    /// Assemble every plugin's `/uimedia` contributions into one bundle. Append
-    /// order follows registration order (a newline separates each plugin's JS/CSS
-    /// so concatenation can't glue two statements together).
+    /// Assemble each plugin's `/uimedia` contributions, kept per-plugin so a
+    /// disabled plugin can be excluded when the server serves `all.js`/`all.css`.
     pub fn media_bundle(&self) -> MediaBundle {
-        let mut bundle = MediaBundle::default();
-        for plugin in &self.plugins {
-            if let Some(js) = plugin.append_js() {
-                bundle.append_js.push(b'\n');
-                bundle.append_js.extend_from_slice(js);
-            }
-            if let Some(css) = plugin.append_css() {
-                bundle.append_css.push(b'\n');
-                bundle.append_css.extend_from_slice(css);
-            }
-            for (path, bytes) in plugin.media_files() {
-                bundle.files.insert(path.to_string(), bytes.to_vec());
-            }
-        }
-        bundle
+        let plugins = self
+            .plugins
+            .iter()
+            .map(|plugin| PluginMedia {
+                name: plugin.name().to_string(),
+                append_js: plugin.append_js().map(|b| b.to_vec()).unwrap_or_default(),
+                append_css: plugin.append_css().map(|b| b.to_vec()).unwrap_or_default(),
+                files: plugin
+                    .media_files()
+                    .into_iter()
+                    .map(|(p, b)| (p.to_string(), b.to_vec()))
+                    .collect(),
+            })
+            .collect();
+        MediaBundle { plugins }
     }
 }
 
@@ -156,5 +156,28 @@ mod tests {
             .unwrap();
         assert_eq!(out["greeting"], "hello, epix");
         assert_eq!(out["from"], "HelloPlugin");
+    }
+
+    #[tokio::test]
+    async fn disabled_plugin_command_is_not_dispatched() {
+        let mut registry = PluginRegistry::new();
+        registry.register(Arc::new(HelloPlugin));
+        let commands = registry.command_registry();
+
+        let state = AppState::new("test");
+        state.set_plugins(vec!["Hello".into()]).await;
+        let session = WsSession::new(state.clone(), None);
+
+        // Enabled: real result.
+        let out = commands.dispatch(&session, "helloPlugin", &json!({}), 1).await.unwrap();
+        assert_eq!(out["from"], "HelloPlugin");
+
+        // Disabled: the command behaves as unregistered (null), no restart.
+        state.set_plugin_enabled("Hello", false).await;
+        let out = commands.dispatch(&session, "helloPlugin", &json!({}), 1).await.unwrap();
+        assert!(out.is_null());
+
+        // Built-ins are unaffected by plugin state.
+        assert_eq!(commands.dispatch(&session, "ping", &json!({}), 1).await.unwrap(), json!("Pong!"));
     }
 }

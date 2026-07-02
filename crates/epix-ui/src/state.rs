@@ -220,14 +220,50 @@ impl AppState {
         })
     }
 
-    /// Set the loaded plugin/feature names reported in `serverInfo`.
+    /// Set the loaded plugin/feature names.
     pub async fn set_plugins(&self, names: Vec<String>) {
         *self.plugins.write().await = names;
     }
 
-    /// The loaded plugin/feature names (`serverInfo.plugins`).
+    /// The loaded plugin/feature names that are currently enabled
+    /// (`serverInfo.plugins`). A disabled plugin is hidden from feature checks.
     pub async fn plugins(&self) -> Vec<String> {
-        self.plugins.read().await.clone()
+        let disabled = self.disabled_plugins().await;
+        self.plugins.read().await.iter().filter(|n| !disabled.contains(*n)).cloned().collect()
+    }
+
+    /// All loaded plugins with their enabled state (`[(name, enabled)]`), for the
+    /// plugin manager.
+    pub async fn plugin_states(&self) -> Vec<(String, bool)> {
+        let disabled = self.disabled_plugins().await;
+        self.plugins.read().await.iter().map(|n| (n.clone(), !disabled.contains(n))).collect()
+    }
+
+    /// Whether a plugin is currently enabled (unknown plugins default enabled).
+    pub async fn plugin_enabled(&self, name: &str) -> bool {
+        !self.disabled_plugins().await.iter().any(|n| n == name)
+    }
+
+    /// Enable/disable a plugin at runtime (persisted). Takes effect on the next
+    /// page load / command — no restart.
+    pub async fn set_plugin_enabled(&self, name: &str, enabled: bool) {
+        let mut disabled = self.disabled_plugins().await;
+        disabled.retain(|n| n != name);
+        if !enabled {
+            disabled.push(name.to_string());
+        }
+        self.config_set("plugins_disabled", json!(disabled)).await;
+    }
+
+    /// The persisted list of disabled plugin names.
+    async fn disabled_plugins(&self) -> Vec<String> {
+        self.config_get("plugins_disabled")
+            .await
+            .and_then(|v| {
+                v.as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            })
+            .unwrap_or_default()
     }
 
     /// A node config value set via `configSet` (e.g. `language`).
@@ -2064,6 +2100,34 @@ mod tests {
         while events.try_recv().is_ok() {}
         state.log("INFO", "after removal").await;
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn plugins_enable_disable_persists_and_hides() {
+        let dir = tempdir().unwrap();
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            s.set_plugins(vec!["Sidebar".into(), "Stats".into()]).await;
+            // All enabled by default.
+            assert!(s.plugin_enabled("Sidebar").await);
+            assert_eq!(s.plugins().await, vec!["Sidebar", "Stats"]);
+
+            // Disabling hides it from serverInfo.plugins immediately (no restart).
+            s.set_plugin_enabled("Sidebar", false).await;
+            assert!(!s.plugin_enabled("Sidebar").await);
+            assert_eq!(s.plugins().await, vec!["Stats".to_string()]);
+            assert_eq!(
+                s.plugin_states().await,
+                vec![("Sidebar".to_string(), false), ("Stats".to_string(), true)]
+            );
+        }
+        // The disabled state persists across a restart (config.json).
+        let s = AppState::with_data_dir("test", dir.path());
+        s.set_plugins(vec!["Sidebar".into(), "Stats".into()]).await;
+        assert!(!s.plugin_enabled("Sidebar").await);
+        // Re-enable.
+        s.set_plugin_enabled("Sidebar", true).await;
+        assert!(s.plugin_enabled("Sidebar").await);
     }
 
     #[tokio::test]
