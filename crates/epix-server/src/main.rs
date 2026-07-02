@@ -241,13 +241,15 @@ async fn serve(
 
     // Bring the node to life: supervised loops re-announce to trackers and
     // re-sync each xite (picking up published updates) in the background.
-    // If `fileserver_port` is configured, also seed files to peers.
-    let fileserver_port = state
-        .config_get("fileserver_port")
-        .await
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16);
+    // Seeding + UPnP are on by default; `fileserver_port: 0` in config opts out.
+    const DEFAULT_FILESERVER_PORT: u16 = 26552;
+    let fileserver_port = match state.config_get("fileserver_port").await.and_then(|v| v.as_u64()) {
+        Some(0) => None,                    // explicitly disabled
+        Some(p) => Some(p as u16),          // operator-chosen port
+        None => Some(DEFAULT_FILESERVER_PORT), // on by default
+    };
     if let Some(port) = fileserver_port {
+        state.set_fileserver_port(port).await;
         state.log("INFO", format!("File seeding enabled on port {port}")).await;
     }
     let runtime_config =

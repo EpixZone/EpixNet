@@ -741,6 +741,7 @@ impl WsCommand for ServerInfo {
             Some(ip) if port_opened => json!(ip),
             _ => json!(false),
         };
+        let fileserver_port = s.state.fileserver_port().await;
         Ok(json!({
             "version": s.state.version,
             "rev": 8192,
@@ -749,7 +750,7 @@ impl WsCommand for ServerInfo {
             "ip_external": ip_external,
             "port_opened": port_opened,
             "fileserver_ip": "127.0.0.1",
-            "fileserver_port": 15441,
+            "fileserver_port": fileserver_port,
             "tor_enabled": false,
             "tor_status": "Disabled",
             "tor_has_meek_bridges": false,
@@ -2320,10 +2321,16 @@ mod tests {
         let state = AppState::new("test");
         let session = WsSession::new(state.clone(), Some("1site".into()));
 
-        // Closed by default: port_opened false, ip_external false.
+        // Closed by default: port_opened false, ip_external false, port 0.
         let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(info["port_opened"], false);
         assert_eq!(info["ip_external"], false);
+        assert_eq!(info["fileserver_port"], 0);
+
+        // The bound seeding port is reported.
+        state.set_fileserver_port(26552).await;
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["fileserver_port"], 26552);
 
         // Once UPnP opens the port, serverInfo shows it + the external IP string.
         state.set_port_status(true, Some("203.0.113.7".into())).await;
