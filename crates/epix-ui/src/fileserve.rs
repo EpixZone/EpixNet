@@ -28,6 +28,19 @@ impl FileService {
         Self { state }
     }
 
+    /// `getPiecefields {site}` - report which pieces of each big file we hold,
+    /// keyed by the file's sha512, so a downloader only asks us for pieces we
+    /// actually have.
+    async fn get_piecefields(&self, params: &Value) -> Value {
+        let site = vget_str(params, "site").unwrap_or_default();
+        let packed = self.state.our_piecefields(&site).await;
+        let map: Vec<(Value, Value)> = packed
+            .into_iter()
+            .map(|(sha512, bytes)| (Value::from(sha512), Value::Binary(bytes)))
+            .collect();
+        vmap(vec![("piecefields_packed", Value::Map(map))])
+    }
+
     async fn get_file(&self, params: &Value) -> Value {
         let site = vget_str(params, "site").unwrap_or_default();
         let inner_path = vget_str(params, "inner_path").unwrap_or_default();
@@ -56,6 +69,10 @@ impl RequestHandler for FileService {
         match cmd {
             "ping" => vmap(vec![("body", Value::Binary(b"Pong!".to_vec()))]),
             "getFile" | "streamFile" => self.get_file(params).await,
+            "getPiecefields" => self.get_piecefields(params).await,
+            // A peer pushing us its piecefields: acknowledge (our downloader
+            // re-queries piecefields when it needs them, so we don't retain).
+            "setPiecefields" => vmap(vec![("ok", Value::from("Updated"))]),
             // Unknown/unsupported request: empty body (the server still wraps it
             // as a response so the peer isn't left hanging).
             _ => Value::Map(vec![]),
