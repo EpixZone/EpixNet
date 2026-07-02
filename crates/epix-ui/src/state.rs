@@ -119,6 +119,9 @@ pub struct AppState {
     /// Path to the persisted peer database (`peers.json`), so known peers survive
     /// restarts (the PeerDb plugin). None for in-memory nodes.
     peers_path: Option<PathBuf>,
+    /// Path to the persisted optional-file pins (`pins.json`), so a pinned file
+    /// stays pinned across restarts (OptionalManager). None for in-memory nodes.
+    pins_path: Option<PathBuf>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -178,6 +181,7 @@ impl AppState {
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
             peers_path: None,
+            pins_path: None,
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -252,6 +256,7 @@ impl AppState {
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
             peers_path: Some(dir.join("peers.json")),
+            pins_path: Some(dir.join("pins.json")),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -515,6 +520,8 @@ impl AppState {
         if !saved.is_empty() {
             peers.add_many(saved, now_secs());
         }
+        // Restore optional-file pins persisted by OptionalManager.
+        let pinned = self.load_persisted_pins(&canonical);
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -529,7 +536,7 @@ impl AppState {
                 tasks_active: 0,
                 started_task_num: 0,
                 workers: 0,
-                pinned: std::collections::HashSet::new(),
+                pinned,
             },
         );
     }
@@ -570,6 +577,40 @@ impl AppState {
             }
             let list: Vec<Value> = x.peers.peers().map(|p| json!(p.addr.to_string())).collect();
             map.insert(canonical, Value::Array(list));
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    // --- OptionalManager: persist optional-file pins across restarts ---------
+
+    /// Load the pinned optional-file paths for a site (by signed content address).
+    fn load_persisted_pins(&self, canonical: &str) -> std::collections::HashSet<String> {
+        let Some(path) = &self.pins_path else { return Default::default() };
+        let map: serde_json::Map<String, Value> = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        map.get(canonical)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Persist every served xite's pins to `pins.json` (keyed by signed content
+    /// address, so aliases share one list).
+    pub async fn persist_pins(&self) {
+        let Some(path) = &self.pins_path else { return };
+        let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (key, x) in self.xites.read().await.iter() {
+            if x.pinned.is_empty() {
+                continue;
+            }
+            let canonical = canonical_address(x.content.as_ref(), key);
+            let mut list: Vec<String> = x.pinned.iter().cloned().collect();
+            list.sort();
+            map.insert(canonical, json!(list));
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
             let _ = std::fs::write(path, bytes);
@@ -1236,9 +1277,13 @@ impl AppState {
         if let Ok(path) = xite.storage.path(inner_path) {
             let _ = std::fs::remove_file(path);
         }
+        let mut changed_pin = false;
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.optional_downloaded = (x.settings.optional_downloaded - info.size).max(0);
-            x.pinned.remove(inner_path);
+            changed_pin = x.pinned.remove(inner_path);
+        }
+        if changed_pin {
+            self.persist_pins().await;
         }
         Ok(Value::from("ok"))
     }
@@ -1252,6 +1297,8 @@ impl AppState {
                 x.pinned.remove(inner_path);
             }
         }
+        // Persist so the pin survives a restart (OptionalManager).
+        self.persist_pins().await;
     }
 
     /// Optional-file storage stats. `optionalLimitStats`. `used` is the total
@@ -3088,6 +3135,27 @@ mod tests {
         let s = AppState::with_data_dir("test", dir.path());
         s.add_xite("1Site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
         assert_eq!(s.peer_counts("1Site").await.total, 2);
+    }
+
+    #[tokio::test]
+    async fn optional_pins_persist_across_restart() {
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let content = json!({
+            "address": addr,
+            "files_optional": { "big.bin": { "size": 10, "sha512": "ab" } },
+        });
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) }).await;
+            s.set_pin(addr, "big.bin", true).await;
+        }
+        // A fresh node over the same dir restores the pin.
+        let s = AppState::with_data_dir("test", dir.path());
+        s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
+        let list = s.optional_file_list(addr, "all").await.unwrap();
+        let entry = list.iter().find(|e| e["inner_path"] == "big.bin").expect("optional file listed");
+        assert_eq!(entry["is_pinned"], true, "pin survived the restart");
     }
 
     #[cfg(feature = "multiuser")]
