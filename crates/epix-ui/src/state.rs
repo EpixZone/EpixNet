@@ -925,6 +925,31 @@ impl AppState {
         out
     }
 
+    /// `sidebarGetPeers` — peer positions for the sidebar's WebGL globe, as a
+    /// flat `[lat, lon, height, …]` array (the globe's `magnitude` format).
+    /// Height is derived from ping (log-scaled around the average), matching
+    /// EpixNet: connected peers rise with latency, unpinged peers sit slightly
+    /// below the surface.
+    pub async fn peer_globe_data(&self) -> Vec<f64> {
+        let locs = self.peer_locations().await;
+        let pings: Vec<f64> =
+            locs.iter().filter_map(|l| l["ping"].as_f64()).filter(|p| *p > 0.0).collect();
+        let ping_avg =
+            if pings.is_empty() { 0.0 } else { pings.iter().sum::<f64>() / pings.len() as f64 };
+        let mut out = Vec::new();
+        for l in &locs {
+            let lat = l["lat"].as_f64().unwrap_or(0.0);
+            let lon = l["lon"].as_f64().unwrap_or(0.0);
+            let height = match l["ping"].as_f64() {
+                Some(p) if p == 0.0 => -0.135, // self
+                Some(p) if p > 0.0 && ping_avg > 0.0 => (1.0 + p / ping_avg).log(300.0).min(0.20),
+                _ => -0.03, // known peer, no live ping
+            };
+            out.extend_from_slice(&[lat, lon, height]);
+        }
+        out
+    }
+
     /// Keep the warm connection pool topped up and pinged, and reflect its
     /// membership onto each xite's peer `connected` flags. Called periodically
     /// by the runtime so connection stats stay live.

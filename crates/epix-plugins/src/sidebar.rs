@@ -67,7 +67,8 @@ impl WsCommand for SidebarGetHtmlTag {
     }
 }
 
-/// `sidebarGetPeers` — the connectable peer addresses (for the globe + copy link).
+/// `sidebarGetPeers` — peer positions for the WebGL globe, as the flat
+/// `[lat, lon, height, …]` array the globe's `magnitude` format expects.
 struct SidebarGetPeers;
 
 #[async_trait]
@@ -77,10 +78,9 @@ impl WsCommand for SidebarGetPeers {
     }
 
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
-        let peers = s.state.connectable_peers(&address, 100).await;
-        let list: Vec<Value> = peers.iter().map(|p| json!(p.to_string())).collect();
-        Ok(json!({ "peers": list }))
+        s.address()?; // globe is per-site; require a bound xite
+        let globe_data = s.state.peer_globe_data().await;
+        Ok(Value::Array(globe_data.into_iter().map(|f| json!(f)).collect()))
     }
 }
 
