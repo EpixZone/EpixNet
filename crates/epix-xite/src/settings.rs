@@ -49,6 +49,9 @@ pub struct XiteSettings {
     pub size_limit: Option<i64>,
     #[serde(default)]
     pub autodownloadoptional: bool,
+    /// Whether the user favourited this xite (sidebar star).
+    #[serde(default)]
+    pub favorite: bool,
     /// Random key authorizing this xite's WebSocket (part of the wrapper URL).
     pub wrapper_key: String,
     /// Random key authorizing AJAX/media requests.
@@ -74,6 +77,7 @@ impl XiteSettings {
             peers: 0,
             size_limit: None,
             autodownloadoptional: false,
+            favorite: false,
             wrapper_key: epix_crypt::new_seed(),
             ajax_key: epix_crypt::new_seed(),
             cache: Cache::default(),

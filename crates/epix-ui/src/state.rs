@@ -11,7 +11,7 @@ use epix_xite::{content_stats, Xite, XiteSettings, XiteStorage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -425,7 +425,15 @@ impl AppState {
                         _ => continue,
                     };
                     if let Ok(rows) = self.db_query(address, query, &params).await {
-                        let count = rows.len() as i64;
+                        // A notification query is usually `SELECT COUNT(*) AS count`,
+                        // so the real total is a column on the first row - not the
+                        // number of rows returned. Fall back to the row count only
+                        // when neither `count` nor `COUNT(*)` is present.
+                        let count = rows
+                            .first()
+                            .and_then(|r| r.get("count").or_else(|| r.get("COUNT(*)")))
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(rows.len() as i64);
                         if count > 0 {
                             num += count;
                             any = true;
@@ -682,6 +690,10 @@ impl AppState {
     /// verify it and download the changed files (updating live worker stats).
     /// Returns true if an update was applied. This is the node's re-sync step.
     pub async fn resync_xite(&self, address: &str) -> Result<bool, String> {
+        // A paused xite (sitePause) is not re-synced until resumed.
+        if !self.is_serving(address).await {
+            return Ok(false);
+        }
         let transport = self.transport.read().await.clone().ok_or("no transport")?;
         let peers = self.connectable_peers(address, 10).await;
         if peers.is_empty() {
@@ -1860,6 +1872,112 @@ impl AppState {
         }
     }
 
+    /// Pause/resume a xite (`sitePause`/`siteResume`). A paused xite is skipped
+    /// by the re-sync loop. Returns false if the xite isn't served here.
+    pub async fn set_serving(&self, address: &str, serving: bool) -> bool {
+        let ok = if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.serving = serving;
+            true
+        } else {
+            false
+        };
+        if ok {
+            self.push_site_info(address).await;
+        }
+        ok
+    }
+
+    /// Whether a xite is currently serving (not paused).
+    pub async fn is_serving(&self, address: &str) -> bool {
+        self.xites.read().await.get(address).map(|x| x.settings.serving).unwrap_or(false)
+    }
+
+    /// Toggle a xite's favourite flag (`siteFavourite`/`siteUnfavourite`).
+    pub async fn set_favorite(&self, address: &str, favorite: bool) -> bool {
+        let ok = if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.favorite = favorite;
+            true
+        } else {
+            false
+        };
+        if ok {
+            self.push_site_info(address).await;
+        }
+        ok
+    }
+
+    /// Set a xite's auto-download-optional flag (`siteSetAutodownloadoptional`).
+    pub async fn set_autodownloadoptional(&self, address: &str, on: bool) -> bool {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.autodownloadoptional = on;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
+    /// Returns false if the xite isn't served here.
+    pub async fn rebuild_xite_db(&self, address: &str) -> bool {
+        let mut xites = self.xites.write().await;
+        let Some(x) = xites.get_mut(address) else { return false };
+        let (db, schema) = match build_xite_db(&x.storage) {
+            Some((db, schema)) => (Some(db), Some(schema)),
+            None => (None, None),
+        };
+        x.db = db;
+        x.db_schema = schema;
+        true
+    }
+
+    /// Remove a xite from the node and delete its files on disk (`siteDelete`).
+    /// Returns false if the xite isn't served here.
+    pub async fn remove_xite(&self, address: &str) -> bool {
+        let removed = self.xites.write().await.remove(address);
+        match removed {
+            Some(x) => {
+                // Best-effort delete of the xite's storage directory.
+                let root = x.storage.root().to_path_buf();
+                let _ = std::fs::remove_dir_all(&root);
+                self.persist_peers().await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Add a peer (ip + port) to a xite's known-peer set (`peerAdd`).
+    pub async fn add_peer_ipport(&self, address: &str, ip: &str, port: u16) -> Result<(), String> {
+        let peer = PeerAddr::parse(&format!("{ip}:{port}")).map_err(|e| e.to_string())?;
+        self.add_peers(address, [peer]).await;
+        Ok(())
+    }
+
+    /// A xite's storage directory on disk (`serverShowdirectory` "site").
+    pub async fn xite_root(&self, address: &str) -> Option<PathBuf> {
+        self.xites.read().await.get(address).map(|x| x.storage.root().to_path_buf())
+    }
+
+    /// The node's data directory (parent of `users.json`), if this is a
+    /// persistent node (`serverShowdirectory` "backup").
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        self.user_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+    }
+
+    /// Remember a dismissed notification center id (`notificationDismiss`), so a
+    /// dismissed banner stays dismissed across reloads.
+    pub async fn notification_dismiss(&self, center: &str) {
+        let mut list = self
+            .config_get("notification_dismissed")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        if !list.iter().any(|v| v.as_str() == Some(center)) {
+            list.push(json!(center));
+            self.config_set("notification_dismissed", json!(list)).await;
+        }
+    }
+
     /// Build the `siteInfo` response for a xite - EpixNet's `formatSiteInfo`.
     /// Returns `Null` if the xite isn't served here.
     pub async fn site_info(&self, address: &str) -> Value {
@@ -2399,6 +2517,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    #[tokio::test]
+    async fn notification_count_reads_the_count_column_not_row_count() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage
+            .write(
+                "data/alice/data.json",
+                br#"{ "posts": [ {"post_id":1,"title":"a"}, {"post_id":2,"title":"b"}, {"post_id":3,"title":"c"} ] }"#,
+            )
+            .unwrap();
+        let addr = "1BlogAddr";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+        // A COUNT(*) subscription must report the column value (3), not 1 row.
+        state
+            .notification_subscribe(addr, json!({ "unread": ["SELECT COUNT(*) AS count FROM post", null] }))
+            .await;
+        let q = state.notification_query().await;
+        assert_eq!(q["num"], 3);
+        assert_eq!(q["results"][0]["count"], 3);
+    }
+
+    #[tokio::test]
+    async fn pause_stops_resync_and_reflects_in_site_info() {
+        let content = json!({ "address": "1PauseMe", "files": {} });
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state
+            .add_xite("1PauseMe", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
+            .await;
+        assert!(state.is_serving("1PauseMe").await);
+
+        assert!(state.set_serving("1PauseMe", false).await);
+        assert!(!state.is_serving("1PauseMe").await);
+        // A paused xite is not re-synced (returns Ok(false), even with no transport).
+        assert_eq!(state.resync_xite("1PauseMe").await, Ok(false));
+        assert_eq!(state.site_info("1PauseMe").await["settings"]["serving"], false);
+
+        assert!(state.set_serving("1PauseMe", true).await);
+        assert_eq!(state.site_info("1PauseMe").await["settings"]["serving"], true);
+    }
+
+    #[tokio::test]
+    async fn favourite_and_delete_take_effect() {
+        let content = json!({ "address": "1FavMe", "files": {} });
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state
+            .add_xite("1FavMe", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
+            .await;
+        assert!(state.set_favorite("1FavMe", true).await);
+        assert_eq!(state.site_info("1FavMe").await["settings"]["favorite"], true);
+
+        // Delete removes the xite; a second delete reports not-found.
+        assert!(state.remove_xite("1FavMe").await);
+        assert!(!state.has_xite("1FavMe").await);
+        assert!(!state.remove_xite("1FavMe").await);
     }
 
     #[tokio::test]
