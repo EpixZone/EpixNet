@@ -71,6 +71,8 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteblockIgnoreAddSite",
     "siteblockList",
     "siteblockRemove",
+    "userList",
+    "userLogin",
     "userLogout",
     "userSelectForm",
     "userSet",
@@ -84,6 +86,13 @@ const ADMIN_COMMANDS: &[&str] = &[
 pub fn is_admin_command(cmd: &str) -> bool {
     ADMIN_COMMANDS.contains(&cmd)
 }
+
+/// Commands that create or clone a new site - blocked by NoNewSites.
+const NEW_SITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
+
+/// Commands that remove a site - also blocked by NoNewSites, so an operator can
+/// lock the node's site set (no adds and no deletes) with one switch.
+const DELETE_SITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 
 /// Per-connection context handed to every command.
 pub struct WsSession {
@@ -112,6 +121,24 @@ impl WsSession {
     /// The xite address bound to this connection, or an error if none.
     pub fn address(&self) -> Result<&str, String> {
         self.xite.as_deref().ok_or_else(|| "no xite bound to this connection".to_string())
+    }
+
+    /// Resolve a possibly cross-origin `inner_path` to `(address, inner_path)`.
+    /// A `cors-<address>/<path>` prefix routes to `<address>` when the bound site
+    /// holds the `Cors:<address>` permission (the Cors plugin); otherwise the
+    /// bound site + path is returned unchanged.
+    pub async fn cors_target(&self, inner_path: &str) -> Result<(String, String), String> {
+        let bound = self.address()?.to_string();
+        if let Some(rest) = inner_path.strip_prefix("cors-") {
+            if let Some((addr, inner)) = rest.split_once('/') {
+                let perm = format!("Cors:{addr}");
+                if self.state.site_permissions(&bound).await.iter().any(|p| *p == perm) {
+                    return Ok((addr.to_string(), inner.to_string()));
+                }
+                return Err(format!("This site has no permission to access site {addr}"));
+            }
+        }
+        Ok((bound, inner_path.to_string()))
     }
 
     /// Whether this connection has joined `channel`.
@@ -227,6 +254,15 @@ impl CommandRegistry {
                 return Err(format!("You don't have permission to run {cmd}"));
             }
         }
+        // NoNewSites: when the operator sets `no_new_sites`, lock the node's site
+        // set - refuse commands that add/clone a new site or delete an existing
+        // one.
+        if NEW_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
+            return Err("Adding new sites is disabled on this node".into());
+        }
+        if DELETE_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
+            return Err("Deleting sites is disabled on this node".into());
+        }
         // A command from a disabled plugin behaves as if unregistered.
         if let Some(plugin) = self.command_plugin.get(cmd) {
             if !session.state.plugin_enabled(plugin).await {
@@ -246,7 +282,8 @@ impl CommandRegistry {
 }
 
 fn default_commands() -> Vec<Arc<dyn WsCommand>> {
-    vec![
+    #[allow(unused_mut)]
+    let mut cmds: Vec<Arc<dyn WsCommand>> = vec![
         Arc::new(Ping),
         Arc::new(ServerInfo),
         Arc::new(SiteInfo),
@@ -265,6 +302,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SitePublish),
         Arc::new(FileWrite),
         Arc::new(FileRules),
+        Arc::new(CorsPermission),
         Arc::new(SiteSetOwned),
         Arc::new(SiteRecoverPrivatekey),
         Arc::new(UserSetSitePrivatekey),
@@ -308,7 +346,11 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AnnouncerStats),
         Arc::new(SiteList),
         Arc::new(ChartDbQuery),
-        Arc::new(simple("notificationQuery", json!([]))),
+        Arc::new(NotificationQuery),
+        Arc::new(NotificationSubscribe),
+        Arc::new(NotificationList),
+        Arc::new(NotificationMute),
+        Arc::new(NotificationMuteStatus),
         Arc::new(FeedQuery),
         Arc::new(FeedFollow),
         Arc::new(FeedListFollow),
@@ -326,7 +368,17 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(UserSetGlobalSettings),
         Arc::new(WrapperNonce),
         Arc::new(FileGet),
-    ]
+    ];
+    // Multiuser: identity login/switch commands (desktop only).
+    #[cfg(feature = "multiuser")]
+    {
+        cmds.push(Arc::new(UserShowMasterSeed));
+        cmds.push(Arc::new(UserList));
+        cmds.push(Arc::new(UserLogin));
+        cmds.push(Arc::new(UserSet));
+        cmds.push(Arc::new(UserLogout));
+    }
+    cmds
 }
 
 struct UserGetGlobalSettings;
@@ -367,16 +419,17 @@ impl WsCommand for FileGet {
         "fileGet"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?;
         // params may be a bare inner_path string or an object with `inner_path`.
         let inner_path = p
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .ok_or("fileGet: missing inner_path")?;
+        // `cors-<address>/<path>` routes to another site (Cors permission).
+        let (address, inner_path) = s.cors_target(inner_path).await?;
         // A `merged-<type>/<address>/<path>` file reads from the merged site.
-        let (target, inner) = match AppState::split_merged_path(inner_path) {
+        let (target, inner) = match AppState::split_merged_path(&inner_path) {
             Some((addr, inner)) => (addr, inner),
-            None => (address.to_string(), inner_path.to_string()),
+            None => (address, inner_path),
         };
         match s.state.read_file(&target, &inner).await {
             Some(bytes) => Ok(Value::from(String::from_utf8_lossy(&bytes).into_owned())),
@@ -407,6 +460,85 @@ impl WsCommand for ConfigList {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(s.state.config_list().await)
+    }
+}
+
+/// `notificationSubscribe(subscriptions)` - save the current site's notification
+/// queries (`{name: [query, params]}`).
+struct NotificationSubscribe;
+#[async_trait]
+impl WsCommand for NotificationSubscribe {
+    fn name(&self) -> &'static str {
+        "notificationSubscribe"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        let subs = p
+            .get("subscriptions")
+            .cloned()
+            .or_else(|| p.as_array().and_then(|a| a.first()).cloned())
+            .unwrap_or_else(|| p.clone());
+        s.state.notification_subscribe(&site, subs).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `notificationList()` - the current site's notification subscriptions.
+struct NotificationList;
+#[async_trait]
+impl WsCommand for NotificationList {
+    fn name(&self) -> &'static str {
+        "notificationList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        Ok(s.state.notification_list(&site).await)
+    }
+}
+
+/// `notificationMute(muted, site_address=None)` - global or per-site mute.
+struct NotificationMute;
+#[async_trait]
+impl WsCommand for NotificationMute {
+    fn name(&self) -> &'static str {
+        "notificationMute"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let muted = p
+            .get("muted")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let site = p
+            .get("site_address")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str());
+        s.state.notification_mute(muted, site).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `notificationMuteStatus()` - `{global_muted, site_mutes}`.
+struct NotificationMuteStatus;
+#[async_trait]
+impl WsCommand for NotificationMuteStatus {
+    fn name(&self) -> &'static str {
+        "notificationMuteStatus"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.notification_mute_status().await)
+    }
+}
+
+/// `notificationQuery()` - notification counts across subscribed sites.
+struct NotificationQuery;
+#[async_trait]
+impl WsCommand for NotificationQuery {
+    fn name(&self) -> &'static str {
+        "notificationQuery"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.notification_query().await)
     }
 }
 
@@ -789,13 +921,47 @@ impl WsCommand for FileRules {
         "fileRules"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let inner_path = p
             .as_str()
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .unwrap_or("content.json");
-        Ok(s.state.file_rules(&address, inner_path).await)
+        let (address, inner_path) = s.cors_target(inner_path).await?;
+        Ok(s.state.file_rules(&address, &inner_path).await)
+    }
+}
+
+/// `corsPermission(address)` - grant this site read access to another site's
+/// files (the `Cors:<address>` permission), so it can load `cors-<address>/…`.
+struct CorsPermission;
+#[async_trait]
+impl WsCommand for CorsPermission {
+    fn name(&self) -> &'static str {
+        "corsPermission"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        // Accept a single address or a list.
+        let addresses: Vec<String> = match p {
+            Value::String(a) => vec![a.clone()],
+            Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            Value::Object(o) => o
+                .get("address")
+                .map(|v| match v {
+                    Value::String(a) => vec![a.clone()],
+                    Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                    _ => vec![],
+                })
+                .unwrap_or_default(),
+            _ => vec![],
+        };
+        if addresses.is_empty() {
+            return Err("corsPermission: address required".into());
+        }
+        for addr in addresses {
+            s.state.add_permission(&site, &format!("Cors:{addr}")).await;
+        }
+        Ok(Value::from("ok"))
     }
 }
 
@@ -1468,6 +1634,83 @@ impl WsCommand for MergerSiteDelete {
     }
 }
 
+// ---- Multiuser: identity login / switch ------------------------------------
+
+/// `userShowMasterSeed()` - reveal the active identity's master seed.
+#[cfg(feature = "multiuser")]
+struct UserShowMasterSeed;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserShowMasterSeed {
+    fn name(&self) -> &'static str {
+        "userShowMasterSeed"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!({ "master_seed": s.state.multiuser_current_seed().await }))
+    }
+}
+
+/// `userList()` - master addresses of every known identity (active first).
+#[cfg(feature = "multiuser")]
+struct UserList;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserList {
+    fn name(&self) -> &'static str {
+        "userList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!(s.state.multiuser_list().await))
+    }
+}
+
+/// `userLogin(master_seed)` - add/select an identity from a master seed.
+#[cfg(feature = "multiuser")]
+struct UserLogin;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserLogin {
+    fn name(&self) -> &'static str {
+        "userLogin"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let seed = arg_str(p, "master_seed", 0).ok_or("master_seed required")?;
+        let addr = s.state.multiuser_login(seed).await?;
+        Ok(json!({ "master_address": addr }))
+    }
+}
+
+/// `userSet(master_address)` - switch the active identity.
+#[cfg(feature = "multiuser")]
+struct UserSet;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserSet {
+    fn name(&self) -> &'static str {
+        "userSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let addr = arg_str(p, "master_address", 0).ok_or("master_address required")?;
+        s.state.multiuser_select(addr).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `userLogout()` - revert to the primary identity.
+#[cfg(feature = "multiuser")]
+struct UserLogout;
+#[cfg(feature = "multiuser")]
+#[async_trait]
+impl WsCommand for UserLogout {
+    fn name(&self) -> &'static str {
+        "userLogout"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        s.state.multiuser_logout().await?;
+        Ok(Value::from("ok"))
+    }
+}
+
 // ---- ContentFilter: mute + siteblock lists ---------------------------------
 
 /// Read a positional-or-named string arg from the command params.
@@ -1622,6 +1865,31 @@ mod tests {
             .unwrap();
         assert!(session.in_channel("siteChanged"));
         assert!(session.in_allsite("siteChanged"));
+    }
+
+    #[tokio::test]
+    async fn cors_routes_only_with_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("1A", XiteEntry { storage: XiteStorage::new(dir.path().join("a")), content: None })
+            .await;
+        let session = WsSession::new(state.clone(), Some("1A".into()));
+
+        // No Cors permission: a cors- path is rejected.
+        assert!(session.cors_target("cors-1B/data.json").await.is_err());
+        // A normal path resolves to the bound site.
+        assert_eq!(
+            session.cors_target("index.html").await.unwrap(),
+            ("1A".to_string(), "index.html".to_string())
+        );
+
+        // Grant Cors:1B (as corsPermission does), then the cors- path routes to 1B.
+        CorsPermission.handle(&session, &json!("1B")).await.unwrap();
+        assert_eq!(
+            session.cors_target("cors-1B/data.json").await.unwrap(),
+            ("1B".to_string(), "data.json".to_string())
+        );
     }
 
     #[tokio::test]

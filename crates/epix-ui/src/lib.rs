@@ -6,11 +6,15 @@
 //! `/EpixNet-Internal/Websocket?wrapper_key=…`. Commands are dispatched through
 //! the [`CommandRegistry`], which the plugin system extends.
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 pub mod chart;
 pub mod command;
 pub mod conn_pool;
 pub mod geoip;
 pub mod state;
+#[cfg(feature = "ui-password")]
+pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
 pub use state::{AppState, XiteEntry};
@@ -84,16 +88,29 @@ impl UiServer {
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/uimedia/*path", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
+            .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
-            .route("/:address/*path", get(serve_file))
-            .with_state(self.ctx.clone())
+            .route("/:address/*path", get(serve_file));
+        // Benchmark: a diagnostics page timing the node's hot paths.
+        #[cfg(feature = "benchmark")]
+        let router = router.route("/Benchmark", get(serve_benchmark));
+        // UiPassword: mount the login/logout routes and the session gate.
+        #[cfg(feature = "ui-password")]
+        let router = router
+            .route("/Login", get(serve_login).post(serve_login_post))
+            .route("/Logout", get(serve_logout))
+            .layer(axum::middleware::from_fn_with_state(
+                self.ctx.clone(),
+                ui_password_gate,
+            ));
+        router.with_state(self.ctx.clone())
     }
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
@@ -305,6 +322,80 @@ fn render_config_page(values: &[(&str, &str, String)]) -> String {
     page_shell("Configuration", "Configuration", "", &body)
 }
 
+/// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
+/// directory inside a xite with links to navigate and open files.
+async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    let (address, inner) = match path.split_once('/') {
+        Some((a, i)) => (a.to_string(), i.trim_end_matches('/').to_string()),
+        None => (path.clone(), String::new()),
+    };
+    let Some(entries) = ctx.state.list_dir(&address, &inner).await else {
+        return (StatusCode::NOT_FOUND, "unknown xite or path").into_response();
+    };
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries))
+        .into_response()
+}
+
+/// Render the file browser for a xite directory.
+fn render_file_manager(address: &str, inner: &str, entries: &[Value]) -> String {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    };
+    let human = |n: u64| {
+        if n >= 1 << 20 {
+            format!("{:.1} MB", n as f64 / (1 << 20) as f64)
+        } else if n >= 1 << 10 {
+            format!("{:.1} kB", n as f64 / (1 << 10) as f64)
+        } else {
+            format!("{n} B")
+        }
+    };
+    let mut rows = String::new();
+    // Parent link.
+    if !inner.is_empty() {
+        let parent = inner.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        rows.push_str(&format!(
+            "<div class='row'><a class='name dir' href='/list/{address}/{parent}'>../</a></div>",
+            address = esc(address),
+            parent = esc(parent),
+        ));
+    }
+    for e in entries {
+        let name = e["name"].as_str().unwrap_or("");
+        let is_dir = e["is_dir"].as_bool().unwrap_or(false);
+        let child = if inner.is_empty() { name.to_string() } else { format!("{inner}/{name}") };
+        if is_dir {
+            rows.push_str(&format!(
+                "<div class='row'><a class='name dir' href='/list/{address}/{child}'>{name}/</a></div>",
+                address = esc(address),
+                child = esc(&child),
+                name = esc(name),
+            ));
+        } else {
+            let size = human(e["size"].as_u64().unwrap_or(0));
+            rows.push_str(&format!(
+                "<div class='row'><a class='name' href='/{address}/{child}'>{name}</a>\
+                 <span class='size'>{size}</span></div>",
+                address = esc(address),
+                child = esc(&child),
+                name = esc(name),
+            ));
+        }
+    }
+    let heading = if inner.is_empty() {
+        format!("Files: {}", esc(address))
+    } else {
+        format!("Files: {}/{}", esc(address), esc(inner))
+    };
+    let body = format!(
+        "<style>.row{{padding:8px 0;border-bottom:1px solid #f0f2f5}}\
+          .name{{font-size:16px}} .name.dir{{font-weight:600}}\
+          .size{{float:right;color:#999;font-size:13px}}</style>\
+         <div class='files'>{rows}</div>"
+    );
+    page_shell("Files", &heading, "", &body)
+}
+
 /// Shared page shell for the server-rendered admin pages, styled to match
 /// EpixNet (light theme, gradient header, sliding toggles, config inputs).
 fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str) -> String {
@@ -500,4 +591,147 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
         Ok(result) => json!({"cmd": "response", "to": id, "result": result}).to_string(),
         Err(error) => json!({"cmd": "response", "to": id, "error": error}).to_string(),
     }
+}
+
+// ---- UiPassword: session gate + login/logout routes ------------------------
+
+/// Middleware: when a UI password is configured, require a valid `session_id`
+/// cookie on every request except the login page and favicon. Unauthenticated
+/// requests get the login page.
+#[cfg(feature = "ui-password")]
+async fn ui_password_gate(
+    State(ctx): State<Ctx>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if ctx.state.ui_password().await.is_none() {
+        return next.run(request).await;
+    }
+    let path = request.uri().path();
+    if path == "/Login" || path.ends_with("favicon.ico") {
+        return next.run(request).await;
+    }
+    let cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok());
+    if uipassword::session_valid(&uipassword::cookie_session_id(cookie)) {
+        return next.run(request).await;
+    }
+    login_page(false)
+}
+
+/// Render the login page as an HTML response.
+#[cfg(feature = "ui-password")]
+fn login_page(bad_password: bool) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        uipassword::login_html(bad_password),
+    )
+        .into_response()
+}
+
+/// `GET /Login` - show the login form.
+#[cfg(feature = "ui-password")]
+async fn serve_login() -> Response {
+    login_page(false)
+}
+
+/// `POST /Login` - check the password; on success set the session cookie and
+/// redirect home, otherwise re-show the form with the error state.
+#[cfg(feature = "ui-password")]
+async fn serve_login_post(State(ctx): State<Ctx>, body: String) -> Response {
+    let password = form_field(&body, "password");
+    match ctx.state.ui_password().await {
+        Some(expected) if password == expected => {
+            let sid = uipassword::session_create();
+            let cookie = format!("session_id={sid}; path=/; max-age=2592000");
+            (
+                StatusCode::SEE_OTHER,
+                [(header::LOCATION, "/".to_string()), (header::SET_COOKIE, cookie)],
+            )
+                .into_response()
+        }
+        _ => login_page(true),
+    }
+}
+
+/// `GET /Logout` - drop the current session and clear the cookie.
+#[cfg(feature = "ui-password")]
+async fn serve_logout(headers: header::HeaderMap) -> Response {
+    let cookie = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
+    uipassword::session_delete(&uipassword::cookie_session_id(cookie));
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/".to_string()),
+            (
+                header::SET_COOKIE,
+                "session_id=deleted; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// Pull a single field out of an `application/x-www-form-urlencoded` body.
+#[cfg(feature = "ui-password")]
+fn form_field(body: &str, key: &str) -> String {
+    for pair in body.split('&') {
+        if let Some(val) = pair.strip_prefix(&format!("{key}=")) {
+            return percent_decode(val);
+        }
+    }
+    String::new()
+}
+
+/// Minimal form-value decode: `+` to space and `%XX` escapes.
+#[cfg(feature = "ui-password")]
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---- Benchmark: /Benchmark diagnostics page --------------------------------
+
+#[cfg(feature = "benchmark")]
+#[derive(Deserialize)]
+struct BenchmarkQuery {
+    #[serde(default)]
+    filter: String,
+}
+
+/// `GET /Benchmark?filter=` - run the micro-benchmark suite and return its
+/// plain-text report. Runs on a blocking thread since it is CPU-bound.
+#[cfg(feature = "benchmark")]
+async fn serve_benchmark(Query(q): Query<BenchmarkQuery>) -> Response {
+    let report = tokio::task::spawn_blocking(move || benchmark::run(&q.filter))
+        .await
+        .unwrap_or_else(|_| "benchmark task failed".to_string());
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], report).into_response()
 }

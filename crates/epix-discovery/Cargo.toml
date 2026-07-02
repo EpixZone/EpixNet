@@ -9,7 +9,9 @@ epix-core = { path = "../epix-core" }
 epix-protocol = { path = "../epix-protocol" }
 epix-transport = { path = "../epix-transport" }
 rmpv = "1"
+sha1 = "0.11.0"
 sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time"] }

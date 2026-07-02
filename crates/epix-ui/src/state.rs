@@ -116,6 +116,16 @@ pub struct AppState {
     /// Open sidebar-console log streams (`consoleLogStream`); new log lines are
     /// pushed to each as `logLineAdd` events.
     log_streams: RwLock<Vec<i64>>,
+    /// Path to the persisted peer database (`peers.json`), so known peers survive
+    /// restarts (the PeerDb plugin). None for in-memory nodes.
+    peers_path: Option<PathBuf>,
+    /// Multiuser: extra identities keyed by master_address, persisted alongside
+    /// the active `user`. Lets the operator log in with another master seed and
+    /// switch between identities. Feature-gated (desktop only).
+    #[cfg(feature = "multiuser")]
+    multi_users: RwLock<HashMap<String, User>>,
+    #[cfg(feature = "multiuser")]
+    multi_users_path: Option<PathBuf>,
 }
 
 /// A server-pushed UI event.
@@ -167,6 +177,11 @@ impl AppState {
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
+            peers_path: None,
+            #[cfg(feature = "multiuser")]
+            multi_users: RwLock::new(HashMap::new()),
+            #[cfg(feature = "multiuser")]
+            multi_users_path: None,
         })
     }
 
@@ -201,6 +216,17 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        // Multiuser: load the extra-identities store, seeding it with the active
+        // user so it is always listed.
+        #[cfg(feature = "multiuser")]
+        let multi_users: HashMap<String, User> = {
+            let mut m: HashMap<String, User> = std::fs::read(dir.join("users_multi.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            m.insert(user.master_address.clone(), user.clone());
+            m
+        };
         Arc::new(Self {
             version: version.into(),
             xites: RwLock::new(HashMap::new()),
@@ -225,6 +251,11 @@ impl AppState {
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
+            peers_path: Some(dir.join("peers.json")),
+            #[cfg(feature = "multiuser")]
+            multi_users: RwLock::new(multi_users),
+            #[cfg(feature = "multiuser")]
+            multi_users_path: Some(dir.join("users_multi.json")),
         })
     }
 
@@ -277,6 +308,137 @@ impl AppState {
     /// A node config value set via `configSet` (e.g. `language`).
     pub async fn config_get(&self, key: &str) -> Option<Value> {
         self.config.read().await.get(key).cloned()
+    }
+
+    // --- NoNewSites: refuse to clone/add new sites when set -----------------
+
+    /// Whether the operator has disabled adding new sites to this node.
+    pub async fn no_new_sites(&self) -> bool {
+        self.config_get("no_new_sites").await.and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    /// The configured UI password, if any (UiPassword). Empty/unset means the
+    /// login gate is off.
+    pub async fn ui_password(&self) -> Option<String> {
+        self.config_get("ui_password")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+    }
+
+    // --- AnnounceShare: persisted working trackers --------------------------
+
+    /// The trackers remembered from previous announces (`epix://…` addresses).
+    pub async fn shared_trackers(&self) -> Vec<PeerAddr> {
+        self.config_get("shared_trackers")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|s| PeerAddr::parse(s).ok())
+            .collect()
+    }
+
+    /// Remember a tracker that answered, so it is reused (and shared) later.
+    async fn add_shared_tracker(&self, tracker: &str) {
+        let mut list: Vec<String> = self
+            .config_get("shared_trackers")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !list.iter().any(|t| t == tracker) {
+            list.push(tracker.to_string());
+            self.config_set("shared_trackers", json!(list)).await;
+        }
+    }
+
+    // --- Notification plugin -------------------------------------------------
+
+    /// `notificationSubscribe` - save a site's notification queries
+    /// (`{name: [query, params]}`), persisted per site.
+    pub async fn notification_subscribe(&self, site: &str, subscriptions: Value) {
+        let mut all = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
+        if let Value::Object(m) = &mut all {
+            m.insert(site.to_string(), subscriptions);
+        }
+        self.config_set("notifications", all).await;
+    }
+
+    /// `notificationList` - a site's saved notification subscriptions.
+    pub async fn notification_list(&self, site: &str) -> Value {
+        self.config_get("notifications")
+            .await
+            .and_then(|v| v.get(site).cloned())
+            .unwrap_or_else(|| json!({}))
+    }
+
+    /// `notificationMute` - global (site = None) or per-site mute.
+    pub async fn notification_mute(&self, muted: bool, site: Option<&str>) {
+        match site {
+            None => self.config_set("notification_muted", json!(muted)).await,
+            Some(addr) => {
+                let mut mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+                if let Value::Object(m) = &mut mutes {
+                    m.insert(addr.to_string(), json!(muted));
+                }
+                self.config_set("notification_site_muted", mutes).await;
+            }
+        }
+    }
+
+    /// `notificationMuteStatus` - `{global_muted, site_mutes}`.
+    pub async fn notification_mute_status(&self) -> Value {
+        let global = self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false);
+        let site_mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        json!({ "global_muted": global, "site_mutes": site_mutes })
+    }
+
+    /// `notificationQuery` - run every subscribed site's notification queries and
+    /// return the row counts (`{results, num, sites, muted}`).
+    pub async fn notification_query(&self) -> Value {
+        if self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false) {
+            return json!({ "results": [], "num": 0, "sites": 0, "muted": true });
+        }
+        let subs = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
+        let site_muted = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        let mut results = Vec::new();
+        let mut num = 0i64;
+        let mut sites = 0i64;
+        if let Value::Object(by_site) = &subs {
+            for (address, site_subs) in by_site {
+                if site_muted.get(address).and_then(|v| v.as_bool()).unwrap_or(false) {
+                    continue;
+                }
+                let Value::Object(queries) = site_subs else { continue };
+                let mut any = false;
+                for (name, spec) in queries {
+                    let (query, params) = match spec {
+                        Value::Array(a) => (
+                            a.first().and_then(|v| v.as_str()).unwrap_or(""),
+                            a.get(1).cloned().unwrap_or(Value::Null),
+                        ),
+                        Value::String(q) => (q.as_str(), Value::Null),
+                        _ => continue,
+                    };
+                    if let Ok(rows) = self.db_query(address, query, &params).await {
+                        let count = rows.len() as i64;
+                        if count > 0 {
+                            num += count;
+                            any = true;
+                            results.push(json!({ "address": address, "name": name, "count": count }));
+                        }
+                    }
+                }
+                if any {
+                    sites += 1;
+                }
+            }
+        }
+        json!({ "results": results, "num": num, "sites": sites, "muted": false })
     }
 
     /// `configList` - the editable config keys with current value + default.
@@ -337,6 +499,13 @@ impl AppState {
             Some((db, schema)) => (Some(db), Some(schema)),
             None => (None, None),
         };
+        // Restore any peers persisted by the PeerDb plugin, keyed by the signed
+        // content address.
+        let mut peers = Peers::new();
+        let saved = self.load_persisted_peers(&canonical);
+        if !saved.is_empty() {
+            peers.add_many(saved, now_secs());
+        }
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -345,7 +514,7 @@ impl AppState {
                 settings,
                 db,
                 db_schema,
-                peers: Peers::new(),
+                peers,
                 bytes_recv: 0,
                 bytes_sent: 0,
                 tasks_active: 0,
@@ -362,6 +531,39 @@ impl AppState {
         if let Some(x) = xites.get_mut(address) {
             x.peers.add_many(addrs, now_secs());
             x.settings.peers = x.peers.len() as i64;
+        }
+    }
+
+    // --- PeerDb: persist known peers across restarts ------------------------
+
+    /// Load the peers persisted for a site (by signed content address).
+    fn load_persisted_peers(&self, canonical: &str) -> Vec<PeerAddr> {
+        let Some(path) = &self.peers_path else { return Vec::new() };
+        let map: serde_json::Map<String, Value> = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        map.get(canonical)
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(|s| PeerAddr::parse(s).ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Persist every served xite's peers to `peers.json` (keyed by signed content
+    /// address, so aliases share one list). Called periodically by the runtime.
+    pub async fn persist_peers(&self) {
+        let Some(path) = &self.peers_path else { return };
+        let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (key, x) in self.xites.read().await.iter() {
+            let canonical = canonical_address(x.content.as_ref(), key);
+            if x.peers.len() == 0 {
+                continue;
+            }
+            let list: Vec<Value> = x.peers.peers().map(|p| json!(p.addr.to_string())).collect();
+            map.insert(canonical, Value::Array(list));
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let _ = std::fs::write(path, bytes);
         }
     }
 
@@ -383,6 +585,11 @@ impl AppState {
         for tracker in trackers {
             let peers = epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(tracker), 0).await;
             self.record_tracker(&tracker.to_string(), peers.len()).await;
+            // AnnounceShare: remember a tracker that answered, so it is reused
+            // (and shared) across restarts.
+            if !peers.is_empty() {
+                self.add_shared_tracker(&tracker.to_string()).await;
+            }
             all.extend(peers);
         }
         self.add_peers(address, all.clone()).await;
@@ -1594,6 +1801,12 @@ impl AppState {
 
     /// Read a file from a served xite's storage.
     pub async fn read_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
+        // FilePack: `<pack>.zip/<inner>` or `<pack>.tar.gz/<inner>` serves a file
+        // from inside the archive.
+        if let Some((archive, within)) = split_archive_path(inner_path) {
+            let bytes = self.xites.read().await.get(address)?.storage.read(&archive).ok()?;
+            return read_from_archive(&archive, &bytes, &within);
+        }
         let xites = self.xites.read().await;
         xites.get(address)?.storage.read(inner_path).ok()
     }
@@ -1601,6 +1814,35 @@ impl AppState {
     /// A clone of a xite's content.json, if loaded.
     pub async fn content(&self, address: &str) -> Option<Value> {
         self.xites.read().await.get(address)?.content.clone()
+    }
+
+    /// `UiFileManager` - list a directory inside a xite as
+    /// `[{name, is_dir, size}]`, sorted (directories first). `None` if the xite
+    /// or path is unknown.
+    pub async fn list_dir(&self, address: &str, inner_path: &str) -> Option<Vec<Value>> {
+        let root = self.xites.read().await.get(address)?.storage.root().to_path_buf();
+        let dir = if inner_path.is_empty() { root.clone() } else { root.join(inner_path) };
+        // Stay within the xite root.
+        if !dir.starts_with(&root) {
+            return None;
+        }
+        let mut entries: Vec<Value> = Vec::new();
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let meta = entry.metadata().ok();
+            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            entries.push(json!({ "name": name, "is_dir": is_dir, "size": size }));
+        }
+        entries.sort_by(|a, b| {
+            let ad = a["is_dir"].as_bool().unwrap_or(false);
+            let bd = b["is_dir"].as_bool().unwrap_or(false);
+            bd.cmp(&ad).then_with(|| {
+                a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+            })
+        });
+        Some(entries)
     }
 
     /// Set the known peer count for a xite (from discovery), persisting nothing
@@ -1707,6 +1949,98 @@ impl AppState {
         if let Some(path) = &self.user_path {
             let _ = self.user.read().await.save(path);
         }
+        // Multiuser: keep the active identity's full state mirrored in the store,
+        // so its certs/follows are not lost when the operator switches identity.
+        #[cfg(feature = "multiuser")]
+        self.multiuser_sync_active().await;
+    }
+
+    // --- Multiuser: multiple master-seed identities ------------------------
+
+    /// Master addresses of every known identity (the active one first).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_list(&self) -> Vec<String> {
+        let active = self.user.read().await.master_address.clone();
+        let mut out = vec![active.clone()];
+        for addr in self.multi_users.read().await.keys() {
+            if *addr != active {
+                out.push(addr.clone());
+            }
+        }
+        out
+    }
+
+    /// The active identity's master seed (`userShowMasterSeed`).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_current_seed(&self) -> String {
+        self.user.read().await.master_seed.clone()
+    }
+
+    /// Add (or look up) an identity from a master seed and make it active.
+    /// Returns its master_address (`responseUserLogin`).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_login(&self, master_seed: &str) -> Result<String, String> {
+        let incoming = User::from_seed(master_seed.trim())?;
+        let addr = incoming.master_address.clone();
+        // Keep an existing richer copy (with certs/follows) if we already know it.
+        {
+            let mut store = self.multi_users.write().await;
+            store.entry(addr.clone()).or_insert(incoming);
+        }
+        self.multiuser_select(&addr).await?;
+        Ok(addr)
+    }
+
+    /// Switch the active identity to a known master_address (`userSet`).
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_select(&self, master_address: &str) -> Result<(), String> {
+        // Persist the currently-active identity into the store first.
+        self.multiuser_sync_active().await;
+        let target = self
+            .multi_users
+            .read()
+            .await
+            .get(master_address)
+            .cloned()
+            .ok_or_else(|| format!("unknown user: {master_address}"))?;
+        *self.user.write().await = target;
+        self.save_user().await;
+        self.persist_multi_users().await;
+        Ok(())
+    }
+
+    /// Log out of an added identity: revert to the primary (first-listed) one.
+    #[cfg(feature = "multiuser")]
+    pub async fn multiuser_logout(&self) -> Result<(), String> {
+        let primary = {
+            let store = self.multi_users.read().await;
+            let active = self.user.read().await.master_address.clone();
+            store.keys().find(|a| **a != active).cloned()
+        };
+        match primary {
+            Some(addr) => self.multiuser_select(&addr).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Copy the active identity's full state into the store (so switching keeps
+    /// its certs/follows).
+    #[cfg(feature = "multiuser")]
+    async fn multiuser_sync_active(&self) {
+        let active = self.user.read().await.clone();
+        self.multi_users.write().await.insert(active.master_address.clone(), active);
+        self.persist_multi_users().await;
+    }
+
+    /// Write the extra-identities store to disk.
+    #[cfg(feature = "multiuser")]
+    async fn persist_multi_users(&self) {
+        if let Some(path) = &self.multi_users_path {
+            let store = self.multi_users.read().await;
+            if let Ok(bytes) = serde_json::to_vec_pretty(&*store) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
     }
 }
 
@@ -1771,6 +2105,45 @@ fn piece_present(storage: &XiteStorage, inner_path: &str, offset: u64, len: u64,
 
 /// content.json trimmed for `siteInfo`: `files`/`files_optional`/`includes`
 /// become counts, and the signatures are stripped (matches `formatSiteInfo`).
+/// Split a FilePack path into `(archive_inner_path, path_within_archive)` if it
+/// points inside a `.zip` or `.tar.gz` archive, e.g.
+/// `data.zip/img/a.jpg` -> `("data.zip", "img/a.jpg")`.
+fn split_archive_path(inner_path: &str) -> Option<(String, String)> {
+    for marker in [".tar.gz/", ".zip/"] {
+        if let Some(pos) = inner_path.find(marker) {
+            let split = pos + marker.len() - 1; // keep the extension, drop the slash
+            return Some((inner_path[..split].to_string(), inner_path[split + 1..].to_string()));
+        }
+    }
+    None
+}
+
+/// Read `within` out of an in-memory `.zip` or `.tar.gz` archive.
+fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if archive_path.ends_with(".zip") {
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+        let mut file = zip.by_name(within).ok()?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out).ok()?;
+        Some(out)
+    } else {
+        // .tar.gz
+        let gz = flate2::read::GzDecoder::new(bytes);
+        let mut tar = tar::Archive::new(gz);
+        for entry in tar.entries().ok()? {
+            let mut entry = entry.ok()?;
+            let path = entry.path().ok()?;
+            if path.to_string_lossy() == within {
+                let mut out = Vec::new();
+                entry.read_to_end(&mut out).ok()?;
+                return Some(out);
+            }
+        }
+        None
+    }
+}
+
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
 /// current directory). Uses `statvfs` on unix.
 fn free_space(path: Option<&std::path::Path>) -> i64 {
@@ -2142,6 +2515,99 @@ mod tests {
         while events.try_recv().is_ok() {}
         state.log("INFO", "after removal").await;
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn notification_subscribe_list_and_mute() {
+        let state = AppState::new("test");
+        state.notification_subscribe("1Chat", json!({ "unread": ["SELECT * FROM message WHERE seen=0", null] })).await;
+        assert_eq!(state.notification_list("1Chat").await["unread"][0], "SELECT * FROM message WHERE seen=0");
+        assert_eq!(state.notification_list("1Other").await, json!({}));
+
+        // Global mute reflected in status + query.
+        state.notification_mute(true, None).await;
+        assert_eq!(state.notification_mute_status().await["global_muted"], true);
+        assert_eq!(state.notification_query().await["muted"], true);
+
+        // Per-site mute.
+        state.notification_mute(false, None).await;
+        state.notification_mute(true, Some("1Chat")).await;
+        assert_eq!(state.notification_mute_status().await["site_mutes"]["1Chat"], true);
+    }
+
+    #[tokio::test]
+    async fn filepack_reads_from_tar_gz() {
+        use std::io::Write;
+        // Build a small .tar.gz containing dir/hello.txt.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut tar = tar::Builder::new(&mut gz);
+            let data = b"hi from the pack";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, "dir/hello.txt", &data[..]).unwrap();
+            tar.finish().unwrap();
+        }
+        let archive = gz.finish().unwrap();
+
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("pack.tar.gz", &archive).unwrap();
+        let state = AppState::new("test");
+        state.add_xite("1Pack", XiteEntry { storage, content: None }).await;
+
+        let out = state.read_file("1Pack", "pack.tar.gz/dir/hello.txt").await;
+        assert_eq!(out.as_deref(), Some(&b"hi from the pack"[..]));
+        // A missing entry is None, not an error.
+        assert!(state.read_file("1Pack", "pack.tar.gz/nope.txt").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn peers_persist_across_restart() {
+        let dir = tempdir().unwrap();
+        let content = json!({ "address": "1Site", "files": {} });
+        {
+            let s = AppState::with_data_dir("test", dir.path());
+            s.add_xite("1Site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) }).await;
+            s.add_peers("1Site", vec![
+                PeerAddr::parse("1.2.3.4:15441").unwrap(),
+                PeerAddr::parse("5.6.7.8:15441").unwrap(),
+            ]).await;
+            s.persist_peers().await;
+        }
+        // A fresh node over the same data dir restores the peers on add_xite.
+        let s = AppState::with_data_dir("test", dir.path());
+        s.add_xite("1Site", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
+        assert_eq!(s.peer_counts("1Site").await.total, 2);
+    }
+
+    #[cfg(feature = "multiuser")]
+    #[tokio::test]
+    async fn multiuser_login_switch_and_persist() {
+        let dir = tempdir().unwrap();
+        // A second identity from a known seed.
+        let seed = "5f5e100000000000000000000000000000000000000000000000000000000001";
+        let (primary, alt) = {
+            let s = AppState::with_data_dir("test", dir.path());
+            let primary = s.multiuser_current_seed().await;
+            let alt = s.multiuser_login(seed).await.unwrap();
+            // Active identity is now the alt one; both are listed.
+            assert_eq!(s.multiuser_current_seed().await, seed);
+            assert!(s.multiuser_list().await.contains(&alt));
+            assert_eq!(s.multiuser_list().await.len(), 2);
+            (primary, alt)
+        };
+        // A fresh node over the same dir remembers both; switching works.
+        let s = AppState::with_data_dir("test", dir.path());
+        assert!(s.multiuser_list().await.contains(&alt));
+        s.multiuser_select(&alt).await.unwrap();
+        assert_eq!(s.multiuser_current_seed().await, seed);
+        // Logout reverts to the primary identity.
+        s.multiuser_logout().await.unwrap();
+        assert_eq!(s.multiuser_current_seed().await, primary);
+        // Selecting an unknown user errors.
+        assert!(s.multiuser_select("epix1nope").await.is_err());
     }
 
     #[tokio::test]

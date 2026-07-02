@@ -21,6 +21,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
+#[cfg(feature = "local-discovery")]
+pub mod local;
+
 /// How often the loops run.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -83,6 +86,14 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.connection_interval,
         )));
+        // AnnounceLocal: discover peers on the LAN over UDP broadcast.
+        #[cfg(feature = "local-discovery")]
+        self.handles.push(tokio::spawn(local::local_discovery_loop(
+            self.state.clone(),
+            0, // this node does not accept incoming P2P connections
+            self.shutdown.clone(),
+            Duration::from_secs(5 * 60),
+        )));
     }
 
     /// Signal the loops to stop and wait for them.
@@ -104,12 +115,34 @@ async fn announce_loop(
     period: Duration,
 ) {
     let announce = || async {
-        if trackers.is_empty() {
+        // AnnounceShare: announce to the configured trackers plus any remembered
+        // from previous runs.
+        let mut all = trackers.clone();
+        for t in state.shared_trackers().await {
+            if !all.contains(&t) {
+                all.push(t);
+            }
+        }
+        if all.is_empty() {
             return;
         }
         for address in state.xite_addresses().await {
-            state.announce_to_trackers(&address, &trackers).await;
+            state.announce_to_trackers(&address, &all).await;
         }
+        // AnnounceBitTorrent: also announce to any configured HTTP(S) BT
+        // trackers and fold their peers in.
+        if let Some(bt) = state.config_get("bt_trackers").await.and_then(|v| v.as_array().cloned()) {
+            for url in bt.iter().filter_map(|v| v.as_str()) {
+                for address in state.xite_addresses().await {
+                    let peers = epix_discovery::announce_bittorrent(url, &address, 0).await;
+                    if !peers.is_empty() {
+                        state.add_peers(&address, peers).await;
+                    }
+                }
+            }
+        }
+        // Persist the freshly discovered peers so they survive a restart.
+        state.persist_peers().await;
     };
     announce().await;
     let mut tick = interval(period);
