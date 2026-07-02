@@ -6,6 +6,8 @@
 //! `/EpixNet-Internal/Websocket?wrapper_key=…`. Commands are dispatched through
 //! the [`CommandRegistry`], which the plugin system extends.
 
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 pub mod chart;
 pub mod command;
 pub mod conn_pool;
@@ -96,6 +98,9 @@ impl UiServer {
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
             .route("/:address/*path", get(serve_file));
+        // Benchmark: a diagnostics page timing the node's hot paths.
+        #[cfg(feature = "benchmark")]
+        let router = router.route("/Benchmark", get(serve_benchmark));
         // UiPassword: mount the login/logout routes and the session gate.
         #[cfg(feature = "ui-password")]
         let router = router
@@ -705,4 +710,23 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---- Benchmark: /Benchmark diagnostics page --------------------------------
+
+#[cfg(feature = "benchmark")]
+#[derive(Deserialize)]
+struct BenchmarkQuery {
+    #[serde(default)]
+    filter: String,
+}
+
+/// `GET /Benchmark?filter=` - run the micro-benchmark suite and return its
+/// plain-text report. Runs on a blocking thread since it is CPU-bound.
+#[cfg(feature = "benchmark")]
+async fn serve_benchmark(Query(q): Query<BenchmarkQuery>) -> Response {
+    let report = tokio::task::spawn_blocking(move || benchmark::run(&q.filter))
+        .await
+        .unwrap_or_else(|_| "benchmark task failed".to_string());
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], report).into_response()
 }

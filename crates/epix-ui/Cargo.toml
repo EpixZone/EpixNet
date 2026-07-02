@@ -32,6 +32,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 getrandom = { version = "0.2", optional = true }
+sha3 = { version = "0.10", optional = true }
+rmpv = { version = "1", optional = true }
 
 [features]
 # UiPassword: a cookie-session login gate over the whole UI. Off by default and
@@ -40,6 +42,9 @@ getrandom = { version = "0.2", optional = true }
 ui-password = ["dep:getrandom"]
 # Multiuser: multiple master-seed identities with login/switch. Desktop only.
 multiuser = []
+# Benchmark: a /Benchmark diagnostics page timing the node's crypto/hash/pack
+# hot paths (shows off the Rust perf win). Off by default.
+benchmark = ["dep:getrandom", "dep:sha3", "dep:rmpv"]
 
 [dev-dependencies]
 rmpv = "1"

@@ -23,4 +23,4 @@ serde_json = "1"
 # phone UI is already local to the device). Build a mobile node with
 # `--no-default-features`.
 default = ["desktop"]
-desktop = ["epix-ui/ui-password", "epix-ui/multiuser"]
+desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
