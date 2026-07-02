@@ -102,10 +102,14 @@ impl Connection {
         Ok(hs)
     }
 
-    /// `ping` → `true` if the peer answers `Pong!`.
+    /// `ping` → `true` if the peer answers `Pong!`. Peers send the body as a
+    /// msgpack string or (more commonly) binary, so accept either.
     pub async fn ping(&mut self) -> Result<bool> {
         let resp = self.request("ping", Value::Map(vec![])).await?;
-        Ok(vget(&resp, "body").and_then(|v| v.as_str()) == Some("Pong!"))
+        let body = vget(&resp, "body");
+        let is_pong = body.and_then(|v| v.as_str()) == Some("Pong!")
+            || body.and_then(|v| v.as_slice()) == Some(b"Pong!".as_slice());
+        Ok(is_pong)
     }
 
     /// Download exactly `size` bytes starting at `offset` (`getFile` with

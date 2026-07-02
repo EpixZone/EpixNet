@@ -27,6 +27,7 @@ pub struct RuntimeConfig {
     pub announce_interval: Duration,
     pub resync_interval: Duration,
     pub chart_interval: Duration,
+    pub connection_interval: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -35,6 +36,7 @@ impl Default for RuntimeConfig {
             announce_interval: Duration::from_secs(20 * 60),
             resync_interval: Duration::from_secs(5 * 60),
             chart_interval: Duration::from_secs(5 * 60),
+            connection_interval: Duration::from_secs(60),
         }
     }
 }
@@ -76,6 +78,11 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.chart_interval,
         )));
+        self.handles.push(tokio::spawn(connection_loop(
+            self.state.clone(),
+            self.shutdown.clone(),
+            self.config.connection_interval,
+        )));
     }
 
     /// Signal the loops to stop and wait for them.
@@ -106,6 +113,25 @@ async fn announce_loop(
                     state.announce_to_trackers(&address, &trackers).await;
                 }
             }
+        }
+    }
+}
+
+/// Keep a small pool of warm peer connections open + pinged, so the dashboard's
+/// connection stats reflect real live links. Runs once immediately, then every
+/// `period`.
+async fn connection_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
+    // Warm the pool, then re-snapshot the chart so its connection stats reflect
+    // the freshly established links instead of the empty startup snapshot.
+    state.manage_connections().await;
+    state.collect_chart().await;
+    let mut tick = interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tick.tick() => state.manage_connections().await,
         }
     }
 }

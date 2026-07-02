@@ -20,6 +20,9 @@ use tokio::sync::RwLock;
 /// Default per-xite size limit, in MB (matches EpixNet's `config.size_limit`).
 const DEFAULT_SIZE_LIMIT_MB: i64 = 10;
 
+/// How many warm peer connections the node keeps for live connection stats.
+const CONNECTION_POOL_MAX: usize = 8;
+
 /// The input to [`AppState::add_xite`]: a xite's storage and (if loaded) its
 /// verified content.json. Settings/stats are derived from these.
 pub struct XiteEntry {
@@ -84,6 +87,9 @@ pub struct AppState {
     /// IP geolocation database for the world map (`chartGetPeerLocations`), set
     /// once the node has extracted its bundled `.mmdb`.
     geoip: RwLock<Option<Arc<crate::geoip::GeoIp>>>,
+    /// A small pool of warm peer connections, so the dashboard's connection
+    /// stats reflect real live links.
+    conn_pool: crate::conn_pool::ConnectionPool,
 }
 
 fn empty_filters() -> Value {
@@ -114,6 +120,7 @@ impl AppState {
             optional_limit: RwLock::new("10%".to_string()),
             optional_limit_path: None,
             geoip: RwLock::new(None),
+            conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
         })
     }
 
@@ -160,6 +167,7 @@ impl AppState {
             optional_limit: RwLock::new(optional_limit),
             optional_limit_path: Some(optional_limit_path),
             geoip: RwLock::new(None),
+            conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
         })
     }
 
@@ -860,6 +868,14 @@ impl AppState {
                 }
             }
         }
+        // Ping (ms) per connected clearnet peer, from the warm pool.
+        for addr in self.conn_pool.connected_addrs().await {
+            if let PeerAddr::Ip(sa) = &addr {
+                if let Some(ms) = self.conn_pool.ping_for(&addr).await {
+                    pings.insert(sa.ip(), Some(ms));
+                }
+            }
+        }
         let mut out = Vec::new();
         for (ip, ping) in pings {
             if let Some(loc) = geoip.locate(ip) {
@@ -875,6 +891,42 @@ impl AppState {
         out
     }
 
+    /// Keep the warm connection pool topped up and pinged, and reflect its
+    /// membership onto each xite's peer `connected` flags. Called periodically
+    /// by the runtime so connection stats stay live.
+    pub async fn manage_connections(&self) {
+        let Some(transport) = self.transport.read().await.clone() else { return };
+        // Candidate peers across all served xites.
+        let mut candidates: Vec<PeerAddr> = Vec::new();
+        {
+            let xites = self.xites.read().await;
+            for x in xites.values() {
+                for p in x.peers.peers() {
+                    if !candidates.contains(&p.addr) {
+                        candidates.push(p.addr.clone());
+                    }
+                }
+            }
+        }
+        self.conn_pool.ensure(transport, &candidates).await;
+        self.conn_pool.ping_all().await;
+
+        // Mark peers we hold a live connection to as connected.
+        let connected = self.conn_pool.connected_addrs().await;
+        let mut xites = self.xites.write().await;
+        for x in xites.values_mut() {
+            for addr in &connected {
+                x.peers.set_connected(addr, true, now_secs());
+            }
+        }
+    }
+
+    /// Live connection stats (`connection`, `connection_in`, `connection_onion`,
+    /// ping avg/min) for the chart collector.
+    pub async fn connection_stats(&self) -> crate::conn_pool::ConnectionStats {
+        self.conn_pool.stats().await
+    }
+
     /// Snapshot current node metrics into the chart db: one global datapoint
     /// set plus a per-xite set. Called at startup and periodically by the
     /// runtime so the dashboard's Stats page has data to draw.
@@ -882,6 +934,7 @@ impl AppState {
         use crate::chart::Metric;
         let now = now_secs();
         let optional_limit = self.optional_limit_bytes().await;
+        let conns = self.connection_stats().await;
         let xites = self.xites.read().await;
 
         let mut size = 0i64;
@@ -889,8 +942,6 @@ impl AppState {
         let mut optional_used = 0i64;
         let mut bytes_recv = 0f64;
         let mut bytes_sent = 0f64;
-        let mut connected = 0f64;
-        let mut connected_onion = 0f64;
         let mut unique_peers = std::collections::HashSet::new();
         let mut onion_peers = std::collections::HashSet::new();
         let mut content = std::collections::HashSet::new();
@@ -900,9 +951,6 @@ impl AppState {
             optional_used += x.settings.optional_downloaded;
             bytes_recv += x.bytes_recv as f64;
             bytes_sent += x.bytes_sent as f64;
-            let counts = x.peers.counts();
-            connected += counts.connected as f64;
-            connected_onion += counts.onion as f64;
             for p in x.peers.peers() {
                 let key = p.addr.to_string();
                 if p.is_onion() {
@@ -921,11 +969,11 @@ impl AppState {
         let global = [
             Metric::now("peer", unique_peers.len() as f64),
             Metric::now("peer_onion", onion_peers.len() as f64),
-            Metric::now("connection", connected),
-            Metric::now("connection_onion", connected_onion),
-            Metric::now("connection_in", 0.0),
-            Metric::now("connection_ping_avg", 0.0),
-            Metric::now("connection_ping_min", 0.0),
+            Metric::now("connection", conns.total as f64),
+            Metric::now("connection_onion", conns.onion as f64),
+            Metric::now("connection_in", conns.incoming as f64),
+            Metric::now("connection_ping_avg", conns.ping_avg as f64),
+            Metric::now("connection_ping_min", conns.ping_min as f64),
             Metric::now("size", size as f64),
             Metric::now("size_optional", size_optional as f64),
             Metric::now("optional_used", optional_used as f64),

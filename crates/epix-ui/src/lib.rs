@@ -8,6 +8,7 @@
 
 pub mod chart;
 pub mod command;
+pub mod conn_pool;
 pub mod geoip;
 pub mod state;
 

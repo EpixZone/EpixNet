@@ -88,26 +88,29 @@ async fn runtime_resyncs_a_published_update() {
             announce_interval: Duration::from_secs(3600),
             resync_interval: Duration::from_millis(100),
             chart_interval: Duration::from_secs(3600),
+            connection_interval: Duration::from_secs(3600),
         },
     );
     runtime.start();
 
-    // The loop should fetch the newer content.json, verify it, and download the file.
-    let ok = timeout(Duration::from_secs(10), async {
+    // The loop should fetch the newer content.json, verify it, and download the
+    // file. Wait for both the applied content and the downloaded file (the file
+    // lands a moment after content.json is applied).
+    let post_path = cli_dir.path().join("post.txt");
+    timeout(Duration::from_secs(10), async {
         loop {
-            let info = state.site_info(&address).await;
-            if info["content_updated"].as_f64() == Some(200.0) {
-                return true;
+            let applied = state.site_info(&address).await["content_updated"].as_f64() == Some(200.0);
+            if applied && std::fs::read(&post_path).ok().as_deref() == Some(post.as_slice()) {
+                return;
             }
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("runtime applied the update in time");
-    assert!(ok);
+    .expect("runtime applied the update + downloaded the file in time");
 
     // The published file was downloaded + verified.
-    assert_eq!(std::fs::read(cli_dir.path().join("post.txt")).unwrap(), post);
+    assert_eq!(std::fs::read(&post_path).unwrap(), post);
 
     runtime.shutdown().await;
 }
