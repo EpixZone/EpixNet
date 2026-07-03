@@ -1273,3 +1273,168 @@ a {
 		max-width: 80%;
 	}
 }
+/* ---- Loading screen: modern flat restyle (mobile-first, no gradients) ---- */
+.loadingscreen {
+	background-color: #FFF;
+}
+.theme-dark .loadingscreen {
+	background-color: #15111B;
+}
+/* App-like centered column (stylesheet !important overrides the JS inline
+   display:block; the screen is only visible once .ready lands anyway). */
+.loadingscreen.ready {
+	display: flex !important;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	padding: 24px;
+	box-sizing: border-box;
+}
+.loadingscreen .flipper-container,
+.loadingscreen.ready .flipper-container {
+	position: static;
+	order: 1;
+	width: 84px;
+	height: 84px;
+	margin: 0 0 30px;
+	transform: none;
+	opacity: 1;
+	transition: none;
+}
+.loadingscreen .loading-stage,
+.loadingscreen.ready .loading-stage {
+	position: static;
+	order: 2;
+	margin: 0 0 26px;
+	width: 100%;
+	max-width: 480px;
+	opacity: 1;
+}
+.loadingscreen .loading-text,
+.loadingscreen.ready .loading-text {
+	position: static;
+	order: 3;
+	margin: 0;
+	width: 100%;
+	max-width: 480px;
+}
+.loadingscreen.staged .loading-text {
+	margin-top: 0;
+}
+/* Stage ticker typography: app-like system type, mono only for data. */
+.loading-stage .stage {
+	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+.loading-stage .stage-prev,
+.loading-stage .stage-next {
+	font-size: 12px;
+	line-height: 20px;
+	color: #9AA0A8;
+	opacity: 1;
+}
+.theme-dark .loading-stage .stage-prev,
+.theme-dark .loading-stage .stage-next {
+	color: #6F6580;
+}
+.loading-stage .stage-current {
+	font-size: 21px;
+	font-weight: 600;
+	letter-spacing: -0.2px;
+	line-height: 30px;
+	color: #17171C;
+	padding: 4px 0 2px;
+}
+.theme-dark .loading-stage .stage-current {
+	color: #F4F1F8;
+}
+.loading-stage .stage-current.error {
+	color: #E5484D;
+}
+.loading-stage .stage-detail {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12px;
+	line-height: 20px;
+	min-height: 20px;
+	color: #8A8F98;
+	opacity: 1;
+}
+.theme-dark .loading-stage .stage-detail {
+	color: #93889F;
+}
+/* Console: a quiet six-line activity log, newest at the bottom. */
+.loadingscreen .console {
+	display: flex;
+	flex-direction: column;
+	justify-content: flex-end;
+	overflow: hidden;
+	height: 126px;
+	line-height: 21px;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 11.5px;
+	text-transform: none;
+	color: #B9BDC4;
+}
+.theme-dark .loadingscreen .console {
+	color: #5F5570;
+}
+.loadingscreen .console-line {
+	flex-shrink: 0;
+}
+.loadingscreen .console-line:last-child {
+	color: #55585F;
+}
+.theme-dark .loadingscreen .console-line:last-child {
+	color: #B9AECB;
+}
+.loadingscreen .console .cursor {
+	background-color: #9760F9;
+	color: #9760F9;
+	width: 7px;
+	height: 15px;
+	margin-right: -7px;
+}
+/* Progress bar: slim flat accent line, no glow. */
+.progressbar {
+	background: #9760F9;
+	height: 3px;
+}
+.progressbar .peg {
+	box-shadow: none;
+	transform: none;
+}
+/* Config link: quiet, top-right. */
+.loading-config,
+.loadingscreen.ready .loading-config {
+	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	font-size: 12px;
+	color: #9AA0A8;
+	text-decoration: none;
+	top: 14px;
+	right: 16px;
+	left: auto;
+	border: none;
+	background: none;
+}
+/* Flat button (size-limit prompt on the loading screen). */
+.loadingscreen .console .button {
+	background: #9760F9;
+	color: #FFF;
+	border: none;
+	border-radius: 8px;
+	padding: 8px 18px;
+	box-shadow: none;
+	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	font-size: 13px;
+}
+/* Wider screens: a touch more air. */
+@media (min-width: 600px) {
+	.loadingscreen .flipper-container,
+	.loadingscreen.ready .flipper-container {
+		width: 96px;
+		height: 96px;
+		margin-bottom: 36px;
+	}
+	.loading-stage .stage-current {
+		font-size: 23px;
+	}
+}
