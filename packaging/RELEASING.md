@@ -8,11 +8,16 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-The workflow builds a signed + notarized macOS `.dmg` and a Linux tarball,
-bundling Firefox ESR, and attaches them to a GitHub Release. You can also run it
-by hand from the Actions tab (workflow_dispatch) for a dry run - without the
-signing secrets it still produces an ad-hoc-signed (unnotarized) app so you can
-test the pipeline.
+The workflow builds a signed macOS `.dmg`, a Linux tarball, and a signed Windows
+installer, bundling Firefox ESR, and attaches them to a GitHub Release.
+
+## Test builds without tagging
+
+To just get an artifact to test - no tag, no signing, no Release - use the
+**Build** workflow: Actions tab -> **Build** -> **Run workflow**. Pick `all` or a
+single platform (faster). It needs no secrets and attaches the unsigned
+artifacts to the run for download. Use this while iterating; tag only when you
+want a real signed release.
 
 ## One-time: set up the macOS signing secrets
 

@@ -1,0 +1,79 @@
+name: Build
+
+# On-demand test builds - no tag, no signing, no Release. Trigger from the
+# Actions tab -> "Build" -> "Run workflow", optionally picking one platform to
+# build faster. The artifacts (unsigned) are attached to the run for download.
+# For a real signed release, push a `v*` tag (that's release.yml).
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Platform to build
+        type: choice
+        default: all
+        options: [all, macos, linux, windows]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Firefox ESR to bundle
+        run: packaging/fetch-firefox-esr.sh osx
+      - name: Build (ad-hoc signed, unnotarized)
+        env:
+          EPIX_MAKE_DMG: "1"
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/Firefox.app
+        run: packaging/macos/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-macos-unsigned
+          path: dist/Epix-*.dmg
+
+  linux:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Firefox ESR to bundle
+        run: packaging/fetch-firefox-esr.sh linux
+      - name: Build Linux tarball
+        env:
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+        run: packaging/linux/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-linux
+          path: dist/epix-linux-*.tar.gz
+
+  windows:
+    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Fetch Firefox ESR to bundle
+        shell: bash
+        run: packaging/fetch-firefox-esr.sh win64
+      - name: Build installer (unsigned)
+        shell: bash
+        env:
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+        run: |
+          export PATH="/c/Program Files (x86)/NSIS:$PATH"
+          packaging/windows/build-windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-windows-unsigned
+          path: dist/Epix-Setup-*.exe
