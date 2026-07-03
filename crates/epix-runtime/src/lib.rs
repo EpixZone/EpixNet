@@ -25,6 +25,11 @@ pub mod handler;
 #[cfg(feature = "local-discovery")]
 pub mod local;
 
+/// Re-export of the Tor routing mode so callers configure it without a direct
+/// `epix-tor` dependency. Only present with the `tor` feature.
+#[cfg(feature = "tor")]
+pub use epix_tor::TorMode;
+
 /// How often the loops run.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {

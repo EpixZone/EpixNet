@@ -1,0 +1,27 @@
+[package]
+name = "epix-node"
+version = "0.1.0"
+edition = "2021"
+description = "Embeddable Epix node: resolve a .epix name, clone + verify the xite, and serve the UI, reused by the server binary, the FFI layer, and the shells."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-transport = { path = "../epix-transport" }
+epix-protocol = { path = "../epix-protocol" }
+epix-xite = { path = "../epix-xite" }
+epix-worker = { path = "../epix-worker" }
+epix-ui = { path = "../epix-ui" }
+epix-chain = { path = "../epix-chain" }
+epix-plugin = { path = "../epix-plugin" }
+epix-plugins = { path = "../epix-plugins" }
+epix-runtime = { path = "../epix-runtime" }
+tokio = { version = "1", features = ["rt", "macros"] }
+serde_json = "1"
+
+[features]
+default = ["tor"]
+tor = ["epix-runtime/tor"]
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

@@ -1,44 +1,34 @@
 //! Runnable Epix node: discover peers, clone a xite from the live EpixNet
-//! network, and serve it in a browser through the UI server.
+//! network, and serve it in a browser through the UI server. The node logic
+//! lives in `epix-node` (shared with the FFI layer and the shells); this binary
+//! adds the desktop concerns: platform data dir, single-instance lock, file
+//! logging, the bundled GeoIP asset, and `epix://` argument handling.
 
 mod platform;
 
-use epix_core::{Address, PeerAddr};
-use epix_protocol::Connection;
-use epix_transport::{TcpTransport, Transport};
-use epix_ui::{AppState, UiServer, XiteEntry};
-use epix_xite::{Xite, XiteStorage};
-use std::sync::Arc;
-
-const TRACKER: &str = "145.223.69.23:26959";
-const DEFAULT_BIND: &str = "127.0.0.1:43110";
-
-/// The UI bind address: `EPIX_UI_ADDR` (e.g. `127.0.0.1:43110`) if set, else the
-/// default loopback bind.
-fn ui_bind() -> String {
-    std::env::var("EPIX_UI_ADDR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_BIND.to_string())
-}
+use epix_node::{NodeOptions, DEFAULT_UI_ADDR};
 
 /// Bundled peer-geolocation database for the dashboard's world map: DB-IP City
 /// Lite (CC-BY-4.0), shipped gzipped and expanded into the data dir at runtime.
 const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
 
+/// The UI bind address: `EPIX_UI_ADDR` if set, else the default loopback bind.
+fn ui_bind() -> String {
+    std::env::var("EPIX_UI_ADDR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_UI_ADDR.to_string())
+}
+
 #[tokio::main]
 async fn main() {
-    // Accept a raw `epix1…` xite address, or a `.epix` name to resolve on-chain.
-    let arg = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
-    let (address, display, from_cache) = resolve_target(&arg).await;
-    // A cached resolution serves instantly; re-verify it on the chain in the
-    // background so a changed record is noticed without blocking startup.
-    if from_cache {
-        let (full, served) = (display.clone(), address.clone());
-        tokio::spawn(async move { reverify_resolution(&full, &served).await });
-    }
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+    // Accept a raw `epix1…` address, a `.epix` name, or an `epix://…` deep link
+    // (from the OS handing off a clicked link). Default to the dashboard.
+    let raw = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
+    let target = epix_node::parse_target(&raw);
 
-    // Persistent per-OS data directory (not the temp dir), with a single-instance
-    // lock so two nodes can't race on the same data. If already running, hand off
-    // to the existing instance's browser tab and exit.
+    // Persistent per-OS data directory with a single-instance lock. If already
+    // running, hand off to the existing instance's browser tab and exit.
     let root = platform::data_root();
     std::fs::create_dir_all(&root).expect("create data root");
     let _lock = match platform::acquire_lock(&root) {
@@ -48,383 +38,30 @@ async fn main() {
                 "Epix is already running (lock held in {}). Opening the existing instance.",
                 root.display()
             );
-            let _ = open_in_browser(&format!("http://{}/{display}/", ui_bind()));
+            epix_node::open_in_browser(&format!("http://{}/{target}/", ui_bind()));
             return;
         }
     };
-    let data_dir = root.join(&address);
-    std::fs::create_dir_all(&data_dir).expect("create data dir");
-    let mut xite = Xite::new(
-        Address::parse(address.clone()).expect("valid address"),
-        XiteStorage::new(&data_dir),
-    );
 
-    // 0. If already cloned + verified, skip the network fetch (fast restarts).
-    if xite.load_content().unwrap_or(false) && xite.files_needed().is_empty() {
-        println!("· {address} already cloned + verified - serving from cache");
-        serve(address, display, data_dir, xite.content.clone(), 0).await;
-        return;
-    }
-
-    // 1. Discover peers via the Epix tracker.
-    println!("· discovering peers for {address} …");
-    let peers = epix_xite::announce(
-        transport.as_ref(),
-        &address,
-        &[PeerAddr::parse(TRACKER).unwrap()],
-        0,
-    )
-    .await;
-    println!("  found {} peers", peers.len());
-    if peers.is_empty() {
-        eprintln!("no peers found - is the network reachable?");
-        std::process::exit(1);
-    }
-
-    // 2. Fetch + verify content.json.
-    let mut ok = false;
-    for peer in &peers {
-        if let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await {
-            if conn.handshake().await.is_ok() {
-                if let Ok(bytes) = conn.get_file(&address, "content.json").await {
-                    if xite.set_content(&bytes).is_ok() {
-                        ok = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if !ok {
-        eprintln!("could not fetch + verify content.json from any peer");
-        std::process::exit(1);
-    }
-
-    // 3. Sync every file, verifying each hash.
-    let needed = xite.files_needed().len();
-    println!("· content.json verified - downloading {needed} files …");
-    let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8)
-        .await
-        .expect("sync");
-    println!(
-        "  downloaded {} files ({} bytes); {} failed",
-        report.downloaded,
-        report.bytes,
-        report.failed.len()
-    );
-
-    // 4. Serve it.
-    serve(address, display, data_dir, xite.content.clone(), report.bytes).await;
-}
-
-/// Turn a CLI argument into `(xite_address, display_name, from_cache)`: pass
-/// `epix1…` through; resolve a `.epix` name (or bare label, defaulting to
-/// `epix`) - from the on-disk resolve cache if we have it (instant, re-verified
-/// later), otherwise on the chain. The display name is the `.epix` name so URLs
-/// read as `dashboard.epix`.
-async fn resolve_target(arg: &str) -> (String, String, bool) {
-    if arg.starts_with("epix1") && !arg.contains('.') {
-        return (arg.to_string(), arg.to_string(), false);
-    }
-    let (name, tld) = arg.rsplit_once('.').unwrap_or((arg, "epix"));
-    let full = format!("{name}.{tld}");
-    if let Some(address) = read_resolve_cache().get(&full).and_then(|v| v.as_str()) {
-        println!("· {full} → {address} (cached; re-verifying on chain in background)");
-        return (address.to_string(), full, true);
-    }
-    println!("· resolving {full} on the Epix chain …");
-    let address = resolve_on_chain(name, tld).await;
-    println!("  {full} → {address} (chain-verified)");
-    write_resolve_cache(&full, &address);
-    (address, full, false)
-}
-
-/// Resolve a `.epix` name to its xite address on the chain (panics on failure).
-async fn resolve_on_chain(name: &str, tld: &str) -> String {
-    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-    let domain = resolver
-        .resolve(name, tld)
-        .await
-        .unwrap_or_else(|e| panic!("could not resolve {name}.{tld}: {e}"));
-    domain
-        .xite_address()
-        .unwrap_or_else(|| panic!("{name}.{tld} has no EpixNet xite address record"))
-        .to_string()
-}
-
-/// Re-resolve a cached name on the chain and warn if the record changed. Runs in
-/// the background after we have already started serving the cached address.
-async fn reverify_resolution(full: &str, served_address: &str) {
-    let (name, tld) = full.rsplit_once('.').unwrap_or((full, "epix"));
-    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-    let resolved =
-        resolver.resolve(name, tld).await.ok().and_then(|d| d.xite_address().map(|a| a.to_string()));
-    match resolved {
-        Some(address) if address == served_address => {
-            println!("· {full} re-verified on chain (unchanged)");
-        }
-        Some(address) => {
-            eprintln!(
-                "⚠ {full} now resolves to {address} (serving cached {served_address}); \
-                 restart to switch to the new address"
-            );
-            write_resolve_cache(full, &address);
-        }
-        None => eprintln!("⚠ could not re-verify {full} on chain; keeping the cached address"),
-    }
-}
-
-/// The name→address resolve cache (shared across xites, keyed by `.epix` name).
-fn resolve_cache_path() -> std::path::PathBuf {
-    platform::data_root().join("resolve-cache.json")
-}
-
-fn read_resolve_cache() -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read(resolve_cache_path())
+    let tor_mode = std::env::var("EPIX_TOR")
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "enable".to_string());
 
-fn write_resolve_cache(full: &str, address: &str) {
-    let path = resolve_cache_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut cache = read_resolve_cache();
-    cache.insert(full.to_string(), serde_json::Value::from(address));
-    if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
-        let _ = std::fs::write(path, bytes);
-    }
-}
-
-async fn serve(
-    address: String,
-    display: String,
-    data_dir: std::path::PathBuf,
-    content: Option<serde_json::Value>,
-    bytes_recv: u64,
-) {
-    let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
-    // Append the node's log to a rotating debug.log in the data root, so
-    // activity survives restarts (rotated once at startup if too large).
-    if let Some(root) = data_dir.parent() {
-        state.set_log_file(&platform::log_path(root, 8 * 1024 * 1024));
-    }
-    // Load the bundled IP geolocation db (DB-IP City Lite, CC-BY-4.0) off the
-    // startup path: first run expands the ~62MB gzip to disk, so do it in the
-    // background. The node serves and connects to peers immediately; the world
-    // map returns empty until the db is ready, then fills in.
-    {
-        let state = state.clone();
-        let mmdb = data_dir.join("geoip-city.mmdb");
-        tokio::spawn(async move {
-            let geoip = tokio::task::spawn_blocking(move || {
-                epix_ui::geoip::GeoIp::ensure(GEOIP_CITY_GZ, &mmdb)
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(geoip) = geoip {
-                state.set_geoip(geoip).await;
-                state.push_notification("done", "World map ready", 4000);
-                state.log("INFO", "Geolocation database ready - world map enabled").await;
-            }
-        });
-    }
-    // Restore any xites served in a previous run (from sites.json), so the node
-    // seeds its whole set on restart, not just the one on the command line.
-    let restored = state.restore_sites().await;
-    if restored > 0 {
-        state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
-    }
-
-    // Serve under the raw address and (if resolved from a name) the .epix name,
-    // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
-    state
-        .add_xite(
-            &address,
-            XiteEntry {
-                storage: XiteStorage::new(&data_dir),
-                content: content.clone(),
-            },
-        )
-        .await;
-    if display != address {
-        state
-            .add_xite(
-                &display,
-                XiteEntry {
-                    storage: XiteStorage::new(&data_dir),
-                    content,
-                },
-            )
-            .await;
-    }
-
-    // Record the clone's transfer so siteInfo/the sidebar show real bytes. The
-    // tracker announce is left to the runtime's announce loop (which runs
-    // immediately on start), so it does not block the server bind.
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-    state.set_transport(transport.clone()).await;
-    // Trackers: the configured list (comma- or newline-separated), else the
-    // default tracker. `trackers_file` adds any addresses listed in the files it
-    // points at (one path per line), matching EpixNet's dynamic tracker files.
-    let mut trackers: Vec<PeerAddr> = match state.config_get("trackers").await.and_then(|v| v.as_str().map(str::to_string)) {
-        Some(list) if !list.trim().is_empty() => {
-            list.split([',', '\n']).filter_map(|t| PeerAddr::parse(t.trim()).ok()).collect()
-        }
-        _ => vec![PeerAddr::parse(TRACKER).unwrap()],
+    let opts = NodeOptions {
+        data_root: root.clone(),
+        target,
+        ui_addr: ui_bind(),
+        tor_mode,
+        open_browser: true,
+        geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
+        log_file: Some(platform::log_path(&root, 8 * 1024 * 1024)),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    if let Some(files) = state.config_get("trackers_file").await.and_then(|v| v.as_str().map(str::to_string)) {
-        for path in files.split([',', '\n']).map(str::trim).filter(|p| !p.is_empty()) {
-            match std::fs::read_to_string(path) {
-                Ok(contents) => {
-                    let before = trackers.len();
-                    for line in contents.lines().map(str::trim) {
-                        // Skip blanks and comments; keep anything that parses as a peer.
-                        if line.is_empty() || line.starts_with('#') {
-                            continue;
-                        }
-                        if let Ok(addr) = PeerAddr::parse(line) {
-                            if !trackers.contains(&addr) {
-                                trackers.push(addr);
-                            }
-                        }
-                    }
-                    state
-                        .log("INFO", format!("Loaded {} tracker(s) from {path}", trackers.len() - before))
-                        .await;
-                }
-                Err(e) => {
-                    state.log("WARNING", format!("Could not read trackers file {path}: {e}")).await;
-                }
-            }
-        }
+
+    println!("· Epix node starting (data: {})", root.display());
+    if let Err(e) = epix_node::run(opts).await {
+        eprintln!("Epix node failed: {e}");
+        std::process::exit(1);
     }
-    state.add_transfer(&address, bytes_recv, 0).await;
-    if display != address {
-        state.add_transfer(&display, bytes_recv, 0).await;
-    }
-    // Fill any merger site's aggregate db from the merged sites we serve.
-    state.rebuild_merger_dbs().await;
-
-    // Bring the node to life: supervised loops re-announce to trackers and
-    // re-sync each xite (picking up published updates) in the background.
-    // Seeding + UPnP are on by default; `fileserver_port: 0` in config opts out.
-    const DEFAULT_FILESERVER_PORT: u16 = 26552;
-    let fileserver_port = match state.config_get("fileserver_port").await.and_then(|v| v.as_u64()) {
-        Some(0) => None,                    // explicitly disabled
-        Some(p) => Some(p as u16),          // operator-chosen port
-        None => Some(DEFAULT_FILESERVER_PORT), // on by default
-    };
-    // Offline mode disables all peer networking (announce, connections, seeding).
-    // The value may be a bool or the string "true"/"false" (from the form).
-    let offline = state
-        .config_get("offline")
-        .await
-        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
-        .unwrap_or(false);
-    if offline {
-        state.log("INFO", "Offline mode: peer networking disabled").await;
-    }
-    if let Some(port) = fileserver_port {
-        state.set_fileserver_port(port).await;
-        if !offline {
-            state.log("INFO", format!("File seeding enabled on port {port}")).await;
-        }
-    }
-    // Tor mode from config (disable/enable/always). Enabled by default so the
-    // node can reach onion peers and be reached over Tor without extra setup.
-    #[cfg(feature = "tor")]
-    let tor_mode = {
-        let mode = state
-            .config_get("tor")
-            .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .map(|s| epix_tor::TorMode::parse(&s))
-            .unwrap_or_default();
-        if mode != epix_tor::TorMode::Disable {
-            state.log("INFO", format!("Tor mode: {mode:?} (in-process Arti)")).await;
-        }
-        mode
-    };
-    // SOCKS port for the browser shells to route page traffic through Tor.
-    #[cfg(feature = "tor")]
-    let tor_socks_port = state
-        .config_get("tor_socks_port")
-        .await
-        .and_then(|v| v.as_u64())
-        .map(|p| p as u16)
-        .or(Some(43111));
-
-    let runtime_config = epix_runtime::RuntimeConfig {
-        fileserver_port: if offline { None } else { fileserver_port },
-        offline,
-        #[cfg(feature = "tor")]
-        tor_mode: if offline { epix_tor::TorMode::Disable } else { tor_mode },
-        #[cfg(feature = "tor")]
-        tor_socks_port,
-        ..Default::default()
-    };
-    let mut runtime =
-        epix_runtime::NodeRuntime::with_config(state.clone(), trackers, runtime_config);
-    // Tor keeps its state + directory cache under the data root.
-    #[cfg(feature = "tor")]
-    if let Some(root) = data_dir.parent() {
-        runtime = runtime.with_data_dir(root.to_path_buf());
-    }
-    runtime.start();
-
-    // Assemble the UI command set + media through the plugin system.
-    let mut plugins = epix_plugin::PluginRegistry::new();
-    plugins.register(std::sync::Arc::new(epix_plugins::SidebarPlugin));
-
-    // Report every built-in plugin so the Plugins page lists them all, plus any
-    // dynamically registered plugin (e.g. Sidebar). serverInfo.plugins drives
-    // the dashboard menu items that gate on a plugin name.
-    let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
-    plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
-    plugin_names.sort();
-    plugin_names.dedup();
-    state.set_plugins(plugin_names).await;
-
-    let bind_addr = ui_bind();
-    let bind: std::net::SocketAddr = bind_addr.parse().unwrap_or_else(|_| {
-        eprintln!("invalid EPIX_UI_ADDR '{bind_addr}', using {DEFAULT_BIND}");
-        DEFAULT_BIND.parse().unwrap()
-    });
-    println!("\n┌──────────────────────────────────────────────");
-    println!("│ Epix node - live (announce + re-sync loops running)");
-    println!("│ plugins: {:?}", plugins.names());
-    println!("│ Open in your browser:");
-    println!("│   http://{bind}/{display}/");
-    println!("└──────────────────────────────────────────────\n");
-    state.log("INFO", format!("Serving {display} ({} bytes received)", bytes_recv)).await;
-
-    // Open the browser on the served xite, unless the operator disabled it.
-    let open_browser = state
-        .config_get("open_browser")
-        .await
-        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
-        .unwrap_or(true);
-    if open_browser {
-        open_in_browser(&format!("http://{bind}/{display}/"));
-    }
-
-    UiServer::with_registry_and_media(state, plugins.command_registry(), plugins.media_bundle())
-        .serve(bind)
-        .await
-        .expect("server");
-}
-
-/// Open `url` in the default browser (best effort, platform-specific).
-fn open_in_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let (cmd, args): (&str, &[&str]) = ("open", &[]);
-    #[cfg(target_os = "windows")]
-    let (cmd, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let (cmd, args): (&str, &[&str]) = ("xdg-open", &[]);
-    let _ = std::process::Command::new(cmd).args(args).arg(url).spawn();
 }
