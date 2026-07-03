@@ -105,10 +105,63 @@ impl DbSchema {
     }
 }
 
+/// Validate a table name is a plain SQL identifier (letters, digits,
+/// underscore; not starting with a digit), since names come from a
+/// site-controlled `dbschema.json`. Rejects anything that could break out of
+/// the interpolated DDL. EpixNet's `safe_sql_identifier`.
+fn safe_identifier(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.chars().next().unwrap().is_ascii_digit()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Db(format!("unsafe table name in dbschema.json: {name:?}")))
+    }
+}
+
 /// Create every user table + index, plus the internal `json` and `keyvalue`
-/// meta-tables the populate step needs. Idempotent (`IF NOT EXISTS`).
+/// meta-tables the populate step needs.
+///
+/// Applies EpixNet's schema versioning: the schema's `version` is tracked in
+/// `keyvalue` (`db.version`). When the site bumps it, every table is **dropped
+/// and recreated** in the new shape (the data is repopulated from the site's
+/// content data files afterward), so a node follows a site's schema change
+/// instead of keeping a stale table layout. Otherwise this is idempotent
+/// (`IF NOT EXISTS`).
 pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
     let db = |e: rusqlite::Error| Error::Db(e.to_string());
+
+    // Validate every table name up front (used in interpolated DDL below).
+    for name in schema.tables.keys() {
+        safe_identifier(name)?;
+    }
+
+    // The keyvalue meta-table must exist before we can read the stored version.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS keyvalue (\
+           keyvalue_id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, value, json_id INTEGER);\
+         CREATE UNIQUE INDEX IF NOT EXISTS key_id ON keyvalue(json_id, key);",
+    )
+    .map_err(db)?;
+    let stored_version: i64 = conn
+        .query_row(
+            "SELECT value FROM keyvalue WHERE json_id = 0 AND key = 'db.version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let outdated = stored_version < schema.version;
+    if outdated {
+        // Drop the user tables + json so they are recreated in the new shape
+        // (the json table's own columns depend on the schema version too).
+        for name in schema.tables.keys() {
+            if name != "keyvalue" {
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name};")).map_err(db)?;
+            }
+        }
+        conn.execute_batch("DROP TABLE IF EXISTS json;").map_err(db)?;
+    }
 
     for (name, table) in &schema.tables {
         if name == "json" || name == "keyvalue" {
@@ -125,6 +178,14 @@ pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
     }
 
     create_meta_tables(conn, schema)?;
+
+    if outdated {
+        conn.execute(
+            "INSERT OR REPLACE INTO keyvalue (json_id, key, value) VALUES (0, 'db.version', ?)",
+            [schema.version],
+        )
+        .map_err(db)?;
+    }
     Ok(())
 }
 
@@ -165,4 +226,59 @@ fn create_meta_tables(conn: &Connection, schema: &DbSchema) -> Result<()> {
     )
     .map_err(db)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_with_col(version: i64, col: &str) -> DbSchema {
+        let json = format!(
+            r#"{{ "db_name": "T", "db_file": "db.db", "version": {version},
+                  "maps": {{}},
+                  "tables": {{ "post": {{ "cols": [["post_id","INTEGER"],["{col}","TEXT"]],
+                                         "indexes": [], "schema_changed": 1 }} }} }}"#
+        );
+        DbSchema::from_json(&json).unwrap()
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    #[test]
+    fn version_bump_rebuilds_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        // v1 schema with a `title` column.
+        apply(&conn, &schema_with_col(1, "title")).unwrap();
+        assert!(columns(&conn, "post").contains(&"title".to_string()));
+        conn.execute("INSERT INTO post (post_id, title) VALUES (1, 'hi')", []).unwrap();
+
+        // Re-applying the same version keeps the table (and its row).
+        apply(&conn, &schema_with_col(1, "title")).unwrap();
+        let count: i64 =
+            conn.query_row("SELECT count(*) FROM post", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1, "same version does not rebuild");
+
+        // Bumping the version to 2 with a different column rebuilds the table.
+        apply(&conn, &schema_with_col(2, "body")).unwrap();
+        let cols = columns(&conn, "post");
+        assert!(cols.contains(&"body".to_string()), "new column present");
+        assert!(!cols.contains(&"title".to_string()), "old column gone (rebuilt)");
+        let stored: i64 = conn
+            .query_row("SELECT value FROM keyvalue WHERE json_id=0 AND key='db.version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 2, "stored version advanced");
+    }
+
+    #[test]
+    fn rejects_unsafe_table_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        let json = r#"{ "db_name": "T", "db_file": "db.db", "version": 1, "maps": {},
+            "tables": { "post; DROP TABLE x": { "cols": [["a","TEXT"]], "indexes": [] } } }"#;
+        let schema = DbSchema::from_json(json).unwrap();
+        assert!(apply(&conn, &schema).is_err(), "unsafe table name rejected");
+    }
 }

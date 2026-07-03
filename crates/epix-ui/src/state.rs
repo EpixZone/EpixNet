@@ -3148,6 +3148,39 @@ impl AppState {
         Some(entries)
     }
 
+    /// Recursively list every file under `inner_path` as inner paths relative to
+    /// the xite root (`fileList`). Stays within the root; `None` if unknown.
+    pub async fn walk_files(&self, address: &str, inner_path: &str) -> Option<Vec<String>> {
+        let root = self.xites.read().await.get(address)?.storage.root().to_path_buf();
+        let start = if inner_path.is_empty() { root.clone() } else { root.join(inner_path) };
+        if !start.starts_with(&root) {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![start];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(rel) = path.strip_prefix(&root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        Some(out)
+    }
+
+    /// A xite's known bad (missing/failed) files (`siteBadFiles`): inner paths
+    /// still needed. Empty if the xite is unknown or fully downloaded.
+    pub async fn bad_files(&self, address: &str) -> Vec<String> {
+        let xites = self.xites.read().await;
+        let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
+        x.settings.cache.bad_files.keys().cloned().collect()
+    }
+
     /// Set the known peer count for a xite (from discovery), persisting nothing
     /// here - it's derived runtime state.
     pub async fn set_peer_count(&self, address: &str, peers: i64) {

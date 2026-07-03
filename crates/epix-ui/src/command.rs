@@ -37,6 +37,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "notificationDismiss",
     "notificationMute",
     "notificationMuteStatus",
+    "feedSearch",
     "notificationQuery",
     "optionalLimitSet",
     "optionalLimitStats",
@@ -60,6 +61,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteList",
     "sitePause",
     "siteRecoverPrivatekey",
+    "siteReload",
     "siteResume",
     "siteSetAutodownloadoptional",
     "siteSetLimit",
@@ -331,7 +333,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(PeerAdd),
         Arc::new(ServerShowdirectory),
         Arc::new(XidClearCache),
-        Arc::new(NotificationDismiss),
+        Arc::new(NotificationDismiss { cmd: "notificationDismiss" }),
+        Arc::new(NotificationDismiss { cmd: "notificationDismissSelf" }),
         Arc::new(SiteblockIgnoreAddSite),
         // CryptMessage
         Arc::new(UserPublickey),
@@ -401,6 +404,13 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(CertSelect),
         Arc::new(CertSet),
         Arc::new(CertList),
+        // File listing + site maintenance + feed search.
+        Arc::new(DirList),
+        Arc::new(FileList),
+        Arc::new(SiteReload),
+        Arc::new(SiteBadFiles),
+        Arc::new(GetTrackers),
+        Arc::new(FeedSearch),
     ];
     // Multiuser: identity login/switch commands (desktop only).
     #[cfg(feature = "multiuser")]
@@ -2076,11 +2086,13 @@ impl WsCommand for XidClearCache {
 }
 
 /// `notificationDismiss(center)` - remember a dismissed notification banner.
-struct NotificationDismiss;
+struct NotificationDismiss {
+    cmd: &'static str,
+}
 #[async_trait]
 impl WsCommand for NotificationDismiss {
     fn name(&self) -> &'static str {
-        "notificationDismiss"
+        self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let center = arg_str(p, "center", 0).ok_or("center required")?;
@@ -2233,6 +2245,141 @@ impl WsCommand for CertList {
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
         Ok(json!(s.state.cert_list(&address).await))
+    }
+}
+
+/// `dirList {inner_path, stats?}` - list a directory's entries. With `stats`,
+/// returns `[{name, is_dir, size}]`; otherwise just the names. Alias-/cors-/
+/// merger-aware via resolve_target.
+struct DirList;
+#[async_trait]
+impl WsCommand for DirList {
+    fn name(&self) -> &'static str {
+        "dirList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = arg_str(p, "inner_path", 0).unwrap_or("");
+        let stats = p.get("stats").and_then(|v| v.as_bool()).unwrap_or(false);
+        let (address, inner) = s.resolve_target(inner_path).await?;
+        let entries = s.state.list_dir(&address, &inner).await.ok_or("dir not found")?;
+        if stats {
+            Ok(Value::Array(entries))
+        } else {
+            // Names only.
+            Ok(Value::Array(
+                entries.iter().filter_map(|e| e.get("name").cloned()).collect(),
+            ))
+        }
+    }
+}
+
+/// `fileList {inner_path}` - recursively list every file under a directory as
+/// inner paths.
+struct FileList;
+#[async_trait]
+impl WsCommand for FileList {
+    fn name(&self) -> &'static str {
+        "fileList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = arg_str(p, "inner_path", 0).unwrap_or("");
+        let (address, inner) = s.resolve_target(inner_path).await?;
+        let files = s.state.walk_files(&address, &inner).await.ok_or("dir not found")?;
+        Ok(json!(files))
+    }
+}
+
+/// `siteReload {inner_path?}` - re-check the site for a newer content.json and
+/// download changes (EpixNet reloads content + downloads). Admin.
+struct SiteReload;
+#[async_trait]
+impl WsCommand for SiteReload {
+    fn name(&self) -> &'static str {
+        "siteReload"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        s.state.resync_xite(&address).await?;
+        s.state.push_site_info(&address).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteBadFiles` - inner paths still missing/failed for this site.
+struct SiteBadFiles;
+#[async_trait]
+impl WsCommand for SiteBadFiles {
+    fn name(&self) -> &'static str {
+        "siteBadFiles"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!(s.state.bad_files(s.address()?).await))
+    }
+}
+
+/// `getTrackers` - the trackers this node announces to (AnnounceShare's shared
+/// set), as address strings.
+struct GetTrackers;
+#[async_trait]
+impl WsCommand for GetTrackers {
+    fn name(&self) -> &'static str {
+        "getTrackers"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let trackers: Vec<String> =
+            s.state.shared_trackers().await.iter().map(|t| t.to_string()).collect();
+        Ok(json!(trackers))
+    }
+}
+
+/// `feedSearch {search, limit?, day_limit?}` - search all followed feeds for a
+/// text match across their rows (title/body/…). Admin.
+struct FeedSearch;
+#[async_trait]
+impl WsCommand for FeedSearch {
+    fn name(&self) -> &'static str {
+        "feedSearch"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let search = arg_str(p, "search", 0).unwrap_or("").to_lowercase();
+        let (limit, day_limit) = feed_limits(p);
+        let follows = s.state.all_follows().await;
+        let mut rows: Vec<Value> = Vec::new();
+        let mut num_sites = 0;
+        for (site, feeds) in &follows {
+            let Some(feeds) = feeds.as_object() else { continue };
+            num_sites += 1;
+            for (name, query_set) in feeds {
+                let (raw, params) = split_feed(query_set);
+                if !is_safe_feed_sql(raw) {
+                    continue;
+                }
+                let full = build_feed_query(raw, day_limit, limit.max(100), params);
+                if !is_safe_feed_sql(&full) {
+                    continue;
+                }
+                let Ok(res) = s.state.db_query(site, &full, &Value::Null).await else { continue };
+                for mut row in res {
+                    // Match the search text against any string field.
+                    let matched = search.is_empty()
+                        || row.as_object().is_some_and(|o| {
+                            o.values().any(|v| {
+                                v.as_str().is_some_and(|s| s.to_lowercase().contains(&search))
+                            })
+                        });
+                    if !matched {
+                        continue;
+                    }
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("site".into(), json!(site));
+                        obj.insert("feed_name".into(), json!(name));
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        rows.truncate(limit);
+        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
     }
 }
 
@@ -2615,6 +2762,41 @@ mod tests {
         assert_eq!(SiteblockGet.handle(&session, &json!(["1GoodSite"])).await.unwrap(), Value::Bool(false));
         let blocks = SiteblockList.handle(&session, &Value::Null).await.unwrap();
         assert!(blocks["1BadSite"].is_object());
+    }
+
+    #[tokio::test]
+    async fn dir_and_file_listing() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = epix_xite::XiteStorage::new(dir.path());
+        storage.write("index.html", b"<html>").unwrap();
+        storage.write("js/app.js", b"1").unwrap();
+        storage.write("js/lib/x.js", b"2").unwrap();
+        state
+            .add_xite(
+                "1Files",
+                crate::state::XiteEntry { storage, content: Some(json!({ "address": "1Files" })) },
+            )
+            .await;
+        let session = WsSession::new(state, Some("1Files".into()));
+
+        // dirList of the root: names only (dirs first).
+        let names = DirList.handle(&session, &json!({ "inner_path": "" })).await.unwrap();
+        let names: Vec<String> =
+            names.as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        assert!(names.contains(&"index.html".to_string()));
+        assert!(names.contains(&"js".to_string()));
+
+        // dirList with stats: objects with name/is_dir/size.
+        let stats = DirList.handle(&session, &json!({ "inner_path": "", "stats": true })).await.unwrap();
+        assert!(stats[0].get("is_dir").is_some());
+
+        // fileList recurses.
+        let files = FileList.handle(&session, &json!({ "inner_path": "" })).await.unwrap();
+        let files: Vec<String> =
+            files.as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        assert!(files.contains(&"js/lib/x.js".to_string()), "recursive: {files:?}");
+        assert_eq!(files.len(), 3);
     }
 
     #[tokio::test]
