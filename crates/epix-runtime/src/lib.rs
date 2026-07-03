@@ -34,6 +34,9 @@ pub struct RuntimeConfig {
     /// TCP port for the inbound file server (seeding). `None` disables it (the
     /// node stays download-only). Ignored without the `inbound-seeding` feature.
     pub fileserver_port: Option<u16>,
+    /// Offline mode: skip every peer-networking loop (announce, connections,
+    /// re-sync, seeding). Only the local chart collector keeps running.
+    pub offline: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -44,6 +47,7 @@ impl Default for RuntimeConfig {
             chart_interval: Duration::from_secs(5 * 60),
             connection_interval: Duration::from_secs(60),
             fileserver_port: None,
+            offline: false,
         }
     }
 }
@@ -67,8 +71,18 @@ impl NodeRuntime {
         Self { state, trackers, config, shutdown: Arc::new(Notify::new()), handles: Vec::new() }
     }
 
-    /// Spawn the background loops. Idempotent per instance (call once).
+    /// Spawn the background loops. Idempotent per instance (call once). The local
+    /// chart collector always runs; the peer-networking loops are skipped in
+    /// offline mode.
     pub fn start(&mut self) {
+        self.handles.push(tokio::spawn(chart_loop(
+            self.state.clone(),
+            self.shutdown.clone(),
+            self.config.chart_interval,
+        )));
+        if self.config.offline {
+            return;
+        }
         self.handles.push(tokio::spawn(announce_loop(
             self.state.clone(),
             self.trackers.clone(),
@@ -79,11 +93,6 @@ impl NodeRuntime {
             self.state.clone(),
             self.shutdown.clone(),
             self.config.resync_interval,
-        )));
-        self.handles.push(tokio::spawn(chart_loop(
-            self.state.clone(),
-            self.shutdown.clone(),
-            self.config.chart_interval,
         )));
         self.handles.push(tokio::spawn(connection_loop(
             self.state.clone(),

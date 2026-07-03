@@ -736,12 +736,23 @@ impl WsCommand for ServerInfo {
             .await
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_else(|| "en".to_string());
-        // Fileserver reachability (UPnP): the external IP as a string when the
-        // port is open, else false - matching EpixNet's serverInfo shape.
-        let (port_opened, ip_external) = s.state.port_status().await;
-        let ip_external = match ip_external {
-            Some(ip) if port_opened => json!(ip),
-            _ => json!(false),
+        // Fileserver reachability: the external IP as a string, else false -
+        // matching EpixNet's serverInfo shape. A configured `ip_external` is a
+        // manual override and is always reported; otherwise the UPnP-detected IP
+        // is reported only when the port is actually open.
+        let (port_opened, detected_ip) = s.state.port_status().await;
+        let configured_ip = s
+            .state
+            .config_get("ip_external")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|x| !x.is_empty());
+        let ip_external = if let Some(ip) = configured_ip {
+            json!(ip)
+        } else if let (true, Some(ip)) = (port_opened, detected_ip) {
+            json!(ip)
+        } else {
+            json!(false)
         };
         let fileserver_port = s.state.fileserver_port().await;
         Ok(json!({
@@ -2345,6 +2356,12 @@ mod tests {
         let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(info["port_opened"], false);
         assert_eq!(info["ip_external"], false);
+
+        // A configured ip_external is a manual override, reported even when the
+        // port isn't open.
+        state.config_set("ip_external", json!("198.51.100.9")).await;
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["ip_external"], "198.51.100.9");
     }
 
     #[tokio::test]

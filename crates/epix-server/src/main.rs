@@ -231,7 +231,41 @@ async fn serve(
     // immediately on start), so it does not block the server bind.
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;
-    let trackers = vec![PeerAddr::parse(TRACKER).unwrap()];
+    // Trackers: the configured list (comma- or newline-separated), else the
+    // default tracker. `trackers_file` adds any addresses listed in the files it
+    // points at (one path per line), matching EpixNet's dynamic tracker files.
+    let mut trackers: Vec<PeerAddr> = match state.config_get("trackers").await.and_then(|v| v.as_str().map(str::to_string)) {
+        Some(list) if !list.trim().is_empty() => {
+            list.split([',', '\n']).filter_map(|t| PeerAddr::parse(t.trim()).ok()).collect()
+        }
+        _ => vec![PeerAddr::parse(TRACKER).unwrap()],
+    };
+    if let Some(files) = state.config_get("trackers_file").await.and_then(|v| v.as_str().map(str::to_string)) {
+        for path in files.split([',', '\n']).map(str::trim).filter(|p| !p.is_empty()) {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let before = trackers.len();
+                    for line in contents.lines().map(str::trim) {
+                        // Skip blanks and comments; keep anything that parses as a peer.
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Ok(addr) = PeerAddr::parse(line) {
+                            if !trackers.contains(&addr) {
+                                trackers.push(addr);
+                            }
+                        }
+                    }
+                    state
+                        .log("INFO", format!("Loaded {} tracker(s) from {path}", trackers.len() - before))
+                        .await;
+                }
+                Err(e) => {
+                    state.log("WARNING", format!("Could not read trackers file {path}: {e}")).await;
+                }
+            }
+        }
+    }
     state.add_transfer(&address, bytes_recv, 0).await;
     if display != address {
         state.add_transfer(&display, bytes_recv, 0).await;
@@ -248,12 +282,27 @@ async fn serve(
         Some(p) => Some(p as u16),          // operator-chosen port
         None => Some(DEFAULT_FILESERVER_PORT), // on by default
     };
+    // Offline mode disables all peer networking (announce, connections, seeding).
+    // The value may be a bool or the string "true"/"false" (from the form).
+    let offline = state
+        .config_get("offline")
+        .await
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+        .unwrap_or(false);
+    if offline {
+        state.log("INFO", "Offline mode: peer networking disabled").await;
+    }
     if let Some(port) = fileserver_port {
         state.set_fileserver_port(port).await;
-        state.log("INFO", format!("File seeding enabled on port {port}")).await;
+        if !offline {
+            state.log("INFO", format!("File seeding enabled on port {port}")).await;
+        }
     }
-    let runtime_config =
-        epix_runtime::RuntimeConfig { fileserver_port, ..Default::default() };
+    let runtime_config = epix_runtime::RuntimeConfig {
+        fileserver_port: if offline { None } else { fileserver_port },
+        offline,
+        ..Default::default()
+    };
     let mut runtime =
         epix_runtime::NodeRuntime::with_config(state.clone(), trackers, runtime_config);
     runtime.start();
@@ -279,8 +328,30 @@ async fn serve(
     println!("│   http://{BIND}/{display}/");
     println!("└──────────────────────────────────────────────\n");
     state.log("INFO", format!("Serving {display} ({} bytes received)", bytes_recv)).await;
+
+    // Open the browser on the served xite, unless the operator disabled it.
+    let open_browser = state
+        .config_get("open_browser")
+        .await
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
+        .unwrap_or(true);
+    if open_browser {
+        open_in_browser(&format!("http://{BIND}/{display}/"));
+    }
+
     UiServer::with_registry_and_media(state, plugins.command_registry(), plugins.media_bundle())
         .serve(bind)
         .await
         .expect("server");
+}
+
+/// Open `url` in the default browser (best effort, platform-specific).
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let (cmd, args): (&str, &[&str]) = ("open", &[]);
+    #[cfg(target_os = "windows")]
+    let (cmd, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let (cmd, args): (&str, &[&str]) = ("xdg-open", &[]);
+    let _ = std::process::Command::new(cmd).args(args).arg(url).spawn();
 }

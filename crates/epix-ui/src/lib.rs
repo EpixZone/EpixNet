@@ -356,54 +356,165 @@ async fn serve_config_page(
     State(ctx): State<Ctx>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    // Action buttons (e.g. Clear xID Cache) come back as `?action=<name>`.
+    if let Some(action) = params.get("action") {
+        if action == "xidClearCache" {
+            // The resolver cache is per-request at the chain layer, so there's
+            // nothing persistent to drop; the call succeeds like EpixNet's.
+            return Redirect::to("/Config?cleared=1").into_response();
+        }
+        return Redirect::to("/Config").into_response();
+    }
     if params.contains_key("save") {
-        for (key, _label, _default) in crate::state::CONFIG_SCHEMA {
-            if let Some(val) = params.get(*key) {
+        for (_section, key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
+            // Disabled ("coming soon") controls and action buttons aren't saved.
+            if kind.starts_with("soon:") || crate::state::is_config_action(kind) {
+                continue;
+            }
+            if *kind == "bool" {
+                // An unchecked checkbox isn't submitted, so absence means false.
+                let on = params.get(*key).map(|v| v == "on" || v == "true").unwrap_or(false);
+                ctx.state.config_set(key, Value::from(if on { "true" } else { "false" })).await;
+            } else if let Some(val) = params.get(*key) {
                 ctx.state.config_set(key, Value::from(val.as_str())).await;
             }
         }
         return Redirect::to("/Config").into_response();
     }
     let mut values = Vec::new();
-    for (key, label, default) in crate::state::CONFIG_SCHEMA {
+    for (section, key, label, default, kind) in crate::state::CONFIG_SCHEMA {
         let val = ctx
             .state
             .config_get(key)
             .await
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| default.to_string());
-        values.push((*key, *label, val, *default));
+        values.push((*section, *key, *label, val, *default, *kind));
     }
+    let cleared = params.contains_key("cleared");
     let homepage = ctx.state.homepage().await.unwrap_or_default();
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, &homepage))
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, cleared, &homepage))
         .into_response()
 }
 
-/// Render the settings page, styled like EpixNet's Config page.
-fn render_config_page(values: &[(&str, &str, String, &str)], homepage: &str) -> String {
+/// Render the settings page, styled like EpixNet's Config page: settings are
+/// grouped into sections (Web Interface / Network / Performance / Epix Chain
+/// Config) with a widget per config kind. Keys whose backend isn't built yet
+/// (Tor, tracker proxy) render disabled with a "coming soon" note.
+fn render_config_page(
+    values: &[(&str, &str, &str, String, &str, &str)],
+    cleared: bool,
+    homepage: &str,
+) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
-    let mut fields = String::new();
-    for (key, label, val, default) in values {
-        fields.push_str(&format!(
-            "<div class='config-item'>\
-               <div class='title'><h3>{label}</h3>\
-                 <div class='description'><span class='default'>(default: {default})</span></div></div>\
-               <div class='value value-right'>\
-                 <input class='input-text' name='{key}' value='{val}' spellcheck='false'></div>\
-             </div>",
-            label = esc(label),
-            key = esc(key),
-            val = esc(val),
-            default = esc(default),
-        ));
+    // Render a `select` from a `Label=value|...` option spec; `disabled` greys it out.
+    let render_select = |key: &str, spec: &str, val: &str, disabled: bool| -> String {
+        let options: String = spec
+            .split('|')
+            .map(|o| {
+                let (label, value) = o.split_once('=').unwrap_or((o, o));
+                let sel = if value == val { "selected" } else { "" };
+                format!("<option value='{v}' {sel}>{l}</option>", v = esc(value), l = esc(label))
+            })
+            .collect();
+        let dis = if disabled { "disabled" } else { "" };
+        format!("<select class='input-text' name='{key}' {dis}>{options}</select>", key = esc(key))
+    };
+
+    let mut sections = String::new();
+    let mut current_section = "";
+    for (section, key, label, val, default, kind) in values {
+        if *section != current_section {
+            if !current_section.is_empty() {
+                sections.push_str("</div>");
+            }
+            sections.push_str(&format!(
+                "<h2 class='section-title'>{}</h2><div class='config'>",
+                esc(section)
+            ));
+            current_section = section;
+        }
+
+        // A "soon:" prefix means the control is shown but disabled.
+        let (kind, coming_soon) = match kind.strip_prefix("soon:") {
+            Some(inner) => (inner, true),
+            None => (*kind, false),
+        };
+
+        let widget = if kind == "bool" {
+            let checked = if matches!(val.as_str(), "true" | "on" | "1") { "checked" } else { "" };
+            let dis = if coming_soon { "disabled" } else { "" };
+            format!(
+                "<label class='checkbox'><input type='checkbox' name='{key}' {checked} {dis}/>\
+                 <div class='checkbox-skin'></div></label>",
+                key = esc(key),
+            )
+        } else if let Some(opts) = kind.strip_prefix("select:") {
+            render_select(key, opts, val, coming_soon)
+        } else if let Some(action) = kind.strip_prefix("button:") {
+            // A standalone action link, not a stored value.
+            format!(
+                "<a class='button' href='/Config?action={action}'>{label}</a>",
+                action = esc(action),
+                label = esc(label),
+            )
+        } else if kind == "textarea" {
+            format!(
+                "<textarea class='input-text' name='{key}' rows='2' spellcheck='false'>{val}</textarea>",
+                key = esc(key),
+                val = esc(val),
+            )
+        } else {
+            format!(
+                "<input class='input-text' name='{key}' value='{val}' spellcheck='false'>",
+                key = esc(key),
+                val = esc(val),
+            )
+        };
+
+        // Buttons carry their label inside the widget; other rows show it up top
+        // with the default value, plus a "coming soon" note when disabled.
+        if kind.starts_with("button:") {
+            sections.push_str(&format!(
+                "<div class='config-item'>\
+                   <div class='title'><h3>{label}</h3></div>\
+                   <div class='value value-right'>{widget}</div>\
+                 </div>",
+                label = esc(label),
+            ));
+        } else {
+            let note = if coming_soon {
+                "<span class='default'> - coming soon (not yet supported)</span>"
+            } else {
+                ""
+            };
+            sections.push_str(&format!(
+                "<div class='config-item'>\
+                   <div class='title'><h3>{label}</h3>\
+                     <div class='description'><span class='default'>(default: {default})</span>{note}</div></div>\
+                   <div class='value value-right'>{widget}</div>\
+                 </div>",
+                label = esc(label),
+                default = esc(default),
+            ));
+        }
     }
+    if !current_section.is_empty() {
+        sections.push_str("</div>");
+    }
+
+    let flash = if cleared {
+        "<div class='notification notification-done'>xID cache cleared.</div>"
+    } else {
+        ""
+    };
     let body = format!(
-        "<form method='get' action='/Config'>\
-           <div class='config'>{fields}</div>\
+        "{flash}<form method='get' action='/Config'>\
+           {sections}\
            <input type='hidden' name='save' value='1'>\
-           <button class='button' type='submit'>Save</button>\
+           <button class='button button-submit' type='submit'>Save</button>\
          </form>"
     );
     page_shell("Configuration", "Configuration", "", &body, homepage)
@@ -523,9 +634,20 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
           .checkbox-skin:before{{content:'';position:relative;width:20px;height:20px;background:#fff;display:block;border-radius:100%;margin:2px 0 0 2px;transition:all .5s cubic-bezier(.785,.135,.15,.86)}}\
           .checkbox.checked .checkbox-skin{{background:#2ECC71}}\
           .checkbox.checked .checkbox-skin:before{{margin-left:27px}}\
+          .checkbox input{{position:absolute;opacity:0;width:0;height:0}}\
+          .checkbox input:checked + .checkbox-skin{{background:#2ECC71}}\
+          .checkbox input:checked + .checkbox-skin:before{{margin-left:27px}}\
           .input-text{{padding:8px 18px;border:1px solid #CCC;border-radius:3px;font-size:15px;box-sizing:border-box;min-width:280px;font-family:'Segoe UI',Arial,sans-serif}}\
           .input-text:focus{{border-color:#3396ff;outline:none}}\
-          .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer}}\
+          textarea.input-text{{resize:vertical;line-height:20px}}\
+          .input-text:disabled{{background:#f5f5f5;color:#aaa;cursor:not-allowed}}\
+          .checkbox input:disabled + .checkbox-skin{{opacity:.45;cursor:not-allowed}}\
+          .section-title{{font-size:15px;font-weight:500;color:#4C4C4C;text-transform:uppercase;letter-spacing:1px;margin:34px 0 4px;padding-bottom:6px;border-bottom:2px solid #EDF2F5}}\
+          .config{{margin-bottom:10px}}\
+          .notification{{padding:12px 18px;border-radius:4px;margin:0 0 20px;font-size:14px}}\
+          .notification-done{{background:#E8F8EF;border:1px solid #2ECC71;color:#227a48}}\
+          .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer;display:inline-block;text-decoration:none}}\
+          .config-item .value .button{{margin-top:0;padding:8px 22px;font-size:15px;color:#fff}}\
           a{{color:#9760F9;text-decoration:none}}\
           .fixbutton{{position:fixed;right:23px;top:9px;width:48px;height:48px;z-index:999;border-radius:50%;background:#000 url('/uimedia/img/logo.png') center/48px no-repeat;display:block;transition:box-shadow .3s,transform .15s}}\
           .fixbutton{{-webkit-user-select:none;user-select:none;-webkit-user-drag:none}}\
