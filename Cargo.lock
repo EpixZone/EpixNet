@@ -1520,6 +1520,7 @@ dependencies = [
  "include_dir",
  "rcgen",
  "rustls",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tower",

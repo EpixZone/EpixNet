@@ -5,7 +5,7 @@ edition = "2021"
 description = "Epix chain layer: chain-verified .epix name resolution (XidResolver) via Merkle proof + validator finality."
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

@@ -422,6 +422,31 @@ async fn serve(
         runtime = runtime.with_data_dir(opts.data_root.clone());
     }
     runtime.start();
+
+    // Tor-always: once the Arti SOCKS listener is up (tor_status == "Always"),
+    // route all chain RPC through it, so name resolution never exposes the
+    // node's IP or which `.epix` names it looks up. Peer/tracker traffic already
+    // rides Tor via the always-mode transport.
+    //
+    // Cold-start gap: Tor takes ~10-40s to bootstrap. Any chain RPC that runs
+    // before this fires (e.g. resolving the site named on the command line at
+    // startup) goes direct. Steady-state resolves - on-demand navigation, the
+    // native host, re-verification - all wait until the proxy is set and route
+    // through Tor.
+    #[cfg(feature = "tor")]
+    if tor_mode == epix_runtime::TorMode::Always {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if state.tor_status().await.1 == "Always" {
+                    epix_chain::set_chain_socks(Some("socks5h://127.0.0.1:43111".into()));
+                    state.log("INFO", "Chain RPC now routed through Tor".to_string()).await;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
     // The runtime's loops are owned by their spawned tasks; leak the handle so
     // they run for the process lifetime (the caller serves forever).
     std::mem::forget(runtime);
