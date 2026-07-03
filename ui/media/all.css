@@ -1292,7 +1292,9 @@ a {
 }
 .loadingscreen .flipper-container,
 .loadingscreen.ready .flipper-container {
-	position: static;
+	position: relative;
+	top: auto;
+	left: auto;
 	order: 1;
 	width: 84px;
 	height: 84px;
@@ -1387,15 +1389,15 @@ a {
 	color: #B9AECB;
 }
 .loadingscreen .console .cursor {
-	background-color: #9760F9;
-	color: #9760F9;
+	background-color: #8A4BDB;
+	color: #8A4BDB;
 	width: 7px;
 	height: 15px;
 	margin-right: -7px;
 }
 /* Progress bar: slim flat accent line, no glow. */
 .progressbar {
-	background: #9760F9;
+	background: #8A4BDB;
 	height: 3px;
 }
 .progressbar .peg {
@@ -1417,7 +1419,7 @@ a {
 }
 /* Flat button (size-limit prompt on the loading screen). */
 .loadingscreen .console .button {
-	background: #9760F9;
+	background: #8A4BDB;
 	color: #FFF;
 	border: none;
 	border-radius: 8px;
@@ -1437,4 +1439,22 @@ a {
 	.loading-stage .stage-current {
 		font-size: 23px;
 	}
+}
+
+/* Flipper: the logo's inner square window (37.5% of the mark), scaled with
+   the responsive container, flipping between the brand purple and cyan. */
+.flipper {
+	width: 37.5%;
+	height: 37.5%;
+	top: 50%;
+	left: 50%;
+	margin: -18.75% 0 0 -18.75%;
+}
+.flipper .front,
+.flipper .back {
+	border-radius: 0;
+	background-color: #8A4BDB;
+}
+.flipper .back {
+	background-color: #69E9F5;
 }
