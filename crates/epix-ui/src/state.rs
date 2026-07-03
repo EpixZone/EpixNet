@@ -2816,6 +2816,22 @@ impl AppState {
         }
     }
 
+    /// Push the outcome of an update check as the dashboard expects it
+    /// (EpixNet's contract): an `updated` event ends the "Updating..." pill -
+    /// rendered as a self-clearing "Updated!" flash on success, or (with
+    /// `content_updated: false`) as the "Update failed"/"No peers" error pill.
+    /// A plain eventless push would leave the old pill text on screen.
+    pub async fn push_update_result(&self, address: &str, ok: bool) {
+        let mut info = self.site_info(address).await;
+        if let Value::Object(m) = &mut info {
+            m.insert("event".to_string(), json!(["updated", true]));
+            if !ok {
+                m.insert("content_updated".to_string(), json!(false));
+            }
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
+    }
+
     /// Push the latest tracker stats (`setAnnouncerInfo`) on `announcerChanged`.
     /// Tagged with the announcing xite's address so its wrapper (the loading
     /// screen's tracker line) picks it up.

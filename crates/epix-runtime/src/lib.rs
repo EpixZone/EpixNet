@@ -499,14 +499,14 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
             _ = shutdown.notified() => break,
             _ = tick.tick() => {
                 for address in state.xite_addresses().await {
-                    // Show the check on the dashboard like EpixNet: spinner
-                    // while checking, "Updated" flash when something landed,
-                    // and a plain refresh (clears the spinner) when current.
+                    // Show the check on the dashboard like EpixNet: the
+                    // "Updating..." pill while checking, then an `updated`
+                    // outcome event - "Updated!" (self-clearing) on success,
+                    // the error pill on failure. The pill only clears on a
+                    // matching outcome event, never on a plain refresh.
                     state.push_site_info_event(&address, "updating").await;
-                    match state.resync_xite(&address).await {
-                        Ok(true) => state.push_site_info_event(&address, "updated").await,
-                        _ => state.push_site_info(&address).await,
-                    }
+                    let ok = state.resync_xite(&address).await.is_ok();
+                    state.push_update_result(&address, ok).await;
                 }
                 // OptionalManager: keep optional files under the size cap.
                 let freed = state.enforce_optional_limit().await;

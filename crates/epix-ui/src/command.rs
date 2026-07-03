@@ -1070,8 +1070,8 @@ impl WsCommand for SiteUpdate {
         let state = s.state.clone();
         tokio::spawn(async move {
             state.push_site_info_event(&address, "updating").await;
-            let _ = state.resync_xite(&address).await;
-            state.push_site_info_event(&address, "updated").await;
+            let ok = state.resync_xite(&address).await.is_ok();
+            state.push_update_result(&address, ok).await;
         });
         Ok(Value::from("Updated"))
     }
