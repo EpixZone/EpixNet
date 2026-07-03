@@ -305,7 +305,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteInfo),
         Arc::new(ChannelJoin { cmd: "channelJoin" }),
         Arc::new(ChannelJoin { cmd: "channelJoinAllsite" }),
-        Arc::new(simple("announcerInfo", json!({ "stats": {} }))),
+        Arc::new(AnnouncerInfo),
         Arc::new(PermissionAdd),
         Arc::new(PermissionRemove),
         Arc::new(PermissionDetails),
@@ -769,6 +769,20 @@ impl WsCommand for SiteInfo {
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?;
         Ok(s.state.site_info(address).await)
+    }
+}
+
+/// `announcerInfo` - per-tracker announce stats for the loading screen's
+/// discovery status line (EpixNet's `actionAnnouncerInfo`).
+struct AnnouncerInfo;
+#[async_trait]
+impl WsCommand for AnnouncerInfo {
+    fn name(&self) -> &'static str {
+        "announcerInfo"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address().unwrap_or_default().to_string();
+        Ok(json!({ "address": address, "stats": s.state.announcer_stats().await }))
     }
 }
 

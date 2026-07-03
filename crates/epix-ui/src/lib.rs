@@ -152,6 +152,12 @@ fn is_proxy_host(host: &str) -> bool {
     host.ends_with(".epix") && !host.is_empty()
 }
 
+/// True if a path segment plausibly references a xite we could fetch on
+/// demand: a `.epix` name (xID) or a bech32 `epix1…` address.
+fn plausible_xite_ref(s: &str) -> bool {
+    s.ends_with(".epix") || (s.starts_with("epix1") && s.len() > 20)
+}
+
 /// Rewrite a transparent-proxy request into the path form the router uses.
 /// `Host: dashboard.epix` + `GET /index.html` (or absolute-form
 /// `GET http://dashboard.epix/index.html`) becomes `GET /dashboard.epix/index.html`,
@@ -338,16 +344,45 @@ async fn serve_wrapper(
     // once here and key everything below (state lookups, wrapper identity,
     // the WS session) by the address.
     let mut address = ctx.state.canonical_key(&requested).await;
+    let mut loading = false;
     if !ctx.state.has_xite(&address).await {
-        // On-demand: if the browser asked for a `.epix` host we don't serve yet,
-        // resolve + clone it live, then serve. Only for transparent-proxy hosts.
-        let cloned = proxy_mode
-            && requested.ends_with(".epix")
-            && ctx.state.ensure_xite(&requested).await;
-        if !cloned {
+        // On-demand: resolve + clone in the background and serve the wrapper
+        // with the loading screen immediately (EpixNet's flow: the wrapper's
+        // inner file request blocks until the download lands). Works for both
+        // `.epix` names and raw addresses, in path and proxy mode alike.
+        if !plausible_xite_ref(&requested) || !ctx.state.has_on_demand().await {
             return (StatusCode::NOT_FOUND, "unknown xite").into_response();
         }
-        address = ctx.state.canonical_key(&requested).await;
+        let ensure = {
+            let state = ctx.state.clone();
+            let target = requested.clone();
+            tokio::spawn(async move {
+                state.ensure_xite(&target).await;
+            })
+        };
+        // A name resolves quickly (cache or one chain query) while the clone
+        // continues in the background; wait briefly so the wrapper can embed
+        // the bech32 identity (the WS session + events key off it). If the
+        // background ensure already finished without a resolution, the name
+        // doesn't exist - fail fast instead of waiting out the window.
+        if !requested.starts_with("epix1") {
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let key = ctx.state.canonical_key(&requested).await;
+                if key != requested {
+                    address = key;
+                    break;
+                }
+                if ensure.is_finished() {
+                    break;
+                }
+            }
+            if address == requested {
+                return (StatusCode::NOT_FOUND, format!("could not resolve {requested}"))
+                    .into_response();
+            }
+        }
+        loading = !ctx.state.has_xite(&address).await;
     }
     // Trust this Host as a WebSocket origin (the wrapper's own page will open
     // the WS from it).
@@ -416,7 +451,7 @@ async fn serve_wrapper(
         ("ajax_key", address.clone()),
         ("postmessage_nonce_security", "false".into()),
         ("permissions", json!(permissions).to_string()),
-        ("show_loadingscreen", "false".into()),
+        ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
         ("sandbox_permissions", String::new()),
         ("server_url", String::new()),
         ("lang", "en".into()),
@@ -867,7 +902,17 @@ async fn serve_file(
         }
     }
     // A `.epix` name in the URL resolves to the bech32 serving key.
-    let address = ctx.state.canonical_key(&address).await;
+    let mut address = ctx.state.canonical_key(&address).await;
+    // EpixNet's `needFile` semantics: a file of a xite that is still being
+    // cloned on demand blocks until the clone lands (the wrapper's iframe
+    // waits behind the loading screen), then serves normally.
+    if !ctx.state.has_xite(&address).await
+        && plausible_xite_ref(&address)
+        && ctx.state.has_on_demand().await
+    {
+        ctx.state.ensure_xite(&address).await;
+        address = ctx.state.canonical_key(&address).await;
+    }
     let ct = content_type(&path).to_string();
     // Range request → 206 Partial Content, streamed from disk (big files seek
     // in the browser without loading the whole file).

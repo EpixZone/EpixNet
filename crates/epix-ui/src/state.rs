@@ -835,9 +835,10 @@ impl AppState {
         self.xites.read().await.get(address).and_then(|x| x.display.clone())
     }
 
-    /// Resolve a `.epix` name (xID) to the bech32 address of a served xite:
-    /// first the in-memory display metadata, then the on-disk resolve cache
-    /// (only if that address is actually served). `None` if we don't serve it.
+    /// Resolve a `.epix` name (xID) to its bech32 address: first the served
+    /// xites' display metadata, then the on-disk resolve cache (written by the
+    /// node on every chain resolution - so a name maps as soon as it resolves,
+    /// even while its clone is still downloading). `None` for unknown names.
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
         {
             let xites = self.xites.read().await;
@@ -845,24 +846,17 @@ impl AppState {
                 return Some(k.clone());
             }
         }
-        // Fall back to resolve-cache.json (written by the node on every chain
-        // resolution), accepting only addresses we serve. Entries are either
-        // `{"address": …, "resolved_at": …}` or a legacy plain string.
+        // Entries are `{"address": …, "resolved_at": …}` or a legacy string.
         let root = self.data_root.as_ref()?;
         let cache: serde_json::Map<String, Value> =
             std::fs::read(root.join("resolve-cache.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())?;
         let entry = cache.get(name)?;
-        let addr = entry
+        entry
             .as_str()
-            .or_else(|| entry.get("address").and_then(Value::as_str))?
-            .to_string();
-        if self.xites.read().await.contains_key(&addr) {
-            Some(addr)
-        } else {
-            None
-        }
+            .or_else(|| entry.get("address").and_then(Value::as_str))
+            .map(str::to_string)
     }
 
     /// Normalize a serving reference to the bech32 address: an address passes
@@ -1266,7 +1260,7 @@ impl AppState {
         self.log("INFO", format!("Announced {address}: {} peers", all.len())).await;
         // Push the fresh peer count + tracker status to any connected UI.
         self.push_site_info(address).await;
-        self.push_announcer_info().await;
+        self.push_announcer_info(&key).await;
         all
     }
 
@@ -2653,9 +2647,48 @@ impl AppState {
     }
 
     /// Push the latest tracker stats (`setAnnouncerInfo`) on `announcerChanged`.
-    pub async fn push_announcer_info(&self) {
-        let params = json!({ "stats": self.announcer_stats().await });
-        self.push_event("setAnnouncerInfo", params, Some("announcerChanged"), None);
+    /// Tagged with the announcing xite's address so its wrapper (the loading
+    /// screen's tracker line) picks it up.
+    pub async fn push_announcer_info(&self, address: &str) {
+        let params = json!({ "address": address, "stats": self.announcer_stats().await });
+        self.push_event(
+            "setAnnouncerInfo",
+            params,
+            Some("announcerChanged"),
+            Some(address.to_string()),
+        );
+    }
+
+    /// Push a synthetic `setSiteInfo` event for a xite that is still being
+    /// cloned (not yet registered), driving the wrapper's loading screen:
+    /// `peers_added` ("Peers found: N"), `file_added` ("N files needs to be
+    /// downloaded"), `file_done` (hides the screen when index.html lands), and
+    /// `file_failed` ("download failed" / "No peers found"). `fields` merges
+    /// extra keys (e.g. `peers`, `bad_files`) over the minimal shape the
+    /// wrapper JS reads.
+    pub fn push_clone_event(&self, address: &str, event: Value, fields: Value) {
+        let mut params = json!({
+            "address": address,
+            "peers": 0,
+            "tasks": 0,
+            "started_task_num": 0,
+            "bad_files": 0,
+            "size_limit": 10,
+            "settings": { "size": 0 },
+            "event": event,
+        });
+        if let (Value::Object(p), Value::Object(f)) = (&mut params, fields) {
+            for (k, v) in f {
+                p.insert(k, v);
+            }
+        }
+        self.push_event("setSiteInfo", params, Some("siteChanged"), Some(address.to_string()));
+    }
+
+    /// Whether an on-demand resolver is installed (the browser/node wires one;
+    /// bare test servers don't).
+    pub async fn has_on_demand(&self) -> bool {
+        self.on_demand.read().await.is_some()
     }
 
     /// Push a wrapper notification (`["info"|"done"|"error", message,

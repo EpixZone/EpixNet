@@ -1916,14 +1916,14 @@ if (window.getComputedStyle(document.body).transform) {
           status_db[val.status].push(val);
         }
       }
-      status_line = "Trackers announcing: " + status_db.announcing.length + ", error: " + status_db.error.length + ", done: " + status_db.announced.length;
+      status_line = "Epix trackers - announcing: " + status_db.announcing.length + ", done: " + status_db.announced.length + (status_db.error.length ? ", failed: " + status_db.error.length : "");
       if (this.announcer_line) {
         this.announcer_line.text(status_line);
       } else {
         this.announcer_line = this.loading.printLine(status_line);
       }
-      if (status_db.error.length > (status_db.announced.length + status_db.announcing.length) && status_db.announced.length < 3) {
-        return this.loading.showTrackerTorBridge(this.server_info);
+      if (status_db.error.length > (status_db.announced.length + status_db.announcing.length) && status_db.announced.length < 3 && !this.tracker_error_line) {
+        this.tracker_error_line = this.loading.printLine("Tracker connections failing - still searching via peer exchange and local discovery.", "warning");
       }
     };
 

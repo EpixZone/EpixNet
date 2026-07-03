@@ -193,6 +193,20 @@ async fn clone_xite(
     transport: Arc<dyn Transport>,
     trackers: &[PeerAddr],
 ) -> Result<(Option<serde_json::Value>, u64), String> {
+    clone_xite_with_progress(address, data_dir, transport, trackers, None).await
+}
+
+/// [`clone_xite`], pushing wrapper loading-screen events (`peers_added`,
+/// `file_done` for content.json with the pending-file counts) to `progress`
+/// as the clone advances - the on-demand path, where a browser is watching
+/// the loading screen.
+async fn clone_xite_with_progress(
+    address: &str,
+    data_dir: &std::path::Path,
+    transport: Arc<dyn Transport>,
+    trackers: &[PeerAddr],
+    progress: Option<&AppState>,
+) -> Result<(Option<serde_json::Value>, u64), String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
     let mut xite = Xite::new(
         Address::parse(address.to_string()).map_err(|e| format!("bad address: {e}"))?,
@@ -207,6 +221,13 @@ async fn clone_xite(
     let peers = epix_xite::announce(transport.as_ref(), address, trackers, 0).await;
     if peers.is_empty() {
         return Err("no peers found - is the network reachable?".into());
+    }
+    if let Some(state) = progress {
+        state.push_clone_event(
+            address,
+            serde_json::json!(["peers_added", peers.len()]),
+            serde_json::json!({ "peers": peers.len() }),
+        );
     }
     if xite.content.is_none() {
         let mut ok = false;
@@ -224,6 +245,19 @@ async fn clone_xite(
         }
         if !ok {
             return Err("could not fetch + verify content.json from any peer".into());
+        }
+        if let Some(state) = progress {
+            let total = xite.files_needed().len();
+            state.push_clone_event(
+                address,
+                serde_json::json!(["file_done", "content.json"]),
+                serde_json::json!({
+                    "peers": peers.len(),
+                    "bad_files": total,
+                    "tasks": total,
+                    "started_task_num": total,
+                }),
+            );
         }
     }
     let mut bytes_recv = 0;
@@ -260,12 +294,21 @@ impl epix_ui::OnDemandResolver for OnDemand {
             let mut inflight = self.in_flight.lock().await;
             if inflight.contains(host) {
                 drop(inflight);
-                for _ in 0..60 {
+                // The wrapper's inner file request blocks on this while the
+                // loading screen shows, so wait as long as a clone can take.
+                for _ in 0..600 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     let key = self.state.canonical_key(host).await;
                     if self.state.has_xite(&key).await {
                         return Ok(());
                     }
+                    if !self.in_flight.lock().await.contains(host) {
+                        break; // the working clone finished (or failed)
+                    }
+                }
+                let key = self.state.canonical_key(host).await;
+                if self.state.has_xite(&key).await {
+                    return Ok(());
                 }
                 return Err("timed out waiting for a concurrent clone".into());
             }
@@ -302,8 +345,27 @@ impl OnDemand {
         let data_dir = self.data_root.join(&address);
         // If we already serve the raw address, just alias the name to it.
         if !self.state.has_xite(&address).await {
-            let (content, bytes) =
-                clone_xite(&address, &data_dir, self.transport.clone(), &self.trackers).await?;
+            let cloned = clone_xite_with_progress(
+                &address,
+                &data_dir,
+                self.transport.clone(),
+                &self.trackers,
+                Some(&self.state),
+            )
+            .await;
+            let (content, bytes) = match cloned {
+                Ok(r) => r,
+                Err(e) => {
+                    // Tell the loading screen: "index.html download failed",
+                    // and "No peers found" when peers stayed at 0.
+                    self.state.push_clone_event(
+                        &address,
+                        serde_json::json!(["file_failed", "index.html"]),
+                        serde_json::json!({}),
+                    );
+                    return Err(e);
+                }
+            };
             self.state
                 .add_xite(
                     &address,
@@ -311,6 +373,13 @@ impl OnDemand {
                 )
                 .await;
             self.state.add_transfer(&address, bytes, 0).await;
+            // Hide the loading screen: the wrapper closes on the file_done of
+            // its own index.html.
+            self.state.push_clone_event(
+                &address,
+                serde_json::json!(["file_done", "index.html"]),
+                serde_json::json!({ "content": content }),
+            );
         }
         // The `.epix` name is display metadata on the address-keyed entry.
         if host != address {
