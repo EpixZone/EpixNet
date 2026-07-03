@@ -14,6 +14,6 @@ tokio = { version = "1", features = ["sync"] }
 [dev-dependencies]
 epix-transport = { path = "../epix-transport" }
 epix-reticulum = { path = "../epix-reticulum" }
-reticulum = { path = "../../../Reticulum-rs" }
+reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "dc4e03bb08a2069d03ba038bcc63eb9358201dd5" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 tokio = { version = "1", features = ["full"] }

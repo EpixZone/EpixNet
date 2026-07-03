@@ -1,10 +1,10 @@
 //! Client side: an [`RpcClient`] that dials peers on demand and sends DHT RPCs
 //! over their `Connection`, pooling connections so a lookup reuses them.
 
-use crate::wire::{decode_response, encode_request, KAD_CMD};
+use crate::wire::{decode_responder_id, decode_response, encode_request, KAD_CMD};
 use async_trait::async_trait;
 use epix_core::PeerAddr;
-use epix_dht::{Contact, Request, Response, RpcClient};
+use epix_dht::{Contact, NodeId, Request, Response, RpcClient};
 use epix_protocol::Connection;
 use epix_transport::Transport;
 use std::collections::HashMap;
@@ -40,6 +40,39 @@ impl WireRpcClient {
 
     async fn drop_connection(&self, addr: &PeerAddr) {
         self.pool.lock().await.remove(addr);
+    }
+
+    /// Bootstrap probe: send `FindNode(target)` to a peer we only know by
+    /// address (no node id yet). Returns the responder's authentic contact
+    /// (id from the stamped response + the address we dialed) and the contacts
+    /// it shared - both safe to insert into a routing table.
+    pub async fn probe(
+        &self,
+        addr: &PeerAddr,
+        target: NodeId,
+    ) -> Result<(Option<Contact>, Vec<Contact>), String> {
+        let conn = self.connection(addr).await?;
+        let params = encode_request(&self.me, &Request::FindNode(target));
+        let result = {
+            let mut guard = conn.lock().await;
+            guard.request(KAD_CMD, params).await
+        };
+        match result {
+            Ok(body) => {
+                let responder = decode_responder_id(&body)
+                    .map(|id| Contact::new(id, addr.clone()));
+                let nodes = match decode_response(&body) {
+                    Response::Nodes(nodes) => nodes,
+                    Response::Peers { nodes, .. } => nodes,
+                    _ => Vec::new(),
+                };
+                Ok((responder, nodes))
+            }
+            Err(e) => {
+                self.drop_connection(addr).await;
+                Err(e.to_string())
+            }
+        }
     }
 }
 
