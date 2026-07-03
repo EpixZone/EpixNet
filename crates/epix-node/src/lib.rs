@@ -103,18 +103,29 @@ pub fn parse_inner_path(arg: &str) -> String {
 
 /// Resolve `target` into `(xite_address, display_name, from_cache)`: pass an
 /// `epix1…` address through; resolve a `.epix` name (or bare label, defaulting
-/// to the `epix` TLD) from the on-disk cache (instant, re-verified later) or
-/// the chain.
+/// to the `epix` TLD) from the on-disk cache, hitting the chain only when the
+/// name has no cache entry or the entry expired ([`RESOLVE_CACHE_TTL_SECS`]).
+/// If an expired entry can't be re-resolved (chain unreachable), the stale
+/// mapping keeps serving rather than failing the boot.
 pub async fn resolve_target(data_root: &std::path::Path, target: &str) -> (String, String, bool) {
     if target.starts_with("epix1") && !target.contains('.') {
         return (target.to_string(), target.to_string(), false);
     }
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
     let full = format!("{name}.{tld}");
-    if let Some(address) =
-        read_resolve_cache(data_root).get(&full).and_then(|v| v.as_str())
-    {
-        return (address.to_string(), full, true);
+    match cached_resolution(data_root, &full) {
+        Some((address, true)) => return (address, full, true),
+        Some((stale, false)) => {
+            // Expired: refresh from the chain; keep the stale mapping if that fails.
+            return match try_resolve_on_chain(name, tld).await {
+                Ok(address) => {
+                    write_resolve_cache(data_root, &full, &address);
+                    (address, full, false)
+                }
+                Err(_) => (stale, full, true),
+            };
+        }
+        None => {}
     }
     let address = resolve_on_chain(name, tld).await;
     write_resolve_cache(data_root, &full, &address);
@@ -150,11 +161,7 @@ pub async fn resolve_on_chain(name: &str, tld: &str) -> String {
 pub async fn boot(
     opts: NodeOptions,
 ) -> Result<(UiServer, RunningNode), String> {
-    let (address, display, from_cache) = resolve_target(&opts.data_root, &opts.target).await;
-    if from_cache {
-        let (full, served) = (display.clone(), address.clone());
-        tokio::spawn(async move { reverify_resolution(&full, &served).await });
-    }
+    let (address, display, _from_cache) = resolve_target(&opts.data_root, &opts.target).await;
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
@@ -272,15 +279,25 @@ impl epix_ui::OnDemandResolver for OnDemand {
 
 impl OnDemand {
     async fn do_ensure(&self, host: &str) -> Result<(), String> {
-        // Resolve the name to a xite address on-chain (unless it's already one).
+        // Resolve the name to a xite address (unless it's already one): the
+        // on-disk cache first; the chain only on a miss or an expired entry.
+        // An expired entry still serves if the chain is unreachable.
         let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         let address = if name.starts_with("epix1") {
             name.to_string()
         } else {
-            try_resolve_on_chain(name, tld).await?
+            match cached_resolution(&self.data_root, host) {
+                Some((address, true)) => address,
+                stale => match try_resolve_on_chain(name, tld).await {
+                    Ok(address) => {
+                        // Persist so a restart serves it without re-resolving.
+                        write_resolve_cache(&self.data_root, host, &address);
+                        address
+                    }
+                    Err(e) => stale.map(|(address, _)| address).ok_or(e)?,
+                },
+            }
         };
-        // Persist the resolution so a restart serves it without re-resolving.
-        write_resolve_cache(&self.data_root, host, &address);
 
         let data_dir = self.data_root.join(&address);
         // If we already serve the raw address, just alias the name to it.
@@ -474,21 +491,38 @@ async fn serve(
     Ok((server, RunningNode { state, display, address, ui_addr: bind }))
 }
 
-/// Re-resolve a cached name on the chain and warn if the record changed.
-async fn reverify_resolution(full: &str, served_address: &str) {
-    let (name, tld) = full.rsplit_once('.').unwrap_or((full, "epix"));
-    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-    let _ = resolver.resolve(name, tld).await.ok().and_then(|d| {
-        d.xite_address().map(|a| {
-            if a.to_string() != served_address {
-                eprintln!("⚠ {full} now resolves to {a} (serving cached {served_address})");
-            }
-        })
-    });
-}
-
 fn resolve_cache_path(data_root: &std::path::Path) -> PathBuf {
     data_root.join("resolve-cache.json")
+}
+
+/// How long a cached xID resolution stays fresh. Within this window the chain
+/// is never consulted for that name; after it, the next lookup re-resolves
+/// (falling back to the stale entry if the chain is unreachable).
+pub const RESOLVE_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Look up a name in the resolve cache: `Some((address, fresh))` where `fresh`
+/// says the entry is within [`RESOLVE_CACHE_TTL_SECS`]. Reads both the current
+/// format (`{"address": "epix1…", "resolved_at": secs}`) and the legacy plain
+/// string form (address known, age unknown - treated as expired so it upgrades
+/// on the next successful resolve).
+pub fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(String, bool)> {
+    match read_resolve_cache(data_root).get(full)? {
+        serde_json::Value::String(address) => Some((address.clone(), false)),
+        serde_json::Value::Object(entry) => {
+            let address = entry.get("address")?.as_str()?.to_string();
+            let resolved_at = entry.get("resolved_at").and_then(|v| v.as_u64()).unwrap_or(0);
+            let fresh = now_secs().saturating_sub(resolved_at) < RESOLVE_CACHE_TTL_SECS;
+            Some((address, fresh))
+        }
+        _ => None,
+    }
 }
 
 fn read_resolve_cache(
@@ -500,13 +534,18 @@ fn read_resolve_cache(
         .unwrap_or_default()
 }
 
-fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &str) {
+/// Record a fresh chain resolution: `{"address": …, "resolved_at": now}`.
+/// Public so the native-messaging host shares the node's cache.
+pub fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &str) {
     let path = resolve_cache_path(data_root);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let mut cache = read_resolve_cache(data_root);
-    cache.insert(full.to_string(), serde_json::Value::from(address));
+    cache.insert(
+        full.to_string(),
+        serde_json::json!({ "address": address, "resolved_at": now_secs() }),
+    );
     if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
         let _ = std::fs::write(path, bytes);
     }
@@ -533,6 +572,36 @@ mod tests {
         assert_eq!(parse_inner_path("epix://talk.epix/?q=2"), "/?q=2");
         assert_eq!(parse_inner_path("epix://talk.epix"), "");
         assert_eq!(parse_inner_path("talk.epix/a"), "/a");
+    }
+
+    #[test]
+    fn resolve_cache_ttl_fresh_expired_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Miss.
+        assert_eq!(cached_resolution(root, "talk.epix"), None);
+
+        // A fresh write is fresh.
+        write_resolve_cache(root, "talk.epix", "epix1talk");
+        assert_eq!(cached_resolution(root, "talk.epix"), Some(("epix1talk".into(), true)));
+
+        // An entry past the TTL reports expired (address still returned, so
+        // callers can fall back to it when the chain is unreachable).
+        let old = now_secs() - RESOLVE_CACHE_TTL_SECS - 1;
+        let cache = serde_json::json!({
+            "old.epix": { "address": "epix1old", "resolved_at": old },
+            "legacy.epix": "epix1legacy",
+        });
+        std::fs::write(resolve_cache_path(root), serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(cached_resolution(root, "old.epix"), Some(("epix1old".into(), false)));
+
+        // Legacy plain-string entries: address known, treated as expired.
+        assert_eq!(cached_resolution(root, "legacy.epix"), Some(("epix1legacy".into(), false)));
+
+        // Re-writing upgrades a legacy entry to the timestamped form.
+        write_resolve_cache(root, "legacy.epix", "epix1legacy");
+        assert_eq!(cached_resolution(root, "legacy.epix"), Some(("epix1legacy".into(), true)));
     }
 }
 
