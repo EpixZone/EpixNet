@@ -213,6 +213,10 @@ pub struct AppState {
     /// `serverInfo`. Default closed / unknown.
     port_opened: RwLock<bool>,
     ip_external: RwLock<Option<String>>,
+    /// Inbound updates currently being verified/downloaded (`site/inner:modified`
+    /// URIs), so the same pushed version isn't processed twice concurrently
+    /// (EpixNet's `files_parsing`).
+    updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -234,6 +238,16 @@ pub struct UiEvent {
     pub channel: Option<String>,
     pub target: Option<String>,
     pub payload: String,
+}
+
+/// Outcome of an accepted inbound `update` push (errors are `Err` strings that
+/// go back on the wire, matching EpixNet's responses).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InboundUpdate {
+    /// Newer version, signature valid: stored, files syncing in the background.
+    Applied,
+    /// We already have this version (or newer) - sender recorded as a peer.
+    NotChanged,
 }
 
 fn empty_filters() -> Value {
@@ -276,6 +290,7 @@ impl AppState {
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
             pins_path: None,
+            updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -354,6 +369,7 @@ impl AppState {
             fileserver_port: RwLock::new(0),
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
+            updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -639,6 +655,10 @@ impl AppState {
         }
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
+            // The node adds a xite after cloning+verifying it, so having content
+            // means it was downloaded. Guards inbound `update`: arbitrary peers
+            // can't push content for sites we never voluntarily fetched.
+            settings.downloaded = Some(now_secs());
         }
         let muted = self.muted_authors().await;
         let (db, db_schema) = match build_xite_db(&entry.storage, &muted) {
@@ -2203,6 +2223,18 @@ impl AppState {
     /// Publish `inner_path` to the xite's connectable peers via the `update`
     /// command. Returns how many peers accepted it. `sitePublish`.
     pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
+        self.publish_to(address, inner_path, 20).await
+    }
+
+    /// Publish to at most `limit` connectable peers. The re-broadcast of an
+    /// accepted inbound update uses a small limit (EpixNet uses 3) so a push
+    /// floods the network without every node hammering every peer.
+    pub async fn publish_to(
+        &self,
+        address: &str,
+        inner_path: &str,
+        limit: usize,
+    ) -> Result<usize, String> {
         let body = self
             .xites
             .read()
@@ -2210,13 +2242,14 @@ impl AppState {
             .get(address)
             .and_then(|x| x.storage.read(inner_path).ok())
             .ok_or("nothing to publish")?;
-        // The version we're publishing, for the offline-peer propagation hint.
+        // The version we're publishing: sent with the update so receivers can
+        // short-circuit, and used for the offline-peer propagation hint.
         let modified = serde_json::from_slice::<Value>(&body)
             .ok()
-            .and_then(|c| c.get("modified").and_then(|v| v.as_i64()))
-            .unwrap_or(0);
+            .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
         let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
-        let peers = self.connectable_peers(address, 20).await;
+        let peers = self.connectable_peers(address, limit).await;
 
         let mut published = 0;
         for peer in peers {
@@ -2224,15 +2257,194 @@ impl AppState {
             if conn.handshake().await.is_err() {
                 continue;
             }
-            if conn.update(address, inner_path, &body).await.is_ok() {
+            if conn.update(address, inner_path, &body, modified).await.is_ok() {
                 self.set_peer_connected(address, &peer, true).await;
                 published += 1;
                 // Live-hook: tell the peer (acting as a propagation node) about
                 // the new version so peers that are offline now can pull it later.
-                let _ = epix_propagation::announce_update(&mut conn, address, modified).await;
+                let _ = epix_propagation::announce_update(&mut conn, address, modified as i64).await;
             }
         }
         Ok(published)
+    }
+
+    /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
+    /// command - the receive half of the publish round-trip). Mirrors EpixNet's
+    /// `FileRequest.actionUpdate`: reject unknown/not-downloaded sites, skip
+    /// versions we already have, verify the signature before accepting, then
+    /// download the changed files in the background and re-publish to a few
+    /// peers so the update floods.
+    ///
+    /// `body` is the pushed content.json (None/empty when the sender omitted it
+    /// - EpixNet drops bodies over 1 MB - in which case it is fetched back from
+    /// `sender`). `modified_hint` is the pushed version, letting us short-
+    /// circuit without parsing. Returns whether the update was applied.
+    pub async fn apply_inbound_update(
+        self: &Arc<Self>,
+        site: &str,
+        inner_path: &str,
+        body: Option<Vec<u8>>,
+        modified_hint: Option<f64>,
+        sender: Option<PeerAddr>,
+    ) -> Result<InboundUpdate, String> {
+        // A xite may be served under aliases (raw address + `.epix` name); an
+        // update applies to every key sharing the pushed canonical address.
+        let keys: Vec<String> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(k, x)| {
+                    k.as_str() == site || canonical_address(x.content.as_ref(), k) == site
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let Some(key) = keys.first().cloned() else {
+            return Err("Unknown site".into());
+        };
+        if !self.is_serving(&key).await {
+            return Err("Unknown site".into());
+        }
+        // Only accept pushes for sites we voluntarily downloaded.
+        let (downloaded, current_modified) = {
+            let xites = self.xites.read().await;
+            let x = xites.get(&key).ok_or("Unknown site")?;
+            let current = x
+                .content
+                .as_ref()
+                .and_then(|c| c.get("modified"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            (x.settings.downloaded.is_some(), current)
+        };
+        if !downloaded {
+            return Err("Site not yet downloaded".into());
+        }
+        if !inner_path.ends_with("content.json") {
+            return Err("Only content.json update allowed".into());
+        }
+        // The engine verifies the root signature only so far; nested/user
+        // content.json verification is the content-rules parity work (Tier 0).
+        if inner_path != "content.json" {
+            return Err(format!(
+                "File {inner_path} invalid: non-root content.json updates not supported yet"
+            ));
+        }
+
+        // Same or older version than ours: record the sender as a peer and stop.
+        if let Some(hint) = modified_hint {
+            if hint <= current_modified {
+                if let Some(s) = &sender {
+                    self.add_peers(&key, [s.clone()]).await;
+                }
+                return Ok(InboundUpdate::NotChanged);
+            }
+        }
+
+        // Body-less update (large content.json): fetch it back from the sender.
+        let bytes = match body.filter(|b| !b.is_empty()) {
+            Some(b) => b,
+            None => {
+                let fetched = match (&sender, self.transport.read().await.clone()) {
+                    (Some(s), Some(transport)) => {
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            let mut conn =
+                                Connection::connect(transport.as_ref(), s).await.ok()?;
+                            conn.handshake().await.ok()?;
+                            conn.get_file(site, inner_path).await.ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                    _ => None,
+                };
+                fetched.ok_or("File invalid update: Can't download updated file")?
+            }
+        };
+
+        let new: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "File invalid JSON".to_string())?;
+        let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if new_modified <= current_modified {
+            if let Some(s) = &sender {
+                self.add_peers(&key, [s.clone()]).await;
+            }
+            return Ok(InboundUpdate::NotChanged);
+        }
+
+        // Don't process the same pushed version twice concurrently.
+        let uri = format!("{site}/{inner_path}:{new_modified}");
+        if !self.updates_in_flight.lock().unwrap().insert(uri.clone()) {
+            return Ok(InboundUpdate::NotChanged);
+        }
+
+        // Verify the signature against the xite address; only writes if valid.
+        let mut xite = match self.xite_view(&key).await {
+            Ok(x) => x,
+            Err(e) => {
+                self.updates_in_flight.lock().unwrap().remove(&uri);
+                return Err(e);
+            }
+        };
+        if let Err(e) = xite.set_content(&bytes) {
+            self.updates_in_flight.lock().unwrap().remove(&uri);
+            return Err(format!("File {inner_path} invalid: {e}"));
+        }
+        for k in &keys {
+            self.update_content(k, xite.content.clone()).await;
+        }
+        if let Some(s) = &sender {
+            self.add_peers(&key, [s.clone()]).await;
+        }
+
+        // Download the changed files and re-publish in the background, like
+        // EpixNet - the sender gets its "ok" response right away.
+        let state = self.clone();
+        let inner = inner_path.to_string();
+        tokio::spawn(async move {
+            state.finish_inbound_update(keys, xite, sender, inner, uri).await;
+        });
+        Ok(InboundUpdate::Applied)
+    }
+
+    /// The deferred half of [`Self::apply_inbound_update`]: sync the files the
+    /// new content.json needs (preferring the sender), rebuild db views, then
+    /// re-publish to a few peers so the update spreads.
+    async fn finish_inbound_update(
+        &self,
+        keys: Vec<String>,
+        xite: Xite,
+        sender: Option<PeerAddr>,
+        inner_path: String,
+        uri: String,
+    ) {
+        let key = keys[0].clone();
+        if let Some(transport) = self.transport.read().await.clone() {
+            let mut peers = self.connectable_peers(&key, 10).await;
+            if let Some(s) = sender {
+                if !peers.contains(&s) {
+                    peers.insert(0, s);
+                }
+            }
+            let needed = xite.files_needed().len();
+            if needed > 0 && !peers.is_empty() {
+                self.set_worker_stats(&key, needed, peers.len().min(8), needed).await;
+                if let Ok(report) =
+                    epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await
+                {
+                    self.add_transfer(&key, report.bytes, 0).await;
+                }
+                self.set_worker_stats(&key, 0, 0, 0).await;
+                // Data files changed - rebuild the db views under every alias.
+                for k in &keys {
+                    self.update_content(k, xite.content.clone()).await;
+                }
+            }
+            // EpixNet re-publishes an accepted update to up to 3 more peers.
+            let _ = self.publish_to(&key, &inner_path, 3).await;
+        }
+        self.updates_in_flight.lock().unwrap().remove(&uri);
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {

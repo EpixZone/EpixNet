@@ -50,6 +50,7 @@ benchmark = ["dep:getrandom", "dep:sha3"]
 [dev-dependencies]
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
+epix-content = { path = "../epix-content" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

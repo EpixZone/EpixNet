@@ -158,11 +158,20 @@ impl Connection {
     /// Publish an updated `content.json` to the peer (`update` FileRequest). The
     /// peer verifies `body`'s signature before accepting, so a bad update is
     /// rejected on their side. `body` is the raw content.json bytes.
-    pub async fn update(&mut self, xite: &str, inner_path: &str, body: &[u8]) -> Result<Value> {
+    pub async fn update(
+        &mut self,
+        xite: &str,
+        inner_path: &str,
+        body: &[u8],
+        modified: f64,
+    ) -> Result<Value> {
         let params = vmap(vec![
             ("site", Value::from(xite)),
             ("inner_path", Value::from(inner_path)),
             ("body", Value::Binary(body.to_vec())),
+            // The version being pushed; receivers skip validation when they
+            // already have this or newer (EpixNet peers send it too).
+            ("modified", Value::from(modified)),
         ]);
         self.request("update", params).await
     }

@@ -8,6 +8,7 @@
 //! Feature-gated behind `inbound-seeding` (off for mobile, which should not
 //! accept inbound connections).
 
+use crate::state::InboundUpdate;
 use crate::AppState;
 use async_trait::async_trait;
 use epix_core::PeerAddr;
@@ -61,14 +62,43 @@ impl FileService {
             None => vmap(vec![("error", Value::from("File not found"))]),
         }
     }
+
+    /// `update {site, inner_path, body, modified}` - a peer pushing us a newer
+    /// content.json (the receive half of publish). Response strings match
+    /// EpixNet's `FileRequest.actionUpdate` so Python senders behave the same
+    /// against a Rust node.
+    async fn update(&self, peer: &PeerAddr, params: &Value) -> Value {
+        let site = vget_str(params, "site").unwrap_or_default();
+        let inner_path = vget_str(params, "inner_path").unwrap_or_default();
+        let body = vget(params, "body").and_then(|v| match v {
+            Value::Binary(b) => Some(b.clone()),
+            Value::String(s) => s.as_str().map(|s| s.as_bytes().to_vec()),
+            _ => None,
+        });
+        let modified = vget(params, "modified")
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)));
+
+        match self
+            .state
+            .apply_inbound_update(&site, &inner_path, body, modified, Some(peer.clone()))
+            .await
+        {
+            Ok(InboundUpdate::Applied) => {
+                vmap(vec![("ok", Value::from(format!("Thanks, file {inner_path} updated!")))])
+            }
+            Ok(InboundUpdate::NotChanged) => vmap(vec![("ok", Value::from("File not changed"))]),
+            Err(e) => vmap(vec![("error", Value::from(e))]),
+        }
+    }
 }
 
 #[async_trait]
 impl RequestHandler for FileService {
-    async fn handle(&self, _peer: &PeerAddr, cmd: &str, params: &Value) -> Value {
+    async fn handle(&self, peer: &PeerAddr, cmd: &str, params: &Value) -> Value {
         match cmd {
             "ping" => vmap(vec![("body", Value::Binary(b"Pong!".to_vec()))]),
             "getFile" | "streamFile" => self.get_file(params).await,
+            "update" => self.update(peer, params).await,
             "getPiecefields" => self.get_piecefields(params).await,
             // A peer pushing us its piecefields: acknowledge (our downloader
             // re-queries piecefields when it needs them, so we don't retain).
@@ -160,5 +190,78 @@ mod tests {
         ]);
         let resp = svc.handle(&peer, "getFile", &params).await;
         assert!(vget(&resp, "error").is_some());
+    }
+
+    /// Build a signed content.json for `address` at version `modified`.
+    fn signed_content(address: &str, privkey: &str, modified: i64) -> (serde_json::Value, Vec<u8>) {
+        let mut content = json!({ "address": address, "modified": modified, "files": {} });
+        epix_content::sign(&mut content, privkey).unwrap();
+        let bytes = serde_json::to_vec(&content).unwrap();
+        (content, bytes)
+    }
+
+    fn update_params(site: &str, inner_path: &str, body: &[u8], modified: i64) -> Value {
+        vmap(vec![
+            ("site", Value::from(site)),
+            ("inner_path", Value::from(inner_path)),
+            ("body", Value::Binary(body.to_vec())),
+            ("modified", Value::from(modified as f64)),
+        ])
+    }
+
+    #[tokio::test]
+    async fn inbound_update_verifies_applies_and_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+
+        let (v1, v1_bytes) = signed_content(&address, &privkey, 1000);
+        storage.write("content.json", &v1_bytes).unwrap();
+
+        let state = AppState::new("test");
+        state.add_xite(&address, XiteEntry { storage, content: Some(v1) }).await;
+        let svc = FileService::new(state.clone());
+        let peer = PeerAddr::parse("1.2.3.4:1234").unwrap();
+
+        // A newer, validly signed version is accepted and stored.
+        let (_v2, v2_bytes) = signed_content(&address, &privkey, 2000);
+        let params = update_params(&address, "content.json", &v2_bytes, 2000);
+        let resp = svc.handle(&peer, "update", &params).await;
+        assert_eq!(vget_str(&resp, "ok").as_deref(), Some("Thanks, file content.json updated!"));
+        let stored = state.content(&address).await.unwrap();
+        assert_eq!(stored.get("modified").and_then(|m| m.as_i64()), Some(2000));
+        // The sender was recorded as a peer.
+        assert!(state.connectable_peers(&address, 10).await.contains(&peer));
+
+        // Replaying the same version is a no-op.
+        let resp = svc.handle(&peer, "update", &params).await;
+        assert_eq!(vget_str(&resp, "ok").as_deref(), Some("File not changed"));
+
+        // A tampered body (modified bumped without re-signing) is rejected and
+        // the stored content is untouched.
+        let mut forged: serde_json::Value = serde_json::from_slice(&v2_bytes).unwrap();
+        forged["modified"] = json!(3000);
+        let forged_bytes = serde_json::to_vec(&forged).unwrap();
+        let params = update_params(&address, "content.json", &forged_bytes, 3000);
+        let resp = svc.handle(&peer, "update", &params).await;
+        assert!(vget_str(&resp, "error").unwrap().contains("invalid"));
+        let stored = state.content(&address).await.unwrap();
+        assert_eq!(stored.get("modified").and_then(|m| m.as_i64()), Some(2000));
+
+        // Unknown site.
+        let params = update_params("1Unknown", "content.json", &v2_bytes, 2000);
+        let resp = svc.handle(&peer, "update", &params).await;
+        assert_eq!(vget_str(&resp, "error").as_deref(), Some("Unknown site"));
+
+        // Only content.json may be pushed.
+        let params = update_params(&address, "index.html", b"<html>", 2000);
+        let resp = svc.handle(&peer, "update", &params).await;
+        assert_eq!(vget_str(&resp, "error").as_deref(), Some("Only content.json update allowed"));
+
+        // An older version short-circuits via the modified hint (no body parse).
+        let params = update_params(&address, "content.json", &v1_bytes, 1000);
+        let resp = svc.handle(&peer, "update", &params).await;
+        assert_eq!(vget_str(&resp, "ok").as_deref(), Some("File not changed"));
     }
 }

@@ -785,6 +785,7 @@ dependencies = [
  "axum 0.7.9",
  "base64",
  "epix-chain",
+ "epix-content",
  "epix-core",
  "epix-crypt",
  "epix-db",
