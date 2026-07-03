@@ -3563,19 +3563,42 @@ impl AppState {
     }
 
     /// Remove a xite from the node and delete its files on disk (`siteDelete`).
-    /// Returns false if the xite isn't served here.
+    /// A site may be served under several keys (raw `epix1…` address plus a
+    /// `.epix` alias) sharing one storage; all of them are removed, otherwise a
+    /// surviving alias keeps syncing and the periodic `persist_sites` writes
+    /// the site straight back into `sites.json`. Returns false if the xite
+    /// isn't served here.
     pub async fn remove_xite(&self, address: &str) -> bool {
-        let removed = self.xites.write().await.remove(address);
-        match removed {
-            Some(x) => {
-                // Best-effort delete of the xite's storage directory.
-                let root = x.storage.root().to_path_buf();
-                let _ = std::fs::remove_dir_all(&root);
-                self.persist_peers().await;
-                true
+        let mut roots = Vec::new();
+        {
+            let mut xites = self.xites.write().await;
+            // Canonical (signed content) address of the target, alias-aware.
+            let Some(x) = self.resolve_xite(&xites, address) else { return false };
+            let canonical = canonical_address(x.content.as_ref(), address);
+            // Remove every serving key that shares this canonical address.
+            let keys: Vec<String> = xites
+                .iter()
+                .filter(|(k, x)| canonical_address(x.content.as_ref(), k) == canonical)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in keys {
+                if let Some(x) = xites.remove(&key) {
+                    let root = x.storage.root().to_path_buf();
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
             }
-            None => false,
         }
+        // Best-effort delete of the xite's storage directory (shared by all
+        // aliases), then drop the site from the persisted registries so it
+        // stays deleted across restarts.
+        for root in roots {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        self.persist_peers().await;
+        self.persist_sites().await;
+        true
     }
 
     /// Add a peer (ip + port) to a xite's known-peer set (`peerAdd`).
@@ -4388,6 +4411,50 @@ mod tests {
         assert!(state.remove_xite("1FavMe").await);
         assert!(!state.has_xite("1FavMe").await);
         assert!(!state.remove_xite("1FavMe").await);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_all_aliases_files_and_sites_json_entry() {
+        // A site served under both its signed address and a `.epix` alias,
+        // like the browser sets up. Deleting by the signed address (what the
+        // dashboard sends) must remove both entries, the files, and the
+        // sites.json record - a surviving alias used to re-sync the site and
+        // write it back, so it came back after a restart.
+        let root = tempdir().unwrap();
+        let addr = "1DeleteMe";
+        let state = AppState::with_data_dir("test", root.path().join(addr));
+        let site_dir = root.path().join(addr);
+        std::fs::write(site_dir.join("index.html"), b"hi").unwrap();
+        let content = json!({ "address": addr, "files": {} });
+        let entry = || XiteEntry {
+            storage: XiteStorage::new(&site_dir),
+            content: Some(content.clone()),
+        };
+        state.add_xite(addr, entry()).await;
+        state.add_xite("deleteme.epix", entry()).await;
+        assert_eq!(state.site_list().await.len(), 1, "alias collapses to one site");
+
+        assert!(state.remove_xite(addr).await);
+        // Both serving keys gone, so nothing re-syncs it.
+        assert!(!state.has_xite(addr).await);
+        assert!(!state.has_xite("deleteme.epix").await);
+        assert!(state.site_list().await.is_empty());
+        // Files gone.
+        assert!(!site_dir.exists());
+        // sites.json no longer records it, so a restart won't restore it.
+        let sites: serde_json::Map<String, Value> =
+            std::fs::read(root.path().join("sites.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+        assert!(!sites.contains_key(addr));
+
+        // Deleting by the alias works the same way.
+        state.add_xite(addr, entry()).await;
+        state.add_xite("deleteme.epix", entry()).await;
+        assert!(state.remove_xite("deleteme.epix").await);
+        assert!(!state.has_xite(addr).await);
+        assert!(!state.has_xite("deleteme.epix").await);
     }
 
     #[tokio::test]
