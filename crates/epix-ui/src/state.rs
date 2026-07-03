@@ -2575,6 +2575,130 @@ impl AppState {
         self.conn_pool.stats().await
     }
 
+    /// Render the diagnostics Stats page (EpixNet's `/Stats`): node identity,
+    /// connection pool, trackers, Tor, and a per-site table. Returns the inner
+    /// HTML body; the route wraps it in the shared page shell.
+    pub async fn stats_html(&self) -> String {
+        use std::fmt::Write;
+        let esc = |s: &str| {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        };
+        let (tor_enabled, tor_status) = self.tor_status().await;
+        let (port_opened, ip_ext) = self.port_status().await;
+        let stats = self.connection_stats().await;
+        let mut h = String::new();
+
+        // Head line.
+        let _ = write!(
+            h,
+            "<div class='stat-head'>v{ver} | Port: {port} | Opened: {opened} |              External IP: {ip} | Tor: {tor} | Connections: {conns}</div>",
+            ver = esc(&self.version),
+            port = self.fileserver_port().await,
+            opened = port_opened,
+            ip = esc(&ip_ext.unwrap_or_else(|| "-".into())),
+            tor = if tor_enabled { esc(&tor_status) } else { "off".into() },
+            conns = stats.total,
+        );
+
+        // Connections.
+        let _ = write!(
+            h,
+            "<h2>Connections ({} live, onion: {})</h2>             <table><tr><th>peer</th><th>type</th><th>ping</th></tr>",
+            stats.total, stats.onion
+        );
+        for addr in self.conn_pool.connected_addrs().await {
+            let ping = self
+                .conn_pool
+                .ping_for(&addr)
+                .await
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "-".into());
+            let kind = match &addr {
+                PeerAddr::Onion { .. } => "onion",
+                PeerAddr::Rns(_) => "mesh",
+                PeerAddr::Ip(_) => "ip",
+            };
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&addr.to_string()),
+                kind,
+                ping
+            );
+        }
+        if stats.total == 0 {
+            h.push_str("<tr><td colspan=3 class='muted'>no live connections</td></tr>");
+        }
+        h.push_str("</table>");
+
+        // Trackers.
+        h.push_str("<h2>Trackers</h2><table><tr><th>address</th><th>requests</th><th>errors</th><th>peers found</th><th>status</th></tr>");
+        let trackers = self.announcer_stats().await;
+        if let Value::Object(map) = &trackers {
+            for (addr, st) in map {
+                let get = |k: &str| st.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+                let status =
+                    st.get("status").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+                let _ = write!(
+                    h,
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    esc(addr),
+                    get("num_request"),
+                    get("num_error"),
+                    get("num_added"),
+                    esc(&status),
+                );
+            }
+        }
+        if !matches!(&trackers, Value::Object(m) if !m.is_empty()) {
+            h.push_str("<tr><td colspan=5 class='muted'>no announces yet</td></tr>");
+        }
+        h.push_str("</table>");
+
+        // Tor.
+        h.push_str("<h2>Tor</h2>");
+        let _ = write!(
+            h,
+            "<div class='stat-row'>status: <b>{}</b></div>",
+            if tor_enabled { esc(&tor_status) } else { "disabled".into() }
+        );
+        if let Some(onion) = self.onion_address().await {
+            let _ = write!(h, "<div class='stat-row'>onion: {}.onion</div>", esc(&onion));
+        }
+
+        // Sites.
+        h.push_str("<h2>Sites</h2><table><tr><th>address</th><th>peers (conn/able/total)</th><th>onion</th><th>local</th><th>out</th><th>in</th><th>serving</th></tr>");
+        for address in self.xite_addresses().await {
+            // One row per site (skip the display-name alias key, if any).
+            if address.contains('.') {
+                continue;
+            }
+            let pc = self.peer_counts(&address).await;
+            let (recv, sent) = self.transfer(&address).await;
+            let serving = self.is_serving(&address).await;
+            let display = self.display_of(&address).await;
+            let label = match &display {
+                Some(d) => format!("{} <span class='muted'>({})</span>", esc(d), esc(&address)),
+                None => esc(&address),
+            };
+            let _ = write!(
+                h,
+                "<tr class='{cls}'><td>{label}</td><td>{c}/{able}/{total}</td><td>{onion}</td>                 <td>{local}</td><td>{out:.0}k</td><td>{in_:.0}k</td><td>{serving}</td></tr>",
+                cls = if serving { "" } else { "muted" },
+                c = pc.connected,
+                able = pc.connectable,
+                total = pc.total,
+                onion = pc.onion,
+                local = pc.local,
+                out = sent as f64 / 1024.0,
+                in_ = recv as f64 / 1024.0,
+                serving = serving,
+            );
+        }
+        h.push_str("</table>");
+        h
+    }
+
     // --- Server-pushed UI events --------------------------------------------
 
     // --- Console log buffer -------------------------------------------------

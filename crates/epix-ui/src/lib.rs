@@ -97,6 +97,7 @@ impl UiServer {
             .route("/uimedia/*path", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
+            .route("/Stats", get(serve_stats_page))
             .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
@@ -139,6 +140,7 @@ fn is_global_path(path: &str) -> bool {
         || path.starts_with("/EpixNet-Internal/")
         || path == "/Config"
         || path == "/Plugins"
+        || path == "/Stats"
         || path.starts_with("/list/")
         || path == "/Benchmark"
         || path == "/Login"
@@ -590,6 +592,29 @@ async fn serve_config_page(
     let cleared = params.contains_key("cleared");
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, cleared, &homepage))
+        .into_response()
+}
+
+/// `GET /Stats` - the diagnostics page (EpixNet's `/Stats`): node identity,
+/// live connections, tracker stats, Tor state, and a per-site table.
+async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
+    let body = ctx.state.stats_html().await;
+    let homepage = ctx.state.homepage().await.unwrap_or_default();
+    let styled = format!(
+        "<style>\
+         .stats-wrap{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}}\
+         .stats-wrap h2{{margin:22px 0 6px;font-size:15px}}\
+         .stats-wrap table{{border-collapse:collapse;width:100%;margin-bottom:6px}}\
+         .stats-wrap th,.stats-wrap td{{text-align:left;padding:3px 12px 3px 0;border-bottom:1px solid #eef0f3;white-space:nowrap}}\
+         .stats-wrap th{{color:#7a828c;font-weight:600}}\
+         .stats-wrap tr.muted td,.stats-wrap .muted{{opacity:.5}}\
+         .stats-wrap .stat-head{{padding:8px 0;color:#4a515a;border-bottom:1px solid #e6e8eb}}\
+         .stats-wrap .stat-row{{padding:2px 0}}\
+         .stats-wrap .overflow{{overflow-x:auto}}\
+         </style>\
+         <div class='stats-wrap'>{body}</div>"
+    );
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page_shell("Stats", "Stats", "Node diagnostics", &styled, &homepage))
         .into_response()
 }
 

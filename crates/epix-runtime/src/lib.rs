@@ -14,7 +14,6 @@
 //! stops cleanly.
 
 use epix_core::PeerAddr;
-use epix_dht::RpcClient as _;
 use epix_ui::AppState;
 use std::sync::Arc;
 use std::time::Duration;
