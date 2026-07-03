@@ -98,6 +98,11 @@ impl UiServer {
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
             .route("/Stats", get(serve_stats_page))
+            // Trailing-slash variants would otherwise fall through to the
+            // xite route ("/Stats/" -> serve_wrapper("Stats") -> 404).
+            .route("/Plugins/", get(|| async { Redirect::permanent("/Plugins") }))
+            .route("/Config/", get(|| async { Redirect::permanent("/Config") }))
+            .route("/Stats/", get(|| async { Redirect::permanent("/Stats") }))
             .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
@@ -141,6 +146,9 @@ fn is_global_path(path: &str) -> bool {
         || path == "/Config"
         || path == "/Plugins"
         || path == "/Stats"
+        || path == "/Config/"
+        || path == "/Plugins/"
+        || path == "/Stats/"
         || path.starts_with("/list/")
         || path == "/Benchmark"
         || path == "/Login"

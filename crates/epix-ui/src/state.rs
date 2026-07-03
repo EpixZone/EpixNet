@@ -1518,10 +1518,11 @@ impl AppState {
             let needed = xite.files_needed().len();
             let workers = peers.len().min(8);
             self.set_worker_stats(address, needed, workers, needed).await;
-            let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8)
-                .await
-                .map_err(|e| e.to_string())?;
+            let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await;
+            // Always clear the live task counters - a leftover tasks>0 keeps
+            // the dashboard row's "Updating" spinner stuck.
             self.set_worker_stats(address, 0, 0, 0).await;
+            let report = report.map_err(|e| e.to_string())?;
             self.add_transfer(address, report.bytes, 0).await;
             // Data files may have changed - rebuild the db view.
             self.update_content(address, xite.content).await;
