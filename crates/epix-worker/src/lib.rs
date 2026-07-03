@@ -23,6 +23,10 @@ pub struct SyncReport {
 
 const MAX_ATTEMPTS: u8 = 3;
 
+/// Per-file progress callback: `(inner_path, files_done, files_total)`, called
+/// as each file finishes downloading. Drives the wrapper's loading screen.
+pub type FileProgress = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
+
 /// Download all files in `xite.files_needed()` from `peers` concurrently.
 ///
 /// Spawns up to `max_workers` workers (capped by the peer count); each connects
@@ -34,6 +38,18 @@ pub async fn sync_files(
     transport: Arc<dyn Transport>,
     max_workers: usize,
 ) -> Result<SyncReport> {
+    sync_files_with_progress(xite, peers, transport, max_workers, None).await
+}
+
+/// [`sync_files`], reporting each finished file to `on_file` - the on-demand
+/// clone path, where a loading screen is watching.
+pub async fn sync_files_with_progress(
+    xite: &Xite,
+    peers: &[PeerAddr],
+    transport: Arc<dyn Transport>,
+    max_workers: usize,
+    on_file: Option<FileProgress>,
+) -> Result<SyncReport> {
     let needed = xite.files_needed();
     if needed.is_empty() || peers.is_empty() {
         let mut report = SyncReport::default();
@@ -41,6 +57,8 @@ pub async fn sync_files(
         return Ok(report);
     }
 
+    let total = needed.len();
+    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let queue: Arc<Mutex<VecDeque<(FileEntry, u8)>>> =
         Arc::new(Mutex::new(needed.into_iter().map(|f| (f, 0u8)).collect()));
     let report = Arc::new(Mutex::new(SyncReport::default()));
@@ -56,6 +74,8 @@ pub async fn sync_files(
         let address = address.clone();
         let storage = XiteStorage::new((*root).clone());
         let transport = transport.clone();
+        let on_file = on_file.clone();
+        let done = done.clone();
 
         handles.push(tokio::spawn(async move {
             let mut conn = match connect(transport.as_ref(), &peer).await {
@@ -69,12 +89,24 @@ pub async fn sync_files(
                 let next = { queue.lock().await.pop_front() };
                 let Some((file, attempts)) = next else { break };
 
-                match conn.get_file(&address, &file.inner_path).await {
+                let fetched = tokio::time::timeout(
+                    FILE_TIMEOUT,
+                    conn.get_file(&address, &file.inner_path),
+                )
+                .await
+                .unwrap_or_else(|_| Err(epix_core::Error::Protocol("file transfer timed out".into())));
+                match fetched {
                     Ok(bytes) if XiteStorage::hash_bytes(&bytes) == file.sha512 => {
                         if storage.write(&file.inner_path, &bytes).is_ok() {
-                            let mut r = report.lock().await;
-                            r.downloaded += 1;
-                            r.bytes += bytes.len() as u64;
+                            {
+                                let mut r = report.lock().await;
+                                r.downloaded += 1;
+                                r.bytes += bytes.len() as u64;
+                            }
+                            if let Some(cb) = &on_file {
+                                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                cb(&file.inner_path, n, total);
+                            }
                         } else {
                             requeue_or_fail(&queue, &report, file, attempts).await;
                         }
@@ -109,10 +141,21 @@ pub async fn sync_files(
     Ok(report)
 }
 
+/// Dial + handshake bounded by a deadline: an unreachable peer must not hang
+/// its worker (the OS TCP timeout is ~75s) while the rest of the queue idles.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Per-file transfer deadline: a peer that stalls mid-transfer gets requeued.
+const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn connect(transport: &dyn Transport, peer: &PeerAddr) -> Option<Connection> {
-    let mut conn = Connection::connect(transport, peer).await.ok()?;
-    conn.handshake().await.ok()?;
-    Some(conn)
+    tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut conn = Connection::connect(transport, peer).await.ok()?;
+        conn.handshake().await.ok()?;
+        Some(conn)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn requeue_or_fail(
