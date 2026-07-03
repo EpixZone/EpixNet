@@ -415,10 +415,13 @@ async fn tor_loop(
 ) {
     use epix_protocol::RequestHandler;
     state.log("INFO", "Tor: bootstrapping in-process Arti client …".to_string()).await;
+    // Surface a bootstrapping state so the browser's Tor icon can show progress.
+    state.set_tor_status(false, "Bootstrapping").await;
     let tor = match epix_tor::Tor::bootstrap(&data_dir).await {
         Ok(t) => t,
         Err(e) => {
             state.log("ERROR", format!("Tor bootstrap failed: {e}")).await;
+            state.set_tor_status(false, "Failed").await;
             return;
         }
     };

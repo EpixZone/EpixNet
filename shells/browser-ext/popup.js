@@ -1,9 +1,5 @@
-// Epix extension popup: show the current .epix site and toggle its clearnet allow.
-
-async function currentTab() {
-  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
-  return tabs[0];
-}
+// Epix extension popup: Tor status + the route-clearnet-through-Tor toggle, and
+// the current site's per-site clearnet allow.
 
 function hostOf(url) {
   try {
@@ -13,28 +9,64 @@ function hostOf(url) {
   }
 }
 
+async function currentTab() {
+  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+  return tabs[0];
+}
+
+function renderTor(status, torClearnet) {
+  const dot = document.getElementById("dot");
+  const text = document.getElementById("torText");
+  const onion = document.getElementById("onion");
+  dot.className = "dot";
+  if (status.tor_enabled) {
+    if (torClearnet) {
+      dot.classList.add("routed");
+      text.textContent = "Tor: on - clearnet routed through Tor";
+    } else {
+      dot.classList.add("ready");
+      text.textContent = "Tor: ready (clearnet direct)";
+    }
+  } else if (status.tor_status === "Bootstrapping") {
+    dot.classList.add("boot");
+    text.textContent = "Tor: connecting…";
+  } else {
+    text.textContent = "Tor: off";
+  }
+  onion.textContent = status.onion_address ? status.onion_address + ".onion" : "";
+}
+
 (async () => {
   const tab = await currentTab();
   const host = hostOf(tab && tab.url);
-  const siteEl = document.getElementById("site");
-  const box = document.getElementById("allow");
-  const note = document.getElementById("note");
+  const state = await browser.runtime.sendMessage({ type: "getState", host });
 
+  renderTor(state.status || {}, state.torClearnet);
+
+  const torBox = document.getElementById("torClearnet");
+  torBox.checked = !!state.torClearnet;
+  torBox.addEventListener("change", async () => {
+    await browser.runtime.sendMessage({ type: "setTorClearnet", on: torBox.checked });
+    const s = await browser.runtime.sendMessage({ type: "getState", host });
+    renderTor(s.status || {}, s.torClearnet);
+  });
+
+  // Per-site clearnet allow.
+  const siteEl = document.getElementById("site");
+  const allowBox = document.getElementById("allow");
+  const note = document.getElementById("note");
   if (!host.endsWith(".epix")) {
     siteEl.textContent = "Not an Epix site";
-    box.disabled = true;
+    allowBox.disabled = true;
     note.textContent = "Open a .epix site to manage its clearnet access.";
-    return;
+  } else {
+    siteEl.textContent = host;
+    allowBox.checked = !!state.allow;
+    note.textContent = "Off by default: this page can't contact the open internet.";
+    allowBox.addEventListener("change", async () => {
+      await browser.runtime.sendMessage({ type: "setAllow", host, allow: allowBox.checked });
+      const t = await currentTab();
+      if (t) browser.tabs.reload(t.id);
+    });
   }
-
-  siteEl.textContent = host;
-  const { allow } = await browser.runtime.sendMessage({ type: "getAllow", host });
-  box.checked = !!allow;
-
-  box.addEventListener("change", async () => {
-    await browser.runtime.sendMessage({ type: "setAllow", host, allow: box.checked });
-    // Reload so the new policy takes effect on the page.
-    const tab = await currentTab();
-    if (tab) browser.tabs.reload(tab.id);
-  });
 })();

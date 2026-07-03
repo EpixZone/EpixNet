@@ -1,0 +1,56 @@
+/* Epix browser chrome theme (starter).
+ *
+ * This restyles Firefox's chrome to look like Epix. It is written into the
+ * profile's chrome/ dir on first launch and NOT overwritten afterwards, so you
+ * can edit it live: change a value, restart the browser, see it. This is the
+ * CSS-only styling surface (full native rebrand is fork/unbranded-build work).
+ *
+ * Requires toolkit.legacyUserProfileCustomizations.stylesheets=true (the
+ * launcher sets it).
+ */
+
+:root {
+  --epix-bg: #0b0e14;
+  --epix-bg2: #111725;
+  --epix-fg: #cbd5e1;
+  --epix-accent: #38bdf8;
+  --epix-border: #1e293b;
+}
+
+/* Toolbar + tab strip background. */
+#navigator-toolbox {
+  background-color: var(--epix-bg) !important;
+  border-bottom: 1px solid var(--epix-border) !important;
+}
+#nav-bar,
+#TabsToolbar,
+#PersonalToolbar {
+  background-color: var(--epix-bg) !important;
+  color: var(--epix-fg) !important;
+}
+
+/* Address bar. */
+#urlbar,
+#searchbar {
+  background-color: var(--epix-bg2) !important;
+  color: var(--epix-fg) !important;
+  border: 1px solid var(--epix-border) !important;
+  border-radius: 8px !important;
+}
+#urlbar[focused="true"] {
+  border-color: var(--epix-accent) !important;
+}
+
+/* Tabs. */
+.tabbrowser-tab {
+  color: var(--epix-fg) !important;
+}
+.tab-background[selected] {
+  background-color: var(--epix-bg2) !important;
+  border-top: 2px solid var(--epix-accent) !important;
+}
+
+/* Toolbar buttons inherit the accent on hover. */
+toolbarbutton:hover {
+  fill: var(--epix-accent) !important;
+}

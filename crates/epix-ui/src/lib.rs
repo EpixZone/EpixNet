@@ -91,6 +91,7 @@ impl UiServer {
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/", get(health))
+            .route("/EpixNet-Internal/Status", get(serve_status))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
             .route("/uimedia/*path", get(serve_uimedia))
@@ -228,6 +229,28 @@ pub fn builtin_plugins() -> Vec<&'static str> {
 
 async fn health() -> &'static str {
     "Epix UI server"
+}
+
+/// `GET /EpixNet-Internal/Status` - a small JSON status the browser's native
+/// host polls to drive the Tor toolbar icon: whether the node is serving, the
+/// Tor state (`tor_enabled`/`tor_status`), and our onion address if published.
+async fn serve_status(State(ctx): State<Ctx>) -> Response {
+    let (tor_enabled, tor_status) = ctx.state.tor_status().await;
+    let onion = ctx.state.onion_address().await;
+    let body = json!({
+        "serving": true,
+        "tor_enabled": tor_enabled,
+        "tor_status": tor_status,
+        "onion_address": onion,
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "null".to_string()),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 /// `/{address}` → `/{address}/` (so a xite URL works without the trailing slash).

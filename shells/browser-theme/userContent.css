@@ -1,0 +1,13 @@
+/* Epix content-area theme (starter).
+ *
+ * Styles Firefox's built-in pages (new tab, about:blank) to match Epix, so the
+ * browser feels like one product rather than stock Firefox. Written into the
+ * profile's chrome/ dir on first launch and not overwritten afterwards - edit
+ * it live.
+ */
+
+@-moz-document url("about:blank"), url("about:newtab"), url("about:home") {
+  body {
+    background: #0b0e14 !important;
+  }
+}

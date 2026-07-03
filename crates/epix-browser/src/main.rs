@@ -133,6 +133,12 @@ async fn main() {
         }
     };
 
+    // Install the starter chrome theme (userChrome.css) - works on any edition,
+    // and is left alone once written so edits persist.
+    if let Err(e) = ext::install_theme(&profile) {
+        eprintln!("· note: could not install the theme: {e}");
+    }
+
     // Install the WebExtension (clearnet-block + CSP) and its native host.
     if ext_capable {
         if let Err(e) = ext::install_extension(&profile) {
@@ -333,6 +339,18 @@ fn write_profile(
     std::fs::write(&pac_path, pac)?;
     let pac_url = format!("file://{}", pac_path.display());
 
+    // Proxy baseline: a file PAC routing `*.epix` to the node proxy, so `.epix`
+    // works from the first request. When the extension is present it takes over
+    // via `proxy.settings` with a generated PAC (adding the live
+    // clearnet-through-Tor toggle) - a clean override, not mixed with the file
+    // PAC. `socks_remote_dns` avoids DNS leaks when Tor routing is on.
+    let proxy_prefs = format!(
+        "user_pref(\"network.proxy.type\", 2);\n\
+         user_pref(\"network.proxy.autoconfig_url\", \"{pac_url}\");\n\
+         user_pref(\"network.proxy.allow_hijacking_localhost\", true);\n\
+         user_pref(\"network.proxy.socks_remote_dns\", true);\n"
+    );
+
     let scheme = if secure { "https" } else { "http" };
     // With a trusted CA we want https; without it, http (and disable https-first
     // so Firefox doesn't upgrade the .epix navigation to a failing https).
@@ -356,10 +374,7 @@ fn write_profile(
 
     let prefs = format!(
         r#"// Managed by epix-browser - regenerated on launch.
-user_pref("network.proxy.type", 2);
-user_pref("network.proxy.autoconfig_url", "{pac_url}");
-user_pref("network.proxy.allow_hijacking_localhost", true);
-{https_prefs}// A dotted host like dashboard.epix should navigate, not search.
+{proxy_prefs}{https_prefs}// A dotted host like dashboard.epix should navigate, not search.
 user_pref("browser.fixup.dns_first_for_single_words", false);
 user_pref("keyword.enabled", false);
 user_pref("browser.urlbar.suggest.searches", false);

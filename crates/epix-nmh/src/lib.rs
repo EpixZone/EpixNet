@@ -75,6 +75,17 @@ impl Settings {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Whether the user routes clearnet (non-`.epix`) browsing through Tor.
+    pub fn tor_clearnet(&self) -> bool {
+        self.read().get("tor_clearnet").and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+
+    pub fn set_tor_clearnet(&self, on: bool) {
+        let mut v = self.read();
+        v["tor_clearnet"] = json!(on);
+        self.write(&v);
+    }
 }
 
 /// Handle one request, returning the response value. `resolve` is async (chain
@@ -83,9 +94,29 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
     let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     match cmd {
         "status" => {
-            let serving =
-                std::net::TcpStream::connect(("127.0.0.1", ui_port)).is_ok();
-            json!({ "serving": serving, "ui_port": ui_port })
+            // Fetch the node's status (Tor state + onion) over loopback; fall
+            // back to a plain connect check if it isn't answering yet.
+            let url = format!("http://127.0.0.1:{ui_port}/EpixNet-Internal/Status");
+            match reqwest::get(&url).await.and_then(|r| r.error_for_status()) {
+                Ok(resp) => match resp.json::<Value>().await {
+                    Ok(mut v) => {
+                        v["ui_port"] = json!(ui_port);
+                        v["tor_clearnet"] = json!(settings.tor_clearnet());
+                        v
+                    }
+                    Err(_) => json!({ "serving": true, "ui_port": ui_port }),
+                },
+                Err(_) => {
+                    let serving = std::net::TcpStream::connect(("127.0.0.1", ui_port)).is_ok();
+                    json!({ "serving": serving, "ui_port": ui_port })
+                }
+            }
+        }
+        "getTorClearnet" => json!({ "on": settings.tor_clearnet() }),
+        "setTorClearnet" => {
+            let on = req.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
+            settings.set_tor_clearnet(on);
+            json!({ "ok": true, "on": on })
         }
         "resolve" => {
             let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");

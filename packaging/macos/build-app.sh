@@ -27,10 +27,14 @@ NMH="$REPO_ROOT/target/release/epix-nmh"
 [ -x "$LAUNCHER" ] || { echo "missing $LAUNCHER"; exit 1; }
 [ -x "$NMH" ] || { echo "missing $NMH"; exit 1; }
 
-# Pick a Firefox to bundle: explicit override, else prefer ESR > Developer >
-# release (the launcher enables the extension only on ESR/Developer/Nightly).
+# Pick a Firefox to bundle: explicit override, a fetched ESR (fetch-firefox-esr.sh),
+# else prefer an installed ESR > Developer > release (the launcher enables the
+# extension only on ESR/Developer/Nightly).
 pick_firefox() {
   if [ -n "${EPIX_BUNDLE_FIREFOX:-}" ]; then echo "$EPIX_BUNDLE_FIREFOX"; return; fi
+  if [ -d "$REPO_ROOT/packaging/firefox-esr/Firefox.app" ]; then
+    echo "$REPO_ROOT/packaging/firefox-esr/Firefox.app"; return
+  fi
   for p in \
     "/Applications/Firefox ESR.app" \
     "/Applications/Firefox Developer Edition.app" \
@@ -82,10 +86,33 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Ad-hoc sign so the app + nested Firefox run locally. (Release: Developer ID.)
-echo "· ad-hoc codesigning"
-codesign --force --deep --sign - "$APP" 2>/dev/null || \
-  echo "  (codesign warned; the app still runs locally)"
+# Sign. With EPIX_SIGN_ID set (a Developer ID Application identity), do a real
+# hardened-runtime signature; otherwise ad-hoc so it runs locally.
+if [ -n "${EPIX_SIGN_ID:-}" ]; then
+  echo "· codesigning with Developer ID: $EPIX_SIGN_ID"
+  # Sign inner code first (nested Firefox), then the outer app, hardened runtime.
+  codesign --force --deep --options runtime --timestamp \
+    --sign "$EPIX_SIGN_ID" "$APP/Contents/Resources/firefox/"*.app 2>/dev/null || true
+  codesign --force --options runtime --timestamp \
+    --sign "$EPIX_SIGN_ID" "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser"
+  codesign --force --options runtime --timestamp --sign "$EPIX_SIGN_ID" "$APP"
+  codesign --verify --deep --strict "$APP" && echo "  signature verified"
+
+  # Notarize if a stored notarytool profile is given (see NOTES).
+  if [ -n "${EPIX_NOTARIZE_PROFILE:-}" ]; then
+    echo "· notarizing (this can take minutes)"
+    ZIP="$OUT_DIR/Epix.zip"
+    ditto -c -k --keepParent "$APP" "$ZIP"
+    xcrun notarytool submit "$ZIP" --keychain-profile "$EPIX_NOTARIZE_PROFILE" --wait
+    xcrun stapler staple "$APP"
+    rm -f "$ZIP"
+    echo "  notarized + stapled"
+  fi
+else
+  echo "· ad-hoc codesigning (set EPIX_SIGN_ID for a release signature)"
+  codesign --force --deep --sign - "$APP" 2>/dev/null || \
+    echo "  (codesign warned; the app still runs locally)"
+fi
 
 # Register with LaunchServices so epix:// links open the app.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
@@ -94,3 +121,12 @@ codesign --force --deep --sign - "$APP" 2>/dev/null || \
 echo "· done: $APP"
 echo "  run:      open \"$APP\""
 echo "  epix://:  open epix://dashboard.epix"
+
+# NOTES (release checklist):
+#  1. Bundle ESR:  packaging/fetch-firefox-esr.sh osx
+#  2. Sign:        EPIX_SIGN_ID="Developer ID Application: Your Org (TEAMID)"
+#  3. Notarize:    xcrun notarytool store-credentials epix-notary \
+#                     --apple-id you@org.com --team-id TEAMID --password <app-specific>
+#                  then EPIX_NOTARIZE_PROFILE=epix-notary
+#  Nesting Mozilla's already-signed Firefox is the thorny part: re-signing it
+#  with our Developer ID (above) is required so the outer notarization passes.
