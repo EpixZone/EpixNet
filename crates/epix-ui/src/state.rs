@@ -2711,6 +2711,7 @@ impl AppState {
         body: Option<Vec<u8>>,
         modified_hint: Option<f64>,
         sender: Option<PeerAddr>,
+        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
     ) -> Result<InboundUpdate, String> {
         // A xite may be served under aliases (raw address + `.epix` name); an
         // update applies to every key sharing the pushed canonical address.
@@ -2829,13 +2830,14 @@ impl AppState {
         let state = self.clone();
         let inner = inner_path.to_string();
         tokio::spawn(async move {
-            state.finish_inbound_update(keys, xite, sender, inner, uri).await;
+            state.finish_inbound_update(keys, xite, sender, inner, uri, diffs).await;
         });
         Ok(InboundUpdate::Applied)
     }
 
-    /// The deferred half of [`Self::apply_inbound_update`]: sync the files the
-    /// new content.json needs (preferring the sender), rebuild db views, then
+    /// The deferred half of [`Self::apply_inbound_update`]: apply any diffs the
+    /// publisher sent (patching our old file copies to skip downloads), sync the
+    /// files still needed (preferring the sender), rebuild db views, then
     /// re-publish to a few peers so the update spreads.
     async fn finish_inbound_update(
         &self,
@@ -2844,8 +2846,31 @@ impl AppState {
         sender: Option<PeerAddr>,
         inner_path: String,
         uri: String,
+        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
     ) {
         let key = keys[0].clone();
+        // Apply diffs first: patch our old copy of each changed file and keep it
+        // only if the result matches the new content.json's declared hash. A
+        // bad/mismatched diff is ignored - the file just gets downloaded below.
+        if !diffs.is_empty() {
+            let mut patched = 0;
+            for (file_path, actions) in &diffs {
+                let Some(info) = xite.file_info(file_path) else { continue };
+                if xite.storage.verify(file_path, &info.sha512) {
+                    continue; // already current
+                }
+                let Ok(old) = xite.storage.read(file_path) else { continue };
+                let Ok(new) = epix_content::patch(&old, actions) else { continue };
+                if XiteStorage::hash_bytes(&new) == info.sha512
+                    && xite.storage.write(file_path, &new).is_ok()
+                {
+                    patched += 1;
+                }
+            }
+            if patched > 0 {
+                self.log("INFO", format!("Applied {patched} diff(s) for {key}")).await;
+            }
+        }
         if let Some(transport) = self.transport.read().await.clone() {
             let mut peers = self.connectable_peers(&key, 10).await;
             if let Some(s) = sender {

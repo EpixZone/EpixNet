@@ -6,6 +6,7 @@ description = "The local UI server: serves xite files over HTTP and the EpixFram
 
 [dependencies]
 epix-core = { path = "../epix-core" }
+epix-content = { path = "../epix-content" }
 epix-xite = { path = "../epix-xite" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
@@ -50,7 +51,6 @@ benchmark = ["dep:getrandom", "dep:sha3"]
 [dev-dependencies]
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
-epix-content = { path = "../epix-content" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"

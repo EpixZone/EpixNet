@@ -78,10 +78,13 @@ impl FileService {
         });
         let modified = vget(params, "modified")
             .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)));
+        // Optional per-file diffs (`inner_path -> [actions]`); applied to skip
+        // re-downloading changed data files.
+        let diffs = parse_diffs(vget(params, "diffs"));
 
         match self
             .state
-            .apply_inbound_update(&site, &inner_path, body, modified, Some(peer.clone()))
+            .apply_inbound_update(&site, &inner_path, body, modified, Some(peer.clone()), diffs)
             .await
         {
             Ok(InboundUpdate::Applied) => {
@@ -303,6 +306,55 @@ impl RequestHandler for FileService {
             // as a response so the peer isn't left hanging).
             _ => Value::Map(vec![]),
         }
+    }
+}
+
+/// Parse an `update`'s `diffs` param (`inner_path -> [["=",n]|["-",n]|["+",[lines]]]`)
+/// into per-file diff actions. Malformed entries are skipped (the file then
+/// downloads normally).
+fn parse_diffs(v: Option<&Value>) -> std::collections::HashMap<String, Vec<epix_content::DiffAction>> {
+    let mut out = std::collections::HashMap::new();
+    let Some(Value::Map(entries)) = v else { return out };
+    for (path, actions) in entries {
+        let Some(path) = path.as_str() else { continue };
+        let Value::Array(list) = actions else { continue };
+        let mut parsed = Vec::new();
+        for action in list {
+            if let Some(a) = rmpv_to_diff_action(action) {
+                parsed.push(a);
+            } else {
+                parsed.clear();
+                break; // a malformed action invalidates the whole file's diff
+            }
+        }
+        if !parsed.is_empty() {
+            out.insert(path.to_string(), parsed);
+        }
+    }
+    out
+}
+
+/// Parse one rmpv diff action (`["=",n]` / `["-",n]` / `["+",[lines]]`).
+fn rmpv_to_diff_action(v: &Value) -> Option<epix_content::DiffAction> {
+    use epix_content::DiffAction;
+    let arr = v.as_array()?;
+    match arr.first()?.as_str()? {
+        "=" => Some(DiffAction::Equal(arr.get(1)?.as_u64()? as usize)),
+        "-" => Some(DiffAction::Remove(arr.get(1)?.as_u64()? as usize)),
+        "+" => {
+            let lines = arr
+                .get(1)?
+                .as_array()?
+                .iter()
+                .map(|l| match l {
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    Value::Binary(b) => b.clone(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            Some(DiffAction::Insert(lines))
+        }
+        _ => None,
     }
 }
 
@@ -548,6 +600,36 @@ mod tests {
             panic!("no modified_files");
         };
         assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_diffs_reads_wire_actions() {
+        // A wire diffs map with one file's action list.
+        let diffs = Value::Map(vec![(
+            Value::from("data.json"),
+            Value::Array(vec![
+                Value::Array(vec![Value::from("="), Value::from(2i64)]),
+                Value::Array(vec![Value::from("-"), Value::from(3i64)]),
+                Value::Array(vec![
+                    Value::from("+"),
+                    Value::Array(vec![Value::from("new")]),
+                ]),
+            ]),
+        )]);
+        let parsed = parse_diffs(Some(&diffs));
+        assert_eq!(parsed.len(), 1);
+        let actions = &parsed["data.json"];
+        assert_eq!(actions.len(), 3);
+        // Applies correctly against an old value.
+        let out = epix_content::patch(b"ab_old", actions).unwrap();
+        assert_eq!(out, b"abnew");
+
+        // A malformed action drops that file's diff entirely.
+        let bad = Value::Map(vec![(
+            Value::from("x"),
+            Value::Array(vec![Value::Array(vec![Value::from("?"), Value::from(1i64)])]),
+        )]);
+        assert!(parse_diffs(Some(&bad)).is_empty());
     }
 
     #[tokio::test]
