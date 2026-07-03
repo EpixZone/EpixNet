@@ -3558,6 +3558,10 @@ impl AppState {
             let _ = self.publish_to(&key, &inner_path, 3).await;
         }
         self.updates_in_flight.lock().unwrap().remove(&uri);
+        // Flash the dashboard row: a peer pushed a new version and it landed.
+        for k in &keys {
+            self.push_site_info_event(k, "updated").await;
+        }
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {

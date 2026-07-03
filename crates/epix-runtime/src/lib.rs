@@ -500,7 +500,14 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
             _ = shutdown.notified() => break,
             _ = tick.tick() => {
                 for address in state.xite_addresses().await {
-                    let _ = state.resync_xite(&address).await;
+                    // Show the check on the dashboard like EpixNet: spinner
+                    // while checking, "Updated" flash when something landed,
+                    // and a plain refresh (clears the spinner) when current.
+                    state.push_site_info_event(&address, "updating").await;
+                    match state.resync_xite(&address).await {
+                        Ok(true) => state.push_site_info_event(&address, "updated").await,
+                        _ => state.push_site_info(&address).await,
+                    }
                 }
                 // OptionalManager: keep optional files under the size cap.
                 let freed = state.enforce_optional_limit().await;
