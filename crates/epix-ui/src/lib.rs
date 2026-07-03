@@ -878,7 +878,9 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         let reply = handle_text(&ctx, &session, &text).await;
-                        if sink.send(Message::Text(reply)).await.is_err() {
+                        // An empty reply (e.g. a response to a pushed callback)
+                        // isn't sent back.
+                        if !reply.is_empty() && sink.send(Message::Text(reply)).await.is_err() {
                             break;
                         }
                     }
@@ -928,6 +930,16 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
     let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     let id = req.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
     let params = req.get("params").cloned().unwrap_or(Value::Null);
+
+    // A reply to a server-pushed confirm/prompt: resolve the waiting callback
+    // rather than dispatching it as a command. `to` is the pushed event's id.
+    if cmd == "response" {
+        if let Some(to) = req.get("to").and_then(|v| v.as_i64()) {
+            let result = req.get("result").cloned().unwrap_or(Value::Null);
+            ctx.state.resolve_callback(to, result);
+        }
+        return String::new(); // no reply to a response
+    }
 
     match ctx.registry.dispatch(session, cmd, &params, id).await {
         Ok(result) => json!({"cmd": "response", "to": id, "result": result}).to_string(),

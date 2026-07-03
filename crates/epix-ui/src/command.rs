@@ -612,6 +612,8 @@ impl WsCommand for PluginConfigSet {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         s.state.set_plugin_enabled(name, enabled).await;
+        // The plugin list changed - push updated serverInfo to the dashboard.
+        s.state.push_server_info().await;
         Ok(Value::from("ok"))
     }
 }
@@ -716,78 +718,7 @@ impl WsCommand for ServerInfo {
         "serverInfo"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        // user_settings drives the theme menu; give it theme + use_system_theme.
-        let mut user_settings = s.state.global_settings().await;
-        if let Value::Object(m) = &mut user_settings {
-            m.entry("theme").or_insert(json!("light"));
-            m.entry("use_system_theme").or_insert(json!(false));
-        }
-        let connections = s.state.connection_stats().await.total;
-        let plugins = s.state.plugins().await;
-        // Multiuser: when the feature is built, report the active identity so the
-        // wrapper UI shows the identity switcher. The desktop operator is admin.
-        #[cfg(feature = "multiuser")]
-        let (multiuser, multiuser_admin, master_address) = (
-            true,
-            true,
-            s.state.multiuser_list().await.first().cloned().unwrap_or_default(),
-        );
-        #[cfg(not(feature = "multiuser"))]
-        let (multiuser, multiuser_admin, master_address): (bool, bool, String) =
-            (false, false, String::new());
-        let language = s
-            .state
-            .config_get("language")
-            .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "en".to_string());
-        // Fileserver reachability: the external IP as a string, else false -
-        // matching EpixNet's serverInfo shape. A configured `ip_external` is a
-        // manual override and is always reported; otherwise the UPnP-detected IP
-        // is reported only when the port is actually open.
-        let (port_opened, detected_ip) = s.state.port_status().await;
-        let configured_ip = s
-            .state
-            .config_get("ip_external")
-            .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|x| !x.is_empty());
-        let ip_external = if let Some(ip) = configured_ip {
-            json!(ip)
-        } else if let (true, Some(ip)) = (port_opened, detected_ip) {
-            json!(ip)
-        } else {
-            json!(false)
-        };
-        let fileserver_port = s.state.fileserver_port().await;
-        Ok(json!({
-            "version": s.state.version,
-            "rev": 8192,
-            "platform": std::env::consts::OS,
-            "dist_type": "standalone",
-            "ip_external": ip_external,
-            "port_opened": port_opened,
-            "fileserver_ip": "127.0.0.1",
-            "fileserver_port": fileserver_port,
-            "tor_enabled": false,
-            "tor_status": "Disabled",
-            "tor_has_meek_bridges": false,
-            "tor_use_bridges": false,
-            "ui_ip": "127.0.0.1",
-            "ui_port": 43110,
-            "debug": false,
-            "offline": false,
-            "multiuser": multiuser,
-            "multiuser_admin": multiuser_admin,
-            "master_address": master_address,
-            "connections": connections,
-            "timecorrection": 0.0,
-            "lib_verify_best": "sslcrypto",
-            "plugins": plugins,
-            "plugins_rev": {},
-            "user_settings": user_settings,
-            "language": language,
-        }))
+        Ok(s.state.server_info().await)
     }
 }
 
@@ -2206,10 +2137,20 @@ impl WsCommand for CertAdd {
                 s.state.push_site_info(&address).await;
                 Ok(Value::from("ok"))
             }
-            // A different cert already exists for this domain. EpixNet prompts to
-            // confirm; until wrapper confirm events are wired we replace it and
-            // notify (the user obtained a new cert for the same provider).
+            // A different cert already exists for this domain: ask the user to
+            // confirm the change (EpixNet's confirm prompt), then replace.
             Some(false) => {
+                let ok = s
+                    .state
+                    .confirm(
+                        &address,
+                        &format!("Change your certificate to {auth_type}/{auth_user_name}@{domain}?"),
+                        "Change",
+                    )
+                    .await;
+                if !ok {
+                    return Ok(Value::from("Not changed"));
+                }
                 s.state
                     .cert_replace(&address, domain, auth_type, auth_user_name, cert)
                     .await?;

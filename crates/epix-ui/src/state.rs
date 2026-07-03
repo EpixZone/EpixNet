@@ -224,6 +224,9 @@ pub struct AppState {
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
     updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Pending wrapper callbacks (`confirm`/`prompt`): a pushed event's `to` id
+    /// maps to the oneshot awaiting the wrapper's `{cmd:"response", to}` reply.
+    callbacks: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -319,6 +322,7 @@ impl AppState {
             ip_external: RwLock::new(None),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            callbacks: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             data_root: None,
@@ -405,6 +409,7 @@ impl AppState {
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            callbacks: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             // The served-xite registry lives in the shared root (the parent of a
@@ -2342,6 +2347,153 @@ impl AppState {
     /// timeout_ms]`). Ungated - notifications reach every connection.
     pub fn push_notification(&self, kind: &str, message: &str, timeout_ms: i64) {
         self.push_event("notification", json!([kind, message, timeout_ms]), None, None);
+    }
+
+    /// Build the `serverInfo` payload (shared by the `serverInfo` command and
+    /// the `setServerInfo` push).
+    pub async fn server_info(&self) -> Value {
+        let mut user_settings = self.global_settings().await;
+        if let Value::Object(m) = &mut user_settings {
+            m.entry("theme").or_insert(json!("light"));
+            m.entry("use_system_theme").or_insert(json!(false));
+        }
+        let connections = self.connection_stats().await.total;
+        let plugins = self.plugins().await;
+        #[cfg(feature = "multiuser")]
+        let (multiuser, multiuser_admin, master_address) =
+            (true, true, self.multiuser_list().await.first().cloned().unwrap_or_default());
+        #[cfg(not(feature = "multiuser"))]
+        let (multiuser, multiuser_admin, master_address): (bool, bool, String) =
+            (false, false, String::new());
+        let language = self
+            .config_get("language")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "en".to_string());
+        let (port_opened, detected_ip) = self.port_status().await;
+        let configured_ip = self
+            .config_get("ip_external")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|x| !x.is_empty());
+        let ip_external = if let Some(ip) = configured_ip {
+            json!(ip)
+        } else if let (true, Some(ip)) = (port_opened, detected_ip) {
+            json!(ip)
+        } else {
+            json!(false)
+        };
+        let fileserver_port = self.fileserver_port().await;
+        json!({
+            "version": self.version,
+            "rev": 8192,
+            "platform": std::env::consts::OS,
+            "dist_type": "standalone",
+            "ip_external": ip_external,
+            "port_opened": port_opened,
+            "fileserver_ip": "127.0.0.1",
+            "fileserver_port": fileserver_port,
+            "tor_enabled": false,
+            "tor_status": "Disabled",
+            "tor_has_meek_bridges": false,
+            "tor_use_bridges": false,
+            "ui_ip": "127.0.0.1",
+            "ui_port": 43110,
+            "debug": false,
+            "offline": false,
+            "multiuser": multiuser,
+            "multiuser_admin": multiuser_admin,
+            "master_address": master_address,
+            "connections": connections,
+            "timecorrection": 0.0,
+            "lib_verify_best": "sslcrypto",
+            "plugins": plugins,
+            "plugins_rev": {},
+            "user_settings": user_settings,
+            "language": language,
+        })
+    }
+
+    /// Push the latest `serverInfo` (`setServerInfo`) on the `serverChanged`
+    /// channel, so the dashboard's server readouts update live (plugins,
+    /// connection counts, tor status, …).
+    pub async fn push_server_info(&self) {
+        let info = self.server_info().await;
+        self.push_event("setServerInfo", info, Some("serverChanged"), None);
+    }
+
+    /// Push a file/site progress event (`progress [inner_path, done, total]`),
+    /// so the wrapper's loading bar advances during a download.
+    pub fn push_progress(&self, address: &str, inner_path: &str, done: i64, total: i64) {
+        self.push_event(
+            "progress",
+            json!([inner_path, done, total]),
+            None,
+            Some(address.to_string()),
+        );
+    }
+
+    /// Ask the wrapper to navigate (`redirect <url>`).
+    pub fn push_redirect(&self, address: &str, url: &str) {
+        self.push_event("redirect", json!(url), None, Some(address.to_string()));
+    }
+
+    /// Inject a script into the wrapper (`injectScript <script>`).
+    pub fn push_inject_script(&self, address: &str, script: &str) {
+        self.push_event("injectScript", json!(script), None, Some(address.to_string()));
+    }
+
+    /// Push a `{cmd, params, to}` event that expects a reply, and return a
+    /// receiver for the wrapper's answer (delivered as `{cmd:"response", to}`).
+    /// Used by `confirm`/`prompt`.
+    fn push_cmd_await(
+        &self,
+        cmd: &str,
+        params: Value,
+        target: Option<String>,
+    ) -> tokio::sync::oneshot::Receiver<Value> {
+        let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.callbacks.lock().unwrap().insert(id, tx);
+        let payload = json!({ "cmd": cmd, "params": params, "to": id }).to_string();
+        let _ = self.events.send(UiEvent { channel: None, target, payload });
+        rx
+    }
+
+    /// Resolve a pending wrapper callback (`{cmd:"response", to}`). Returns true
+    /// if a callback was waiting on `to`.
+    pub fn resolve_callback(&self, to: i64, result: Value) -> bool {
+        if let Some(tx) = self.callbacks.lock().unwrap().remove(&to) {
+            let _ = tx.send(result);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ask the wrapper to confirm (`confirm [body, button_title]`); resolves to
+    /// the user's choice. Times out to `false` if no wrapper answers.
+    pub async fn confirm(&self, address: &str, body: &str, button_title: &str) -> bool {
+        let rx = self.push_cmd_await(
+            "confirm",
+            json!([body, button_title]),
+            Some(address.to_string()),
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(v)) => v.as_bool().unwrap_or(!v.is_null()),
+            _ => false,
+        }
+    }
+
+    /// Ask the wrapper to prompt for input (`prompt [body, type]`); resolves to
+    /// the entered string, or None on timeout/cancel.
+    pub async fn prompt(&self, address: &str, body: &str, input_type: &str) -> Option<String> {
+        let rx =
+            self.push_cmd_await("prompt", json!([body, input_type]), Some(address.to_string()));
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(Value::String(s))) => Some(s),
+            _ => None,
+        }
     }
 
     /// Enforce chart-db retention (drop old datapoints, reclaim space). Called
@@ -4391,5 +4543,47 @@ mod tests {
         s.add_xite("dashboard.epix", XiteEntry { storage: store(), content: Some(content) }).await;
         assert!(s.site_has_admin("epix1dash").await);
         assert!(s.site_has_admin("dashboard.epix").await);
+    }
+
+    #[tokio::test]
+    async fn confirm_resolves_via_wrapper_callback() {
+        let s = AppState::new("test");
+        let mut events = s.subscribe_events();
+
+        // Server asks the wrapper to confirm; the future is pending.
+        let s2 = s.clone();
+        let handle = tokio::spawn(async move { s2.confirm("talk.epix", "Sure?", "Yes").await });
+
+        // The pushed confirm event carries a `to` id we reply to.
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "confirm");
+        let to = payload["to"].as_i64().unwrap();
+        assert!(s.resolve_callback(to, json!(true)));
+
+        // confirm() now resolves to the wrapper's answer.
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(answer, "confirm resolves true when the wrapper accepts");
+
+        // An unknown callback id resolves nothing.
+        assert!(!s.resolve_callback(999999, json!(true)));
+    }
+
+    #[tokio::test]
+    async fn server_info_push_targets_server_changed() {
+        let s = AppState::new("test");
+        let mut events = s.subscribe_events();
+        s.push_server_info().await;
+        let ev = events.try_recv().unwrap();
+        assert_eq!(ev.channel.as_deref(), Some("serverChanged"));
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "setServerInfo");
+        assert!(payload["params"]["version"].is_string());
     }
 }
