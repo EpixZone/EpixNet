@@ -5,7 +5,7 @@
     <style>
       body {
         font: 13px -apple-system, system-ui, sans-serif;
-        width: 260px;
+        width: 280px;
         margin: 0;
         padding: 14px;
         background: #0b0e14;
@@ -13,40 +13,66 @@
       }
       h1 {
         font-size: 14px;
-        margin: 0 0 10px;
+        margin: 0 0 12px;
         color: #38bdf8;
       }
-      .site {
-        font-weight: 600;
+      .tor {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #64748b;
+      }
+      .dot.ready { background: #a78bfa; }
+      .dot.routed { background: #4ade80; }
+      .dot.boot { background: #f5c450; }
+      .onion {
+        font-size: 11px;
+        opacity: 0.7;
         word-break: break-all;
-        margin-bottom: 12px;
+        margin: 2px 0 12px;
       }
       .row {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
+        padding: 8px 0;
+        border-top: 1px solid #1e293b;
       }
-      .muted {
-        opacity: 0.65;
-        font-size: 12px;
-        margin-top: 10px;
-      }
-      label {
-        cursor: pointer;
-      }
+      label { cursor: pointer; }
+      .muted { opacity: 0.6; font-size: 11px; margin-top: 4px; }
+      .site { font-weight: 600; word-break: break-all; }
     </style>
   </head>
   <body>
     <h1>Epix</h1>
-    <div class="site" id="site">-</div>
+
+    <div class="tor">
+      <span class="dot" id="dot"></span>
+      <span id="torText">Tor: …</span>
+    </div>
+    <div class="onion" id="onion"></div>
+
     <div class="row">
-      <label for="allow">Allow this site to reach clearnet</label>
-      <input type="checkbox" id="allow" />
+      <label for="torClearnet">Route clearnet through Tor</label>
+      <input type="checkbox" id="torClearnet" />
     </div>
-    <div class="muted" id="note">
-      Off by default: <code>.epix</code> pages can't contact the open internet.
+
+    <div class="row" style="flex-direction: column; align-items: stretch">
+      <div class="site" id="site">-</div>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px">
+        <label for="allow">Allow this site to reach clearnet</label>
+        <input type="checkbox" id="allow" />
+      </div>
+      <div class="muted" id="note"></div>
     </div>
+
     <script src="popup.js"></script>
   </body>
 </html>

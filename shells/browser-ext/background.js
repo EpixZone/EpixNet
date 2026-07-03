@@ -1,29 +1,31 @@
 // Epix browser extension - background script.
 //
-// Enforces the xite security contract in the browser:
-//   1. Clearnet block - a page on a `.epix` origin may not make requests to
-//      clearnet (tracking / deanonymization), unless the user has allowed that
-//      site. This is the EpixNet #15 rule, browser-side.
-//   2. CSP reinforcement - make sure a `.epix` document response carries a
-//      Content-Security-Policy (the node sets one; this is belt-and-suspenders
-//      so a proxy hiccup can't drop it).
-// Per-site "allow clearnet" is stored in extension storage and mirrored to the
-// native host so the node/launcher share the setting.
+// Three jobs:
+//   1. Proxy routing (B5): `.epix` hosts go to the node's browser proxy (https);
+//      clearnet goes DIRECT, or through the node's Tor SOCKS listener when the
+//      user turns on "route clearnet through Tor".
+//   2. Clearnet block (EpixNet #15): a `.epix` page may not reach clearnet
+//      unless the user allowed that site.
+//   3. Tor status icon: poll the node (via the native host) and reflect the Tor
+//      state in the toolbar icon, like Brave's Tor indicator.
 
 const NATIVE_HOST = "zone.epix.nmh";
+const PROXY_PORT = 43112; // node browser proxy (TLS-terminates .epix)
+const SOCKS_PORT = 43111; // node Tor SOCKS listener
 
-// In-memory allowlist of `.epix` hosts permitted to reach clearnet.
-let allowed = new Set();
+// State kept in memory, synced from storage / the native host.
+let allowed = new Set(); // .epix sites permitted to reach clearnet
+let torClearnet = false; // route clearnet browsing through Tor
 
-// Load the allowlist from storage at startup and keep it in sync.
-browser.storage.local.get("clearnetAllow").then((data) => {
-  const list = (data && data.clearnetAllow) || [];
-  allowed = new Set(list);
+browser.storage.local.get(["clearnetAllow", "torClearnet"]).then((data) => {
+  allowed = new Set((data && data.clearnetAllow) || []);
+  torClearnet = !!(data && data.torClearnet);
+  applyProxy(); // take over routing from the launcher's file PAC
 });
 browser.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.clearnetAllow) {
-    allowed = new Set(changes.clearnetAllow.newValue || []);
-  }
+  if (area !== "local") return;
+  if (changes.clearnetAllow) allowed = new Set(changes.clearnetAllow.newValue || []);
+  if (changes.torClearnet) torClearnet = !!changes.torClearnet.newValue;
 });
 
 function hostOf(url) {
@@ -33,24 +35,32 @@ function hostOf(url) {
     return "";
   }
 }
+const isEpix = (h) => h.endsWith(".epix");
+const isLocal = (h) => h === "127.0.0.1" || h === "localhost" || h === "[::1]";
 
-function isEpix(host) {
-  return host.endsWith(".epix");
+// 1. Proxy routing, via the proxy.settings API with a generated PAC. `.epix`
+// always goes to the node's browser proxy; clearnet goes DIRECT, or through the
+// node's Tor SOCKS listener when the user turns it on. Regenerated live when
+// the toggle changes (a clean override of the launcher's file PAC).
+function applyProxy() {
+  const clearnet = torClearnet
+    ? `return "SOCKS5 127.0.0.1:${SOCKS_PORT}";`
+    : `return "DIRECT";`;
+  const pac =
+    `function FindProxyForURL(url, host) {` +
+    `if (shExpMatch(host, "*.epix")) return "PROXY 127.0.0.1:${PROXY_PORT}";` +
+    `if (host === "127.0.0.1" || host === "localhost") return "DIRECT";` +
+    `${clearnet}}`;
+  const dataUrl = "data:application/x-ns-proxy-autoconfig," + encodeURIComponent(pac);
+  browser.proxy.settings.set({ value: { proxyType: "autoConfig", autoConfigUrl: dataUrl } });
 }
 
-function isLocal(host) {
-  return host === "127.0.0.1" || host === "localhost" || host === "[::1]";
-}
-
-// 1. Clearnet block.
+// 2. Clearnet block.
 browser.webRequest.onBeforeRequest.addListener(
   (details) => {
     const originHost = hostOf(details.originUrl || details.documentUrl || "");
-    // Only police requests made by a `.epix` page.
     if (!isEpix(originHost)) return {};
-
     const url = details.url || "";
-    // Non-network schemes are always fine.
     if (
       url.startsWith("data:") ||
       url.startsWith("blob:") ||
@@ -60,10 +70,7 @@ browser.webRequest.onBeforeRequest.addListener(
       return {};
     }
     const targetHost = hostOf(url);
-    // Same-network (other `.epix`) and loopback (the node) are allowed.
     if (isEpix(targetHost) || isLocal(targetHost)) return {};
-
-    // A clearnet request from a `.epix` page: block unless the site is allowed.
     if (allowed.has(originHost)) return {};
     console.warn(`Epix: blocked clearnet request from ${originHost} -> ${url}`);
     return { cancel: true };
@@ -72,20 +79,14 @@ browser.webRequest.onBeforeRequest.addListener(
   ["blocking"]
 );
 
-// 2. CSP reinforcement on `.epix` documents (only add if missing, so we never
-// weaken or fight the node's own wrapper/sandbox CSP).
+// CSP reinforcement on .epix documents (only add if missing).
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
-    const host = hostOf(details.url);
-    if (!isEpix(host)) return {};
+    if (!isEpix(hostOf(details.url))) return {};
     const headers = details.responseHeaders || [];
-    const hasCsp = headers.some(
-      (h) => h.name.toLowerCase() === "content-security-policy"
-    );
-    if (!hasCsp) {
+    if (!headers.some((h) => h.name.toLowerCase() === "content-security-policy")) {
       headers.push({
         name: "Content-Security-Policy",
-        // Allow self + the wrapper runtime + the local node's WS; no clearnet.
         value:
           "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'",
       });
@@ -97,27 +98,71 @@ browser.webRequest.onHeadersReceived.addListener(
   ["blocking", "responseHeaders"]
 );
 
-// Popup <-> background messaging: get/set the current site's clearnet allow.
+// 3. Tor status icon.
+let lastStatus = { tor_status: "Unknown" };
+
+function iconFor(status) {
+  // Ready + routing clearnet through Tor -> green; ready -> purple;
+  // bootstrapping -> amber; otherwise off/gray.
+  if (status.tor_enabled) return torClearnet ? "icons/tor-routed.png" : "icons/tor-ready.png";
+  if (status.tor_status === "Bootstrapping") return "icons/tor-boot.png";
+  return "icons/tor-off.png";
+}
+
+function titleFor(status) {
+  if (status.tor_enabled) {
+    return torClearnet
+      ? "Tor: on - clearnet routed through Tor"
+      : "Tor: ready (clearnet direct)";
+  }
+  if (status.tor_status === "Bootstrapping") return "Tor: connecting…";
+  return "Tor: off";
+}
+
+async function pollStatus() {
+  try {
+    lastStatus = await browser.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "status" });
+  } catch (e) {
+    lastStatus = { tor_status: "Unknown" };
+  }
+  browser.browserAction.setIcon({ path: { 32: iconFor(lastStatus) } });
+  browser.browserAction.setTitle({ title: titleFor(lastStatus) });
+}
+setInterval(pollStatus, 5000);
+pollStatus();
+
+// Popup <-> background messaging.
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === "getAllow") {
-    sendResponse({ allow: allowed.has(msg.host) });
+  if (msg.type === "getState") {
+    sendResponse({
+      status: lastStatus,
+      torClearnet,
+      allow: msg.host ? allowed.has(msg.host) : false,
+    });
     return false;
   }
   if (msg.type === "setAllow") {
     if (msg.allow) allowed.add(msg.host);
     else allowed.delete(msg.host);
-    const list = Array.from(allowed);
-    browser.storage.local.set({ clearnetAllow: list });
-    // Mirror to the native host (best effort - it persists for the node).
+    browser.storage.local.set({ clearnetAllow: Array.from(allowed) });
     try {
       browser.runtime.sendNativeMessage(NATIVE_HOST, {
         cmd: "setClearnetAllow",
         site: msg.host,
         allow: msg.allow,
       });
-    } catch (e) {
-      /* native host optional */
-    }
+    } catch (e) {}
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg.type === "setTorClearnet") {
+    torClearnet = !!msg.on;
+    browser.storage.local.set({ torClearnet });
+    applyProxy(); // reroute clearnet live
+    try {
+      browser.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "setTorClearnet", on: torClearnet });
+    } catch (e) {}
+    pollStatus(); // refresh the icon immediately
     sendResponse({ ok: true });
     return false;
   }

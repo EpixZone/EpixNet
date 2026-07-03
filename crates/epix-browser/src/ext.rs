@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 /// The extension files, embedded at build time.
 static EXT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-ext");
 
+/// The starter chrome theme, embedded at build time.
+static THEME: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-theme");
+
 /// The extension id (must match `manifest.json`'s gecko id).
 pub const EXT_ID: &str = "browser-ext@epix.zone";
 /// The native-messaging host name (must match `background.js`).
@@ -52,6 +55,22 @@ fn write_dir_to_zip(
         let name = sub.path().file_name().unwrap().to_string_lossy();
         let p = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
         write_dir_to_zip(zip, sub, &p, opts)?;
+    }
+    Ok(())
+}
+
+/// Install the starter chrome theme into `<profile>/chrome/`, but only files
+/// that don't exist yet - so a user's edits to userChrome.css survive relaunch.
+pub fn install_theme(profile: &Path) -> Result<(), String> {
+    let chrome = profile.join("chrome");
+    std::fs::create_dir_all(&chrome).map_err(|e| format!("chrome dir: {e}"))?;
+    for file in THEME.files() {
+        let name = file.path().file_name().unwrap();
+        let dest = chrome.join(name);
+        if !dest.exists() {
+            std::fs::write(&dest, file.contents())
+                .map_err(|e| format!("write {}: {e}", dest.display()))?;
+        }
     }
     Ok(())
 }
