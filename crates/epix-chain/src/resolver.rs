@@ -21,10 +21,7 @@ pub struct XidResolver {
 
 impl XidResolver {
     pub fn new(rpc_url: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .expect("reqwest client");
+        let client = crate::http_client(Duration::from_secs(15));
         Self {
             client,
             rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
