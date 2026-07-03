@@ -1,0 +1,22 @@
+[package]
+name = "epix-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Epix desktop shell: a Tauri window over the embedded node, with epix:// deep-link handling and a tray."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The embedded engine: one code path with the server binary and the mobile FFI.
+epix-node = { path = "../../../crates/epix-node" }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde_json = "1"
+
+[features]
+# Tor is on by default (in-process Arti in the embedded node).
+default = ["tor"]
+tor = ["epix-node/tor"]

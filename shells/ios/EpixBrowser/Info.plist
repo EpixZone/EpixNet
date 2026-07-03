@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Epix</string>
+    <key>CFBundleIdentifier</key>
+    <string>zone.epix.browser</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <!-- Register epix:// so tapped links open this app. -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>zone.epix.browser</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>epix</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- The embedded node serves on loopback; allow the local HTTP origin. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+
+    <!-- BLE mesh (Reticulum). -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Epix uses Bluetooth to sync sites over the mesh when offline.</string>
+</dict>
+</plist>
