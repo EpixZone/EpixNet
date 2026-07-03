@@ -379,14 +379,21 @@ async fn serve_wrapper(
     // WebSocket via siteInfo.
     let permissions = ctx.state.site_permissions(&address).await;
 
-    // In transparent-proxy (host) mode the page lives at the host root, so
-    // wrapper URLs are host-relative (`/index.html`) not path-prefixed. In path
-    // mode keep the segment the browser navigated with (name or address); the
-    // file route translates names the same way this one does.
+    // The corner home button returns to the node's homepage (the launch xite,
+    // e.g. dashboard.epix), not the xite being viewed. In transparent-proxy
+    // (host) mode a named homepage links as a host (`//dashboard.epix`) so the
+    // browser lands on its clean origin; an address links by path, which the
+    // proxy rewrite routes as-is. File URLs stay relative to the current xite.
+    let node_home = ctx.state.homepage().await.unwrap_or_else(|| requested.clone());
     let (homepage, file_url) = if proxy_mode {
-        (String::new(), "/index.html".to_string())
+        let home = if node_home.contains('.') {
+            format!("//{node_home}")
+        } else {
+            format!("/{node_home}")
+        };
+        (home, "/index.html".to_string())
     } else {
-        (format!("/{requested}"), format!("/{requested}/index.html"))
+        (format!("/{node_home}"), format!("/{requested}/index.html"))
     };
 
     // wrapper_key == the bech32 address for this single-user local node, so

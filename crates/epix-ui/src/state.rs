@@ -266,6 +266,9 @@ pub struct AppState {
     /// Hosts allowed as WebSocket `Origin`s (a wrapper's Host is added when
     /// served), so a cross-origin page can't drive the local WS API.
     allowed_ws_origins: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The launch xite (name or address) the node was started with - where the
+    /// wrapper's corner home button and the admin pages' back link return to.
+    launch_homepage: std::sync::Mutex<Option<String>>,
     /// The shared data root (holds `sites.json` + per-xite subdirectories), so
     /// the served-xite list can be restored on the next start. None for
     /// in-memory nodes.
@@ -383,6 +386,7 @@ impl AppState {
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
+            launch_homepage: std::sync::Mutex::new(None),
             data_root: None,
             sites_path: None,
             #[cfg(feature = "multiuser")]
@@ -476,6 +480,7 @@ impl AppState {
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
+            launch_homepage: std::sync::Mutex::new(None),
             // The served-xite registry lives in the shared root (the parent of a
             // per-xite dir), so it spans every xite that shares this root.
             data_root: Some(data_root.clone()),
@@ -1380,11 +1385,19 @@ impl AppState {
             .unwrap_or_else(|| "INFO".to_string())
     }
 
-    /// The node's homepage xite - where the standalone admin pages' "back"
-    /// button returns to. Prefers a human-readable name (e.g. `dashboard.epix`,
-    /// display metadata or a legacy alias key) for the URL, else the first
-    /// served xite's address.
+    /// Record the launch xite (name or address) as the node's homepage - where
+    /// the wrapper's corner home button and the admin pages' back link go.
+    pub fn set_homepage(&self, target: &str) {
+        *self.launch_homepage.lock().unwrap() = Some(target.to_string());
+    }
+
+    /// The node's homepage xite: the launch target if recorded, else a served
+    /// xite's human-readable name (display metadata or a legacy alias key),
+    /// else the first served xite's address.
     pub async fn homepage(&self) -> Option<String> {
+        if let Some(home) = self.launch_homepage.lock().unwrap().clone() {
+            return Some(home);
+        }
         let xites = self.xites.read().await;
         xites
             .values()
