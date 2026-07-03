@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Epix</title>
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #0b0e14;
+        color: #cbd5e1;
+        font: 15px/1.5 -apple-system, system-ui, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .box { text-align: center; }
+      .spinner {
+        width: 34px; height: 34px; margin: 0 auto 16px;
+        border: 3px solid #1e293b; border-top-color: #38bdf8;
+        border-radius: 50%; animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      #err { color: #f87171; margin-top: 12px; max-width: 480px; }
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <div class="spinner"></div>
+      <div>Starting Epix and connecting to the network…</div>
+      <div id="err"></div>
+    </div>
+    <script>
+      // The Rust side navigates this window to the local node once serving.
+      // Surface a boot error if one is emitted.
+      if (window.__TAURI__) {
+        window.__TAURI__.event.listen("epix://error", (e) => {
+          document.getElementById("err").textContent =
+            "Could not start: " + e.payload;
+        });
+      }
+    </script>
+  </body>
+</html>

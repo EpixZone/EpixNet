@@ -1,0 +1,30 @@
+[package]
+name = "epix-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "UniFFI bindings exposing the Epix node to Kotlin (Android) and Swift (iOS). The mobile shells embed this in-process."
+
+[lib]
+# cdylib for the phones to load; staticlib for the iOS link; rlib for tests.
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "epix_ffi"
+
+# The bindings generator, only built with `--features cli` (needs uniffi/cli).
+[[bin]]
+name = "uniffi-bindgen"
+required-features = ["cli"]
+
+[dependencies]
+epix-node = { path = "../epix-node", default-features = false }
+epix-chain = { path = "../epix-chain" }
+uniffi = { version = "0.28", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+thiserror = "1"
+
+[features]
+default = ["tor"]
+tor = ["epix-node/tor"]
+# Generate the `uniffi-bindgen` CLI entry point (used by the mobile build
+# scripts to emit Kotlin/Swift). Kept behind a feature so the library builds
+# without pulling the CLI into every consumer.
+cli = ["uniffi/cli"]

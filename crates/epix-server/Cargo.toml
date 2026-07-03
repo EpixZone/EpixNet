@@ -5,18 +5,9 @@ edition = "2021"
 description = "Runnable Epix node: clones a xite from the network and serves it in a browser."
 
 [dependencies]
-epix-core = { path = "../epix-core" }
-epix-transport = { path = "../epix-transport" }
-epix-protocol = { path = "../epix-protocol" }
-epix-xite = { path = "../epix-xite" }
-epix-worker = { path = "../epix-worker" }
+epix-node = { path = "../epix-node", default-features = false }
 epix-ui = { path = "../epix-ui" }
-epix-chain = { path = "../epix-chain" }
-epix-plugin = { path = "../epix-plugin" }
-epix-plugins = { path = "../epix-plugins" }
-epix-runtime = { path = "../epix-runtime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -28,5 +19,7 @@ tempfile = "3"
 # Desktop bundles the auth/login plugins that a mobile build leaves off (the
 # phone UI is already local to the device). Build a mobile node with
 # `--no-default-features`.
-default = ["desktop"]
+default = ["desktop", "tor"]
 desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
+# In-process Tor (Arti): onion dialing + hosting + SOCKS listener for the shell.
+tor = ["epix-node/tor"]

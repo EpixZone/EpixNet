@@ -14,6 +14,7 @@ epix-protocol = { path = "../epix-protocol" }
 epix-dht = { path = "../epix-dht" }
 epix-dht-net = { path = "../epix-dht-net" }
 epix-propagation = { path = "../epix-propagation" }
+epix-tor = { path = "../epix-tor", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 async-trait = "0.1"
 rmpv = "1"
@@ -28,6 +29,9 @@ local-discovery = []
 # mapping so the fileserver port is reachable through a home router. Off on
 # mobile, which should not accept inbound connections or poke router ports.
 inbound-seeding = ["dep:igd-next"]
+# In-process Tor (Arti): dial .onion peers, host an onion service for inbound,
+# and a local SOCKS listener for the browser shells. On all platforms.
+tor = ["dep:epix-tor"]
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }

@@ -91,6 +91,7 @@ async fn runtime_resyncs_a_published_update() {
             connection_interval: Duration::from_secs(3600),
             fileserver_port: None,
             offline: false,
+            ..Default::default()
         },
     );
     runtime.start();
