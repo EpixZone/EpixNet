@@ -1,6 +1,7 @@
 //! `epix-xite` - xite lifecycle: storage, content.json, and peer announcing.
 
 pub mod announcer;
+pub mod hashfield;
 pub mod settings;
 pub mod piecefield;
 pub mod piecemap;
@@ -8,6 +9,7 @@ pub mod xite;
 pub mod storage;
 
 pub use announcer::announce;
+pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, XiteSettings};
 pub use piecefield::Piecefield;
 pub use piecemap::parse_piecemap;

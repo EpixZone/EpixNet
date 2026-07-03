@@ -167,6 +167,90 @@ impl FileService {
         vmap(vec![("modified_files", Value::Map(pairs))])
     }
 
+    /// `getHashfield {site}` - report which optional files we hold, as a packed
+    /// hash-id array, so a peer knows what optional content to request from us.
+    async fn get_hashfield(&self, params: &Value) -> Value {
+        let site = vget_str(params, "site").unwrap_or_default();
+        match self.state.hashfield_bytes(&site).await {
+            Some(bytes) => vmap(vec![("hashfield_raw", Value::Binary(bytes))]),
+            None => vmap(vec![("error", Value::from("Unknown site"))]),
+        }
+    }
+
+    /// `setHashfield {site, hashfield_raw}` - a peer telling us which optional
+    /// files it holds; stored so `findHashIds` can route downloaders to it.
+    async fn set_hashfield(&self, peer: &PeerAddr, params: &Value) -> Value {
+        let site = vget_str(params, "site").unwrap_or_default();
+        let raw = match vget(params, "hashfield_raw") {
+            Some(Value::Binary(b)) => b.clone(),
+            Some(Value::String(s)) => s.as_bytes().to_vec(),
+            _ => return vmap(vec![("error", Value::from("Missing hashfield_raw"))]),
+        };
+        if self.state.set_peer_hashfield(&site, peer, &raw).await {
+            vmap(vec![("ok", Value::from("Updated"))])
+        } else {
+            vmap(vec![("error", Value::from("Unknown site"))])
+        }
+    }
+
+    /// `findHashIds {site, hash_ids}` - for each optional-file hash id, which
+    /// peers we know hold it (packed, bucketed by ip type), plus which we hold
+    /// ourselves (`my`). Lets a downloader locate a rare optional file.
+    async fn find_hash_ids(&self, params: &Value) -> Value {
+        let site = vget_str(params, "site").unwrap_or_default();
+        if !self.state.has_any_alias(&site).await {
+            return vmap(vec![("error", Value::from("Unknown site"))]);
+        }
+        let hash_ids: Vec<u16> = match vget(params, "hash_ids") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .filter(|n| (0..=u16::MAX as i64).contains(n))
+                .map(|n| n as u16)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let (v4, v6, onion, mine) = self.state.find_hash_ids(&site, &hash_ids).await;
+        // Pack each bucket as {hash_id: [binary addr]}.
+        let bucket = |m: std::collections::HashMap<u16, Vec<Vec<u8>>>| -> Value {
+            Value::Map(
+                m.into_iter()
+                    .map(|(id, addrs)| {
+                        (
+                            Value::from(id as i64),
+                            Value::Array(addrs.into_iter().map(Value::Binary).collect()),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        vmap(vec![
+            ("peers", bucket(v4)),
+            ("peers_ipv6", bucket(v6)),
+            ("peers_onion", bucket(onion)),
+            ("my", Value::Array(mine.into_iter().map(|id| Value::from(id as i64)).collect())),
+        ])
+    }
+
+    /// `pushFile {site, inner_path, body}` - a peer pushing an optional file
+    /// directly. Verified (size + sha512) against content.json before writing.
+    async fn push_file(&self, params: &Value) -> Value {
+        let site = vget_str(params, "site").unwrap_or_default();
+        let inner_path = vget_str(params, "inner_path").unwrap_or_default();
+        let body = match vget(params, "body") {
+            Some(Value::Binary(b)) => b.clone(),
+            Some(Value::String(s)) => s.as_bytes().to_vec(),
+            _ => return vmap(vec![("error", Value::from("Missing params"))]),
+        };
+        if inner_path.is_empty() || body.is_empty() {
+            return vmap(vec![("error", Value::from("Missing params"))]);
+        }
+        match self.state.apply_push_file(&site, &inner_path, &body).await {
+            Ok(msg) => vmap(vec![("ok", Value::from(msg))]),
+            Err(e) => vmap(vec![("error", Value::from(e))]),
+        }
+    }
+
     /// `checkport {port}` - the peer asks us to test whether its fileserver
     /// port is reachable from our side (so it can tell if it's behind a
     /// closed NAT). We dial back the requester's IP at `port`.
@@ -207,6 +291,10 @@ impl RequestHandler for FileService {
             "pex" => self.pex(peer, params).await,
             "listModified" => self.list_modified(params).await,
             "checkport" => self.checkport(peer, params).await,
+            "getHashfield" => self.get_hashfield(params).await,
+            "setHashfield" => self.set_hashfield(peer, params).await,
+            "findHashIds" => self.find_hash_ids(params).await,
+            "pushFile" => self.push_file(params).await,
             "getPiecefields" => self.get_piecefields(params).await,
             // A peer pushing us its piecefields: acknowledge (our downloader
             // re-queries piecefields when it needs them, so we don't retain).
@@ -460,6 +548,90 @@ mod tests {
             panic!("no modified_files");
         };
         assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hashfield_and_pushfile_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let optional_body = b"optional data";
+        let sha = XiteStorage::hash_bytes(optional_body);
+        let content = json!({
+            "address": "1Opt",
+            "modified": 1,
+            "files": {},
+            "files_optional": { "big.dat": { "size": optional_body.len(), "sha512": sha } },
+        });
+        let state = AppState::new("test");
+        state.add_xite("1Opt", XiteEntry { storage, content: Some(content) }).await;
+        let svc = FileService::new(state.clone());
+        let peer = PeerAddr::parse("8.8.8.8:15441").unwrap();
+
+        // We don't hold the optional file yet -> empty hashfield.
+        let resp = svc.handle(&peer, "getHashfield", &vmap(vec![("site", Value::from("1Opt"))])).await;
+        assert_eq!(vget(&resp, "hashfield_raw"), Some(&Value::Binary(vec![])));
+
+        // A peer pushes the optional file; verified + written + advertised.
+        let params = vmap(vec![
+            ("site", Value::from("1Opt")),
+            ("inner_path", Value::from("big.dat")),
+            ("body", Value::Binary(optional_body.to_vec())),
+        ]);
+        let resp = svc.handle(&peer, "pushFile", &params).await;
+        assert_eq!(vget_str(&resp, "ok").as_deref(), Some("File pushed"));
+        assert_eq!(state.read_file("1Opt", "big.dat").await.as_deref(), Some(&optional_body[..]));
+
+        // Now our hashfield advertises it (hash id of the file's sha512).
+        let resp = svc.handle(&peer, "getHashfield", &vmap(vec![("site", Value::from("1Opt"))])).await;
+        let expected = epix_xite::Hashfield::hash_id(&sha).unwrap().to_le_bytes().to_vec();
+        assert_eq!(vget(&resp, "hashfield_raw"), Some(&Value::Binary(expected)));
+
+        // A tampered push (wrong bytes for the declared hash) is rejected.
+        let params = vmap(vec![
+            ("site", Value::from("1Opt")),
+            ("inner_path", Value::from("big.dat")),
+            ("body", Value::Binary(b"tampered data!".to_vec())),
+        ]);
+        let resp = svc.handle(&peer, "pushFile", &params).await;
+        assert!(vget_str(&resp, "error").is_some());
+    }
+
+    #[tokio::test]
+    async fn set_and_find_hash_ids_locates_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let state = AppState::new("test");
+        state
+            .add_xite("1Find", XiteEntry { storage, content: Some(json!({ "address": "1Find" })) })
+            .await;
+        let svc = FileService::new(state.clone());
+
+        // A peer advertises holding hash id 0x1234.
+        let holder = PeerAddr::parse("8.8.8.8:15441").unwrap();
+        let mut hf = epix_xite::Hashfield::new();
+        hf.add_id(0x1234);
+        let params = vmap(vec![
+            ("site", Value::from("1Find")),
+            ("hashfield_raw", Value::Binary(hf.to_bytes())),
+        ]);
+        let resp = svc.handle(&holder, "setHashfield", &params).await;
+        assert_eq!(vget_str(&resp, "ok").as_deref(), Some("Updated"));
+
+        // findHashIds returns that peer for 0x1234 in the ipv4 bucket.
+        let params = vmap(vec![
+            ("site", Value::from("1Find")),
+            ("hash_ids", Value::Array(vec![Value::from(0x1234i64), Value::from(0x9999i64)])),
+        ]);
+        let resp = svc.handle(&holder, "findHashIds", &params).await;
+        let Some(Value::Map(v4)) = vget(&resp, "peers").cloned() else { panic!("no peers") };
+        // One entry keyed by hash id 0x1234, containing the packed holder.
+        assert_eq!(v4.len(), 1);
+        let (id, addrs) = &v4[0];
+        assert_eq!(id.as_i64(), Some(0x1234));
+        let Value::Array(addrs) = addrs else { panic!() };
+        assert_eq!(addrs.len(), 1);
+        let Value::Binary(packed) = &addrs[0] else { panic!() };
+        assert_eq!(PeerAddr::unpack_ip(packed).unwrap(), holder);
     }
 
     #[tokio::test]

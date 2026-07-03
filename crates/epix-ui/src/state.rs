@@ -141,6 +141,13 @@ struct ManagedXite {
     workers: usize,
     /// Optional files the user pinned (kept even when clearing space).
     pinned: std::collections::HashSet<String>,
+    /// Which optional-file hash ids we hold (`getHashfield`), maintained as
+    /// optional files are downloaded/pushed/deleted.
+    hashfield: epix_xite::Hashfield,
+    /// Optional-file hash ids each known peer advertises (`setHashfield`), so
+    /// `findHashIds` can point a downloader at peers holding a rare file.
+    /// Keyed by peer address string.
+    peer_hashfields: HashMap<String, epix_xite::Hashfield>,
 }
 
 /// Server-wide state shared across all HTTP/WebSocket handlers.
@@ -674,6 +681,9 @@ impl AppState {
         }
         // Restore optional-file pins persisted by OptionalManager.
         let pinned = self.load_persisted_pins(&canonical);
+        // Seed the optional-file hashfield from what's already on disk, so we
+        // advertise held optional files immediately (getHashfield/findHashIds).
+        let hashfield = compute_hashfield(&entry.storage, entry.content.as_ref());
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -689,6 +699,8 @@ impl AppState {
                 started_task_num: 0,
                 workers: 0,
                 pinned,
+                hashfield,
+                peer_hashfields: HashMap::new(),
             },
         );
     }
@@ -739,6 +751,141 @@ impl AppState {
             }
         }
         out
+    }
+
+    /// Our optional-file hashfield bytes for a xite (`getHashfield` reply).
+    pub async fn hashfield_bytes(&self, address: &str) -> Option<Vec<u8>> {
+        let xites = self.xites.read().await;
+        self.resolve_xite(&xites, address).map(|x| x.hashfield.to_bytes())
+    }
+
+    /// Record a peer's advertised hashfield (`setHashfield`). Also registers the
+    /// peer if new.
+    pub async fn set_peer_hashfield(&self, address: &str, peer: &PeerAddr, raw: &[u8]) -> bool {
+        let mut xites = self.xites.write().await;
+        let key = xites
+            .iter()
+            .find(|(k, x)| {
+                k.as_str() == address || canonical_address(x.content.as_ref(), k) == address
+            })
+            .map(|(k, _)| k.clone());
+        let Some(key) = key else { return false };
+        let x = xites.get_mut(&key).unwrap();
+        x.peers.add(peer.clone(), now_secs());
+        x.settings.peers = x.peers.len() as i64;
+        x.peer_hashfields
+            .insert(peer.to_string(), epix_xite::Hashfield::from_bytes(raw));
+        true
+    }
+
+    /// Mark that we now hold an optional file (add its hash id to our hashfield).
+    pub async fn hashfield_add(&self, address: &str, sha512: &str) {
+        let mut xites = self.xites.write().await;
+        if let Some(x) = xites.get_mut(address) {
+            x.hashfield.add_hash(sha512);
+        }
+    }
+
+    /// For `findHashIds`: which known peers advertise each requested hash id,
+    /// packed and bucketed by ip type (`{hash_id: [packed_addr]}` per bucket),
+    /// plus the hash ids we ourselves hold (`my`). Up to 20 peers per hash id.
+    pub async fn find_hash_ids(
+        &self,
+        address: &str,
+        hash_ids: &[u16],
+    ) -> (
+        HashMap<u16, Vec<Vec<u8>>>, // ipv4
+        HashMap<u16, Vec<Vec<u8>>>, // ipv6
+        HashMap<u16, Vec<Vec<u8>>>, // onion
+        Vec<u16>,                   // my
+    ) {
+        let (mut v4, mut v6, mut onion) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let mut mine = Vec::new();
+        let xites = self.xites.read().await;
+        let Some(x) = self.resolve_xite(&xites, address) else {
+            return (v4, v6, onion, mine);
+        };
+        for &id in hash_ids {
+            if x.hashfield.has_id(id) {
+                mine.push(id);
+            }
+            for peer in x.peers.peers() {
+                let has = x.peer_hashfields.get(&peer.addr.to_string()).is_some_and(|hf| hf.has_id(id));
+                if !has || !peer.is_connectable() {
+                    continue;
+                }
+                let (Some(bucket), Some(packed)) = (
+                    match peer.addr.ip_type() {
+                        epix_core::IpType::Ipv4 => Some(&mut v4),
+                        epix_core::IpType::Ipv6 => Some(&mut v6),
+                        epix_core::IpType::Onion => Some(&mut onion),
+                        epix_core::IpType::Rns => None,
+                    },
+                    peer.addr.pack(),
+                ) else {
+                    continue;
+                };
+                let list: &mut Vec<Vec<u8>> = bucket.entry(id).or_default();
+                if list.len() < 20 {
+                    list.push(packed);
+                }
+            }
+        }
+        (v4, v6, onion, mine)
+    }
+
+    /// Receive a pushed optional file (`pushFile`): verify its declared size and
+    /// sha512 from content.json, write it, and record it in our hashfield.
+    /// Mirrors EpixNet's `actionPushFile`. Returns an Ok/error message string.
+    pub async fn apply_push_file(
+        &self,
+        site: &str,
+        inner_path: &str,
+        body: &[u8],
+    ) -> Result<String, String> {
+        let (key, info) = {
+            let xites = self.xites.read().await;
+            let x = self.resolve_xite(&xites, site).ok_or("Unknown site")?;
+            if x.settings.downloaded.is_none() {
+                return Err("Site not yet downloaded".into());
+            }
+            // File must be declared (required or optional) in content.json.
+            let info = x
+                .content
+                .as_ref()
+                .and_then(|c| {
+                    c.get("files")
+                        .and_then(|f| f.get(inner_path))
+                        .or_else(|| c.get("files_optional").and_then(|f| f.get(inner_path)))
+                })
+                .ok_or("File not in content.json")?;
+            let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let sha512 = info.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Find the real serving key so we write to the right storage.
+            let key = xites
+                .iter()
+                .find(|(k, x)| {
+                    k.as_str() == site || canonical_address(x.content.as_ref(), k) == site
+                })
+                .map(|(k, _)| k.clone())
+                .ok_or("Unknown site")?;
+            (key, (size, sha512))
+        };
+        let (expected_size, expected_hash) = info;
+        if body.len() as i64 != expected_size {
+            return Err("File size mismatch".into());
+        }
+        let actual = XiteStorage::hash_bytes(body);
+        if actual != expected_hash {
+            return Err("File verify failed".into());
+        }
+        {
+            let xites = self.xites.read().await;
+            let x = xites.get(&key).ok_or("Unknown site")?;
+            x.storage.write(inner_path, body).map_err(|e| e.to_string())?;
+        }
+        self.hashfield_add(&key, &expected_hash).await;
+        Ok("File pushed".into())
     }
 
     /// Find a managed xite by a key that may be its serving key or its signed
@@ -1258,10 +1405,12 @@ impl AppState {
             if XiteStorage::hash_bytes(&bytes) == info.sha512 {
                 xite.storage.write(inner_path, &bytes).map_err(|e| e.to_string())?;
                 self.set_peer_connected(address, &peer, true).await;
-                // Count optional bytes downloaded.
+                // Count optional bytes downloaded and advertise it in our
+                // hashfield so peers can discover we now hold it.
                 if xite.optional_files().iter().any(|f| f.inner_path == inner_path) {
                     if let Some(x) = self.xites.write().await.get_mut(address) {
                         x.settings.optional_downloaded += info.size;
+                        x.hashfield.add_hash(&info.sha512);
                     }
                 }
                 return Ok(true);
@@ -3083,6 +3232,23 @@ fn format_log_line(line: &Value) -> String {
 /// The address a permission grant is keyed by: the xite's signed content
 /// address when known (so a site served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
+/// Build the optional-file hashfield from what's present on disk: for each
+/// `files_optional` entry we actually hold (hash-verified), record its hash id.
+fn compute_hashfield(storage: &XiteStorage, content: Option<&Value>) -> epix_xite::Hashfield {
+    let mut hf = epix_xite::Hashfield::new();
+    let Some(files) = content.and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
+    else {
+        return hf;
+    };
+    for (path, info) in files {
+        let Some(sha512) = info.get("sha512").and_then(|v| v.as_str()) else { continue };
+        if storage.verify(path, sha512) {
+            hf.add_hash(sha512);
+        }
+    }
+    hf
+}
+
 fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
     content
         .and_then(|c| c.get("address"))

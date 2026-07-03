@@ -236,6 +236,37 @@ impl Connection {
         self.request("listModified", params).await
     }
 
+    /// Ask which optional files the peer holds (`getHashfield`); returns the
+    /// packed hash-id bytes (unpack with `epix_xite::Hashfield::from_bytes`).
+    pub async fn get_hashfield(&mut self, xite: &str) -> Result<Vec<u8>> {
+        let params = vmap(vec![("site", Value::from(xite))]);
+        let resp = self.request("getHashfield", params).await?;
+        match vget(&resp, "hashfield_raw") {
+            Some(Value::Binary(b)) => Ok(b.clone()),
+            _ => Err(Error::Protocol("getHashfield response has no hashfield_raw".into())),
+        }
+    }
+
+    /// Tell the peer which optional files we hold (`setHashfield`).
+    pub async fn set_hashfield(&mut self, xite: &str, hashfield_raw: Vec<u8>) -> Result<Value> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            ("hashfield_raw", Value::Binary(hashfield_raw)),
+        ]);
+        self.request("setHashfield", params).await
+    }
+
+    /// Push an optional file directly to the peer (`pushFile`); the peer
+    /// verifies size + sha512 against content.json before accepting.
+    pub async fn push_file(&mut self, xite: &str, inner_path: &str, body: &[u8]) -> Result<Value> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            ("inner_path", Value::from(inner_path)),
+            ("body", Value::Binary(body.to_vec())),
+        ]);
+        self.request("pushFile", params).await
+    }
+
     /// Ask which pieces of each big file the peer holds (`getPiecefields`).
     /// Returns `sha512 -> packed piecefield bytes`; the caller unpacks with
     /// `epix_xite::Piecefield` (kept out of the protocol layer to avoid a cycle).
