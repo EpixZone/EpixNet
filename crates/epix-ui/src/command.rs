@@ -396,6 +396,11 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(UserSetGlobalSettings),
         Arc::new(WrapperNonce),
         Arc::new(FileGet),
+        // Certs: obtain + select an ID-provider identity.
+        Arc::new(CertAdd),
+        Arc::new(CertSelect),
+        Arc::new(CertSet),
+        Arc::new(CertList),
     ];
     // Multiuser: identity login/switch commands (desktop only).
     #[cfg(feature = "multiuser")]
@@ -2177,6 +2182,119 @@ fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
         .or_else(|| p.as_str())
 }
 
+/// `certAdd` - store a cert issued by an ID provider (bound to the site's auth
+/// address) and select it globally. Not admin (any site can offer a cert).
+struct CertAdd;
+#[async_trait]
+impl WsCommand for CertAdd {
+    fn name(&self) -> &'static str {
+        "certAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let domain = arg_str(p, "domain", 0).ok_or("certAdd: domain required")?;
+        let auth_type = arg_str(p, "auth_type", 1).unwrap_or("web");
+        let auth_user_name = arg_str(p, "auth_user_name", 2).unwrap_or("");
+        let cert = arg_str(p, "cert", 3).unwrap_or("");
+        match s.state.cert_add(&address, domain, auth_type, auth_user_name, cert).await? {
+            Some(true) => {
+                s.state.push_notification(
+                    "done",
+                    &format!("New certificate added: {auth_type}/{auth_user_name}@{domain}"),
+                    5000,
+                );
+                s.state.push_site_info(&address).await;
+                Ok(Value::from("ok"))
+            }
+            // A different cert already exists for this domain. EpixNet prompts to
+            // confirm; until wrapper confirm events are wired we replace it and
+            // notify (the user obtained a new cert for the same provider).
+            Some(false) => {
+                s.state
+                    .cert_replace(&address, domain, auth_type, auth_user_name, cert)
+                    .await?;
+                s.state.push_notification(
+                    "done",
+                    &format!("Certificate changed to {auth_type}/{auth_user_name}@{domain}"),
+                    5000,
+                );
+                s.state.push_site_info(&address).await;
+                Ok(Value::from("ok"))
+            }
+            None => Ok(Value::from("Not changed")),
+        }
+    }
+}
+
+/// `certSelect` - choose which stored identity to use on this site. Full picker
+/// UI needs wrapper confirm/injectScript events (a follow-up); for now this
+/// selects the first acceptable cert (or leaves the current one) and returns the
+/// account list so a caller can display choices.
+struct CertSelect;
+#[async_trait]
+impl WsCommand for CertSelect {
+    fn name(&self) -> &'static str {
+        "certSelect"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let accepted: Vec<String> = p
+            .get("accepted_domains")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let accept_any = p.get("accept_any").and_then(|v| v.as_bool()).unwrap_or(accepted.is_empty());
+
+        let certs = s.state.cert_list(&address).await;
+        // Pick an acceptable cert to select (already-selected wins; else first).
+        let acceptable = |domain: &str| accept_any || accepted.iter().any(|d| d == domain);
+        let already = certs.iter().find(|c| c["selected"].as_bool() == Some(true));
+        let choice = already
+            .filter(|c| c["domain"].as_str().is_some_and(acceptable))
+            .or_else(|| certs.iter().find(|c| c["domain"].as_str().is_some_and(acceptable)));
+        if let Some(cert) = choice {
+            if let Some(domain) = cert["domain"].as_str() {
+                s.state.cert_set(domain).await;
+                s.state.push_site_info(&address).await;
+            }
+        }
+        // Return the accounts so a UI can present them (None + the certs).
+        Ok(json!(certs))
+    }
+}
+
+/// `certSet {domain}` - select a cert on all sites (portable cert), or clear
+/// with an empty domain. Admin.
+struct CertSet;
+#[async_trait]
+impl WsCommand for CertSet {
+    fn name(&self) -> &'static str {
+        "certSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let domain = arg_str(p, "domain", 0).unwrap_or("");
+        s.state.cert_set(domain).await;
+        if let Ok(addr) = s.address() {
+            let addr = addr.to_string();
+            s.state.push_site_info(&addr).await;
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `certList` - the user's certs with which is selected for this site. Admin.
+struct CertList;
+#[async_trait]
+impl WsCommand for CertList {
+    fn name(&self) -> &'static str {
+        "certList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        Ok(json!(s.state.cert_list(&address).await))
+    }
+}
+
 struct MuteAdd;
 #[async_trait]
 impl WsCommand for MuteAdd {
@@ -2556,6 +2674,51 @@ mod tests {
         assert_eq!(SiteblockGet.handle(&session, &json!(["1GoodSite"])).await.unwrap(), Value::Bool(false));
         let blocks = SiteblockList.handle(&session, &Value::Null).await.unwrap();
         assert!(blocks["1BadSite"].is_object());
+    }
+
+    #[tokio::test]
+    async fn cert_add_select_list_flow() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        state
+            .add_xite(
+                "talk.epix",
+                crate::state::XiteEntry {
+                    storage: epix_xite::XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": "talk.epix" })),
+                },
+            )
+            .await;
+        let session = WsSession::new(state, Some("talk.epix".into()));
+
+        // No certs yet.
+        let list = CertList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+
+        // certAdd stores + selects a cert for this site's identity.
+        CertAdd
+            .handle(&session, &json!({
+                "domain": "zeroid.bit",
+                "auth_type": "web",
+                "auth_user_name": "alice",
+                "cert": "sig",
+            }))
+            .await
+            .unwrap();
+        let list = CertList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["domain"], "zeroid.bit");
+        assert_eq!(list[0]["auth_user_name"], "alice");
+        assert_eq!(list[0]["selected"], true);
+
+        // siteInfo now reports the cert user id.
+        let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["cert_user_id"], "alice@zeroid.bit");
+
+        // certSet "" clears it everywhere.
+        CertSet.handle(&session, &json!([""])).await.unwrap();
+        let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
+        assert!(info["cert_user_id"].is_null());
     }
 
     #[test]

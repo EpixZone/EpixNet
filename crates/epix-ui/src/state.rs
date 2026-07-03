@@ -1338,6 +1338,74 @@ impl AppState {
         self.user.write().await.auth_address(address)
     }
 
+    // --- Certs (certAdd / certSelect / certSet / certList) ------------------
+
+    /// Add a cert obtained from an ID provider, bound to the xite's current auth
+    /// address, and (if newly added) select it globally. Returns:
+    /// `Ok(Some(true))` added + selected, `Ok(None)` unchanged (identical),
+    /// `Ok(Some(false))` a different cert exists for the domain (needs the user
+    /// to confirm replacement). Persists on change.
+    pub async fn cert_add(
+        &self,
+        address: &str,
+        domain: &str,
+        auth_type: &str,
+        auth_user_name: &str,
+        cert_sign: &str,
+    ) -> Result<Option<bool>, String> {
+        let mut user = self.user.write().await;
+        let auth_address = user.auth_address(address)?;
+        let res = user.add_cert(&auth_address, domain, auth_type, auth_user_name, cert_sign)?;
+        if res == Some(true) {
+            user.set_cert_global(Some(domain));
+        }
+        drop(user);
+        if res == Some(true) {
+            self.save_user().await;
+        }
+        Ok(res)
+    }
+
+    /// Replace an existing cert for `domain` (used after the user confirms the
+    /// change prompt), then select it globally.
+    pub async fn cert_replace(
+        &self,
+        address: &str,
+        domain: &str,
+        auth_type: &str,
+        auth_user_name: &str,
+        cert_sign: &str,
+    ) -> Result<(), String> {
+        let mut user = self.user.write().await;
+        let auth_address = user.auth_address(address)?;
+        user.delete_cert(domain);
+        user.add_cert(&auth_address, domain, auth_type, auth_user_name, cert_sign)?;
+        user.set_cert_global(Some(domain));
+        drop(user);
+        self.save_user().await;
+        Ok(())
+    }
+
+    /// Select a cert domain on all sites (portable cert), or clear with an empty
+    /// domain. `certSet`. Persists.
+    pub async fn cert_set(&self, domain: &str) {
+        let d = if domain.is_empty() { None } else { Some(domain) };
+        self.user.write().await.set_cert_global(d);
+        self.save_user().await;
+    }
+
+    /// The user's certs for `certList` (`[{auth_address, auth_type,
+    /// auth_user_name, domain, selected}]`).
+    pub async fn cert_list(&self, address: &str) -> Vec<Value> {
+        self.user.write().await.cert_list(address)
+    }
+
+    /// Whether the user already holds a cert for `domain` (used by certAdd to
+    /// decide whether to prompt for replacement).
+    pub async fn has_cert(&self, domain: &str) -> bool {
+        self.user.read().await.certs.contains_key(domain)
+    }
+
     /// The configured Epix chain RPC URL (Vrf / XidResolver), or the default.
     pub async fn chain_rpc_url(&self) -> String {
         self.config_get("chain_rpc_url")
