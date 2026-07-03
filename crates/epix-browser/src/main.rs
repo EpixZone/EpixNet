@@ -28,15 +28,14 @@ const UI_ADDR: &str = "127.0.0.1:43110";
 const PROXY_ADDR: &str = "127.0.0.1:43112";
 const SOCKS_ADDR: &str = "127.0.0.1:43111";
 
-/// Whether the user has turned on "route clearnet through Tor" (persisted by the
-/// native host in `<data_root>/browser-settings.json`). Read at launch to build
-/// the file PAC.
-fn tor_clearnet_enabled(data_root: &Path) -> bool {
+/// The "route clearnet through Tor" setting (persisted by the native host in
+/// `<data_root>/browser-settings.json`), read at launch to build the file PAC.
+/// `None` when unset - the caller applies the default (on).
+fn tor_clearnet_setting(data_root: &Path) -> Option<bool> {
     std::fs::read(data_root.join("browser-settings.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v.get("tor_clearnet").and_then(|t| t.as_bool()))
-        .unwrap_or(false)
 }
 
 #[tokio::main]
@@ -74,11 +73,12 @@ async fn main() {
 
     // Boot the node and serve the plain UI on loopback.
     println!("· starting the Epix node …");
+    let tor_mode = std::env::var("EPIX_TOR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "enable".into());
     let opts = epix_node::NodeOptions {
         data_root: data_root.clone(),
         target: target.clone(),
         ui_addr: UI_ADDR.to_string(),
-        tor_mode: std::env::var("EPIX_TOR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "enable".into()),
+        tor_mode: tor_mode.clone(),
         open_browser: false,
         geoip_gz: None,
         log_file: None,
@@ -129,9 +129,13 @@ async fn main() {
     let ext_capable = firefox_allows_unsigned(&firefox);
 
     let socks_addr: SocketAddr = SOCKS_ADDR.parse().unwrap();
-    let tor_clearnet = tor_clearnet_enabled(&data_root);
+    // Route clearnet through Tor by default (opt-out), but only when Tor is on -
+    // otherwise there is no SOCKS listener and clearnet would break. An explicit
+    // saved setting overrides the default.
+    let tor_on = tor_mode != "disable";
+    let tor_clearnet = tor_on && tor_clearnet_setting(&data_root).unwrap_or(true);
     if tor_clearnet {
-        println!("· routing clearnet through Tor (from the saved setting)");
+        println!("· routing clearnet through Tor (clearnet is slower, and needs ~40s until Tor is up)");
     }
 
     // Write the managed profile, then inject the CA so https://*.epix is trusted.

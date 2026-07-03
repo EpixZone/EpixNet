@@ -19,7 +19,8 @@ let torClearnet = false; // route clearnet browsing through Tor
 
 browser.storage.local.get(["clearnetAllow", "torClearnet"]).then((data) => {
   allowed = new Set((data && data.clearnetAllow) || []);
-  torClearnet = !!(data && data.torClearnet);
+  // Default on (opt-out): only off if the user explicitly turned it off.
+  torClearnet = !(data && data.torClearnet === false);
 });
 browser.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;

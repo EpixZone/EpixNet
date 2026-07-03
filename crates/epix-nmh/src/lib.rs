@@ -78,7 +78,8 @@ impl Settings {
 
     /// Whether the user routes clearnet (non-`.epix`) browsing through Tor.
     pub fn tor_clearnet(&self) -> bool {
-        self.read().get("tor_clearnet").and_then(|v| v.as_bool()).unwrap_or(false)
+        // Default on (opt-out): clearnet routes through Tor unless turned off.
+        self.read().get("tor_clearnet").and_then(|v| v.as_bool()).unwrap_or(true)
     }
 
     pub fn set_tor_clearnet(&self, on: bool) {
