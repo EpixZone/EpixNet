@@ -172,6 +172,8 @@ async fn announce_loop(
         }
         // Persist the freshly discovered peers so they survive a restart.
         state.persist_peers().await;
+        // Persist the served-xite list (settings/size may have changed).
+        state.persist_sites().await;
     };
     announce().await;
     let mut tick = interval(period);

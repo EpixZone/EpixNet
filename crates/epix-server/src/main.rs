@@ -203,6 +203,13 @@ async fn serve(
             }
         });
     }
+    // Restore any xites served in a previous run (from sites.json), so the node
+    // seeds its whole set on restart, not just the one on the command line.
+    let restored = state.restore_sites().await;
+    if restored > 0 {
+        state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
+    }
+
     // Serve under the raw address and (if resolved from a name) the .epix name,
     // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
     state

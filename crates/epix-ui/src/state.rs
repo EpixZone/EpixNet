@@ -224,6 +224,13 @@ pub struct AppState {
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
     updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The shared data root (holds `sites.json` + per-xite subdirectories), so
+    /// the served-xite list can be restored on the next start. None for
+    /// in-memory nodes.
+    data_root: Option<PathBuf>,
+    /// Path to `sites.json` (the persistent served-xite registry, EpixNet's
+    /// SiteManager). None for in-memory nodes.
+    sites_path: Option<PathBuf>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -298,6 +305,8 @@ impl AppState {
             ip_external: RwLock::new(None),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            data_root: None,
+            sites_path: None,
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -310,6 +319,9 @@ impl AppState {
     pub fn with_data_dir(version: impl Into<String>, data_dir: impl Into<PathBuf>) -> Arc<Self> {
         let dir = data_dir.into();
         let _ = std::fs::create_dir_all(&dir);
+        // The shared root holds the cross-xite registry (sites.json) and the
+        // per-xite subdirectories; a per-xite `dir` sits directly under it.
+        let data_root = dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.clone());
         let user_path = dir.join("users.json");
         let user = User::load_or_create(&user_path).unwrap_or_else(|_| User::generate());
         let filters_path = dir.join("filters.json");
@@ -377,6 +389,10 @@ impl AppState {
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            // The served-xite registry lives in the shared root (the parent of a
+            // per-xite dir), so it spans every xite that shares this root.
+            data_root: Some(data_root.clone()),
+            sites_path: Some(data_root.join("sites.json")),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -703,6 +719,73 @@ impl AppState {
                 peer_hashfields: HashMap::new(),
             },
         );
+        // Record the served-xite list so it is restored on the next start.
+        self.persist_sites().await;
+    }
+
+    // --- SiteManager: persist the served-xite list across restarts ----------
+
+    /// Persist the served xites to `sites.json` (keyed by signed content
+    /// address; aliases collapse to one entry). Stores each xite's settings and
+    /// its display alias, so the next start restores the same list without a
+    /// re-clone. EpixNet's `SiteManager.save`.
+    pub async fn persist_sites(&self) {
+        let Some(path) = &self.sites_path else { return };
+        let xites = self.xites.read().await;
+        let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (key, x) in xites.iter() {
+            let canonical = canonical_address(x.content.as_ref(), key);
+            // Prefer the human-readable alias (e.g. `dashboard.epix`) as display.
+            let display = if key != &canonical { Some(key.clone()) } else { None };
+            let entry = map.entry(canonical).or_insert_with(|| {
+                json!({ "settings": x.settings, "display": Value::Null })
+            });
+            if let (Some(d), Value::Object(obj)) = (display, entry) {
+                obj.insert("display".to_string(), json!(d));
+            }
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(map)) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    /// Restore xites recorded in `sites.json`: for each, point storage at
+    /// `<root>/<canonical>`, load + verify the on-disk content.json, and add it
+    /// (plus its display alias). Skips entries already served and any whose
+    /// content.json is missing or fails verification. Returns how many were
+    /// restored. Call once at startup before serving.
+    pub async fn restore_sites(self: &Arc<Self>) -> usize {
+        let (Some(path), Some(root)) = (&self.sites_path, &self.data_root) else { return 0 };
+        let map: serde_json::Map<String, Value> = match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => return 0,
+        };
+        let mut restored = 0;
+        for (canonical, entry) in map {
+            if self.has_any_alias(&canonical).await {
+                continue;
+            }
+            let dir = root.join(&canonical);
+            let storage = XiteStorage::new(&dir);
+            // Load + verify the on-disk content.json under the canonical address.
+            let Ok(addr) = Address::parse(canonical.clone()) else { continue };
+            let mut xite = Xite::new(addr, storage.clone());
+            match xite.load_content() {
+                Ok(true) => {}
+                _ => continue, // no content.json, or it failed signature verification
+            }
+            let content = xite.content.clone();
+            self.add_xite(&canonical, XiteEntry { storage: storage.clone(), content: content.clone() })
+                .await;
+            // Re-add the display alias (e.g. `dashboard.epix`) if one was saved.
+            if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
+                if display != canonical {
+                    self.add_xite(display, XiteEntry { storage, content }).await;
+                }
+            }
+            restored += 1;
+        }
+        restored
     }
 
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
