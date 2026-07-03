@@ -53,23 +53,62 @@ The Windows job builds a signed NSIS installer. Signing uses **Azure Trusted
 Signing** (~$10/month, cloud HSM - no cert file or token to manage). Without the
 secrets the installer is still built, just unsigned.
 
-One-time setup:
-1. Create a **Trusted Signing account** + a **certificate profile** in the Azure
-   portal, and complete identity validation.
-2. Create an **Entra ID app registration** (service principal) and give it the
-   *Trusted Signing Certificate Profile Signer* role on the account.
-3. Add these repo secrets:
+### One-time Azure setup
 
-| Secret | What it is |
+1. **Register the provider.** Azure portal -> your Subscription ->
+   *Resource providers* -> search `Microsoft.CodeSigning` -> **Register**.
+
+2. **Create a Trusted Signing account.** Search *Trusted Signing accounts* ->
+   **Create**. Pick a resource group and a **region** (this decides your
+   endpoint - see the table below). The Basic tier is ~$9.99/month. The name you
+   give it is `AZURE_TS_ACCOUNT`.
+
+3. **Validate your identity.** In the account -> *Identity validations* -> **New**.
+   Choose Organization or Individual and complete it. This is the slow step
+   (hours to days, may need documents) and it gates everything - you can't issue
+   a public-trust cert without it.
+
+4. **Create a certificate profile.** In the account -> *Certificate profiles* ->
+   **Create** -> type **Public Trust** (for publicly distributed apps) -> select
+   the approved identity validation. The name you give it is `AZURE_TS_PROFILE`.
+
+5. **Create a service principal.** Microsoft Entra ID -> *App registrations* ->
+   **New registration** (name it e.g. `epix-signing`). From its Overview copy
+   the **Application (client) ID** (`AZURE_CLIENT_ID`) and **Directory (tenant)
+   ID** (`AZURE_TENANT_ID`). Then *Certificates & secrets* -> **New client
+   secret** -> copy the secret **Value** immediately (`AZURE_CLIENT_SECRET`; it's
+   shown once).
+
+6. **Grant it the signer role.** Trusted Signing account -> *Access control
+   (IAM)* -> **Add role assignment** -> role **Trusted Signing Certificate
+   Profile Signer** -> assign to the `epix-signing` app registration.
+
+### The six repo secrets
+
+Repo -> Settings -> Secrets and variables -> Actions -> New repository secret:
+
+| Secret | Where to get it |
 |---|---|
-| `AZURE_TENANT_ID` | your Entra tenant id |
-| `AZURE_CLIENT_ID` | the app registration's client id |
-| `AZURE_CLIENT_SECRET` | a client secret for that app |
-| `AZURE_TS_ENDPOINT` | the account's region endpoint, e.g. `https://eus.codesigning.azure.net` |
+| `AZURE_TENANT_ID` | app registration Overview -> Directory (tenant) ID |
+| `AZURE_CLIENT_ID` | app registration Overview -> Application (client) ID |
+| `AZURE_CLIENT_SECRET` | the client secret Value from step 5 |
+| `AZURE_TS_ENDPOINT` | your region endpoint (table below) |
 | `AZURE_TS_ACCOUNT` | the Trusted Signing account name |
 | `AZURE_TS_PROFILE` | the certificate profile name |
 
-Push a `v*` tag and the installer is built, signed, and attached to the Release.
+Region endpoints (`AZURE_TS_ENDPOINT`): East US `https://eus.codesigning.azure.net`,
+West US 3 `https://wus3.codesigning.azure.net`, West Central US
+`https://wcus.codesigning.azure.net`, North Europe `https://neu.codesigning.azure.net`,
+West Europe `https://weu.codesigning.azure.net`. If unsure, the account Overview
+in the portal shows the endpoint.
+
+### Test it
+
+Run the **Release** workflow by hand (Actions -> Release -> Run workflow) - the
+Windows job builds *and signs* and uploads the installer as a run artifact,
+without publishing a Release. (The **Build** workflow is intentionally unsigned,
+so use Release to test signing.) Once it's green, push a `v*` tag for the real
+thing.
 
 Note: a fresh certificate builds Microsoft SmartScreen reputation over time, so
 the first downloads may still show a warning until reputation accrues - this is
