@@ -12,4 +12,4 @@ pub mod peer;
 pub use address::Address;
 pub use emitter::{CollectingEmitter, Emitter, NoopEmitter};
 pub use error::{Error, Result};
-pub use peer::PeerAddr;
+pub use peer::{IpType, PeerAddr};

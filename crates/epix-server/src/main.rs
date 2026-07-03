@@ -1,6 +1,8 @@
 //! Runnable Epix node: discover peers, clone a xite from the live EpixNet
 //! network, and serve it in a browser through the UI server.
 
+mod platform;
+
 use epix_core::{Address, PeerAddr};
 use epix_protocol::Connection;
 use epix_transport::{TcpTransport, Transport};
@@ -9,7 +11,13 @@ use epix_xite::{Xite, XiteStorage};
 use std::sync::Arc;
 
 const TRACKER: &str = "145.223.69.23:26959";
-const BIND: &str = "127.0.0.1:43110";
+const DEFAULT_BIND: &str = "127.0.0.1:43110";
+
+/// The UI bind address: `EPIX_UI_ADDR` (e.g. `127.0.0.1:43110`) if set, else the
+/// default loopback bind.
+fn ui_bind() -> String {
+    std::env::var("EPIX_UI_ADDR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_BIND.to_string())
+}
 
 /// Bundled peer-geolocation database for the dashboard's world map: DB-IP City
 /// Lite (CC-BY-4.0), shipped gzipped and expanded into the data dir at runtime.
@@ -28,7 +36,23 @@ async fn main() {
     }
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
-    let data_dir = std::env::temp_dir().join("epix-data").join(&address);
+    // Persistent per-OS data directory (not the temp dir), with a single-instance
+    // lock so two nodes can't race on the same data. If already running, hand off
+    // to the existing instance's browser tab and exit.
+    let root = platform::data_root();
+    std::fs::create_dir_all(&root).expect("create data root");
+    let _lock = match platform::acquire_lock(&root) {
+        Ok(lock) => lock,
+        Err(()) => {
+            eprintln!(
+                "Epix is already running (lock held in {}). Opening the existing instance.",
+                root.display()
+            );
+            let _ = open_in_browser(&format!("http://{}/{display}/", ui_bind()));
+            return;
+        }
+    };
+    let data_dir = root.join(&address);
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     let mut xite = Xite::new(
         Address::parse(address.clone()).expect("valid address"),
@@ -152,7 +176,7 @@ async fn reverify_resolution(full: &str, served_address: &str) {
 
 /// The name→address resolve cache (shared across xites, keyed by `.epix` name).
 fn resolve_cache_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("epix-data").join("resolve-cache.json")
+    platform::data_root().join("resolve-cache.json")
 }
 
 fn read_resolve_cache() -> serde_json::Map<String, serde_json::Value> {
@@ -182,6 +206,11 @@ async fn serve(
     bytes_recv: u64,
 ) {
     let state = AppState::with_data_dir(env!("CARGO_PKG_VERSION"), &data_dir);
+    // Append the node's log to a rotating debug.log in the data root, so
+    // activity survives restarts (rotated once at startup if too large).
+    if let Some(root) = data_dir.parent() {
+        state.set_log_file(&platform::log_path(root, 8 * 1024 * 1024));
+    }
     // Load the bundled IP geolocation db (DB-IP City Lite, CC-BY-4.0) off the
     // startup path: first run expands the ~62MB gzip to disk, so do it in the
     // background. The node serves and connects to peers immediately; the world
@@ -203,6 +232,13 @@ async fn serve(
             }
         });
     }
+    // Restore any xites served in a previous run (from sites.json), so the node
+    // seeds its whole set on restart, not just the one on the command line.
+    let restored = state.restore_sites().await;
+    if restored > 0 {
+        state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
+    }
+
     // Serve under the raw address and (if resolved from a name) the .epix name,
     // so both http://…/dashboard.epix/ and http://…/epix1…/ work.
     state
@@ -320,12 +356,16 @@ async fn serve(
     plugin_names.dedup();
     state.set_plugins(plugin_names).await;
 
-    let bind: std::net::SocketAddr = BIND.parse().unwrap();
+    let bind_addr = ui_bind();
+    let bind: std::net::SocketAddr = bind_addr.parse().unwrap_or_else(|_| {
+        eprintln!("invalid EPIX_UI_ADDR '{bind_addr}', using {DEFAULT_BIND}");
+        DEFAULT_BIND.parse().unwrap()
+    });
     println!("\n┌──────────────────────────────────────────────");
     println!("│ Epix node - live (announce + re-sync loops running)");
     println!("│ plugins: {:?}", plugins.names());
     println!("│ Open in your browser:");
-    println!("│   http://{BIND}/{display}/");
+    println!("│   http://{bind}/{display}/");
     println!("└──────────────────────────────────────────────\n");
     state.log("INFO", format!("Serving {display} ({} bytes received)", bytes_recv)).await;
 
@@ -336,7 +376,7 @@ async fn serve(
         .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() != Some("false")))
         .unwrap_or(true);
     if open_browser {
-        open_in_browser(&format!("http://{BIND}/{display}/"));
+        open_in_browser(&format!("http://{bind}/{display}/"));
     }
 
     UiServer::with_registry_and_media(state, plugins.command_registry(), plugins.media_bundle())

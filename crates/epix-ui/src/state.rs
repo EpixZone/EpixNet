@@ -141,6 +141,13 @@ struct ManagedXite {
     workers: usize,
     /// Optional files the user pinned (kept even when clearing space).
     pinned: std::collections::HashSet<String>,
+    /// Which optional-file hash ids we hold (`getHashfield`), maintained as
+    /// optional files are downloaded/pushed/deleted.
+    hashfield: epix_xite::Hashfield,
+    /// Optional-file hash ids each known peer advertises (`setHashfield`), so
+    /// `findHashIds` can point a downloader at peers holding a rare file.
+    /// Keyed by peer address string.
+    peer_hashfields: HashMap<String, epix_xite::Hashfield>,
 }
 
 /// Server-wide state shared across all HTTP/WebSocket handlers.
@@ -213,6 +220,33 @@ pub struct AppState {
     /// `serverInfo`. Default closed / unknown.
     port_opened: RwLock<bool>,
     ip_external: RwLock<Option<String>>,
+    /// Inbound updates currently being verified/downloaded (`site/inner:modified`
+    /// URIs), so the same pushed version isn't processed twice concurrently
+    /// (EpixNet's `files_parsing`).
+    updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Pending wrapper callbacks (`confirm`/`prompt`): a pushed event's `to` id
+    /// maps to the oneshot awaiting the wrapper's `{cmd:"response", to}` reply.
+    callbacks: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
+    /// Optional file that `log()` also appends each line to (`debug.log`), so
+    /// the node's activity survives restarts for support/debugging. Set by the
+    /// host; None keeps logging in-memory + stdout only.
+    log_file: std::sync::Mutex<Option<std::fs::File>>,
+    /// Pending Bigfile uploads keyed by nonce (`bigfileUploadInit` → the
+    /// `/EpixNet-Internal/BigfileUpload` POST consumes it).
+    bigfile_uploads: std::sync::Mutex<HashMap<String, BigfileUpload>>,
+    /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
+    /// issued when a wrapper is served, consumed on the inner file request.
+    wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Hosts allowed as WebSocket `Origin`s (a wrapper's Host is added when
+    /// served), so a cross-origin page can't drive the local WS API.
+    allowed_ws_origins: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The shared data root (holds `sites.json` + per-xite subdirectories), so
+    /// the served-xite list can be restored on the next start. None for
+    /// in-memory nodes.
+    data_root: Option<PathBuf>,
+    /// Path to `sites.json` (the persistent served-xite registry, EpixNet's
+    /// SiteManager). None for in-memory nodes.
+    sites_path: Option<PathBuf>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -236,12 +270,49 @@ pub struct UiEvent {
     pub payload: String,
 }
 
+/// Outcome of an accepted inbound `update` push (errors are `Err` strings that
+/// go back on the wire, matching EpixNet's responses).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InboundUpdate {
+    /// Newer version, signature valid: stored, files syncing in the background.
+    Applied,
+    /// We already have this version (or newer) - sender recorded as a peer.
+    NotChanged,
+}
+
+/// A pending Bigfile upload (created by `bigfileUploadInit`, consumed by the
+/// `/EpixNet-Internal/BigfileUpload` POST).
+#[derive(Clone)]
+pub struct BigfileUpload {
+    pub address: String,
+    pub inner_path: String,
+    pub size: u64,
+    pub piece_size: usize,
+    pub piecemap_inner_path: String,
+}
+
+/// The result of a completed Bigfile upload (returned to the uploader).
+pub struct BigfileUploadResult {
+    pub merkle_root: String,
+    pub piece_num: usize,
+    pub piece_size: usize,
+    pub inner_path: String,
+}
+
 fn empty_filters() -> Value {
     json!({ "mutes": {}, "siteblocks": {} })
 }
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// A random lowercase-hex string of `bytes` random bytes (2 hex chars each).
+/// Used for wrapper/CSP nonces.
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl AppState {
@@ -276,6 +347,14 @@ impl AppState {
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
             pins_path: None,
+            updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            callbacks: std::sync::Mutex::new(HashMap::new()),
+            log_file: std::sync::Mutex::new(None),
+            bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
+            wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
+            data_root: None,
+            sites_path: None,
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -288,6 +367,9 @@ impl AppState {
     pub fn with_data_dir(version: impl Into<String>, data_dir: impl Into<PathBuf>) -> Arc<Self> {
         let dir = data_dir.into();
         let _ = std::fs::create_dir_all(&dir);
+        // The shared root holds the cross-xite registry (sites.json) and the
+        // per-xite subdirectories; a per-xite `dir` sits directly under it.
+        let data_root = dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.clone());
         let user_path = dir.join("users.json");
         let user = User::load_or_create(&user_path).unwrap_or_else(|_| User::generate());
         let filters_path = dir.join("filters.json");
@@ -354,6 +436,16 @@ impl AppState {
             fileserver_port: RwLock::new(0),
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
+            updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            callbacks: std::sync::Mutex::new(HashMap::new()),
+            log_file: std::sync::Mutex::new(None),
+            bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
+            wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
+            // The served-xite registry lives in the shared root (the parent of a
+            // per-xite dir), so it spans every xite that shares this root.
+            data_root: Some(data_root.clone()),
+            sites_path: Some(data_root.join("sites.json")),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -639,6 +731,10 @@ impl AppState {
         }
         if let Some(content) = &entry.content {
             settings.apply_content_stats(&content_stats(content));
+            // The node adds a xite after cloning+verifying it, so having content
+            // means it was downloaded. Guards inbound `update`: arbitrary peers
+            // can't push content for sites we never voluntarily fetched.
+            settings.downloaded = Some(now_secs());
         }
         let muted = self.muted_authors().await;
         let (db, db_schema) = match build_xite_db(&entry.storage, &muted) {
@@ -654,6 +750,9 @@ impl AppState {
         }
         // Restore optional-file pins persisted by OptionalManager.
         let pinned = self.load_persisted_pins(&canonical);
+        // Seed the optional-file hashfield from what's already on disk, so we
+        // advertise held optional files immediately (getHashfield/findHashIds).
+        let hashfield = compute_hashfield(&entry.storage, entry.content.as_ref());
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -669,8 +768,97 @@ impl AppState {
                 started_task_num: 0,
                 workers: 0,
                 pinned,
+                hashfield,
+                peer_hashfields: HashMap::new(),
             },
         );
+        // Record the served-xite list so it is restored on the next start.
+        self.persist_sites().await;
+    }
+
+    // --- SiteManager: persist the served-xite list across restarts ----------
+
+    /// Persist the served xites to `sites.json` (keyed by signed content
+    /// address; aliases collapse to one entry). The file is EpixNet's
+    /// `SiteManager.save` schema - `{address: {…settings…}}` with the settings
+    /// flat at the top level - so a Python node can read it and vice versa.
+    /// The display alias (e.g. `dashboard.epix`) rides along as an extra
+    /// `display` key inside the settings dict (Python preserves unknown keys).
+    pub async fn persist_sites(&self) {
+        let Some(path) = &self.sites_path else { return };
+        let xites = self.xites.read().await;
+        let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
+        for (key, x) in xites.iter() {
+            let canonical = canonical_address(x.content.as_ref(), key);
+            // Prefer the human-readable alias (e.g. `dashboard.epix`) as display.
+            let display = if key != &canonical { Some(key.clone()) } else { None };
+            let entry = map.entry(canonical).or_insert_with(|| json!(x.settings));
+            if let (Some(d), Value::Object(obj)) = (display, entry) {
+                obj.insert("display".to_string(), json!(d));
+            }
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(map)) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    /// Restore xites recorded in `sites.json`: for each, point storage at
+    /// `<root>/<canonical>`, load + verify the on-disk content.json, and add it
+    /// (plus its display alias). Skips entries already served and any whose
+    /// content.json is missing or fails verification. Returns how many were
+    /// restored. Call once at startup before serving.
+    pub async fn restore_sites(self: &Arc<Self>) -> usize {
+        let (Some(path), Some(root)) = (&self.sites_path, &self.data_root) else { return 0 };
+        let map: serde_json::Map<String, Value> = match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => return 0,
+        };
+        let mut restored = 0;
+        for (canonical, entry) in map {
+            if self.has_any_alias(&canonical).await {
+                continue;
+            }
+            let dir = root.join(&canonical);
+            let storage = XiteStorage::new(&dir);
+            // Load + verify the on-disk content.json under the canonical address.
+            let Ok(addr) = Address::parse(canonical.clone()) else { continue };
+            let mut xite = Xite::new(addr, storage.clone());
+            match xite.load_content() {
+                Ok(true) => {}
+                _ => continue, // no content.json, or it failed signature verification
+            }
+            let content = xite.content.clone();
+            // Settings live flat in the entry (EpixNet schema); accept the old
+            // nested `{"settings": {…}}` form too.
+            let settings_src = entry.get("settings").cloned().unwrap_or_else(|| entry.clone());
+            let saved: Option<XiteSettings> = serde_json::from_value(settings_src).ok();
+            self.add_xite(&canonical, XiteEntry { storage: storage.clone(), content: content.clone() })
+                .await;
+            // Reapply the persisted user-facing settings (ownership, serving,
+            // size limit, favourite, added time) that add_xite can't derive
+            // from content.json.
+            if let Some(saved) = saved {
+                let mut xites = self.xites.write().await;
+                if let Some(x) = xites.get_mut(&canonical) {
+                    x.settings.own = saved.own;
+                    x.settings.serving = saved.serving;
+                    x.settings.size_limit = saved.size_limit;
+                    x.settings.autodownloadoptional = saved.autodownloadoptional;
+                    x.settings.favorite = saved.favorite;
+                    if saved.added > 0 {
+                        x.settings.added = saved.added;
+                    }
+                }
+            }
+            // Re-add the display alias (e.g. `dashboard.epix`) if one was saved.
+            if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
+                if display != canonical {
+                    self.add_xite(display, XiteEntry { storage, content }).await;
+                }
+            }
+            restored += 1;
+        }
+        restored
     }
 
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
@@ -680,6 +868,201 @@ impl AppState {
             x.peers.add_many(addrs, now_secs());
             x.settings.peers = x.peers.len() as i64;
         }
+    }
+
+    /// Connectable public peers for a PEX reply: up to `need`, excluding any in
+    /// `exclude` (peers the requester already sent us) and private/loopback
+    /// addresses. Resolves aliases so any key sharing the canonical address
+    /// draws from the same peer set.
+    pub async fn pex_peers(
+        &self,
+        address: &str,
+        need: usize,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Vec<PeerAddr> {
+        let xites = self.xites.read().await;
+        let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
+        x.peers
+            .peers()
+            .filter(|p| p.is_connectable() && !p.addr.is_private())
+            .filter(|p| !exclude.contains(&p.addr.to_string()))
+            .map(|p| p.addr.clone())
+            .take(need)
+            .collect()
+    }
+
+    /// content.json files modified after `since` (ms), as `{inner_path:
+    /// modified}` - the `listModified` reply. Only the root content.json is
+    /// tracked until includes land, so this returns it when newer than `since`.
+    pub async fn list_modified(&self, address: &str, since: f64) -> serde_json::Map<String, Value> {
+        let mut out = serde_json::Map::new();
+        let xites = self.xites.read().await;
+        if let Some(x) = self.resolve_xite(&xites, address) {
+            if let Some(modified) =
+                x.content.as_ref().and_then(|c| c.get("modified")).and_then(|v| v.as_f64())
+            {
+                if modified > since {
+                    out.insert("content.json".to_string(), json!(modified));
+                }
+            }
+        }
+        out
+    }
+
+    /// Our optional-file hashfield bytes for a xite (`getHashfield` reply).
+    pub async fn hashfield_bytes(&self, address: &str) -> Option<Vec<u8>> {
+        let xites = self.xites.read().await;
+        self.resolve_xite(&xites, address).map(|x| x.hashfield.to_bytes())
+    }
+
+    /// Record a peer's advertised hashfield (`setHashfield`). Also registers the
+    /// peer if new.
+    pub async fn set_peer_hashfield(&self, address: &str, peer: &PeerAddr, raw: &[u8]) -> bool {
+        let mut xites = self.xites.write().await;
+        let key = xites
+            .iter()
+            .find(|(k, x)| {
+                k.as_str() == address || canonical_address(x.content.as_ref(), k) == address
+            })
+            .map(|(k, _)| k.clone());
+        let Some(key) = key else { return false };
+        let x = xites.get_mut(&key).unwrap();
+        x.peers.add(peer.clone(), now_secs());
+        x.settings.peers = x.peers.len() as i64;
+        x.peer_hashfields
+            .insert(peer.to_string(), epix_xite::Hashfield::from_bytes(raw));
+        true
+    }
+
+    /// Mark that we now hold an optional file (add its hash id to our hashfield).
+    pub async fn hashfield_add(&self, address: &str, sha512: &str) {
+        let mut xites = self.xites.write().await;
+        if let Some(x) = xites.get_mut(address) {
+            x.hashfield.add_hash(sha512);
+        }
+    }
+
+    /// For `findHashIds`: which known peers advertise each requested hash id,
+    /// packed and bucketed by ip type (`{hash_id: [packed_addr]}` per bucket),
+    /// plus the hash ids we ourselves hold (`my`). Up to 20 peers per hash id.
+    pub async fn find_hash_ids(
+        &self,
+        address: &str,
+        hash_ids: &[u16],
+    ) -> (
+        HashMap<u16, Vec<Vec<u8>>>, // ipv4
+        HashMap<u16, Vec<Vec<u8>>>, // ipv6
+        HashMap<u16, Vec<Vec<u8>>>, // onion
+        Vec<u16>,                   // my
+    ) {
+        let (mut v4, mut v6, mut onion) = (HashMap::new(), HashMap::new(), HashMap::new());
+        let mut mine = Vec::new();
+        let xites = self.xites.read().await;
+        let Some(x) = self.resolve_xite(&xites, address) else {
+            return (v4, v6, onion, mine);
+        };
+        for &id in hash_ids {
+            if x.hashfield.has_id(id) {
+                mine.push(id);
+            }
+            for peer in x.peers.peers() {
+                let has = x.peer_hashfields.get(&peer.addr.to_string()).is_some_and(|hf| hf.has_id(id));
+                if !has || !peer.is_connectable() {
+                    continue;
+                }
+                let (Some(bucket), Some(packed)) = (
+                    match peer.addr.ip_type() {
+                        epix_core::IpType::Ipv4 => Some(&mut v4),
+                        epix_core::IpType::Ipv6 => Some(&mut v6),
+                        epix_core::IpType::Onion => Some(&mut onion),
+                        epix_core::IpType::Rns => None,
+                    },
+                    peer.addr.pack(),
+                ) else {
+                    continue;
+                };
+                let list: &mut Vec<Vec<u8>> = bucket.entry(id).or_default();
+                if list.len() < 20 {
+                    list.push(packed);
+                }
+            }
+        }
+        (v4, v6, onion, mine)
+    }
+
+    /// Receive a pushed optional file (`pushFile`): verify its declared size and
+    /// sha512 from content.json, write it, and record it in our hashfield.
+    /// Mirrors EpixNet's `actionPushFile`. Returns an Ok/error message string.
+    pub async fn apply_push_file(
+        &self,
+        site: &str,
+        inner_path: &str,
+        body: &[u8],
+    ) -> Result<String, String> {
+        let (key, info) = {
+            let xites = self.xites.read().await;
+            let x = self.resolve_xite(&xites, site).ok_or("Unknown site")?;
+            if x.settings.downloaded.is_none() {
+                return Err("Site not yet downloaded".into());
+            }
+            // File must be declared (required or optional) in content.json.
+            let info = x
+                .content
+                .as_ref()
+                .and_then(|c| {
+                    c.get("files")
+                        .and_then(|f| f.get(inner_path))
+                        .or_else(|| c.get("files_optional").and_then(|f| f.get(inner_path)))
+                })
+                .ok_or("File not in content.json")?;
+            let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let sha512 = info.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Find the real serving key so we write to the right storage.
+            let key = xites
+                .iter()
+                .find(|(k, x)| {
+                    k.as_str() == site || canonical_address(x.content.as_ref(), k) == site
+                })
+                .map(|(k, _)| k.clone())
+                .ok_or("Unknown site")?;
+            (key, (size, sha512))
+        };
+        let (expected_size, expected_hash) = info;
+        if body.len() as i64 != expected_size {
+            return Err("File size mismatch".into());
+        }
+        let actual = XiteStorage::hash_bytes(body);
+        if actual != expected_hash {
+            return Err("File verify failed".into());
+        }
+        {
+            let xites = self.xites.read().await;
+            let x = xites.get(&key).ok_or("Unknown site")?;
+            x.storage.write(inner_path, body).map_err(|e| e.to_string())?;
+        }
+        self.hashfield_add(&key, &expected_hash).await;
+        Ok("File pushed".into())
+    }
+
+    /// Find a managed xite by a key that may be its serving key or its signed
+    /// content address (alias-aware).
+    fn resolve_xite<'a>(
+        &self,
+        xites: &'a HashMap<String, ManagedXite>,
+        address: &str,
+    ) -> Option<&'a ManagedXite> {
+        xites.get(address).or_else(|| {
+            xites
+                .values()
+                .find(|x| canonical_address(x.content.as_ref(), address) == address)
+        })
+    }
+
+    /// True if we serve a xite under `address` (its serving key or signed
+    /// content address).
+    pub async fn has_any_alias(&self, address: &str) -> bool {
+        let xites = self.xites.read().await;
+        self.resolve_xite(&xites, address).is_some()
     }
 
     // --- PeerDb: persist known peers across restarts ------------------------
@@ -943,12 +1326,14 @@ impl AppState {
                 return Ok(false); // already current
             }
 
-            // Verify + apply the newer content.json, then sync its changed files.
+            // Verify + apply the newer content.json (full signer/rules check,
+            // size-limited), then sync its changed files.
             let mut xite = Xite::new(
                 Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
                 view.storage.clone(),
             );
-            xite.set_content(&bytes).map_err(|e| e.to_string())?; // checks signature + writes
+            let limit = self.size_limit_bytes(address).await;
+            xite.set_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
             self.update_content(address, xite.content.clone()).await;
 
             let needed = xite.files_needed().len();
@@ -1026,6 +1411,74 @@ impl AppState {
     /// The user's auth (identity) address for a xite.
     pub async fn user_auth_address(&self, address: &str) -> Result<String, String> {
         self.user.write().await.auth_address(address)
+    }
+
+    // --- Certs (certAdd / certSelect / certSet / certList) ------------------
+
+    /// Add a cert obtained from an ID provider, bound to the xite's current auth
+    /// address, and (if newly added) select it globally. Returns:
+    /// `Ok(Some(true))` added + selected, `Ok(None)` unchanged (identical),
+    /// `Ok(Some(false))` a different cert exists for the domain (needs the user
+    /// to confirm replacement). Persists on change.
+    pub async fn cert_add(
+        &self,
+        address: &str,
+        domain: &str,
+        auth_type: &str,
+        auth_user_name: &str,
+        cert_sign: &str,
+    ) -> Result<Option<bool>, String> {
+        let mut user = self.user.write().await;
+        let auth_address = user.auth_address(address)?;
+        let res = user.add_cert(&auth_address, domain, auth_type, auth_user_name, cert_sign)?;
+        if res == Some(true) {
+            user.set_cert_global(Some(domain));
+        }
+        drop(user);
+        if res == Some(true) {
+            self.save_user().await;
+        }
+        Ok(res)
+    }
+
+    /// Replace an existing cert for `domain` (used after the user confirms the
+    /// change prompt), then select it globally.
+    pub async fn cert_replace(
+        &self,
+        address: &str,
+        domain: &str,
+        auth_type: &str,
+        auth_user_name: &str,
+        cert_sign: &str,
+    ) -> Result<(), String> {
+        let mut user = self.user.write().await;
+        let auth_address = user.auth_address(address)?;
+        user.delete_cert(domain);
+        user.add_cert(&auth_address, domain, auth_type, auth_user_name, cert_sign)?;
+        user.set_cert_global(Some(domain));
+        drop(user);
+        self.save_user().await;
+        Ok(())
+    }
+
+    /// Select a cert domain on all sites (portable cert), or clear with an empty
+    /// domain. `certSet`. Persists.
+    pub async fn cert_set(&self, domain: &str) {
+        let d = if domain.is_empty() { None } else { Some(domain) };
+        self.user.write().await.set_cert_global(d);
+        self.save_user().await;
+    }
+
+    /// The user's certs for `certList` (`[{auth_address, auth_type,
+    /// auth_user_name, domain, selected}]`).
+    pub async fn cert_list(&self, address: &str) -> Vec<Value> {
+        self.user.write().await.cert_list(address)
+    }
+
+    /// Whether the user already holds a cert for `domain` (used by certAdd to
+    /// decide whether to prompt for replacement).
+    pub async fn has_cert(&self, domain: &str) -> bool {
+        self.user.read().await.certs.contains_key(domain)
     }
 
     /// The configured Epix chain RPC URL (Vrf / XidResolver), or the default.
@@ -1178,10 +1631,12 @@ impl AppState {
             if XiteStorage::hash_bytes(&bytes) == info.sha512 {
                 xite.storage.write(inner_path, &bytes).map_err(|e| e.to_string())?;
                 self.set_peer_connected(address, &peer, true).await;
-                // Count optional bytes downloaded.
+                // Count optional bytes downloaded and advertise it in our
+                // hashfield so peers can discover we now hold it.
                 if xite.optional_files().iter().any(|f| f.inner_path == inner_path) {
                     if let Some(x) = self.xites.write().await.get_mut(address) {
                         x.settings.optional_downloaded += info.size;
+                        x.hashfield.add_hash(&info.sha512);
                     }
                 }
                 return Ok(true);
@@ -1369,6 +1824,126 @@ impl AppState {
     /// (`getPiecefields`). A big file is one with a `piecemap` + `piece_size` in
     /// content.json; a piece counts as held when the on-disk bytes verify against
     /// the piecemap. Files without their piecemap on disk are skipped.
+    /// Begin a Bigfile upload (`bigfileUploadInit`): check the user may write to
+    /// this site (owner, or their auth address is a valid signer), stash the
+    /// upload under a fresh nonce, and return `(nonce, piece_size,
+    /// file_relative_path)`. The caller POSTs the bytes to
+    /// `/EpixNet-Internal/BigfileUpload?upload_nonce=<nonce>`.
+    pub async fn bigfile_upload_init(
+        &self,
+        address: &str,
+        inner_path: &str,
+        size: u64,
+    ) -> Result<(String, usize, String), String> {
+        // Permission: own the site, or the user's auth address is a valid signer.
+        let owned = self.xites.read().await.get(address).map(|x| x.settings.own).unwrap_or(false);
+        if !owned {
+            let auth = self.user.write().await.auth_address(address).unwrap_or_default();
+            let content = self.content(address).await;
+            let is_signer = content
+                .as_ref()
+                .and_then(|c| c.get("signers"))
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.iter().any(|s| s.as_str() == Some(&auth)))
+                || content.as_ref().and_then(|c| c.get("address")).and_then(|v| v.as_str())
+                    == Some(&auth);
+            if !is_signer {
+                return Err("Forbidden, you can only modify your own files".into());
+            }
+        }
+        const PIECE_SIZE: usize = 1024 * 1024;
+        let inner_path = inner_path.trim_start_matches('/').to_string();
+        let piecemap_inner_path = format!("{inner_path}.piecemap.msgpack");
+        let file_relative_path =
+            inner_path.rsplit('/').next().unwrap_or(&inner_path).to_string();
+        let nonce = random_hex(16);
+        self.bigfile_uploads.lock().unwrap().insert(
+            nonce.clone(),
+            BigfileUpload {
+                address: address.to_string(),
+                inner_path,
+                size,
+                piece_size: PIECE_SIZE,
+                piecemap_inner_path,
+            },
+        );
+        Ok((nonce, PIECE_SIZE, file_relative_path))
+    }
+
+    /// Complete a Bigfile upload (`/EpixNet-Internal/BigfileUpload` POST): hash
+    /// the body into pieces + a merkle root, write the file and (for a multi-
+    /// piece file) its `.piecemap.msgpack`, add a `files_optional` entry to the
+    /// on-disk root content.json (unsigned - the owner signs later via
+    /// `siteSign`), and advertise the file in our hashfield. Consumes the nonce.
+    pub async fn bigfile_upload_finish(
+        &self,
+        nonce: &str,
+        body: &[u8],
+    ) -> Result<BigfileUploadResult, String> {
+        let upload = self
+            .bigfile_uploads
+            .lock()
+            .unwrap()
+            .remove(nonce)
+            .ok_or("Unknown or expired upload nonce")?;
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(&upload.address)
+            .map(|x| x.storage.clone())
+            .ok_or("Unknown site")?;
+
+        let hash = epix_xite::hash_bigfile(body, upload.piece_size);
+        storage.write(&upload.inner_path, body).map_err(|e| e.to_string())?;
+
+        let piece_num = hash.piece_hashes.len();
+        let mut entry = json!({
+            "sha512": hash.merkle_root,
+            "size": body.len(),
+        });
+        if piece_num > 1 {
+            // Multi-piece: write the piecemap and record it in the entry.
+            let file_name =
+                upload.inner_path.rsplit('/').next().unwrap_or(&upload.inner_path);
+            let blob = epix_xite::build_piecemap(file_name, &hash);
+            storage.write(&upload.piecemap_inner_path, &blob).map_err(|e| e.to_string())?;
+            let piecemap_rel =
+                upload.piecemap_inner_path.rsplit('/').next().unwrap_or(&upload.piecemap_inner_path);
+            if let Value::Object(m) = &mut entry {
+                m.insert("piecemap".into(), json!(piecemap_rel));
+                m.insert("piece_size".into(), json!(hash.piece_size));
+            }
+        }
+
+        // Add to the on-disk root content.json's files_optional (unsigned).
+        let mut content: Value = storage
+            .read("content.json")
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(|| json!({}));
+        if let Value::Object(root) = &mut content {
+            let files_opt = root
+                .entry("files_optional")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Value::Object(fo) = files_opt {
+                fo.insert(upload.inner_path.clone(), entry);
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&content).map_err(|e| e.to_string())?;
+        storage.write("content.json", &bytes).map_err(|e| e.to_string())?;
+        // Refresh our in-memory view + advertise the file.
+        self.update_content(&upload.address, Some(content)).await;
+        self.hashfield_add(&upload.address, &hash.merkle_root).await;
+
+        Ok(BigfileUploadResult {
+            merkle_root: hash.merkle_root,
+            piece_num,
+            piece_size: hash.piece_size,
+            inner_path: upload.inner_path,
+        })
+    }
+
     pub async fn our_piecefields(&self, address: &str) -> std::collections::HashMap<String, Vec<u8>> {
         let mut out = std::collections::HashMap::new();
         let content = self.content(address).await;
@@ -1747,9 +2322,72 @@ impl AppState {
             xites.keys().cloned().collect()
         };
         // Push the updated connection/peer counts to any connected UI.
-        for address in addresses {
-            self.push_site_info(&address).await;
+        for address in &addresses {
+            self.push_site_info(address).await;
         }
+
+        // PEX: keep the peer set self-healing between announces. Cheap - a few
+        // peers per xite - so run it each connection cycle.
+        for address in &addresses {
+            self.run_pex(address, 3, 5).await;
+        }
+    }
+
+    /// Peer-exchange one xite: ask a few connectable peers for their peers and
+    /// fold in any new ones. Trackers/DHT bootstrap discovery; PEX keeps it
+    /// self-healing between announces (EpixNet runs this in its cleanup loop).
+    /// Returns how many new peers were learned.
+    pub async fn run_pex(&self, address: &str, max_peers: usize, need: i64) -> usize {
+        let Some(transport) = self.transport.read().await.clone() else { return 0 };
+        let canonical = {
+            let xites = self.xites.read().await;
+            let Some(x) = self.resolve_xite(&xites, address) else { return 0 };
+            canonical_address(x.content.as_ref(), address)
+        };
+        // The peers we offer them (packed by type), and the set we already know.
+        let ours = self.connectable_peers(address, 10).await;
+        let mut known: std::collections::HashSet<String> =
+            ours.iter().map(|p| p.to_string()).collect();
+        let (mut ipv4, mut ipv6, mut onion) = (Vec::new(), Vec::new(), Vec::new());
+        for p in &ours {
+            if p.is_private() {
+                continue;
+            }
+            match (p.ip_type(), p.pack()) {
+                (epix_core::IpType::Ipv4, Some(b)) => ipv4.push(b),
+                (epix_core::IpType::Ipv6, Some(b)) => ipv6.push(b),
+                (epix_core::IpType::Onion, Some(b)) => onion.push(b),
+                _ => {}
+            }
+        }
+
+        let mut learned: Vec<PeerAddr> = Vec::new();
+        for peer in ours.iter().take(max_peers) {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
+                conn.handshake().await.ok()?;
+                conn.pex(&canonical, ipv4.clone(), ipv6.clone(), onion.clone(), need).await.ok()
+            })
+            .await;
+            let Ok(Some(reply)) = got else { continue };
+            self.set_peer_connected(address, peer, true).await;
+            let unpacked = reply
+                .ipv4
+                .iter()
+                .chain(reply.ipv6.iter())
+                .filter_map(|b| PeerAddr::unpack_ip(b))
+                .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)));
+            for p in unpacked {
+                if known.insert(p.to_string()) {
+                    learned.push(p);
+                }
+            }
+        }
+        let count = learned.len();
+        if count > 0 {
+            self.add_peers(address, learned).await;
+        }
+        count
     }
 
     /// Live connection stats (`connection`, `connection_in`, `connection_onion`,
@@ -1775,6 +2413,11 @@ impl AppState {
         }
         let message = message.into();
         println!("[{level}] {message}");
+        // Append to the on-disk log file, if one is configured.
+        if let Some(file) = self.log_file.lock().unwrap().as_mut() {
+            use std::io::Write;
+            let _ = writeln!(file, "[{}] [{level}] {message}", now_secs());
+        }
         let line = json!([now_secs() as f64, level, message]);
         {
             let mut logs = self.logs.write().await;
@@ -1879,6 +2522,153 @@ impl AppState {
     /// timeout_ms]`). Ungated - notifications reach every connection.
     pub fn push_notification(&self, kind: &str, message: &str, timeout_ms: i64) {
         self.push_event("notification", json!([kind, message, timeout_ms]), None, None);
+    }
+
+    /// Build the `serverInfo` payload (shared by the `serverInfo` command and
+    /// the `setServerInfo` push).
+    pub async fn server_info(&self) -> Value {
+        let mut user_settings = self.global_settings().await;
+        if let Value::Object(m) = &mut user_settings {
+            m.entry("theme").or_insert(json!("light"));
+            m.entry("use_system_theme").or_insert(json!(false));
+        }
+        let connections = self.connection_stats().await.total;
+        let plugins = self.plugins().await;
+        #[cfg(feature = "multiuser")]
+        let (multiuser, multiuser_admin, master_address) =
+            (true, true, self.multiuser_list().await.first().cloned().unwrap_or_default());
+        #[cfg(not(feature = "multiuser"))]
+        let (multiuser, multiuser_admin, master_address): (bool, bool, String) =
+            (false, false, String::new());
+        let language = self
+            .config_get("language")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "en".to_string());
+        let (port_opened, detected_ip) = self.port_status().await;
+        let configured_ip = self
+            .config_get("ip_external")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|x| !x.is_empty());
+        let ip_external = if let Some(ip) = configured_ip {
+            json!(ip)
+        } else if let (true, Some(ip)) = (port_opened, detected_ip) {
+            json!(ip)
+        } else {
+            json!(false)
+        };
+        let fileserver_port = self.fileserver_port().await;
+        json!({
+            "version": self.version,
+            "rev": 8192,
+            "platform": std::env::consts::OS,
+            "dist_type": "standalone",
+            "ip_external": ip_external,
+            "port_opened": port_opened,
+            "fileserver_ip": "127.0.0.1",
+            "fileserver_port": fileserver_port,
+            "tor_enabled": false,
+            "tor_status": "Disabled",
+            "tor_has_meek_bridges": false,
+            "tor_use_bridges": false,
+            "ui_ip": "127.0.0.1",
+            "ui_port": 43110,
+            "debug": false,
+            "offline": false,
+            "multiuser": multiuser,
+            "multiuser_admin": multiuser_admin,
+            "master_address": master_address,
+            "connections": connections,
+            "timecorrection": 0.0,
+            "lib_verify_best": "sslcrypto",
+            "plugins": plugins,
+            "plugins_rev": {},
+            "user_settings": user_settings,
+            "language": language,
+        })
+    }
+
+    /// Push the latest `serverInfo` (`setServerInfo`) on the `serverChanged`
+    /// channel, so the dashboard's server readouts update live (plugins,
+    /// connection counts, tor status, …).
+    pub async fn push_server_info(&self) {
+        let info = self.server_info().await;
+        self.push_event("setServerInfo", info, Some("serverChanged"), None);
+    }
+
+    /// Push a file/site progress event (`progress [inner_path, done, total]`),
+    /// so the wrapper's loading bar advances during a download.
+    pub fn push_progress(&self, address: &str, inner_path: &str, done: i64, total: i64) {
+        self.push_event(
+            "progress",
+            json!([inner_path, done, total]),
+            None,
+            Some(address.to_string()),
+        );
+    }
+
+    /// Ask the wrapper to navigate (`redirect <url>`).
+    pub fn push_redirect(&self, address: &str, url: &str) {
+        self.push_event("redirect", json!(url), None, Some(address.to_string()));
+    }
+
+    /// Inject a script into the wrapper (`injectScript <script>`).
+    pub fn push_inject_script(&self, address: &str, script: &str) {
+        self.push_event("injectScript", json!(script), None, Some(address.to_string()));
+    }
+
+    /// Push a `{cmd, params, to}` event that expects a reply, and return a
+    /// receiver for the wrapper's answer (delivered as `{cmd:"response", to}`).
+    /// Used by `confirm`/`prompt`.
+    fn push_cmd_await(
+        &self,
+        cmd: &str,
+        params: Value,
+        target: Option<String>,
+    ) -> tokio::sync::oneshot::Receiver<Value> {
+        let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.callbacks.lock().unwrap().insert(id, tx);
+        let payload = json!({ "cmd": cmd, "params": params, "to": id }).to_string();
+        let _ = self.events.send(UiEvent { channel: None, target, payload });
+        rx
+    }
+
+    /// Resolve a pending wrapper callback (`{cmd:"response", to}`). Returns true
+    /// if a callback was waiting on `to`.
+    pub fn resolve_callback(&self, to: i64, result: Value) -> bool {
+        if let Some(tx) = self.callbacks.lock().unwrap().remove(&to) {
+            let _ = tx.send(result);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ask the wrapper to confirm (`confirm [body, button_title]`); resolves to
+    /// the user's choice. Times out to `false` if no wrapper answers.
+    pub async fn confirm(&self, address: &str, body: &str, button_title: &str) -> bool {
+        let rx = self.push_cmd_await(
+            "confirm",
+            json!([body, button_title]),
+            Some(address.to_string()),
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(v)) => v.as_bool().unwrap_or(!v.is_null()),
+            _ => false,
+        }
+    }
+
+    /// Ask the wrapper to prompt for input (`prompt [body, type]`); resolves to
+    /// the entered string, or None on timeout/cancel.
+    pub async fn prompt(&self, address: &str, body: &str, input_type: &str) -> Option<String> {
+        let rx =
+            self.push_cmd_await("prompt", json!([body, input_type]), Some(address.to_string()));
+        match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+            Ok(Ok(Value::String(s))) => Some(s),
+            _ => None,
+        }
     }
 
     /// Enforce chart-db retention (drop old datapoints, reclaim space). Called
@@ -2164,6 +2954,47 @@ impl AppState {
         storage.write(inner_path, bytes).map_err(|e| e.to_string())
     }
 
+    /// Delete a file from a xite's storage (`fileDelete`). If the file is an
+    /// optional file, its `files_optional` entry is removed from the stored
+    /// content.json as well (matching EpixNet's `actionFileDelete`; the
+    /// content.json becomes changed-needs-signing).
+    pub async fn delete_file(&self, address: &str, inner_path: &str) -> Result<(), String> {
+        let (storage, content) = {
+            let x = self.xites.read().await;
+            let e = x.get(address).ok_or("unknown xite")?;
+            (e.storage.clone(), e.content.clone())
+        };
+        let is_optional = content
+            .as_ref()
+            .and_then(|c| c.get("files_optional"))
+            .and_then(|f| f.get(inner_path))
+            .is_some();
+        if is_optional {
+            if let Ok(bytes) = storage.read("content.json") {
+                if let Ok(mut json) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(map) =
+                        json.get_mut("files_optional").and_then(|f| f.as_object_mut())
+                    {
+                        if map.remove(inner_path).is_some() {
+                            if let Ok(out) = serde_json::to_vec(&json) {
+                                let _ = storage.write("content.json", &out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if storage.exists(inner_path) {
+            storage
+                .delete(inner_path)
+                .map_err(|e| format!("Delete error: {e}"))?;
+        } else if !is_optional {
+            return Err("Delete error: file does not exist".into());
+        }
+        self.push_site_info_event(address, "file_deleted").await;
+        Ok(())
+    }
+
     /// Sign a xite's content.json with `privatekey` (rebuilds the files map,
     /// bumps `modified` past the previous value), updating the managed content
     /// + settings. Returns the signed content.json bytes. The key must own the
@@ -2203,6 +3034,18 @@ impl AppState {
     /// Publish `inner_path` to the xite's connectable peers via the `update`
     /// command. Returns how many peers accepted it. `sitePublish`.
     pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
+        self.publish_to(address, inner_path, 20).await
+    }
+
+    /// Publish to at most `limit` connectable peers. The re-broadcast of an
+    /// accepted inbound update uses a small limit (EpixNet uses 3) so a push
+    /// floods the network without every node hammering every peer.
+    pub async fn publish_to(
+        &self,
+        address: &str,
+        inner_path: &str,
+        limit: usize,
+    ) -> Result<usize, String> {
         let body = self
             .xites
             .read()
@@ -2210,13 +3053,14 @@ impl AppState {
             .get(address)
             .and_then(|x| x.storage.read(inner_path).ok())
             .ok_or("nothing to publish")?;
-        // The version we're publishing, for the offline-peer propagation hint.
+        // The version we're publishing: sent with the update so receivers can
+        // short-circuit, and used for the offline-peer propagation hint.
         let modified = serde_json::from_slice::<Value>(&body)
             .ok()
-            .and_then(|c| c.get("modified").and_then(|v| v.as_i64()))
-            .unwrap_or(0);
+            .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
         let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
-        let peers = self.connectable_peers(address, 20).await;
+        let peers = self.connectable_peers(address, limit).await;
 
         let mut published = 0;
         for peer in peers {
@@ -2224,15 +3068,227 @@ impl AppState {
             if conn.handshake().await.is_err() {
                 continue;
             }
-            if conn.update(address, inner_path, &body).await.is_ok() {
+            if conn.update(address, inner_path, &body, modified).await.is_ok() {
                 self.set_peer_connected(address, &peer, true).await;
                 published += 1;
                 // Live-hook: tell the peer (acting as a propagation node) about
                 // the new version so peers that are offline now can pull it later.
-                let _ = epix_propagation::announce_update(&mut conn, address, modified).await;
+                let _ = epix_propagation::announce_update(&mut conn, address, modified as i64).await;
             }
         }
         Ok(published)
+    }
+
+    /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
+    /// command - the receive half of the publish round-trip). Mirrors EpixNet's
+    /// `FileRequest.actionUpdate`: reject unknown/not-downloaded sites, skip
+    /// versions we already have, verify the signature before accepting, then
+    /// download the changed files in the background and re-publish to a few
+    /// peers so the update floods.
+    ///
+    /// `body` is the pushed content.json (None/empty when the sender omitted it
+    /// - EpixNet drops bodies over 1 MB - in which case it is fetched back from
+    /// `sender`). `modified_hint` is the pushed version, letting us short-
+    /// circuit without parsing. Returns whether the update was applied.
+    pub async fn apply_inbound_update(
+        self: &Arc<Self>,
+        site: &str,
+        inner_path: &str,
+        body: Option<Vec<u8>>,
+        modified_hint: Option<f64>,
+        sender: Option<PeerAddr>,
+        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    ) -> Result<InboundUpdate, String> {
+        // A xite may be served under aliases (raw address + `.epix` name); an
+        // update applies to every key sharing the pushed canonical address.
+        let keys: Vec<String> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(k, x)| {
+                    k.as_str() == site || canonical_address(x.content.as_ref(), k) == site
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let Some(key) = keys.first().cloned() else {
+            return Err("Unknown site".into());
+        };
+        if !self.is_serving(&key).await {
+            return Err("Unknown site".into());
+        }
+        // Only accept pushes for sites we voluntarily downloaded.
+        let (downloaded, current_modified) = {
+            let xites = self.xites.read().await;
+            let x = xites.get(&key).ok_or("Unknown site")?;
+            let current = x
+                .content
+                .as_ref()
+                .and_then(|c| c.get("modified"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            (x.settings.downloaded.is_some(), current)
+        };
+        if !downloaded {
+            return Err("Site not yet downloaded".into());
+        }
+        if !inner_path.ends_with("content.json") {
+            return Err("Only content.json update allowed".into());
+        }
+        // The engine verifies the root signature only so far; nested/user
+        // content.json verification is the content-rules parity work (Tier 0).
+        if inner_path != "content.json" {
+            return Err(format!(
+                "File {inner_path} invalid: non-root content.json updates not supported yet"
+            ));
+        }
+
+        // Same or older version than ours: record the sender as a peer and stop.
+        if let Some(hint) = modified_hint {
+            if hint <= current_modified {
+                if let Some(s) = &sender {
+                    self.add_peers(&key, [s.clone()]).await;
+                }
+                return Ok(InboundUpdate::NotChanged);
+            }
+        }
+
+        // Body-less update (large content.json): fetch it back from the sender.
+        let bytes = match body.filter(|b| !b.is_empty()) {
+            Some(b) => b,
+            None => {
+                let fetched = match (&sender, self.transport.read().await.clone()) {
+                    (Some(s), Some(transport)) => {
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            let mut conn =
+                                Connection::connect(transport.as_ref(), s).await.ok()?;
+                            conn.handshake().await.ok()?;
+                            conn.get_file(site, inner_path).await.ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                    _ => None,
+                };
+                fetched.ok_or("File invalid update: Can't download updated file")?
+            }
+        };
+
+        let new: Value =
+            serde_json::from_slice(&bytes).map_err(|_| "File invalid JSON".to_string())?;
+        let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // Reject far-future timestamps (EpixNet allows at most now + 1 day) so
+        // a peer can't pin a bogus "newest" version that blocks real updates.
+        if new_modified > (now_secs() as f64) + 60.0 * 60.0 * 24.0 {
+            return Err(format!(
+                "File {inner_path} invalid: Modify timestamp is in the far future!"
+            ));
+        }
+        if new_modified <= current_modified {
+            if let Some(s) = &sender {
+                self.add_peers(&key, [s.clone()]).await;
+            }
+            return Ok(InboundUpdate::NotChanged);
+        }
+
+        // Don't process the same pushed version twice concurrently.
+        let uri = format!("{site}/{inner_path}:{new_modified}");
+        if !self.updates_in_flight.lock().unwrap().insert(uri.clone()) {
+            return Ok(InboundUpdate::NotChanged);
+        }
+
+        // Full verification (signers/rules/size limit); only writes if valid.
+        let mut xite = match self.xite_view(&key).await {
+            Ok(x) => x,
+            Err(e) => {
+                self.updates_in_flight.lock().unwrap().remove(&uri);
+                return Err(e);
+            }
+        };
+        let limit = self.size_limit_bytes(&key).await;
+        if let Err(e) = xite.set_content_limited(&bytes, limit) {
+            self.updates_in_flight.lock().unwrap().remove(&uri);
+            return Err(format!("File {inner_path} invalid: {e}"));
+        }
+        for k in &keys {
+            self.update_content(k, xite.content.clone()).await;
+        }
+        if let Some(s) = &sender {
+            self.add_peers(&key, [s.clone()]).await;
+        }
+
+        // Download the changed files and re-publish in the background, like
+        // EpixNet - the sender gets its "ok" response right away.
+        let state = self.clone();
+        let inner = inner_path.to_string();
+        tokio::spawn(async move {
+            state.finish_inbound_update(keys, xite, sender, inner, uri, diffs).await;
+        });
+        Ok(InboundUpdate::Applied)
+    }
+
+    /// The deferred half of [`Self::apply_inbound_update`]: apply any diffs the
+    /// publisher sent (patching our old file copies to skip downloads), sync the
+    /// files still needed (preferring the sender), rebuild db views, then
+    /// re-publish to a few peers so the update spreads.
+    async fn finish_inbound_update(
+        &self,
+        keys: Vec<String>,
+        xite: Xite,
+        sender: Option<PeerAddr>,
+        inner_path: String,
+        uri: String,
+        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    ) {
+        let key = keys[0].clone();
+        // Apply diffs first: patch our old copy of each changed file and keep it
+        // only if the result matches the new content.json's declared hash. A
+        // bad/mismatched diff is ignored - the file just gets downloaded below.
+        if !diffs.is_empty() {
+            let mut patched = 0;
+            for (file_path, actions) in &diffs {
+                let Some(info) = xite.file_info(file_path) else { continue };
+                if xite.storage.verify(file_path, &info.sha512) {
+                    continue; // already current
+                }
+                let Ok(old) = xite.storage.read(file_path) else { continue };
+                let Ok(new) = epix_content::patch(&old, actions) else { continue };
+                if XiteStorage::hash_bytes(&new) == info.sha512
+                    && xite.storage.write(file_path, &new).is_ok()
+                {
+                    patched += 1;
+                }
+            }
+            if patched > 0 {
+                self.log("INFO", format!("Applied {patched} diff(s) for {key}")).await;
+            }
+        }
+        if let Some(transport) = self.transport.read().await.clone() {
+            let mut peers = self.connectable_peers(&key, 10).await;
+            if let Some(s) = sender {
+                if !peers.contains(&s) {
+                    peers.insert(0, s);
+                }
+            }
+            let needed = xite.files_needed().len();
+            if needed > 0 && !peers.is_empty() {
+                self.set_worker_stats(&key, needed, peers.len().min(8), needed).await;
+                if let Ok(report) =
+                    epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await
+                {
+                    self.add_transfer(&key, report.bytes, 0).await;
+                }
+                self.set_worker_stats(&key, 0, 0, 0).await;
+                // Data files changed - rebuild the db views under every alias.
+                for k in &keys {
+                    self.update_content(k, xite.content.clone()).await;
+                }
+            }
+            // EpixNet re-publishes an accepted update to up to 3 more peers.
+            let _ = self.publish_to(&key, &inner_path, 3).await;
+        }
+        self.updates_in_flight.lock().unwrap().remove(&uri);
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -2304,6 +3360,39 @@ impl AppState {
         Some(entries)
     }
 
+    /// Recursively list every file under `inner_path` as inner paths relative to
+    /// the xite root (`fileList`). Stays within the root; `None` if unknown.
+    pub async fn walk_files(&self, address: &str, inner_path: &str) -> Option<Vec<String>> {
+        let root = self.xites.read().await.get(address)?.storage.root().to_path_buf();
+        let start = if inner_path.is_empty() { root.clone() } else { root.join(inner_path) };
+        if !start.starts_with(&root) {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![start];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(rel) = path.strip_prefix(&root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        Some(out)
+    }
+
+    /// A xite's known bad (missing/failed) files (`siteBadFiles`): inner paths
+    /// still needed. Empty if the xite is unknown or fully downloaded.
+    pub async fn bad_files(&self, address: &str) -> Vec<String> {
+        let xites = self.xites.read().await;
+        let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
+        x.settings.cache.bad_files.keys().cloned().collect()
+    }
+
     /// Set the known peer count for a xite (from discovery), persisting nothing
     /// here - it's derived runtime state.
     pub async fn set_peer_count(&self, address: &str, peers: i64) {
@@ -2317,6 +3406,19 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.size_limit = Some(size_limit_mb);
         }
+    }
+
+    /// A xite's effective size limit in bytes (its per-xite override or the
+    /// default), for content.json verification. Unknown xite -> default.
+    pub async fn size_limit_bytes(&self, address: &str) -> i64 {
+        let mb = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.size_limit(DEFAULT_SIZE_LIMIT_MB))
+            .unwrap_or(DEFAULT_SIZE_LIMIT_MB);
+        mb.saturating_mul(1024 * 1024)
     }
 
     /// Pause/resume a xite (`sitePause`/`siteResume`). A paused xite is skipped
@@ -2508,6 +3610,57 @@ impl AppState {
     pub fn wrapper_nonce(&self) -> String {
         let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
         format!("{n:016x}")
+    }
+
+    /// Append the node's log lines to `path` as well as stdout / the in-memory
+    /// buffer, so activity survives restarts. Opens in append mode.
+    pub fn set_log_file(&self, path: &std::path::Path) {
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            *self.log_file.lock().unwrap() = Some(file);
+        }
+    }
+
+    /// Issue a one-time wrapper nonce (tracked so an inner file request can be
+    /// recognized as coming through the wrapper), EpixNet's
+    /// `server.wrapper_nonces`.
+    pub fn issue_wrapper_nonce(&self) -> String {
+        let nonce = random_hex(16);
+        let mut set = self.wrapper_nonces.lock().unwrap();
+        set.insert(nonce.clone());
+        // Bound the set so it can't grow without limit on a long-running node.
+        if set.len() > 2000 {
+            if let Some(oldest) = set.iter().next().cloned() {
+                set.remove(&oldest);
+            }
+        }
+        nonce
+    }
+
+    /// Consume a wrapper nonce; true if it was outstanding (valid). Matches
+    /// EpixNet's remove-on-use.
+    pub fn consume_wrapper_nonce(&self, nonce: &str) -> bool {
+        self.wrapper_nonces.lock().unwrap().remove(nonce)
+    }
+
+    /// Record a wrapper's Host as an allowed WebSocket origin (EpixNet adds
+    /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
+    pub fn allow_ws_origin(&self, host: &str) {
+        if !host.is_empty() {
+            self.allowed_ws_origins.lock().unwrap().insert(host.to_string());
+        }
+    }
+
+    /// Whether a WebSocket `Origin` host is allowed: same as the request host,
+    /// loopback, or a previously-served wrapper host.
+    pub fn is_ws_origin_allowed(&self, origin_host: &str, request_host: &str) -> bool {
+        if origin_host.is_empty() || origin_host == request_host {
+            return true;
+        }
+        let host_only = origin_host.split(':').next().unwrap_or(origin_host);
+        if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "[::1]" {
+            return true;
+        }
+        self.allowed_ws_origins.lock().unwrap().contains(origin_host)
     }
 
     /// Persist the user identity if this node has a data dir.
@@ -2748,6 +3901,23 @@ fn format_log_line(line: &Value) -> String {
 /// The address a permission grant is keyed by: the xite's signed content
 /// address when known (so a site served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
+/// Build the optional-file hashfield from what's present on disk: for each
+/// `files_optional` entry we actually hold (hash-verified), record its hash id.
+fn compute_hashfield(storage: &XiteStorage, content: Option<&Value>) -> epix_xite::Hashfield {
+    let mut hf = epix_xite::Hashfield::new();
+    let Some(files) = content.and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
+    else {
+        return hf;
+    };
+    for (path, info) in files {
+        let Some(sha512) = info.get("sha512").and_then(|v| v.as_str()) else { continue };
+        if storage.verify(path, sha512) {
+            hf.add_hash(sha512);
+        }
+    }
+    hf
+}
+
 fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
     content
         .and_then(|c| c.get("address"))
@@ -3637,5 +4807,47 @@ mod tests {
         s.add_xite("dashboard.epix", XiteEntry { storage: store(), content: Some(content) }).await;
         assert!(s.site_has_admin("epix1dash").await);
         assert!(s.site_has_admin("dashboard.epix").await);
+    }
+
+    #[tokio::test]
+    async fn confirm_resolves_via_wrapper_callback() {
+        let s = AppState::new("test");
+        let mut events = s.subscribe_events();
+
+        // Server asks the wrapper to confirm; the future is pending.
+        let s2 = s.clone();
+        let handle = tokio::spawn(async move { s2.confirm("talk.epix", "Sure?", "Yes").await });
+
+        // The pushed confirm event carries a `to` id we reply to.
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "confirm");
+        let to = payload["to"].as_i64().unwrap();
+        assert!(s.resolve_callback(to, json!(true)));
+
+        // confirm() now resolves to the wrapper's answer.
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(answer, "confirm resolves true when the wrapper accepts");
+
+        // An unknown callback id resolves nothing.
+        assert!(!s.resolve_callback(999999, json!(true)));
+    }
+
+    #[tokio::test]
+    async fn server_info_push_targets_server_changed() {
+        let s = AppState::new("test");
+        let mut events = s.subscribe_events();
+        s.push_server_info().await;
+        let ev = events.try_recv().unwrap();
+        assert_eq!(ev.channel.as_deref(), Some("serverChanged"));
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "setServerInfo");
+        assert!(payload["params"]["version"].is_string());
     }
 }

@@ -48,6 +48,21 @@ impl XiteStorage {
         std::fs::write(&p, bytes).map_err(Error::Io)
     }
 
+    /// Delete a stored file, pruning any directories the removal left empty.
+    pub fn delete(&self, inner_path: &str) -> Result<()> {
+        let p = self.path(inner_path)?;
+        std::fs::remove_file(&p).map_err(Error::Io)?;
+        // Best effort: remove now-empty parent dirs up to (not including) root.
+        let mut dir = p.parent().map(Path::to_path_buf);
+        while let Some(d) = dir {
+            if d == self.root || std::fs::remove_dir(&d).is_err() {
+                break;
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        Ok(())
+    }
+
     /// content.json file hash: hex of the first 32 bytes of SHA-512
     /// (`sha512(bytes).hexdigest()[:64]`).
     pub fn hash_bytes(bytes: &[u8]) -> String {

@@ -15,14 +15,27 @@ pub struct Cache {
     pub bad_files: HashMap<String, i64>,
 }
 
-/// The persisted per-xite state, mirroring EpixNet's `Site.settings`.
+fn default_true() -> bool {
+    true
+}
+
+fn random_key() -> String {
+    epix_crypt::new_seed()
+}
+
+/// The persisted per-xite state, mirroring EpixNet's `Site.settings`. Every
+/// field Python doesn't write has a serde default, so an EpixNet-written
+/// `sites.json` entry deserializes as-is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XiteSettings {
+    #[serde(default = "default_true")]
     pub serving: bool,
+    #[serde(default)]
     pub own: bool,
     #[serde(default)]
     pub permissions: Vec<String>,
     /// Unix time the xite was added.
+    #[serde(default)]
     pub added: i64,
     /// Unix time the last file finished downloading (None until first sync).
     #[serde(default)]
@@ -53,8 +66,10 @@ pub struct XiteSettings {
     #[serde(default)]
     pub favorite: bool,
     /// Random key authorizing this xite's WebSocket (part of the wrapper URL).
+    #[serde(default = "random_key")]
     pub wrapper_key: String,
     /// Random key authorizing AJAX/media requests.
+    #[serde(default = "random_key")]
     pub ajax_key: String,
     #[serde(default)]
     pub cache: Cache,

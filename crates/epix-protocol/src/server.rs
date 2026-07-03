@@ -57,7 +57,7 @@ impl PeerServer {
 /// and returns when the peer disconnects.
 pub async fn serve_stream(
     handler: Arc<dyn RequestHandler>,
-    peer: PeerAddr,
+    mut peer: PeerAddr,
     mut stream: epix_transport::PeerStream,
     version: &str,
     rev: i64,
@@ -69,6 +69,18 @@ pub async fn serve_stream(
         let params = vget(&req, "params").cloned().unwrap_or(Value::Nil);
 
         let body = if cmd == "handshake" {
+            // The connection arrives from an ephemeral port; the handshake
+            // advertises the peer's fileserver port, so rebind the address
+            // handlers see to one we can dial back (inbound `update` fetches
+            // body-less updates from the sender, and adds it as a peer).
+            let advertised = vget(&params, "fileserver_port").and_then(|v| v.as_i64());
+            if let (PeerAddr::Ip(addr), Some(port)) = (&peer, advertised) {
+                if port > 0 && port <= u16::MAX as i64 {
+                    let mut dialable = *addr;
+                    dialable.set_port(port as u16);
+                    peer = PeerAddr::Ip(dialable);
+                }
+            }
             handshake_response(version, rev)
         } else {
             handler.handle(&peer, &cmd, &params).await

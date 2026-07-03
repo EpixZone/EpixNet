@@ -563,6 +563,7 @@ version = "0.1.0"
 dependencies = [
  "epix-core",
  "epix-crypt",
+ "regex",
  "serde",
  "serde_json",
 ]
@@ -571,6 +572,7 @@ dependencies = [
 name = "epix-core"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "epix-crypt",
  "hex",
  "serde",
@@ -736,7 +738,10 @@ dependencies = [
  "epix-content",
  "epix-core",
  "epix-crypt",
+ "epix-dht",
+ "epix-dht-net",
  "epix-discovery",
+ "epix-propagation",
  "epix-protocol",
  "epix-transport",
  "epix-ui",
@@ -764,7 +769,9 @@ dependencies = [
  "epix-ui",
  "epix-worker",
  "epix-xite",
+ "libc",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -785,6 +792,7 @@ dependencies = [
  "axum 0.7.9",
  "base64",
  "epix-chain",
+ "epix-content",
  "epix-core",
  "epix-crypt",
  "epix-db",

@@ -1,6 +1,7 @@
 //! `epix-xite` - xite lifecycle: storage, content.json, and peer announcing.
 
 pub mod announcer;
+pub mod hashfield;
 pub mod settings;
 pub mod piecefield;
 pub mod piecemap;
@@ -8,9 +9,10 @@ pub mod xite;
 pub mod storage;
 
 pub use announcer::announce;
+pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, XiteSettings};
 pub use piecefield::Piecefield;
-pub use piecemap::parse_piecemap;
+pub use piecemap::{build_piecemap, hash_bigfile, parse_piecemap, BigfileHash};
 pub use xite::{FileEntry, Xite};
 pub use storage::XiteStorage;
 
@@ -80,7 +82,8 @@ mod tests {
             content["files"]["index.html"]["sha512"],
             XiteStorage::hash_bytes(b"<h1>hi</h1>")
         );
-        assert_eq!(content["modified"], 1777992698.0);
+        // Whole-second timestamps sign as integers (EpixNet writes int(time.time())).
+        assert_eq!(content["modified"], 1777992698);
         assert!(content["files"].get("content.json").is_none(), "content.json isn't listed in files");
         assert!(xite.files_needed().is_empty());
 

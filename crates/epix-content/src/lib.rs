@@ -5,8 +5,12 @@
 //! with `epix-crypt`'s `dbl`-format recoverable ECDSA.
 
 pub mod canonical;
+pub mod diff;
+pub mod verify;
 
 pub use canonical::dumps_sorted;
+pub use diff::{patch, DiffAction};
+pub use verify::{verify_content_file, VerifyContext, VerifyError};
 use epix_core::{Error, Result};
 use serde_json::Value;
 

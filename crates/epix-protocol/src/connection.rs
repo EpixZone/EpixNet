@@ -4,6 +4,7 @@ use crate::msg::{read_msg, send_msg, vget, vmap};
 use epix_core::{Error, PeerAddr, Result};
 use epix_transport::{PeerStream, Transport};
 use rmpv::Value;
+use std::collections::HashMap;
 
 /// The handshake info exchanged with a peer.
 #[derive(Debug, Clone)]
@@ -14,6 +15,26 @@ pub struct HandshakeInfo {
     pub peer_id: String,
     pub fileserver_port: u16,
     pub crypt_supported: Vec<String>,
+}
+
+/// A `pex` reply's peers, packed by bucket. Unpack with `PeerAddr::unpack_ip`
+/// (ipv4/ipv6) and `PeerAddr::unpack_onion` (onion).
+#[derive(Debug, Clone, Default)]
+pub struct PexReply {
+    pub ipv4: Vec<Vec<u8>>,
+    pub ipv6: Vec<Vec<u8>>,
+    pub onion: Vec<Vec<u8>>,
+}
+
+/// A `findHashIds` reply: which peers hold each optional-file hash id (packed
+/// addresses, bucketed by type) and which hash ids the answering peer itself
+/// holds (`my`).
+#[derive(Debug, Clone, Default)]
+pub struct FindHashIdsReply {
+    pub ipv4: HashMap<u16, Vec<Vec<u8>>>,
+    pub ipv6: HashMap<u16, Vec<Vec<u8>>>,
+    pub onion: HashMap<u16, Vec<Vec<u8>>>,
+    pub my: Vec<u16>,
 }
 
 fn parse_handshake(v: &Value) -> HandshakeInfo {
@@ -158,13 +179,155 @@ impl Connection {
     /// Publish an updated `content.json` to the peer (`update` FileRequest). The
     /// peer verifies `body`'s signature before accepting, so a bad update is
     /// rejected on their side. `body` is the raw content.json bytes.
-    pub async fn update(&mut self, xite: &str, inner_path: &str, body: &[u8]) -> Result<Value> {
+    pub async fn update(
+        &mut self,
+        xite: &str,
+        inner_path: &str,
+        body: &[u8],
+        modified: f64,
+    ) -> Result<Value> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            ("inner_path", Value::from(inner_path)),
+            ("body", Value::Binary(body.to_vec())),
+            // The version being pushed; receivers skip validation when they
+            // already have this or newer (EpixNet peers send it too).
+            ("modified", Value::from(modified)),
+        ]);
+        self.request("update", params).await
+    }
+
+    /// Exchange peers (`pex`): send some of our connectable peers (packed by
+    /// type) and `need`, get back the peer's peers we don't have. Returns the
+    /// packed peer byte-lists by bucket (`ipv4`, `ipv6`, `onion`); the caller
+    /// unpacks with `PeerAddr::unpack_*` (kept out of the protocol layer).
+    pub async fn pex(
+        &mut self,
+        xite: &str,
+        peers: Vec<Vec<u8>>,
+        peers_ipv6: Vec<Vec<u8>>,
+        peers_onion: Vec<Vec<u8>>,
+        need: i64,
+    ) -> Result<PexReply> {
+        let pack = |list: Vec<Vec<u8>>| Value::Array(list.into_iter().map(Value::Binary).collect());
+        let mut params = vec![
+            ("site", Value::from(xite)),
+            ("need", Value::from(need)),
+            ("peers", pack(peers)),
+        ];
+        if !peers_ipv6.is_empty() {
+            params.push(("peers_ipv6", pack(peers_ipv6)));
+        }
+        if !peers_onion.is_empty() {
+            params.push(("peers_onion", pack(peers_onion)));
+        }
+        let resp = self.request("pex", vmap(params)).await?;
+        let extract = |field: &str| -> Vec<Vec<u8>> {
+            match vget(&resp, field) {
+                Some(Value::Array(list)) => list
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Binary(b) => Some(b.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        Ok(PexReply {
+            ipv4: extract("peers"),
+            ipv6: extract("peers_ipv6"),
+            onion: extract("peers_onion"),
+        })
+    }
+
+    /// Ask which content.json files the peer changed after `since` (ms).
+    /// Returns `{inner_path: modified}`.
+    pub async fn list_modified(&mut self, xite: &str, since: f64) -> Result<Value> {
+        let params = vmap(vec![("site", Value::from(xite)), ("since", Value::from(since))]);
+        self.request("listModified", params).await
+    }
+
+    /// Ask which optional files the peer holds (`getHashfield`); returns the
+    /// packed hash-id bytes (unpack with `epix_xite::Hashfield::from_bytes`).
+    pub async fn get_hashfield(&mut self, xite: &str) -> Result<Vec<u8>> {
+        let params = vmap(vec![("site", Value::from(xite))]);
+        let resp = self.request("getHashfield", params).await?;
+        match vget(&resp, "hashfield_raw") {
+            Some(Value::Binary(b)) => Ok(b.clone()),
+            _ => Err(Error::Protocol("getHashfield response has no hashfield_raw".into())),
+        }
+    }
+
+    /// Tell the peer which optional files we hold (`setHashfield`).
+    pub async fn set_hashfield(&mut self, xite: &str, hashfield_raw: Vec<u8>) -> Result<Value> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            ("hashfield_raw", Value::Binary(hashfield_raw)),
+        ]);
+        self.request("setHashfield", params).await
+    }
+
+    /// Ask the peer which peers it knows hold each optional-file hash id
+    /// (`findHashIds`). Returns `(hash_id -> packed peer addrs)` buckets for
+    /// ipv4/ipv6/onion plus the hash ids the peer itself holds - the same
+    /// shape EpixNet's `actionFindHashIds` answers. Unpack the packed
+    /// addresses with `epix_core::PeerAddr::unpack_ip`/`unpack_onion`.
+    pub async fn find_hash_ids(&mut self, xite: &str, hash_ids: &[u16]) -> Result<FindHashIdsReply> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            (
+                "hash_ids",
+                Value::Array(hash_ids.iter().map(|id| Value::from(*id as i64)).collect()),
+            ),
+        ]);
+        let resp = self.request("findHashIds", params).await?;
+        let bucket = |key: &str| -> HashMap<u16, Vec<Vec<u8>>> {
+            let mut out = HashMap::new();
+            if let Some(Value::Map(entries)) = vget(&resp, key) {
+                for (k, v) in entries {
+                    let (Some(id), Value::Array(addrs)) = (k.as_i64(), v) else { continue };
+                    if !(0..=u16::MAX as i64).contains(&id) {
+                        continue;
+                    }
+                    let packed: Vec<Vec<u8>> = addrs
+                        .iter()
+                        .filter_map(|a| match a {
+                            Value::Binary(b) => Some(b.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    out.insert(id as u16, packed);
+                }
+            }
+            out
+        };
+        let my = match vget(&resp, "my") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .filter(|n| (0..=u16::MAX as i64).contains(n))
+                .map(|n| n as u16)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(FindHashIdsReply {
+            ipv4: bucket("peers"),
+            ipv6: bucket("peers_ipv6"),
+            onion: bucket("peers_onion"),
+            my,
+        })
+    }
+
+    /// Push an optional file directly to the peer (`pushFile`); the peer
+    /// verifies size + sha512 against content.json before accepting.
+    pub async fn push_file(&mut self, xite: &str, inner_path: &str, body: &[u8]) -> Result<Value> {
         let params = vmap(vec![
             ("site", Value::from(xite)),
             ("inner_path", Value::from(inner_path)),
             ("body", Value::Binary(body.to_vec())),
         ]);
-        self.request("update", params).await
+        self.request("pushFile", params).await
     }
 
     /// Ask which pieces of each big file the peer holds (`getPiecefields`).

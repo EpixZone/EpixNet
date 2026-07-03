@@ -37,6 +37,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "notificationDismiss",
     "notificationMute",
     "notificationMuteStatus",
+    "feedSearch",
     "notificationQuery",
     "optionalLimitSet",
     "optionalLimitStats",
@@ -60,7 +61,9 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteList",
     "sitePause",
     "siteRecoverPrivatekey",
+    "siteReload",
     "siteResume",
+    "siteSetAutodownloadBigfileLimit",
     "siteSetAutodownloadoptional",
     "siteSetLimit",
     "siteSetOwned",
@@ -314,6 +317,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteSign),
         Arc::new(SitePublish),
         Arc::new(FileWrite),
+        Arc::new(FileDelete),
         Arc::new(FileRules),
         Arc::new(CorsPermission),
         Arc::new(SiteSetOwned),
@@ -331,7 +335,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(PeerAdd),
         Arc::new(ServerShowdirectory),
         Arc::new(XidClearCache),
-        Arc::new(NotificationDismiss),
+        Arc::new(NotificationDismiss { cmd: "notificationDismiss" }),
+        Arc::new(NotificationDismiss { cmd: "notificationDismissSelf" }),
         Arc::new(SiteblockIgnoreAddSite),
         // CryptMessage
         Arc::new(UserPublickey),
@@ -396,6 +401,21 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(UserSetGlobalSettings),
         Arc::new(WrapperNonce),
         Arc::new(FileGet),
+        // Certs: obtain + select an ID-provider identity.
+        Arc::new(CertAdd),
+        Arc::new(CertSelect),
+        Arc::new(CertSet),
+        Arc::new(CertList),
+        // File listing + site maintenance + feed search.
+        Arc::new(DirList),
+        Arc::new(FileList),
+        Arc::new(SiteReload),
+        Arc::new(SiteBadFiles),
+        Arc::new(GetTrackers),
+        Arc::new(FeedSearch),
+        // Bigfile authoring.
+        Arc::new(BigfileUploadInit),
+        Arc::new(SiteSetAutodownloadBigfileLimit),
     ];
     // Multiuser: identity login/switch commands (desktop only).
     #[cfg(feature = "multiuser")]
@@ -607,6 +627,8 @@ impl WsCommand for PluginConfigSet {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         s.state.set_plugin_enabled(name, enabled).await;
+        // The plugin list changed - push updated serverInfo to the dashboard.
+        s.state.push_server_info().await;
         Ok(Value::from("ok"))
     }
 }
@@ -711,78 +733,7 @@ impl WsCommand for ServerInfo {
         "serverInfo"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        // user_settings drives the theme menu; give it theme + use_system_theme.
-        let mut user_settings = s.state.global_settings().await;
-        if let Value::Object(m) = &mut user_settings {
-            m.entry("theme").or_insert(json!("light"));
-            m.entry("use_system_theme").or_insert(json!(false));
-        }
-        let connections = s.state.connection_stats().await.total;
-        let plugins = s.state.plugins().await;
-        // Multiuser: when the feature is built, report the active identity so the
-        // wrapper UI shows the identity switcher. The desktop operator is admin.
-        #[cfg(feature = "multiuser")]
-        let (multiuser, multiuser_admin, master_address) = (
-            true,
-            true,
-            s.state.multiuser_list().await.first().cloned().unwrap_or_default(),
-        );
-        #[cfg(not(feature = "multiuser"))]
-        let (multiuser, multiuser_admin, master_address): (bool, bool, String) =
-            (false, false, String::new());
-        let language = s
-            .state
-            .config_get("language")
-            .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "en".to_string());
-        // Fileserver reachability: the external IP as a string, else false -
-        // matching EpixNet's serverInfo shape. A configured `ip_external` is a
-        // manual override and is always reported; otherwise the UPnP-detected IP
-        // is reported only when the port is actually open.
-        let (port_opened, detected_ip) = s.state.port_status().await;
-        let configured_ip = s
-            .state
-            .config_get("ip_external")
-            .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|x| !x.is_empty());
-        let ip_external = if let Some(ip) = configured_ip {
-            json!(ip)
-        } else if let (true, Some(ip)) = (port_opened, detected_ip) {
-            json!(ip)
-        } else {
-            json!(false)
-        };
-        let fileserver_port = s.state.fileserver_port().await;
-        Ok(json!({
-            "version": s.state.version,
-            "rev": 8192,
-            "platform": std::env::consts::OS,
-            "dist_type": "standalone",
-            "ip_external": ip_external,
-            "port_opened": port_opened,
-            "fileserver_ip": "127.0.0.1",
-            "fileserver_port": fileserver_port,
-            "tor_enabled": false,
-            "tor_status": "Disabled",
-            "tor_has_meek_bridges": false,
-            "tor_use_bridges": false,
-            "ui_ip": "127.0.0.1",
-            "ui_port": 43110,
-            "debug": false,
-            "offline": false,
-            "multiuser": multiuser,
-            "multiuser_admin": multiuser_admin,
-            "master_address": master_address,
-            "connections": connections,
-            "timecorrection": 0.0,
-            "lib_verify_best": "sslcrypto",
-            "plugins": plugins,
-            "plugins_rev": {},
-            "user_settings": user_settings,
-            "language": language,
-        }))
+        Ok(s.state.server_info().await)
     }
 }
 
@@ -945,6 +896,26 @@ impl WsCommand for FileWrite {
             .ok_or("fileWrite: content_base64 required")?;
         let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
         s.state.write_file(&address, inner_path, &bytes).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `fileDelete(inner_path)` - delete a file from the xite (optional files are
+/// also removed from content.json's `files_optional`, like EpixNet).
+struct FileDelete;
+#[async_trait]
+impl WsCommand for FileDelete {
+    fn name(&self) -> &'static str {
+        "fileDelete"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = p
+            .as_str()
+            .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or("fileDelete: inner_path required")?;
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        s.state.delete_file(&address, &inner_path).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -2140,11 +2111,13 @@ impl WsCommand for XidClearCache {
 }
 
 /// `notificationDismiss(center)` - remember a dismissed notification banner.
-struct NotificationDismiss;
+struct NotificationDismiss {
+    cmd: &'static str,
+}
 #[async_trait]
 impl WsCommand for NotificationDismiss {
     fn name(&self) -> &'static str {
-        "notificationDismiss"
+        self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let center = arg_str(p, "center", 0).ok_or("center required")?;
@@ -2175,6 +2148,311 @@ fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
         .or_else(|| p.as_array().and_then(|a| a.get(idx)))
         .and_then(|v| v.as_str())
         .or_else(|| p.as_str())
+}
+
+/// `certAdd` - store a cert issued by an ID provider (bound to the site's auth
+/// address) and select it globally. Not admin (any site can offer a cert).
+struct CertAdd;
+#[async_trait]
+impl WsCommand for CertAdd {
+    fn name(&self) -> &'static str {
+        "certAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let domain = arg_str(p, "domain", 0).ok_or("certAdd: domain required")?;
+        let auth_type = arg_str(p, "auth_type", 1).unwrap_or("web");
+        let auth_user_name = arg_str(p, "auth_user_name", 2).unwrap_or("");
+        let cert = arg_str(p, "cert", 3).unwrap_or("");
+        match s.state.cert_add(&address, domain, auth_type, auth_user_name, cert).await? {
+            Some(true) => {
+                s.state.push_notification(
+                    "done",
+                    &format!("New certificate added: {auth_type}/{auth_user_name}@{domain}"),
+                    5000,
+                );
+                s.state.push_site_info(&address).await;
+                Ok(Value::from("ok"))
+            }
+            // A different cert already exists for this domain: ask the user to
+            // confirm the change (EpixNet's confirm prompt), then replace.
+            Some(false) => {
+                let ok = s
+                    .state
+                    .confirm(
+                        &address,
+                        &format!("Change your certificate to {auth_type}/{auth_user_name}@{domain}?"),
+                        "Change",
+                    )
+                    .await;
+                if !ok {
+                    return Ok(Value::from("Not changed"));
+                }
+                s.state
+                    .cert_replace(&address, domain, auth_type, auth_user_name, cert)
+                    .await?;
+                s.state.push_notification(
+                    "done",
+                    &format!("Certificate changed to {auth_type}/{auth_user_name}@{domain}"),
+                    5000,
+                );
+                s.state.push_site_info(&address).await;
+                Ok(Value::from("ok"))
+            }
+            None => Ok(Value::from("Not changed")),
+        }
+    }
+}
+
+/// `certSelect` - choose which stored identity to use on this site. Full picker
+/// UI needs wrapper confirm/injectScript events (a follow-up); for now this
+/// selects the first acceptable cert (or leaves the current one) and returns the
+/// account list so a caller can display choices.
+struct CertSelect;
+#[async_trait]
+impl WsCommand for CertSelect {
+    fn name(&self) -> &'static str {
+        "certSelect"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let accepted: Vec<String> = p
+            .get("accepted_domains")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let accept_any = p.get("accept_any").and_then(|v| v.as_bool()).unwrap_or(accepted.is_empty());
+
+        let certs = s.state.cert_list(&address).await;
+        // Pick an acceptable cert to select (already-selected wins; else first).
+        let acceptable = |domain: &str| accept_any || accepted.iter().any(|d| d == domain);
+        let already = certs.iter().find(|c| c["selected"].as_bool() == Some(true));
+        let choice = already
+            .filter(|c| c["domain"].as_str().is_some_and(acceptable))
+            .or_else(|| certs.iter().find(|c| c["domain"].as_str().is_some_and(acceptable)));
+        if let Some(cert) = choice {
+            if let Some(domain) = cert["domain"].as_str() {
+                s.state.cert_set(domain).await;
+                s.state.push_site_info(&address).await;
+            }
+        }
+        // Return the accounts so a UI can present them (None + the certs).
+        Ok(json!(certs))
+    }
+}
+
+/// `certSet {domain}` - select a cert on all sites (portable cert), or clear
+/// with an empty domain. Admin.
+struct CertSet;
+#[async_trait]
+impl WsCommand for CertSet {
+    fn name(&self) -> &'static str {
+        "certSet"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let domain = arg_str(p, "domain", 0).unwrap_or("");
+        s.state.cert_set(domain).await;
+        if let Ok(addr) = s.address() {
+            let addr = addr.to_string();
+            s.state.push_site_info(&addr).await;
+        }
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `certList` - the user's certs with which is selected for this site. Admin.
+struct CertList;
+#[async_trait]
+impl WsCommand for CertList {
+    fn name(&self) -> &'static str {
+        "certList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        Ok(json!(s.state.cert_list(&address).await))
+    }
+}
+
+/// `bigfileUploadInit {inner_path, size}` - start a Bigfile upload; returns the
+/// POST URL, piece size, and the file's path relative to content.json. The
+/// browser then POSTs the bytes to that URL.
+struct BigfileUploadInit;
+#[async_trait]
+impl WsCommand for BigfileUploadInit {
+    fn name(&self) -> &'static str {
+        "bigfileUploadInit"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = arg_str(p, "inner_path", 0).ok_or("bigfileUploadInit: inner_path required")?;
+        let size = p
+            .get("size")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_u64())
+            .ok_or("bigfileUploadInit: size required")?;
+        let (nonce, piece_size, file_relative_path) =
+            s.state.bigfile_upload_init(&address, inner_path, size).await?;
+        Ok(json!({
+            "url": format!("/EpixNet-Internal/BigfileUpload?upload_nonce={nonce}"),
+            "piece_size": piece_size,
+            "inner_path": inner_path,
+            "file_relative_path": file_relative_path,
+        }))
+    }
+}
+
+/// `siteSetAutodownloadBigfileLimit {limit}` - the max big-file size (MB) to
+/// auto-download; persisted in config. Admin.
+struct SiteSetAutodownloadBigfileLimit;
+#[async_trait]
+impl WsCommand for SiteSetAutodownloadBigfileLimit {
+    fn name(&self) -> &'static str {
+        "siteSetAutodownloadBigfileLimit"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let limit = p
+            .get("limit")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_i64())
+            .ok_or("limit required")?;
+        s.state.config_set("autodownload_bigfile_size_limit", json!(limit)).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `dirList {inner_path, stats?}` - list a directory's entries. With `stats`,
+/// returns `[{name, is_dir, size}]`; otherwise just the names. Alias-/cors-/
+/// merger-aware via resolve_target.
+struct DirList;
+#[async_trait]
+impl WsCommand for DirList {
+    fn name(&self) -> &'static str {
+        "dirList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = arg_str(p, "inner_path", 0).unwrap_or("");
+        let stats = p.get("stats").and_then(|v| v.as_bool()).unwrap_or(false);
+        let (address, inner) = s.resolve_target(inner_path).await?;
+        let entries = s.state.list_dir(&address, &inner).await.ok_or("dir not found")?;
+        if stats {
+            Ok(Value::Array(entries))
+        } else {
+            // Names only.
+            Ok(Value::Array(
+                entries.iter().filter_map(|e| e.get("name").cloned()).collect(),
+            ))
+        }
+    }
+}
+
+/// `fileList {inner_path}` - recursively list every file under a directory as
+/// inner paths.
+struct FileList;
+#[async_trait]
+impl WsCommand for FileList {
+    fn name(&self) -> &'static str {
+        "fileList"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = arg_str(p, "inner_path", 0).unwrap_or("");
+        let (address, inner) = s.resolve_target(inner_path).await?;
+        let files = s.state.walk_files(&address, &inner).await.ok_or("dir not found")?;
+        Ok(json!(files))
+    }
+}
+
+/// `siteReload {inner_path?}` - re-check the site for a newer content.json and
+/// download changes (EpixNet reloads content + downloads). Admin.
+struct SiteReload;
+#[async_trait]
+impl WsCommand for SiteReload {
+    fn name(&self) -> &'static str {
+        "siteReload"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        s.state.resync_xite(&address).await?;
+        s.state.push_site_info(&address).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteBadFiles` - inner paths still missing/failed for this site.
+struct SiteBadFiles;
+#[async_trait]
+impl WsCommand for SiteBadFiles {
+    fn name(&self) -> &'static str {
+        "siteBadFiles"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!(s.state.bad_files(s.address()?).await))
+    }
+}
+
+/// `getTrackers` - the trackers this node announces to (AnnounceShare's shared
+/// set), as address strings.
+struct GetTrackers;
+#[async_trait]
+impl WsCommand for GetTrackers {
+    fn name(&self) -> &'static str {
+        "getTrackers"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let trackers: Vec<String> =
+            s.state.shared_trackers().await.iter().map(|t| t.to_string()).collect();
+        Ok(json!(trackers))
+    }
+}
+
+/// `feedSearch {search, limit?, day_limit?}` - search all followed feeds for a
+/// text match across their rows (title/body/…). Admin.
+struct FeedSearch;
+#[async_trait]
+impl WsCommand for FeedSearch {
+    fn name(&self) -> &'static str {
+        "feedSearch"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let search = arg_str(p, "search", 0).unwrap_or("").to_lowercase();
+        let (limit, day_limit) = feed_limits(p);
+        let follows = s.state.all_follows().await;
+        let mut rows: Vec<Value> = Vec::new();
+        let mut num_sites = 0;
+        for (site, feeds) in &follows {
+            let Some(feeds) = feeds.as_object() else { continue };
+            num_sites += 1;
+            for (name, query_set) in feeds {
+                let (raw, params) = split_feed(query_set);
+                if !is_safe_feed_sql(raw) {
+                    continue;
+                }
+                let full = build_feed_query(raw, day_limit, limit.max(100), params);
+                if !is_safe_feed_sql(&full) {
+                    continue;
+                }
+                let Ok(res) = s.state.db_query(site, &full, &Value::Null).await else { continue };
+                for mut row in res {
+                    // Match the search text against any string field.
+                    let matched = search.is_empty()
+                        || row.as_object().is_some_and(|o| {
+                            o.values().any(|v| {
+                                v.as_str().is_some_and(|s| s.to_lowercase().contains(&search))
+                            })
+                        });
+                    if !matched {
+                        continue;
+                    }
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("site".into(), json!(site));
+                        obj.insert("feed_name".into(), json!(name));
+                    }
+                    rows.push(row);
+                }
+            }
+        }
+        rows.truncate(limit);
+        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
+    }
 }
 
 struct MuteAdd;
@@ -2556,6 +2834,165 @@ mod tests {
         assert_eq!(SiteblockGet.handle(&session, &json!(["1GoodSite"])).await.unwrap(), Value::Bool(false));
         let blocks = SiteblockList.handle(&session, &Value::Null).await.unwrap();
         assert!(blocks["1BadSite"].is_object());
+    }
+
+    #[tokio::test]
+    async fn bigfile_upload_init_and_finish() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = epix_xite::XiteStorage::new(dir.path());
+        storage.write("content.json", br#"{"address":"1Big","files_optional":{}}"#).unwrap();
+        state
+            .add_xite(
+                "1Big",
+                crate::state::XiteEntry {
+                    storage,
+                    // Owned site so the upload permission check passes.
+                    content: Some(json!({ "address": "1Big" })),
+                },
+            )
+            .await;
+        state.set_owned("1Big", true).await;
+
+        // A multi-piece file (3 pieces of 4 bytes) via the state path.
+        let body = b"AAAABBBBCCCC";
+        let (nonce, piece_size, rel) =
+            state.bigfile_upload_init("1Big", "data/movie.bin", body.len() as u64).await.unwrap();
+        assert_eq!(piece_size, 1024 * 1024);
+        assert_eq!(rel, "movie.bin");
+
+        // Finish with a small forced piece size by re-initing won't change piece
+        // size; instead exercise finish with the real 1MB piece (single piece).
+        let result = state.bigfile_upload_finish(&nonce, body).await.unwrap();
+        assert_eq!(result.piece_num, 1, "12 bytes < 1MB is a single piece");
+        assert_eq!(result.merkle_root, epix_xite::XiteStorage::hash_bytes(body));
+
+        // The file was written and content.json gained a files_optional entry.
+        assert_eq!(state.read_file("1Big", "data/movie.bin").await.as_deref(), Some(&body[..]));
+        let content = state.content("1Big").await.unwrap();
+        let entry = &content["files_optional"]["data/movie.bin"];
+        assert_eq!(entry["size"], body.len());
+        assert_eq!(entry["sha512"], result.merkle_root);
+
+        // The nonce is single-use.
+        assert!(state.bigfile_upload_finish(&nonce, body).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dir_and_file_listing() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = epix_xite::XiteStorage::new(dir.path());
+        storage.write("index.html", b"<html>").unwrap();
+        storage.write("js/app.js", b"1").unwrap();
+        storage.write("js/lib/x.js", b"2").unwrap();
+        state
+            .add_xite(
+                "1Files",
+                crate::state::XiteEntry { storage, content: Some(json!({ "address": "1Files" })) },
+            )
+            .await;
+        let session = WsSession::new(state, Some("1Files".into()));
+
+        // dirList of the root: names only (dirs first).
+        let names = DirList.handle(&session, &json!({ "inner_path": "" })).await.unwrap();
+        let names: Vec<String> =
+            names.as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        assert!(names.contains(&"index.html".to_string()));
+        assert!(names.contains(&"js".to_string()));
+
+        // dirList with stats: objects with name/is_dir/size.
+        let stats = DirList.handle(&session, &json!({ "inner_path": "", "stats": true })).await.unwrap();
+        assert!(stats[0].get("is_dir").is_some());
+
+        // fileList recurses.
+        let files = FileList.handle(&session, &json!({ "inner_path": "" })).await.unwrap();
+        let files: Vec<String> =
+            files.as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        assert!(files.contains(&"js/lib/x.js".to_string()), "recursive: {files:?}");
+        assert_eq!(files.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_delete_removes_files_and_optional_entries() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = epix_xite::XiteStorage::new(dir.path());
+        storage.write("data/post.json", b"{}").unwrap();
+        storage.write("movie.mp4", b"xxxx").unwrap();
+        let content = json!({
+            "address": "1Del",
+            "files": { "data/post.json": { "size": 2, "sha512": "aa" } },
+            "files_optional": { "movie.mp4": { "size": 4, "sha512": "bb" } },
+        });
+        storage.write("content.json", &serde_json::to_vec(&content).unwrap()).unwrap();
+        state
+            .add_xite(
+                "1Del",
+                crate::state::XiteEntry { storage: storage.clone(), content: Some(content) },
+            )
+            .await;
+        let session = WsSession::new(state, Some("1Del".into()));
+
+        // A required file: deleted from disk.
+        let out = FileDelete.handle(&session, &json!(["data/post.json"])).await.unwrap();
+        assert_eq!(out, json!("ok"));
+        assert!(!storage.exists("data/post.json"));
+
+        // An optional file: deleted AND dropped from content.json files_optional.
+        FileDelete.handle(&session, &json!(["movie.mp4"])).await.unwrap();
+        assert!(!storage.exists("movie.mp4"));
+        let on_disk: Value =
+            serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap();
+        assert!(on_disk["files_optional"].get("movie.mp4").is_none());
+
+        // A missing non-optional file errors.
+        assert!(FileDelete.handle(&session, &json!(["nope.txt"])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cert_add_select_list_flow() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        state
+            .add_xite(
+                "talk.epix",
+                crate::state::XiteEntry {
+                    storage: epix_xite::XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": "talk.epix" })),
+                },
+            )
+            .await;
+        let session = WsSession::new(state, Some("talk.epix".into()));
+
+        // No certs yet.
+        let list = CertList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0);
+
+        // certAdd stores + selects a cert for this site's identity.
+        CertAdd
+            .handle(&session, &json!({
+                "domain": "zeroid.bit",
+                "auth_type": "web",
+                "auth_user_name": "alice",
+                "cert": "sig",
+            }))
+            .await
+            .unwrap();
+        let list = CertList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["domain"], "zeroid.bit");
+        assert_eq!(list[0]["auth_user_name"], "alice");
+        assert_eq!(list[0]["selected"], true);
+
+        // siteInfo now reports the cert user id.
+        let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["cert_user_id"], "alice@zeroid.bit");
+
+        // certSet "" clears it everywhere.
+        CertSet.handle(&session, &json!([""])).await.unwrap();
+        let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
+        assert!(info["cert_user_id"].is_null());
     }
 
     #[test]

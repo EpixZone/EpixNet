@@ -6,6 +6,7 @@ description = "The local UI server: serves xite files over HTTP and the EpixFram
 
 [dependencies]
 epix-core = { path = "../epix-core" }
+epix-content = { path = "../epix-content" }
 epix-xite = { path = "../epix-xite" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
@@ -33,19 +34,19 @@ flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-getrandom = { version = "0.2", optional = true }
+getrandom = { version = "0.2" }
 sha3 = { version = "0.10", optional = true }
 
 [features]
 # UiPassword: a cookie-session login gate over the whole UI. Off by default and
 # on mobile (a phone's UI is already local to the device); enable for a shared
 # or exposed desktop node.
-ui-password = ["dep:getrandom"]
+ui-password = []
 # Multiuser: multiple master-seed identities with login/switch. Desktop only.
 multiuser = []
 # Benchmark: a /Benchmark diagnostics page timing the node's crypto/hash/pack
 # hot paths (shows off the Rust perf win). Off by default.
-benchmark = ["dep:getrandom", "dep:sha3"]
+benchmark = ["dep:sha3"]
 
 [dev-dependencies]
 async-trait = "0.1"

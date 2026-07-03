@@ -21,6 +21,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
+pub mod handler;
 #[cfg(feature = "local-discovery")]
 pub mod local;
 
@@ -60,6 +61,12 @@ pub struct NodeRuntime {
     config: RuntimeConfig,
     shutdown: Arc<Notify>,
     handles: Vec<JoinHandle<()>>,
+    /// The node's DHT participant (serves `kad` RPCs + drives lookups). Shared
+    /// with the inbound handler so peers can query us as a DHT node.
+    dht: Arc<epix_dht::Node>,
+    /// Store-and-forward propagation store peers announce updates into (served
+    /// by the propagation handler so offline peers can catch up later).
+    prop_store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
 }
 
 impl NodeRuntime {
@@ -68,7 +75,28 @@ impl NodeRuntime {
     }
 
     pub fn with_config(state: Arc<AppState>, trackers: Vec<PeerAddr>, config: RuntimeConfig) -> Self {
-        Self { state, trackers, config, shutdown: Arc::new(Notify::new()), handles: Vec::new() }
+        // A per-process DHT node id (ties to this run; a stable identity-derived
+        // id is a later Sybil-resistance refinement).
+        let seed = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let dht = Arc::new(epix_dht::Node::new(epix_dht::NodeId::hash(seed.as_bytes())));
+        let prop_store =
+            Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
+        Self {
+            state,
+            trackers,
+            config,
+            shutdown: Arc::new(Notify::new()),
+            handles: Vec::new(),
+            dht,
+            prop_store,
+        }
     }
 
     /// Spawn the background loops. Idempotent per instance (call once). The local
@@ -107,6 +135,8 @@ impl NodeRuntime {
                 self.state.clone(),
                 port,
                 self.shutdown.clone(),
+                self.dht.clone(),
+                self.prop_store.clone(),
             )));
             self.handles.push(tokio::spawn(upnp_loop(
                 self.state.clone(),
@@ -172,6 +202,8 @@ async fn announce_loop(
         }
         // Persist the freshly discovered peers so they survive a restart.
         state.persist_peers().await;
+        // Persist the served-xite list (settings/size may have changed).
+        state.persist_sites().await;
     };
     announce().await;
     let mut tick = interval(period);
@@ -279,7 +311,13 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
 /// Serve inbound file requests (seeding) on `port` until shutdown. Peers connect
 /// with the ordinary wire protocol and pull files via `getFile`.
 #[cfg(feature = "inbound-seeding")]
-async fn seed_loop(state: Arc<AppState>, port: u16, shutdown: Arc<Notify>) {
+async fn seed_loop(
+    state: Arc<AppState>,
+    port: u16,
+    shutdown: Arc<Notify>,
+    dht: Arc<epix_dht::Node>,
+    prop_store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
+) {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
         Err(e) => {
@@ -287,9 +325,15 @@ async fn seed_loop(state: Arc<AppState>, port: u16, shutdown: Arc<Notify>) {
             return;
         }
     };
-    let handler = Arc::new(epix_ui::fileserve::FileService::new(state.clone()));
+    // Compose the file, DHT, and propagation services into one handler so this
+    // one listener answers all three (previously only files were served).
+    let handler = Arc::new(handler::NodeHandler::new(
+        Arc::new(epix_ui::fileserve::FileService::new(state.clone())),
+        Arc::new(epix_dht_net::DhtService::new(dht)),
+        Arc::new(epix_propagation::PropagationService::new(prop_store)),
+    ));
     let server = epix_protocol::PeerServer::new(handler);
-    state.log("INFO", format!("Seeding files on port {port}")).await;
+    state.log("INFO", format!("Seeding files (+ DHT + propagation) on port {port}")).await;
     tokio::select! {
         _ = shutdown.notified() => {}
         _ = server.serve(listener) => {}
