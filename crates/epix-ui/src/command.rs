@@ -985,6 +985,7 @@ impl WsCommand for CorsPermission {
             return Err("corsPermission: address required".into());
         }
         for addr in addresses {
+            let addr = require_address(&addr)?;
             s.state.add_permission(&site, &format!("Cors:{addr}")).await;
         }
         Ok(Value::from("ok"))
@@ -1030,13 +1031,15 @@ impl WsCommand for SiteUpdate {
         "siteUpdate"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = p
+        let address = match p
             .get("address")
             .and_then(|v| v.as_str())
             .or_else(|| p.as_str())
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
-            .map(String::from)
-            .unwrap_or(s.address()?.to_string());
+        {
+            Some(a) => require_address(a)?,
+            None => s.address()?.to_string(),
+        };
         // Run in the background (like EpixNet's updateThread) so this returns
         // immediately. Progress shows inline on the dashboard's site row via
         // setSiteInfo events (`updating` -> spinner, `updated` -> done), not a
@@ -1849,7 +1852,7 @@ impl WsCommand for MergerSiteDelete {
             return Err("Not a merger site".into());
         }
         for target in arg_addresses(p) {
-            s.state.remove_xite(&target).await;
+            s.state.remove_xite(&require_address(&target)?).await;
         }
         s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
@@ -1937,9 +1940,19 @@ impl WsCommand for UserLogout {
 
 /// The target xite for a site action: an explicit `address` param, else the
 /// bound xite.
+/// Site commands reference a xite by its bech32 address only. A `.epix` name
+/// (xID) is rejected so commands, events, grants, and persistence all key off
+/// one identity; names are translated to addresses at the HTTP/WS edges.
+fn require_address(addr: &str) -> Result<String, String> {
+    if addr.contains('.') {
+        return Err(format!("Site commands take the epix1 address, not a name: {addr}"));
+    }
+    Ok(addr.to_string())
+}
+
 fn target_address(s: &WsSession, p: &Value) -> Result<String, String> {
     match arg_str(p, "address", 0) {
-        Some(a) => Ok(a.to_string()),
+        Some(a) => require_address(a),
         None => Ok(s.address()?.to_string()),
     }
 }
@@ -2502,8 +2515,9 @@ impl WsCommand for SiteblockAdd {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let site = arg_str(p, "site_address", 0).ok_or("siteblockAdd: site_address required")?;
+        let site = require_address(site)?;
         let reason = arg_str(p, "reason", 1).unwrap_or("");
-        s.state.siteblock_add(site, reason).await;
+        s.state.siteblock_add(&site, reason).await;
         Ok(Value::from("ok"))
     }
 }
@@ -2516,7 +2530,8 @@ impl WsCommand for SiteblockRemove {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let site = arg_str(p, "site_address", 0).ok_or("siteblockRemove: site_address required")?;
-        s.state.siteblock_remove(site).await;
+        let site = require_address(site)?;
+        s.state.siteblock_remove(&site).await;
         Ok(Value::from("ok"))
     }
 }

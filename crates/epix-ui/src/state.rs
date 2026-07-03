@@ -137,6 +137,11 @@ struct ManagedXite {
     storage: XiteStorage,
     content: Option<Value>,
     settings: XiteSettings,
+    /// The human-readable `.epix` name (xID) this xite was resolved from, if
+    /// any. Display metadata only - the map is keyed by the bech32 address and
+    /// every command references the address; names are translated at the
+    /// HTTP/WS edges.
+    display: Option<String>,
     /// Per-xite database (built from dbschema.json), if the xite has one.
     db: Option<Database>,
     /// The parsed dbschema (kept for merger-db rebuilds).
@@ -788,6 +793,7 @@ impl AppState {
                 storage: entry.storage,
                 content: entry.content,
                 settings,
+                display: None,
                 db,
                 db_schema,
                 peers,
@@ -805,6 +811,60 @@ impl AppState {
         self.persist_sites().await;
     }
 
+    /// Record the `.epix` name (xID) a served xite was resolved from. Display
+    /// metadata only; the serving key stays the bech32 address.
+    pub async fn set_display(&self, address: &str, name: &str) {
+        {
+            let mut xites = self.xites.write().await;
+            let Some(x) = xites.get_mut(address) else { return };
+            if x.display.as_deref() == Some(name) {
+                return;
+            }
+            x.display = Some(name.to_string());
+        }
+        self.persist_sites().await;
+    }
+
+    /// The `.epix` name a served xite was resolved from, if any.
+    pub async fn display_of(&self, address: &str) -> Option<String> {
+        self.xites.read().await.get(address).and_then(|x| x.display.clone())
+    }
+
+    /// Resolve a `.epix` name (xID) to the bech32 address of a served xite:
+    /// first the in-memory display metadata, then the on-disk resolve cache
+    /// (only if that address is actually served). `None` if we don't serve it.
+    pub async fn resolve_name(&self, name: &str) -> Option<String> {
+        {
+            let xites = self.xites.read().await;
+            if let Some((k, _)) = xites.iter().find(|(_, x)| x.display.as_deref() == Some(name)) {
+                return Some(k.clone());
+            }
+        }
+        // Fall back to resolve-cache.json (written by the node on every chain
+        // resolution), accepting only addresses we serve.
+        let root = self.data_root.as_ref()?;
+        let cache: serde_json::Map<String, Value> =
+            std::fs::read(root.join("resolve-cache.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())?;
+        let addr = cache.get(name)?.as_str()?.to_string();
+        if self.xites.read().await.contains_key(&addr) {
+            Some(addr)
+        } else {
+            None
+        }
+    }
+
+    /// Normalize a serving reference to the bech32 address: an address passes
+    /// through; a `.epix` name resolves via [`Self::resolve_name`]. Returns the
+    /// input unchanged if the name is unknown (lookups then miss cleanly).
+    pub async fn canonical_key(&self, address_or_name: &str) -> String {
+        if !address_or_name.contains('.') {
+            return address_or_name.to_string();
+        }
+        self.resolve_name(address_or_name).await.unwrap_or_else(|| address_or_name.to_string())
+    }
+
     // --- SiteManager: persist the served-xite list across restarts ----------
 
     /// Persist the served xites to `sites.json` (keyed by signed content
@@ -819,8 +879,10 @@ impl AppState {
         let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
         for (key, x) in xites.iter() {
             let canonical = canonical_address(x.content.as_ref(), key);
-            // Prefer the human-readable alias (e.g. `dashboard.epix`) as display.
-            let display = if key != &canonical { Some(key.clone()) } else { None };
+            // The human-readable name (e.g. `dashboard.epix`) rides along as
+            // display metadata; legacy alias-keyed entries still collapse.
+            let display =
+                x.display.clone().or_else(|| (key != &canonical).then(|| key.clone()));
             let entry = map.entry(canonical).or_insert_with(|| json!(x.settings));
             if let (Some(d), Value::Object(obj)) = (display, entry) {
                 obj.insert("display".to_string(), json!(d));
@@ -879,10 +941,14 @@ impl AppState {
                     }
                 }
             }
-            // Re-add the display alias (e.g. `dashboard.epix`) if one was saved.
+            // The `.epix` name is display metadata, not a second serving key.
             if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
                 if display != canonical {
-                    self.add_xite(display, XiteEntry { storage, content }).await;
+                    self.set_display(&canonical, display).await;
+                    // Older builds keyed the per-site user identity (certs,
+                    // site keys) by the name; move it to the address so the
+                    // identity survives the switch to address-only keys.
+                    self.migrate_user_site_key(display, &canonical).await;
                 }
             }
             restored += 1;
@@ -1310,11 +1376,16 @@ impl AppState {
     }
 
     /// The node's homepage xite - where the standalone admin pages' "back"
-    /// button returns to. Prefers a human-readable alias (e.g. `dashboard.epix`)
-    /// over the canonical address, else the first served xite.
+    /// button returns to. Prefers a human-readable name (e.g. `dashboard.epix`,
+    /// display metadata or a legacy alias key) for the URL, else the first
+    /// served xite's address.
     pub async fn homepage(&self) -> Option<String> {
         let xites = self.xites.read().await;
-        xites.keys().find(|k| k.contains('.')).or_else(|| xites.keys().next()).cloned()
+        xites
+            .values()
+            .find_map(|x| x.display.clone())
+            .or_else(|| xites.keys().find(|k| k.contains('.')).cloned())
+            .or_else(|| xites.keys().next().cloned())
     }
 
     /// Replace a xite's content.json, refreshing its stats and rebuilding its db.
@@ -3669,6 +3740,7 @@ impl AppState {
             "cert_user_id": cert_user_id,
             "xid_directory": xid_directory,
             "address": address,
+            "display": entry.display,
             "address_short": short,
             "address_hash": address_hash,
             "settings": serde_json::to_value(settings).unwrap_or(Value::Null),
@@ -3766,6 +3838,28 @@ impl AppState {
             return true;
         }
         self.allowed_ws_origins.lock().unwrap().contains(origin_host)
+    }
+
+    /// Move a per-site user identity (derived site keys, cert binding, feed
+    /// follows) stored under an old serving key (a `.epix` name, from builds
+    /// that keyed sites by name as well as address) to the bech32 address.
+    /// Never overwrites an existing address-keyed entry.
+    async fn migrate_user_site_key(&self, from: &str, to: &str) {
+        let mut changed = false;
+        {
+            let mut user = self.user.write().await;
+            if let Some(auth) = user.sites.remove(from) {
+                user.sites.entry(to.to_string()).or_insert(auth);
+                changed = true;
+            }
+            if let Some(follows) = user.follows.remove(from) {
+                user.follows.entry(to.to_string()).or_insert(follows);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_user().await;
+        }
     }
 
     /// Persist the user identity if this node has a data dir.
