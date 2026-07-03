@@ -231,13 +231,41 @@ async fn serve(
     // immediately on start), so it does not block the server bind.
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;
-    // Trackers: the configured list (comma-separated), else the default tracker.
-    let trackers: Vec<PeerAddr> = match state.config_get("trackers").await.and_then(|v| v.as_str().map(str::to_string)) {
+    // Trackers: the configured list (comma- or newline-separated), else the
+    // default tracker. `trackers_file` adds any addresses listed in the files it
+    // points at (one path per line), matching EpixNet's dynamic tracker files.
+    let mut trackers: Vec<PeerAddr> = match state.config_get("trackers").await.and_then(|v| v.as_str().map(str::to_string)) {
         Some(list) if !list.trim().is_empty() => {
-            list.split(',').filter_map(|t| PeerAddr::parse(t.trim()).ok()).collect()
+            list.split([',', '\n']).filter_map(|t| PeerAddr::parse(t.trim()).ok()).collect()
         }
         _ => vec![PeerAddr::parse(TRACKER).unwrap()],
     };
+    if let Some(files) = state.config_get("trackers_file").await.and_then(|v| v.as_str().map(str::to_string)) {
+        for path in files.split([',', '\n']).map(str::trim).filter(|p| !p.is_empty()) {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let before = trackers.len();
+                    for line in contents.lines().map(str::trim) {
+                        // Skip blanks and comments; keep anything that parses as a peer.
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Ok(addr) = PeerAddr::parse(line) {
+                            if !trackers.contains(&addr) {
+                                trackers.push(addr);
+                            }
+                        }
+                    }
+                    state
+                        .log("INFO", format!("Loaded {} tracker(s) from {path}", trackers.len() - before))
+                        .await;
+                }
+                Err(e) => {
+                    state.log("WARNING", format!("Could not read trackers file {path}: {e}")).await;
+                }
+            }
+        }
+    }
     state.add_transfer(&address, bytes_recv, 0).await;
     if display != address {
         state.add_transfer(&display, bytes_recv, 0).await;

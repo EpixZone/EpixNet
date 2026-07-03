@@ -57,22 +57,62 @@ fn effective_enabled(name: &str, disabled: &[String], enabled: &[String]) -> boo
 const CONNECTION_POOL_MAX: usize = 8;
 
 /// Editable node config keys shown on the Config page:
-/// `(key, label, default, kind)`. `kind` drives the input widget: `"text"`,
-/// `"bool"`, or `"select:opt1|opt2|…"`. Mirrors EpixNet's editable config set,
-/// minus the Tor and gevent-thread keys that don't apply to this node.
-pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str)] = &[
-    ("language", "Interface language", "en", "text"),
-    ("fileserver_port", "FileServer port for seeding (0 to disable)", "26552", "text"),
-    ("open_browser", "Open the browser on start", "true", "bool"),
-    ("offline", "Offline mode (no peer networking)", "false", "bool"),
-    ("trackers", "Peer trackers (comma-separated)", "145.223.69.23:26959", "text"),
-    ("ip_external", "External IP override (blank = auto-detect via UPnP)", "", "text"),
-    ("log_level", "Log level", "INFO", "select:DEBUG|INFO|WARNING|ERROR"),
-    ("fileserver_ip_type", "FileServer IP type", "ipv4", "select:ipv4|ipv6|dual"),
-    ("chain_rpc_url", "Chain RPC URL", "https://api.epix.zone", "text"),
-    ("chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
-    ("chain_block_explorer_url", "Block explorer URL", "https://scan.epix.zone", "text"),
+/// `(section, key, label, default, kind)`, grouped into the same sections
+/// EpixNet's Config page uses (Web Interface / Network / Performance / Epix
+/// Chain Config). `kind` drives the input widget:
+///   - `"text"` / `"textarea"` - free text
+///   - `"bool"` - checkbox
+///   - `"select:Label=value|Label2=value2"` - dropdown (label defaults to value
+///     when there's no `=`)
+///   - `"button:actionName"` - an action button (not a stored config key)
+///   - `"soon:<inner>"` - render `<inner>` disabled with a "coming soon" note,
+///     for keys whose backend (Tor transport, SOCKS proxy) isn't built yet.
+pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
+    // --- Web Interface
+    ("Web Interface", "open_browser", "Open web browser on EpixNet startup", "true", "bool"),
+    ("Web Interface", "language", "Interface language", "en", "text"),
+    // --- Network
+    ("Network", "offline", "Offline mode", "false", "bool"),
+    (
+        "Network",
+        "fileserver_ip_type",
+        "File server network",
+        "ipv4",
+        "select:IPv4=ipv4|IPv6=ipv6|Dual (IPv4 & IPv6)=dual",
+    ),
+    ("Network", "fileserver_port", "File server port (0 to disable seeding)", "26552", "text"),
+    ("Network", "ip_external", "File server external ip (blank = auto-detect via UPnP)", "", "textarea"),
+    ("Network", "tor", "Tor", "disable", "soon:select:Disable=disable|Enable=enable|Always=always"),
+    ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
+    ("Network", "trackers", "Trackers", "145.223.69.23:26959", "textarea"),
+    ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
+    (
+        "Network",
+        "trackers_proxy",
+        "Proxy for tracker connections",
+        "disable",
+        "soon:select:Custom=custom|Tor=tor|Disable=disable",
+    ),
+    // --- Performance
+    (
+        "Performance",
+        "log_level",
+        "Level of logging to file",
+        "INFO",
+        "select:Everything=DEBUG|Only important messages=INFO|Only errors=ERROR",
+    ),
+    // --- Epix Chain Config
+    ("Epix Chain Config", "chain_rpc_url", "Chain RPC URL", "https://api.epix.zone", "text"),
+    ("Epix Chain Config", "chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
+    ("Epix Chain Config", "chain_block_explorer_url", "Block Explorer URL", "https://scan.epix.zone", "text"),
+    ("Epix Chain Config", "xid_clear_cache", "Clear xID Cache", "", "button:xidClearCache"),
 ];
+
+/// True for schema entries that aren't stored config keys (action buttons), so
+/// `configList` / save loops can skip them.
+pub fn is_config_action(kind: &str) -> bool {
+    kind.starts_with("button:")
+}
 
 /// The input to [`AppState::add_xite`]: a xite's storage and (if loaded) its
 /// verified content.json. Settings/stats are derived from these.
@@ -546,7 +586,10 @@ impl AppState {
     /// `configList` - the editable config keys with current value + default.
     pub async fn config_list(&self) -> Value {
         let mut back = serde_json::Map::new();
-        for (key, _label, default, _kind) in CONFIG_SCHEMA {
+        for (_section, key, _label, default, kind) in CONFIG_SCHEMA {
+            if is_config_action(kind) {
+                continue;
+            }
             let value = self.config_get(key).await.unwrap_or_else(|| json!(default));
             back.insert(
                 key.to_string(),
