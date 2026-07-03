@@ -218,7 +218,15 @@ async fn clone_xite_with_progress(
         return Ok((xite.content.clone(), 0));
     }
 
-    let peers = epix_xite::announce(transport.as_ref(), address, trackers, 0).await;
+    let mut peers = epix_xite::announce(transport.as_ref(), address, trackers, 0).await;
+    // Trackers came up short: ask the DHT (tracker-independent - any peer that
+    // serves the site can answer). Only wired on the on-demand path; at boot
+    // the runtime (which owns the DHT) isn't running yet.
+    if peers.is_empty() {
+        if let Some(state) = progress {
+            peers = state.find_peers_dht(address).await;
+        }
+    }
     if peers.is_empty() {
         return Err("no peers found - is the network reachable?".into());
     }

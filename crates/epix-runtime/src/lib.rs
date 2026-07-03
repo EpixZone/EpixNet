@@ -14,6 +14,7 @@
 //! stops cleanly.
 
 use epix_core::PeerAddr;
+use epix_dht::RpcClient as _;
 use epix_ui::AppState;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,6 +168,17 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.connection_interval,
         )));
+        // DHT: probe known peers into the routing table, announce every served
+        // site, and look up extra peers - a tracker-independent discovery path
+        // (works for rare sites and if the trackers go down). Also installs the
+        // PeerFinder hook so on-demand clones can query the DHT.
+        self.handles.push(tokio::spawn(dht_loop(
+            self.state.clone(),
+            self.dht.clone(),
+            self.config.fileserver_port,
+            self.shutdown.clone(),
+            self.config.announce_interval,
+        )));
         // Inbound file server: let peers pull our files (seeding), and try to
         // open that port through the home router with UPnP so it's reachable.
         #[cfg(feature = "inbound-seeding")]
@@ -279,6 +291,132 @@ async fn announce_loop(
         tokio::select! {
             _ = shutdown.notified() => break,
             _ = tick.tick() => announce().await,
+        }
+    }
+}
+
+/// A [`epix_ui::PeerFinder`] backed by the runtime's DHT node, so the
+/// on-demand clone path can look up peers for sites the trackers don't know.
+struct DhtPeerFinder {
+    dht: Arc<epix_dht::Node>,
+    rpc: Arc<epix_dht_net::WireRpcClient>,
+}
+
+#[async_trait::async_trait]
+impl epix_ui::PeerFinder for DhtPeerFinder {
+    async fn find(&self, address: &str) -> Vec<PeerAddr> {
+        let mut peers = self.dht.get_peers(epix_dht::site_key(address), self.rpc.as_ref()).await;
+        peers.retain(|p| !matches!(p, PeerAddr::Ip(s) if s.ip().is_unspecified()));
+        peers
+    }
+}
+
+/// Drive the DHT: seed the routing table by probing peers we already know
+/// (learning real node contacts from their responses), announce every served
+/// site under its key, and fold looked-up peers into each site's registry.
+/// Tracker-independent discovery: a rare site findable from any peer that
+/// serves it, even with every tracker down. Runs on the announce cadence.
+async fn dht_loop(
+    state: Arc<AppState>,
+    dht: Arc<epix_dht::Node>,
+    fileserver_port: Option<u16>,
+    shutdown: Arc<Notify>,
+    period: Duration,
+) {
+    // Wait for the transport (set by the node just before the runtime starts).
+    let transport = loop {
+        if let Some(t) = state.transport().await {
+            break t;
+        }
+        tokio::select! {
+            _ = shutdown.notified() => return,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    };
+    // Our claimed contact. A NAT'd node doesn't know its public IP; it claims
+    // 0.0.0.0 and the serving side substitutes the connection's source IP
+    // (see DhtService). The port is our real listening port.
+    let port = fileserver_port.unwrap_or(0);
+    let me_addr = PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr");
+    let me = epix_dht::Contact::new(dht.id, me_addr.clone());
+    let rpc = Arc::new(epix_dht_net::WireRpcClient::new(me, transport));
+
+    // Expose DHT lookups to the on-demand clone path.
+    state
+        .set_peer_finder(Arc::new(DhtPeerFinder { dht: dht.clone(), rpc: rpc.clone() }))
+        .await;
+
+    let round = || async {
+        // 1. Probe a handful of known peers: send FindNode(self) so they learn
+        //    our real contact and we learn real contacts from their tables.
+        //    The probed peer itself is NOT inserted (we don't know its node id;
+        //    only contacts carried in responses have authentic ids).
+        let addresses = state.xite_addresses().await;
+        let mut probed = std::collections::HashSet::new();
+        for address in &addresses {
+            for peer in state.connectable_peers(address, 3).await {
+                if !probed.insert(peer.clone()) || probed.len() > 8 {
+                    continue;
+                }
+                let probe = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    rpc.probe(&peer, dht.id),
+                );
+                if let Ok(Ok((responder, contacts))) = probe.await {
+                    // The responder's authentic contact (id stamped into the
+                    // reply, address we dialed) plus whatever it shared.
+                    for contact in responder.into_iter().chain(contacts) {
+                        if contact.id != dht.id {
+                            dht.add_contact(contact);
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Announce every served site and fold in any peers the DHT knows.
+        let mut found_total = 0;
+        for address in &addresses {
+            let key = epix_dht::site_key(address);
+            if port != 0 {
+                dht.announce(key, me_addr.clone(), rpc.as_ref()).await;
+            }
+            let mut peers = dht.get_peers(key, rpc.as_ref()).await;
+            // Drop unusable claims (a NAT'd announcer's own 0.0.0.0 entry).
+            peers.retain(|p| !matches!(p, PeerAddr::Ip(s) if s.ip().is_unspecified()));
+            if !peers.is_empty() {
+                found_total += peers.len();
+                state.add_peers(address, peers).await;
+            }
+        }
+        let routing = dht.routing_len();
+        if !probed.is_empty() || routing > 0 || found_total > 0 {
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "DHT: probed {} peer(s), {routing} node(s) in the routing table, {found_total} peer(s) found for {} site(s)",
+                        probed.len(),
+                        addresses.len()
+                    ),
+                )
+                .await;
+        }
+    };
+
+    // First round shortly after start (peers arrive from the first announce),
+    // then on the announce cadence.
+    tokio::select! {
+        _ = shutdown.notified() => return,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(120), round()).await;
+    let mut tick = interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tick.tick() => { let _ = tokio::time::timeout(Duration::from_secs(120), round()).await; },
         }
     }
 }

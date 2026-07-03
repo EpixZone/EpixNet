@@ -31,6 +31,16 @@ pub trait OnDemandResolver: Send + Sync {
     async fn ensure(&self, host: &str) -> Result<(), String>;
 }
 
+/// Extra peer discovery beyond the trackers - the runtime installs a DHT
+/// lookup here so announces and on-demand clones can find peers for rare
+/// sites when the trackers come up short. Kept as a trait so `epix-ui` has
+/// no dependency on the DHT crates.
+#[async_trait::async_trait]
+pub trait PeerFinder: Send + Sync {
+    /// Find peers hosting the xite at `address` (bech32).
+    async fn find(&self, address: &str) -> Vec<PeerAddr>;
+}
+
 /// Plugins that ship disabled by default, matching the plugins EpixNet keeps
 /// `disabled-` (that we have): they are off until the operator turns them on.
 const DEFAULT_DISABLED_PLUGINS: &[&str] = &["NoNewSites", "UiPassword", "Multiuser"];
@@ -185,6 +195,8 @@ pub struct AppState {
     /// the node, which has the chain + worker). Lets the browser open any
     /// `talk.epix` by typing it, cloning it live.
     on_demand: RwLock<Option<Arc<dyn OnDemandResolver>>>,
+    /// DHT-backed peer lookup, installed by the runtime.
+    peer_finder: RwLock<Option<Arc<dyn PeerFinder>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -358,6 +370,7 @@ impl AppState {
             filters_path: None,
             transport: RwLock::new(None),
             on_demand: RwLock::new(None),
+            peer_finder: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -452,6 +465,7 @@ impl AppState {
             filters_path: Some(filters_path),
             transport: RwLock::new(None),
             on_demand: RwLock::new(None),
+            peer_finder: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -3040,9 +3054,29 @@ impl AppState {
         *self.transport.write().await = Some(transport);
     }
 
+    /// The transport set by the node, once available.
+    pub async fn transport(&self) -> Option<Arc<dyn Transport>> {
+        self.transport.read().await.clone()
+    }
+
     /// Install the on-demand resolver (set by the node).
     pub async fn set_on_demand(&self, resolver: Arc<dyn OnDemandResolver>) {
         *self.on_demand.write().await = Some(resolver);
+    }
+
+    /// Install the DHT-backed peer lookup (set by the runtime).
+    pub async fn set_peer_finder(&self, finder: Arc<dyn PeerFinder>) {
+        *self.peer_finder.write().await = Some(finder);
+    }
+
+    /// Look up peers for `address` via the installed [`PeerFinder`] (the DHT),
+    /// or an empty list when none is installed.
+    pub async fn find_peers_dht(&self, address: &str) -> Vec<PeerAddr> {
+        let hook = self.peer_finder.read().await.clone();
+        match hook {
+            Some(hook) => hook.find(address).await,
+            None => Vec::new(),
+        }
     }
 
     /// Ensure `host` (a `.epix` name) is served, resolving + cloning it on demand

@@ -66,18 +66,31 @@ pub fn decode_request(params: &Value) -> Option<(Contact, Request)> {
     Some((from, req))
 }
 
-pub fn encode_response(resp: &Response) -> Value {
+/// Encode a response, stamped with the responder's node id (`id`) so a caller
+/// that only knows an address - a bootstrap probe - learns the authentic
+/// contact from the reply itself.
+pub fn encode_response(resp: &Response, me: &NodeId) -> Value {
+    let mut pairs = vec![("id", id_to_value(me))];
     match resp {
-        Response::Pong => vmap(vec![("pong", Value::from(true))]),
-        Response::Ack => vmap(vec![("ack", Value::from(true))]),
+        Response::Pong => pairs.push(("pong", Value::from(true))),
+        Response::Ack => pairs.push(("ack", Value::from(true))),
         Response::Nodes(nodes) => {
-            vmap(vec![("nodes", Value::Array(nodes.iter().map(contact_to_value).collect()))])
+            pairs.push(("nodes", Value::Array(nodes.iter().map(contact_to_value).collect())))
         }
-        Response::Peers { peers, nodes } => vmap(vec![
-            ("peers", Value::Array(peers.iter().map(|p| Value::from(p.to_string())).collect())),
-            ("nodes", Value::Array(nodes.iter().map(contact_to_value).collect())),
-        ]),
+        Response::Peers { peers, nodes } => {
+            pairs.push((
+                "peers",
+                Value::Array(peers.iter().map(|p| Value::from(p.to_string())).collect()),
+            ));
+            pairs.push(("nodes", Value::Array(nodes.iter().map(contact_to_value).collect())));
+        }
     }
+    vmap(pairs)
+}
+
+/// The responder's node id from a response, if stamped (older nodes omit it).
+pub fn decode_responder_id(body: &Value) -> Option<NodeId> {
+    value_to_id(vget(body, "id")?)
 }
 
 /// Decode a response from the (already-unwrapped) response map, inferring the
