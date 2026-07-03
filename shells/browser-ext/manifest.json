@@ -1,0 +1,31 @@
+{
+  "manifest_version": 2,
+  "name": "Epix",
+  "version": "0.1.0",
+  "description": "Enforces the Epix xite security contract: a strict CSP on .epix pages and a clearnet block (per-site allow), plus name resolution via the native host.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "browser-ext@epix.zone",
+      "strict_min_version": "115.0"
+    }
+  },
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "storage",
+    "tabs",
+    "nativeMessaging",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "Epix",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "32": "icon32.png"
+    }
+  }
+}
