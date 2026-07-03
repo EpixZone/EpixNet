@@ -219,9 +219,18 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
     )
 }
 
-async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> Response {
+async fn serve_wrapper(
+    State(ctx): State<Ctx>,
+    Path(address): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if !ctx.state.has_xite(&address).await {
         return (StatusCode::NOT_FOUND, "unknown xite").into_response();
+    }
+    // Trust this Host as a WebSocket origin (the wrapper's own page will open
+    // the WS from it).
+    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        ctx.state.allow_ws_origin(host);
     }
     // ContentFilter: a blocked site is not served - show the block page instead.
     if let Some(reason) = ctx.state.siteblock_reason(&address).await {
@@ -239,7 +248,10 @@ async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> R
         .and_then(|t| t.as_str())
         .unwrap_or(&address)
         .to_string();
-    let nonce = ctx.state.wrapper_nonce();
+    // A one-time wrapper nonce (released on the inner file request) and a random
+    // CSP script nonce for the wrapper's own inline scripts.
+    let nonce = ctx.state.issue_wrapper_nonce();
+    let script_nonce = ctx.state.issue_wrapper_nonce();
     // The xite's real permissions (empty until the user grants one). This is
     // only the wrapper's initial value; the authoritative list arrives over the
     // WebSocket via siteInfo.
@@ -252,7 +264,7 @@ async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> R
         ("meta_tags", String::new()),
         ("body_style", String::new()),
         ("themeclass", "theme-light".into()),
-        ("script_nonce", String::new()),
+        ("script_nonce", script_nonce.clone()),
         ("homepage", format!("/{address}")),
         ("site_file_server", String::new()),
         ("file_url", format!("/{address}/index.html")),
@@ -270,7 +282,16 @@ async fn serve_wrapper(State(ctx): State<Ctx>, Path(address): Path<String>) -> R
         ("lang", "en".into()),
     ];
     let html = render(WRAPPER_HTML, &vars);
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CONTENT_SECURITY_POLICY, wrapper_csp(&script_nonce)),
+            (header::REFERRER_POLICY, "same-origin".to_string()),
+            (header::CACHE_CONTROL, "no-cache, no-store, private, must-revalidate, max-age=0".to_string()),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -693,8 +714,16 @@ fn render(template: &str, vars: &[(&str, String)]) -> String {
 async fn serve_file(
     State(ctx): State<Ctx>,
     Path((address, path)): Path<(String, String)>,
+    Query(q): Query<FileQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    // Release a one-time wrapper nonce if the inner frame passed one (tracks
+    // that the request came through the wrapper; EpixNet warns otherwise).
+    if let Some(nonce) = &q.wrapper_nonce {
+        if !ctx.state.consume_wrapper_nonce(nonce) {
+            ctx.state.log("WARNING", format!("Invalid wrapper nonce for /{address}/{path}")).await;
+        }
+    }
     let ct = content_type(&path).to_string();
     // Range request → 206 Partial Content, streamed from disk (big files seek
     // in the browser without loading the whole file).
@@ -708,28 +737,24 @@ async fn serve_file(
                 // Big file: pull only the pieces this range needs (no-op otherwise).
                 let _ = ctx.state.bigfile_fetch_range(&address, &path, start, len as u64).await;
                 if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
-                    return (
-                        StatusCode::PARTIAL_CONTENT,
-                        [
-                            (header::CONTENT_TYPE, ct),
-                            (header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}")),
-                            (header::ACCEPT_RANGES, "bytes".to_string()),
-                        ],
-                        bytes,
-                    )
-                        .into_response();
+                    let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
+                    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                        h.insert(header::CONTENT_RANGE, v);
+                    }
+                    return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
                 }
             }
         }
     }
     match ctx.state.read_file(&address, &path).await {
-        Some(bytes) => (
-            [(header::CONTENT_TYPE, ct), (header::ACCEPT_RANGES, "bytes".to_string())],
-            bytes,
-        )
-            .into_response(),
+        Some(bytes) => (file_headers(&ct, StatusCode::OK), bytes).into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    wrapper_nonce: Option<String>,
 }
 
 /// Parse an HTTP `Range: bytes=start-end` (single range). `end` is optional.
@@ -740,6 +765,60 @@ fn parse_range(header: &str) -> Option<(u64, Option<u64>)> {
     let end = end.trim();
     let end = if end.is_empty() { None } else { Some(end.parse().ok()?) };
     Some((start, end))
+}
+
+/// Security + caching headers for an inner site file, matching EpixNet's
+/// `sendHeader`: the sandbox CSP (site files run inside the sandboxed frame),
+/// Referrer-Policy, Cache-Control by type, and Content-Disposition:attachment
+/// for file types that are dangerous to render inline (svg/xml/pdf/flash).
+fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap {
+    let mut pairs = vec![
+        (header::CONTENT_TYPE, content_type.to_string()),
+        (header::ACCEPT_RANGES, "bytes".to_string()),
+        (header::REFERRER_POLICY, "same-origin".to_string()),
+        // The site file is loaded inside the wrapper's sandboxed iframe; this CSP
+        // is EpixNet's noscript/raw sandbox policy.
+        (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; sandbox allow-top-navigation allow-forms; \
+             img-src *; font-src * data:; media-src *; style-src * 'unsafe-inline';"
+                .to_string(),
+        ),
+    ];
+    // Download (don't render) types that can carry active content.
+    if ["/svg", "/xml", "/x-shockwave-flash", "/pdf"].iter().any(|t| content_type.contains(t)) {
+        pairs.push((header::CONTENT_DISPOSITION, "attachment".to_string()));
+    }
+    let base = content_type.split('/').next().unwrap_or("");
+    let cacheable = matches!(base, "image" | "video" | "font")
+        || content_type.starts_with("application/javascript")
+        || content_type.starts_with("text/css");
+    let cache = if matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) && cacheable {
+        "public, max-age=600"
+    } else {
+        "no-cache, no-store, private, must-revalidate, max-age=0"
+    };
+    pairs.push((header::CACHE_CONTROL, cache.to_string()));
+    header_map(pairs)
+}
+
+/// Build a `HeaderMap` from name/value pairs (bad values are skipped).
+fn header_map(pairs: Vec<(header::HeaderName, String)>) -> axum::http::HeaderMap {
+    let mut map = axum::http::HeaderMap::new();
+    for (name, value) in pairs {
+        if let Ok(v) = header::HeaderValue::from_str(&value) {
+            map.insert(name, v);
+        }
+    }
+    map
+}
+
+/// The wrapper's script-nonce CSP header value (EpixNet's `script_nonce` path).
+fn wrapper_csp(script_nonce: &str) -> String {
+    format!(
+        "default-src 'none'; script-src 'nonce-{script_nonce}'; img-src 'self' blob: data:; \
+         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *"
+    )
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -767,7 +846,21 @@ struct WsQuery {
     xite: Option<String>,
 }
 
-async fn ws_upgrade(State(ctx): State<Ctx>, Query(q): Query<WsQuery>, ws: WebSocketUpgrade) -> Response {
+async fn ws_upgrade(
+    State(ctx): State<Ctx>,
+    Query(q): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Reject a WebSocket whose Origin isn't the request host, loopback, or a
+    // previously-served wrapper host - so a cross-origin page can't drive the
+    // local command API (EpixNet's allowed_ws_origins check).
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin_host = origin.rsplit("://").next().unwrap_or("");
+    if !ctx.state.is_ws_origin_allowed(origin_host, host) {
+        return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
+    }
     // wrapper_key == xite address for this node.
     let xite = q.wrapper_key.or(q.xite);
     ws.on_upgrade(move |socket| handle_ws(socket, ctx, xite))

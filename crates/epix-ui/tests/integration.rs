@@ -65,12 +65,41 @@ async fn serves_xite_files_over_http() {
         body.headers()["content-type"],
         "text/html; charset=utf-8"
     );
+    // Security headers: sandbox CSP + Referrer-Policy on inner site files.
+    let csp = body.headers()["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("sandbox"), "inner file gets the sandbox CSP: {csp}");
+    assert_eq!(body.headers()["referrer-policy"], "same-origin");
     assert_eq!(body.text().await.unwrap(), "<html>hi from xite</html>");
+
+    // The wrapper page carries a script-nonce CSP (not the sandbox one).
+    let wrapper = reqwest::get(format!("http://{addr}/epix1xite/")).await.unwrap();
+    let wcsp = wrapper.headers()["content-security-policy"].to_str().unwrap();
+    assert!(wcsp.contains("script-src 'nonce-"), "wrapper CSP has a script nonce: {wcsp}");
+    assert!(!wcsp.contains("sandbox"));
 
     let missing = reqwest::get(format!("http://{addr}/epix1xite/nope.txt"))
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn rejects_cross_origin_websocket() {
+    let (addr, _dir) = start_server().await;
+    // A WebSocket from a foreign Origin is refused (can't drive the local API).
+    use tokio_tungstenite::tungstenite::http;
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite"))
+        .header("Host", addr.to_string())
+        .header("Origin", "http://evil.example.com")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let result = tokio_tungstenite::connect_async(req).await;
+    assert!(result.is_err(), "cross-origin WS should be rejected");
 }
 
 #[tokio::test]

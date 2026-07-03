@@ -224,6 +224,12 @@ pub struct AppState {
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
     updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
+    /// issued when a wrapper is served, consumed on the inner file request.
+    wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Hosts allowed as WebSocket `Origin`s (a wrapper's Host is added when
+    /// served), so a cross-origin page can't drive the local WS API.
+    allowed_ws_origins: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The shared data root (holds `sites.json` + per-xite subdirectories), so
     /// the served-xite list can be restored on the next start. None for
     /// in-memory nodes.
@@ -272,6 +278,14 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// A random lowercase-hex string of `bytes` random bytes (2 hex chars each).
+/// Used for wrapper/CSP nonces.
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 impl AppState {
     /// In-memory node with a freshly generated user identity.
     pub fn new(version: impl Into<String>) -> Arc<Self> {
@@ -305,6 +319,8 @@ impl AppState {
             ip_external: RwLock::new(None),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             data_root: None,
             sites_path: None,
             #[cfg(feature = "multiuser")]
@@ -389,6 +405,8 @@ impl AppState {
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             // The served-xite registry lives in the shared root (the parent of a
             // per-xite dir), so it spans every xite that shares this root.
             data_root: Some(data_root.clone()),
@@ -3184,6 +3202,49 @@ impl AppState {
     pub fn wrapper_nonce(&self) -> String {
         let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
         format!("{n:016x}")
+    }
+
+    /// Issue a one-time wrapper nonce (tracked so an inner file request can be
+    /// recognized as coming through the wrapper), EpixNet's
+    /// `server.wrapper_nonces`.
+    pub fn issue_wrapper_nonce(&self) -> String {
+        let nonce = random_hex(16);
+        let mut set = self.wrapper_nonces.lock().unwrap();
+        set.insert(nonce.clone());
+        // Bound the set so it can't grow without limit on a long-running node.
+        if set.len() > 2000 {
+            if let Some(oldest) = set.iter().next().cloned() {
+                set.remove(&oldest);
+            }
+        }
+        nonce
+    }
+
+    /// Consume a wrapper nonce; true if it was outstanding (valid). Matches
+    /// EpixNet's remove-on-use.
+    pub fn consume_wrapper_nonce(&self, nonce: &str) -> bool {
+        self.wrapper_nonces.lock().unwrap().remove(nonce)
+    }
+
+    /// Record a wrapper's Host as an allowed WebSocket origin (EpixNet adds
+    /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
+    pub fn allow_ws_origin(&self, host: &str) {
+        if !host.is_empty() {
+            self.allowed_ws_origins.lock().unwrap().insert(host.to_string());
+        }
+    }
+
+    /// Whether a WebSocket `Origin` host is allowed: same as the request host,
+    /// loopback, or a previously-served wrapper host.
+    pub fn is_ws_origin_allowed(&self, origin_host: &str, request_host: &str) -> bool {
+        if origin_host.is_empty() || origin_host == request_host {
+            return true;
+        }
+        let host_only = origin_host.split(':').next().unwrap_or(origin_host);
+        if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "[::1]" {
+            return true;
+        }
+        self.allowed_ws_origins.lock().unwrap().contains(origin_host)
     }
 
     /// Persist the user identity if this node has a data dir.
