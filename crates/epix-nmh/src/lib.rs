@@ -126,6 +126,11 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             if label.starts_with("epix1") {
                 return json!({ "address": label });
             }
+            // If the node routes clearnet through Tor (always mode), resolve the
+            // name through Tor too, so this lookup doesn't leak the IP / name.
+            if node_is_tor_always(ui_port).await {
+                epix_chain::set_chain_socks(Some("socks5h://127.0.0.1:43111".into()));
+            }
             let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
             match resolver.resolve(label, tld).await {
                 Ok(d) => match d.xite_address() {
@@ -150,6 +155,15 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
         "listClearnetAllow" => json!({ "sites": settings.allowed_sites() }),
         other => json!({ "error": format!("unknown command: {other}") }),
     }
+}
+
+/// Whether the node is in Tor-always mode (its status reports `tor_status ==
+/// "Always"`), meaning name resolution should also go through Tor.
+async fn node_is_tor_always(ui_port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{ui_port}/EpixNet-Internal/Status");
+    let Ok(resp) = reqwest::get(&url).await else { return false };
+    let Ok(v) = resp.json::<Value>().await else { return false };
+    v.get("tor_status").and_then(|s| s.as_str()) == Some("Always")
 }
 
 /// Read one native-messaging frame (4-byte LE length + JSON) from `r`. Returns
