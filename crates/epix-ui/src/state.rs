@@ -3659,6 +3659,7 @@ impl AppState {
     /// isn't served here.
     pub async fn remove_xite(&self, address: &str) -> bool {
         let mut roots = Vec::new();
+        let mut removed_keys = Vec::new();
         {
             let mut xites = self.xites.write().await;
             // Canonical (signed content) address of the target, alias-aware.
@@ -3676,6 +3677,12 @@ impl AppState {
                     if !roots.contains(&root) {
                         roots.push(root);
                     }
+                    // The site's user data may be keyed by the display name in
+                    // stores written by older builds; purge both.
+                    if let Some(display) = x.display {
+                        removed_keys.push(display);
+                    }
+                    removed_keys.push(key);
                 }
             }
         }
@@ -3685,9 +3692,30 @@ impl AppState {
         for root in roots {
             let _ = std::fs::remove_dir_all(&root);
         }
+        // EpixNet parity (`user.deleteSiteData`): forget the site's derived
+        // auth identity, cert selection, and feed follows. Harmless to the
+        // user - the keys re-derive from the master seed if the site returns.
+        self.delete_user_site_data(&removed_keys).await;
         self.persist_peers().await;
         self.persist_sites().await;
         true
+    }
+
+    /// Drop the per-site user data (derived auth keys, cert binding, feed
+    /// follows) for the given serving keys and persist users.json if anything
+    /// was removed. EpixNet's `User.deleteSiteData`.
+    async fn delete_user_site_data(&self, keys: &[String]) {
+        let mut changed = false;
+        {
+            let mut user = self.user.write().await;
+            for key in keys {
+                changed |= user.sites.remove(key).is_some();
+                changed |= user.follows.remove(key).is_some();
+            }
+        }
+        if changed {
+            self.save_user().await;
+        }
     }
 
     /// Add a peer (ip + port) to a xite's known-peer set (`peerAdd`).
@@ -4567,6 +4595,36 @@ mod tests {
         assert!(state.remove_xite("deleteme.epix").await);
         assert!(!state.has_xite(addr).await);
         assert!(!state.has_xite("deleteme.epix").await);
+    }
+
+    #[tokio::test]
+    async fn delete_drops_user_site_data() {
+        // EpixNet parity: siteDelete also forgets the site's per-user data
+        // (derived auth identity, feed follows), like `user.deleteSiteData`.
+        let root = tempdir().unwrap();
+        let addr = "1ForgetMe";
+        // Keep the node's users.json outside the site dir (as in production,
+        // where it lives in the launch xite's dir) so deleting the site does
+        // not delete the store itself.
+        let state = AppState::with_data_dir("test", root.path().join("node"));
+        let site_dir = root.path().join(addr);
+        std::fs::create_dir_all(&site_dir).unwrap();
+        state
+            .add_xite(addr, XiteEntry {
+                storage: XiteStorage::new(&site_dir),
+                content: Some(json!({ "address": addr, "files": {} })),
+            })
+            .await;
+
+        // Touch the site (siteInfo derives the auth identity) and follow a feed.
+        state.site_info(addr).await;
+        state.set_feed_follow(addr, json!({ "posts": ["q", []] })).await;
+        assert!(state.user.read().await.sites.contains_key(addr));
+        assert!(state.user.read().await.follows.contains_key(addr));
+
+        assert!(state.remove_xite(addr).await);
+        assert!(!state.user.read().await.sites.contains_key(addr));
+        assert!(!state.user.read().await.follows.contains_key(addr));
     }
 
     #[tokio::test]
