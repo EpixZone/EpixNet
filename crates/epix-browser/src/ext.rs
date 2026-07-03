@@ -76,14 +76,32 @@ pub fn install_theme(profile: &Path) -> Result<(), String> {
 }
 
 /// Write the native-messaging host manifest so Firefox can launch `epix-nmh`.
-/// Located in Firefox's per-user host dir; `path` points at the nmh binary.
+/// On macOS/Linux it goes in Firefox's per-user host dir; on Windows Firefox
+/// reads the manifest location from the registry, so we also set that key.
 pub fn install_native_host() -> Result<(), String> {
     let nmh = nmh_binary().ok_or("epix-nmh binary not found next to the launcher")?;
     let dir = native_host_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("native host dir: {e}"))?;
-    let manifest = serde_json_manifest(&nmh);
-    std::fs::write(dir.join(format!("{NMH_NAME}.json")), manifest)
+    let manifest_path = dir.join(format!("{NMH_NAME}.json"));
+    std::fs::write(&manifest_path, serde_json_manifest(&nmh))
         .map_err(|e| format!("write native host manifest: {e}"))?;
+    #[cfg(windows)]
+    set_windows_native_host_registry(&manifest_path)?;
+    Ok(())
+}
+
+/// Point Firefox at the native-host manifest via the registry (Windows only):
+/// `HKCU\Software\Mozilla\NativeMessagingHosts\<name>` = the manifest path.
+#[cfg(windows)]
+fn set_windows_native_host_registry(manifest_path: &Path) -> Result<(), String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu
+        .create_subkey(format!("Software\\Mozilla\\NativeMessagingHosts\\{NMH_NAME}"))
+        .map_err(|e| format!("create registry key: {e}"))?;
+    key.set_value("", &manifest_path.to_string_lossy().to_string())
+        .map_err(|e| format!("set registry value: {e}"))?;
     Ok(())
 }
 
@@ -95,8 +113,13 @@ fn serde_json_manifest(nmh: &Path) -> String {
     )
 }
 
-/// The Firefox per-user native-messaging host directory.
+/// Where the native-messaging host manifest is written.
 fn native_host_dir() -> PathBuf {
+    if cfg!(windows) {
+        // Windows reads the path from the registry, so any stable dir works.
+        let appdata = std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
+        return appdata.join("Epix");
+    }
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Mozilla/NativeMessagingHosts")

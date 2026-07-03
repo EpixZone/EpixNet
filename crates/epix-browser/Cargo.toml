@@ -26,6 +26,10 @@ axum = "0.7"
 include_dir = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Windows: register the native-messaging host via the registry.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
 [features]
 default = ["tor"]
 tor = ["epix-node/tor"]

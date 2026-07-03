@@ -37,7 +37,17 @@ case "$OS" in
     ;;
   win64)
     curl -L -o "$OUT/firefox-esr.exe" "$URL"
-    echo "· ready: $OUT/firefox-esr.exe (Windows installer; extract with 7z for bundling)"
+    # The ESR installer is a 7z self-extractor; the browser lives under core/.
+    if command -v 7z >/dev/null 2>&1; then
+      rm -rf "$OUT/extract" "$OUT/firefox"
+      7z x -y "$OUT/firefox-esr.exe" -o"$OUT/extract" >/dev/null
+      mkdir -p "$OUT/firefox"
+      cp -R "$OUT/extract/core/." "$OUT/firefox/"
+      rm -rf "$OUT/extract" "$OUT/firefox-esr.exe"
+      echo "· ready: $OUT/firefox/ (Windows)"
+    else
+      echo "· downloaded $OUT/firefox-esr.exe (install 7z to auto-extract into firefox/)"
+    fi
     ;;
   *)
     echo "unknown os '$OS' (use osx | linux | win64)"; exit 1

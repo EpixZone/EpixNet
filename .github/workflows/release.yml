@@ -97,8 +97,65 @@ jobs:
           name: epix-linux
           path: dist/epix-linux-*.tar.gz
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version from tag
+        id: v
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Fetch Firefox ESR to bundle
+        shell: bash
+        run: packaging/fetch-firefox-esr.sh win64
+      - name: Build installer
+        shell: bash
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+        run: |
+          # makensis comes from the NSIS install; put it on PATH for Git Bash.
+          export PATH="/c/Program Files (x86)/NSIS:$PATH"
+          packaging/windows/build-windows.sh
+      # Sign the installer + the two exes with Azure Trusted Signing, if the
+      # Azure secrets are configured (otherwise ship it unsigned).
+      - name: Check signing config
+        id: signcfg
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.AZURE_TENANT_ID }}" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false; installer will be unsigned"
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Sign with Azure Trusted Signing
+        if: steps.signcfg.outputs.sign == 'true'
+        # Pin bumped as Microsoft releases the action; check the latest tag at
+        # github.com/Azure/trusted-signing-action before a release.
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ github.workspace }}/dist
+          files-folder-filter: exe
+          files-folder-recurse: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-windows
+          path: dist/Epix-Setup-*.exe
+
   release:
-    needs: [macos, linux]
+    needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -114,4 +171,5 @@ jobs:
             --title "Epix $GITHUB_REF_NAME" \
             --generate-notes \
             artifacts/epix-macos/*.dmg \
-            artifacts/epix-linux/*.tar.gz
+            artifacts/epix-linux/*.tar.gz \
+            artifacts/epix-windows/*.exe

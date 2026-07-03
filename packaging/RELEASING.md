@@ -42,12 +42,38 @@ You need an Apple Developer account ($99/yr). In
 
 That's it - push a `v*` tag and the Release appears with a signed, notarized DMG.
 
-## Windows / Linux
+## Windows signing (Azure Trusted Signing)
 
-The Linux tarball builds in CI. Windows is a scaffold (see
-`packaging/windows/README.md`): once the NSIS installer + registry steps are
-finished, add a `windows` job mirroring the others (Authenticode signing needs a
-code-signing cert in a secret, similar to the macOS flow).
+The Windows job builds a signed NSIS installer. Signing uses **Azure Trusted
+Signing** (~$10/month, cloud HSM - no cert file or token to manage). Without the
+secrets the installer is still built, just unsigned.
+
+One-time setup:
+1. Create a **Trusted Signing account** + a **certificate profile** in the Azure
+   portal, and complete identity validation.
+2. Create an **Entra ID app registration** (service principal) and give it the
+   *Trusted Signing Certificate Profile Signer* role on the account.
+3. Add these repo secrets:
+
+| Secret | What it is |
+|---|---|
+| `AZURE_TENANT_ID` | your Entra tenant id |
+| `AZURE_CLIENT_ID` | the app registration's client id |
+| `AZURE_CLIENT_SECRET` | a client secret for that app |
+| `AZURE_TS_ENDPOINT` | the account's region endpoint, e.g. `https://eus.codesigning.azure.net` |
+| `AZURE_TS_ACCOUNT` | the Trusted Signing account name |
+| `AZURE_TS_PROFILE` | the certificate profile name |
+
+Push a `v*` tag and the installer is built, signed, and attached to the Release.
+
+Note: a fresh certificate builds Microsoft SmartScreen reputation over time, so
+the first downloads may still show a warning until reputation accrues - this is
+normal and not something signing fixes immediately.
+
+## Linux
+
+The Linux tarball builds in CI (unsigned; distribute the checksum, or GPG-sign
+the tarball as a follow-up).
 
 ## Notes
 
