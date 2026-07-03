@@ -766,7 +766,9 @@ dependencies = [
  "epix-ui",
  "epix-worker",
  "epix-xite",
+ "libc",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

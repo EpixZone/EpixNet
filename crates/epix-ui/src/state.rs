@@ -227,6 +227,10 @@ pub struct AppState {
     /// Pending wrapper callbacks (`confirm`/`prompt`): a pushed event's `to` id
     /// maps to the oneshot awaiting the wrapper's `{cmd:"response", to}` reply.
     callbacks: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
+    /// Optional file that `log()` also appends each line to (`debug.log`), so
+    /// the node's activity survives restarts for support/debugging. Set by the
+    /// host; None keeps logging in-memory + stdout only.
+    log_file: std::sync::Mutex<Option<std::fs::File>>,
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -323,6 +327,7 @@ impl AppState {
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
+            log_file: std::sync::Mutex::new(None),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             data_root: None,
@@ -410,6 +415,7 @@ impl AppState {
             ip_external: RwLock::new(None),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
+            log_file: std::sync::Mutex::new(None),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             // The served-xite registry lives in the shared root (the parent of a
@@ -2243,6 +2249,11 @@ impl AppState {
         }
         let message = message.into();
         println!("[{level}] {message}");
+        // Append to the on-disk log file, if one is configured.
+        if let Some(file) = self.log_file.lock().unwrap().as_mut() {
+            use std::io::Write;
+            let _ = writeln!(file, "[{}] [{level}] {message}", now_secs());
+        }
         let line = json!([now_secs() as f64, level, message]);
         {
             let mut logs = self.logs.write().await;
@@ -3354,6 +3365,14 @@ impl AppState {
     pub fn wrapper_nonce(&self) -> String {
         let n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
         format!("{n:016x}")
+    }
+
+    /// Append the node's log lines to `path` as well as stdout / the in-memory
+    /// buffer, so activity survives restarts. Opens in append mode.
+    pub fn set_log_file(&self, path: &std::path::Path) {
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            *self.log_file.lock().unwrap() = Some(file);
+        }
     }
 
     /// Issue a one-time wrapper nonce (tracked so an inner file request can be
