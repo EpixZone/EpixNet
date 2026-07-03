@@ -2611,6 +2611,11 @@ impl AppState {
         };
         let fileserver_port = self.fileserver_port().await;
         let (tor_enabled, tor_status) = self.tor_status().await;
+        // The dashboard reads `fileserver_ip == "127.0.0.1"` as "route all via
+        // Tor" (the fileserver is loopback-only). Only report that in Tor-always
+        // mode; otherwise "*" (all interfaces), matching EpixNet's default - so
+        // the dashboard doesn't wrongly warn "your browser is not safe".
+        let fileserver_ip = if tor_status == "Always" { "127.0.0.1" } else { "*" };
         json!({
             "version": self.version,
             "rev": 8192,
@@ -2618,7 +2623,7 @@ impl AppState {
             "dist_type": "standalone",
             "ip_external": ip_external,
             "port_opened": port_opened,
-            "fileserver_ip": "127.0.0.1",
+            "fileserver_ip": fileserver_ip,
             "fileserver_port": fileserver_port,
             "tor_enabled": tor_enabled,
             "tor_status": tor_status,

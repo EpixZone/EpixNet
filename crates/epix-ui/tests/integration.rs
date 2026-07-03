@@ -65,9 +65,13 @@ async fn serves_xite_files_over_http() {
         body.headers()["content-type"],
         "text/html; charset=utf-8"
     );
-    // Security headers: sandbox CSP + Referrer-Policy on inner site files.
-    let csp = body.headers()["content-security-policy"].to_str().unwrap();
-    assert!(csp.contains("sandbox"), "inner file gets the sandbox CSP: {csp}");
+    // Inner site files carry NO CSP (like EpixNet) - the wrapper's iframe
+    // sandbox attribute does the sandboxing; a `default-src 'none'` CSP here
+    // would block the site's own scripts + service worker. Referrer-Policy stays.
+    assert!(
+        body.headers().get("content-security-policy").is_none(),
+        "inner file has no CSP",
+    );
     assert_eq!(body.headers()["referrer-policy"], "same-origin");
     assert_eq!(body.text().await.unwrap(), "<html>hi from xite</html>");
 

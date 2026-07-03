@@ -26,6 +26,17 @@ use std::time::Duration;
 
 const UI_ADDR: &str = "127.0.0.1:43110";
 const PROXY_ADDR: &str = "127.0.0.1:43112";
+const SOCKS_ADDR: &str = "127.0.0.1:43111";
+
+/// The "route clearnet through Tor" setting (persisted by the native host in
+/// `<data_root>/browser-settings.json`), read at launch to build the file PAC.
+/// `None` when unset - the caller applies the default (on).
+fn tor_clearnet_setting(data_root: &Path) -> Option<bool> {
+    std::fs::read(data_root.join("browser-settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("tor_clearnet").and_then(|t| t.as_bool()))
+}
 
 #[tokio::main]
 async fn main() {
@@ -62,11 +73,12 @@ async fn main() {
 
     // Boot the node and serve the plain UI on loopback.
     println!("· starting the Epix node …");
+    let tor_mode = std::env::var("EPIX_TOR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "enable".into());
     let opts = epix_node::NodeOptions {
         data_root: data_root.clone(),
         target: target.clone(),
         ui_addr: UI_ADDR.to_string(),
-        tor_mode: std::env::var("EPIX_TOR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "enable".into()),
+        tor_mode: tor_mode.clone(),
         open_browser: false,
         geoip_gz: None,
         log_file: None,
@@ -116,10 +128,22 @@ async fn main() {
     // Firefox enforces signing, so the extension silently won't load there.
     let ext_capable = firefox_allows_unsigned(&firefox);
 
+    let socks_addr: SocketAddr = SOCKS_ADDR.parse().unwrap();
+    // Route clearnet through Tor by default (opt-out), but only when Tor is on -
+    // otherwise there is no SOCKS listener and clearnet would break. An explicit
+    // saved setting overrides the default.
+    let tor_on = tor_mode != "disable";
+    let tor_clearnet = tor_on && tor_clearnet_setting(&data_root).unwrap_or(true);
+    if tor_clearnet {
+        println!("· routing clearnet through Tor (clearnet is slower, and needs ~40s until Tor is up)");
+    }
+
     // Write the managed profile, then inject the CA so https://*.epix is trusted.
     let profile = data_root.join("firefox-profile");
     let secure = {
-        if let Err(e) = write_profile(&profile, proxy_addr, &display, true, ext_capable) {
+        if let Err(e) =
+            write_profile(&profile, proxy_addr, socks_addr, &display, true, tor_clearnet, ext_capable)
+        {
             eprintln!("could not write the Firefox profile: {e}");
             std::process::exit(1);
         }
@@ -127,7 +151,9 @@ async fn main() {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("· note: could not install the local CA ({e}); falling back to http");
-                let _ = write_profile(&profile, proxy_addr, &display, false, ext_capable);
+                let _ = write_profile(
+                    &profile, proxy_addr, socks_addr, &display, false, tor_clearnet, ext_capable,
+                );
                 false
             }
         }
@@ -320,30 +346,39 @@ fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
 /// Write the managed profile: the PAC (routes `*.epix` to the proxy) and a
 /// `user.js` locking the proxy and the navigate-not-search behaviour. `secure`
 /// picks the homepage scheme (https when the CA is trusted, else http).
+#[allow(clippy::too_many_arguments)]
 fn write_profile(
     profile: &Path,
     proxy_addr: SocketAddr,
+    socks_addr: SocketAddr,
     display: &str,
     secure: bool,
+    tor_clearnet: bool,
     ext_capable: bool,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(profile)?;
 
+    // The file PAC does all routing (the browser proxy API proved unreliable for
+    // this): `.epix` -> the node's browser proxy; clearnet -> the node's Tor
+    // SOCKS listener when the user has turned on "route clearnet through Tor",
+    // else DIRECT. The toggle updates the persisted setting; this PAC is rebuilt
+    // from it on the next launch.
+    let clearnet = if tor_clearnet {
+        format!("return \"SOCKS5 {socks_addr}\";")
+    } else {
+        "return \"DIRECT\";".to_string()
+    };
     let pac_path = profile.join("epix.pac");
     let pac = format!(
         "function FindProxyForURL(url, host) {{\n\
          \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {proxy_addr}\"; }}\n\
-         \x20 return \"DIRECT\";\n\
+         \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
+         \x20 {clearnet}\n\
          }}\n"
     );
     std::fs::write(&pac_path, pac)?;
     let pac_url = format!("file://{}", pac_path.display());
 
-    // Proxy baseline: a file PAC routing `*.epix` to the node proxy, so `.epix`
-    // works from the first request. When the extension is present it takes over
-    // via `proxy.settings` with a generated PAC (adding the live
-    // clearnet-through-Tor toggle) - a clean override, not mixed with the file
-    // PAC. `socks_remote_dns` avoids DNS leaks when Tor routing is on.
     let proxy_prefs = format!(
         "user_pref(\"network.proxy.type\", 2);\n\
          user_pref(\"network.proxy.autoconfig_url\", \"{pac_url}\");\n\

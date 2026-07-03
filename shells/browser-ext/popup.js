@@ -49,6 +49,8 @@ function renderTor(status, torClearnet) {
     await browser.runtime.sendMessage({ type: "setTorClearnet", on: torBox.checked });
     const s = await browser.runtime.sendMessage({ type: "getState", host });
     renderTor(s.status || {}, s.torClearnet);
+    const onion = document.getElementById("onion");
+    onion.textContent = "Restart Epix to apply the clearnet routing change.";
   });
 
   // Per-site clearnet allow.
