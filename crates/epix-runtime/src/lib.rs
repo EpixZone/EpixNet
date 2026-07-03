@@ -38,6 +38,13 @@ pub struct RuntimeConfig {
     /// Offline mode: skip every peer-networking loop (announce, connections,
     /// re-sync, seeding). Only the local chart collector keeps running.
     pub offline: bool,
+    /// Tor routing mode. Ignored without the `tor` feature.
+    #[cfg(feature = "tor")]
+    pub tor_mode: epix_tor::TorMode,
+    /// Local SOCKS5 port the browser shells route page traffic through (dialed
+    /// via Tor). `None` disables the listener. Ignored without `tor`.
+    #[cfg(feature = "tor")]
+    pub tor_socks_port: Option<u16>,
 }
 
 impl Default for RuntimeConfig {
@@ -49,6 +56,10 @@ impl Default for RuntimeConfig {
             connection_interval: Duration::from_secs(60),
             fileserver_port: None,
             offline: false,
+            #[cfg(feature = "tor")]
+            tor_mode: epix_tor::TorMode::default(),
+            #[cfg(feature = "tor")]
+            tor_socks_port: None,
         }
     }
 }
@@ -67,6 +78,10 @@ pub struct NodeRuntime {
     /// Store-and-forward propagation store peers announce updates into (served
     /// by the propagation handler so offline peers can catch up later).
     prop_store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
+    /// Data root for Tor state/cache (`<root>/tor/...`). Set via
+    /// [`NodeRuntime::with_data_dir`] before `start()` to enable Tor.
+    #[cfg(feature = "tor")]
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl NodeRuntime {
@@ -96,7 +111,27 @@ impl NodeRuntime {
             handles: Vec::new(),
             dht,
             prop_store,
+            #[cfg(feature = "tor")]
+            data_dir: None,
         }
+    }
+
+    /// Set the data root Tor keeps its state + directory cache under. Required
+    /// for the `tor` feature to actually bootstrap a client.
+    #[cfg(feature = "tor")]
+    pub fn with_data_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.data_dir = Some(dir.into());
+        self
+    }
+
+    /// The composite inbound handler (files + DHT + propagation), shared by the
+    /// TCP seed loop and the Tor onion-service accept loop.
+    fn node_handler(&self) -> Arc<handler::NodeHandler> {
+        Arc::new(handler::NodeHandler::new(
+            Arc::new(epix_ui::fileserve::FileService::new(self.state.clone())),
+            Arc::new(epix_dht_net::DhtService::new(self.dht.clone())),
+            Arc::new(epix_propagation::PropagationService::new(self.prop_store.clone())),
+        ))
     }
 
     /// Spawn the background loops. Idempotent per instance (call once). The local
@@ -133,16 +168,42 @@ impl NodeRuntime {
         if let Some(port) = self.config.fileserver_port {
             self.handles.push(tokio::spawn(seed_loop(
                 self.state.clone(),
+                self.node_handler(),
                 port,
                 self.shutdown.clone(),
-                self.dht.clone(),
-                self.prop_store.clone(),
             )));
             self.handles.push(tokio::spawn(upnp_loop(
                 self.state.clone(),
                 port,
                 self.shutdown.clone(),
             )));
+        }
+        // In-process Tor: bootstrap Arti, set the peer transport (onion dials,
+        // or all traffic in Always mode), host an onion service that feeds the
+        // same inbound handler, and run the SOCKS listener for the browser
+        // shells. All best-effort and off the startup path.
+        #[cfg(feature = "tor")]
+        if self.config.tor_mode != epix_tor::TorMode::Disable {
+            if let Some(dir) = self.data_dir.clone() {
+                self.handles.push(tokio::spawn(tor_loop(
+                    self.state.clone(),
+                    self.node_handler(),
+                    dir,
+                    self.config.tor_mode,
+                    self.config.fileserver_port,
+                    self.config.tor_socks_port,
+                    self.shutdown.clone(),
+                )));
+            } else {
+                tokio::spawn({
+                    let state = self.state.clone();
+                    async move {
+                        state
+                            .log("WARNING", "Tor enabled but no data dir set; skipping".to_string())
+                            .await;
+                    }
+                });
+            }
         }
         // AnnounceLocal: discover peers on the LAN over UDP broadcast. When the
         // file server is up, advertise its port so discovered peers can reach us.
@@ -313,10 +374,9 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
 #[cfg(feature = "inbound-seeding")]
 async fn seed_loop(
     state: Arc<AppState>,
+    handler: Arc<handler::NodeHandler>,
     port: u16,
     shutdown: Arc<Notify>,
-    dht: Arc<epix_dht::Node>,
-    prop_store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
 ) {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
@@ -325,19 +385,96 @@ async fn seed_loop(
             return;
         }
     };
-    // Compose the file, DHT, and propagation services into one handler so this
-    // one listener answers all three (previously only files were served).
-    let handler = Arc::new(handler::NodeHandler::new(
-        Arc::new(epix_ui::fileserve::FileService::new(state.clone())),
-        Arc::new(epix_dht_net::DhtService::new(dht)),
-        Arc::new(epix_propagation::PropagationService::new(prop_store)),
-    ));
     let server = epix_protocol::PeerServer::new(handler);
     state.log("INFO", format!("Seeding files (+ DHT + propagation) on port {port}")).await;
     tokio::select! {
         _ = shutdown.notified() => {}
         _ = server.serve(listener) => {}
     }
+}
+
+/// Bootstrap in-process Tor and run its three surfaces until shutdown: the peer
+/// transport (set on the app state so onion peers are dialable, or all traffic
+/// is Tor-routed in Always mode), an onion service whose inbound streams feed
+/// the same node handler as the TCP seed loop, and a local SOCKS listener for
+/// the browser shells.
+#[cfg(feature = "tor")]
+async fn tor_loop(
+    state: Arc<AppState>,
+    handler: Arc<handler::NodeHandler>,
+    data_dir: std::path::PathBuf,
+    mode: epix_tor::TorMode,
+    fileserver_port: Option<u16>,
+    socks_port: Option<u16>,
+    shutdown: Arc<Notify>,
+) {
+    use epix_protocol::RequestHandler;
+    state.log("INFO", "Tor: bootstrapping in-process Arti client …".to_string()).await;
+    let tor = match epix_tor::Tor::bootstrap(&data_dir).await {
+        Ok(t) => t,
+        Err(e) => {
+            state.log("ERROR", format!("Tor bootstrap failed: {e}")).await;
+            return;
+        }
+    };
+    state.log("INFO", "Tor: bootstrapped".to_string()).await;
+
+    // Route peer dials through Tor: onion peers always, everything in Always
+    // mode. Wrap the existing transport type so the worker/connection code is
+    // unchanged.
+    let route_all = mode == epix_tor::TorMode::Always;
+    let transport: Arc<dyn epix_transport::Transport> =
+        Arc::new(epix_tor::MixedTransport::new(Some(tor.transport(route_all)), mode));
+    state.set_transport(transport).await;
+    state.set_tor_status(true, if route_all { "Always" } else { "OK" }).await;
+
+    // Host an onion service for inbound peers (so Tor-only peers reach us) and
+    // feed its streams to the same handler the TCP listener uses.
+    if let Some(port) = fileserver_port {
+        match tor.launch_onion_service("epix", port) {
+            Ok((_svc, onion_host, mut inbound)) => {
+                state
+                    .log("INFO", format!("Tor: onion service up at {onion_host}.onion:{port}"))
+                    .await;
+                state.set_onion_address(&onion_host).await;
+                let handler = handler.clone();
+                let (version, rev) = epix_protocol::PeerServer::new(handler.clone()).banner();
+                tokio::spawn(async move {
+                    while let Some(stream) = inbound.recv().await {
+                        let handler = handler.clone() as Arc<dyn RequestHandler>;
+                        let version = version.clone();
+                        // Inbound onion peers have no dial-back IP; the handshake
+                        // rebind is a no-op for them (they PEX their onion host).
+                        let peer = epix_core::PeerAddr::Onion {
+                            host: String::new(),
+                            port: 0,
+                        };
+                        tokio::spawn(async move {
+                            epix_protocol::serve_stream(handler, peer, stream, &version, rev).await;
+                        });
+                    }
+                });
+            }
+            Err(e) => state.log("WARNING", format!("Tor: onion service failed: {e}")).await,
+        }
+    }
+
+    // Local SOCKS5 for the browser shells to route page traffic through Tor.
+    if let Some(sport) = socks_port {
+        match tokio::net::TcpListener::bind(("127.0.0.1", sport)).await {
+            Ok(listener) => {
+                state.log("INFO", format!("Tor: SOCKS5 listener on 127.0.0.1:{sport}")).await;
+                let tor = tor.clone();
+                tokio::spawn(async move {
+                    let _ = tor.serve_socks(listener).await;
+                });
+            }
+            Err(e) => state.log("WARNING", format!("Tor: SOCKS bind on {sport} failed: {e}")).await,
+        }
+    }
+
+    shutdown.notified().await;
+    state.set_tor_status(false, "Disabled").await;
 }
 
 /// Keep the fileserver `port` mapped through the home router with UPnP so peers

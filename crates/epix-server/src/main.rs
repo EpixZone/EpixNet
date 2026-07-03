@@ -334,13 +334,46 @@ async fn serve(
             state.log("INFO", format!("File seeding enabled on port {port}")).await;
         }
     }
+    // Tor mode from config (disable/enable/always). Enabled by default so the
+    // node can reach onion peers and be reached over Tor without extra setup.
+    #[cfg(feature = "tor")]
+    let tor_mode = {
+        let mode = state
+            .config_get("tor")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .map(|s| epix_tor::TorMode::parse(&s))
+            .unwrap_or_default();
+        if mode != epix_tor::TorMode::Disable {
+            state.log("INFO", format!("Tor mode: {mode:?} (in-process Arti)")).await;
+        }
+        mode
+    };
+    // SOCKS port for the browser shells to route page traffic through Tor.
+    #[cfg(feature = "tor")]
+    let tor_socks_port = state
+        .config_get("tor_socks_port")
+        .await
+        .and_then(|v| v.as_u64())
+        .map(|p| p as u16)
+        .or(Some(43111));
+
     let runtime_config = epix_runtime::RuntimeConfig {
         fileserver_port: if offline { None } else { fileserver_port },
         offline,
+        #[cfg(feature = "tor")]
+        tor_mode: if offline { epix_tor::TorMode::Disable } else { tor_mode },
+        #[cfg(feature = "tor")]
+        tor_socks_port,
         ..Default::default()
     };
     let mut runtime =
         epix_runtime::NodeRuntime::with_config(state.clone(), trackers, runtime_config);
+    // Tor keeps its state + directory cache under the data root.
+    #[cfg(feature = "tor")]
+    if let Some(root) = data_dir.parent() {
+        runtime = runtime.with_data_dir(root.to_path_buf());
+    }
     runtime.start();
 
     // Assemble the UI command set + media through the plugin system.

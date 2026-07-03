@@ -1,0 +1,26 @@
+[package]
+name = "epix-tor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-transport = { path = "../epix-transport" }
+arti-client = { version = "0.44", features = [
+    "tokio",
+    "onion-service-client",
+    "onion-service-service",
+] }
+tor-hsservice = "0.44"
+safelog = "0.9"
+tor-rtcompat = { version = "0.44", features = ["tokio", "native-tls"] }
+tor-cell = "0.44"
+tor-proto = "0.44"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }

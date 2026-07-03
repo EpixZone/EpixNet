@@ -82,7 +82,7 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ),
     ("Network", "fileserver_port", "File server port (0 to disable seeding)", "26552", "text"),
     ("Network", "ip_external", "File server external ip (blank = auto-detect via UPnP)", "", "textarea"),
-    ("Network", "tor", "Tor", "disable", "soon:select:Disable=disable|Enable=enable|Always=always"),
+    ("Network", "tor", "Tor", "enable", "select:Disable=disable|Enable=enable|Always=always"),
     ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
     ("Network", "trackers", "Trackers", "145.223.69.23:26959", "textarea"),
     ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
@@ -220,6 +220,12 @@ pub struct AppState {
     /// `serverInfo`. Default closed / unknown.
     port_opened: RwLock<bool>,
     ip_external: RwLock<Option<String>>,
+    /// Tor: whether the in-process Arti client is up, its status string
+    /// (`OK`/`Always`/`Disabled`), and our onion address once the service
+    /// publishes. Set by the runtime's Tor loop; read by `serverInfo`.
+    tor_enabled: RwLock<bool>,
+    tor_status: RwLock<String>,
+    onion_address: RwLock<Option<String>>,
     /// Inbound updates currently being verified/downloaded (`site/inner:modified`
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
@@ -346,6 +352,9 @@ impl AppState {
             fileserver_port: RwLock::new(0),
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
+            tor_enabled: RwLock::new(false),
+            tor_status: RwLock::new("Disabled".to_string()),
+            onion_address: RwLock::new(None),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
@@ -436,6 +445,9 @@ impl AppState {
             fileserver_port: RwLock::new(0),
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
+            tor_enabled: RwLock::new(false),
+            tor_status: RwLock::new("Disabled".to_string()),
+            onion_address: RwLock::new(None),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1237,6 +1249,28 @@ impl AppState {
     /// The fileserver's reachability for `serverInfo`: `(port_opened, ip_external)`.
     pub async fn port_status(&self) -> (bool, Option<String>) {
         (*self.port_opened.read().await, self.ip_external.read().await.clone())
+    }
+
+    /// Record the in-process Tor client's state, for `serverInfo`. `status` is
+    /// the human string EpixNet shows (`OK`/`Always`/`Disabled`).
+    pub async fn set_tor_status(&self, enabled: bool, status: &str) {
+        *self.tor_enabled.write().await = enabled;
+        *self.tor_status.write().await = status.to_string();
+    }
+
+    /// Record our onion address (no `.onion` suffix) once the service publishes.
+    pub async fn set_onion_address(&self, host: &str) {
+        *self.onion_address.write().await = Some(host.to_string());
+    }
+
+    /// Tor state for `serverInfo`: `(enabled, status)`.
+    pub async fn tor_status(&self) -> (bool, String) {
+        (*self.tor_enabled.read().await, self.tor_status.read().await.clone())
+    }
+
+    /// Our onion address (no suffix), if the onion service has published one.
+    pub async fn onion_address(&self) -> Option<String> {
+        self.onion_address.read().await.clone()
     }
 
     /// Set the fileserver (seeding) port the node bound, for `serverInfo`.
@@ -2559,6 +2593,7 @@ impl AppState {
             json!(false)
         };
         let fileserver_port = self.fileserver_port().await;
+        let (tor_enabled, tor_status) = self.tor_status().await;
         json!({
             "version": self.version,
             "rev": 8192,
@@ -2568,8 +2603,8 @@ impl AppState {
             "port_opened": port_opened,
             "fileserver_ip": "127.0.0.1",
             "fileserver_port": fileserver_port,
-            "tor_enabled": false,
-            "tor_status": "Disabled",
+            "tor_enabled": tor_enabled,
+            "tor_status": tor_status,
             "tor_has_meek_bridges": false,
             "tor_use_bridges": false,
             "ui_ip": "127.0.0.1",
