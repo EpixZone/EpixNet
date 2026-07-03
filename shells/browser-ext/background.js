@@ -79,25 +79,6 @@ browser.webRequest.onBeforeRequest.addListener(
   ["blocking"]
 );
 
-// CSP reinforcement on .epix documents (only add if missing).
-browser.webRequest.onHeadersReceived.addListener(
-  (details) => {
-    if (!isEpix(hostOf(details.url))) return {};
-    const headers = details.responseHeaders || [];
-    if (!headers.some((h) => h.name.toLowerCase() === "content-security-policy")) {
-      headers.push({
-        name: "Content-Security-Policy",
-        value:
-          "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'",
-      });
-      return { responseHeaders: headers };
-    }
-    return {};
-  },
-  { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
-  ["blocking", "responseHeaders"]
-);
-
 // 3. Tor status icon.
 let lastStatus = { tor_status: "Unknown" };
 

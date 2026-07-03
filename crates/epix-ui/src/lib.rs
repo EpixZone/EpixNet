@@ -953,22 +953,21 @@ fn parse_range(header: &str) -> Option<(u64, Option<u64>)> {
 }
 
 /// Security + caching headers for an inner site file, matching EpixNet's
-/// `sendHeader`: the sandbox CSP (site files run inside the sandboxed frame),
-/// Referrer-Policy, Cache-Control by type, and Content-Disposition:attachment
-/// for file types that are dangerous to render inline (svg/xml/pdf/flash).
+/// `sendHeader`: Referrer-Policy, Cache-Control by type, and
+/// Content-Disposition:attachment for file types dangerous to render inline
+/// (svg/xml/pdf/flash).
+///
+/// Normal site files carry **no** Content-Security-Policy - matching EpixNet,
+/// which only sends the restrictive `sandbox` CSP for `raw`/noscript requests.
+/// The inner content is sandboxed by the wrapper's iframe `sandbox` attribute
+/// (`allow-scripts allow-same-origin …`); putting `default-src 'none'; sandbox
+/// (no allow-scripts)` on the file itself would block the site's own scripts and
+/// - now that we serve over https (a secure context) - its service worker.
 fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap {
     let mut pairs = vec![
         (header::CONTENT_TYPE, content_type.to_string()),
         (header::ACCEPT_RANGES, "bytes".to_string()),
         (header::REFERRER_POLICY, "same-origin".to_string()),
-        // The site file is loaded inside the wrapper's sandboxed iframe; this CSP
-        // is EpixNet's noscript/raw sandbox policy.
-        (
-            header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; sandbox allow-top-navigation allow-forms; \
-             img-src *; font-src * data:; media-src *; style-src * 'unsafe-inline';"
-                .to_string(),
-        ),
     ];
     // Download (don't render) types that can carry active content.
     if ["/svg", "/xml", "/x-shockwave-flash", "/pdf"].iter().any(|t| content_type.contains(t)) {
