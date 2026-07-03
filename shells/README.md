@@ -14,6 +14,19 @@ engine through one of two entry points:
 One engine, one code path. A change to resolution, verification, or Tor is made
 once in the core and every shell gets it.
 
+## Running the desktop browser locally
+
+```
+scripts/run-browser.sh              # opens dashboard.epix
+scripts/run-browser.sh talk.epix    # a specific xite
+```
+
+Use the script rather than a bare `cargo run -p epix-browser`: cargo won't
+build the native-messaging host (`epix-nmh`) as a side effect, and the browser
+extension needs it for the **Tor status icon** and name resolution. If
+`epix-nmh` is missing or stale the Tor icon shows "Off" even when Tor is up. The
+script builds both, then runs. (The packaged app already bundles both.)
+
 ## What is verified in this repo
 
 - `epix-node`, `epix-ffi`, `epix-tor` all compile and their unit tests pass on
