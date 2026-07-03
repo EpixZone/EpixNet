@@ -367,6 +367,9 @@ async fn serve(
     if display != address {
         state.set_display(&address, &display).await;
     }
+    // The launch xite is the homepage: the wrapper's corner home button and
+    // the admin pages' back link return here from any other xite.
+    state.set_homepage(&display);
 
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;
