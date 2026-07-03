@@ -11,7 +11,11 @@ epix-xite = { path = "../epix-xite" }
 epix-discovery = { path = "../epix-discovery" }
 epix-transport = { path = "../epix-transport" }
 epix-protocol = { path = "../epix-protocol" }
+epix-dht = { path = "../epix-dht" }
+epix-dht-net = { path = "../epix-dht-net" }
+epix-propagation = { path = "../epix-propagation" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+async-trait = "0.1"
 rmpv = "1"
 socket2 = "0.5"
 igd-next = { version = "0.16", features = ["aio_tokio"], optional = true }
