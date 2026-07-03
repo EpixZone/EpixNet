@@ -205,7 +205,7 @@ async fn clone_xite_with_progress(
     data_dir: &std::path::Path,
     transport: Arc<dyn Transport>,
     trackers: &[PeerAddr],
-    progress: Option<&AppState>,
+    progress: Option<&Arc<AppState>>,
 ) -> Result<(Option<serde_json::Value>, u64), String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
     let mut xite = Xite::new(
@@ -218,7 +218,16 @@ async fn clone_xite_with_progress(
         return Ok((xite.content.clone(), 0));
     }
 
-    let mut peers = epix_xite::announce(transport.as_ref(), address, trackers, 0).await;
+    // With a loading screen watching, announce through the state so the
+    // per-tracker stats record + push live (the screen's tracker status line)
+    // and the screen shows the search stage; the boot path stays direct.
+    let mut peers = match progress {
+        Some(state) => {
+            state.push_clone_event(address, serde_json::Value::Null, serde_json::json!({}));
+            state.announce_to_trackers(address, trackers).await
+        }
+        None => epix_xite::announce(transport.as_ref(), address, trackers, 0).await,
+    };
     // Trackers came up short: ask the DHT (tracker-independent - any peer that
     // serves the site can answer). Only wired on the on-demand path; at boot
     // the runtime (which owns the DHT) isn't running yet.
@@ -256,20 +265,51 @@ async fn clone_xite_with_progress(
         }
         if let Some(state) = progress {
             let total = xite.files_needed().len();
+            let counts = serde_json::json!({
+                "peers": peers.len(),
+                "bad_files": total,
+                "tasks": total,
+                "started_task_num": total,
+            });
             state.push_clone_event(
                 address,
                 serde_json::json!(["file_done", "content.json"]),
+                counts.clone(),
+            );
+            // "N files needs to be downloaded"
+            state.push_clone_event(address, serde_json::json!(["file_added", total]), counts);
+        }
+    }
+    // Per-file progress: each finished file prints its line on the loading
+    // screen and advances the progress bar (tasks/started_task_num).
+    let on_file = progress.map(|state| {
+        let state = state.clone();
+        let addr = address.to_string();
+        let peers_n = peers.len();
+        Arc::new(move |inner: &str, done: usize, total: usize| {
+            // The wrapper closes the loading screen on index.html's file_done,
+            // but the page itself only serves once the whole clone lands - so
+            // that one is pushed at the end (do_ensure), not from here.
+            if inner == "index.html" {
+                return;
+            }
+            let left = total.saturating_sub(done);
+            state.push_clone_event(
+                &addr,
+                serde_json::json!(["file_done", inner]),
                 serde_json::json!({
-                    "peers": peers.len(),
-                    "bad_files": total,
-                    "tasks": total,
+                    "peers": peers_n,
+                    "bad_files": left,
+                    "tasks": left,
                     "started_task_num": total,
                 }),
             );
-        }
-    }
+        }) as epix_worker::FileProgress
+    });
     let mut bytes_recv = 0;
-    if let Ok(report) = epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await {
+    if let Ok(report) =
+        epix_worker::sync_files_with_progress(&xite, &peers, transport.clone(), 8, on_file).await
+    {
         bytes_recv = report.bytes;
     }
     Ok((xite.content.clone(), bytes_recv))
