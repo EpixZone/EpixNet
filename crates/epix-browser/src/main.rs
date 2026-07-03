@@ -26,6 +26,18 @@ use std::time::Duration;
 
 const UI_ADDR: &str = "127.0.0.1:43110";
 const PROXY_ADDR: &str = "127.0.0.1:43112";
+const SOCKS_ADDR: &str = "127.0.0.1:43111";
+
+/// Whether the user has turned on "route clearnet through Tor" (persisted by the
+/// native host in `<data_root>/browser-settings.json`). Read at launch to build
+/// the file PAC.
+fn tor_clearnet_enabled(data_root: &Path) -> bool {
+    std::fs::read(data_root.join("browser-settings.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("tor_clearnet").and_then(|t| t.as_bool()))
+        .unwrap_or(false)
+}
 
 #[tokio::main]
 async fn main() {
@@ -116,10 +128,18 @@ async fn main() {
     // Firefox enforces signing, so the extension silently won't load there.
     let ext_capable = firefox_allows_unsigned(&firefox);
 
+    let socks_addr: SocketAddr = SOCKS_ADDR.parse().unwrap();
+    let tor_clearnet = tor_clearnet_enabled(&data_root);
+    if tor_clearnet {
+        println!("· routing clearnet through Tor (from the saved setting)");
+    }
+
     // Write the managed profile, then inject the CA so https://*.epix is trusted.
     let profile = data_root.join("firefox-profile");
     let secure = {
-        if let Err(e) = write_profile(&profile, proxy_addr, &display, true, ext_capable) {
+        if let Err(e) =
+            write_profile(&profile, proxy_addr, socks_addr, &display, true, tor_clearnet, ext_capable)
+        {
             eprintln!("could not write the Firefox profile: {e}");
             std::process::exit(1);
         }
@@ -127,7 +147,9 @@ async fn main() {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("· note: could not install the local CA ({e}); falling back to http");
-                let _ = write_profile(&profile, proxy_addr, &display, false, ext_capable);
+                let _ = write_profile(
+                    &profile, proxy_addr, socks_addr, &display, false, tor_clearnet, ext_capable,
+                );
                 false
             }
         }
@@ -320,30 +342,39 @@ fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
 /// Write the managed profile: the PAC (routes `*.epix` to the proxy) and a
 /// `user.js` locking the proxy and the navigate-not-search behaviour. `secure`
 /// picks the homepage scheme (https when the CA is trusted, else http).
+#[allow(clippy::too_many_arguments)]
 fn write_profile(
     profile: &Path,
     proxy_addr: SocketAddr,
+    socks_addr: SocketAddr,
     display: &str,
     secure: bool,
+    tor_clearnet: bool,
     ext_capable: bool,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(profile)?;
 
+    // The file PAC does all routing (the browser proxy API proved unreliable for
+    // this): `.epix` -> the node's browser proxy; clearnet -> the node's Tor
+    // SOCKS listener when the user has turned on "route clearnet through Tor",
+    // else DIRECT. The toggle updates the persisted setting; this PAC is rebuilt
+    // from it on the next launch.
+    let clearnet = if tor_clearnet {
+        format!("return \"SOCKS5 {socks_addr}\";")
+    } else {
+        "return \"DIRECT\";".to_string()
+    };
     let pac_path = profile.join("epix.pac");
     let pac = format!(
         "function FindProxyForURL(url, host) {{\n\
          \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {proxy_addr}\"; }}\n\
-         \x20 return \"DIRECT\";\n\
+         \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
+         \x20 {clearnet}\n\
          }}\n"
     );
     std::fs::write(&pac_path, pac)?;
     let pac_url = format!("file://{}", pac_path.display());
 
-    // Proxy baseline: a file PAC routing `*.epix` to the node proxy, so `.epix`
-    // works from the first request. When the extension is present it takes over
-    // via `proxy.settings` with a generated PAC (adding the live
-    // clearnet-through-Tor toggle) - a clean override, not mixed with the file
-    // PAC. `socks_remote_dns` avoids DNS leaks when Tor routing is on.
     let proxy_prefs = format!(
         "user_pref(\"network.proxy.type\", 2);\n\
          user_pref(\"network.proxy.autoconfig_url\", \"{pac_url}\");\n\
