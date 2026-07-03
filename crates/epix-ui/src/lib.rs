@@ -92,6 +92,7 @@ impl UiServer {
         let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
+            .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
             .route("/uimedia/*path", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
@@ -755,6 +756,74 @@ async fn serve_file(
 #[derive(Deserialize)]
 struct FileQuery {
     wrapper_nonce: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    upload_nonce: Option<String>,
+}
+
+/// `POST /EpixNet-Internal/BigfileUpload?upload_nonce=<nonce>` - receive a big
+/// file's bytes (from `bigfileUploadInit`), hash + store them, and return the
+/// merkle root + piece info. Accepts a raw body or a single multipart part.
+async fn bigfile_upload(
+    State(ctx): State<Ctx>,
+    Query(q): Query<UploadQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(nonce) = q.upload_nonce else {
+        return (StatusCode::BAD_REQUEST, "missing upload_nonce").into_response();
+    };
+    // If multipart/form-data, extract the single file part's bytes.
+    let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let data: &[u8] = if content_type.starts_with("multipart/form-data") {
+        match extract_multipart_file(&body) {
+            Some(slice) => slice,
+            None => return (StatusCode::BAD_REQUEST, "malformed multipart body").into_response(),
+        }
+    } else {
+        &body
+    };
+    match ctx.state.bigfile_upload_finish(&nonce, data).await {
+        Ok(r) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "merkle_root": r.merkle_root,
+                "piece_num": r.piece_num,
+                "piece_size": r.piece_size,
+                "inner_path": r.inner_path,
+            })
+            .to_string(),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({ "error": e }).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+/// Extract the single file part's bytes from a `multipart/form-data` body: the
+/// content between the first blank line (`\r\n\r\n`) after the part headers and
+/// the trailing boundary. Good enough for the wrapper's single-file XHR upload.
+fn extract_multipart_file(body: &[u8]) -> Option<&[u8]> {
+    let header_end = find_subslice(body, b"\r\n\r\n")? + 4;
+    let rest = &body[header_end..];
+    // The part ends at the last CRLF before the closing boundary line (`--…`).
+    let boundary_start = rfind_subslice(rest, b"\r\n--")?;
+    Some(&rest[..boundary_start])
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
 /// Parse an HTTP `Range: bytes=start-end` (single range). `end` is optional.

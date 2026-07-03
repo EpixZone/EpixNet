@@ -63,6 +63,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteRecoverPrivatekey",
     "siteReload",
     "siteResume",
+    "siteSetAutodownloadBigfileLimit",
     "siteSetAutodownloadoptional",
     "siteSetLimit",
     "siteSetOwned",
@@ -411,6 +412,9 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteBadFiles),
         Arc::new(GetTrackers),
         Arc::new(FeedSearch),
+        // Bigfile authoring.
+        Arc::new(BigfileUploadInit),
+        Arc::new(SiteSetAutodownloadBigfileLimit),
     ];
     // Multiuser: identity login/switch commands (desktop only).
     #[cfg(feature = "multiuser")]
@@ -2248,6 +2252,53 @@ impl WsCommand for CertList {
     }
 }
 
+/// `bigfileUploadInit {inner_path, size}` - start a Bigfile upload; returns the
+/// POST URL, piece size, and the file's path relative to content.json. The
+/// browser then POSTs the bytes to that URL.
+struct BigfileUploadInit;
+#[async_trait]
+impl WsCommand for BigfileUploadInit {
+    fn name(&self) -> &'static str {
+        "bigfileUploadInit"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let inner_path = arg_str(p, "inner_path", 0).ok_or("bigfileUploadInit: inner_path required")?;
+        let size = p
+            .get("size")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_u64())
+            .ok_or("bigfileUploadInit: size required")?;
+        let (nonce, piece_size, file_relative_path) =
+            s.state.bigfile_upload_init(&address, inner_path, size).await?;
+        Ok(json!({
+            "url": format!("/EpixNet-Internal/BigfileUpload?upload_nonce={nonce}"),
+            "piece_size": piece_size,
+            "inner_path": inner_path,
+            "file_relative_path": file_relative_path,
+        }))
+    }
+}
+
+/// `siteSetAutodownloadBigfileLimit {limit}` - the max big-file size (MB) to
+/// auto-download; persisted in config. Admin.
+struct SiteSetAutodownloadBigfileLimit;
+#[async_trait]
+impl WsCommand for SiteSetAutodownloadBigfileLimit {
+    fn name(&self) -> &'static str {
+        "siteSetAutodownloadBigfileLimit"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let limit = p
+            .get("limit")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_i64())
+            .ok_or("limit required")?;
+        s.state.config_set("autodownload_bigfile_size_limit", json!(limit)).await;
+        Ok(Value::from("ok"))
+    }
+}
+
 /// `dirList {inner_path, stats?}` - list a directory's entries. With `stats`,
 /// returns `[{name, is_dir, size}]`; otherwise just the names. Alias-/cors-/
 /// merger-aware via resolve_target.
@@ -2762,6 +2813,48 @@ mod tests {
         assert_eq!(SiteblockGet.handle(&session, &json!(["1GoodSite"])).await.unwrap(), Value::Bool(false));
         let blocks = SiteblockList.handle(&session, &Value::Null).await.unwrap();
         assert!(blocks["1BadSite"].is_object());
+    }
+
+    #[tokio::test]
+    async fn bigfile_upload_init_and_finish() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = epix_xite::XiteStorage::new(dir.path());
+        storage.write("content.json", br#"{"address":"1Big","files_optional":{}}"#).unwrap();
+        state
+            .add_xite(
+                "1Big",
+                crate::state::XiteEntry {
+                    storage,
+                    // Owned site so the upload permission check passes.
+                    content: Some(json!({ "address": "1Big" })),
+                },
+            )
+            .await;
+        state.set_owned("1Big", true).await;
+
+        // A multi-piece file (3 pieces of 4 bytes) via the state path.
+        let body = b"AAAABBBBCCCC";
+        let (nonce, piece_size, rel) =
+            state.bigfile_upload_init("1Big", "data/movie.bin", body.len() as u64).await.unwrap();
+        assert_eq!(piece_size, 1024 * 1024);
+        assert_eq!(rel, "movie.bin");
+
+        // Finish with a small forced piece size by re-initing won't change piece
+        // size; instead exercise finish with the real 1MB piece (single piece).
+        let result = state.bigfile_upload_finish(&nonce, body).await.unwrap();
+        assert_eq!(result.piece_num, 1, "12 bytes < 1MB is a single piece");
+        assert_eq!(result.merkle_root, epix_xite::XiteStorage::hash_bytes(body));
+
+        // The file was written and content.json gained a files_optional entry.
+        assert_eq!(state.read_file("1Big", "data/movie.bin").await.as_deref(), Some(&body[..]));
+        let content = state.content("1Big").await.unwrap();
+        let entry = &content["files_optional"]["data/movie.bin"];
+        assert_eq!(entry["size"], body.len());
+        assert_eq!(entry["sha512"], result.merkle_root);
+
+        // The nonce is single-use.
+        assert!(state.bigfile_upload_finish(&nonce, body).await.is_err());
     }
 
     #[tokio::test]

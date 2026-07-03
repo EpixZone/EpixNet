@@ -12,7 +12,7 @@ pub use announcer::announce;
 pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, XiteSettings};
 pub use piecefield::Piecefield;
-pub use piecemap::parse_piecemap;
+pub use piecemap::{build_piecemap, hash_bigfile, parse_piecemap, BigfileHash};
 pub use xite::{FileEntry, Xite};
 pub use storage::XiteStorage;
 

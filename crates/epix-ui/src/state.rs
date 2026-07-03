@@ -231,6 +231,9 @@ pub struct AppState {
     /// the node's activity survives restarts for support/debugging. Set by the
     /// host; None keeps logging in-memory + stdout only.
     log_file: std::sync::Mutex<Option<std::fs::File>>,
+    /// Pending Bigfile uploads keyed by nonce (`bigfileUploadInit` → the
+    /// `/EpixNet-Internal/BigfileUpload` POST consumes it).
+    bigfile_uploads: std::sync::Mutex<HashMap<String, BigfileUpload>>,
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -275,6 +278,25 @@ pub enum InboundUpdate {
     Applied,
     /// We already have this version (or newer) - sender recorded as a peer.
     NotChanged,
+}
+
+/// A pending Bigfile upload (created by `bigfileUploadInit`, consumed by the
+/// `/EpixNet-Internal/BigfileUpload` POST).
+#[derive(Clone)]
+pub struct BigfileUpload {
+    pub address: String,
+    pub inner_path: String,
+    pub size: u64,
+    pub piece_size: usize,
+    pub piecemap_inner_path: String,
+}
+
+/// The result of a completed Bigfile upload (returned to the uploader).
+pub struct BigfileUploadResult {
+    pub merkle_root: String,
+    pub piece_num: usize,
+    pub piece_size: usize,
+    pub inner_path: String,
 }
 
 fn empty_filters() -> Value {
@@ -328,6 +350,7 @@ impl AppState {
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
+            bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             data_root: None,
@@ -416,6 +439,7 @@ impl AppState {
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
+            bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             // The served-xite registry lives in the shared root (the parent of a
@@ -1780,6 +1804,126 @@ impl AppState {
     /// (`getPiecefields`). A big file is one with a `piecemap` + `piece_size` in
     /// content.json; a piece counts as held when the on-disk bytes verify against
     /// the piecemap. Files without their piecemap on disk are skipped.
+    /// Begin a Bigfile upload (`bigfileUploadInit`): check the user may write to
+    /// this site (owner, or their auth address is a valid signer), stash the
+    /// upload under a fresh nonce, and return `(nonce, piece_size,
+    /// file_relative_path)`. The caller POSTs the bytes to
+    /// `/EpixNet-Internal/BigfileUpload?upload_nonce=<nonce>`.
+    pub async fn bigfile_upload_init(
+        &self,
+        address: &str,
+        inner_path: &str,
+        size: u64,
+    ) -> Result<(String, usize, String), String> {
+        // Permission: own the site, or the user's auth address is a valid signer.
+        let owned = self.xites.read().await.get(address).map(|x| x.settings.own).unwrap_or(false);
+        if !owned {
+            let auth = self.user.write().await.auth_address(address).unwrap_or_default();
+            let content = self.content(address).await;
+            let is_signer = content
+                .as_ref()
+                .and_then(|c| c.get("signers"))
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.iter().any(|s| s.as_str() == Some(&auth)))
+                || content.as_ref().and_then(|c| c.get("address")).and_then(|v| v.as_str())
+                    == Some(&auth);
+            if !is_signer {
+                return Err("Forbidden, you can only modify your own files".into());
+            }
+        }
+        const PIECE_SIZE: usize = 1024 * 1024;
+        let inner_path = inner_path.trim_start_matches('/').to_string();
+        let piecemap_inner_path = format!("{inner_path}.piecemap.msgpack");
+        let file_relative_path =
+            inner_path.rsplit('/').next().unwrap_or(&inner_path).to_string();
+        let nonce = random_hex(16);
+        self.bigfile_uploads.lock().unwrap().insert(
+            nonce.clone(),
+            BigfileUpload {
+                address: address.to_string(),
+                inner_path,
+                size,
+                piece_size: PIECE_SIZE,
+                piecemap_inner_path,
+            },
+        );
+        Ok((nonce, PIECE_SIZE, file_relative_path))
+    }
+
+    /// Complete a Bigfile upload (`/EpixNet-Internal/BigfileUpload` POST): hash
+    /// the body into pieces + a merkle root, write the file and (for a multi-
+    /// piece file) its `.piecemap.msgpack`, add a `files_optional` entry to the
+    /// on-disk root content.json (unsigned - the owner signs later via
+    /// `siteSign`), and advertise the file in our hashfield. Consumes the nonce.
+    pub async fn bigfile_upload_finish(
+        &self,
+        nonce: &str,
+        body: &[u8],
+    ) -> Result<BigfileUploadResult, String> {
+        let upload = self
+            .bigfile_uploads
+            .lock()
+            .unwrap()
+            .remove(nonce)
+            .ok_or("Unknown or expired upload nonce")?;
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(&upload.address)
+            .map(|x| x.storage.clone())
+            .ok_or("Unknown site")?;
+
+        let hash = epix_xite::hash_bigfile(body, upload.piece_size);
+        storage.write(&upload.inner_path, body).map_err(|e| e.to_string())?;
+
+        let piece_num = hash.piece_hashes.len();
+        let mut entry = json!({
+            "sha512": hash.merkle_root,
+            "size": body.len(),
+        });
+        if piece_num > 1 {
+            // Multi-piece: write the piecemap and record it in the entry.
+            let file_name =
+                upload.inner_path.rsplit('/').next().unwrap_or(&upload.inner_path);
+            let blob = epix_xite::build_piecemap(file_name, &hash);
+            storage.write(&upload.piecemap_inner_path, &blob).map_err(|e| e.to_string())?;
+            let piecemap_rel =
+                upload.piecemap_inner_path.rsplit('/').next().unwrap_or(&upload.piecemap_inner_path);
+            if let Value::Object(m) = &mut entry {
+                m.insert("piecemap".into(), json!(piecemap_rel));
+                m.insert("piece_size".into(), json!(hash.piece_size));
+            }
+        }
+
+        // Add to the on-disk root content.json's files_optional (unsigned).
+        let mut content: Value = storage
+            .read("content.json")
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_else(|| json!({}));
+        if let Value::Object(root) = &mut content {
+            let files_opt = root
+                .entry("files_optional")
+                .or_insert_with(|| Value::Object(Default::default()));
+            if let Value::Object(fo) = files_opt {
+                fo.insert(upload.inner_path.clone(), entry);
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&content).map_err(|e| e.to_string())?;
+        storage.write("content.json", &bytes).map_err(|e| e.to_string())?;
+        // Refresh our in-memory view + advertise the file.
+        self.update_content(&upload.address, Some(content)).await;
+        self.hashfield_add(&upload.address, &hash.merkle_root).await;
+
+        Ok(BigfileUploadResult {
+            merkle_root: hash.merkle_root,
+            piece_num,
+            piece_size: hash.piece_size,
+            inner_path: upload.inner_path,
+        })
+    }
+
     pub async fn our_piecefields(&self, address: &str) -> std::collections::HashMap<String, Vec<u8>> {
         let mut out = std::collections::HashMap::new();
         let content = self.content(address).await;
