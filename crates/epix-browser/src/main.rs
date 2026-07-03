@@ -1,28 +1,30 @@
 //! The Epix desktop browser.
 //!
-//! This is Workstream B: a launcher that bundles the node with **real Firefox**
-//! so you get a genuine browser (extensions and all), not a WebView. It:
+//! Workstream B: a launcher that bundles the node with **real Firefox** so you
+//! get a genuine browser (extensions and all), not a WebView. It:
 //!
 //! 1. boots the embedded node ([`epix_node`]) - the same engine the server
 //!    binary runs, with in-process Tor;
-//! 2. writes a managed Firefox profile whose proxy PAC routes every `*.epix`
-//!    host to the node and leaves clearnet DIRECT;
-//! 3. launches Firefox on that profile at `http://<xite>/`, so the address bar
-//!    reads `dashboard.epix` and the node serves it in transparent-proxy mode;
+//! 2. serves a browser proxy that Firefox routes every `*.epix` host to. The
+//!    proxy TLS-terminates with a per-host leaf cert from a local CA Firefox
+//!    trusts, so `https://dashboard.epix/` is a real secure context;
+//! 3. writes a managed Firefox profile (PAC -> proxy, trust the CA, prefs) and
+//!    launches Firefox at `https://<xite>/`;
 //! 4. shuts the node down when Firefox exits.
-//!
-//! The node change that makes this work is the transparent-proxy host rewrite in
-//! `epix-ui` (a `Host: dashboard.epix` request is served as that xite). Secure
-//! origins (a local CA for `https://*.epix`), the bundled extension, and the
-//! CSP/clearnet-block are the next milestones; this gets the browser working
-//! end to end over `http://` first.
 
+mod ca;
+mod proxy;
+
+use ca::LocalCa;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
 const UI_ADDR: &str = "127.0.0.1:43110";
+const PROXY_ADDR: &str = "127.0.0.1:43112";
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +39,6 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Find Firefox before doing any slow work, so we fail fast with guidance.
     let firefox = match find_firefox() {
         Some(p) => p,
         None => {
@@ -49,7 +50,16 @@ async fn main() {
         }
     };
 
-    // Boot the node and start serving on a background task.
+    // The local CA for secure `https://*.epix` origins.
+    let ca = match LocalCa::load_or_create(&data_root.join("browser-ca")) {
+        Ok(ca) => Arc::new(ca),
+        Err(e) => {
+            eprintln!("could not set up the local CA: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Boot the node and serve the plain UI on loopback.
     println!("· starting the Epix node …");
     let opts = epix_node::NodeOptions {
         data_root: data_root.clone(),
@@ -70,27 +80,56 @@ async fn main() {
     };
     let display = running.display.clone();
     let ui_addr = running.ui_addr;
+
+    // The proxy serves the same router (with the transparent-proxy host rewrite)
+    // over TLS + plain http. Build it before the plain server consumes `server`.
+    let proxy_app =
+        tower::ServiceExt::<axum::extract::Request>::map_request(server.router(), epix_ui::rewrite_proxy_host);
     tokio::spawn(async move {
         let _ = server.serve(ui_addr).await;
     });
 
-    // Wait for the UI port to accept connections before launching Firefox.
-    if !wait_for_port(ui_addr, Duration::from_secs(30)).await {
-        eprintln!("the node's UI server did not come up on {ui_addr}");
+    let proxy_addr: SocketAddr = PROXY_ADDR.parse().unwrap();
+    {
+        let ca = ca.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(proxy_addr).await {
+                Ok(listener) => {
+                    let _ = proxy::serve(listener, proxy_app, ca).await;
+                }
+                Err(e) => eprintln!("browser proxy bind on {proxy_addr} failed: {e}"),
+            }
+        });
+    }
+
+    if !wait_for_port(ui_addr, Duration::from_secs(30)).await
+        || !wait_for_port(proxy_addr, Duration::from_secs(10)).await
+    {
+        eprintln!("the node did not come up");
         std::process::exit(1);
     }
-    println!("· node serving on http://{ui_addr}/  (xite: {display})");
+    println!("· node serving (xite: {display}); browser proxy on {proxy_addr}");
 
-    // Write the managed Firefox profile (prefs + PAC).
+    // Write the managed profile, then inject the CA so https://*.epix is trusted.
     let profile = data_root.join("firefox-profile");
-    if let Err(e) = write_profile(&profile, ui_addr) {
-        eprintln!("could not write the Firefox profile: {e}");
-        std::process::exit(1);
-    }
+    let secure = {
+        if let Err(e) = write_profile(&profile, proxy_addr, &display, true) {
+            eprintln!("could not write the Firefox profile: {e}");
+            std::process::exit(1);
+        }
+        match install_ca(&profile, &ca) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("· note: could not install the local CA ({e}); falling back to http");
+                // Rewrite the profile for http so there's no cert warning.
+                let _ = write_profile(&profile, proxy_addr, &display, false);
+                false
+            }
+        }
+    };
 
-    // Launch Firefox at the xite. In transparent-proxy mode the address bar
-    // shows the xite host, and the node serves it.
-    let start_url = format!("http://{display}/");
+    let scheme = if secure { "https" } else { "http" };
+    let start_url = format!("{scheme}://{display}/");
     println!("· launching Firefox at {start_url}");
     let status = Command::new(&firefox)
         .arg("--profile")
@@ -132,48 +171,113 @@ fn find_firefox() -> Option<PathBuf> {
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// Write the managed profile: a PAC that routes `*.epix` to the node, and a
-/// `user.js` that locks the proxy and keeps `.epix` navigations on http (no
-/// HTTPS-first, no search-from-address-bar).
-fn write_profile(profile: &Path, ui_addr: std::net::SocketAddr) -> std::io::Result<()> {
+/// Locate `certutil` (NSS): PATH, then keg-only Homebrew locations.
+fn find_certutil() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("EPIX_CERTUTIL") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let candidates = [
+        "/opt/homebrew/opt/nss/bin/certutil",
+        "/usr/local/opt/nss/bin/certutil",
+        "/usr/bin/certutil",
+        "/usr/local/bin/certutil",
+    ];
+    candidates.iter().map(PathBuf::from).find(|p| p.exists()).or_else(|| {
+        // Fall back to whatever is on PATH.
+        std::process::Command::new("certutil")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| PathBuf::from("certutil"))
+    })
+}
+
+/// Trust the local CA in the profile's NSS cert DB (`cert9.db`), so
+/// `https://*.epix` loads without a warning. Idempotent (re-add by nickname).
+fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
+    let certutil = find_certutil().ok_or_else(|| {
+        "certutil not found (install NSS, e.g. `brew install nss`, or set EPIX_CERTUTIL)".to_string()
+    })?;
+    let ca_path = profile.join("epix-ca.pem");
+    std::fs::write(&ca_path, ca.cert_pem()).map_err(|e| format!("write ca pem: {e}"))?;
+
+    // certutil needs the sql: db to exist; -N creates it if absent (empty pw).
+    let db = format!("sql:{}", profile.display());
+    // Ensure a db exists (ignore failure if it already does).
+    let _ = Command::new(&certutil)
+        .args(["-N", "--empty-password", "-d", &db])
+        .output();
+    // Remove any prior copy so this is idempotent, then add as a trusted CA.
+    let _ = Command::new(&certutil).args(["-D", "-n", "Epix Local CA", "-d", &db]).output();
+    let out = Command::new(&certutil)
+        .args(["-A", "-n", "Epix Local CA", "-t", "CT,C,C", "-d", &db])
+        .arg("-i")
+        .arg(&ca_path)
+        .output()
+        .map_err(|e| format!("run certutil: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("certutil -A failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(())
+}
+
+/// Write the managed profile: the PAC (routes `*.epix` to the proxy) and a
+/// `user.js` locking the proxy and the navigate-not-search behaviour. `secure`
+/// picks the homepage scheme (https when the CA is trusted, else http).
+fn write_profile(
+    profile: &Path,
+    proxy_addr: SocketAddr,
+    display: &str,
+    secure: bool,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(profile)?;
 
     let pac_path = profile.join("epix.pac");
     let pac = format!(
         "function FindProxyForURL(url, host) {{\n\
-         \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {ui_addr}\"; }}\n\
+         \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {proxy_addr}\"; }}\n\
          \x20 return \"DIRECT\";\n\
          }}\n"
     );
     std::fs::write(&pac_path, pac)?;
-    // Firefox wants a file:// URL for the PAC.
     let pac_url = format!("file://{}", pac_path.display());
 
+    let scheme = if secure { "https" } else { "http" };
+    // With a trusted CA we want https; without it, http (and disable https-first
+    // so Firefox doesn't upgrade the .epix navigation to a failing https).
+    let https_prefs = if secure {
+        ""
+    } else {
+        "user_pref(\"dom.security.https_only_mode\", false);\n\
+         user_pref(\"dom.security.https_first\", false);\n\
+         user_pref(\"dom.security.https_first_pbm\", false);\n"
+    };
+
     let prefs = format!(
-        r#"// Managed by epix-browser - do not edit; regenerated on launch.
+        r#"// Managed by epix-browser - regenerated on launch.
 user_pref("network.proxy.type", 2);
 user_pref("network.proxy.autoconfig_url", "{pac_url}");
 user_pref("network.proxy.allow_hijacking_localhost", true);
-// Keep .epix on http for now (secure-origin local CA is a later milestone).
-user_pref("dom.security.https_only_mode", false);
-user_pref("dom.security.https_first", false);
-user_pref("dom.security.https_first_pbm", false);
-// A dotted host like dashboard.epix should navigate, not search.
+{https_prefs}// A dotted host like dashboard.epix should navigate, not search.
 user_pref("browser.fixup.dns_first_for_single_words", false);
 user_pref("keyword.enabled", false);
 user_pref("browser.urlbar.suggest.searches", false);
 user_pref("browser.urlbar.suggest.quickactions", false);
 // Skip first-run noise so it opens straight on the xite.
-user_pref("browser.startup.homepage", "http://{ui_display}/");
+user_pref("browser.startup.homepage", "{scheme}://{display}/");
 user_pref("browser.startup.page", 1);
 user_pref("browser.aboutwelcome.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
 user_pref("browser.warnOnQuit", false);
-"#,
-        pac_url = pac_url,
-        ui_display = "dashboard.epix",
+// Allow userChrome.css / userContent.css styling of the browser chrome.
+user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
+"#
     );
     let mut f = std::fs::File::create(profile.join("user.js"))?;
     f.write_all(prefs.as_bytes())?;
@@ -181,7 +285,7 @@ user_pref("browser.warnOnQuit", false);
 }
 
 /// Poll `addr` until a TCP connection succeeds or `timeout` elapses.
-async fn wait_for_port(addr: std::net::SocketAddr, timeout: Duration) -> bool {
+async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {

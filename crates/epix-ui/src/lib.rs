@@ -157,7 +157,10 @@ fn is_proxy_host(host: &str) -> bool {
 /// so the existing `/:address/*path` handlers serve it. The Host header is left
 /// intact so [`serve_wrapper`] can tell it is host mode and emit host-relative
 /// URLs. Non-`.epix` hosts and the global routes pass through unchanged.
-fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Request {
+///
+/// Public so the desktop browser proxy (which serves the same router over TLS)
+/// can apply the identical rewrite.
+pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Request {
     let host = req
         .headers()
         .get(header::HOST)
