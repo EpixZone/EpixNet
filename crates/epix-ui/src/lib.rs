@@ -548,6 +548,9 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
           .checkbox-skin:before{{content:'';position:relative;width:20px;height:20px;background:#fff;display:block;border-radius:100%;margin:2px 0 0 2px;transition:all .5s cubic-bezier(.785,.135,.15,.86)}}\
           .checkbox.checked .checkbox-skin{{background:#2ECC71}}\
           .checkbox.checked .checkbox-skin:before{{margin-left:27px}}\
+          .checkbox input{{position:absolute;opacity:0;width:0;height:0}}\
+          .checkbox input:checked + .checkbox-skin{{background:#2ECC71}}\
+          .checkbox input:checked + .checkbox-skin:before{{margin-left:27px}}\
           .input-text{{padding:8px 18px;border:1px solid #CCC;border-radius:3px;font-size:15px;box-sizing:border-box;min-width:280px;font-family:'Segoe UI',Arial,sans-serif}}\
           .input-text:focus{{border-color:#3396ff;outline:none}}\
           .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer}}\
