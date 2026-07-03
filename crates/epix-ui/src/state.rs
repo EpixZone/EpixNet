@@ -976,10 +976,22 @@ impl AppState {
 
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
     pub async fn add_peers(&self, address: &str, addrs: impl IntoIterator<Item = PeerAddr>) {
-        let mut xites = self.xites.write().await;
-        if let Some(x) = xites.get_mut(address) {
-            x.peers.add_many(addrs, now_secs());
-            x.settings.peers = x.peers.len() as i64;
+        let grew = {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) => {
+                    let before = x.peers.len();
+                    x.peers.add_many(addrs, now_secs());
+                    x.settings.peers = x.peers.len() as i64;
+                    x.peers.len() > before
+                }
+                None => false,
+            }
+        };
+        // New peers discovered (announce/PEX/DHT/local): update the site's
+        // dashboard row live, like EpixNet's peers_added.
+        if grew {
+            self.push_site_info(address).await;
         }
     }
 
@@ -1343,8 +1355,17 @@ impl AppState {
     /// Record the fileserver's reachability (UPnP): whether the port is open to
     /// the internet and the node's external IP, if known.
     pub async fn set_port_status(&self, opened: bool, ip_external: Option<String>) {
-        *self.port_opened.write().await = opened;
+        let changed = {
+            let mut cur = self.port_opened.write().await;
+            let was = *cur;
+            *cur = opened;
+            was != opened
+        };
         *self.ip_external.write().await = ip_external;
+        // The dashboard shows port reachability live (serverChanged).
+        if changed {
+            self.push_server_info().await;
+        }
     }
 
     /// The fileserver's reachability for `serverInfo`: `(port_opened, ip_external)`.
@@ -1355,13 +1376,23 @@ impl AppState {
     /// Record the in-process Tor client's state, for `serverInfo`. `status` is
     /// the human string EpixNet shows (`OK`/`Always`/`Disabled`).
     pub async fn set_tor_status(&self, enabled: bool, status: &str) {
-        *self.tor_enabled.write().await = enabled;
-        *self.tor_status.write().await = status.to_string();
+        let changed = {
+            let mut cur = self.tor_status.write().await;
+            let was = cur.clone();
+            *self.tor_enabled.write().await = enabled;
+            *cur = status.to_string();
+            was != status
+        };
+        // The dashboard shows the Tor state live (serverChanged).
+        if changed {
+            self.push_server_info().await;
+        }
     }
 
     /// Record our onion address (no `.onion` suffix) once the service publishes.
     pub async fn set_onion_address(&self, host: &str) {
         *self.onion_address.write().await = Some(host.to_string());
+        self.push_server_info().await;
     }
 
     /// Tor state for `serverInfo`: `(enabled, status)`.
@@ -1487,10 +1518,11 @@ impl AppState {
             let needed = xite.files_needed().len();
             let workers = peers.len().min(8);
             self.set_worker_stats(address, needed, workers, needed).await;
-            let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8)
-                .await
-                .map_err(|e| e.to_string())?;
+            let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await;
+            // Always clear the live task counters - a leftover tasks>0 keeps
+            // the dashboard row's "Updating" spinner stuck.
             self.set_worker_stats(address, 0, 0, 0).await;
+            let report = report.map_err(|e| e.to_string())?;
             self.add_transfer(address, report.bytes, 0).await;
             // Data files may have changed - rebuild the db view.
             self.update_content(address, xite.content).await;
@@ -2544,6 +2576,130 @@ impl AppState {
         self.conn_pool.stats().await
     }
 
+    /// Render the diagnostics Stats page (EpixNet's `/Stats`): node identity,
+    /// connection pool, trackers, Tor, and a per-site table. Returns the inner
+    /// HTML body; the route wraps it in the shared page shell.
+    pub async fn stats_html(&self) -> String {
+        use std::fmt::Write;
+        let esc = |s: &str| {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        };
+        let (tor_enabled, tor_status) = self.tor_status().await;
+        let (port_opened, ip_ext) = self.port_status().await;
+        let stats = self.connection_stats().await;
+        let mut h = String::new();
+
+        // Head line.
+        let _ = write!(
+            h,
+            "<div class='stat-head'>v{ver} | Port: {port} | Opened: {opened} |              External IP: {ip} | Tor: {tor} | Connections: {conns}</div>",
+            ver = esc(&self.version),
+            port = self.fileserver_port().await,
+            opened = port_opened,
+            ip = esc(&ip_ext.unwrap_or_else(|| "-".into())),
+            tor = if tor_enabled { esc(&tor_status) } else { "off".into() },
+            conns = stats.total,
+        );
+
+        // Connections.
+        let _ = write!(
+            h,
+            "<h2>Connections ({} live, onion: {})</h2>             <table><tr><th>peer</th><th>type</th><th>ping</th></tr>",
+            stats.total, stats.onion
+        );
+        for addr in self.conn_pool.connected_addrs().await {
+            let ping = self
+                .conn_pool
+                .ping_for(&addr)
+                .await
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "-".into());
+            let kind = match &addr {
+                PeerAddr::Onion { .. } => "onion",
+                PeerAddr::Rns(_) => "mesh",
+                PeerAddr::Ip(_) => "ip",
+            };
+            let _ = write!(
+                h,
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&addr.to_string()),
+                kind,
+                ping
+            );
+        }
+        if stats.total == 0 {
+            h.push_str("<tr><td colspan=3 class='muted'>no live connections</td></tr>");
+        }
+        h.push_str("</table>");
+
+        // Trackers.
+        h.push_str("<h2>Trackers</h2><table><tr><th>address</th><th>requests</th><th>errors</th><th>peers found</th><th>status</th></tr>");
+        let trackers = self.announcer_stats().await;
+        if let Value::Object(map) = &trackers {
+            for (addr, st) in map {
+                let get = |k: &str| st.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+                let status =
+                    st.get("status").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+                let _ = write!(
+                    h,
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    esc(addr),
+                    get("num_request"),
+                    get("num_error"),
+                    get("num_added"),
+                    esc(&status),
+                );
+            }
+        }
+        if !matches!(&trackers, Value::Object(m) if !m.is_empty()) {
+            h.push_str("<tr><td colspan=5 class='muted'>no announces yet</td></tr>");
+        }
+        h.push_str("</table>");
+
+        // Tor.
+        h.push_str("<h2>Tor</h2>");
+        let _ = write!(
+            h,
+            "<div class='stat-row'>status: <b>{}</b></div>",
+            if tor_enabled { esc(&tor_status) } else { "disabled".into() }
+        );
+        if let Some(onion) = self.onion_address().await {
+            let _ = write!(h, "<div class='stat-row'>onion: {}.onion</div>", esc(&onion));
+        }
+
+        // Sites.
+        h.push_str("<h2>Sites</h2><table><tr><th>address</th><th>peers (conn/able/total)</th><th>onion</th><th>local</th><th>out</th><th>in</th><th>serving</th></tr>");
+        for address in self.xite_addresses().await {
+            // One row per site (skip the display-name alias key, if any).
+            if address.contains('.') {
+                continue;
+            }
+            let pc = self.peer_counts(&address).await;
+            let (recv, sent) = self.transfer(&address).await;
+            let serving = self.is_serving(&address).await;
+            let display = self.display_of(&address).await;
+            let label = match &display {
+                Some(d) => format!("{} <span class='muted'>({})</span>", esc(d), esc(&address)),
+                None => esc(&address),
+            };
+            let _ = write!(
+                h,
+                "<tr class='{cls}'><td>{label}</td><td>{c}/{able}/{total}</td><td>{onion}</td>                 <td>{local}</td><td>{out:.0}k</td><td>{in_:.0}k</td><td>{serving}</td></tr>",
+                cls = if serving { "" } else { "muted" },
+                c = pc.connected,
+                able = pc.connectable,
+                total = pc.total,
+                onion = pc.onion,
+                local = pc.local,
+                out = sent as f64 / 1024.0,
+                in_ = recv as f64 / 1024.0,
+                serving = serving,
+            );
+        }
+        h.push_str("</table>");
+        h
+    }
+
     // --- Server-pushed UI events --------------------------------------------
 
     // --- Console log buffer -------------------------------------------------
@@ -2656,6 +2812,22 @@ impl AppState {
         let mut info = self.site_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!([event, true]));
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
+    }
+
+    /// Push the outcome of an update check as the dashboard expects it
+    /// (EpixNet's contract): an `updated` event ends the "Updating..." pill -
+    /// rendered as a self-clearing "Updated!" flash on success, or (with
+    /// `content_updated: false`) as the "Update failed"/"No peers" error pill.
+    /// A plain eventless push would leave the old pill text on screen.
+    pub async fn push_update_result(&self, address: &str, ok: bool) {
+        let mut info = self.site_info(address).await;
+        if let Value::Object(m) = &mut info {
+            m.insert("event".to_string(), json!(["updated", true]));
+            if !ok {
+                m.insert("content_updated".to_string(), json!(false));
+            }
             self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
         }
     }
@@ -3527,6 +3699,10 @@ impl AppState {
             let _ = self.publish_to(&key, &inner_path, 3).await;
         }
         self.updates_in_flight.lock().unwrap().remove(&uri);
+        // Flash the dashboard row: a peer pushed a new version and it landed.
+        for k in &keys {
+            self.push_site_info_event(k, "updated").await;
+        }
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {

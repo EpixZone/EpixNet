@@ -829,7 +829,16 @@ impl WsCommand for ChannelJoin {
         self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        s.join_channels(p, self.cmd == "channelJoinAllsite");
+        // An ADMIN site's joins carry all-site scope. The dashboard sends
+        // channelJoinAllsite only once at page load; after a node restart the
+        // wrapper auto-rejoins with plain channelJoin, and without this the
+        // dashboard silently stops receiving other sites' events (rows frozen,
+        // spinners stuck) until a manual refresh.
+        let admin = match s.address() {
+            Ok(addr) => s.state.site_has_admin(addr).await,
+            Err(_) => false,
+        };
+        s.join_channels(p, self.cmd == "channelJoinAllsite" || admin);
         Ok(Value::from("ok"))
     }
 }
@@ -1061,8 +1070,8 @@ impl WsCommand for SiteUpdate {
         let state = s.state.clone();
         tokio::spawn(async move {
             state.push_site_info_event(&address, "updating").await;
-            let _ = state.resync_xite(&address).await;
-            state.push_site_info_event(&address, "updated").await;
+            let ok = state.resync_xite(&address).await.is_ok();
+            state.push_update_result(&address, ok).await;
         });
         Ok(Value::from("Updated"))
     }
