@@ -121,17 +121,26 @@ pub async fn resolve_target(data_root: &std::path::Path, target: &str) -> (Strin
     (address, full, false)
 }
 
-/// Resolve a `.epix` name to its xite address on the chain.
-pub async fn resolve_on_chain(name: &str, tld: &str) -> String {
+/// Resolve a `.epix` name to its xite address on the chain, or an error string
+/// (never panics - safe to call from a request handler).
+pub async fn try_resolve_on_chain(name: &str, tld: &str) -> Result<String, String> {
     let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
     let domain = resolver
         .resolve(name, tld)
         .await
-        .unwrap_or_else(|e| panic!("could not resolve {name}.{tld}: {e}"));
+        .map_err(|e| format!("could not resolve {name}.{tld}: {e}"))?;
     domain
         .xite_address()
-        .unwrap_or_else(|| panic!("{name}.{tld} has no EpixNet xite address record"))
-        .to_string()
+        .map(|a| a.to_string())
+        .ok_or_else(|| format!("{name}.{tld} has no EpixNet xite address record"))
+}
+
+/// Resolve a `.epix` name to its xite address on the chain (panics on failure -
+/// the initial-boot CLI path).
+pub async fn resolve_on_chain(name: &str, tld: &str) -> String {
+    try_resolve_on_chain(name, tld)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// Boot the node: resolve, clone + verify (unless already on disk), set up the
@@ -152,51 +161,11 @@ pub async fn boot(
     let data_dir = opts.data_root.join(&address);
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
-    let mut xite = Xite::new(
-        Address::parse(address.clone()).map_err(|e| format!("bad address: {e}"))?,
-        XiteStorage::new(&data_dir),
-    );
+    let trackers = vec![PeerAddr::parse(DEFAULT_TRACKER).unwrap()];
+    let (content, bytes_recv) =
+        clone_xite(&address, &data_dir, transport.clone(), &trackers).await?;
 
-    // Clone from the network unless the xite is already complete on disk.
-    let mut bytes_recv = 0u64;
-    let complete = xite.load_content().unwrap_or(false) && xite.files_needed().is_empty();
-    if !complete {
-        let peers = epix_xite::announce(
-            transport.as_ref(),
-            &address,
-            &[PeerAddr::parse(DEFAULT_TRACKER).unwrap()],
-            0,
-        )
-        .await;
-        if peers.is_empty() {
-            return Err("no peers found - is the network reachable?".into());
-        }
-        // Fetch + verify content.json from any peer.
-        if xite.content.is_none() {
-            let mut ok = false;
-            for peer in &peers {
-                if let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await {
-                    if conn.handshake().await.is_ok() {
-                        if let Ok(b) = conn.get_file(&address, "content.json").await {
-                            if xite.set_content(&b).is_ok() {
-                                ok = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if !ok {
-                return Err("could not fetch + verify content.json from any peer".into());
-            }
-        }
-        // Sync every file, verifying each hash.
-        if let Ok(report) = epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await {
-            bytes_recv = report.bytes;
-        }
-    }
-
-    let running = serve(opts, address, display, data_dir, xite.content.clone(), bytes_recv).await?;
+    let running = serve(opts, address, display, data_dir, content, bytes_recv).await?;
     Ok(running)
 }
 
@@ -205,6 +174,131 @@ pub async fn boot(
 pub async fn run(opts: NodeOptions) -> Result<(), String> {
     let (server, running) = boot(opts).await?;
     server.serve(running.ui_addr).await.map_err(|e| format!("server: {e}"))
+}
+
+/// Clone a xite into `data_dir` from the network (skipping the fetch if it is
+/// already complete on disk): discover peers, fetch + verify content.json, and
+/// sync every file. Returns the verified content and the bytes downloaded.
+/// Shared by initial boot and the on-demand resolver.
+async fn clone_xite(
+    address: &str,
+    data_dir: &std::path::Path,
+    transport: Arc<dyn Transport>,
+    trackers: &[PeerAddr],
+) -> Result<(Option<serde_json::Value>, u64), String> {
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
+    let mut xite = Xite::new(
+        Address::parse(address.to_string()).map_err(|e| format!("bad address: {e}"))?,
+        XiteStorage::new(data_dir),
+    );
+
+    let complete = xite.load_content().unwrap_or(false) && xite.files_needed().is_empty();
+    if complete {
+        return Ok((xite.content.clone(), 0));
+    }
+
+    let peers = epix_xite::announce(transport.as_ref(), address, trackers, 0).await;
+    if peers.is_empty() {
+        return Err("no peers found - is the network reachable?".into());
+    }
+    if xite.content.is_none() {
+        let mut ok = false;
+        for peer in &peers {
+            if let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await {
+                if conn.handshake().await.is_ok() {
+                    if let Ok(b) = conn.get_file(address, "content.json").await {
+                        if xite.set_content(&b).is_ok() {
+                            ok = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !ok {
+            return Err("could not fetch + verify content.json from any peer".into());
+        }
+    }
+    let mut bytes_recv = 0;
+    if let Ok(report) = epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await {
+        bytes_recv = report.bytes;
+    }
+    Ok((xite.content.clone(), bytes_recv))
+}
+
+/// The on-demand resolver the browser proxy path uses: given a `.epix` host not
+/// yet served, resolve it on-chain, clone it, and add it as a served xite (under
+/// both its address and the name), so typing any `talk.epix` opens it live.
+struct OnDemand {
+    state: Arc<AppState>,
+    data_root: PathBuf,
+    transport: Arc<dyn Transport>,
+    trackers: Vec<PeerAddr>,
+    /// Names currently being cloned, so concurrent requests coalesce.
+    in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl epix_ui::OnDemandResolver for OnDemand {
+    async fn ensure(&self, host: &str) -> Result<(), String> {
+        if self.state.has_xite(host).await {
+            return Ok(());
+        }
+        // Coalesce concurrent clones of the same name: the first does the work,
+        // the rest wait briefly for it to land.
+        {
+            let mut inflight = self.in_flight.lock().await;
+            if inflight.contains(host) {
+                drop(inflight);
+                for _ in 0..60 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if self.state.has_xite(host).await {
+                        return Ok(());
+                    }
+                }
+                return Err("timed out waiting for a concurrent clone".into());
+            }
+            inflight.insert(host.to_string());
+        }
+        let result = self.do_ensure(host).await;
+        self.in_flight.lock().await.remove(host);
+        result
+    }
+}
+
+impl OnDemand {
+    async fn do_ensure(&self, host: &str) -> Result<(), String> {
+        // Resolve the name to a xite address on-chain (unless it's already one).
+        let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+        let address = if name.starts_with("epix1") {
+            name.to_string()
+        } else {
+            try_resolve_on_chain(name, tld).await?
+        };
+        // Persist the resolution so a restart serves it without re-resolving.
+        write_resolve_cache(&self.data_root, host, &address);
+
+        let data_dir = self.data_root.join(&address);
+        // If we already serve the raw address, just alias the name to it.
+        if !self.state.has_xite(&address).await {
+            let (content, bytes) =
+                clone_xite(&address, &data_dir, self.transport.clone(), &self.trackers).await?;
+            self.state
+                .add_xite(
+                    &address,
+                    XiteEntry { storage: XiteStorage::new(&data_dir), content: content.clone() },
+                )
+                .await;
+            self.state.add_transfer(&address, bytes, 0).await;
+        }
+        // Serve it under the `.epix` name too.
+        let content = self.state.content(&address).await;
+        self.state
+            .add_xite(host, XiteEntry { storage: XiteStorage::new(&data_dir), content })
+            .await;
+        self.state.log("INFO", format!("On-demand cloned {host} -> {address}")).await;
+        Ok(())
+    }
 }
 
 /// Wire up the [`AppState`], plugins, background runtime, and UI server for an
@@ -257,7 +351,7 @@ async fn serve(
     }
 
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-    state.set_transport(transport).await;
+    state.set_transport(transport.clone()).await;
 
     // Trackers: configured list, else the default.
     let trackers: Vec<PeerAddr> = match state
@@ -270,6 +364,19 @@ async fn serve(
         }
         _ => vec![PeerAddr::parse(DEFAULT_TRACKER).unwrap()],
     };
+
+    // On-demand resolve + clone: typing any `talk.epix` in the browser clones
+    // and serves it live.
+    state
+        .set_on_demand(Arc::new(OnDemand {
+            state: state.clone(),
+            data_root: opts.data_root.clone(),
+            transport: transport.clone(),
+            trackers: trackers.clone(),
+            in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        }))
+        .await;
+
     state.add_transfer(&address, bytes_recv, 0).await;
     if display != address {
         state.add_transfer(&display, bytes_recv, 0).await;

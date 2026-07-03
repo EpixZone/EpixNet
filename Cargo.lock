@@ -1664,6 +1664,7 @@ dependencies = [
 name = "epix-node"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "epix-chain",
  "epix-core",
  "epix-plugin",

@@ -15,8 +15,9 @@ epix-chain = { path = "../epix-chain" }
 epix-plugin = { path = "../epix-plugin" }
 epix-plugins = { path = "../epix-plugins" }
 epix-runtime = { path = "../epix-runtime" }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
 serde_json = "1"
+async-trait = "0.1"
 
 [features]
 default = ["tor"]

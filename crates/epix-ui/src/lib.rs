@@ -18,7 +18,7 @@ pub mod state;
 pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
-pub use state::{AppState, XiteEntry};
+pub use state::{AppState, OnDemandResolver, XiteEntry};
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -295,8 +295,23 @@ async fn serve_wrapper(
     Path(address): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    // The Host without port; in transparent-proxy mode it equals the xite name.
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .unwrap_or_default();
+    let proxy_mode = host == address;
+
     if !ctx.state.has_xite(&address).await {
-        return (StatusCode::NOT_FOUND, "unknown xite").into_response();
+        // On-demand: if the browser asked for a `.epix` host we don't serve yet,
+        // resolve + clone it live, then serve. Only for transparent-proxy hosts.
+        let cloned = proxy_mode
+            && address.ends_with(".epix")
+            && ctx.state.ensure_xite(&address).await;
+        if !cloned {
+            return (StatusCode::NOT_FOUND, "unknown xite").into_response();
+        }
     }
     // Trust this Host as a WebSocket origin (the wrapper's own page will open
     // the WS from it).
@@ -328,16 +343,8 @@ async fn serve_wrapper(
     // WebSocket via siteInfo.
     let permissions = ctx.state.site_permissions(&address).await;
 
-    // Transparent-proxy (host) mode: Firefox routed a `*.epix` host here, so the
-    // Host header equals the xite name (rewrite_proxy_host injected the path
-    // prefix). In that case the page lives at the host root, so wrapper URLs are
-    // host-relative (`/index.html`) not path-prefixed (`/dashboard.epix/index.html`).
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|h| h.split(':').next().unwrap_or(h).to_string())
-        .unwrap_or_default();
-    let proxy_mode = host == address;
+    // In transparent-proxy (host) mode the page lives at the host root, so
+    // wrapper URLs are host-relative (`/index.html`) not path-prefixed.
     let (homepage, file_url) = if proxy_mode {
         (String::new(), "/index.html".to_string())
     } else {

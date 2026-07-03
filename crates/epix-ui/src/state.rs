@@ -20,6 +20,17 @@ use tokio::sync::RwLock;
 /// Default per-xite size limit, in MB (matches EpixNet's `config.size_limit`).
 const DEFAULT_SIZE_LIMIT_MB: i64 = 10;
 
+/// Resolves + clones a `.epix` host that isn't served yet, so the browser can
+/// open any name by typing it. Implemented by the node (which has the chain
+/// resolver + download worker); the UI server calls it via
+/// [`AppState::ensure_xite`]. Kept as a trait so `epix-ui` has no dependency on
+/// the chain/worker crates.
+#[async_trait::async_trait]
+pub trait OnDemandResolver: Send + Sync {
+    /// Resolve + clone `host` and add it as a served xite. `Ok(())` once served.
+    async fn ensure(&self, host: &str) -> Result<(), String>;
+}
+
 /// Plugins that ship disabled by default, matching the plugins EpixNet keeps
 /// `disabled-` (that we have): they are off until the operator turns them on.
 const DEFAULT_DISABLED_PLUGINS: &[&str] = &["NoNewSites", "UiPassword", "Multiuser"];
@@ -165,6 +176,10 @@ pub struct AppState {
     filters_path: Option<PathBuf>,
     /// Transport used to publish updates to peers (set by the node).
     transport: RwLock<Option<Arc<dyn Transport>>>,
+    /// On-demand resolver: resolve + clone a `.epix` host not yet served (set by
+    /// the node, which has the chain + worker). Lets the browser open any
+    /// `talk.epix` by typing it, cloning it live.
+    on_demand: RwLock<Option<Arc<dyn OnDemandResolver>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -334,6 +349,7 @@ impl AppState {
             filters: RwLock::new(empty_filters()),
             filters_path: None,
             transport: RwLock::new(None),
+            on_demand: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -426,6 +442,7 @@ impl AppState {
             filters: RwLock::new(filters),
             filters_path: Some(filters_path),
             transport: RwLock::new(None),
+            on_demand: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -2894,6 +2911,31 @@ impl AppState {
     /// The transport used to publish updates to peers.
     pub async fn set_transport(&self, transport: Arc<dyn Transport>) {
         *self.transport.write().await = Some(transport);
+    }
+
+    /// Install the on-demand resolver (set by the node).
+    pub async fn set_on_demand(&self, resolver: Arc<dyn OnDemandResolver>) {
+        *self.on_demand.write().await = Some(resolver);
+    }
+
+    /// Ensure `host` (a `.epix` name) is served, resolving + cloning it on demand
+    /// if a resolver is installed and it isn't served yet. Returns whether it is
+    /// now served. Used by the browser proxy path so typing any `talk.epix`
+    /// clones and opens it live.
+    pub async fn ensure_xite(&self, host: &str) -> bool {
+        if self.has_xite(host).await {
+            return true;
+        }
+        let hook = self.on_demand.read().await.clone();
+        match hook {
+            Some(hook) => {
+                if let Err(e) = hook.ensure(host).await {
+                    self.log("INFO", format!("On-demand resolve of {host} failed: {e}")).await;
+                }
+                self.has_xite(host).await
+            }
+            None => false,
+        }
     }
 
     /// Mark a xite owned/not (`siteSetOwned`). Signing still requires the key.
