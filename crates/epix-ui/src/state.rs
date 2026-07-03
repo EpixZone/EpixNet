@@ -702,6 +702,66 @@ impl AppState {
         }
     }
 
+    /// Connectable public peers for a PEX reply: up to `need`, excluding any in
+    /// `exclude` (peers the requester already sent us) and private/loopback
+    /// addresses. Resolves aliases so any key sharing the canonical address
+    /// draws from the same peer set.
+    pub async fn pex_peers(
+        &self,
+        address: &str,
+        need: usize,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Vec<PeerAddr> {
+        let xites = self.xites.read().await;
+        let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
+        x.peers
+            .peers()
+            .filter(|p| p.is_connectable() && !p.addr.is_private())
+            .filter(|p| !exclude.contains(&p.addr.to_string()))
+            .map(|p| p.addr.clone())
+            .take(need)
+            .collect()
+    }
+
+    /// content.json files modified after `since` (ms), as `{inner_path:
+    /// modified}` - the `listModified` reply. Only the root content.json is
+    /// tracked until includes land, so this returns it when newer than `since`.
+    pub async fn list_modified(&self, address: &str, since: f64) -> serde_json::Map<String, Value> {
+        let mut out = serde_json::Map::new();
+        let xites = self.xites.read().await;
+        if let Some(x) = self.resolve_xite(&xites, address) {
+            if let Some(modified) =
+                x.content.as_ref().and_then(|c| c.get("modified")).and_then(|v| v.as_f64())
+            {
+                if modified > since {
+                    out.insert("content.json".to_string(), json!(modified));
+                }
+            }
+        }
+        out
+    }
+
+    /// Find a managed xite by a key that may be its serving key or its signed
+    /// content address (alias-aware).
+    fn resolve_xite<'a>(
+        &self,
+        xites: &'a HashMap<String, ManagedXite>,
+        address: &str,
+    ) -> Option<&'a ManagedXite> {
+        xites.get(address).or_else(|| {
+            xites
+                .values()
+                .find(|x| canonical_address(x.content.as_ref(), address) == address)
+        })
+    }
+
+    /// True if we serve a xite under `address` (its serving key or signed
+    /// content address).
+    pub async fn has_any_alias(&self, address: &str) -> bool {
+        let xites = self.xites.read().await;
+        self.resolve_xite(&xites, address).is_some()
+    }
+
     // --- PeerDb: persist known peers across restarts ------------------------
 
     /// Load the peers persisted for a site (by signed content address).
@@ -1767,9 +1827,72 @@ impl AppState {
             xites.keys().cloned().collect()
         };
         // Push the updated connection/peer counts to any connected UI.
-        for address in addresses {
-            self.push_site_info(&address).await;
+        for address in &addresses {
+            self.push_site_info(address).await;
         }
+
+        // PEX: keep the peer set self-healing between announces. Cheap - a few
+        // peers per xite - so run it each connection cycle.
+        for address in &addresses {
+            self.run_pex(address, 3, 5).await;
+        }
+    }
+
+    /// Peer-exchange one xite: ask a few connectable peers for their peers and
+    /// fold in any new ones. Trackers/DHT bootstrap discovery; PEX keeps it
+    /// self-healing between announces (EpixNet runs this in its cleanup loop).
+    /// Returns how many new peers were learned.
+    pub async fn run_pex(&self, address: &str, max_peers: usize, need: i64) -> usize {
+        let Some(transport) = self.transport.read().await.clone() else { return 0 };
+        let canonical = {
+            let xites = self.xites.read().await;
+            let Some(x) = self.resolve_xite(&xites, address) else { return 0 };
+            canonical_address(x.content.as_ref(), address)
+        };
+        // The peers we offer them (packed by type), and the set we already know.
+        let ours = self.connectable_peers(address, 10).await;
+        let mut known: std::collections::HashSet<String> =
+            ours.iter().map(|p| p.to_string()).collect();
+        let (mut ipv4, mut ipv6, mut onion) = (Vec::new(), Vec::new(), Vec::new());
+        for p in &ours {
+            if p.is_private() {
+                continue;
+            }
+            match (p.ip_type(), p.pack()) {
+                (epix_core::IpType::Ipv4, Some(b)) => ipv4.push(b),
+                (epix_core::IpType::Ipv6, Some(b)) => ipv6.push(b),
+                (epix_core::IpType::Onion, Some(b)) => onion.push(b),
+                _ => {}
+            }
+        }
+
+        let mut learned: Vec<PeerAddr> = Vec::new();
+        for peer in ours.iter().take(max_peers) {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
+                conn.handshake().await.ok()?;
+                conn.pex(&canonical, ipv4.clone(), ipv6.clone(), onion.clone(), need).await.ok()
+            })
+            .await;
+            let Ok(Some(reply)) = got else { continue };
+            self.set_peer_connected(address, peer, true).await;
+            let unpacked = reply
+                .ipv4
+                .iter()
+                .chain(reply.ipv6.iter())
+                .filter_map(|b| PeerAddr::unpack_ip(b))
+                .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)));
+            for p in unpacked {
+                if known.insert(p.to_string()) {
+                    learned.push(p);
+                }
+            }
+        }
+        let count = learned.len();
+        if count > 0 {
+            self.add_peers(address, learned).await;
+        }
+        count
     }
 
     /// Live connection stats (`connection`, `connection_in`, `connection_onion`,

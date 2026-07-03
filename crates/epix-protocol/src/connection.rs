@@ -16,6 +16,15 @@ pub struct HandshakeInfo {
     pub crypt_supported: Vec<String>,
 }
 
+/// A `pex` reply's peers, packed by bucket. Unpack with `PeerAddr::unpack_ip`
+/// (ipv4/ipv6) and `PeerAddr::unpack_onion` (onion).
+#[derive(Debug, Clone, Default)]
+pub struct PexReply {
+    pub ipv4: Vec<Vec<u8>>,
+    pub ipv6: Vec<Vec<u8>>,
+    pub onion: Vec<Vec<u8>>,
+}
+
 fn parse_handshake(v: &Value) -> HandshakeInfo {
     let s = |k: &str| vget(v, k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let i = |k: &str| vget(v, k).and_then(|x| x.as_i64()).unwrap_or(0);
@@ -174,6 +183,57 @@ impl Connection {
             ("modified", Value::from(modified)),
         ]);
         self.request("update", params).await
+    }
+
+    /// Exchange peers (`pex`): send some of our connectable peers (packed by
+    /// type) and `need`, get back the peer's peers we don't have. Returns the
+    /// packed peer byte-lists by bucket (`ipv4`, `ipv6`, `onion`); the caller
+    /// unpacks with `PeerAddr::unpack_*` (kept out of the protocol layer).
+    pub async fn pex(
+        &mut self,
+        xite: &str,
+        peers: Vec<Vec<u8>>,
+        peers_ipv6: Vec<Vec<u8>>,
+        peers_onion: Vec<Vec<u8>>,
+        need: i64,
+    ) -> Result<PexReply> {
+        let pack = |list: Vec<Vec<u8>>| Value::Array(list.into_iter().map(Value::Binary).collect());
+        let mut params = vec![
+            ("site", Value::from(xite)),
+            ("need", Value::from(need)),
+            ("peers", pack(peers)),
+        ];
+        if !peers_ipv6.is_empty() {
+            params.push(("peers_ipv6", pack(peers_ipv6)));
+        }
+        if !peers_onion.is_empty() {
+            params.push(("peers_onion", pack(peers_onion)));
+        }
+        let resp = self.request("pex", vmap(params)).await?;
+        let extract = |field: &str| -> Vec<Vec<u8>> {
+            match vget(&resp, field) {
+                Some(Value::Array(list)) => list
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Binary(b) => Some(b.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        Ok(PexReply {
+            ipv4: extract("peers"),
+            ipv6: extract("peers_ipv6"),
+            onion: extract("peers_onion"),
+        })
+    }
+
+    /// Ask which content.json files the peer changed after `since` (ms).
+    /// Returns `{inner_path: modified}`.
+    pub async fn list_modified(&mut self, xite: &str, since: f64) -> Result<Value> {
+        let params = vmap(vec![("site", Value::from(xite)), ("since", Value::from(since))]);
+        self.request("listModified", params).await
     }
 
     /// Ask which pieces of each big file the peer holds (`getPiecefields`).

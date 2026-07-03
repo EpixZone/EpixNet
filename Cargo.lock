@@ -571,6 +571,7 @@ dependencies = [
 name = "epix-core"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "epix-crypt",
  "hex",
  "serde",
