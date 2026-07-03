@@ -671,10 +671,46 @@ if (window.getComputedStyle(document.body).transform) {
       })(this)), 300);
     };
 
+    Loading.STAGES = ["Searching for peers", "Fetching site information", "Downloading files", "Opening the site"];
+
+    // The centered stage ticker: previous action faded above, the current one
+    // big in the middle with a live detail line, the next faded below.
+    Loading.prototype.setStage = function (index, detail, is_error) {
+      var stages = Loading.STAGES;
+      if (index < (this.stage_index || 0)) {
+        return; // never step backwards (events can arrive out of order)
+      }
+      if (!this.stage_el || this.stage_el.length === 0) {
+        this.stage_el = $(
+          "<div class='loading-stage'>" +
+          "<div class='stage stage-prev'></div>" +
+          "<div class='stage stage-current'></div>" +
+          "<div class='stage stage-detail'></div>" +
+          "<div class='stage stage-next'></div>" +
+          "</div>"
+        ).appendTo(".loadingscreen");
+        $(".loadingscreen").addClass("staged");
+      }
+      var current = this.stage_el.find(".stage-current");
+      if (index !== this.stage_index) {
+        this.stage_index = index;
+        this.stage_el.find(".stage-prev").text(index > 0 ? stages[index - 1] : "Connected");
+        current.text(stages[index]);
+        this.stage_el.find(".stage-next").text(index + 1 < stages.length ? "next: " + stages[index + 1] : "");
+        // Re-trigger the pop animation.
+        current.removeClass("pop");
+        void current[0].offsetWidth;
+        current.addClass("pop");
+      }
+      current.toggleClass("error", !!is_error);
+      return this.stage_el.find(".stage-detail").text(detail || "");
+    };
+
     Loading.prototype.showScreen = function () {
       $(".loadingscreen").css("display", "block").addClassLater("ready");
       this.screen_visible = true;
-      return this.printLine("&nbsp;&nbsp;&nbsp;Connecting...");
+      this.printLine("&nbsp;&nbsp;&nbsp;Connecting...");
+      return this.setStage(0, "");
     };
 
     Loading.prototype.showTooLarge = function (site_info) {
@@ -1752,9 +1788,14 @@ if (window.getComputedStyle(document.body).transform) {
       if (site_info.event != null) {
         if (site_info.event[0] === "file_added" && site_info.bad_files) {
           this.loading.printLine(site_info.bad_files + " files needs to be downloaded");
+          this.loading.setStage(2, "0 / " + site_info.bad_files + " files");
         } else if (site_info.event[0] === "file_done") {
           this.loading.printLine(site_info.event[1] + " downloaded");
+          if (site_info.started_task_num > 0 && site_info.event[1] !== "content.json") {
+            this.loading.setStage(2, (site_info.started_task_num - site_info.tasks) + " / " + site_info.started_task_num + " files - " + site_info.event[1]);
+          }
           if (site_info.event[1] === window.file_inner_path) {
+            this.loading.setStage(3, "");
             this.loading.hideScreen();
             if (!this.site_info) {
               this.reloadSiteInfo();
@@ -1777,10 +1818,14 @@ if (window.getComputedStyle(document.body).transform) {
             if (site_info.peers <= 1) {
               this.site_error = "No peers found";
               this.loading.printLine("No peers found");
+              this.loading.setStage(this.loading.stage_index || 0, "No peers found", true);
+            } else {
+              this.loading.setStage(this.loading.stage_index || 0, site_info.event[1] + " download failed", true);
             }
           }
         } else if (site_info.event[0] === "peers_added") {
           this.loading.printLine("Peers found: " + site_info.peers);
+          this.loading.setStage(1, "peers found: " + site_info.peers);
         }
       }
       if (this.loading.screen_visible && !this.site_info) {
