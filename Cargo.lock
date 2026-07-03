@@ -1451,6 +1451,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-browser"
+version = "0.1.0"
+dependencies = [
+ "epix-node",
+ "tokio",
+]
+
+[[package]]
 name = "epix-chain"
 version = "0.1.0"
 dependencies = [
@@ -1767,6 +1775,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tower",
  "zip",
 ]
 

@@ -405,6 +405,38 @@ mod tests {
     }
 }
 
+/// The shared data root: `EPIX_DATA_DIR` if set, else the conventional per-OS
+/// application-data location (`~/Library/Application Support/EpixNet` on macOS,
+/// `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
+/// `~/.local/share/EpixNet` on Linux). Shared by the server binary and the
+/// desktop browser so they use one identity, site set, and Tor state.
+pub fn data_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("EPIX_DATA_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    let base = if cfg!(target_os = "macos") {
+        home_dir().join("Library/Application Support")
+    } else if cfg!(target_os = "windows") {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir().join("AppData/Roaming"))
+    } else {
+        std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir().join(".local/share"))
+    };
+    base.join("EpixNet")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
 /// Open `url` in the default browser (best effort, platform-specific).
 pub fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
