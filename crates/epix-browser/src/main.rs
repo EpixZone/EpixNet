@@ -13,6 +13,7 @@
 //! 4. shuts the node down when Firefox exits.
 
 mod ca;
+mod ext;
 mod proxy;
 
 use ca::LocalCa;
@@ -110,10 +111,15 @@ async fn main() {
     }
     println!("· node serving (xite: {display}); browser proxy on {proxy_addr}");
 
+    // Whether this Firefox will load our unsigned extension: only ESR /
+    // Developer / Nightly honor `xpinstall.signatures.required=false`. Release
+    // Firefox enforces signing, so the extension silently won't load there.
+    let ext_capable = firefox_allows_unsigned(&firefox);
+
     // Write the managed profile, then inject the CA so https://*.epix is trusted.
     let profile = data_root.join("firefox-profile");
     let secure = {
-        if let Err(e) = write_profile(&profile, proxy_addr, &display, true) {
+        if let Err(e) = write_profile(&profile, proxy_addr, &display, true, ext_capable) {
             eprintln!("could not write the Firefox profile: {e}");
             std::process::exit(1);
         }
@@ -121,12 +127,29 @@ async fn main() {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("· note: could not install the local CA ({e}); falling back to http");
-                // Rewrite the profile for http so there's no cert warning.
-                let _ = write_profile(&profile, proxy_addr, &display, false);
+                let _ = write_profile(&profile, proxy_addr, &display, false, ext_capable);
                 false
             }
         }
     };
+
+    // Install the WebExtension (clearnet-block + CSP) and its native host.
+    if ext_capable {
+        if let Err(e) = ext::install_extension(&profile) {
+            eprintln!("· note: could not install the extension: {e}");
+        }
+        if let Err(e) = ext::install_native_host() {
+            eprintln!("· note: could not install the native host: {e}");
+        }
+        println!("· extension + native host installed");
+    } else {
+        println!(
+            "· note: {} enforces extension signing, so the clearnet-block extension \
+             won't load. Use Firefox ESR or Developer Edition (the shipping bundle \
+             uses ESR).",
+            firefox.display()
+        );
+    }
 
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
@@ -153,22 +176,38 @@ fn find_firefox() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    // Prefer editions that allow our unsigned extension (ESR / Developer /
+    // Nightly) over release Firefox, since the extension is core to the
+    // security contract.
     let candidates: &[&str] = if cfg!(target_os = "macos") {
         &[
-            "/Applications/Firefox.app/Contents/MacOS/firefox",
+            "/Applications/Firefox ESR.app/Contents/MacOS/firefox",
             "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox",
             "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
-            "/Applications/Firefox ESR.app/Contents/MacOS/firefox",
+            "/Applications/Firefox.app/Contents/MacOS/firefox",
         ]
     } else if cfg!(target_os = "windows") {
         &[
+            "C:\\Program Files\\Firefox ESR\\firefox.exe",
+            "C:\\Program Files\\Firefox Developer Edition\\firefox.exe",
             "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
             "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
         ]
     } else {
-        &["/usr/bin/firefox", "/usr/bin/firefox-esr", "/usr/local/bin/firefox", "/snap/bin/firefox"]
+        &["/usr/bin/firefox-esr", "/usr/bin/firefox", "/usr/local/bin/firefox", "/snap/bin/firefox"]
     };
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
+}
+
+/// Whether this Firefox honors `xpinstall.signatures.required=false` (so it can
+/// load our unsigned extension): ESR, Developer Edition, and Nightly do;
+/// release Firefox does not. Detected from the app path.
+fn firefox_allows_unsigned(firefox: &Path) -> bool {
+    if let Ok(v) = std::env::var("EPIX_FIREFOX_UNSIGNED") {
+        return v != "0" && !v.is_empty();
+    }
+    let p = firefox.to_string_lossy();
+    p.contains("ESR") || p.contains("Developer Edition") || p.contains("Nightly") || p.contains("firefox-esr")
 }
 
 /// Locate `certutil` (NSS): PATH, then keg-only Homebrew locations.
@@ -205,18 +244,27 @@ fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
     let ca_path = profile.join("epix-ca.pem");
     std::fs::write(&ca_path, ca.cert_pem()).map_err(|e| format!("write ca pem: {e}"))?;
 
-    // certutil needs the sql: db to exist; -N creates it if absent (empty pw).
     let db = format!("sql:{}", profile.display());
-    // Ensure a db exists (ignore failure if it already does).
-    let _ = Command::new(&certutil)
-        .args(["-N", "--empty-password", "-d", &db])
-        .output();
+    // Create the NSS db only if it doesn't exist yet - `-N` on an existing db
+    // prompts for confirmation and would hang. Always give certutil a null
+    // stdin so it can never block on a prompt.
+    let null = || std::process::Stdio::null();
+    if !profile.join("cert9.db").exists() {
+        let _ = Command::new(&certutil)
+            .args(["-N", "--empty-password", "-d", &db])
+            .stdin(null())
+            .output();
+    }
     // Remove any prior copy so this is idempotent, then add as a trusted CA.
-    let _ = Command::new(&certutil).args(["-D", "-n", "Epix Local CA", "-d", &db]).output();
+    let _ = Command::new(&certutil)
+        .args(["-D", "-n", "Epix Local CA", "-d", &db])
+        .stdin(null())
+        .output();
     let out = Command::new(&certutil)
         .args(["-A", "-n", "Epix Local CA", "-t", "CT,C,C", "-d", &db])
         .arg("-i")
         .arg(&ca_path)
+        .stdin(null())
         .output()
         .map_err(|e| format!("run certutil: {e}"))?;
     if !out.status.success() {
@@ -233,6 +281,7 @@ fn write_profile(
     proxy_addr: SocketAddr,
     display: &str,
     secure: bool,
+    ext_capable: bool,
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(profile)?;
 
@@ -256,6 +305,16 @@ fn write_profile(
          user_pref(\"dom.security.https_first\", false);\n\
          user_pref(\"dom.security.https_first_pbm\", false);\n"
     };
+    // Load and auto-enable the bundled (unsigned) extension from the profile.
+    // Only on editions that allow it; harmless prefs otherwise.
+    let ext_prefs = if ext_capable {
+        "user_pref(\"xpinstall.signatures.required\", false);\n\
+         user_pref(\"extensions.autoDisableScopes\", 0);\n\
+         user_pref(\"extensions.enabledScopes\", 5);\n\
+         user_pref(\"extensions.installDistroAddons\", false);\n"
+    } else {
+        ""
+    };
 
     let prefs = format!(
         r#"// Managed by epix-browser - regenerated on launch.
@@ -277,7 +336,7 @@ user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
 user_pref("browser.warnOnQuit", false);
 // Allow userChrome.css / userContent.css styling of the browser chrome.
 user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
-"#
+{ext_prefs}"#
     );
     let mut f = std::fs::File::create(profile.join("user.js"))?;
     f.write_all(prefs.as_bytes())?;

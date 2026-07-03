@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px -apple-system, system-ui, sans-serif;
+        width: 260px;
+        margin: 0;
+        padding: 14px;
+        background: #0b0e14;
+        color: #cbd5e1;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+        color: #38bdf8;
+      }
+      .site {
+        font-weight: 600;
+        word-break: break-all;
+        margin-bottom: 12px;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .muted {
+        opacity: 0.65;
+        font-size: 12px;
+        margin-top: 10px;
+      }
+      label {
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Epix</h1>
+    <div class="site" id="site">-</div>
+    <div class="row">
+      <label for="allow">Allow this site to reach clearnet</label>
+      <input type="checkbox" id="allow" />
+    </div>
+    <div class="muted" id="note">
+      Off by default: <code>.epix</code> pages can't contact the open internet.
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -21,6 +21,10 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
 axum = "0.7"
+# The bundled WebExtension is embedded and written out as an XPI into the
+# managed profile at launch.
+include_dir = "0.7"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 default = ["tor"]

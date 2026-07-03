@@ -1,0 +1,19 @@
+[package]
+name = "epix-nmh"
+version = "0.1.0"
+edition = "2021"
+description = "Native-messaging host for the Epix browser extension: length-prefixed JSON over stdio, bridging the extension to name resolution and browser settings."
+
+[[bin]]
+name = "epix-nmh"
+path = "src/main.rs"
+
+[dependencies]
+epix-node = { path = "../epix-node", default-features = false }
+epix-chain = { path = "../epix-chain" }
+tokio = { version = "1", features = ["rt", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
