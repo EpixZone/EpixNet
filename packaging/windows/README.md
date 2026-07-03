@@ -1,7 +1,15 @@
-# Windows packaging (scaffold)
+# Windows packaging
 
-Untested in CI here - this documents the Windows installer approach; the Rust
-cores (`epix-browser`, `epix-nmh`) build the same as on other platforms.
+The Windows installer is built by the release workflow (`.github/workflows/
+release.yml`, `windows` job) on a `windows-latest` runner, signed with Azure
+Trusted Signing. Locally: `packaging/windows/build-windows.sh` assembles the
+tree and compiles `installer.nsi` with NSIS.
+
+Not run in CI on this repo's non-Windows dev machine, but: the NSIS script
+compiles (verified with `makensis`), and the Windows Rust build (including the
+`winreg` native-host registry step) compiles on the Windows runner - it can't
+be cross-compiled from macOS because `ring`/`aws-lc-sys` need a Windows C
+toolchain.
 
 ## Layout
 

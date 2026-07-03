@@ -1,0 +1,175 @@
+name: Release
+
+# Build official, signed release artifacts when a version tag is pushed
+# (e.g. `git tag v0.2.0 && git push origin v0.2.0`), and attach them to a
+# GitHub Release. Also runnable by hand (workflow_dispatch) for a dry run.
+#
+# Required repo secrets for the signed + notarized macOS build (Settings ->
+# Secrets and variables -> Actions). If they are absent the macOS job still
+# builds an ad-hoc-signed (unnotarized) app, so you can test the pipeline first.
+#   APPLE_CERT_P12          base64 of your "Developer ID Application" .p12
+#   APPLE_CERT_PASSWORD     password for that .p12
+#   APPLE_SIGN_IDENTITY     e.g. "Developer ID Application: Your Org (TEAMID)"
+#   APPLE_ID                your Apple ID email (for notarization)
+#   APPLE_TEAM_ID           your 10-char team id
+#   APPLE_APP_PASSWORD      an app-specific password for notarytool
+# See packaging/RELEASING.md for how to create each.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch Firefox ESR to bundle
+        run: packaging/fetch-firefox-esr.sh osx
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "No signing cert secret set - the build will be ad-hoc signed (unnotarized)."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/epix.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Make our keychain the default search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build, sign, notarize, DMG
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_MAKE_DMG: "1"
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/Firefox.app
+          # Empty when secrets are unset -> build-app.sh falls back to ad-hoc.
+          EPIX_SIGN_ID: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: packaging/macos/build-app.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-macos
+          path: dist/Epix-*.dmg
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Firefox ESR to bundle
+        run: packaging/fetch-firefox-esr.sh linux
+      - name: Build Linux tarball
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+        run: packaging/linux/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-linux
+          path: dist/epix-linux-*.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version from tag
+        id: v
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Fetch Firefox ESR to bundle
+        shell: bash
+        run: packaging/fetch-firefox-esr.sh win64
+      - name: Build installer
+        shell: bash
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+        run: |
+          # makensis comes from the NSIS install; put it on PATH for Git Bash.
+          export PATH="/c/Program Files (x86)/NSIS:$PATH"
+          packaging/windows/build-windows.sh
+      # Sign the installer + the two exes with Azure Trusted Signing, if the
+      # Azure secrets are configured (otherwise ship it unsigned).
+      - name: Check signing config
+        id: signcfg
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.AZURE_TENANT_ID }}" ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sign=false; installer will be unsigned"
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Sign with Azure Trusted Signing
+        if: steps.signcfg.outputs.sign == 'true'
+        # Pin bumped as Microsoft releases the action; check the latest tag at
+        # github.com/Azure/trusted-signing-action before a release.
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ github.workspace }}/dist
+          files-folder-filter: exe
+          files-folder-recurse: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-windows
+          path: dist/Epix-Setup-*.exe
+
+  release:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Epix $GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/epix-macos/*.dmg \
+            artifacts/epix-linux/*.tar.gz \
+            artifacts/epix-windows/*.exe
