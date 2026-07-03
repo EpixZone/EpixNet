@@ -84,6 +84,70 @@ async fn serves_xite_files_over_http() {
 }
 
 #[tokio::test]
+async fn transparent_proxy_serves_epix_host() {
+    // A xite served under a `.epix` name, reachable via the transparent-proxy
+    // host rewrite (what Firefox's PAC sends: Host: talk.epix, path /).
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("index.html", b"<h1>inner</h1>").unwrap();
+    let state = AppState::new("0.1.0");
+    state
+        .add_xite(
+            "talk.epix",
+            XiteEntry {
+                storage,
+                content: Some(json!({ "title": "Talk", "files": { "index.html": {} } })),
+            },
+        )
+        .await;
+
+    // The full serve() path (includes the proxy rewrite wrap), not router().
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener); // serve() binds itself
+    let server = UiServer::new(state);
+    tokio::spawn(async move {
+        let _ = server.serve(addr).await;
+    });
+    // Wait for bind.
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let client = reqwest::Client::new();
+
+    // Proxy request for the wrapper: Host is the xite name, path is "/".
+    let wrapper = client
+        .get(format!("http://{addr}/"))
+        .header("host", "talk.epix")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrapper.status(), 200);
+    let html = wrapper.text().await.unwrap();
+    // Host mode emits host-relative URLs (NOT /talk.epix/index.html).
+    assert!(html.contains(r#"iframe_src = "/index.html?"#), "host-relative iframe: {html}");
+    assert!(!html.contains("/talk.epix/index.html"), "no path-prefix in host mode");
+
+    // Proxy request for an inner file: Host + host-relative path.
+    let inner = client
+        .get(format!("http://{addr}/index.html"))
+        .header("host", "talk.epix")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inner.status(), 200);
+    assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
+
+    // Normal localhost path mode is unchanged: path-prefixed URLs.
+    let path_mode = client.get(format!("http://{addr}/talk.epix/")).send().await.unwrap();
+    let path_html = path_mode.text().await.unwrap();
+    assert!(path_html.contains("/talk.epix/index.html"), "path mode keeps the prefix");
+}
+
+#[tokio::test]
 async fn rejects_cross_origin_websocket() {
     let (addr, _dir) = start_server().await;
     // A WebSocket from a foreign Origin is refused (can't drive the local API).

@@ -117,8 +117,75 @@ impl UiServer {
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, self.router()).await
+        // Wrap the router so a transparent-proxy request (Firefox routing a
+        // `*.epix` host to us) is rewritten from host form to the path form the
+        // routes already understand, BEFORE routing. `Router::layer` runs after
+        // route matching, so the rewrite is a `map_request` around the whole
+        // router served per-connection via `Shared`.
+        let app = tower::ServiceExt::<axum::extract::Request>::map_request(
+            self.router(),
+            rewrite_proxy_host,
+        );
+        axum::serve(listener, tower::make::Shared::new(app)).await
     }
+}
+
+/// Global routes that are served the same regardless of Host (the UI chrome and
+/// the wrapper runtime), so a `*.epix` proxy request to one of these is NOT
+/// rewritten into a per-xite path.
+fn is_global_path(path: &str) -> bool {
+    path.starts_with("/uimedia/")
+        || path.starts_with("/EpixNet-Internal/")
+        || path == "/Config"
+        || path == "/Plugins"
+        || path.starts_with("/list/")
+        || path == "/Benchmark"
+        || path == "/Login"
+        || path == "/Logout"
+        || path == "/favicon.ico"
+}
+
+/// True if `host` (no port) is a transparent-proxy xite host - a `.epix` name
+/// Firefox routed to us - rather than the loopback UI bind.
+fn is_proxy_host(host: &str) -> bool {
+    host.ends_with(".epix") && !host.is_empty()
+}
+
+/// Rewrite a transparent-proxy request into the path form the router uses.
+/// `Host: dashboard.epix` + `GET /index.html` (or absolute-form
+/// `GET http://dashboard.epix/index.html`) becomes `GET /dashboard.epix/index.html`,
+/// so the existing `/:address/*path` handlers serve it. The Host header is left
+/// intact so [`serve_wrapper`] can tell it is host mode and emit host-relative
+/// URLs. Non-`.epix` hosts and the global routes pass through unchanged.
+fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Request {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if !is_proxy_host(&host) {
+        return req;
+    }
+    let path = req.uri().path();
+    if is_global_path(path) {
+        return req;
+    }
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let new_paq = format!("/{host}{path}{query}");
+    let mut parts = req.uri().clone().into_parts();
+    parts.scheme = None;
+    parts.authority = None;
+    if let Ok(paq) = new_paq.parse() {
+        parts.path_and_query = Some(paq);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
+    }
+    req
 }
 
 /// The built-in plugins/features this node ships, for the Plugins page and
@@ -258,6 +325,22 @@ async fn serve_wrapper(
     // WebSocket via siteInfo.
     let permissions = ctx.state.site_permissions(&address).await;
 
+    // Transparent-proxy (host) mode: Firefox routed a `*.epix` host here, so the
+    // Host header equals the xite name (rewrite_proxy_host injected the path
+    // prefix). In that case the page lives at the host root, so wrapper URLs are
+    // host-relative (`/index.html`) not path-prefixed (`/dashboard.epix/index.html`).
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+        .unwrap_or_default();
+    let proxy_mode = host == address;
+    let (homepage, file_url) = if proxy_mode {
+        (String::new(), "/index.html".to_string())
+    } else {
+        (format!("/{address}"), format!("/{address}/index.html"))
+    };
+
     // wrapper_key == address for this single-user local node.
     let vars: Vec<(&str, String)> = vec![
         ("title", title),
@@ -266,9 +349,9 @@ async fn serve_wrapper(
         ("body_style", String::new()),
         ("themeclass", "theme-light".into()),
         ("script_nonce", script_nonce.clone()),
-        ("homepage", format!("/{address}")),
+        ("homepage", homepage),
         ("site_file_server", String::new()),
-        ("file_url", format!("/{address}/index.html")),
+        ("file_url", file_url),
         ("file_inner_path", "index.html".into()),
         ("query_string", format!("?wrapper_nonce={nonce}")),
         ("address", address.clone()),

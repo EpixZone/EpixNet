@@ -1,0 +1,17 @@
+[package]
+name = "epix-browser"
+version = "0.1.0"
+edition = "2021"
+description = "The Epix desktop browser: launches Firefox with a managed profile that routes .epix through the embedded node, so typing dashboard.epix loads the xite."
+
+[[bin]]
+name = "epix-browser"
+path = "src/main.rs"
+
+[dependencies]
+epix-node = { path = "../epix-node" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+
+[features]
+default = ["tor"]
+tor = ["epix-node/tor"]

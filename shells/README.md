@@ -32,21 +32,28 @@ registration) are in place; the browser-policy layer (per-engine CSP/clearnet
 enforcement, secure-context handling) is the remaining work, tracked in
 `../Epix/PLAN.md` (Workstream B/C + Phase 8b spikes).
 
-### Desktop (`desktop/`) - Tauri v2
+### Desktop - real Firefox (`crates/epix-browser`)
 
-A native window over the embedded node, with a tray, `epix://` deep links, and
-single-instance handoff (a clicked link routes to the running window).
+The desktop browser is **real Firefox**, not a WebView, so you get genuine
+extension support. `epix-browser` is a launcher that bundles the node with
+Firefox: it boots the embedded node, writes a managed Firefox profile whose
+proxy PAC routes every `*.epix` host to the node (clearnet stays DIRECT), and
+launches Firefox at the xite. The node serves `*.epix` hosts in
+transparent-proxy mode (`Host: dashboard.epix` -> that xite, host-relative
+wrapper URLs), so the address bar reads `dashboard.epix`.
 
 ```
-cargo install tauri-cli --version '^2'
-cd shells/desktop
-cargo tauri dev      # or: cargo tauri build
+cargo run -p epix-browser            # opens dashboard.epix
+cargo run -p epix-browser talk.epix  # opens a specific xite
 ```
 
-The window opens on a loading page, the node boots on a background thread, and
-the window is navigated to `http://127.0.0.1:43110/<xite>/` once serving.
-`epix://` is registered via `tauri.conf.json` (macOS bundle) and at runtime
-(Windows/Linux).
+Needs Firefox installed (or `EPIX_FIREFOX=/path/to/firefox`). Verified end to
+end on macOS: Firefox loads `dashboard.epix` through the node's proxy.
+
+Remaining Workstream B milestones (tracked in PLAN.md): secure origins via a
+per-install local CA (`https://*.epix` with no warning), the bundled extension
++ native-messaging host, the EpixNet#15 CSP/clearnet-block, and on-demand
+resolve+clone of a `.epix` name that isn't served yet.
 
 ### Android (`android/`) - Kotlin + GeckoView
 
