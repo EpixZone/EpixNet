@@ -4,6 +4,7 @@ use crate::msg::{read_msg, send_msg, vget, vmap};
 use epix_core::{Error, PeerAddr, Result};
 use epix_transport::{PeerStream, Transport};
 use rmpv::Value;
+use std::collections::HashMap;
 
 /// The handshake info exchanged with a peer.
 #[derive(Debug, Clone)]
@@ -23,6 +24,17 @@ pub struct PexReply {
     pub ipv4: Vec<Vec<u8>>,
     pub ipv6: Vec<Vec<u8>>,
     pub onion: Vec<Vec<u8>>,
+}
+
+/// A `findHashIds` reply: which peers hold each optional-file hash id (packed
+/// addresses, bucketed by type) and which hash ids the answering peer itself
+/// holds (`my`).
+#[derive(Debug, Clone, Default)]
+pub struct FindHashIdsReply {
+    pub ipv4: HashMap<u16, Vec<Vec<u8>>>,
+    pub ipv6: HashMap<u16, Vec<Vec<u8>>>,
+    pub onion: HashMap<u16, Vec<Vec<u8>>>,
+    pub my: Vec<u16>,
 }
 
 fn parse_handshake(v: &Value) -> HandshakeInfo {
@@ -254,6 +266,57 @@ impl Connection {
             ("hashfield_raw", Value::Binary(hashfield_raw)),
         ]);
         self.request("setHashfield", params).await
+    }
+
+    /// Ask the peer which peers it knows hold each optional-file hash id
+    /// (`findHashIds`). Returns `(hash_id -> packed peer addrs)` buckets for
+    /// ipv4/ipv6/onion plus the hash ids the peer itself holds - the same
+    /// shape EpixNet's `actionFindHashIds` answers. Unpack the packed
+    /// addresses with `epix_core::PeerAddr::unpack_ip`/`unpack_onion`.
+    pub async fn find_hash_ids(&mut self, xite: &str, hash_ids: &[u16]) -> Result<FindHashIdsReply> {
+        let params = vmap(vec![
+            ("site", Value::from(xite)),
+            (
+                "hash_ids",
+                Value::Array(hash_ids.iter().map(|id| Value::from(*id as i64)).collect()),
+            ),
+        ]);
+        let resp = self.request("findHashIds", params).await?;
+        let bucket = |key: &str| -> HashMap<u16, Vec<Vec<u8>>> {
+            let mut out = HashMap::new();
+            if let Some(Value::Map(entries)) = vget(&resp, key) {
+                for (k, v) in entries {
+                    let (Some(id), Value::Array(addrs)) = (k.as_i64(), v) else { continue };
+                    if !(0..=u16::MAX as i64).contains(&id) {
+                        continue;
+                    }
+                    let packed: Vec<Vec<u8>> = addrs
+                        .iter()
+                        .filter_map(|a| match a {
+                            Value::Binary(b) => Some(b.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    out.insert(id as u16, packed);
+                }
+            }
+            out
+        };
+        let my = match vget(&resp, "my") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(|v| v.as_i64())
+                .filter(|n| (0..=u16::MAX as i64).contains(n))
+                .map(|n| n as u16)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok(FindHashIdsReply {
+            ipv4: bucket("peers"),
+            ipv6: bucket("peers_ipv6"),
+            onion: bucket("peers_onion"),
+            my,
+        })
     }
 
     /// Push an optional file directly to the peer (`pushFile`); the peer

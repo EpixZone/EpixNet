@@ -52,6 +52,84 @@ async fn served_xites_survive_a_restart() {
 }
 
 #[tokio::test]
+async fn sites_json_uses_the_epixnet_schema_and_restores_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let (content, bytes) = signed_content(&address, &privkey, 1000);
+
+    let xite_dir = root.path().join(&address);
+    let storage = XiteStorage::new(&xite_dir);
+    storage.write("content.json", &bytes).unwrap();
+
+    {
+        let state = AppState::with_data_dir("run-1", &xite_dir);
+        state
+            .add_xite(&address, XiteEntry { storage: storage.clone(), content: Some(content) })
+            .await;
+        state.set_owned(&address, true).await;
+        state.set_size_limit(&address, 25).await;
+        state.persist_sites().await;
+    }
+
+    // The written schema is EpixNet's SiteManager.save: settings flat at the
+    // top level of each entry (a Python node can read this file directly).
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("sites.json")).unwrap()).unwrap();
+    let entry = saved.get(&address).expect("entry keyed by address");
+    assert!(entry.get("serving").is_some(), "settings are flat, not nested: {entry}");
+    assert!(entry.get("settings").is_none(), "no nested settings key");
+    assert_eq!(entry.get("own"), Some(&json!(true)));
+
+    // A fresh node restores the persisted user-facing settings.
+    let state = AppState::with_data_dir("run-2", &xite_dir);
+    assert_eq!(state.restore_sites().await, 1);
+    let info = state.site_info(&address).await;
+    assert_eq!(info.get("settings").and_then(|s| s.get("own")), Some(&json!(true)));
+    assert_eq!(info.get("size_limit").and_then(|v| v.as_i64()), Some(25));
+}
+
+#[tokio::test]
+async fn restores_a_python_written_sites_json_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let (_content, bytes) = signed_content(&address, &privkey, 1000);
+
+    let xite_dir = root.path().join(&address);
+    XiteStorage::new(&xite_dir).write("content.json", &bytes).unwrap();
+
+    // A sites.json as EpixNet's SiteManager writes it: flat settings, no
+    // wrapper_key/ajax_key, extra keys the Rust side doesn't model.
+    let python_sites = json!({
+        &address: {
+            "own": true,
+            "serving": true,
+            "permissions": ["ADMIN"],
+            "added": 1600000000,
+            "downloaded": 1600000001,
+            "modified": 1000,
+            "size": 0,
+            "size_optional": 0,
+            "optional_downloaded": 0,
+            "peers": 3,
+            "cache": { "bad_files": {} },
+            "size_files_optional": 0
+        }
+    });
+    std::fs::write(
+        root.path().join("sites.json"),
+        serde_json::to_vec_pretty(&python_sites).unwrap(),
+    )
+    .unwrap();
+
+    let state = AppState::with_data_dir("run-1", &xite_dir);
+    assert_eq!(state.restore_sites().await, 1, "python-written entry restores");
+    let info = state.site_info(&address).await;
+    assert_eq!(info.get("settings").and_then(|s| s.get("own")), Some(&json!(true)));
+}
+
+#[tokio::test]
 async fn restore_skips_unverified_content() {
     let root = tempfile::tempdir().unwrap();
     let privkey = epix_crypt::new_seed();

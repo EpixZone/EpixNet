@@ -8,6 +8,6 @@ pub mod connection;
 pub mod msg;
 pub mod server;
 
-pub use connection::{Connection, HandshakeInfo};
+pub use connection::{Connection, FindHashIdsReply, HandshakeInfo, PexReply};
 pub use msg::{vget, vmap};
 pub use server::{serve_stream, PeerServer, RequestHandler};

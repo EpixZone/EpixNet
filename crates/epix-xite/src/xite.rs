@@ -165,8 +165,19 @@ impl Xite {
             Error::Protocol("content.json is not a JSON object".into())
         })?;
         map.insert("files".into(), Value::Object(files));
-        map.insert("modified".into(), json!(modified));
+        // EpixNet signs an integer `modified` (int(time.time())); keep whole
+        // seconds as an integer so our output matches, but allow a fractional
+        // bump (prev + 1.0 collisions never produce one in practice).
+        if modified.fract() == 0.0 {
+            map.insert("modified".into(), json!(modified as i64));
+        } else {
+            map.insert("modified".into(), json!(modified));
+        }
         map.insert("address".into(), json!(self.address.as_str()));
+        map.insert("inner_path".into(), json!("content.json"));
+        if !map.contains_key("signs_required") {
+            map.insert("signs_required".into(), json!(1));
+        }
 
         epix_content::sign(&mut content, privatekey)?;
         let bytes = serde_json::to_vec(&content).map_err(Error::from)?;

@@ -88,7 +88,17 @@ impl FileService {
             .await
         {
             Ok(InboundUpdate::Applied) => {
-                vmap(vec![("ok", Value::from(format!("Thanks, file {inner_path} updated!")))])
+                // Like EpixNet, piggyback our optional-file hashfield on the
+                // ack so the publisher learns what we hold without a
+                // getHashfield round-trip.
+                let mut fields =
+                    vec![("ok", Value::from(format!("Thanks, file {inner_path} updated!")))];
+                if let Some(hashfield) = self.state.hashfield_bytes(&site).await {
+                    if !hashfield.is_empty() {
+                        fields.push(("hashfield_raw", Value::Binary(hashfield)));
+                    }
+                }
+                vmap(fields)
             }
             Ok(InboundUpdate::NotChanged) => vmap(vec![("ok", Value::from("File not changed"))]),
             Err(e) => vmap(vec![("error", Value::from(e))]),

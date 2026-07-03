@@ -82,7 +82,8 @@ mod tests {
             content["files"]["index.html"]["sha512"],
             XiteStorage::hash_bytes(b"<h1>hi</h1>")
         );
-        assert_eq!(content["modified"], 1777992698.0);
+        // Whole-second timestamps sign as integers (EpixNet writes int(time.time())).
+        assert_eq!(content["modified"], 1777992698);
         assert!(content["files"].get("content.json").is_none(), "content.json isn't listed in files");
         assert!(xite.files_needed().is_empty());
 

@@ -317,6 +317,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteSign),
         Arc::new(SitePublish),
         Arc::new(FileWrite),
+        Arc::new(FileDelete),
         Arc::new(FileRules),
         Arc::new(CorsPermission),
         Arc::new(SiteSetOwned),
@@ -895,6 +896,26 @@ impl WsCommand for FileWrite {
             .ok_or("fileWrite: content_base64 required")?;
         let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
         s.state.write_file(&address, inner_path, &bytes).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `fileDelete(inner_path)` - delete a file from the xite (optional files are
+/// also removed from content.json's `files_optional`, like EpixNet).
+struct FileDelete;
+#[async_trait]
+impl WsCommand for FileDelete {
+    fn name(&self) -> &'static str {
+        "fileDelete"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = p
+            .as_str()
+            .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
+            .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
+            .ok_or("fileDelete: inner_path required")?;
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        s.state.delete_file(&address, &inner_path).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -2890,6 +2911,43 @@ mod tests {
             files.as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
         assert!(files.contains(&"js/lib/x.js".to_string()), "recursive: {files:?}");
         assert_eq!(files.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_delete_removes_files_and_optional_entries() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let storage = epix_xite::XiteStorage::new(dir.path());
+        storage.write("data/post.json", b"{}").unwrap();
+        storage.write("movie.mp4", b"xxxx").unwrap();
+        let content = json!({
+            "address": "1Del",
+            "files": { "data/post.json": { "size": 2, "sha512": "aa" } },
+            "files_optional": { "movie.mp4": { "size": 4, "sha512": "bb" } },
+        });
+        storage.write("content.json", &serde_json::to_vec(&content).unwrap()).unwrap();
+        state
+            .add_xite(
+                "1Del",
+                crate::state::XiteEntry { storage: storage.clone(), content: Some(content) },
+            )
+            .await;
+        let session = WsSession::new(state, Some("1Del".into()));
+
+        // A required file: deleted from disk.
+        let out = FileDelete.handle(&session, &json!(["data/post.json"])).await.unwrap();
+        assert_eq!(out, json!("ok"));
+        assert!(!storage.exists("data/post.json"));
+
+        // An optional file: deleted AND dropped from content.json files_optional.
+        FileDelete.handle(&session, &json!(["movie.mp4"])).await.unwrap();
+        assert!(!storage.exists("movie.mp4"));
+        let on_disk: Value =
+            serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap();
+        assert!(on_disk["files_optional"].get("movie.mp4").is_none());
+
+        // A missing non-optional file errors.
+        assert!(FileDelete.handle(&session, &json!(["nope.txt"])).await.is_err());
     }
 
     #[tokio::test]

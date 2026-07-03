@@ -779,9 +779,11 @@ impl AppState {
     // --- SiteManager: persist the served-xite list across restarts ----------
 
     /// Persist the served xites to `sites.json` (keyed by signed content
-    /// address; aliases collapse to one entry). Stores each xite's settings and
-    /// its display alias, so the next start restores the same list without a
-    /// re-clone. EpixNet's `SiteManager.save`.
+    /// address; aliases collapse to one entry). The file is EpixNet's
+    /// `SiteManager.save` schema - `{address: {…settings…}}` with the settings
+    /// flat at the top level - so a Python node can read it and vice versa.
+    /// The display alias (e.g. `dashboard.epix`) rides along as an extra
+    /// `display` key inside the settings dict (Python preserves unknown keys).
     pub async fn persist_sites(&self) {
         let Some(path) = &self.sites_path else { return };
         let xites = self.xites.read().await;
@@ -790,9 +792,7 @@ impl AppState {
             let canonical = canonical_address(x.content.as_ref(), key);
             // Prefer the human-readable alias (e.g. `dashboard.epix`) as display.
             let display = if key != &canonical { Some(key.clone()) } else { None };
-            let entry = map.entry(canonical).or_insert_with(|| {
-                json!({ "settings": x.settings, "display": Value::Null })
-            });
+            let entry = map.entry(canonical).or_insert_with(|| json!(x.settings));
             if let (Some(d), Value::Object(obj)) = (display, entry) {
                 obj.insert("display".to_string(), json!(d));
             }
@@ -828,8 +828,28 @@ impl AppState {
                 _ => continue, // no content.json, or it failed signature verification
             }
             let content = xite.content.clone();
+            // Settings live flat in the entry (EpixNet schema); accept the old
+            // nested `{"settings": {…}}` form too.
+            let settings_src = entry.get("settings").cloned().unwrap_or_else(|| entry.clone());
+            let saved: Option<XiteSettings> = serde_json::from_value(settings_src).ok();
             self.add_xite(&canonical, XiteEntry { storage: storage.clone(), content: content.clone() })
                 .await;
+            // Reapply the persisted user-facing settings (ownership, serving,
+            // size limit, favourite, added time) that add_xite can't derive
+            // from content.json.
+            if let Some(saved) = saved {
+                let mut xites = self.xites.write().await;
+                if let Some(x) = xites.get_mut(&canonical) {
+                    x.settings.own = saved.own;
+                    x.settings.serving = saved.serving;
+                    x.settings.size_limit = saved.size_limit;
+                    x.settings.autodownloadoptional = saved.autodownloadoptional;
+                    x.settings.favorite = saved.favorite;
+                    if saved.added > 0 {
+                        x.settings.added = saved.added;
+                    }
+                }
+            }
             // Re-add the display alias (e.g. `dashboard.epix`) if one was saved.
             if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
                 if display != canonical {
@@ -2934,6 +2954,47 @@ impl AppState {
         storage.write(inner_path, bytes).map_err(|e| e.to_string())
     }
 
+    /// Delete a file from a xite's storage (`fileDelete`). If the file is an
+    /// optional file, its `files_optional` entry is removed from the stored
+    /// content.json as well (matching EpixNet's `actionFileDelete`; the
+    /// content.json becomes changed-needs-signing).
+    pub async fn delete_file(&self, address: &str, inner_path: &str) -> Result<(), String> {
+        let (storage, content) = {
+            let x = self.xites.read().await;
+            let e = x.get(address).ok_or("unknown xite")?;
+            (e.storage.clone(), e.content.clone())
+        };
+        let is_optional = content
+            .as_ref()
+            .and_then(|c| c.get("files_optional"))
+            .and_then(|f| f.get(inner_path))
+            .is_some();
+        if is_optional {
+            if let Ok(bytes) = storage.read("content.json") {
+                if let Ok(mut json) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(map) =
+                        json.get_mut("files_optional").and_then(|f| f.as_object_mut())
+                    {
+                        if map.remove(inner_path).is_some() {
+                            if let Ok(out) = serde_json::to_vec(&json) {
+                                let _ = storage.write("content.json", &out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if storage.exists(inner_path) {
+            storage
+                .delete(inner_path)
+                .map_err(|e| format!("Delete error: {e}"))?;
+        } else if !is_optional {
+            return Err("Delete error: file does not exist".into());
+        }
+        self.push_site_info_event(address, "file_deleted").await;
+        Ok(())
+    }
+
     /// Sign a xite's content.json with `privatekey` (rebuilds the files map,
     /// bumps `modified` past the previous value), updating the managed content
     /// + settings. Returns the signed content.json bytes. The key must own the
@@ -3117,6 +3178,13 @@ impl AppState {
         let new: Value =
             serde_json::from_slice(&bytes).map_err(|_| "File invalid JSON".to_string())?;
         let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // Reject far-future timestamps (EpixNet allows at most now + 1 day) so
+        // a peer can't pin a bogus "newest" version that blocks real updates.
+        if new_modified > (now_secs() as f64) + 60.0 * 60.0 * 24.0 {
+            return Err(format!(
+                "File {inner_path} invalid: Modify timestamp is in the far future!"
+            ));
+        }
         if new_modified <= current_modified {
             if let Some(s) = &sender {
                 self.add_peers(&key, [s.clone()]).await;
