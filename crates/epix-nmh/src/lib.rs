@@ -76,6 +76,11 @@ impl Settings {
             .unwrap_or_default()
     }
 
+    /// The node data root these settings live in (parent of the settings file).
+    pub fn data_root(&self) -> Option<&Path> {
+        self.path.parent()
+    }
+
     /// Whether the user routes clearnet (non-`.epix`) browsing through Tor.
     pub fn tor_clearnet(&self) -> bool {
         // Default on (opt-out): clearnet routes through Tor unless turned off.
@@ -126,6 +131,15 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             if label.starts_with("epix1") {
                 return json!({ "address": label });
             }
+            // The node's resolve cache first: the chain is only consulted when
+            // there is no entry for the name or the entry has expired.
+            let full = format!("{label}.{tld}");
+            let cached = settings
+                .data_root()
+                .and_then(|root| epix_node::cached_resolution(root, &full));
+            if let Some((address, true)) = &cached {
+                return json!({ "address": address });
+            }
             // If the node routes clearnet through Tor (always mode), resolve the
             // name through Tor too, so this lookup doesn't leak the IP / name.
             if node_is_tor_always(ui_port).await {
@@ -134,10 +148,19 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
             match resolver.resolve(label, tld).await {
                 Ok(d) => match d.xite_address() {
-                    Some(a) => json!({ "address": a.to_string() }),
+                    Some(a) => {
+                        if let Some(root) = settings.data_root() {
+                            epix_node::write_resolve_cache(root, &full, &a.to_string());
+                        }
+                        json!({ "address": a.to_string() })
+                    }
                     None => json!({ "error": format!("{label}.{tld} has no xite address") }),
                 },
-                Err(e) => json!({ "error": format!("resolve {label}.{tld}: {e}") }),
+                // Chain unreachable: an expired cache entry still beats failing.
+                Err(e) => match cached {
+                    Some((address, _)) => json!({ "address": address }),
+                    None => json!({ "error": format!("resolve {label}.{tld}: {e}") }),
+                },
             }
         }
         "getClearnetAllow" => {

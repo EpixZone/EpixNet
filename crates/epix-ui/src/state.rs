@@ -841,13 +841,18 @@ impl AppState {
             }
         }
         // Fall back to resolve-cache.json (written by the node on every chain
-        // resolution), accepting only addresses we serve.
+        // resolution), accepting only addresses we serve. Entries are either
+        // `{"address": …, "resolved_at": …}` or a legacy plain string.
         let root = self.data_root.as_ref()?;
         let cache: serde_json::Map<String, Value> =
             std::fs::read(root.join("resolve-cache.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())?;
-        let addr = cache.get(name)?.as_str()?.to_string();
+        let entry = cache.get(name)?;
+        let addr = entry
+            .as_str()
+            .or_else(|| entry.get("address").and_then(Value::as_str))?
+            .to_string();
         if self.xites.read().await.contains_key(&addr) {
             Some(addr)
         } else {
