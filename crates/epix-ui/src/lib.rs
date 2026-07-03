@@ -178,6 +178,13 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
     if is_global_path(path) {
         return req;
     }
+    // A path that already targets a xite (`/epix1…/` or `/name.epix/`, as the
+    // dashboard's site links do) routes as-is instead of being nested under
+    // this host's path.
+    let first_seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    if (first_seg.starts_with("epix1") && first_seg.len() > 20) || first_seg.ends_with(".epix") {
+        return req;
+    }
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
     let new_paq = format!("/{host}{path}{query}");
     let mut parts = req.uri().clone().into_parts();
@@ -315,7 +322,7 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
 
 async fn serve_wrapper(
     State(ctx): State<Ctx>,
-    Path(address): Path<String>,
+    Path(requested): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // The Host without port; in transparent-proxy mode it equals the xite name.
@@ -324,17 +331,23 @@ async fn serve_wrapper(
         .and_then(|v| v.to_str().ok())
         .map(|h| h.split(':').next().unwrap_or(h).to_string())
         .unwrap_or_default();
-    let proxy_mode = host == address;
+    let proxy_mode = host == requested;
 
+    // The path segment may be a `.epix` name (xID) or the bech32 address; the
+    // node's identity for a xite is ALWAYS the bech32 address, so translate
+    // once here and key everything below (state lookups, wrapper identity,
+    // the WS session) by the address.
+    let mut address = ctx.state.canonical_key(&requested).await;
     if !ctx.state.has_xite(&address).await {
         // On-demand: if the browser asked for a `.epix` host we don't serve yet,
         // resolve + clone it live, then serve. Only for transparent-proxy hosts.
         let cloned = proxy_mode
-            && address.ends_with(".epix")
-            && ctx.state.ensure_xite(&address).await;
+            && requested.ends_with(".epix")
+            && ctx.state.ensure_xite(&requested).await;
         if !cloned {
             return (StatusCode::NOT_FOUND, "unknown xite").into_response();
         }
+        address = ctx.state.canonical_key(&requested).await;
     }
     // Trust this Host as a WebSocket origin (the wrapper's own page will open
     // the WS from it).
@@ -355,7 +368,7 @@ async fn serve_wrapper(
         .as_ref()
         .and_then(|c| c.get("title"))
         .and_then(|t| t.as_str())
-        .unwrap_or(&address)
+        .unwrap_or(&requested)
         .to_string();
     // A one-time wrapper nonce (released on the inner file request) and a random
     // CSP script nonce for the wrapper's own inline scripts.
@@ -367,14 +380,17 @@ async fn serve_wrapper(
     let permissions = ctx.state.site_permissions(&address).await;
 
     // In transparent-proxy (host) mode the page lives at the host root, so
-    // wrapper URLs are host-relative (`/index.html`) not path-prefixed.
+    // wrapper URLs are host-relative (`/index.html`) not path-prefixed. In path
+    // mode keep the segment the browser navigated with (name or address); the
+    // file route translates names the same way this one does.
     let (homepage, file_url) = if proxy_mode {
         (String::new(), "/index.html".to_string())
     } else {
-        (format!("/{address}"), format!("/{address}/index.html"))
+        (format!("/{requested}"), format!("/{requested}/index.html"))
     };
 
-    // wrapper_key == address for this single-user local node.
+    // wrapper_key == the bech32 address for this single-user local node, so
+    // the WS session and every command bind to the address, never the name.
     let vars: Vec<(&str, String)> = vec![
         ("title", title),
         ("rev", "1".into()),
@@ -665,6 +681,8 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
         Some((a, i)) => (a.to_string(), i.trim_end_matches('/').to_string()),
         None => (path.clone(), String::new()),
     };
+    // A `.epix` name in the URL resolves to the bech32 serving key.
+    let address = ctx.state.canonical_key(&address).await;
     let Some(entries) = ctx.state.list_dir(&address, &inner).await else {
         return (StatusCode::NOT_FOUND, "unknown xite or path").into_response();
     };
@@ -841,6 +859,8 @@ async fn serve_file(
             ctx.state.log("WARNING", format!("Invalid wrapper nonce for /{address}/{path}")).await;
         }
     }
+    // A `.epix` name in the URL resolves to the bech32 serving key.
+    let address = ctx.state.canonical_key(&address).await;
     let ct = content_type(&path).to_string();
     // Range request → 206 Partial Content, streamed from disk (big files seek
     // in the browser without loading the whole file).
@@ -1045,8 +1065,13 @@ async fn ws_upgrade(
     if !ctx.state.is_ws_origin_allowed(origin_host, host) {
         return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
     }
-    // wrapper_key == xite address for this node.
-    let xite = q.wrapper_key.or(q.xite);
+    // wrapper_key == xite address for this node. The wrapper embeds the bech32
+    // address, but resolve a `.epix` name too (older wrappers, manual clients)
+    // so the session always binds to the address.
+    let xite = match q.wrapper_key.or(q.xite) {
+        Some(key) => Some(ctx.state.canonical_key(&key).await),
+        None => None,
+    };
     ws.on_upgrade(move |socket| handle_ws(socket, ctx, xite))
 }
 

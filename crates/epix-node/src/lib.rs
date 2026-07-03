@@ -227,8 +227,9 @@ async fn clone_xite(
 }
 
 /// The on-demand resolver the browser proxy path uses: given a `.epix` host not
-/// yet served, resolve it on-chain, clone it, and add it as a served xite (under
-/// both its address and the name), so typing any `talk.epix` opens it live.
+/// yet served, resolve it on-chain, clone it, and add it as a served xite keyed
+/// by its bech32 address (the name is display metadata), so typing any
+/// `talk.epix` opens it live.
 struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
@@ -241,7 +242,9 @@ struct OnDemand {
 #[async_trait::async_trait]
 impl epix_ui::OnDemandResolver for OnDemand {
     async fn ensure(&self, host: &str) -> Result<(), String> {
-        if self.state.has_xite(host).await {
+        // Served already? (name -> address via display metadata / resolve cache)
+        let key = self.state.canonical_key(host).await;
+        if self.state.has_xite(&key).await {
             return Ok(());
         }
         // Coalesce concurrent clones of the same name: the first does the work,
@@ -252,7 +255,8 @@ impl epix_ui::OnDemandResolver for OnDemand {
                 drop(inflight);
                 for _ in 0..60 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if self.state.has_xite(host).await {
+                    let key = self.state.canonical_key(host).await;
+                    if self.state.has_xite(&key).await {
                         return Ok(());
                     }
                 }
@@ -291,11 +295,10 @@ impl OnDemand {
                 .await;
             self.state.add_transfer(&address, bytes, 0).await;
         }
-        // Serve it under the `.epix` name too.
-        let content = self.state.content(&address).await;
-        self.state
-            .add_xite(host, XiteEntry { storage: XiteStorage::new(&data_dir), content })
-            .await;
+        // The `.epix` name is display metadata on the address-keyed entry.
+        if host != address {
+            self.state.set_display(&address, host).await;
+        }
         self.state.log("INFO", format!("On-demand cloned {host} -> {address}")).await;
         Ok(())
     }
@@ -340,14 +343,13 @@ async fn serve(
         state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
     }
 
-    // Serve under the raw address and (if resolved) the .epix name.
+    // Serve keyed by the bech32 address; the resolved `.epix` name is display
+    // metadata (names translate to addresses at the HTTP/WS edges).
     state
-        .add_xite(&address, XiteEntry { storage: XiteStorage::new(&data_dir), content: content.clone() })
+        .add_xite(&address, XiteEntry { storage: XiteStorage::new(&data_dir), content })
         .await;
     if display != address {
-        state
-            .add_xite(&display, XiteEntry { storage: XiteStorage::new(&data_dir), content })
-            .await;
+        state.set_display(&address, &display).await;
     }
 
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
@@ -378,9 +380,6 @@ async fn serve(
         .await;
 
     state.add_transfer(&address, bytes_recv, 0).await;
-    if display != address {
-        state.add_transfer(&display, bytes_recv, 0).await;
-    }
     state.rebuild_merger_dbs().await;
 
     // Seeding + offline policy.
