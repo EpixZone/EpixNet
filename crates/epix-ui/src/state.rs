@@ -1253,12 +1253,14 @@ impl AppState {
                 return Ok(false); // already current
             }
 
-            // Verify + apply the newer content.json, then sync its changed files.
+            // Verify + apply the newer content.json (full signer/rules check,
+            // size-limited), then sync its changed files.
             let mut xite = Xite::new(
                 Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
                 view.storage.clone(),
             );
-            xite.set_content(&bytes).map_err(|e| e.to_string())?; // checks signature + writes
+            let limit = self.size_limit_bytes(address).await;
+            xite.set_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
             self.update_content(address, xite.content.clone()).await;
 
             let needed = xite.files_needed().len();
@@ -2802,7 +2804,7 @@ impl AppState {
             return Ok(InboundUpdate::NotChanged);
         }
 
-        // Verify the signature against the xite address; only writes if valid.
+        // Full verification (signers/rules/size limit); only writes if valid.
         let mut xite = match self.xite_view(&key).await {
             Ok(x) => x,
             Err(e) => {
@@ -2810,7 +2812,8 @@ impl AppState {
                 return Err(e);
             }
         };
-        if let Err(e) = xite.set_content(&bytes) {
+        let limit = self.size_limit_bytes(&key).await;
+        if let Err(e) = xite.set_content_limited(&bytes, limit) {
             self.updates_in_flight.lock().unwrap().remove(&uri);
             return Err(format!("File {inner_path} invalid: {e}"));
         }
@@ -2952,6 +2955,19 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.size_limit = Some(size_limit_mb);
         }
+    }
+
+    /// A xite's effective size limit in bytes (its per-xite override or the
+    /// default), for content.json verification. Unknown xite -> default.
+    pub async fn size_limit_bytes(&self, address: &str) -> i64 {
+        let mb = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.size_limit(DEFAULT_SIZE_LIMIT_MB))
+            .unwrap_or(DEFAULT_SIZE_LIMIT_MB);
+        mb.saturating_mul(1024 * 1024)
     }
 
     /// Pause/resume a xite (`sitePause`/`siteResume`). A paused xite is skipped

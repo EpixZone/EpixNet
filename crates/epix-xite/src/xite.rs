@@ -1,8 +1,27 @@
 //! A xite: its address, storage, and (once loaded) verified content.json.
 
 use crate::storage::XiteStorage;
+use epix_content::VerifyContext;
 use epix_core::{Address, Error, Result};
 use serde_json::{json, Value};
+
+/// Verification context for a root content.json: only the site address and the
+/// size limit are needed (the root's rules bootstrap from itself).
+struct RootCtx {
+    address: String,
+    size_limit: i64,
+}
+impl VerifyContext for RootCtx {
+    fn site_address(&self) -> &str {
+        &self.address
+    }
+    fn loaded_content(&self, _inner_path: &str) -> Option<Value> {
+        None
+    }
+    fn size_limit_bytes(&self) -> i64 {
+        self.size_limit
+    }
+}
 
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,14 +54,22 @@ impl Xite {
         Ok(true)
     }
 
-    /// Verify `content.json` is signed by the xite address, then store + parse it.
+    /// Verify + store the root `content.json` with no size limit. See
+    /// [`Self::set_content_limited`].
     pub fn set_content(&mut self, bytes: &[u8]) -> Result<()> {
+        self.set_content_limited(bytes, i64::MAX)
+    }
+
+    /// Verify the root `content.json` - signatures against the valid signers
+    /// (including a delegated `signers` list authorized by `signers_sign`),
+    /// address/inner_path/relative-path rules, and the `size_limit` (bytes) -
+    /// then store + parse it. This is the full EpixNet `verifyFile` path, not
+    /// just a single-owner signature.
+    pub fn set_content_limited(&mut self, bytes: &[u8], size_limit: i64) -> Result<()> {
         let json: Value = serde_json::from_slice(bytes)?;
-        if !epix_content::verify_signer(&json, self.address.as_str()) {
-            return Err(Error::Crypt(
-                "content.json is not validly signed by the xite address".into(),
-            ));
-        }
+        let ctx = RootCtx { address: self.address.as_str().to_string(), size_limit };
+        epix_content::verify_content_file("content.json", &json, bytes.len() as i64, &ctx)
+            .map_err(|e| Error::Crypt(e.to_string()))?;
         self.storage.write("content.json", bytes)?;
         self.content = Some(json);
         Ok(())
