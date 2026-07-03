@@ -1,0 +1,117 @@
+name: Release
+
+# Build official, signed release artifacts when a version tag is pushed
+# (e.g. `git tag v0.2.0 && git push origin v0.2.0`), and attach them to a
+# GitHub Release. Also runnable by hand (workflow_dispatch) for a dry run.
+#
+# Required repo secrets for the signed + notarized macOS build (Settings ->
+# Secrets and variables -> Actions). If they are absent the macOS job still
+# builds an ad-hoc-signed (unnotarized) app, so you can test the pipeline first.
+#   APPLE_CERT_P12          base64 of your "Developer ID Application" .p12
+#   APPLE_CERT_PASSWORD     password for that .p12
+#   APPLE_SIGN_IDENTITY     e.g. "Developer ID Application: Your Org (TEAMID)"
+#   APPLE_ID                your Apple ID email (for notarization)
+#   APPLE_TEAM_ID           your 10-char team id
+#   APPLE_APP_PASSWORD      an app-specific password for notarytool
+# See packaging/RELEASING.md for how to create each.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch Firefox ESR to bundle
+        run: packaging/fetch-firefox-esr.sh osx
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "No signing cert secret set - the build will be ad-hoc signed (unnotarized)."
+            exit 0
+          fi
+          KEYCHAIN="$RUNNER_TEMP/epix.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$APPLE_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          # Make our keychain the default search list so codesign finds the identity.
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build, sign, notarize, DMG
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_MAKE_DMG: "1"
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/Firefox.app
+          # Empty when secrets are unset -> build-app.sh falls back to ad-hoc.
+          EPIX_SIGN_ID: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: packaging/macos/build-app.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-macos
+          path: dist/Epix-*.dmg
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Firefox ESR to bundle
+        run: packaging/fetch-firefox-esr.sh linux
+      - name: Build Linux tarball
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+        run: packaging/linux/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: epix-linux
+          path: dist/epix-linux-*.tar.gz
+
+  release:
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Epix $GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/epix-macos/*.dmg \
+            artifacts/epix-linux/*.tar.gz

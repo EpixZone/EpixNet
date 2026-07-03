@@ -16,7 +16,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${1:-$REPO_ROOT/dist}"
 APP="$OUT_DIR/Epix.app"
 IDENTIFIER="zone.epix.browser"
-VERSION="0.1.0"
+# Version comes from the tag in CI (EPIX_VERSION), else a default.
+VERSION="${EPIX_VERSION:-0.1.0}"
+# notarytool args, populated during signing if credentials are present.
+NOTARY_ARGS=()
 
 echo "· building release binaries"
 if [ "${EPIX_SKIP_BUILD:-0}" != "1" ]; then
@@ -98,15 +101,23 @@ if [ -n "${EPIX_SIGN_ID:-}" ]; then
   codesign --force --options runtime --timestamp --sign "$EPIX_SIGN_ID" "$APP"
   codesign --verify --deep --strict "$APP" && echo "  signature verified"
 
-  # Notarize if a stored notarytool profile is given (see NOTES).
+  # Notarize with either a stored notarytool profile (local) or direct
+  # credentials (CI: APPLE_ID + APPLE_TEAM_ID + APPLE_APP_PASSWORD).
   if [ -n "${EPIX_NOTARIZE_PROFILE:-}" ]; then
-    echo "· notarizing (this can take minutes)"
+    NOTARY_ARGS=(--keychain-profile "$EPIX_NOTARIZE_PROFILE")
+  elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+    NOTARY_ARGS=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD")
+  fi
+  if [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
+    echo "· notarizing the app (this can take minutes)"
     ZIP="$OUT_DIR/Epix.zip"
     ditto -c -k --keepParent "$APP" "$ZIP"
-    xcrun notarytool submit "$ZIP" --keychain-profile "$EPIX_NOTARIZE_PROFILE" --wait
+    xcrun notarytool submit "$ZIP" "${NOTARY_ARGS[@]}" --wait
     xcrun stapler staple "$APP"
     rm -f "$ZIP"
     echo "  notarized + stapled"
+  else
+    echo "· skipping notarization (no credentials)"
   fi
 else
   echo "· ad-hoc codesigning (set EPIX_SIGN_ID for a release signature)"
@@ -117,6 +128,23 @@ fi
 # Register with LaunchServices so epix:// links open the app.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
   -f "$APP" 2>/dev/null || true
+
+# Package a DMG for distribution (EPIX_MAKE_DMG=1). The app inside is already
+# stapled, so the DMG passes Gatekeeper; notarize the DMG too when we can.
+if [ "${EPIX_MAKE_DMG:-0}" = "1" ]; then
+  DMG="$OUT_DIR/Epix-$VERSION.dmg"
+  echo "· building $DMG"
+  rm -f "$DMG"
+  hdiutil create -volname "Epix" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+  if [ -n "${EPIX_SIGN_ID:-}" ]; then
+    codesign --force --sign "$EPIX_SIGN_ID" --timestamp "$DMG" || true
+    if [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
+      xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait || true
+      xcrun stapler staple "$DMG" || true
+    fi
+  fi
+  echo "· done: $DMG"
+fi
 
 echo "· done: $APP"
 echo "  run:      open \"$APP\""

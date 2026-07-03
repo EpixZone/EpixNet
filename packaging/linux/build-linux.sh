@@ -11,7 +11,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${1:-$REPO_ROOT/dist}"
 STAGE="$OUT_DIR/epix-linux"
-VERSION="0.1.0"
+VERSION="${EPIX_VERSION:-0.1.0}"
 
 ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh )
 
