@@ -976,10 +976,22 @@ impl AppState {
 
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
     pub async fn add_peers(&self, address: &str, addrs: impl IntoIterator<Item = PeerAddr>) {
-        let mut xites = self.xites.write().await;
-        if let Some(x) = xites.get_mut(address) {
-            x.peers.add_many(addrs, now_secs());
-            x.settings.peers = x.peers.len() as i64;
+        let grew = {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) => {
+                    let before = x.peers.len();
+                    x.peers.add_many(addrs, now_secs());
+                    x.settings.peers = x.peers.len() as i64;
+                    x.peers.len() > before
+                }
+                None => false,
+            }
+        };
+        // New peers discovered (announce/PEX/DHT/local): update the site's
+        // dashboard row live, like EpixNet's peers_added.
+        if grew {
+            self.push_site_info(address).await;
         }
     }
 
@@ -1343,8 +1355,17 @@ impl AppState {
     /// Record the fileserver's reachability (UPnP): whether the port is open to
     /// the internet and the node's external IP, if known.
     pub async fn set_port_status(&self, opened: bool, ip_external: Option<String>) {
-        *self.port_opened.write().await = opened;
+        let changed = {
+            let mut cur = self.port_opened.write().await;
+            let was = *cur;
+            *cur = opened;
+            was != opened
+        };
         *self.ip_external.write().await = ip_external;
+        // The dashboard shows port reachability live (serverChanged).
+        if changed {
+            self.push_server_info().await;
+        }
     }
 
     /// The fileserver's reachability for `serverInfo`: `(port_opened, ip_external)`.
@@ -1355,13 +1376,23 @@ impl AppState {
     /// Record the in-process Tor client's state, for `serverInfo`. `status` is
     /// the human string EpixNet shows (`OK`/`Always`/`Disabled`).
     pub async fn set_tor_status(&self, enabled: bool, status: &str) {
-        *self.tor_enabled.write().await = enabled;
-        *self.tor_status.write().await = status.to_string();
+        let changed = {
+            let mut cur = self.tor_status.write().await;
+            let was = cur.clone();
+            *self.tor_enabled.write().await = enabled;
+            *cur = status.to_string();
+            was != status
+        };
+        // The dashboard shows the Tor state live (serverChanged).
+        if changed {
+            self.push_server_info().await;
+        }
     }
 
     /// Record our onion address (no `.onion` suffix) once the service publishes.
     pub async fn set_onion_address(&self, host: &str) {
         *self.onion_address.write().await = Some(host.to_string());
+        self.push_server_info().await;
     }
 
     /// Tor state for `serverInfo`: `(enabled, status)`.
