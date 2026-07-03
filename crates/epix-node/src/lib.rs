@@ -349,7 +349,6 @@ async fn serve(
             .flatten();
             if let Some(geoip) = geoip {
                 state.set_geoip(geoip).await;
-                state.push_notification("done", "World map ready", 4000);
             }
         });
     }
