@@ -50,10 +50,30 @@ cargo run -p epix-browser talk.epix  # opens a specific xite
 Needs Firefox installed (or `EPIX_FIREFOX=/path/to/firefox`). Verified end to
 end on macOS: Firefox loads `dashboard.epix` through the node's proxy.
 
-Remaining Workstream B milestones (tracked in PLAN.md): secure origins via a
-per-install local CA (`https://*.epix` with no warning), the bundled extension
-+ native-messaging host, the EpixNet#15 CSP/clearnet-block, and on-demand
-resolve+clone of a `.epix` name that isn't served yet.
+What works now (all verified on macOS):
+- **Secure origins**: the node serves `.epix` over real https via a per-install
+  local CA (`crates/epix-browser/src/ca.rs` + `proxy.rs`); xites are secure
+  contexts, no warning.
+- **Clearnet-block extension + native host**: a bundled WebExtension
+  (`shells/browser-ext`) blocks `.epix` pages from reaching clearnet (per-site
+  toggle), with a Rust native-messaging host (`crates/epix-nmh`) for resolution
+  and settings.
+- **On-demand resolve+clone**: type any `talk.epix` and the node resolves it
+  on-chain and clones it live.
+
+**Packaging (self-contained install).** The shipping app bundles Firefox, so
+the user does not need Firefox installed:
+
+```
+packaging/macos/build-app.sh          # -> dist/Epix.app (bundles Firefox)
+```
+
+`Epix.app` contains the launcher, the native host, and a full Firefox under
+`Contents/Resources/firefox/`; the launcher prefers that bundled Firefox over
+any system one. It registers the `epix://` scheme. The script ad-hoc signs for
+local use; a release build uses Firefox ESR + a Developer ID signature +
+notarization (see the notes in the script). Remaining: the ESR-based signed +
+notarized release build, and Windows/Linux installers.
 
 ### Android (`android/`) - Kotlin + GeckoView
 

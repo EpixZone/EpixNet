@@ -168,13 +168,19 @@ async fn main() {
     }
 }
 
-/// Locate a Firefox executable: `EPIX_FIREFOX`, then the usual per-OS spots.
+/// Locate a Firefox executable: `EPIX_FIREFOX`, a Firefox bundled inside our own
+/// `.app` (the shipping case), then the usual per-OS spots.
 fn find_firefox() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EPIX_FIREFOX") {
         let p = PathBuf::from(p);
         if p.exists() {
             return Some(p);
         }
+    }
+    // Bundled Firefox: `Epix.app/Contents/Resources/firefox/*.app/Contents/MacOS/firefox`,
+    // relative to this launcher at `Epix.app/Contents/MacOS/epix-browser`.
+    if let Some(bundled) = bundled_firefox() {
+        return Some(bundled);
     }
     // Prefer editions that allow our unsigned extension (ESR / Developer /
     // Nightly) over release Firefox, since the extension is core to the
@@ -197,6 +203,38 @@ fn find_firefox() -> Option<PathBuf> {
         &["/usr/bin/firefox-esr", "/usr/bin/firefox", "/usr/local/bin/firefox", "/snap/bin/firefox"]
     };
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
+}
+
+/// A Firefox bundled next to this launcher inside our `.app` / install dir.
+fn bundled_firefox() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?; // .../Contents/MacOS
+    // macOS: ../Resources/firefox/<Firefox…>.app/Contents/MacOS/firefox
+    let fx_root = dir.parent().map(|c| c.join("Resources/firefox"));
+    // Linux/Windows: ./firefox/firefox[.exe] next to the launcher.
+    let sibling = dir.join("firefox");
+    for base in [fx_root, Some(sibling)].into_iter().flatten() {
+        if !base.exists() {
+            continue;
+        }
+        // Direct binary?
+        for name in ["firefox", "firefox.exe"] {
+            let p = base.join(name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        // A nested *.app (macOS)?
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for e in entries.flatten() {
+                let p = e.path().join("Contents/MacOS/firefox");
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Whether this Firefox honors `xpinstall.signatures.required=false` (so it can
