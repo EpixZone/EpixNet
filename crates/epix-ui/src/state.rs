@@ -1035,12 +1035,19 @@ impl AppState {
     pub async fn list_modified(&self, address: &str, since: f64) -> serde_json::Map<String, Value> {
         let mut out = serde_json::Map::new();
         let xites = self.xites.read().await;
-        if let Some(x) = self.resolve_xite(&xites, address) {
-            if let Some(modified) =
-                x.content.as_ref().and_then(|c| c.get("modified")).and_then(|v| v.as_f64())
-            {
-                if modified > since {
-                    out.insert("content.json".to_string(), json!(modified));
+        let Some(x) = self.resolve_xite(&xites, address) else { return out };
+        let root = x.storage.root().to_path_buf();
+        drop(xites);
+        // Every content.json on disk (root + includes + per-user), keyed by its
+        // `modified` time - so a peer cloning a user_contents site learns about
+        // the included and per-user content.json files, not just the root.
+        for path in walk_content_json(&root) {
+            if let Ok(bytes) = std::fs::read(root.join(&path)) {
+                if let Ok(json) = serde_json::from_slice::<Value>(&bytes) {
+                    let modified = json.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if modified > since {
+                        out.insert(path, json!(modified));
+                    }
                 }
             }
         }
@@ -4349,6 +4356,26 @@ impl AppState {
 /// Build a xite's database from its `dbschema.json` (if present): open an
 /// in-memory db, create the tables, and populate from the xite's JSON data
 /// files. `None` if the xite has no schema or building fails.
+/// Every `content.json` under `root`, as site-relative inner_paths.
+fn walk_content_json(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("content.json") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, DbSchema)> {
     let bytes = storage.read("dbschema.json").ok()?;
     let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;

@@ -581,15 +581,12 @@ mod tests {
     async fn list_modified_reports_newer_content() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
+        // listModified reads content.json from disk (root + includes + per-user).
+        let content = json!({ "address": "1Mod", "modified": 5000 });
+        storage.write("content.json", content.to_string().as_bytes()).unwrap();
         let state = AppState::new("test");
         state
-            .add_xite(
-                "1Mod",
-                XiteEntry {
-                    storage,
-                    content: Some(json!({ "address": "1Mod", "modified": 5000 })),
-                },
-            )
+            .add_xite("1Mod", XiteEntry { storage, content: Some(content) })
             .await;
         let svc = FileService::new(state);
         let peer = PeerAddr::parse("8.8.8.8:1").unwrap();
