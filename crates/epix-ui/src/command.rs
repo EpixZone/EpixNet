@@ -767,28 +767,10 @@ impl WsCommand for SiteInfo {
         "siteInfo"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        // A xite being cloned on demand is registered (empty) before the
+        // download starts, so this is real - never null - during loading.
         let address = s.address()?;
-        let info = s.state.site_info(address).await;
-        if !info.is_null() {
-            return Ok(info);
-        }
-        // The xite is still being cloned on demand (the loading screen is
-        // watching): answer with a minimal stub instead of null, so the
-        // wrapper learns its address and accepts the progress events.
-        // EpixNet always has a site object here (need() registers it empty).
-        Ok(json!({
-            "address": address,
-            "settings": { "size": 0, "peers": 0, "serving": true, "modified": 0 },
-            "content": Value::Null,
-            "content_updated": 0,
-            "peers": 0,
-            "tasks": 0,
-            "started_task_num": 0,
-            "bad_files": 0,
-            "size_limit": 10,
-            "next_size_limit": 20,
-            "workers": 0,
-        }))
+        Ok(s.state.site_info(address).await)
     }
 }
 

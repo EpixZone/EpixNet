@@ -2887,6 +2887,17 @@ impl AppState {
         self.on_demand.read().await.is_some()
     }
 
+    /// Whether a served xite's file exists on disk (ready to serve) - false
+    /// while it is still downloading.
+    pub async fn xite_file_exists(&self, address: &str, inner_path: &str) -> bool {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.exists(inner_path))
+            .unwrap_or(false)
+    }
+
     /// Progressive serve during an on-demand clone: the state of one file of a
     /// xite that is downloading but not yet registered.
     pub fn loading_file(&self, address: &str, inner_path: &str) -> LoadingFile {
