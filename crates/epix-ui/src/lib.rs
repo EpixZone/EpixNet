@@ -350,6 +350,33 @@ async fn serve_wrapper(
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    render_wrapper(ctx, requested, "index.html".to_string(), raw_query, headers).await
+}
+
+/// The inner file a wrapper request points its iframe at, for a `/:address/path`
+/// URL. A top-level navigation to a directory renders the wrapper with the
+/// iframe pointed at that directory's `index.html` (this is how multi-page
+/// xites like Git Epix navigate: `index/`, `myrepos/`). A request for a
+/// specific file (js, css, image, or even a bare `.html`) is a raw resource
+/// load and returns `None` - the iframe fetches those directly (with the
+/// wrapper nonce), and a direct address of a file is served raw as before.
+fn wrapper_inner_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        Some("index.html".to_string())
+    } else if path.ends_with('/') {
+        Some(format!("{path}index.html"))
+    } else {
+        None
+    }
+}
+
+async fn render_wrapper(
+    ctx: Ctx,
+    requested: String,
+    inner_path: String,
+    raw_query: Option<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     // The Host without port; in transparent-proxy mode it equals the xite name.
     let host = headers
         .get(header::HOST)
@@ -478,9 +505,9 @@ async fn serve_wrapper(
         } else {
             format!("/{node_home}")
         };
-        (home, "/index.html".to_string())
+        (home, format!("/{inner_path}"))
     } else {
-        (format!("/{node_home}"), format!("/{requested}/index.html"))
+        (format!("/{node_home}"), format!("/{requested}/{inner_path}"))
     };
 
     // wrapper_key == the bech32 address for this single-user local node, so
@@ -495,7 +522,7 @@ async fn serve_wrapper(
         ("homepage", homepage),
         ("site_file_server", String::new()),
         ("file_url", file_url),
-        ("file_inner_path", "index.html".into()),
+        ("file_inner_path", inner_path.clone()),
         ("query_string", query_string),
         ("address", address.clone()),
         ("wrapper_nonce", nonce),
@@ -995,6 +1022,14 @@ fn escape_query(q: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Drop a `wrapper_nonce=…` pair from a raw query string, keeping the rest.
+fn strip_wrapper_nonce(q: &str) -> String {
+    q.split('&')
+        .filter(|kv| !kv.starts_with("wrapper_nonce="))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 fn render(template: &str, vars: &[(&str, String)]) -> String {
     let mut out = template.to_string();
     for (k, v) in vars {
@@ -1008,8 +1043,25 @@ async fn serve_file(
     State(ctx): State<Ctx>,
     Path((address, path)): Path<(String, String)>,
     Query(q): Query<FileQuery>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    // A top-level navigation to a directory or HTML page (no wrapper_nonce)
+    // renders the wrapper with the iframe pointed at that inner file, matching
+    // EpixNet's isWrapperNecessary. Multi-page xites (Git Epix's `index/`,
+    // `myrepos/`) navigate this way. Iframe resource loads carry the nonce and
+    // fall through to the raw file below.
+    if q.wrapper_nonce.is_none() {
+        if let Some(inner) = wrapper_inner_path(&path) {
+            // Strip the wrapper_nonce we would append back; the caller had none.
+            let outer_query = raw_query
+                .as_deref()
+                .map(strip_wrapper_nonce)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            return render_wrapper(ctx, address, inner, outer_query, headers).await;
+        }
+    }
     // Release a one-time wrapper nonce if the inner frame passed one (tracks
     // that the request came through the wrapper; EpixNet warns otherwise).
     if let Some(nonce) = &q.wrapper_nonce {

@@ -42,7 +42,10 @@ const ADMIN_COMMANDS: &[&str] = &[
     "optionalLimitSet",
     "optionalLimitStats",
     "peerAdd",
-    "permissionAdd",
+    // permissionAdd is intentionally NOT admin-gated (matches EpixNet): a site
+    // grants itself a permission after the user confirms it in the wrapper,
+    // over its own non-admin WS. This is how a merger site (Git Epix) gets its
+    // Merger:<type> permission.
     "permissionDetails",
     "permissionRemove",
     "pluginConfigSet",
@@ -1956,6 +1959,13 @@ impl WsCommand for MergerSiteList {
 fn arg_addresses(p: &Value) -> Vec<String> {
     match p {
         Value::String(a) => vec![a.clone()],
+        // Positional call: the addresses are the first argument, which is
+        // itself a list - `cmd("mergerSiteAdd", [needed])` sends
+        // `[["addr", ...]]`. Unwrap that single nested array.
+        Value::Array(a) if a.len() == 1 && a[0].is_array() => a[0]
+            .as_array()
+            .map(|inner| inner.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
         Value::Array(a) => a
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
@@ -1969,23 +1979,60 @@ fn arg_addresses(p: &Value) -> Vec<String> {
     }
 }
 
-/// `mergerSiteAdd(addresses)` - accept sites into this merger. Links any of the
-/// requested sites already present on the node into the merger database.
-/// (Cloning a not-yet-present site from the network awaits the on-demand clone
-/// flow.)
+/// `mergerSiteAdd(addresses)` - clone the requested sites into the node and
+/// link them into this merger's database (EpixNet's actionMergerSiteAdd,
+/// which needs each address via SiteManager). One address adds without
+/// asking; several ask the user first. Responds "ok" right away and clones
+/// in the background, like EpixNet.
 struct MergerSiteAdd;
 #[async_trait]
 impl WsCommand for MergerSiteAdd {
     fn name(&self) -> &'static str {
         "mergerSiteAdd"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
         if s.state.merger_types(&address).await.is_empty() {
             return Err("Not a merger site".into());
         }
-        // Re-link present mergeable sites into every merger's database.
-        s.state.rebuild_merger_dbs().await;
+        let mut targets = Vec::new();
+        for a in arg_addresses(p) {
+            targets.push(require_address(&a)?);
+        }
+        if targets.is_empty() {
+            return Err("mergerSiteAdd: addresses required".into());
+        }
+        let state = s.state.clone();
+        let merger = address.clone();
+        tokio::spawn(async move {
+            if targets.len() > 1 {
+                let body = format!("Add <b>{}</b> new site?", targets.len());
+                if !state.confirm(&merger, &body, "Add").await {
+                    return;
+                }
+            }
+            let mut added = 0;
+            for target in &targets {
+                if state.ensure_xite(target).await {
+                    added += 1;
+                } else {
+                    state.push_notification(
+                        "error",
+                        &format!("Adding <b>{target}</b> failed"),
+                        0,
+                    );
+                }
+            }
+            if added > 0 {
+                state.rebuild_merger_dbs().await;
+                state.push_notification(
+                    "done",
+                    &format!("Added <b>{added}</b> new site"),
+                    5000,
+                );
+                state.push_site_info(&merger).await;
+            }
+        });
         Ok(Value::from("ok"))
     }
 }

@@ -3269,6 +3269,19 @@ impl AppState {
         }
     }
 
+    /// The `merged_type` a xite's content.json declares, if any (the mark of a
+    /// site that belongs to a merger, e.g. a Git Epix repo).
+    pub async fn site_merged_type(&self, address: &str) -> Option<String> {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .and_then(|x| x.content.as_ref())
+            .and_then(|c| c.get("merged_type"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
     /// The merger types a site declares (`Merger:<type>` permissions).
     pub async fn merger_types(&self, address: &str) -> Vec<String> {
         self.xites
@@ -3355,16 +3368,16 @@ impl AppState {
                 .collect()
         };
         for (db, schema, types) in mergers {
-            let sub = db_file_dir(std::path::Path::new(""), &schema.db_file);
             for (merged_addr, merged_dir, merged_type) in &merged {
                 if types.contains(merged_type) {
-                    // Same db-file-relative rooting as build_xite_db.
-                    let dir = if sub.as_os_str().is_empty() {
-                        merged_dir.clone()
-                    } else {
-                        merged_dir.join(&sub)
-                    };
-                    let _ = db.populate_site(&schema, &dir, merged_addr);
+                    // Scan the merged site's root and key every file under the
+                    // merged site's address. EpixNet nests merged sites
+                    // physically at `merged-<type>/<address>/`, so its relative
+                    // paths (and json.directory) begin with the address; we
+                    // reproduce that with the prefix instead of nesting on disk.
+                    // The `db_file` subdir is where the MERGER keeps its own db,
+                    // not a subdir of each merged site, so it is not joined here.
+                    let _ = db.populate_site(&schema, merged_dir, merged_addr);
                 }
             }
         }
@@ -3427,6 +3440,11 @@ impl AppState {
         let (bytes, files) = hook.sync_user_content(address).await;
         if bytes > 0 {
             self.rebuild_xite_db(address).await;
+            // A merged site's fresh rows must reach its merger's db too (its
+            // repos/issues live there; the merger page queries only its own db).
+            if self.site_merged_type(address).await.is_some() {
+                self.rebuild_merger_dbs().await;
+            }
             self.log("INFO", format!("Synced user content for {address} ({bytes} bytes)")).await;
             // file_done per arrived file (EpixNet fires these as files land):
             // open pages re-query their db on it - EpixSites' list, EpixTalk's
@@ -5571,8 +5589,11 @@ mod tests {
         mstore
             .write(
                 "dbschema.json",
+                // A real merger schema keys merged files under the merged
+                // site's address (EpixNet nests them at merged-<type>/<addr>/),
+                // so the map's leading `.+/` matches that address segment.
                 br#"{ "db_name":"Merger","db_file":"db.db","version":3,
-                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
                      "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
             )
             .unwrap();
