@@ -620,12 +620,12 @@ async fn resolve_user_signers(
         return map;
     }
     let (label, tld) = name.rsplit_once('.').unwrap_or((name, "epix"));
-    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-    if let Ok(domain) = resolver.resolve(label, tld).await {
-        // Any of the xID's owner or identity addresses may sign its content.
-        let mut addrs = vec![domain.owner.clone()];
-        addrs.extend(domain.identities.iter().map(|i| i.address.clone()));
-        map.insert(name.to_string(), addrs);
+    // The user's content is signed by an identity linked to their xID; resolve
+    // (cached) the linked identity addresses and accept any (EpixNet's
+    // resolveUserSigners). The xID resolver is chain-verified (Merkle proof).
+    let signers = epix_chain::xid_signers::resolve(label, tld).await;
+    if !signers.is_empty() {
+        map.insert(name.to_string(), signers);
     }
     map
 }

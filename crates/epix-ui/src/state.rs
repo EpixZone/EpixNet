@@ -3311,9 +3311,16 @@ impl AppState {
                 .collect()
         };
         for (db, schema, types) in mergers {
+            let sub = db_file_dir(std::path::Path::new(""), &schema.db_file);
             for (merged_addr, merged_dir, merged_type) in &merged {
                 if types.contains(merged_type) {
-                    let _ = db.populate_site(&schema, merged_dir, merged_addr);
+                    // Same db-file-relative rooting as build_xite_db.
+                    let dir = if sub.as_os_str().is_empty() {
+                        merged_dir.clone()
+                    } else {
+                        merged_dir.join(&sub)
+                    };
+                    let _ = db.populate_site(&schema, &dir, merged_addr);
                 }
             }
         }
@@ -4409,6 +4416,16 @@ fn walk_content_json(root: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// The directory the db indexes files under: the site root joined with the
+/// directory part of `db_file` (EpixNet's `db_dir = dirname(db_path)`), so
+/// json paths are relative to the db file, not the site root.
+fn db_file_dir(root: &std::path::Path, db_file: &str) -> std::path::PathBuf {
+    match db_file.replace('\\', "/").rsplit_once('/') {
+        Some((dir, _)) if !dir.is_empty() => root.join(dir),
+        _ => root.to_path_buf(),
+    }
+}
+
 fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, DbSchema)> {
     let bytes = storage.read("dbschema.json").ok()?;
     let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;
@@ -4418,7 +4435,12 @@ fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, D
     // not from its own files; everything else populates from its own tree -
     // skipping muted authors' data files (ContentFilter enforcement).
     if schema.version != 3 {
-        let _ = db.populate_filtered(&schema, storage.root(), muted);
+        // EpixNet indexes files relative to the db FILE's directory (from
+        // `db_file`, e.g. data/users/epix_talk.db -> data/users/), so the
+        // json.directory of data/users/dice.epix/data.json is `dice.epix`,
+        // not `data/users/dice.epix`. Root the scan there.
+        let db_dir = db_file_dir(storage.root(), &schema.db_file);
+        let _ = db.populate_filtered(&schema, &db_dir, muted);
     }
     Some((db, schema))
 }
@@ -4743,13 +4765,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn db_directory_is_relative_to_the_db_file_dir() {
+        // A user_contents-style layout: db under data/users/, per-user data at
+        // data/users/<name>/data.json. json.directory must be `<name>`, not
+        // `data/users/<name>` (EpixNet computes it relative to the db file).
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Talk","db_file":"data/users/talk.db","version":2,
+                     "maps": { ".+/data.json": { "to_table": [{"node":"topic","table":"topic"}] } },
+                     "tables": { "topic": { "cols": [["topic_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage
+            .write(
+                "data/users/dice.epix/data.json",
+                br#"{ "topic": [ {"topic_id":1,"title":"Hi"} ] }"#,
+            )
+            .unwrap();
+        let addr = "1TalkAddr";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+
+        let rows = state
+            .db_query(addr, "SELECT directory FROM json", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["directory"], "dice.epix", "directory relative to db file dir");
+
+        // The topic still populated (path matched relative to the db dir).
+        let topics = state
+            .db_query(addr, "SELECT title FROM topic", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(topics[0]["title"], "Hi");
+    }
+
+    #[tokio::test]
     async fn db_query_returns_real_rows_from_the_xite_db() {
         let dir = tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         storage
             .write(
                 "dbschema.json",
-                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                br#"{ "db_name":"Blog","db_file":"db.db","version":2,
                      "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
                      "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
             )
@@ -4828,7 +4890,7 @@ mod tests {
         storage
             .write(
                 "dbschema.json",
-                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                br#"{ "db_name":"Blog","db_file":"db.db","version":2,
                      "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
                      "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
             )
@@ -4891,7 +4953,7 @@ mod tests {
         storage
             .write(
                 "dbschema.json",
-                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                br#"{ "db_name":"Blog","db_file":"db.db","version":2,
                      "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
                      "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
             )

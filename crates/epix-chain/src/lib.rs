@@ -67,3 +67,56 @@ pub enum ChainError {
 }
 
 pub type Result<T> = std::result::Result<T, ChainError>;
+
+/// Cached resolution of an xID name to its linked identity addresses (the
+/// content signers for that user), mirroring EpixNet's XidResolver plugin:
+/// check the in-memory cache first, else resolve on-chain (Merkle-verified)
+/// and cache the result. A rarely-changing mapping that would otherwise cost
+/// one RPC per user per resync cycle.
+pub mod xid_signers {
+    use super::XidResolver;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use std::time::{Duration, Instant};
+
+    /// How long a positive resolution stays cached.
+    const TTL: Duration = Duration::from_secs(30 * 60);
+
+    struct Entry {
+        signers: Vec<String>,
+        at: Instant,
+    }
+
+    static CACHE: RwLock<Option<HashMap<String, Entry>>> = RwLock::new(None);
+
+    fn cached(key: &str) -> Option<Vec<String>> {
+        let guard = CACHE.read().ok()?;
+        let map = guard.as_ref()?;
+        let entry = map.get(key)?;
+        (entry.at.elapsed() < TTL).then(|| entry.signers.clone())
+    }
+
+    fn store(key: String, signers: Vec<String>) {
+        if let Ok(mut guard) = CACHE.write() {
+            guard.get_or_insert_with(HashMap::new).insert(key, Entry { signers, at: Instant::now() });
+        }
+    }
+
+    /// The addresses that may sign for `name.tld`'s user content: its linked
+    /// identity addresses (all of them - a signature matching any is valid,
+    /// EpixNet's `resolveUserSigners`). Empty if the name doesn't resolve.
+    pub async fn resolve(name: &str, tld: &str) -> Vec<String> {
+        let key = format!("{name}.{tld}");
+        if let Some(hit) = cached(&key) {
+            return hit;
+        }
+        let resolver = XidResolver::new(super::DEFAULT_RPC_URL);
+        let Ok(domain) = resolver.resolve(name, tld).await else {
+            return Vec::new();
+        };
+        let signers: Vec<String> =
+            domain.identities.iter().map(|i| i.address.clone()).collect();
+        store(key, signers.clone());
+        signers
+    }
+}
