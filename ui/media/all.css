@@ -1419,6 +1419,24 @@ a {
 	border: none;
 	background: none;
 }
+/* Dismissal: fade the whole screen out in place. The old height-collapse
+   squeezed the centered stage ticker into a thin strip at the top while the
+   container shrank. pointer-events off so the invisible overlay never blocks
+   the site while it waits to be removed from the DOM. */
+.loadingscreen.done {
+	height: 100%;
+	opacity: 0;
+	transform: translateY(-12px);
+	transition: opacity 0.45s ease, transform 0.45s ease;
+	pointer-events: none;
+}
+.loadingscreen.done .console,
+.loadingscreen.done .flipper-container,
+.loadingscreen.done .loading-stage {
+	opacity: 0;
+	transform: none;
+	transition: opacity 0.3s ease;
+}
 /* Flat button (size-limit prompt on the loading screen). */
 .loadingscreen .console .button {
 	background: #8A4BDB;
