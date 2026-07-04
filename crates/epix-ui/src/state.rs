@@ -41,6 +41,16 @@ pub trait PeerFinder: Send + Sync {
     async fn find(&self, address: &str) -> Vec<PeerAddr>;
 }
 
+/// Fetch a xite's included / per-user content (user_contents sites keep their
+/// data - topics, posts - outside the root's file list). Implemented by the
+/// node (it has the chain resolver for user xIDs); the resync loop calls it so
+/// existing sites pick up new and backfilled user content.
+#[async_trait::async_trait]
+pub trait ContentSyncer: Send + Sync {
+    /// Sync `address`'s included/user content; returns bytes downloaded.
+    async fn sync_user_content(&self, address: &str) -> u64;
+}
+
 /// One file's state during an on-demand clone (progressive serve).
 pub enum LoadingFile {
     /// Verified bytes are on disk - serve them now.
@@ -207,6 +217,8 @@ pub struct AppState {
     on_demand: RwLock<Option<Arc<dyn OnDemandResolver>>>,
     /// DHT-backed peer lookup, installed by the runtime.
     peer_finder: RwLock<Option<Arc<dyn PeerFinder>>>,
+    /// Included/user-content syncer, installed by the node.
+    content_syncer: RwLock<Option<Arc<dyn ContentSyncer>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -381,6 +393,7 @@ impl AppState {
             transport: RwLock::new(None),
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
+            content_syncer: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -476,6 +489,7 @@ impl AppState {
             transport: RwLock::new(None),
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
+            content_syncer: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -3347,6 +3361,25 @@ impl AppState {
             Some(hook) => hook.find(address).await,
             None => Vec::new(),
         }
+    }
+
+    /// Install the included/user-content syncer (set by the node).
+    pub async fn set_content_syncer(&self, syncer: Arc<dyn ContentSyncer>) {
+        *self.content_syncer.write().await = Some(syncer);
+    }
+
+    /// Sync a xite's included / per-user content via the installed
+    /// [`ContentSyncer`]; rebuilds the db when anything new arrived.
+    pub async fn sync_user_content(&self, address: &str) -> u64 {
+        let hook = self.content_syncer.read().await.clone();
+        let Some(hook) = hook else { return 0 };
+        let bytes = hook.sync_user_content(address).await;
+        if bytes > 0 {
+            self.rebuild_xite_db(address).await;
+            self.log("INFO", format!("Synced user content for {address} ({bytes} bytes)")).await;
+            self.push_site_info(address).await;
+        }
+        bytes
     }
 
     /// Ensure `host` (a `.epix` name) is served, resolving + cloning it on demand

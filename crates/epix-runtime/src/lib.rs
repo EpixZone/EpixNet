@@ -491,6 +491,23 @@ async fn chart_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duratio
 
 /// Re-sync every xite (fetch a newer content.json + changed files).
 async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
+    // Initial user-content pass shortly after start (own task, so the resync
+    // ticker isn't delayed): sites cloned before the recursive-content
+    // feature (or while this node was offline) backfill their included and
+    // per-user data without waiting a full period.
+    {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown.notified() => return,
+                _ = tokio::time::sleep(Duration::from_secs(20)) => {}
+            }
+            for address in state.xite_addresses().await {
+                state.sync_user_content(&address).await;
+            }
+        });
+    }
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await;
@@ -506,6 +523,9 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
                     // matching outcome event, never on a plain refresh.
                     state.push_site_info_event(&address, "updating").await;
                     let ok = state.resync_xite(&address).await.is_ok();
+                    // New and updated user content (posts, comments) rides the
+                    // same cycle.
+                    state.sync_user_content(&address).await;
                     state.push_update_result(&address, ok).await;
                 }
                 // OptionalManager: keep optional files under the size cap.

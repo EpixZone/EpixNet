@@ -507,9 +507,10 @@ async fn sync_included_content(
     // Enumerate content.json paths: the root's includes, plus everything a peer
     // advertises via listModified (this is how per-user content.json files -
     // never listed statically - are discovered).
-    let mut paths: HashSet<String> = xite.includes().into_iter().collect();
-    let from_includes = paths.len();
-    let mut from_peer = 0usize;
+    // Paths to consider, with the peer-advertised modified time when known
+    // (0.0 = statically included, always checked).
+    let mut paths: std::collections::HashMap<String, f64> =
+        xite.includes().into_iter().map(|p| (p, 0.0)).collect();
     // Race listModified across the first several peers concurrently and take
     // the first non-empty answer, so one slow/dead peer can't stall the pass.
     let mut probes = tokio::task::JoinSet::new();
@@ -521,9 +522,12 @@ async fn sync_included_content(
     while let Some(res) = probes.join_next().await {
         if let Ok(Some(list)) = res {
             if !list.is_empty() {
-                for p in list {
-                    if p.ends_with("content.json") && p != "content.json" && paths.insert(p) {
-                        from_peer += 1;
+                for (p, modified) in list {
+                    if p.ends_with("content.json") && p != "content.json" {
+                        let entry = paths.entry(p).or_insert(0.0);
+                        if modified > *entry {
+                            *entry = modified;
+                        }
                     }
                 }
                 break;
@@ -531,27 +535,33 @@ async fn sync_included_content(
         }
     }
     probes.abort_all();
-    let _ = (from_includes, from_peer);
     if paths.is_empty() {
         return 0;
     }
     // Parent-first: shallower paths (data/users/content.json) before deeper
     // ones (data/users/mud.epix/content.json), so each verifies against its parent.
-    let mut ordered: Vec<String> = paths.into_iter().collect();
-    ordered.sort_by_key(|p| p.matches('/').count());
+    let mut ordered: Vec<(String, f64)> = paths.into_iter().collect();
+    ordered.sort_by_key(|(p, _)| p.matches('/').count());
 
     let mut child_files: Vec<epix_xite::FileEntry> = Vec::new();
-    let mut queue: std::collections::VecDeque<String> = ordered.into();
+    let mut queue: std::collections::VecDeque<(String, f64)> = ordered.into();
     let mut seen: HashSet<String> = HashSet::new();
-    while let Some(path) = queue.pop_front() {
+    while let Some((path, peer_modified)) = queue.pop_front() {
         if !seen.insert(path.clone()) {
             continue;
         }
-        // Prefer the on-disk copy (a resync), else fetch it; add_content
-        // re-verifies either way before trusting it.
-        let bytes = match xite.storage().read(&path) {
-            Ok(b) => Some(b),
-            Err(_) => fetch_inner_file(transport.as_ref(), peers, address, &path).await,
+        // The on-disk copy serves unless a peer advertises a newer version
+        // (new posts); add_content re-verifies either way before trusting it.
+        let disk = xite.storage().read(&path).ok();
+        let disk_modified = disk
+            .as_deref()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .and_then(|j| j.get("modified").and_then(|v| v.as_f64()))
+            .unwrap_or(-1.0);
+        let bytes = if disk.is_some() && peer_modified <= disk_modified {
+            disk
+        } else {
+            fetch_inner_file(transport.as_ref(), peers, address, &path).await.or(disk)
         };
         let Some(bytes) = bytes else { continue };
         let xid_map = resolve_user_signers(&path).await;
@@ -561,7 +571,7 @@ async fn sync_included_content(
                 // Recurse into nested includes this child declares.
                 for inc in xite.child_includes(&path) {
                     if !seen.contains(&inc) {
-                        queue.push_back(inc);
+                        queue.push_back((inc, 0.0));
                     }
                 }
             }
@@ -626,7 +636,7 @@ async fn fetch_list_modified(
     transport: &dyn Transport,
     peer: &PeerAddr,
     address: &str,
-) -> Option<Vec<String>> {
+) -> Option<Vec<(String, f64)>> {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let mut conn = Connection::connect(transport, peer).await.ok()?;
         conn.handshake().await.ok()?;
@@ -634,7 +644,11 @@ async fn fetch_list_modified(
         let map = epix_protocol::vget(&reply, "modified_files")?.as_map()?;
         Some(
             map.iter()
-                .filter_map(|(k, _)| k.as_str().map(str::to_string))
+                .filter_map(|(k, v)| {
+                    let path = k.as_str()?.to_string();
+                    let modified = v.as_f64().or_else(|| v.as_i64().map(|n| n as f64))?;
+                    Some((path, modified))
+                })
                 .collect::<Vec<_>>(),
         )
     })
@@ -732,6 +746,39 @@ impl epix_ui::OnDemandResolver for OnDemand {
         let result = self.do_ensure(host).await;
         self.in_flight.lock().await.remove(host);
         result
+    }
+}
+
+#[async_trait::async_trait]
+impl epix_ui::ContentSyncer for OnDemand {
+    async fn sync_user_content(&self, address: &str) -> u64 {
+        let dir = self.data_root.join(address);
+        let Ok(addr) = Address::parse(address.to_string()) else { return 0 };
+        let mut xite = Xite::new(addr, XiteStorage::new(dir));
+        // Only user_contents sites (with includes) have out-of-tree content.
+        if !xite.load_content().unwrap_or(false) || xite.includes().is_empty() {
+            return 0;
+        }
+        let mut peers = self.state.connectable_peers(address, 20).await;
+        if peers.is_empty() {
+            // A rarely-visited site may have no warm peers yet: announce for
+            // some, then fall back to the DHT.
+            peers = self.state.announce_to_trackers(address, &self.trackers).await;
+            if peers.is_empty() {
+                peers = self.state.find_peers_dht(address).await;
+            }
+        }
+        if peers.is_empty() {
+            return 0;
+        }
+        sync_included_content(
+            &xite,
+            &peers,
+            self.transport.clone(),
+            Some(&self.state),
+            address,
+        )
+        .await
     }
 }
 
@@ -886,15 +933,17 @@ async fn serve(
 
     // On-demand resolve + clone: typing any `talk.epix` in the browser clones
     // and serves it live.
-    state
-        .set_on_demand(Arc::new(OnDemand {
-            state: state.clone(),
-            data_root: opts.data_root.clone(),
-            transport: transport.clone(),
-            trackers: trackers.clone(),
-            in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
-        }))
-        .await;
+    let on_demand = Arc::new(OnDemand {
+        state: state.clone(),
+        data_root: opts.data_root.clone(),
+        transport: transport.clone(),
+        trackers: trackers.clone(),
+        in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+    });
+    state.set_on_demand(on_demand.clone()).await;
+    // The same component syncs included/user content for existing sites
+    // (called by the resync loop, so EpixTalk-style posts stay fresh).
+    state.set_content_syncer(on_demand).await;
 
     state.add_transfer(&address, bytes_recv, 0).await;
     state.rebuild_merger_dbs().await;
