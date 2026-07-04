@@ -279,8 +279,14 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
 }
 
 /// `/{address}` → `/{address}/` (so a xite URL works without the trailing slash).
-async fn redirect_to_slash(Path(address): Path<String>) -> Redirect {
-    Redirect::permanent(&format!("/{address}/"))
+async fn redirect_to_slash(
+    Path(address): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Redirect {
+    match query.as_deref().filter(|q| !q.is_empty()) {
+        Some(q) => Redirect::permanent(&format!("/{address}/?{q}")),
+        None => Redirect::permanent(&format!("/{address}/")),
+    }
 }
 
 /// Serve `/uimedia/*` from the embedded wrapper runtime, with plugin
@@ -341,6 +347,7 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
 async fn serve_wrapper(
     State(ctx): State<Ctx>,
     Path(requested): Path<String>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // The Host without port; in transparent-proxy mode it equals the xite name.
@@ -437,6 +444,15 @@ async fn serve_wrapper(
     // CSP script nonce for the wrapper's own inline scripts.
     let nonce = ctx.state.issue_wrapper_nonce();
     let script_nonce = ctx.state.issue_wrapper_nonce();
+    // Forward the request's query string into the iframe src so client-routed
+    // xites keep working: EpixTalk links use `<base target="_top">`, the top
+    // window lands on `/{address}/?Topic:...`, and the inner page reads the
+    // query on boot to route. Without this the inner page always reloads at
+    // its default view.
+    let query_string = match raw_query.as_deref().filter(|q| !q.is_empty()) {
+        Some(q) => format!("?{}&wrapper_nonce={nonce}", escape_query(q)),
+        None => format!("?wrapper_nonce={nonce}"),
+    };
     // The xite's real permissions (empty until the user grants one). This is
     // only the wrapper's initial value; the authoritative list arrives over the
     // WebSocket via siteInfo.
@@ -472,7 +488,7 @@ async fn serve_wrapper(
         ("site_file_server", String::new()),
         ("file_url", file_url),
         ("file_inner_path", "index.html".into()),
-        ("query_string", format!("?wrapper_nonce={nonce}")),
+        ("query_string", query_string),
         ("address", address.clone()),
         ("wrapper_nonce", nonce),
         ("wrapper_key", address.clone()),
@@ -959,6 +975,18 @@ b.addEventListener('click',function(e){if(b._dragged){e.preventDefault();b._drag
 })();</script>";
 
 /// Replace known `{name}` tokens; JS braces (not a known name) are left intact.
+/// Escape a raw query string for embedding in the wrapper template (it lands
+/// inside a script string that sets the iframe src). Mirrors EpixNet's
+/// xescape: html chars become entities so the value cannot break out of the
+/// string or the script tag; backslashes are doubled.
+fn escape_query(q: &str) -> String {
+    q.replace('\\', "\\\\")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn render(template: &str, vars: &[(&str, String)]) -> String {
     let mut out = template.to_string();
     for (k, v) in vars {
