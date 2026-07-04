@@ -1441,14 +1441,15 @@ a {
 	}
 }
 
-/* Flipper: the logo's inner square window (37.5% of the mark), scaled with
-   the responsive container, flipping between the brand purple and cyan. */
+/* Flipper: the logo's inner square window (37.5% of the mark), inset a
+   touch so it visibly spins inside the black frame, scaled with the
+   responsive container, flipping between the brand purple and cyan. */
 .flipper {
-	width: 37.5%;
-	height: 37.5%;
+	width: 30%;
+	height: 30%;
 	top: 50%;
 	left: 50%;
-	margin: -18.75% 0 0 -18.75%;
+	margin: -15% 0 0 -15%;
 }
 .flipper .front,
 .flipper .back {
