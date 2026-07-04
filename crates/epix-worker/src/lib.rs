@@ -23,6 +23,38 @@ pub struct SyncReport {
 
 const MAX_ATTEMPTS: u8 = 3;
 
+/// Download order, ported from EpixNet's `WorkerManager.getPriorityBoost`:
+/// the visible page first (index.html, then css/js/dbschema), user-data json
+/// later, `-default` scaffolding last. With the progressive file route this
+/// is what makes a big site render seconds into a clone.
+pub fn download_priority(inner_path: &str) -> i32 {
+    if inner_path == "content.json" {
+        return 9999;
+    }
+    if inner_path == "index.html" {
+        return 9998;
+    }
+    if inner_path.contains("-default") {
+        return -4;
+    }
+    if inner_path.ends_with("all.css") {
+        return 14;
+    }
+    if inner_path.ends_with("all.js") {
+        return 13;
+    }
+    if inner_path.ends_with("dbschema.json") {
+        return 12;
+    }
+    if inner_path.ends_with("content.json") {
+        return 1;
+    }
+    if inner_path.ends_with(".json") {
+        return if inner_path.len() < 50 { 11 } else { 2 };
+    }
+    0
+}
+
 /// Per-file progress callback: `(inner_path, files_done, files_total)`, called
 /// as each file finishes downloading. Drives the wrapper's loading screen.
 pub type FileProgress = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
@@ -56,11 +88,13 @@ struct SyncCtx {
 
 impl SyncCtx {
     fn new(
-        needed: Vec<FileEntry>,
+        mut needed: Vec<FileEntry>,
         xite: &Xite,
         transport: Arc<dyn Transport>,
         on_file: Option<FileProgress>,
     ) -> Self {
+        // Highest priority first: the visible page downloads before the bulk.
+        needed.sort_by_key(|f| std::cmp::Reverse(download_priority(&f.inner_path)));
         let total = needed.len();
         Self {
             queue: Arc::new(Mutex::new(needed.into_iter().map(|f| (f, 0u8)).collect())),
@@ -169,6 +203,7 @@ pub async fn sync_files_with_progress(
         report.failed = needed.into_iter().map(|f| f.inner_path).collect();
         return Ok(report);
     }
+    let max_workers = scale_workers(max_workers, needed.len());
     let ctx = SyncCtx::new(needed, xite, transport, on_file);
     let worker_count = peers.len().min(max_workers.max(1));
     let mut handles = Vec::new();
@@ -197,8 +232,8 @@ pub async fn sync_files_streaming(
     if needed.is_empty() {
         return Ok(SyncReport::default());
     }
+    let max_workers = scale_workers(max_workers, needed.len()).max(1);
     let ctx = SyncCtx::new(needed, xite, transport, on_file);
-    let max_workers = max_workers.max(1);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut spares: VecDeque<PeerAddr> = VecDeque::new();
     let mut join = tokio::task::JoinSet::new();
@@ -241,6 +276,12 @@ pub async fn sync_files_streaming(
     Ok(ctx.finish().await)
 }
 
+/// EpixNet's `getMaxWorkers`: triple the worker cap when the task list is
+/// large, so big sites saturate more peers.
+fn scale_workers(max_workers: usize, tasks: usize) -> usize {
+    if tasks > 50 { max_workers * 3 } else { max_workers }
+}
+
 /// Dial + handshake bounded by a deadline: an unreachable peer must not hang
 /// its worker (the OS TCP timeout is ~75s) while the rest of the queue idles.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -268,5 +309,36 @@ async fn requeue_or_fail(
         queue.lock().await.push_back((file, attempts + 1));
     } else {
         report.lock().await.failed.push(file.inner_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::download_priority;
+
+    #[test]
+    fn priority_orders_the_visible_page_first() {
+        let mut files = vec![
+            "data/users/1abc/content.json",
+            "js/all.js",
+            "index.html",
+            "img/hero.png",
+            "css/all.css",
+            "dbschema.json",
+            "index-default.html",
+        ];
+        files.sort_by_key(|f| std::cmp::Reverse(download_priority(f)));
+        assert_eq!(
+            files,
+            vec![
+                "index.html",
+                "css/all.css",
+                "js/all.js",
+                "dbschema.json",
+                "data/users/1abc/content.json",
+                "img/hero.png",
+                "index-default.html",
+            ]
+        );
     }
 }

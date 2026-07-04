@@ -41,6 +41,16 @@ pub trait PeerFinder: Send + Sync {
     async fn find(&self, address: &str) -> Vec<PeerAddr>;
 }
 
+/// One file's state during an on-demand clone (progressive serve).
+pub enum LoadingFile {
+    /// Verified bytes are on disk - serve them now.
+    Ready(Vec<u8>),
+    /// Expected but not downloaded yet - keep waiting.
+    Pending,
+    /// content.json is here and doesn't list this file - 404.
+    NotInSite,
+}
+
 /// Plugins that ship disabled by default, matching the plugins EpixNet keeps
 /// `disabled-` (that we have): they are off until the operator turns them on.
 const DEFAULT_DISABLED_PLUGINS: &[&str] = &["NoNewSites", "UiPassword", "Multiuser"];
@@ -2875,6 +2885,36 @@ impl AppState {
     /// bare test servers don't).
     pub async fn has_on_demand(&self) -> bool {
         self.on_demand.read().await.is_some()
+    }
+
+    /// Progressive serve during an on-demand clone: the state of one file of a
+    /// xite that is downloading but not yet registered.
+    pub fn loading_file(&self, address: &str, inner_path: &str) -> LoadingFile {
+        let Some(root) = &self.data_root else { return LoadingFile::Pending };
+        let storage = epix_xite::XiteStorage::new(root.join(address));
+        // Workers verify every file's hash (against the signature-verified
+        // content.json) before writing, so anything on disk is safe to serve.
+        if let Ok(bytes) = storage.read(inner_path) {
+            return LoadingFile::Ready(bytes);
+        }
+        // content.json on disk tells us which files will ever exist: a request
+        // for something unlisted 404s instead of waiting out the clone.
+        if let Ok(bytes) = storage.read("content.json") {
+            if let Ok(content) = serde_json::from_slice::<Value>(&bytes) {
+                let listed = content
+                    .get("files")
+                    .and_then(|f| f.get(inner_path))
+                    .is_some()
+                    || content
+                        .get("files_optional")
+                        .and_then(|f| f.get(inner_path))
+                        .is_some();
+                if !listed {
+                    return LoadingFile::NotInSite;
+                }
+            }
+        }
+        LoadingFile::Pending
     }
 
     /// Push a wrapper notification (`["info"|"done"|"error", message,
