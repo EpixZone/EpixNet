@@ -935,16 +935,54 @@ async fn serve_file(
         }
     }
     // A `.epix` name in the URL resolves to the bech32 serving key.
-    let mut address = ctx.state.canonical_key(&address).await;
-    // EpixNet's `needFile` semantics: a file of a xite that is still being
-    // cloned on demand blocks until the clone lands (the wrapper's iframe
-    // waits behind the loading screen), then serves normally.
+    let requested = address;
+    let mut address = ctx.state.canonical_key(&requested).await;
+    // Progressive serve during an on-demand clone (EpixNet's `needFile`, per
+    // file): kick the clone off (coalesced with any already running) and serve
+    // each file the moment its verified bytes hit disk - the page renders
+    // seconds into a big clone because index.html/css/js download first.
     if !ctx.state.has_xite(&address).await
-        && plausible_xite_ref(&address)
+        && plausible_xite_ref(&requested)
         && ctx.state.has_on_demand().await
     {
-        ctx.state.ensure_xite(&address).await;
-        address = ctx.state.canonical_key(&address).await;
+        {
+            let state = ctx.state.clone();
+            let target = requested.clone();
+            tokio::spawn(async move {
+                state.ensure_xite(&target).await;
+            });
+        }
+        let ct = content_type(&path).to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            let key = ctx.state.canonical_key(&requested).await;
+            if ctx.state.has_xite(&key).await {
+                address = key; // registered - serve through the normal path
+                break;
+            }
+            // Once the name resolved (or was an address all along), the clone
+            // dir is known - check the disk.
+            let disk_key = if key != requested || requested.starts_with("epix1") {
+                Some(key)
+            } else {
+                None
+            };
+            if let Some(k) = disk_key {
+                match ctx.state.loading_file(&k, &path) {
+                    crate::state::LoadingFile::Ready(bytes) => {
+                        return (file_headers(&ct, StatusCode::OK), bytes).into_response();
+                    }
+                    crate::state::LoadingFile::NotInSite => {
+                        return (StatusCode::NOT_FOUND, "not found").into_response();
+                    }
+                    crate::state::LoadingFile::Pending => {}
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return (StatusCode::NOT_FOUND, "not found").into_response();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
     let ct = content_type(&path).to_string();
     // Range request → 206 Partial Content, streamed from disk (big files seek

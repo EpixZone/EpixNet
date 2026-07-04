@@ -275,6 +275,51 @@ async fn clone_xite_with_progress(
             }
         });
     }
+    // PEX: the first few discovered peers are asked for their peers too,
+    // feeding the same channel - EpixNet ran peer exchange during the
+    // download, and it reaches peers the trackers/DHT don't know.
+    let pex_budget = Arc::new(std::sync::atomic::AtomicUsize::new(3));
+    let spawn_pex = {
+        let found = found.clone();
+        let address = address.to_string();
+        let transport = transport.clone();
+        let budget = pex_budget.clone();
+        move |peer: PeerAddr, tx: tokio::sync::mpsc::UnboundedSender<PeerAddr>| {
+            use std::sync::atomic::Ordering;
+            if budget
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| b.checked_sub(1))
+                .is_err()
+            {
+                return;
+            }
+            let found = found.clone();
+            let address = address.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let reply = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
+                    conn.handshake().await.ok()?;
+                    conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), 10).await.ok()
+                })
+                .await
+                .ok()
+                .flatten();
+                let Some(reply) = reply else { return };
+                let unpacked = reply
+                    .ipv4
+                    .iter()
+                    .chain(reply.ipv6.iter())
+                    .filter_map(|b| PeerAddr::unpack_ip(b))
+                    .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)));
+                for p in unpacked {
+                    if found.lock().unwrap().insert(p.to_string()) {
+                        let _ = tx.send(p);
+                    }
+                }
+            });
+        }
+    };
+    let pex_tx = tx.clone();
     drop(tx);
 
     // Phase 1: race the first peers for a verified content.json (unless it is
@@ -305,6 +350,7 @@ async fn clone_xite_with_progress(
                                 );
                             }
                             let _ = sync_tx.send(peer.clone());
+                            spawn_pex(peer.clone(), pex_tx.clone());
                             if fetchers.len() < 4 {
                                 fetchers.spawn(fetch_content(
                                     transport.clone(),
@@ -367,6 +413,8 @@ async fn clone_xite_with_progress(
         let state = progress.cloned();
         let address = address.to_string();
         let mut count = peer_count;
+        let spawn_pex = spawn_pex.clone();
+        let pex_tx = pex_tx.clone();
         tokio::spawn(async move {
             while let Some(peer) = rx.recv().await {
                 count += 1;
@@ -377,10 +425,13 @@ async fn clone_xite_with_progress(
                         serde_json::json!({ "peers": count }),
                     );
                 }
+                spawn_pex(peer.clone(), pex_tx.clone());
                 let _ = sync_tx.send(peer);
             }
+            drop(pex_tx);
         });
     }
+    drop(pex_tx);
     drop(sync_tx);
 
     // Per-file progress: each finished file prints its line on the loading
@@ -390,12 +441,9 @@ async fn clone_xite_with_progress(
         let addr = address.to_string();
         let peers_n = peer_count.max(1);
         Arc::new(move |inner: &str, done: usize, total: usize| {
-            // The wrapper closes the loading screen on index.html's file_done,
-            // but the page itself only serves once the whole clone lands - so
-            // that one is pushed at the end (do_ensure), not from here.
-            if inner == "index.html" {
-                return;
-            }
+            // index.html downloads first (priority queue) and the file route
+            // serves it progressively, so its file_done hides the loading
+            // screen the moment the page is actually viewable.
             let left = total.saturating_sub(done);
             state.push_clone_event(
                 &addr,
