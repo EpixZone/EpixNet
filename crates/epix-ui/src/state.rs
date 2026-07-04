@@ -2944,9 +2944,15 @@ impl AppState {
         }
         let connections = self.connection_stats().await.total;
         let plugins = self.plugins().await;
+        // The multiuser feature compiles the code in; the PLUGIN toggle (off
+        // by default) decides at runtime whether the dashboard sees it.
         #[cfg(feature = "multiuser")]
-        let (multiuser, multiuser_admin, master_address) =
-            (true, true, self.multiuser_list().await.first().cloned().unwrap_or_default());
+        let (multiuser, multiuser_admin, master_address) = if self.plugin_enabled("Multiuser").await
+        {
+            (true, true, self.multiuser_list().await.first().cloned().unwrap_or_default())
+        } else {
+            (false, false, String::new())
+        };
         #[cfg(not(feature = "multiuser"))]
         let (multiuser, multiuser_admin, master_address): (bool, bool, String) =
             (false, false, String::new());

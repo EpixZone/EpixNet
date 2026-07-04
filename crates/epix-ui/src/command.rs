@@ -229,6 +229,15 @@ impl CommandRegistry {
         for c in default_commands() {
             r.register(c);
         }
+        // Multiuser's identity commands only work while the plugin is enabled
+        // (it ships disabled; the feature only compiles the code in).
+        #[cfg(feature = "multiuser")]
+        for cmd in ["userShowMasterSeed", "userList", "userLogin", "userSet", "userLogout"] {
+            r.command_plugin.insert(
+                r.commands.get(cmd).map(|c| c.name()).unwrap_or(cmd),
+                "Multiuser".to_string(),
+            );
+        }
         r
     }
 
@@ -2756,6 +2765,23 @@ mod tests {
             session.cors_target("cors-1B/data.json").await.unwrap(),
             ("1B".to_string(), "data.json".to_string())
         );
+    }
+
+    #[cfg(feature = "multiuser")]
+    #[tokio::test]
+    async fn multiuser_commands_follow_the_plugin_toggle() {
+        let state = AppState::new("test");
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some("1Wrapper".into()));
+
+        // Plugin off (the default): the command behaves as if unregistered.
+        let off = registry.dispatch(&session, "userList", &json!([]), 1_000_001).await;
+        assert_eq!(off.unwrap(), Value::Null);
+
+        // Toggled on: it answers.
+        state.set_plugin_enabled("Multiuser", true).await;
+        let on = registry.dispatch(&session, "userList", &json!([]), 1_000_002).await;
+        assert!(on.unwrap().is_array());
     }
 
     #[tokio::test]
