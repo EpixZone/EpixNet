@@ -1328,7 +1328,12 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
 
     match ctx.registry.dispatch(session, cmd, &params, id).await {
         Ok(result) => json!({"cmd": "response", "to": id, "result": result}).to_string(),
-        Err(error) => json!({"cmd": "response", "to": id, "error": error}).to_string(),
+        // EpixNet convention: a command error is the result being
+        // `{"error": ...}`, which is what site scripts and epixframe.js read
+        // (a top-level `error` field is dropped by callback-mode ws.cmd).
+        Err(error) => {
+            json!({"cmd": "response", "to": id, "result": { "error": error }}).to_string()
+        }
     }
 }
 
