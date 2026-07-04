@@ -98,6 +98,7 @@ impl UiServer {
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
             .route("/Stats", get(serve_stats_page))
+            .route("/StatsJson", get(serve_stats_json))
             // Trailing-slash variants would otherwise fall through to the
             // xite route ("/Stats/" -> serve_wrapper("Stats") -> 404).
             .route("/Plugins/", get(|| async { Redirect::permanent("/Plugins") }))
@@ -146,6 +147,7 @@ fn is_global_path(path: &str) -> bool {
         || path == "/Config"
         || path == "/Plugins"
         || path == "/Stats"
+        || path == "/StatsJson"
         || path == "/Config/"
         || path == "/Plugins/"
         || path == "/Stats/"
@@ -373,6 +375,12 @@ async fn serve_wrapper(
         if !plausible_xite_ref(&requested) || !ctx.state.has_on_demand().await {
             return (StatusCode::NOT_FOUND, "unknown xite").into_response();
         }
+        // NoNewSites: a locked node serves what it has; browsing to a xite it
+        // doesn't serve won't clone it.
+        if !ctx.state.has_xite(&address).await && ctx.state.no_new_sites().await {
+            return (StatusCode::FORBIDDEN, "Adding new sites is disabled on this node")
+                .into_response();
+        }
         let ensure = {
             let state = ctx.state.clone();
             let target = requested.clone();
@@ -476,7 +484,11 @@ async fn serve_wrapper(
         ("server_url", String::new()),
         ("lang", "en".into()),
     ];
-    let html = render(WRAPPER_HTML, &vars);
+    let mut html = render(WRAPPER_HTML, &vars);
+    // NoNewSites gateway: every page carries the read-only banner.
+    if ctx.state.no_new_sites().await {
+        html = inject_gateway_banner(html);
+    }
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
@@ -611,6 +623,31 @@ async fn serve_config_page(
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, cleared, &homepage))
         .into_response()
+}
+
+/// `GET /StatsJson` - the lightweight public stats endpoint the NoNewSites
+/// gateway exposes for a marketing page (CORS left to the reverse proxy, as
+/// in the original, so headers are not doubled).
+async fn serve_stats_json(State(ctx): State<Ctx>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], ctx.state.stats_json().await.to_string())
+        .into_response()
+}
+
+/// The public-gateway banner the NoNewSites plugin injects into every wrapper
+/// page (ported from the original): a fixed top bar telling visitors this is
+/// a read-only gateway, with the iframe shifted down to make room.
+const GATEWAY_BANNER_HTML: &str = "<style>#epix-gateway-banner {    position: fixed; top: 0; left: 0; right: 0; z-index: 1;    height: 38px;    background: #0d1117; color: #e6edf3;    font: 13px/38px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;    text-align: center; padding: 0 16px;    box-sizing: border-box;}#epix-gateway-banner strong { color: #f0f6fc; font-weight: 600; }#epix-gateway-banner a {    color: #fff; background: #238636; text-decoration: none;    padding: 5px 12px; border-radius: 4px; margin-left: 10px;    font-weight: 600; transition: background 0.15s;}#epix-gateway-banner a:hover { background: #2ea043; }#inner-iframe { top: 38px !important; height: calc(100% - 38px) !important; }</style><div id='epix-gateway-banner'>    <strong>Public gateway - read-only.</strong>    Install EpixNet to use your own identity, browse the full network, and host sites.    <a href='https://epixnet.io/#download' target='_blank' rel='noopener'>Get EpixNet</a></div>";
+
+/// Inject the gateway banner just before the wrapper's closing body tag.
+fn inject_gateway_banner(html: String) -> String {
+    match html.rfind("</body>") {
+        Some(i) => {
+            let mut out = html;
+            out.insert_str(i, GATEWAY_BANNER_HTML);
+            out
+        }
+        None => html,
+    }
 }
 
 /// `GET /Stats` - the diagnostics page (EpixNet's `/Stats`): node identity,
@@ -953,8 +990,13 @@ async fn serve_file(
     // seconds into a big clone because index.html/css/js download first. The
     // entry registers (empty) at clone start, so a registered entry whose
     // requested file is missing gets the same wait-for-disk treatment.
-    let still_loading = !ctx.state.has_xite(&address).await
-        || !ctx.state.xite_file_exists(&address, &path).await;
+    let registered = ctx.state.has_xite(&address).await;
+    if !registered && ctx.state.no_new_sites().await {
+        // NoNewSites: don't start a clone for a file request either.
+        return (StatusCode::FORBIDDEN, "Adding new sites is disabled on this node")
+            .into_response();
+    }
+    let still_loading = !registered || !ctx.state.xite_file_exists(&address, &path).await;
     if still_loading && plausible_xite_ref(&requested) && ctx.state.has_on_demand().await {
         {
             let state = ctx.state.clone();
@@ -1431,4 +1473,21 @@ async fn serve_benchmark(Query(q): Query<BenchmarkQuery>) -> Response {
         .await
         .unwrap_or_else(|_| "benchmark task failed".to_string());
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], report).into_response()
+}
+
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::inject_gateway_banner;
+
+    #[test]
+    fn banner_lands_before_the_closing_body_tag() {
+        let html = "<html><body><h1>site</h1></body></html>".to_string();
+        let out = inject_gateway_banner(html);
+        assert!(out.contains("epix-gateway-banner"));
+        assert!(out.ends_with("</body></html>"));
+        let banner_at = out.find("epix-gateway-banner").unwrap();
+        assert!(banner_at < out.rfind("</body>").unwrap());
+        assert!(banner_at > out.find("<h1>site</h1>").unwrap());
+    }
 }

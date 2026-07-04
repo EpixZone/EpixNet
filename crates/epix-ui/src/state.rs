@@ -603,7 +603,10 @@ impl AppState {
 
     /// Whether the operator has disabled adding new sites to this node.
     pub async fn no_new_sites(&self) -> bool {
-        self.config_get("no_new_sites").await.and_then(|v| v.as_bool()).unwrap_or(false)
+        // The NoNewSites plugin toggle is the normal switch; the config key
+        // remains as an operator override (headless/proxy deployments).
+        self.plugin_enabled("NoNewSites").await
+            || self.config_get("no_new_sites").await.and_then(|v| v.as_bool()).unwrap_or(false)
     }
 
     /// The configured UI password, if any (UiPassword). Empty/unset means the
@@ -2586,6 +2589,37 @@ impl AppState {
         self.conn_pool.stats().await
     }
 
+    /// The lightweight public stats payload (`/StatsJson`, the NoNewSites
+    /// gateway endpoint): totals a marketing page can poll without hitting
+    /// the full diagnostics page.
+    pub async fn stats_json(&self) -> Value {
+        let xites = self.xites.read().await;
+        let mut peers_total = 0usize;
+        let mut peers_connected = 0usize;
+        let mut bytes_recv = 0u64;
+        let mut bytes_sent = 0u64;
+        for x in xites.values() {
+            let counts = x.peers.counts();
+            peers_total += counts.total;
+            peers_connected += counts.connected;
+            bytes_recv += x.bytes_recv;
+            bytes_sent += x.bytes_sent;
+        }
+        let sites = xites.len();
+        drop(xites);
+        let (port_opened, _) = self.port_status().await;
+        json!({
+            "version": self.version,
+            "sites": sites,
+            "peers_total": peers_total,
+            "peers_connected": peers_connected,
+            "connections": self.connection_stats().await.total,
+            "bytes_recv": bytes_recv,
+            "bytes_sent": bytes_sent,
+            "port_opened": port_opened,
+        })
+    }
+
     /// Render the diagnostics Stats page (EpixNet's `/Stats`): node identity,
     /// connection pool, trackers, Tor, and a per-site table. Returns the inner
     /// HTML body; the route wraps it in the shared page shell.
@@ -3315,6 +3349,10 @@ impl AppState {
     pub async fn ensure_xite(&self, host: &str) -> bool {
         if self.has_xite(host).await {
             return true;
+        }
+        // NoNewSites: the node's site set is locked - nothing new gets cloned.
+        if self.no_new_sites().await {
+            return false;
         }
         let hook = self.on_demand.read().await.clone();
         match hook {
@@ -4834,6 +4872,34 @@ mod tests {
 
         assert!(state.set_serving("1PauseMe", true).await);
         assert_eq!(state.site_info("1PauseMe").await["settings"]["serving"], true);
+    }
+
+    #[tokio::test]
+    async fn no_new_sites_plugin_toggle_locks_the_site_set() {
+        struct AlwaysClone;
+        #[async_trait::async_trait]
+        impl OnDemandResolver for AlwaysClone {
+            async fn ensure(&self, _host: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let state = AppState::new("test");
+        state.set_on_demand(Arc::new(AlwaysClone)).await;
+
+        // Plugin off (default): resolver runs (returns false only because the
+        // stub doesn't register anything).
+        assert!(!state.no_new_sites().await);
+
+        // Plugin on: the site set is locked and the resolver is never asked.
+        state.set_plugin_enabled("NoNewSites", true).await;
+        assert!(state.no_new_sites().await);
+        assert!(!state.ensure_xite("locked.epix").await);
+
+        // The config key still works as an operator override.
+        state.set_plugin_enabled("NoNewSites", false).await;
+        assert!(!state.no_new_sites().await);
+        state.config_set("no_new_sites", serde_json::json!(true)).await;
+        assert!(state.no_new_sites().await);
     }
 
     #[tokio::test]
