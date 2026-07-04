@@ -192,7 +192,8 @@ async fn handles_epixframe_websocket_commands() {
     // An admin command from the inner page (small id) is refused...
     let denied = call(&mut ws, "siteList", 4).await;
     assert_eq!(denied["to"], 4);
-    assert!(denied["error"].as_str().unwrap().contains("permission"));
+    // Errors nest under `result` (ZeroNet/EpixNet convention).
+    assert!(denied["result"]["error"].as_str().unwrap().contains("permission"));
 
     // ...but the trusted wrapper chrome (id >= 1_000_000) may run it.
     let allowed = call(&mut ws, "siteList", 1_000_001).await;

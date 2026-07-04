@@ -283,10 +283,16 @@ impl CommandRegistry {
         // set - refuse commands that add/clone a new site or delete an existing
         // one.
         if NEW_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
-            return Err("Adding new sites is disabled on this node".into());
+            let msg = "Adding new sites is disabled on this node";
+            // Also push a toast: the dashboard fires these without a callback,
+            // so the plain error response alone is invisible to the user.
+            session.state.push_notification("error", msg, 0);
+            return Err(msg.into());
         }
         if DELETE_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
-            return Err("Deleting sites is disabled on this node".into());
+            let msg = "Deleting sites is disabled on this node";
+            session.state.push_notification("error", msg, 0);
+            return Err(msg.into());
         }
         // A command from a disabled plugin behaves as if unregistered.
         if let Some(plugin) = self.command_plugin.get(cmd) {
