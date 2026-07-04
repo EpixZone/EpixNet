@@ -785,11 +785,26 @@ impl WsCommand for SiteInfo {
     fn name(&self) -> &'static str {
         "siteInfo"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         // A xite being cloned on demand is registered (empty) before the
         // download starts, so this is real - never null - during loading.
         let address = s.address()?;
-        Ok(s.state.site_info(address).await)
+        let mut info = s.state.site_info(address).await;
+        // file_status (EpixNet's actionSiteInfo): the loading-screen wrapper
+        // asks about its index.html on connect. If the file already landed,
+        // answer with its file_done event - the live event fires early in the
+        // download and is missed when the WS connects after it, which left
+        // the loading screen up until the whole clone finished.
+        let file_status = p
+            .get("file_status")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str());
+        if let (Some(path), Value::Object(m)) = (file_status, &mut info) {
+            if s.state.xite_file_exists(address, path).await {
+                m.insert("event".to_string(), json!(["file_done", path]));
+            }
+        }
+        Ok(info)
     }
 }
 

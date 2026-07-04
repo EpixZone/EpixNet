@@ -1800,7 +1800,7 @@ if (window.getComputedStyle(document.body).transform) {
             if (!this.site_info) {
               this.reloadSiteInfo();
             }
-            if (site_info.content && !this.is_title_changed) {
+            if (site_info.content && site_info.content.title && !this.is_title_changed) {
               window.document.title = site_info.content.title + " - EpixNet";
               this.log("Required file " + window.file_inner_path + " done, setting title to", window.document.title);
             }
