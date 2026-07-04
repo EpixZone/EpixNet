@@ -118,8 +118,12 @@ fn get_rules(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> Opti
         }));
     }
     let parts: Vec<&str> = inner_path.split('/').collect();
-    // Walk parent directories from the closest up to the root.
-    for cut in (0..parts.len()).rev() {
+    // Walk parent directories from the file's OWN directory up to the root -
+    // but never the file's own content.json (EpixNet's "Dont check in self
+    // dir"): rules for X/content.json come from its parent, else re-verifying
+    // a stored include (e.g. data/users/content.json) would match its own
+    // user_contents and wrongly demand a cert.
+    for cut in (0..parts.len().saturating_sub(1)).rev() {
         let parent_dir = parts[..cut].join("/");
         let content_inner_path = if parent_dir.is_empty() {
             "content.json".to_string()
@@ -434,6 +438,36 @@ pub fn is_single_owner_signed(content: &Value, site_address: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    struct DiskCtx {
+        files: std::collections::HashMap<String, Value>,
+    }
+    impl VerifyContext for DiskCtx {
+        fn site_address(&self) -> &str { "epix1site" }
+        fn loaded_content(&self, inner_path: &str) -> Option<Value> {
+            self.files.get(inner_path).cloned()
+        }
+    }
+
+    #[test]
+    fn get_rules_skips_the_files_own_content_json() {
+        // Root includes data/users/content.json (which itself has
+        // user_contents). Rules for data/users/content.json must come from the
+        // ROOT include entry, not from its own user_contents.
+        let root = json!({
+            "address": "epix1site",
+            "includes": { "data/users/content.json": { "signers": ["mud.epix"] } },
+        });
+        let uc = json!({ "user_contents": { "cert_signers": { "xid.epix": ["chain"] } } });
+        let mut files = std::collections::HashMap::new();
+        files.insert("content.json".to_string(), root);
+        files.insert("data/users/content.json".to_string(), uc.clone());
+        let ctx = DiskCtx { files };
+        let rules = super::get_rules("data/users/content.json", &uc, &ctx).expect("rules");
+        // The include entry (has signers, no cert_signers), not user_contents.
+        assert!(rules.get("signers").is_some());
+        assert!(rules.get("cert_signers").is_none());
+    }
+
     use super::*;
     use serde_json::json;
 
