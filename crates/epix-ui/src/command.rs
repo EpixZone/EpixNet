@@ -2767,6 +2767,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn no_new_sites_blocks_add_and_delete_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("1Existing", XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some("1Existing".into()));
+        state.add_permission("1Existing", "ADMIN").await;
+        state.set_plugin_enabled("NoNewSites", true).await;
+
+        // Deleting is refused while the node's site set is locked.
+        let del = registry
+            .dispatch(&session, "siteDelete", &json!({ "address": "1Existing" }), 1)
+            .await;
+        assert!(del.unwrap_err().contains("disabled"));
+        assert!(state.has_xite("1Existing").await, "site survived the refused delete");
+
+        // Unlocked again: the delete goes through.
+        state.set_plugin_enabled("NoNewSites", false).await;
+        let del = registry
+            .dispatch(&session, "siteDelete", &json!({ "address": "1Existing" }), 2)
+            .await;
+        assert!(del.is_ok());
+        assert!(!state.has_xite("1Existing").await);
+    }
+
     #[cfg(feature = "multiuser")]
     #[tokio::test]
     async fn multiuser_commands_follow_the_plugin_toggle() {
