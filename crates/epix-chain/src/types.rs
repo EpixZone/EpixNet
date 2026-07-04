@@ -18,6 +18,12 @@ pub struct DomainSnapshot {
     pub identities: Vec<Identity>,
     /// The domain's DNS records (carry the xite address + other pointers).
     pub dns_records: Vec<DnsRecord>,
+    /// Profile avatar URL, empty if unset.
+    #[serde(default)]
+    pub avatar: String,
+    /// Profile bio text, empty if unset.
+    #[serde(default)]
+    pub bio: String,
 }
 
 impl DomainSnapshot {
@@ -57,4 +63,10 @@ pub struct Identity {
     pub address: String,
     pub label: String,
     pub active: bool,
+    /// Block height the identity was revoked at (0 = not revoked).
+    #[serde(default)]
+    pub revoked_at: u64,
+    /// Unix time the identity was revoked at (0 = not revoked).
+    #[serde(default)]
+    pub revoked_at_time: u64,
 }

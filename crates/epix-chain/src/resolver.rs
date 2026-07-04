@@ -138,6 +138,11 @@ fn parse_domain(name: &str, tld: &str, domain: &Value) -> Result<DomainSnapshot>
                         address: id.get("address")?.as_str()?.to_string(),
                         label: id.get("label").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                         active: id.get("active").and_then(|v| v.as_bool()).unwrap_or(false),
+                        revoked_at: id.get("revoked_at").and_then(u64_value).unwrap_or(0),
+                        revoked_at_time: id
+                            .get("revoked_at_time")
+                            .and_then(u64_value)
+                            .unwrap_or(0),
                     })
                 })
                 .collect()
@@ -159,6 +164,18 @@ fn parse_domain(name: &str, tld: &str, domain: &Value) -> Result<DomainSnapshot>
         })
         .unwrap_or_default();
 
+    let profile = domain.get("profile");
+    let avatar = profile
+        .and_then(|p| p.get("avatar"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let bio = profile
+        .and_then(|p| p.get("bio"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     Ok(DomainSnapshot {
         name: name.to_string(),
         tld: tld.to_string(),
@@ -166,7 +183,13 @@ fn parse_domain(name: &str, tld: &str, domain: &Value) -> Result<DomainSnapshot>
         content_root,
         identities,
         dns_records,
+        avatar,
+        bio,
     })
+}
+
+fn u64_value(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 fn as_u32(v: &Value) -> Option<u32> {
