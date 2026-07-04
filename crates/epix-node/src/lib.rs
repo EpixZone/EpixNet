@@ -193,7 +193,9 @@ async fn clone_xite(
     transport: Arc<dyn Transport>,
     trackers: &[PeerAddr],
 ) -> Result<(Option<serde_json::Value>, u64), String> {
-    clone_xite_with_progress(address, data_dir, transport, trackers, None).await
+    clone_xite_with_progress(address, data_dir, transport, trackers, None)
+        .await
+        .map(|(content, bytes, _)| (content, bytes))
 }
 
 /// [`clone_xite`], pushing wrapper loading-screen events (`peers_added`,
@@ -212,7 +214,7 @@ async fn clone_xite_with_progress(
     transport: Arc<dyn Transport>,
     trackers: &[PeerAddr],
     progress: Option<&Arc<AppState>>,
-) -> Result<(Option<serde_json::Value>, u64), String> {
+) -> Result<(Option<serde_json::Value>, u64, Vec<String>), String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
     let mut xite = Xite::new(
         Address::parse(address.to_string()).map_err(|e| format!("bad address: {e}"))?,
@@ -221,7 +223,7 @@ async fn clone_xite_with_progress(
 
     let complete = xite.load_content().unwrap_or(false) && xite.files_needed().is_empty();
     if complete {
-        return Ok((xite.content.clone(), 0));
+        return Ok((xite.content.clone(), 0, Vec::new()));
     }
     if let Some(state) = progress {
         // "Searching for peers..." on the loading screen.
@@ -478,10 +480,14 @@ async fn clone_xite_with_progress(
     // that the root's `files` map never lists. Fetch those content.json files
     // and their data files so the site's db can populate.
     let peers = state_peers(progress, &xite, address).await;
+    let mut user_files = Vec::new();
     if !peers.is_empty() {
-        bytes_recv += sync_included_content(&xite, &peers, transport.clone(), progress, address).await;
+        let (bytes, files) =
+            sync_included_content(&xite, &peers, transport.clone(), progress, address).await;
+        bytes_recv += bytes;
+        user_files = files;
     }
-    Ok((xite.content.clone(), bytes_recv))
+    Ok((xite.content.clone(), bytes_recv, user_files))
 }
 
 /// The peer set to use for the included-content pass: the live registry when a
@@ -495,14 +501,16 @@ async fn state_peers(progress: Option<&Arc<AppState>>, _xite: &Xite, address: &s
 
 /// Download every included / per-user content.json (and the data files they
 /// declare) for a user_contents site, parent-first so each verifies against
-/// its parent's rules. Returns the bytes downloaded.
+/// its parent's rules. Returns the bytes downloaded and the inner paths of
+/// the files that arrived from peers (for `file_done` events after the db
+/// rebuild).
 async fn sync_included_content(
     xite: &Xite,
     peers: &[PeerAddr],
     transport: Arc<dyn Transport>,
     progress: Option<&Arc<AppState>>,
     address: &str,
-) -> u64 {
+) -> (u64, Vec<String>) {
     use std::collections::HashSet;
     // Enumerate content.json paths: the root's includes, plus everything a peer
     // advertises via listModified (this is how per-user content.json files -
@@ -536,7 +544,7 @@ async fn sync_included_content(
     }
     probes.abort_all();
     if paths.is_empty() {
-        return 0;
+        return (0, Vec::new());
     }
     // Parent-first: shallower paths (data/users/content.json) before deeper
     // ones (data/users/mud.epix/content.json), so each verifies against its parent.
@@ -544,6 +552,7 @@ async fn sync_included_content(
     ordered.sort_by_key(|(p, _)| p.matches('/').count());
 
     let mut child_files: Vec<epix_xite::FileEntry> = Vec::new();
+    let mut arrived: Vec<String> = Vec::new();
     let mut queue: std::collections::VecDeque<(String, f64)> = ordered.into();
     let mut seen: HashSet<String> = HashSet::new();
     while let Some((path, peer_modified)) = queue.pop_front() {
@@ -558,15 +567,25 @@ async fn sync_included_content(
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
             .and_then(|j| j.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(-1.0);
+        let mut fetched = false;
         let bytes = if disk.is_some() && peer_modified <= disk_modified {
             disk
         } else {
-            fetch_inner_file(transport.as_ref(), peers, address, &path).await.or(disk)
+            match fetch_inner_file(transport.as_ref(), peers, address, &path).await {
+                Some(b) => {
+                    fetched = true;
+                    Some(b)
+                }
+                None => disk,
+            }
         };
         let Some(bytes) = bytes else { continue };
         let xid_map = resolve_user_signers(&path).await;
         match xite.add_content(&path, &bytes, &xid_map) {
             Ok(files) => {
+                if fetched {
+                    arrived.push(path.clone());
+                }
                 child_files.extend(files);
                 // Recurse into nested includes this child declares.
                 for inc in xite.child_includes(&path) {
@@ -589,16 +608,24 @@ async fn sync_included_content(
         .filter(|f| !xite.storage().verify(&f.inner_path, &f.sha512))
         .collect();
     if needed.is_empty() {
-        return 0;
+        return (0, arrived);
     }
     if let Some(state) = progress {
         state
             .log("INFO", format!("Fetching {} user-content file(s) for {address}", needed.len()))
             .await;
     }
+    let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
     match epix_worker::sync_files_list(needed, xite, peers, transport, 8).await {
-        Ok(report) => report.bytes,
-        Err(_) => 0,
+        Ok(report) => {
+            // Report only the files that actually landed - a partial sync
+            // (dead peers) must not fire file_done for missing files.
+            arrived.extend(
+                needed_paths.into_iter().filter(|p| xite.storage().exists(p)),
+            );
+            (report.bytes, arrived)
+        }
+        Err(_) => (0, arrived),
     }
 }
 
@@ -751,13 +778,13 @@ impl epix_ui::OnDemandResolver for OnDemand {
 
 #[async_trait::async_trait]
 impl epix_ui::ContentSyncer for OnDemand {
-    async fn sync_user_content(&self, address: &str) -> u64 {
+    async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>) {
         let dir = self.data_root.join(address);
-        let Ok(addr) = Address::parse(address.to_string()) else { return 0 };
+        let Ok(addr) = Address::parse(address.to_string()) else { return (0, Vec::new()) };
         let mut xite = Xite::new(addr, XiteStorage::new(dir));
         // Only user_contents sites (with includes) have out-of-tree content.
         if !xite.load_content().unwrap_or(false) || xite.includes().is_empty() {
-            return 0;
+            return (0, Vec::new());
         }
         let mut peers = self.state.connectable_peers(address, 20).await;
         if peers.is_empty() {
@@ -769,7 +796,7 @@ impl epix_ui::ContentSyncer for OnDemand {
             }
         }
         if peers.is_empty() {
-            return 0;
+            return (0, Vec::new());
         }
         sync_included_content(
             &xite,
@@ -828,7 +855,7 @@ impl OnDemand {
                 Some(&self.state),
             )
             .await;
-            let (content, bytes) = match cloned {
+            let (content, bytes, user_files) = match cloned {
                 Ok(r) => r,
                 Err(e) => {
                     // Tell the loading screen ("index.html download failed",
@@ -849,6 +876,13 @@ impl OnDemand {
             // disk, so a user_contents site's topics/comments are queryable.
             self.state.rebuild_xite_db(&address).await;
             self.state.push_site_info(&address).await;
+            // file_done per user-content file, AFTER the rebuild: the page is
+            // already up (served progressively) and ran its first db query
+            // against an empty db - these events make it re-query, or the
+            // list stays empty until a manual reload.
+            for f in &user_files {
+                self.state.push_site_info_file_done(&address, f).await;
+            }
             // Hide the loading screen: the wrapper closes on the file_done of
             // its own index.html.
             self.state.push_clone_event(

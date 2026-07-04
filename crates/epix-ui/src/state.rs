@@ -47,8 +47,9 @@ pub trait PeerFinder: Send + Sync {
 /// existing sites pick up new and backfilled user content.
 #[async_trait::async_trait]
 pub trait ContentSyncer: Send + Sync {
-    /// Sync `address`'s included/user content; returns bytes downloaded.
-    async fn sync_user_content(&self, address: &str) -> u64;
+    /// Sync `address`'s included/user content; returns bytes downloaded and
+    /// the inner paths of the files that arrived (for `file_done` events).
+    async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>);
 }
 
 /// One file's state during an on-demand clone (progressive serve).
@@ -1590,7 +1591,25 @@ impl AppState {
     /// the xite has no `dbschema.json`.
     pub async fn db_query(&self, address: &str, query: &str, params: &Value) -> Result<Vec<Value>, String> {
         // Clone the pooled DB handle out of the lock so the query doesn't hold it.
-        let db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+        let mut db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+        if db.is_none() {
+            // Lazy build, matching EpixNet's openDb: a dbQuery that arrives
+            // before the db exists (a page served progressively mid-clone)
+            // creates the schema and returns real (if still empty) rows.
+            // Sites crash on an error here - their query callbacks iterate
+            // the result - and their boot never recovers.
+            let has_schema = self
+                .xites
+                .read()
+                .await
+                .get(address)
+                .map(|x| x.storage.exists("dbschema.json"))
+                .unwrap_or(false);
+            if has_schema {
+                self.rebuild_xite_db(address).await;
+                db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+            }
+        }
         let db = db.ok_or_else(|| "xite has no database".to_string())?;
         db.query_value(query, params).map_err(|e| e.to_string())
     }
@@ -1609,6 +1628,17 @@ impl AppState {
     /// All follows across sites (`site_address -> feeds`), for feed aggregation.
     pub async fn all_follows(&self) -> std::collections::HashMap<String, Value> {
         self.user.read().await.follows.clone()
+    }
+
+    /// All identity addresses this node's user controls: the master address
+    /// plus every per-site auth address. xidResolve's fallback tries them all
+    /// when the queried address is the user's own (EpixNet does the same, so
+    /// an identity linked under any of the user's addresses is found).
+    pub async fn user_all_addresses(&self) -> Vec<String> {
+        let user = self.user.read().await;
+        let mut out = vec![user.master_address.clone()];
+        out.extend(user.sites.values().map(|s| s.auth_address.clone()));
+        out
     }
 
     /// The user's CryptMessage encryption private key (WIF) for a xite.
@@ -2881,6 +2911,18 @@ impl AppState {
         }
     }
 
+    /// Push `setSiteInfo` tagged `["file_done", inner_path]`, EpixNet's
+    /// per-file signal. Sites re-query their db when a `.json` file lands
+    /// (EpixSites' site list, EpixTalk's topics), so push this only after the
+    /// db is rebuilt or the page re-queries into the old data.
+    pub async fn push_site_info_file_done(&self, address: &str, inner_path: &str) {
+        let mut info = self.site_info(address).await;
+        if let Value::Object(m) = &mut info {
+            m.insert("event".to_string(), json!(["file_done", inner_path]));
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
+    }
+
     /// Push the outcome of an update check as the dashboard expects it
     /// (EpixNet's contract): an `updated` event ends the "Updating..." pill -
     /// rendered as a self-clearing "Updated!" flash on success, or (with
@@ -3380,11 +3422,20 @@ impl AppState {
     pub async fn sync_user_content(&self, address: &str) -> u64 {
         let hook = self.content_syncer.read().await.clone();
         let Some(hook) = hook else { return 0 };
-        let bytes = hook.sync_user_content(address).await;
+        let (bytes, files) = hook.sync_user_content(address).await;
         if bytes > 0 {
             self.rebuild_xite_db(address).await;
             self.log("INFO", format!("Synced user content for {address} ({bytes} bytes)")).await;
-            self.push_site_info(address).await;
+            // file_done per arrived file (EpixNet fires these as files land):
+            // open pages re-query their db on it - EpixSites' list, EpixTalk's
+            // topics. Must come after the rebuild so the query finds the rows.
+            if files.is_empty() {
+                self.push_site_info(address).await;
+            } else {
+                for f in &files {
+                    self.push_site_info_file_done(address, f).await;
+                }
+            }
         }
         bytes
     }

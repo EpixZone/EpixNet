@@ -382,6 +382,10 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalLimitStats),
         Arc::new(OptionalLimitSet),
         Arc::new(DbQuery),
+        // xID identity resolution (the XidResolver plugin's WS API;
+        // xidResolveName is registered with the chain commands above).
+        Arc::new(XidResolve),
+        Arc::new(XidResolveBatch),
         // Dashboard polling / lists - benign empty values.
         Arc::new(ServerErrors),
         Arc::new(ConfigList),
@@ -909,6 +913,98 @@ impl WsCommand for DbQuery {
         };
         let rows = s.state.db_query(address, query, &params).await?;
         Ok(Value::Array(rows))
+    }
+}
+
+// ---- xID resolution --------------------------------------------------------
+
+/// The plugin's response shape: `{name, tld, owner, active, revoked_at,
+/// revoked_at_time, avatar, bio}`.
+fn xid_info_value(info: &epix_chain::xid_identity::XidInfo) -> Value {
+    json!({
+        "name": info.name,
+        "tld": info.tld,
+        "owner": info.owner,
+        "active": info.active,
+        "revoked_at": info.revoked_at,
+        "revoked_at_time": info.revoked_at_time,
+        "avatar": info.avatar,
+        "bio": info.bio,
+    })
+}
+
+/// First string out of `[value]` / `{key: value}` params (sites use both).
+fn xid_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
+    p.as_array()
+        .and_then(|a| a.first())
+        .or_else(|| p.get(key))
+        .and_then(|v| v.as_str())
+}
+
+/// `xidResolve(address)` - reverse-resolve a linked identity address to its
+/// xID name (chain-verified, cached). When the queried address is the user's
+/// own auth address for this site and it isn't linked, the user's other
+/// addresses (master + per-site auths) are tried too, matching EpixNet.
+struct XidResolve;
+#[async_trait]
+impl WsCommand for XidResolve {
+    fn name(&self) -> &'static str {
+        "xidResolve"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = xid_param(p, "address").ok_or("xidResolve: address required")?;
+        if let Some(info) = epix_chain::xid_identity::resolve_identity(address).await {
+            return Ok(xid_info_value(&info));
+        }
+        let own = s
+            .state
+            .user_auth_address(s.address()?)
+            .await
+            .map(|a| a == address)
+            .unwrap_or(false);
+        if own {
+            for other in s.state.user_all_addresses().await {
+                if other == address {
+                    continue;
+                }
+                if let Some(info) = epix_chain::xid_identity::resolve_identity(&other).await {
+                    return Ok(xid_info_value(&info));
+                }
+            }
+        }
+        Ok(Value::Null)
+    }
+}
+
+/// `xidResolveBatch(addresses)` - resolve up to 50 addresses / dotted names
+/// in one call; returns `{key: result-or-null}`.
+struct XidResolveBatch;
+#[async_trait]
+impl WsCommand for XidResolveBatch {
+    fn name(&self) -> &'static str {
+        "xidResolveBatch"
+    }
+    async fn handle(&self, _s: &WsSession, p: &Value) -> Result<Value, String> {
+        let list = p
+            .as_array()
+            .and_then(|a| a.first())
+            .or_else(|| p.get("addresses"))
+            .and_then(|v| v.as_array())
+            .ok_or("xidResolveBatch: addresses must be a list")?;
+        let mut out = serde_json::Map::new();
+        for v in list.iter().take(50) {
+            let Some(key) = v.as_str() else { continue };
+            let resolved = if key.contains('.') {
+                epix_chain::xid_identity::resolve_name(key).await
+            } else {
+                epix_chain::xid_identity::resolve_identity(key).await
+            };
+            out.insert(
+                key.to_string(),
+                resolved.map(|i| xid_info_value(&i)).unwrap_or(Value::Null),
+            );
+        }
+        Ok(Value::Object(out))
     }
 }
 

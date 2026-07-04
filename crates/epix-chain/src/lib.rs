@@ -120,3 +120,135 @@ pub mod xid_signers {
         signers
     }
 }
+
+/// Cached xID identity lookups, mirroring EpixNet's XidResolver plugin
+/// (`resolve_identity_xid` / `_resolve_xid_name_profile`): reverse-resolve a
+/// linked identity address to its xID name, or forward-resolve a `name.tld`
+/// to its profile. The reverse endpoint only NAMES the domain; the answer is
+/// then confirmed through the Merkle-verified forward resolve, so a rogue RPC
+/// can't attach an address to someone else's name. Negative answers cache
+/// briefly (transient failures don't cache at all), positives cache long -
+/// this is what stops sites from hammering the chain once per render.
+pub mod xid_identity {
+    use super::{XidResolver, DEFAULT_RPC_URL};
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    use std::time::{Duration, Instant};
+
+    /// Positive results are near-permanent on-chain; revocation is carried in
+    /// the record itself.
+    const POSITIVE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+    /// Negatives are usually "not linked (yet)" - recover fast.
+    const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+
+    /// A resolved xID identity, the shape EpixNet's plugin returns.
+    #[derive(Clone, Debug)]
+    pub struct XidInfo {
+        pub name: String,
+        pub tld: String,
+        pub owner: String,
+        pub active: bool,
+        pub revoked_at: u64,
+        pub revoked_at_time: u64,
+        pub avatar: String,
+        pub bio: String,
+    }
+
+    static CACHE: RwLock<Option<HashMap<String, (Option<XidInfo>, Instant)>>> =
+        RwLock::new(None);
+
+    fn cached(key: &str) -> Option<Option<XidInfo>> {
+        let guard = CACHE.read().ok()?;
+        let (info, at) = guard.as_ref()?.get(key)?;
+        let ttl = if info.is_some() { POSITIVE_TTL } else { NEGATIVE_TTL };
+        (at.elapsed() < ttl).then(|| info.clone())
+    }
+
+    fn store(key: String, info: Option<XidInfo>) {
+        if let Ok(mut guard) = CACHE.write() {
+            guard
+                .get_or_insert_with(HashMap::new)
+                .insert(key, (info, Instant::now()));
+        }
+    }
+
+    /// Reverse-resolve a linked identity address to its xID, or `None` if the
+    /// address isn't linked to any name.
+    pub async fn resolve_identity(address: &str) -> Option<XidInfo> {
+        if let Some(hit) = cached(address) {
+            return hit;
+        }
+        // Step 1: unverified reverse lookup - names the candidate domain.
+        let client = super::http_client(Duration::from_secs(15));
+        let url = format!("{DEFAULT_RPC_URL}/xid/v1/reverse_identity/{address}");
+        // Transient fetch errors return without caching so the next call retries.
+        let data: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        let record = match data.get("name_record").filter(|r| !r.is_null()) {
+            Some(r) => r,
+            None => {
+                store(address.to_string(), None);
+                return None;
+            }
+        };
+        let name = record.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let tld = record.get("tld").and_then(|v| v.as_str()).unwrap_or("");
+        if name.is_empty() || tld.is_empty() {
+            store(address.to_string(), None);
+            return None;
+        }
+        // Step 2: confirm through the Merkle-verified forward resolve.
+        let resolver = XidResolver::new(DEFAULT_RPC_URL);
+        let domain = resolver.resolve(name, tld).await.ok()?;
+        let Some(ident) = domain.identities.iter().find(|i| i.address == address) else {
+            // Verified domain doesn't actually contain this identity.
+            store(address.to_string(), None);
+            return None;
+        };
+        let info = XidInfo {
+            name: domain.name.clone(),
+            tld: domain.tld.clone(),
+            owner: domain.owner.clone(),
+            active: ident.active,
+            revoked_at: ident.revoked_at,
+            revoked_at_time: ident.revoked_at_time,
+            avatar: domain.avatar.clone(),
+            bio: domain.bio.clone(),
+        };
+        store(address.to_string(), Some(info.clone()));
+        store(domain.fqdn(), Some(info.clone()));
+        Some(info)
+    }
+
+    /// Forward-resolve `name.tld` to its profile, or `None` if unregistered.
+    pub async fn resolve_name(fqdn: &str) -> Option<XidInfo> {
+        let (name, tld) = fqdn.rsplit_once('.')?;
+        if name.is_empty() || tld.is_empty() {
+            return None;
+        }
+        if let Some(hit) = cached(fqdn) {
+            return hit;
+        }
+        let resolver = XidResolver::new(DEFAULT_RPC_URL);
+        let domain = match resolver.resolve(name, tld).await {
+            Ok(d) => d,
+            Err(super::ChainError::NotFound(_)) => {
+                store(fqdn.to_string(), None);
+                return None;
+            }
+            // Transient failure - don't cache, let the next call retry.
+            Err(_) => return None,
+        };
+        let info = XidInfo {
+            name: domain.name.clone(),
+            tld: domain.tld.clone(),
+            owner: domain.owner.clone(),
+            active: true,
+            revoked_at: 0,
+            revoked_at_time: 0,
+            avatar: domain.avatar.clone(),
+            bio: domain.bio.clone(),
+        };
+        store(fqdn.to_string(), Some(info.clone()));
+        Some(info)
+    }
+}
