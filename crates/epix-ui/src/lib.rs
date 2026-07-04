@@ -355,11 +355,21 @@ async fn serve_wrapper(
     // the WS session) by the address.
     let mut address = ctx.state.canonical_key(&requested).await;
     let mut loading = false;
-    if !ctx.state.has_xite(&address).await {
+    let ready = |state: &Arc<AppState>, addr: String| {
+        let state = state.clone();
+        async move {
+            state.has_xite(&addr).await
+                && state.content(&addr).await.is_some()
+                && state.xite_file_exists(&addr, "index.html").await
+        }
+    };
+    if !ready(&ctx.state, address.clone()).await {
         // On-demand: resolve + clone in the background and serve the wrapper
         // with the loading screen immediately (EpixNet's flow: the wrapper's
-        // inner file request blocks until the download lands). Works for both
-        // `.epix` names and raw addresses, in path and proxy mode alike.
+        // inner file request blocks per file until it lands). The entry
+        // registers (empty) as soon as the clone starts, so "loading" means
+        // not-ready, not not-registered. Works for `.epix` names and raw
+        // addresses, in path and proxy mode alike.
         if !plausible_xite_ref(&requested) || !ctx.state.has_on_demand().await {
             return (StatusCode::NOT_FOUND, "unknown xite").into_response();
         }
@@ -392,7 +402,7 @@ async fn serve_wrapper(
                     .into_response();
             }
         }
-        loading = !ctx.state.has_xite(&address).await;
+        loading = !ready(&ctx.state, address.clone()).await;
     }
     // Trust this Host as a WebSocket origin (the wrapper's own page will open
     // the WS from it).
@@ -940,11 +950,12 @@ async fn serve_file(
     // Progressive serve during an on-demand clone (EpixNet's `needFile`, per
     // file): kick the clone off (coalesced with any already running) and serve
     // each file the moment its verified bytes hit disk - the page renders
-    // seconds into a big clone because index.html/css/js download first.
-    if !ctx.state.has_xite(&address).await
-        && plausible_xite_ref(&requested)
-        && ctx.state.has_on_demand().await
-    {
+    // seconds into a big clone because index.html/css/js download first. The
+    // entry registers (empty) at clone start, so a registered entry whose
+    // requested file is missing gets the same wait-for-disk treatment.
+    let still_loading = !ctx.state.has_xite(&address).await
+        || !ctx.state.xite_file_exists(&address, &path).await;
+    if still_loading && plausible_xite_ref(&requested) && ctx.state.has_on_demand().await {
         {
             let state = ctx.state.clone();
             let target = requested.clone();
@@ -956,8 +967,8 @@ async fn serve_file(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             let key = ctx.state.canonical_key(&requested).await;
-            if ctx.state.has_xite(&key).await {
-                address = key; // registered - serve through the normal path
+            if ctx.state.has_xite(&key).await && ctx.state.xite_file_exists(&key, &path).await {
+                address = key; // the file is on disk - serve the normal path
                 break;
             }
             // Once the name resolved (or was an address all along), the clone

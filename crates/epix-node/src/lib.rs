@@ -350,6 +350,9 @@ async fn clone_xite_with_progress(
                                 );
                             }
                             let _ = sync_tx.send(peer.clone());
+                            if let Some(state) = progress {
+                                state.add_peers(address, [peer.clone()]).await;
+                            }
                             spawn_pex(peer.clone(), pex_tx.clone());
                             if fetchers.len() < 4 {
                                 fetchers.spawn(fetch_content(
@@ -390,6 +393,11 @@ async fn clone_xite_with_progress(
             return Err("could not fetch + verify content.json from any peer".into());
         }
         if let Some(state) = progress {
+            // The entry is registered (empty) during the clone: give it the
+            // verified content right away so siteInfo/files are real.
+            state.update_content(address, xite.content.clone()).await;
+        }
+        if let Some(state) = progress {
             let total = xite.files_needed().len();
             let counts = serde_json::json!({
                 "peers": peer_count,
@@ -419,6 +427,7 @@ async fn clone_xite_with_progress(
             while let Some(peer) = rx.recv().await {
                 count += 1;
                 if let Some(state) = &state {
+                    state.add_peers(&address, [peer.clone()]).await;
                     state.push_clone_event(
                         &address,
                         serde_json::json!(["peers_added", count]),
@@ -560,6 +569,19 @@ impl OnDemand {
         let data_dir = self.data_root.join(&address);
         // If we already serve the raw address, just alias the name to it.
         if !self.state.has_xite(&address).await {
+            // Register the xite empty BEFORE the download (EpixNet's
+            // SiteManager.need): siteInfo/dbQuery/permissions are real for the
+            // page the moment it renders progressively, peers accumulate on
+            // the live entry, and the dashboard shows the row mid-clone.
+            self.state
+                .add_xite(
+                    &address,
+                    XiteEntry { storage: XiteStorage::new(&data_dir), content: None },
+                )
+                .await;
+            if host != address {
+                self.state.set_display(&address, host).await;
+            }
             let cloned = clone_xite_with_progress(
                 &address,
                 &data_dir,
@@ -571,23 +593,21 @@ impl OnDemand {
             let (content, bytes) = match cloned {
                 Ok(r) => r,
                 Err(e) => {
-                    // Tell the loading screen: "index.html download failed",
-                    // and "No peers found" when peers stayed at 0.
+                    // Tell the loading screen ("index.html download failed",
+                    // "No peers found" when none), and unregister the failed
+                    // clone so a revisit starts fresh.
                     self.state.push_clone_event(
                         &address,
                         serde_json::json!(["file_failed", "index.html"]),
                         serde_json::json!({}),
                     );
+                    self.state.remove_xite(&address).await;
                     return Err(e);
                 }
             };
-            self.state
-                .add_xite(
-                    &address,
-                    XiteEntry { storage: XiteStorage::new(&data_dir), content: content.clone() },
-                )
-                .await;
+            self.state.update_content(&address, content.clone()).await;
             self.state.add_transfer(&address, bytes, 0).await;
+            self.state.push_site_info(&address).await;
             // Hide the loading screen: the wrapper closes on the file_done of
             // its own index.html.
             self.state.push_clone_event(
