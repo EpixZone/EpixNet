@@ -440,6 +440,14 @@ async fn serve_wrapper(
         .and_then(|t| t.as_str())
         .unwrap_or(&requested)
         .to_string();
+    // A xite's content.json can opt into strict postMessage nonce checks
+    // (EpixNet honors this flag; the wrapper then requires the wrapper_nonce
+    // on every inner message instead of running the opener test).
+    let nonce_security = content
+        .as_ref()
+        .and_then(|c| c.get("postmessage_nonce_security"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     // A one-time wrapper nonce (released on the inner file request) and a random
     // CSP script nonce for the wrapper's own inline scripts.
     let nonce = ctx.state.issue_wrapper_nonce();
@@ -493,7 +501,7 @@ async fn serve_wrapper(
         ("wrapper_nonce", nonce),
         ("wrapper_key", address.clone()),
         ("ajax_key", address.clone()),
-        ("postmessage_nonce_security", "false".into()),
+        ("postmessage_nonce_security", nonce_security.to_string()),
         ("permissions", json!(permissions).to_string()),
         ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
         ("sandbox_permissions", String::new()),
@@ -1051,6 +1059,7 @@ async fn serve_file(
             if let Some(k) = disk_key {
                 match ctx.state.loading_file(&k, &path) {
                     crate::state::LoadingFile::Ready(bytes) => {
+                        let bytes = substitute_html_vars(&ctx.state, &k, &ct, bytes).await;
                         return (file_headers(&ct, StatusCode::OK), bytes).into_response();
                     }
                     crate::state::LoadingFile::NotInSite => {
@@ -1088,9 +1097,43 @@ async fn serve_file(
         }
     }
     match ctx.state.read_file(&address, &path).await {
-        Some(bytes) => (file_headers(&ct, StatusCode::OK), bytes).into_response(),
+        Some(bytes) => {
+            let bytes = substitute_html_vars(&ctx.state, &address, &ct, bytes).await;
+            (file_headers(&ct, StatusCode::OK), bytes).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+/// EpixNet substitutes wrapper variables in served .html files
+/// (`replaceHtmlVariables` + Translate): `{themeclass}` (the user's theme),
+/// `{site_modified}` (content.json's modified time) and the `lang={lang}`
+/// cache-buster. Xites key their styling off `body.theme-…`, so serving the
+/// raw placeholder leaves them unstyled.
+async fn substitute_html_vars(
+    state: &Arc<AppState>,
+    address: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Vec<u8> {
+    if !content_type.starts_with("text/html") {
+        return bytes;
+    }
+    let mut text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(e) => return e.into_bytes(),
+    };
+    text = text.replace("{themeclass}", "theme-light");
+    text = text.replace("lang={lang}", "lang=en");
+    if text.contains("{site_modified}") {
+        let modified = state
+            .content(address)
+            .await
+            .and_then(|c| c.get("modified").and_then(|m| m.as_f64()))
+            .unwrap_or(0.0) as i64;
+        text = text.replace("{site_modified}", &modified.to_string());
+    }
+    text.into_bytes()
 }
 
 #[derive(Deserialize)]
