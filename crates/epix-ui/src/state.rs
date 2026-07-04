@@ -2968,6 +2968,8 @@ impl AppState {
             "bad_files": 0,
             "size_limit": 10,
             "settings": { "size": 0 },
+            // Always an object - dashboard rows read `content.title` unchecked.
+            "content": {},
             "event": event,
         });
         if let (Value::Object(p), Value::Object(f)) = (&mut params, fields) {
@@ -4208,7 +4210,11 @@ impl AppState {
         let short = if address.len() > 6 { &address[..6] } else { address };
         let size_limit = settings.size_limit(DEFAULT_SIZE_LIMIT_MB);
         let next_size_limit = next_size_limit(settings.size);
-        let content = entry.content.as_ref().map(summarize_content).unwrap_or(Value::Null);
+        // No verified content.json yet (registered mid-clone): an EMPTY object,
+        // not null - EpixNet's formatSiteInfo sends {} too, and dashboard site
+        // rows read `content.title` without a null check, so null kills the
+        // whole site list render.
+        let content = entry.content.as_ref().map(summarize_content).unwrap_or_else(|| json!({}));
 
         // peers = max(settings, known) + self (we serve it), matching formatSiteInfo.
         let known_peers = entry.peers.len() as i64;

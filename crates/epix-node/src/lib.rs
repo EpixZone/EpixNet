@@ -339,10 +339,19 @@ async fn clone_xite_with_progress(
                 break;
             }
             tokio::select! {
-                maybe = rx.recv(), if channel_open => {
+                maybe = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    rx.recv(),
+                ), if channel_open => {
                     match maybe {
-                        None => channel_open = false,
-                        Some(peer) => {
+                        // 60s with no newly discovered peer and still no
+                        // content.json: stop waiting on discovery. A hung
+                        // tracker/DHT task would otherwise keep this loop -
+                        // and the registered-but-empty xite entry - alive
+                        // forever. In-flight fetchers still drain (bounded).
+                        Err(_) => channel_open = false,
+                        Ok(None) => channel_open = false,
+                        Ok(Some(peer)) => {
                             peer_count += 1;
                             if let Some(state) = progress {
                                 state.push_clone_event(
