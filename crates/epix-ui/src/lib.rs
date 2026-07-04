@@ -18,7 +18,7 @@ pub mod state;
 pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
-pub use state::{AppState, OnDemandResolver, PeerFinder, XiteEntry};
+pub use state::{AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry};
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
