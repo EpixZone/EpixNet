@@ -3125,7 +3125,7 @@ mod tests {
         storage
             .write(
                 "dbschema.json",
-                br#"{ "db_name":"Blog","db_file":"db/db.db","version":2,
+                br#"{ "db_name":"Blog","db_file":"db.db","version":2,
                      "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
                      "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["date_added","INTEGER"],["json_id","INTEGER"]] } } }"#,
             )
