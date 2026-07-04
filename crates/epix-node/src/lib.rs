@@ -200,6 +200,12 @@ async fn clone_xite(
 /// `file_done` for content.json with the pending-file counts) to `progress`
 /// as the clone advances - the on-demand path, where a browser is watching
 /// the loading screen.
+///
+/// Discovery and download run concurrently: every tracker announce and the
+/// DHT lookup stream discovered peers into a channel, content.json is raced
+/// against the first peers to respond, and the file download starts the
+/// moment content.json verifies - while discovery keeps feeding fresh peers
+/// (and replacement workers) into the running download.
 async fn clone_xite_with_progress(
     address: &str,
     data_dir: &std::path::Path,
@@ -217,56 +223,130 @@ async fn clone_xite_with_progress(
     if complete {
         return Ok((xite.content.clone(), 0));
     }
-
-    // With a loading screen watching, announce through the state so the
-    // per-tracker stats record + push live (the screen's tracker status line)
-    // and the screen shows the search stage; the boot path stays direct.
-    let mut peers = match progress {
-        Some(state) => {
-            state.push_clone_event(address, serde_json::Value::Null, serde_json::json!({}));
-            state.announce_to_trackers(address, trackers).await
-        }
-        None => epix_xite::announce(transport.as_ref(), address, trackers, 0).await,
-    };
-    // Trackers came up short: ask the DHT (tracker-independent - any peer that
-    // serves the site can answer). Only wired on the on-demand path; at boot
-    // the runtime (which owns the DHT) isn't running yet.
-    if peers.is_empty() {
-        if let Some(state) = progress {
-            peers = state.find_peers_dht(address).await;
-        }
+    if let Some(state) = progress {
+        // "Searching for peers..." on the loading screen.
+        state.push_clone_event(address, serde_json::Value::Null, serde_json::json!({}));
     }
-    if peers.is_empty() {
-        return Err("no peers found - is the network reachable?".into());
+
+    // Discovery: one task per tracker plus a DHT lookup, all feeding a shared
+    // channel as peers turn up (deduplicated at the source). The channel
+    // closes when every discovery task is done.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PeerAddr>();
+    let found = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<String>::new()));
+    for tracker in trackers.iter().cloned() {
+        let tx = tx.clone();
+        let found = found.clone();
+        let address = address.to_string();
+        let transport = transport.clone();
+        let state = progress.cloned();
+        tokio::spawn(async move {
+            let peers = match &state {
+                // Through the state so per-tracker stats record + push live
+                // (the loading screen's tracker line).
+                Some(s) => s.announce_to_trackers(&address, std::slice::from_ref(&tracker)).await,
+                None => {
+                    epix_xite::announce(
+                        transport.as_ref(),
+                        &address,
+                        std::slice::from_ref(&tracker),
+                        0,
+                    )
+                    .await
+                }
+            };
+            for p in peers {
+                if found.lock().unwrap().insert(p.to_string()) {
+                    let _ = tx.send(p);
+                }
+            }
+        });
     }
     if let Some(state) = progress {
-        state.push_clone_event(
-            address,
-            serde_json::json!(["peers_added", peers.len()]),
-            serde_json::json!({ "peers": peers.len() }),
-        );
+        // The DHT joins the search from the start (tracker-independent).
+        let tx = tx.clone();
+        let found = found.clone();
+        let address = address.to_string();
+        let state = state.clone();
+        tokio::spawn(async move {
+            for p in state.find_peers_dht(&address).await {
+                if found.lock().unwrap().insert(p.to_string()) {
+                    let _ = tx.send(p);
+                }
+            }
+        });
     }
+    drop(tx);
+
+    // Phase 1: race the first peers for a verified content.json (unless it is
+    // already on disk). Every discovered peer is also forwarded to the
+    // download channel, so the file sync starts with them buffered.
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<PeerAddr>();
+    let mut peer_count = 0usize;
     if xite.content.is_none() {
-        let mut ok = false;
-        for peer in &peers {
-            if let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await {
-                if conn.handshake().await.is_ok() {
-                    if let Ok(b) = conn.get_file(address, "content.json").await {
-                        if xite.set_content(&b).is_ok() {
-                            ok = true;
-                            break;
+        let mut fetchers: tokio::task::JoinSet<Option<Vec<u8>>> = tokio::task::JoinSet::new();
+        let mut untried: std::collections::VecDeque<PeerAddr> = std::collections::VecDeque::new();
+        let mut channel_open = true;
+        let mut got_content = false;
+        while !got_content {
+            if !channel_open && fetchers.is_empty() && untried.is_empty() {
+                break;
+            }
+            tokio::select! {
+                maybe = rx.recv(), if channel_open => {
+                    match maybe {
+                        None => channel_open = false,
+                        Some(peer) => {
+                            peer_count += 1;
+                            if let Some(state) = progress {
+                                state.push_clone_event(
+                                    address,
+                                    serde_json::json!(["peers_added", peer_count]),
+                                    serde_json::json!({ "peers": peer_count }),
+                                );
+                            }
+                            let _ = sync_tx.send(peer.clone());
+                            if fetchers.len() < 4 {
+                                fetchers.spawn(fetch_content(
+                                    transport.clone(),
+                                    peer,
+                                    address.to_string(),
+                                ));
+                            } else {
+                                untried.push_back(peer);
+                            }
                         }
                     }
                 }
+                Some(result) = fetchers.join_next(), if !fetchers.is_empty() => {
+                    if let Ok(Some(bytes)) = result {
+                        if xite.set_content(&bytes).is_ok() {
+                            got_content = true;
+                        }
+                    }
+                    if !got_content {
+                        if let Some(peer) = untried.pop_front() {
+                            fetchers.spawn(fetch_content(
+                                transport.clone(),
+                                peer,
+                                address.to_string(),
+                            ));
+                        }
+                    }
+                }
+                else => break,
             }
         }
-        if !ok {
+        fetchers.abort_all();
+        if !got_content {
+            if peer_count == 0 {
+                return Err("no peers found - is the network reachable?".into());
+            }
             return Err("could not fetch + verify content.json from any peer".into());
         }
         if let Some(state) = progress {
             let total = xite.files_needed().len();
             let counts = serde_json::json!({
-                "peers": peers.len(),
+                "peers": peer_count,
                 "bad_files": total,
                 "tasks": total,
                 "started_task_num": total,
@@ -280,12 +360,35 @@ async fn clone_xite_with_progress(
             state.push_clone_event(address, serde_json::json!(["file_added", total]), counts);
         }
     }
+    // Keep forwarding late-discovered peers into the running download; the
+    // sync channel closes when discovery finishes.
+    {
+        let sync_tx = sync_tx.clone();
+        let state = progress.cloned();
+        let address = address.to_string();
+        let mut count = peer_count;
+        tokio::spawn(async move {
+            while let Some(peer) = rx.recv().await {
+                count += 1;
+                if let Some(state) = &state {
+                    state.push_clone_event(
+                        &address,
+                        serde_json::json!(["peers_added", count]),
+                        serde_json::json!({ "peers": count }),
+                    );
+                }
+                let _ = sync_tx.send(peer);
+            }
+        });
+    }
+    drop(sync_tx);
+
     // Per-file progress: each finished file prints its line on the loading
     // screen and advances the progress bar (tasks/started_task_num).
     let on_file = progress.map(|state| {
         let state = state.clone();
         let addr = address.to_string();
-        let peers_n = peers.len();
+        let peers_n = peer_count.max(1);
         Arc::new(move |inner: &str, done: usize, total: usize| {
             // The wrapper closes the loading screen on index.html's file_done,
             // but the page itself only serves once the whole clone lands - so
@@ -308,11 +411,27 @@ async fn clone_xite_with_progress(
     });
     let mut bytes_recv = 0;
     if let Ok(report) =
-        epix_worker::sync_files_with_progress(&xite, &peers, transport.clone(), 8, on_file).await
+        epix_worker::sync_files_streaming(&xite, sync_rx, transport.clone(), 8, on_file).await
     {
         bytes_recv = report.bytes;
     }
     Ok((xite.content.clone(), bytes_recv))
+}
+
+/// One bounded attempt to pull content.json from a peer (phase 1 of a clone).
+async fn fetch_content(
+    transport: Arc<dyn Transport>,
+    peer: PeerAddr,
+    address: String,
+) -> Option<Vec<u8>> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
+        conn.handshake().await.ok()?;
+        conn.get_file(&address, "content.json").await.ok()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The on-demand resolver the browser proxy path uses: given a `.epix` host not

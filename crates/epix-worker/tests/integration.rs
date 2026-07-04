@@ -169,3 +169,51 @@ async fn live_clone_dashboard_from_network() {
     assert!(report.failed.is_empty(), "failed: {:?}", report.failed);
     assert!(xite.files_needed().is_empty(), "entire xite cloned + verified");
 }
+
+#[tokio::test]
+async fn streaming_sync_starts_before_discovery_finishes() {
+    // Two peers: one holds file a, the other file b. The second peer arrives
+    // AFTER the download started - the streaming sync must pick it up and
+    // finish, proving discovery and download overlap.
+    let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+    let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+    let a = b"streaming file a".to_vec();
+    let b = b"streaming file b".to_vec();
+    let mut content = json!({
+        "address": address,
+        "files": {
+            "a.txt": { "sha512": XiteStorage::hash_bytes(&a), "size": a.len() },
+            "b.txt": { "sha512": XiteStorage::hash_bytes(&b), "size": b.len() },
+        },
+    });
+    epix_content::sign(&mut content, priv_hex).unwrap();
+
+    // Peer 1 has only a.txt; peer 2 has only b.txt.
+    let peer1 = spawn_mock_peer(HashMap::from([("a.txt".to_string(), a.clone())])).await;
+    let peer2 = spawn_mock_peer(HashMap::from([("b.txt".to_string(), b.clone())])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut xite = Xite::new(
+        Address::parse(address.clone()).unwrap(),
+        XiteStorage::new(dir.path()),
+    );
+    xite.set_content(content.to_string().as_bytes()).unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tx.send(PeerAddr::Ip(peer1)).unwrap();
+    // Deliver the second peer late, while the sync is already running.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tx.send(PeerAddr::Ip(peer2)).unwrap();
+        // tx drops here -> discovery "finishes" -> channel closes
+    });
+
+    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+    let report = epix_worker::sync_files_streaming(&xite, rx, transport, 4, None)
+        .await
+        .unwrap();
+    assert_eq!(report.downloaded, 2, "failed: {:?}", report.failed);
+    assert!(report.failed.is_empty());
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), a);
+    assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), b);
+}

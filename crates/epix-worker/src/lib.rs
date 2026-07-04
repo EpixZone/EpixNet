@@ -41,6 +41,119 @@ pub async fn sync_files(
     sync_files_with_progress(xite, peers, transport, max_workers, None).await
 }
 
+/// Shared state for one sync pass, cloned into each worker.
+#[derive(Clone)]
+struct SyncCtx {
+    queue: Arc<Mutex<VecDeque<(FileEntry, u8)>>>,
+    report: Arc<Mutex<SyncReport>>,
+    address: Arc<String>,
+    root: Arc<std::path::PathBuf>,
+    transport: Arc<dyn Transport>,
+    on_file: Option<FileProgress>,
+    done: Arc<std::sync::atomic::AtomicUsize>,
+    total: usize,
+}
+
+impl SyncCtx {
+    fn new(
+        needed: Vec<FileEntry>,
+        xite: &Xite,
+        transport: Arc<dyn Transport>,
+        on_file: Option<FileProgress>,
+    ) -> Self {
+        let total = needed.len();
+        Self {
+            queue: Arc::new(Mutex::new(needed.into_iter().map(|f| (f, 0u8)).collect())),
+            report: Arc::new(Mutex::new(SyncReport::default())),
+            address: Arc::new(xite.address.as_str().to_string()),
+            root: Arc::new(xite.storage.root().to_path_buf()),
+            transport,
+            on_file,
+            done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            total,
+        }
+    }
+
+    /// Drain into the final report (leftover queue items count as failed).
+    async fn finish(self) -> SyncReport {
+        let leftover: Vec<String> =
+            self.queue.lock().await.drain(..).map(|(f, _)| f.inner_path).collect();
+        let mut report = Arc::try_unwrap(self.report)
+            .map(|m| m.into_inner())
+            .unwrap_or_default();
+        report.failed.extend(leftover);
+        report
+    }
+}
+
+/// One worker: connect to `peer` and pull files from the shared queue until
+/// it drains or the peer stops cooperating.
+async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
+    let storage = XiteStorage::new((*ctx.root).clone());
+    let mut conn = match connect(ctx.transport.as_ref(), &peer).await {
+        Some(c) => c,
+        None => {
+            // Couldn't use this peer - leave the queue for other workers.
+            return;
+        }
+    };
+    // Files this peer already failed to deliver: one shot per file per peer,
+    // so a peer missing a file can't burn the global retry budget by itself -
+    // the file goes back in the queue for a different peer.
+    let mut refused: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let next = {
+            let mut q = ctx.queue.lock().await;
+            let mut next = None;
+            for _ in 0..q.len() {
+                if let Some((f, a)) = q.pop_front() {
+                    if refused.contains(&f.inner_path) {
+                        q.push_back((f, a));
+                    } else {
+                        next = Some((f, a));
+                        break;
+                    }
+                }
+            }
+            next
+        };
+        let Some((file, attempts)) = next else { break };
+
+        let fetched = tokio::time::timeout(
+            FILE_TIMEOUT,
+            conn.get_file(&ctx.address, &file.inner_path),
+        )
+        .await
+        .unwrap_or_else(|_| Err(epix_core::Error::Protocol("file transfer timed out".into())));
+        match fetched {
+            Ok(bytes) if XiteStorage::hash_bytes(&bytes) == file.sha512 => {
+                if storage.write(&file.inner_path, &bytes).is_ok() {
+                    {
+                        let mut r = ctx.report.lock().await;
+                        r.downloaded += 1;
+                        r.bytes += bytes.len() as u64;
+                    }
+                    if let Some(cb) = &ctx.on_file {
+                        let n = ctx.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        cb(&file.inner_path, n, ctx.total);
+                    }
+                } else {
+                    requeue_or_fail(&ctx.queue, &ctx.report, file, attempts).await;
+                }
+            }
+            _ => {
+                refused.insert(file.inner_path.clone());
+                requeue_or_fail(&ctx.queue, &ctx.report, file, attempts).await;
+                // The connection may be unhealthy; reconnect for the next item.
+                match connect(ctx.transport.as_ref(), &peer).await {
+                    Some(c) => conn = c,
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
 /// [`sync_files`], reporting each finished file to `on_file` - the on-demand
 /// clone path, where a loading screen is watching.
 pub async fn sync_files_with_progress(
@@ -56,94 +169,81 @@ pub async fn sync_files_with_progress(
         report.failed = needed.into_iter().map(|f| f.inner_path).collect();
         return Ok(report);
     }
-
-    let total = needed.len();
-    let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let queue: Arc<Mutex<VecDeque<(FileEntry, u8)>>> =
-        Arc::new(Mutex::new(needed.into_iter().map(|f| (f, 0u8)).collect()));
-    let report = Arc::new(Mutex::new(SyncReport::default()));
-    let address = Arc::new(xite.address.as_str().to_string());
-    let root = Arc::new(xite.storage.root().to_path_buf());
-
+    let ctx = SyncCtx::new(needed, xite, transport, on_file);
     let worker_count = peers.len().min(max_workers.max(1));
     let mut handles = Vec::new();
     for i in 0..worker_count {
-        let peer = peers[i % peers.len()].clone();
-        let queue = queue.clone();
-        let report = report.clone();
-        let address = address.clone();
-        let storage = XiteStorage::new((*root).clone());
-        let transport = transport.clone();
-        let on_file = on_file.clone();
-        let done = done.clone();
+        handles.push(tokio::spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone())));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(ctx.finish().await)
+}
 
-        handles.push(tokio::spawn(async move {
-            let mut conn = match connect(transport.as_ref(), &peer).await {
-                Some(c) => c,
-                None => {
-                    // Couldn't use this peer - leave the queue for other workers.
-                    return;
-                }
-            };
-            loop {
-                let next = { queue.lock().await.pop_front() };
-                let Some((file, attempts)) = next else { break };
+/// Streaming sync: peers arrive over a channel while the download runs.
+/// A worker spawns the moment a peer is discovered (up to `max_workers`);
+/// extras are kept as spares and replace workers whose peer stops
+/// cooperating. Ends when every file is downloaded, or when the peer
+/// channel closes and no worker or spare can make progress.
+pub async fn sync_files_streaming(
+    xite: &Xite,
+    mut peers: tokio::sync::mpsc::UnboundedReceiver<PeerAddr>,
+    transport: Arc<dyn Transport>,
+    max_workers: usize,
+    on_file: Option<FileProgress>,
+) -> Result<SyncReport> {
+    let needed = xite.files_needed();
+    if needed.is_empty() {
+        return Ok(SyncReport::default());
+    }
+    let ctx = SyncCtx::new(needed, xite, transport, on_file);
+    let max_workers = max_workers.max(1);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut spares: VecDeque<PeerAddr> = VecDeque::new();
+    let mut join = tokio::task::JoinSet::new();
+    let mut channel_open = true;
 
-                let fetched = tokio::time::timeout(
-                    FILE_TIMEOUT,
-                    conn.get_file(&address, &file.inner_path),
-                )
-                .await
-                .unwrap_or_else(|_| Err(epix_core::Error::Protocol("file transfer timed out".into())));
-                match fetched {
-                    Ok(bytes) if XiteStorage::hash_bytes(&bytes) == file.sha512 => {
-                        if storage.write(&file.inner_path, &bytes).is_ok() {
-                            {
-                                let mut r = report.lock().await;
-                                r.downloaded += 1;
-                                r.bytes += bytes.len() as u64;
+    loop {
+        // No workers running: done, respawn from a spare, or (channel closed)
+        // give up on whatever is left.
+        if join.is_empty() {
+            if ctx.queue.lock().await.is_empty() {
+                break;
+            }
+            if let Some(peer) = spares.pop_front() {
+                join.spawn(run_worker(peer, ctx.clone()));
+            } else if !channel_open {
+                break;
+            }
+        }
+        tokio::select! {
+            maybe = peers.recv(), if channel_open => {
+                match maybe {
+                    None => channel_open = false,
+                    Some(peer) => {
+                        if seen.insert(peer.to_string()) {
+                            if join.len() < max_workers && !ctx.queue.lock().await.is_empty() {
+                                join.spawn(run_worker(peer, ctx.clone()));
+                            } else {
+                                spares.push_back(peer);
                             }
-                            if let Some(cb) = &on_file {
-                                let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                cb(&file.inner_path, n, total);
-                            }
-                        } else {
-                            requeue_or_fail(&queue, &report, file, attempts).await;
-                        }
-                    }
-                    _ => {
-                        requeue_or_fail(&queue, &report, file, attempts).await;
-                        // The connection may be unhealthy; reconnect for the next item.
-                        match connect(transport.as_ref(), &peer).await {
-                            Some(c) => conn = c,
-                            None => break,
                         }
                     }
                 }
             }
-        }));
+            Some(_) = join.join_next(), if !join.is_empty() => {
+                // A worker finished; the top of the loop decides what's next.
+            }
+            else => break,
+        }
     }
-
-    for h in handles {
-        let _ = h.await;
-    }
-    // Any items still queued (all workers gave up) count as failed.
-    let leftover: Vec<String> = queue
-        .lock()
-        .await
-        .drain(..)
-        .map(|(f, _)| f.inner_path)
-        .collect();
-    let mut report = Arc::try_unwrap(report)
-        .map(|m| m.into_inner())
-        .unwrap_or_default();
-    report.failed.extend(leftover);
-    Ok(report)
+    Ok(ctx.finish().await)
 }
 
 /// Dial + handshake bounded by a deadline: an unreachable peer must not hang
 /// its worker (the OS TCP timeout is ~75s) while the rest of the queue idles.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Per-file transfer deadline: a peer that stalls mid-transfer gets requeued.
 const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
