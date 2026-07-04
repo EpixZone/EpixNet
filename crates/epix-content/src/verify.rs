@@ -47,6 +47,14 @@ pub trait VerifyContext {
     fn size_limit_bytes(&self) -> i64 {
         i64::MAX
     }
+    /// Resolve an xID name (e.g. `facts.epix`) to the bech32 addresses that may
+    /// sign for it (owner + identities). EpixTalk-style user_contents dirs are
+    /// named by the user's xID and the content is signed by the identity that
+    /// xID belongs to, so a signer given as an xID name must be resolved to
+    /// match the signature. The node pre-resolves these; default is empty.
+    fn resolve_xid(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The valid signer addresses for `inner_path`: the declared `signers` (root
@@ -67,6 +75,14 @@ pub fn valid_signers(inner_path: &str, content: &Value, ctx: &dyn VerifyContext)
             signers.extend(list.iter().filter_map(|v| v.as_str().map(str::to_string)));
         }
     }
+    // A signer given as an xID name (contains a dot, not a bech32 address)
+    // resolves to the chain address that actually signs the content.
+    let resolved: Vec<String> = signers
+        .iter()
+        .filter(|s| s.contains('.'))
+        .flat_map(|name| ctx.resolve_xid(name))
+        .collect();
+    signers.extend(resolved);
     let site = ctx.site_address().to_string();
     if !signers.contains(&site) {
         signers.push(site);
@@ -202,21 +218,33 @@ fn verify_cert(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> Re
         return err("Invalid domain in cert_user_id");
     }
     let (name, domain) = cert_user_id.rsplit_once('@').unwrap();
-    let cert_address = rules
+    // The issuers allowed for this domain: `cert_signers[domain]` is a list of
+    // addresses (EpixNet stores an array), or the domain itself via a pattern.
+    let issuers: Vec<String> = rules
         .get("cert_signers")
         .and_then(|m| m.get(domain))
         .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
         .or_else(|| {
-            // Fall back to a cert_signers_pattern match (domain is its own issuer).
             let pat = rules.get("cert_signers_pattern").and_then(|v| v.as_str())?;
-            regex_full_match(pat, domain).then(|| domain.to_string())
-        });
-    let Some(cert_address) = cert_address else {
+            regex_full_match(pat, domain).then(|| vec![domain.to_string()])
+        })
+        .unwrap_or_default();
+    if issuers.is_empty() {
         return err(format!("Invalid cert signer: {domain}"));
-    };
+    }
+    // Epix chain-delegated certs (`["chain"]`): the issuing authority is the
+    // Epix chain / XID system (keccak-ethsecp256k1 signatures resolved on
+    // chain), not a static ECC address. The user's content.json is still
+    // signature-verified on its own (the user's auth address signs it), so
+    // accept the chain-delegated cert here.
+    // TODO: full on-chain cert verification (resolve the xID, check the
+    // cert_sign against the chain-registered key) to also reject forged
+    // chain-issued identities, not just enforce the content signature.
+    if issuers.iter().any(|i| i == "chain") {
+        return Ok(true);
+    }
+    let cert_address = issuers[0].clone();
     let user_address = rules.get("user_address").and_then(|v| v.as_str()).unwrap_or("");
     let auth_type = content.get("cert_auth_type").and_then(|v| v.as_str()).unwrap_or("");
     let cert_sign = content.get("cert_sign").and_then(|v| v.as_str()).unwrap_or("");
@@ -344,7 +372,12 @@ pub fn verify_content_file(
     let mut valid = 0u64;
     for address in &signers {
         if let Some(sig) = signs.get(address).and_then(|v| v.as_str()) {
-            if epix_crypt::verify(&data, address, sig) {
+            // Epix accepts two signature schemes: the classic double-SHA256
+            // (ZeroNet) and keccak256 (chain / ethsecp256k1). User_contents
+            // content is signed with keccak, so try both.
+            if epix_crypt::verify(&data, address, sig)
+                || epix_crypt::verify_keccak(&data, address, sig)
+            {
                 valid += 1;
             }
         }

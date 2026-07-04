@@ -472,7 +472,198 @@ async fn clone_xite_with_progress(
     {
         bytes_recv = report.bytes;
     }
+
+    // Recursive content: user_contents sites (EpixTalk, EpixPost, ...) keep their
+    // real data (topics, comments) in INCLUDED and per-user content.json files
+    // that the root's `files` map never lists. Fetch those content.json files
+    // and their data files so the site's db can populate.
+    let peers = state_peers(progress, &xite, address).await;
+    if !peers.is_empty() {
+        bytes_recv += sync_included_content(&xite, &peers, transport.clone(), progress, address).await;
+    }
     Ok((xite.content.clone(), bytes_recv))
+}
+
+/// The peer set to use for the included-content pass: the live registry when a
+/// state is present (accumulated during discovery), else empty.
+async fn state_peers(progress: Option<&Arc<AppState>>, _xite: &Xite, address: &str) -> Vec<PeerAddr> {
+    match progress {
+        Some(state) => state.connectable_peers(address, 20).await,
+        None => Vec::new(),
+    }
+}
+
+/// Download every included / per-user content.json (and the data files they
+/// declare) for a user_contents site, parent-first so each verifies against
+/// its parent's rules. Returns the bytes downloaded.
+async fn sync_included_content(
+    xite: &Xite,
+    peers: &[PeerAddr],
+    transport: Arc<dyn Transport>,
+    progress: Option<&Arc<AppState>>,
+    address: &str,
+) -> u64 {
+    use std::collections::HashSet;
+    // Enumerate content.json paths: the root's includes, plus everything a peer
+    // advertises via listModified (this is how per-user content.json files -
+    // never listed statically - are discovered).
+    let mut paths: HashSet<String> = xite.includes().into_iter().collect();
+    let from_includes = paths.len();
+    let mut from_peer = 0usize;
+    // Race listModified across the first several peers concurrently and take
+    // the first non-empty answer, so one slow/dead peer can't stall the pass.
+    let mut probes = tokio::task::JoinSet::new();
+    for peer in peers.iter().take(8).cloned() {
+        let transport = transport.clone();
+        let address = address.to_string();
+        probes.spawn(async move { fetch_list_modified(transport.as_ref(), &peer, &address).await });
+    }
+    while let Some(res) = probes.join_next().await {
+        if let Ok(Some(list)) = res {
+            if !list.is_empty() {
+                for p in list {
+                    if p.ends_with("content.json") && p != "content.json" && paths.insert(p) {
+                        from_peer += 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    probes.abort_all();
+    let _ = (from_includes, from_peer);
+    if paths.is_empty() {
+        return 0;
+    }
+    // Parent-first: shallower paths (data/users/content.json) before deeper
+    // ones (data/users/mud.epix/content.json), so each verifies against its parent.
+    let mut ordered: Vec<String> = paths.into_iter().collect();
+    ordered.sort_by_key(|p| p.matches('/').count());
+
+    let mut child_files: Vec<epix_xite::FileEntry> = Vec::new();
+    let mut queue: std::collections::VecDeque<String> = ordered.into();
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(path) = queue.pop_front() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        // Prefer the on-disk copy (a resync), else fetch it; add_content
+        // re-verifies either way before trusting it.
+        let bytes = match xite.storage().read(&path) {
+            Ok(b) => Some(b),
+            Err(_) => fetch_inner_file(transport.as_ref(), peers, address, &path).await,
+        };
+        let Some(bytes) = bytes else { continue };
+        let xid_map = resolve_user_signers(&path).await;
+        match xite.add_content(&path, &bytes, &xid_map) {
+            Ok(files) => {
+                child_files.extend(files);
+                // Recurse into nested includes this child declares.
+                for inc in xite.child_includes(&path) {
+                    if !seen.contains(&inc) {
+                        queue.push_back(inc);
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(state) = progress {
+                    state.log("WARNING", format!("Skipped {path}: {e}")).await;
+                }
+                continue;
+            }
+        }
+    }
+    // Download the declared data files that aren't already present.
+    let needed: Vec<_> = child_files
+        .into_iter()
+        .filter(|f| !xite.storage().verify(&f.inner_path, &f.sha512))
+        .collect();
+    if needed.is_empty() {
+        return 0;
+    }
+    if let Some(state) = progress {
+        state
+            .log("INFO", format!("Fetching {} user-content file(s) for {address}", needed.len()))
+            .await;
+    }
+    match epix_worker::sync_files_list(needed, xite, peers, transport, 8).await {
+        Ok(report) => report.bytes,
+        Err(_) => 0,
+    }
+}
+
+/// Resolve the xID user-directory name in `data/users/<name>/content.json` to
+/// the chain addresses that may sign that user's content: the domain owner and
+/// its active identities. EpixTalk stores each user's posts under their xID and
+/// signs with the identity that xID belongs to. Returns `{name -> address}`
+/// (the map allows several signers by mapping successive synthetic keys).
+async fn resolve_user_signers(
+    inner_path: &str,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    let parts: Vec<&str> = inner_path.split('/').collect();
+    if parts.len() < 3 || parts[0] != "data" || parts[1] != "users" {
+        return map;
+    }
+    let name = parts[2];
+    if !name.contains('.') {
+        return map;
+    }
+    let (label, tld) = name.rsplit_once('.').unwrap_or((name, "epix"));
+    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
+    if let Ok(domain) = resolver.resolve(label, tld).await {
+        // Any of the xID's owner or identity addresses may sign its content.
+        let mut addrs = vec![domain.owner.clone()];
+        addrs.extend(domain.identities.iter().map(|i| i.address.clone()));
+        map.insert(name.to_string(), addrs);
+    }
+    map
+}
+
+/// Ask a peer for its list of modified files (`listModified` since 0): the
+/// inner_paths of every content.json it serves, including per-user ones.
+async fn fetch_list_modified(
+    transport: &dyn Transport,
+    peer: &PeerAddr,
+    address: &str,
+) -> Option<Vec<String>> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut conn = Connection::connect(transport, peer).await.ok()?;
+        conn.handshake().await.ok()?;
+        let reply = conn.list_modified(address, 0.0).await.ok()?;
+        let map = epix_protocol::vget(&reply, "modified_files")?.as_map()?;
+        Some(
+            map.iter()
+                .filter_map(|(k, _)| k.as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Fetch one inner file from the first cooperative peer.
+async fn fetch_inner_file(
+    transport: &dyn Transport,
+    peers: &[PeerAddr],
+    address: &str,
+    inner_path: &str,
+) -> Option<Vec<u8>> {
+    for peer in peers {
+        let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut conn = Connection::connect(transport, peer).await.ok()?;
+            conn.handshake().await.ok()?;
+            conn.get_file(address, inner_path).await.ok()
+        })
+        .await
+        .ok()
+        .flatten();
+        if got.is_some() {
+            return got;
+        }
+    }
+    None
 }
 
 /// One bounded attempt to pull content.json from a peer (phase 1 of a clone).
@@ -607,6 +798,9 @@ impl OnDemand {
             };
             self.state.update_content(&address, content.clone()).await;
             self.state.add_transfer(&address, bytes, 0).await;
+            // Rebuild the db now that the included / per-user data files are on
+            // disk, so a user_contents site's topics/comments are queryable.
+            self.state.rebuild_xite_db(&address).await;
             self.state.push_site_info(&address).await;
             // Hide the loading screen: the wrapper closes on the file_done of
             // its own index.html.

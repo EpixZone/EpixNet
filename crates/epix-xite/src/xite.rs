@@ -23,6 +23,27 @@ impl VerifyContext for RootCtx {
     }
 }
 
+/// Verification context for a non-root content.json (an include or a user
+/// content.json): resolves parent content.json files from storage so the
+/// signer/cert rules can be checked.
+struct ChildCtx<'a> {
+    address: String,
+    storage: &'a XiteStorage,
+    xid_map: &'a std::collections::HashMap<String, Vec<String>>,
+}
+impl VerifyContext for ChildCtx<'_> {
+    fn site_address(&self) -> &str {
+        &self.address
+    }
+    fn loaded_content(&self, inner_path: &str) -> Option<Value> {
+        let bytes = self.storage.read(inner_path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+    fn resolve_xid(&self, name: &str) -> Vec<String> {
+        self.xid_map.get(name).cloned().unwrap_or_default()
+    }
+}
+
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -94,6 +115,82 @@ impl Xite {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// This xite's storage handle.
+    pub fn storage(&self) -> &XiteStorage {
+        &self.storage
+    }
+
+    /// The `includes` inner_paths declared in a content.json value.
+    pub fn includes_in(content: &Value) -> Vec<String> {
+        content
+            .get("includes")
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The `includes` declared in the root content.json.
+    pub fn includes(&self) -> Vec<String> {
+        self.content.as_ref().map(Self::includes_in).unwrap_or_default()
+    }
+
+    /// Verify + store a non-root content.json (an include or a user
+    /// content.json) whose PARENT content.json is already on disk, then return
+    /// the files it declares (`files` + `files_optional`). `inner_path` is the
+    /// child's path, e.g. `data/users/1abc/content.json`.
+    pub fn add_content(
+        &self,
+        inner_path: &str,
+        bytes: &[u8],
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Vec<FileEntry>> {
+        let json: Value = serde_json::from_slice(bytes)?;
+        let ctx = ChildCtx {
+            address: self.address.as_str().to_string(),
+            storage: &self.storage,
+            xid_map,
+        };
+        epix_content::verify_content_file(inner_path, &json, bytes.len() as i64, &ctx)
+            .map_err(|e| Error::Crypt(e.to_string()))?;
+        self.storage.write(inner_path, bytes)?;
+        // The child's declared files are relative to its own directory.
+        let dir = match inner_path.rsplit_once('/') {
+            Some((d, _)) => d.to_string(),
+            None => String::new(),
+        };
+        let join = |rel: &str| if dir.is_empty() { rel.to_string() } else { format!("{dir}/{rel}") };
+        let mut out = Vec::new();
+        for node in ["files", "files_optional"] {
+            if let Some(files) = json.get(node).and_then(|f| f.as_object()) {
+                for (path, info) in files {
+                    if let (Some(size), Some(sha512)) = (
+                        info.get("size").and_then(|v| v.as_i64()),
+                        info.get("sha512").and_then(|v| v.as_str()),
+                    ) {
+                        out.push(FileEntry {
+                            inner_path: join(path),
+                            size,
+                            sha512: sha512.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `includes` a stored child content.json declares, as inner_paths
+    /// relative to the site root (for recursing into nested includes).
+    pub fn child_includes(&self, inner_path: &str) -> Vec<String> {
+        let Ok(bytes) = self.storage.read(inner_path) else { return Vec::new() };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { return Vec::new() };
+        let dir = inner_path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+        Self::includes_in(&json)
+            .into_iter()
+            .map(|rel| if dir.is_empty() { rel } else { format!("{dir}/{rel}") })
+            .collect()
     }
 
     /// All required files declared in content.json (`files`).

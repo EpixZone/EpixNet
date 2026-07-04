@@ -188,6 +188,34 @@ async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
     }
 }
 
+/// Download an explicit list of files (not just the root content.json's
+/// `files`) - used for the files declared by included / user content.json,
+/// which the xite's own `files_needed()` doesn't know about.
+pub async fn sync_files_list(
+    needed: Vec<FileEntry>,
+    xite: &Xite,
+    peers: &[PeerAddr],
+    transport: Arc<dyn Transport>,
+    max_workers: usize,
+) -> Result<SyncReport> {
+    if needed.is_empty() || peers.is_empty() {
+        let mut report = SyncReport::default();
+        report.failed = needed.into_iter().map(|f| f.inner_path).collect();
+        return Ok(report);
+    }
+    let max_workers = scale_workers(max_workers, needed.len());
+    let ctx = SyncCtx::new(needed, xite, transport, None);
+    let worker_count = peers.len().min(max_workers.max(1));
+    let mut handles = Vec::new();
+    for i in 0..worker_count {
+        handles.push(tokio::spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone())));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    Ok(ctx.finish().await)
+}
+
 /// [`sync_files`], reporting each finished file to `on_file` - the on-demand
 /// clone path, where a loading screen is watching.
 pub async fn sync_files_with_progress(
