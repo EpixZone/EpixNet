@@ -75,11 +75,13 @@ impl Database {
         exclude: &[String],
     ) -> Result<usize> {
         let conn = self.conn()?;
-        populate::populate_site_filtered(&conn, schema, db_dir.as_ref(), "", exclude)
+        populate::populate_site_filtered(&conn, schema, db_dir.as_ref(), "", exclude, "")
     }
 
     /// Populate a version-3 merger db from one merged site's files, tagging the
-    /// rows with `site`. Call once per merged site.
+    /// rows with `site`. Every file's path is matched as `<site>/<relpath>`, so
+    /// the merger's address-scoped dbschema regexes match. Call once per
+    /// merged site.
     pub fn populate_site(
         &self,
         schema: &DbSchema,
@@ -87,7 +89,7 @@ impl Database {
         site: &str,
     ) -> Result<usize> {
         let conn = self.conn()?;
-        populate::populate_site(&conn, schema, db_dir.as_ref(), site)
+        populate::populate_site_prefixed(&conn, schema, db_dir.as_ref(), site, site)
     }
 
     /// Run a read query, returning rows as JSON objects.

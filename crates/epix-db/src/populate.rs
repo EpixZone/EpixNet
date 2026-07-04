@@ -211,13 +211,29 @@ pub fn update_json(
 /// that match a map. `db_dir` is the xite's content root; paths are matched
 /// relative to it (forward slashes), like EpixNet.
 pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<usize> {
-    populate_site_filtered(conn, schema, db_dir, "", &[])
+    populate_site_filtered(conn, schema, db_dir, "", &[], "")
 }
 
 /// Like [`populate`], but tags every row with `site` - for a version-3 merger
 /// db aggregating data from several merged sites (call once per merged site).
 pub fn populate_site(conn: &Connection, schema: &DbSchema, db_dir: &Path, site: &str) -> Result<usize> {
-    populate_site_filtered(conn, schema, db_dir, site, &[])
+    populate_site_filtered(conn, schema, db_dir, site, &[], "")
+}
+
+/// Like [`populate_site`], but every scanned file's path is matched against the
+/// schema as `<path_prefix>/<relative path>`. Merger databases use this: a
+/// merged site's files are keyed under its address (e.g.
+/// `epix1…/data/users/x/data.json`), which is what the merger's dbschema
+/// regexes match on (a plain `data/users/x/data.json` matches nothing, since
+/// the patterns require an address segment before `data/`).
+pub fn populate_site_prefixed(
+    conn: &Connection,
+    schema: &DbSchema,
+    db_dir: &Path,
+    site: &str,
+    path_prefix: &str,
+) -> Result<usize> {
+    populate_site_filtered(conn, schema, db_dir, site, &[], path_prefix)
 }
 
 /// Like [`populate_site`], but skips any data file whose path contains one of
@@ -229,6 +245,7 @@ pub fn populate_site_filtered(
     db_dir: &Path,
     site: &str,
     exclude: &[String],
+    path_prefix: &str,
 ) -> Result<usize> {
     let mut count = 0;
     let mut stack = vec![db_dir.to_path_buf()];
@@ -244,7 +261,12 @@ pub fn populate_site_filtered(
                 continue;
             }
             let Ok(rel) = path.strip_prefix(db_dir) else { continue };
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let rel_body = rel.to_string_lossy().replace('\\', "/");
+            let rel_str = if path_prefix.is_empty() {
+                rel_body
+            } else {
+                format!("{path_prefix}/{rel_body}")
+            };
             if !exclude.is_empty() && exclude.iter().any(|e| rel_str.contains(e.as_str())) {
                 continue;
             }

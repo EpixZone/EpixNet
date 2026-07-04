@@ -884,6 +884,10 @@ impl OnDemand {
             // Rebuild the db now that the included / per-user data files are on
             // disk, so a user_contents site's topics/comments are queryable.
             self.state.rebuild_xite_db(&address).await;
+            // A merged site (e.g. a Git Epix repo) also feeds its merger's db.
+            if content.as_ref().and_then(|c| c.get("merged_type")).is_some() {
+                self.state.rebuild_merger_dbs().await;
+            }
             self.state.push_site_info(&address).await;
             // file_done per user-content file, AFTER the rebuild: the page is
             // already up (served progressively) and ran its first db query
