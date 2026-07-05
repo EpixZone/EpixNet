@@ -4304,21 +4304,22 @@ impl AppState {
         };
         self.save_user().await; // auth_privatekey may have derived the site entry
 
-        // An xID-named user directory (`data/users/facts.epix/…`) is signed by
-        // the identity that xID belongs to; resolve the allowed signers from
-        // the chain so verification can match the signature (as inbound
-        // updates do).
+        // Resolve every xID name verification will need: the user directory's
+        // own name (`data/users/user.epix/…` is signed by the identity that
+        // xID belongs to) plus any name-form signers the parent rules grant
+        // (a site's admins may sign every user's content for moderation).
+        let parent_path = epix_content::verify::parent_content_path(content_inner_path);
+        let parent = storage
+            .read(&parent_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or_else(|| json!({ "inner_path": parent_path }));
         let mut xid_map = std::collections::HashMap::new();
-        let dir_name = content_inner_path
-            .rsplit_once('/')
-            .map(|(d, _)| d)
-            .and_then(|d| d.rsplit_once('/').map(|(_, n)| n).or(Some(d)))
-            .unwrap_or("");
-        if dir_name.contains('.') {
-            let (label, tld) = dir_name.rsplit_once('.').unwrap_or((dir_name, "epix"));
+        for name in epix_content::verify::user_content_xid_names(&parent, content_inner_path) {
+            let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
             let signers = epix_chain::xid_signers::resolve(label, tld).await;
             if !signers.is_empty() {
-                xid_map.insert(dir_name.to_string(), signers);
+                xid_map.insert(name, signers);
             }
         }
 

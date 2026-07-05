@@ -687,7 +687,7 @@ async fn sync_included_content(
             }
         }
         for (path, bytes, was_fetched) in fetched {
-            let xid_map = resolve_user_signers(&path).await; // warm cache: cheap
+            let xid_map = resolve_user_signers(&xite, &path).await; // warm cache: cheap
             match xite.add_content(&path, &bytes, &xid_map) {
                 Ok(files) => {
                     if was_fetched {
@@ -793,26 +793,30 @@ fn user_dir_name(inner_path: &str) -> Option<&str> {
     }
 }
 
-/// Resolve the xID user-directory name in `data/users/<name>/content.json` to
-/// the chain addresses that may sign that user's content: the domain owner and
-/// its active identities. EpixTalk stores each user's posts under their xID and
-/// signs with the identity that xID belongs to. Returns `{name -> address}`
-/// (the map allows several signers by mapping successive synthetic keys).
+/// Resolve every xID name that verifying `inner_path` may need to the chain
+/// addresses allowed to sign it: the user directory's own name (EpixTalk
+/// stores each user's posts under their xID and signs with the identity that
+/// xID belongs to) plus any name-form signers the parent's `user_contents`
+/// rules grant (site admins, for moderation). Resolution is chain-verified
+/// (Merkle proof) and cached.
 async fn resolve_user_signers(
+    xite: &Xite,
     inner_path: &str,
 ) -> std::collections::HashMap<String, Vec<String>> {
     let mut map = std::collections::HashMap::new();
-    let Some(name) = user_dir_name(inner_path) else { return map };
-    if !name.contains('.') {
-        return map;
-    }
-    let (label, tld) = name.rsplit_once('.').unwrap_or((name, "epix"));
-    // The user's content is signed by an identity linked to their xID; resolve
-    // (cached) the linked identity addresses and accept any (EpixNet's
-    // resolveUserSigners). The xID resolver is chain-verified (Merkle proof).
-    let signers = epix_chain::xid_signers::resolve(label, tld).await;
-    if !signers.is_empty() {
-        map.insert(name.to_string(), signers);
+    let parent_path = epix_content::verify::parent_content_path(inner_path);
+    let parent = xite
+        .storage()
+        .read(&parent_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({ "inner_path": parent_path }));
+    for name in epix_content::verify::user_content_xid_names(&parent, inner_path) {
+        let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
+        let signers = epix_chain::xid_signers::resolve(label, tld).await;
+        if !signers.is_empty() {
+            map.insert(name, signers);
+        }
     }
     map
 }

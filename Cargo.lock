@@ -1669,6 +1669,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "epix-chain",
+ "epix-content",
  "epix-core",
  "epix-plugin",
  "epix-plugins",
