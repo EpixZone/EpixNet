@@ -78,6 +78,37 @@ impl Database {
         populate::populate_site_filtered(&conn, schema, db_dir.as_ref(), "", exclude, "")
     }
 
+    /// Route ONE data file under `db_dir` into the db, per the schema's `maps`
+    /// - EpixNet's `Db.updateJson` for a single file, so a file is queryable
+    /// the moment it arrives instead of after a full-tree rescan. `rel_path`
+    /// is the file's path relative to `db_dir`; `path_prefix` (a merged
+    /// site's address, or empty) is prepended for the regex match, and `site`
+    /// tags the rows for a version-3 merger db. Returns whether any map
+    /// matched (false too when the file is missing or not JSON, mirroring the
+    /// full scan, which skips such files).
+    pub fn update_file(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+        rel_path: &str,
+        site: &str,
+        path_prefix: &str,
+    ) -> Result<bool> {
+        let Ok(bytes) = std::fs::read(db_dir.as_ref().join(rel_path)) else {
+            return Ok(false);
+        };
+        let Ok(data) = serde_json::from_slice::<Value>(&bytes) else {
+            return Ok(false);
+        };
+        let matched_path = if path_prefix.is_empty() {
+            rel_path.to_string()
+        } else {
+            format!("{path_prefix}/{rel_path}")
+        };
+        let conn = self.conn()?;
+        populate::update_json(&conn, schema, &matched_path, &data, site)
+    }
+
     /// Populate a version-3 merger db from one merged site's files, tagging the
     /// rows with `site`. Every file's path is matched as `<site>/<relpath>`, so
     /// the merger's address-scoped dbschema regexes match. Call once per
