@@ -371,6 +371,16 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// Escape a string for safe interpolation into dialog HTML (cert names,
+/// addresses shown in the certXid picker).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 /// A random lowercase-hex string of `bytes` random bytes (2 hex chars each).
 /// Used for wrapper/CSP nonces.
 fn random_hex(bytes: usize) -> String {
@@ -1739,6 +1749,310 @@ impl AppState {
     /// decide whether to prompt for replacement).
     pub async fn has_cert(&self, domain: &str) -> bool {
         self.user.read().await.certs.contains_key(domain)
+    }
+
+    // --- xID cert (certXid) --------------------------------------------------
+
+    /// The Epix chain's xID auth/linking site - where "New" and the
+    /// not-yet-linked redirect send the user to link an identity address to
+    /// their xID name. EpixNet's `xid_site`.
+    const XID_SITE: &'static str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
+
+    /// Show the xID cert-selection dialog and act on the choice (EpixNet's
+    /// `actionCertXid`). Discovers which of the user's addresses already map
+    /// to a registered xID name on chain, offers them plus a "New" option
+    /// that links a fresh identity, and on selection acquires (self-signs) the
+    /// cert or redirects to the xID site to link. Returns the WS result the
+    /// site's callback expects (`"ok"`, `"Not changed"`, or an error object).
+    ///
+    /// With `xid_name` set, skips the dialog and goes straight to acquisition
+    /// (EpixNet's direct-name path).
+    pub async fn cert_xid(&self, site_address: &str, xid_name: Option<&str>) -> Result<Value, String> {
+        if let Some(name) = xid_name {
+            return self.cert_xid_acquire(site_address, name, None).await;
+        }
+
+        let auth_address = self.user.write().await.auth_address(site_address)?;
+        let (existing_cert, is_xid_active, identity_addresses) = {
+            let user = self.user.read().await;
+            let existing = user.certs.get("xid.epix").cloned();
+            let active = user.get_cert(site_address).map(|c| c.auth_type == "xid").unwrap_or(false);
+            (existing, active, user.identity_addresses())
+        };
+        let existing_name = existing_cert.as_ref().map(|c| c.auth_user_name.clone());
+
+        // Discover linked xID names across the user's addresses. The site's
+        // own auth address first, then each standalone identity - stopping at
+        // the first UNLINKED identity, which becomes the "New" candidate.
+        let mut discovered: Vec<(String, String)> = Vec::new(); // (name, address)
+        let mut new_addr: Option<String> = None;
+        self.push_inject_script(site_address, "$('#button-identity').text('Checking...')");
+        if let Some(info) = epix_chain::xid_identity::resolve_identity(&auth_address).await {
+            if existing_name.as_deref() != Some(info.name.as_str()) {
+                discovered.push((info.name.clone(), auth_address.clone()));
+            }
+        }
+        for addr in &identity_addresses {
+            if *addr == auth_address {
+                continue;
+            }
+            match epix_chain::xid_identity::resolve_identity(addr).await {
+                Some(info) if existing_name.as_deref() != Some(info.name.as_str()) => {
+                    discovered.push((info.name.clone(), addr.clone()));
+                }
+                Some(_) => {}
+                None => {
+                    new_addr = Some(addr.clone());
+                    break;
+                }
+            }
+        }
+        self.push_inject_script(site_address, "$('#button-identity').text('Change')");
+
+        // No spare unlinked identity: mint one so "New" always has an address.
+        let new_addr = match new_addr {
+            Some(a) => a,
+            None => {
+                let (addr, _pk) = self.user.write().await.generate_new_identity_address()?;
+                self.save_user().await;
+                addr
+            }
+        };
+
+        // Build the picker (EpixNet's dialog markup + classes/titles).
+        let mut body = String::from(
+            "<span style='padding-bottom: 5px; display: inline-block'>\
+             Select the xID account you want to use on this site:</span>",
+        );
+        let none_current = if is_xid_active { "" } else { " <small>(currently selected)</small>" };
+        let none_active = if is_xid_active { "" } else { " active" };
+        body.push_str(&format!(
+            "<a href='#Select+account' class='select select-close cert{none_active}' title=''>\
+             <b>None</b>{none_current}</a>"
+        ));
+        if let Some(name) = &existing_name {
+            if !name.is_empty() {
+                let cur = if is_xid_active { " <small>(currently selected)</small>" } else { "" };
+                let act = if is_xid_active { " active" } else { "" };
+                body.push_str(&format!(
+                    "<a href='#Select+account' class='select select-close cert{act}' title='xid.epix'>\
+                     <b>{}@xid.epix</b>{cur}</a>",
+                    html_escape(name)
+                ));
+            }
+        }
+        for (name, addr) in &discovered {
+            body.push_str(&format!(
+                "<a href='#Select+account' class='select select-close cert' title='acquire:{}:{}'>\
+                 <b>{}.epix</b> <small>(acquire certificate)</small></a>",
+                html_escape(name), html_escape(addr), html_escape(name)
+            ));
+        }
+        let short = if new_addr.len() > 14 {
+            format!("{}...{}", &new_addr[..10], &new_addr[new_addr.len() - 4..])
+        } else {
+            new_addr.clone()
+        };
+        let new_link = format!(
+            "/{}/?linkIdentity={}&returnTo=/{}",
+            Self::XID_SITE, new_addr, site_address
+        );
+        body.push_str(&format!(
+            "<a href='{new_link}' target='_top' class='select'>\
+             <b>New</b> {short} <small>Register &raquo;</small></a>"
+        ));
+
+        // Ask, then act on the clicked option's title.
+        let choice = self.notification_ask(site_address, &body).await;
+        match choice.as_deref() {
+            // "New" is a plain navigation link (no `.cert` class), so it never
+            // resolves the callback - the wrapper just follows the href.
+            None => Ok(Value::from("Not changed")),
+            Some("") => {
+                // None: drop the global xID cert.
+                self.user.write().await.set_cert_global(None);
+                self.save_user().await;
+                self.push_cert_changed(site_address).await;
+                Ok(Value::from("ok"))
+            }
+            Some("xid.epix") => {
+                self.user.write().await.set_cert_global(Some("xid.epix"));
+                self.save_user().await;
+                self.push_cert_changed(site_address).await;
+                Ok(Value::from("ok"))
+            }
+            Some(choice) if choice.starts_with("acquire:") => {
+                let parts: Vec<&str> = choice.splitn(3, ':').collect();
+                if parts.len() == 3 {
+                    self.cert_xid_acquire(site_address, parts[1], Some(parts[2])).await
+                } else {
+                    Err("Invalid acquire choice".to_string())
+                }
+            }
+            Some(_) => Ok(Value::from("Not changed")),
+        }
+    }
+
+    /// Acquire (self-sign) an xID cert for `xid_name`, verifying on chain that
+    /// the auth address is an active linked identity of that name. If it isn't
+    /// linked, offers to open the xID site to link it. EpixNet's
+    /// `_processCertXid`. `linked_auth_address` overrides the site's own auth
+    /// address (when the identity was discovered under a different one).
+    async fn cert_xid_acquire(
+        &self,
+        site_address: &str,
+        xid_name: &str,
+        linked_auth_address: Option<&str>,
+    ) -> Result<Value, String> {
+        let name = xid_name.trim().to_lowercase();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .enumerate()
+                .all(|(i, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || (i > 0 && c == b'-'))
+        {
+            return Err("Invalid xID name".to_string());
+        }
+
+        // Resolve the auth address + its private key to sign the cert.
+        let (auth_address, privatekey) = match linked_auth_address {
+            Some(addr) => {
+                let pk = self
+                    .user
+                    .read()
+                    .await
+                    .privatekey_for(addr)
+                    .ok_or("No private key for the linked identity")?;
+                (addr.to_string(), pk)
+            }
+            None => {
+                let mut user = self.user.write().await;
+                let sd = user.site_data(site_address)?.clone();
+                (sd.auth_address, sd.auth_privatekey)
+            }
+        };
+
+        // Verify on chain: the name resolves and this address is an ACTIVE
+        // linked identity of it. Uses the full snapshot (identities + active).
+        let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
+        let domain = match epix_chain::shared_resolver().resolve(label, tld).await {
+            Ok(d) => d,
+            Err(_) => {
+                return Ok(json!({ "error": format!("xID name '{name}' not found on chain") }))
+            }
+        };
+        let linked = domain
+            .identities
+            .iter()
+            .any(|i| i.address == auth_address && i.active);
+        if !linked {
+            // Offer to open the xID site to link this address.
+            let url = format!(
+                "/{}/?linkIdentity={}&returnTo=/{}",
+                Self::XID_SITE, auth_address, site_address
+            );
+            let body = format!(
+                "Your address is not linked as an identity for <b>{}.{}</b>.<br><br>\
+                 Open the xID site to link it?",
+                html_escape(label), html_escape(tld)
+            );
+            if self.confirm(site_address, &body, "Open xID").await {
+                self.push_redirect(site_address, &url);
+            }
+            return Ok(json!({ "error": "identity_not_linked", "auth_address": auth_address }));
+        }
+
+        // Self-signed cert: sign "<auth_address>#xid/<name>" with the auth key.
+        let cert_subject = format!("{auth_address}#xid/{label}");
+        let cert_sign = epix_crypt::sign_keccak(&cert_subject, &privatekey)
+            .map_err(|e| format!("Failed to sign certificate: {e}"))?;
+
+        let mut user = self.user.write().await;
+        match user.add_cert(&auth_address, "xid.epix", "xid", label, &cert_sign)? {
+            Some(true) => {
+                user.set_cert_global(Some("xid.epix"));
+                drop(user);
+                self.save_user().await;
+                self.push_notification(
+                    "done",
+                    &format!("xID certificate acquired: {label}@xid.epix"),
+                    5000,
+                );
+                self.push_cert_changed(site_address).await;
+                Ok(Value::from("ok"))
+            }
+            Some(false) => {
+                // A different xID cert exists: confirm replacement.
+                drop(user);
+                let body = "You already have an xID cert. Replace it?".to_string();
+                if !self.confirm(site_address, &body, "Replace").await {
+                    return Ok(Value::from("Not changed"));
+                }
+                let mut user = self.user.write().await;
+                user.delete_cert("xid.epix");
+                user.add_cert(&auth_address, "xid.epix", "xid", label, &cert_sign)?;
+                user.set_cert_global(Some("xid.epix"));
+                drop(user);
+                self.save_user().await;
+                self.push_notification(
+                    "done",
+                    &format!("xID certificate updated: {label}@xid.epix"),
+                    5000,
+                );
+                self.push_cert_changed(site_address).await;
+                Ok(Value::from("ok"))
+            }
+            None => {
+                // Identical cert already present: just select it.
+                user.set_cert_global(Some("xid.epix"));
+                drop(user);
+                self.save_user().await;
+                self.push_cert_changed(site_address).await;
+                Ok(Value::from("ok"))
+            }
+        }
+    }
+
+    /// Push a `notification ["ask", body]` dialog and wire its option links to
+    /// resolve with the clicked link's `title`, awaiting the user's choice
+    /// (EpixNet's cert dialog: a `notification` plus an `injectScript` that
+    /// binds `.select.cert` clicks to `epixframe.response`). `None` on
+    /// timeout, dismissal, or a non-`.cert` link (e.g. "New" navigates away).
+    async fn notification_ask(&self, address: &str, body: &str) -> Option<String> {
+        let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.callbacks.lock().unwrap().insert(id, tx);
+        let payload =
+            json!({ "cmd": "notification", "params": ["ask", body], "id": id }).to_string();
+        let _ = self.events.send(UiEvent {
+            channel: None,
+            target: Some(address.to_string()),
+            payload,
+        });
+        // Bind the dialog's `.select.cert` options to answer with their title.
+        // The wrapper renders a `notification` under `.notification-ws-<id>`.
+        let script = format!(
+            "$('.notification .select.cert').off('click.certxid').on('click.certxid', function() {{ \
+               $('.notification .select').removeClass('active'); \
+               epixframe.response({id}, $(this).attr('title') || ''); \
+               return false; }})"
+        );
+        self.push_inject_script(address, &script);
+        match tokio::time::timeout(std::time::Duration::from_secs(180), rx).await {
+            Ok(Ok(Value::String(s))) => Some(s),
+            Ok(Ok(v)) if !v.is_null() => Some(v.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Notify the site (and its wrapper) that the selected cert changed, so the
+    /// page re-renders its identity - EpixNet's `updateWebsocket(cert_changed)`.
+    async fn push_cert_changed(&self, address: &str) {
+        let mut info = self.site_info(address).await;
+        if let Value::Object(m) = &mut info {
+            m.insert("event".to_string(), json!(["cert_changed", "xid.epix"]));
+            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
     }
 
     /// The configured Epix chain RPC URL (Vrf / XidResolver), or the default.

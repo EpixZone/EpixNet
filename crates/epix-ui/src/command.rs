@@ -428,6 +428,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(CertSelect),
         Arc::new(CertSet),
         Arc::new(CertList),
+        Arc::new(CertXid),
         // File listing + site maintenance + feed search.
         Arc::new(DirList),
         Arc::new(FileList),
@@ -875,7 +876,7 @@ impl WsCommand for AnnouncerInfo {
 }
 
 /// `chartDbQuery(query, params)` - run a read-only query against the node's
-/// network-stats chart database (the dashboard's Stats page). ZeroFrame passes
+/// network-stats chart database (the dashboard's Stats page). EpixFrame passes
 /// either a bare query string or `[query, params]`.
 struct ChartDbQuery;
 #[async_trait]
@@ -956,7 +957,7 @@ impl WsCommand for SiteList {
 }
 
 /// `dbQuery(query, params)` - run a read query against the xite's database.
-/// ZeroFrame passes `[query, params]`; we also accept a bare string or
+/// EpixFrame passes `[query, params]`; we also accept a bare string or
 /// `{query, params}`.
 struct DbQuery;
 #[async_trait]
@@ -2526,6 +2527,25 @@ impl WsCommand for CertSet {
     }
 }
 
+/// `certXid` - the xID identity flow (EpixNet's `actionCertXid`). With no
+/// name, shows the account picker (discovered linked xID names + a "New"
+/// link) and acts on the choice; with a name, acquires that cert directly.
+/// Self-signs the cert once the chosen address is verified on chain as an
+/// active linked identity, else offers to open the xID site to link it.
+struct CertXid;
+#[async_trait]
+impl WsCommand for CertXid {
+    fn name(&self) -> &'static str {
+        "certXid"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        // Optional direct name: positional `[name]` or `{xid_name}`.
+        let xid_name = arg_str(p, "xid_name", 0).filter(|n| !n.is_empty());
+        s.state.cert_xid(&address, xid_name).await
+    }
+}
+
 /// `certList` - the user's certs with which is selected for this site. Admin.
 struct CertList;
 #[async_trait]
@@ -3132,11 +3152,11 @@ mod tests {
         let session = WsSession::new(state.clone(), Some("1site".into()));
 
         MuteAdd
-            .handle(&session, &json!(["1AuthorAddr", "bob@zeroid.bit", "spam"]))
+            .handle(&session, &json!(["1AuthorAddr", "bob@xid.epix", "spam"]))
             .await
             .unwrap();
         let list = MuteList.handle(&session, &Value::Null).await.unwrap();
-        assert_eq!(list["1AuthorAddr"]["cert_user_id"], "bob@zeroid.bit");
+        assert_eq!(list["1AuthorAddr"]["cert_user_id"], "bob@xid.epix");
         assert_eq!(list["1AuthorAddr"]["reason"], "spam");
 
         MuteRemove.handle(&session, &json!(["1AuthorAddr"])).await.unwrap();
@@ -3285,8 +3305,8 @@ mod tests {
         // certAdd stores + selects a cert for this site's identity.
         CertAdd
             .handle(&session, &json!({
-                "domain": "zeroid.bit",
-                "auth_type": "web",
+                "domain": "xid.epix",
+                "auth_type": "xid",
                 "auth_user_name": "alice",
                 "cert": "sig",
             }))
@@ -3294,13 +3314,13 @@ mod tests {
             .unwrap();
         let list = CertList.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
-        assert_eq!(list[0]["domain"], "zeroid.bit");
+        assert_eq!(list[0]["domain"], "xid.epix");
         assert_eq!(list[0]["auth_user_name"], "alice");
         assert_eq!(list[0]["selected"], true);
 
         // siteInfo now reports the cert user id.
         let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
-        assert_eq!(info["cert_user_id"], "alice@zeroid.bit");
+        assert_eq!(info["cert_user_id"], "alice@xid.epix");
 
         // certSet "" clears it everywhere.
         CertSet.handle(&session, &json!([""])).await.unwrap();
