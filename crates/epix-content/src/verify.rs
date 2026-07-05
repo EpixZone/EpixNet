@@ -47,7 +47,7 @@ pub trait VerifyContext {
     fn size_limit_bytes(&self) -> i64 {
         i64::MAX
     }
-    /// Resolve an xID name (e.g. `facts.epix`) to the bech32 addresses that may
+    /// Resolve an xID name (e.g. `user.epix`) to the bech32 addresses that may
     /// sign for it (owner + identities). EpixTalk-style user_contents dirs are
     /// named by the user's xID and the content is signed by the identity that
     /// xID belongs to, so a signer given as an xID name must be resolved to
@@ -143,15 +143,18 @@ fn get_rules(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> Opti
 }
 
 /// Rules for a file under a `user_contents` node: pick the permission set for
-/// the user (by address or cert user id), attach the provider `cert_signers`,
-/// set the user's own address as a signer, and forbid nested includes. A
-/// focused port of `getUserContentRules` (the `permission_rules` regex merge is
-/// omitted; the common `permissions[address|cert_user_id]` path is covered).
+/// the user (by address or cert user id), merge in the regex-keyed
+/// `permission_rules`, attach the provider `cert_signers`, set the user's own
+/// address as a signer, and forbid nested includes. A port of
+/// `getUserContentRules`.
 fn user_content_rules(parent: &Value, inner_path: &str, content: &Value) -> Option<Value> {
     let user_contents = parent.get("user_contents")?;
     // The user directory name is the path segment after the user_contents dir.
     let user_address = user_dir_segment(parent, inner_path)?;
     let cert_user_id = content.get("cert_user_id").and_then(|v| v.as_str()).unwrap_or("n-a");
+    let cert_auth_type = content.get("cert_auth_type").and_then(|v| v.as_str()).unwrap_or("n-a");
+    // The urn permission_rules patterns match against, e.g. `xid/user@xid.epix`.
+    let user_urn = format!("{cert_auth_type}/{cert_user_id}");
 
     let permissions = user_contents.get("permissions").and_then(|v| v.as_object());
     let mut rules = permissions
@@ -163,8 +166,33 @@ fn user_content_rules(parent: &Value, inner_path: &str, content: &Value) -> Opti
     if banned || !rules.is_object() {
         rules = serde_json::json!({});
     }
-
     let obj = rules.as_object_mut().unwrap();
+
+    // permission_rules: regex-keyed defaults merged into the user's rules
+    // (larger numbers and longer strings win, lists append). This is how a
+    // site grants extra rights across all users - EpixTalk lists its admins
+    // as additional `signers` on every user dir so moderation can re-sign
+    // any user's content.json.
+    let zeroed = serde_json::json!({ "max_size": 0, "max_size_optional": 0 });
+    if let Some(prules) = user_contents.get("permission_rules").and_then(|v| v.as_object()) {
+        for (pattern, extra) in prules {
+            if !regex_prefix_match(pattern, &user_urn) {
+                continue;
+            }
+            // A null rule means "may write nothing" (sizes zeroed).
+            let extra = if extra.is_null() { &zeroed } else { extra };
+            let Some(extra) = extra.as_object() else { continue };
+            for (key, val) in extra {
+                match obj.get_mut(key) {
+                    None => {
+                        obj.insert(key.clone(), val.clone());
+                    }
+                    Some(cur) => merge_rule_value(cur, val),
+                }
+            }
+        }
+    }
+
     obj.insert(
         "cert_signers".to_string(),
         user_contents.get("cert_signers").cloned().unwrap_or_else(|| serde_json::json!({})),
@@ -186,6 +214,69 @@ fn user_content_rules(parent: &Value, inner_path: &str, content: &Value) -> Opti
     Some(rules)
 }
 
+/// Merge one `permission_rules` value into an already-present rule, with
+/// EpixNet's semantics: a larger number wins, a longer string wins, dicts
+/// merge per key taking larger values, lists append.
+fn merge_rule_value(cur: &mut Value, val: &Value) {
+    match (cur, val) {
+        (Value::Number(c), Value::Number(v)) => {
+            if v.as_f64().unwrap_or(0.0) > c.as_f64().unwrap_or(0.0) {
+                *c = v.clone();
+            }
+        }
+        (Value::String(c), Value::String(v)) => {
+            if v.len() > c.len() {
+                *c = v.clone();
+            }
+        }
+        (Value::Object(c), Value::Object(v)) => {
+            for (k, vv) in v {
+                match c.get_mut(k) {
+                    Some(cv) => merge_rule_value(cv, vv),
+                    None => {
+                        c.insert(k.clone(), vv.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(c), Value::Array(v)) => c.extend(v.iter().cloned()),
+        _ => {}
+    }
+}
+
+/// The xID names whose chain-linked addresses a
+/// verifier must resolve before checking a user content.json: the user
+/// directory's own name plus any name-form signers the parent's
+/// `user_contents` rules grant (site admins for moderation). Callers resolve
+/// each and pass the map into verification / signing.
+pub fn user_content_xid_names(parent: &Value, inner_path: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let looks_like_name = |s: &str| s.contains('.') && !s.contains('@') && !s.contains('/');
+    if let Some(dir) = user_dir_segment(parent, inner_path) {
+        if looks_like_name(&dir) {
+            names.push(dir);
+        }
+    }
+    if let Some(uc) = parent.get("user_contents") {
+        for node in ["permissions", "permission_rules"] {
+            let Some(map) = uc.get(node).and_then(|v| v.as_object()) else { continue };
+            for entry in map.values() {
+                let Some(signers) = entry.get("signers").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for s in signers.iter().filter_map(|v| v.as_str()) {
+                    if looks_like_name(s) {
+                        names.push(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The user-directory segment of `inner_path` relative to the `user_contents`
 /// parent (e.g. `data/users/<addr>/data.json` -> `<addr>`).
 fn user_dir_segment(parent: &Value, inner_path: &str) -> Option<String> {
@@ -193,6 +284,17 @@ fn user_dir_segment(parent: &Value, inner_path: &str) -> Option<String> {
     let parent_dir = dirname(parent_inner);
     let rest = inner_path.strip_prefix(&parent_dir).unwrap_or(inner_path);
     rest.trim_start_matches('/').split('/').next().map(str::to_string).filter(|s| !s.is_empty())
+}
+
+/// The inner_path of the parent content.json governing a child content.json:
+/// one directory level up (`data/users/user.epix/content.json` ->
+/// `data/users/content.json`), falling back to the root.
+pub fn parent_content_path(inner_path: &str) -> String {
+    let dir = dirname(inner_path);
+    match dir.trim_end_matches('/').rsplit_once('/') {
+        Some((up, _)) => format!("{up}/content.json"),
+        None => "content.json".to_string(),
+    }
 }
 
 /// `data/site/content.json` -> `data/site/` (EpixNet's `helper.getDirname`).
@@ -427,6 +529,13 @@ fn regex_full_match(pattern: &str, text: &str) -> bool {
     regex::Regex::new(&anchored).map(|re| re.is_match(text)).unwrap_or(false)
 }
 
+/// Regex match anchored at the start only - Python `re.match` semantics, which
+/// is what `getUserContentRules` uses for `permission_rules` patterns.
+fn regex_prefix_match(pattern: &str, text: &str) -> bool {
+    let anchored = format!("^(?:{pattern})");
+    regex::Regex::new(&anchored).map(|re| re.is_match(text)).unwrap_or(false)
+}
+
 /// Convenience for verifying a root content.json that is signed by the site
 /// address only (no delegated signers) - the common single-owner case. Used by
 /// `Xite::set_content` as a fast path; falls back to full verification when a
@@ -526,6 +635,68 @@ mod tests {
         let ctx = Ctx { address: addr, loaded: Default::default(), limit: 5 };
         let e = verify_content_file("content.json", &content, bytes.len() as i64, &ctx).unwrap_err();
         assert!(e.0.contains("Content too large"), "{}", e.0);
+    }
+
+    #[test]
+    fn permission_rules_grant_moderator_signing_over_user_dirs() {
+        // EpixTalk's moderation model: data/users/content.json lists the site
+        // admins as extra `signers` under a permission_rules catch-all, so an
+        // admin may re-sign any user's content.json (deleting their post).
+        let user_pk = epix_crypt::new_seed();
+        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let mod_pk = epix_crypt::new_seed();
+        let moderator = epix_crypt::privatekey_to_address(&mod_pk).unwrap();
+        let stranger_pk = epix_crypt::new_seed();
+
+        let parent = json!({
+            "inner_path": "data/users/content.json",
+            "user_contents": {
+                "cert_signers": {},
+                "permissions": {},
+                "permission_rules": {
+                    ".*": { "signers": [moderator], "max_size": 100000 },
+                },
+            }
+        });
+        let inner = format!("data/users/{user}/content.json");
+        let mut loaded = std::collections::HashMap::new();
+        loaded.insert("data/users/content.json".to_string(), parent);
+        let ctx = Ctx { address: "epix1site".to_string(), loaded, limit: i64::MAX };
+        let make = |pk: &str| {
+            sign_content(
+                json!({
+                    "address": "epix1site", "inner_path": inner, "modified": 2,
+                    "files": { "data.json": { "size": 10, "sha512": "ab" } },
+                }),
+                pk,
+            )
+        };
+
+        // The rule-granted moderator may sign the user's file.
+        let (c, b) = make(&mod_pk);
+        assert!(verify_content_file(&inner, &c, b.len() as i64, &ctx).is_ok());
+        // The user's own key (the dir name) still signs.
+        let (c, b) = make(&user_pk);
+        assert!(verify_content_file(&inner, &c, b.len() as i64, &ctx).is_ok());
+        // Anyone else is rejected.
+        let (c, b) = make(&stranger_pk);
+        assert!(verify_content_file(&inner, &c, b.len() as i64, &ctx).is_err());
+
+        // The merged max_size is enforced: a parent allowing only 10 bytes
+        // rejects this content.json.
+        let tiny = json!({
+            "inner_path": "data/users/content.json",
+            "user_contents": {
+                "cert_signers": {},
+                "permissions": {},
+                "permission_rules": { ".*": { "max_size": 10 } },
+            }
+        });
+        let mut loaded = std::collections::HashMap::new();
+        loaded.insert("data/users/content.json".to_string(), tiny);
+        let ctx = Ctx { address: "epix1site".to_string(), loaded, limit: i64::MAX };
+        let (c, b) = make(&user_pk);
+        assert!(verify_content_file(&inner, &c, b.len() as i64, &ctx).is_err());
     }
 
     #[test]
