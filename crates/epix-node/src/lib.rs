@@ -528,6 +528,14 @@ async fn sync_included_content(
     // (0.0 = statically included, always checked).
     let mut paths: std::collections::HashMap<String, f64> =
         xite.includes().into_iter().map(|p| (p, 0.0)).collect();
+    // Also every content.json already on disk (per-user ones from earlier
+    // passes): their declared data files may still be missing, and when the
+    // listModified race below comes up empty they would otherwise never be
+    // visited - a hub with all its user content.json but none of the
+    // data.json (the actual posts) stays that way forever.
+    for p in walk_disk_content_json(xite.storage().root()) {
+        paths.entry(p).or_insert(0.0);
+    }
     // Race listModified across the first several peers concurrently and take
     // the first non-empty answer, so one slow/dead peer can't stall the pass.
     let mut probes = tokio::task::JoinSet::new();
@@ -636,6 +644,30 @@ async fn sync_included_content(
         }
         Err(_) => (0, arrived),
     }
+}
+
+/// Every non-root `content.json` under `root` (per-user / included content
+/// already on disk), as inner paths.
+fn walk_disk_content_json(root: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("content.json") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if rel != "content.json" {
+                        out.push(rel);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Resolve the xID user-directory name in `data/users/<name>/content.json` to
@@ -962,6 +994,12 @@ async fn serve(
     // The launch xite is the homepage: the wrapper's corner home button and
     // the admin pages' back link return here from any other xite.
     state.set_homepage(&display);
+
+    // Xite dbs are in-memory, so merger databases (Git Epix, Epix Post) are
+    // empty on every boot until filled from their merged sites - do it now
+    // that all restored xites are registered, or merger pages show nothing
+    // until some merger action happens to trigger a rebuild.
+    state.rebuild_merger_dbs().await;
 
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;

@@ -53,7 +53,13 @@ fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, site: &str) -> 
                 .map_err(db_err)
         }
         3 => {
-            let (dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path.as_str()));
+            // Merger paths are keyed `<site>/<inner path>` so the schema
+            // regexes match, but the json row's `directory` is stored WITHOUT
+            // the site segment (EpixNet's v3 getJsonRow splits the path into
+            // site / directory / file_name). Queries rely on that shape, e.g.
+            // REPLACE(json.directory, 'data/users/', '') for the user name.
+            let inner = rel_path.strip_prefix(&format!("{site}/")).unwrap_or(rel_path.as_str());
+            let (dir, name) = inner.rsplit_once('/').unwrap_or(("", inner));
             conn.execute(
                 "INSERT OR IGNORE INTO json (site, directory, file_name) VALUES (?1, ?2, ?3)",
                 [site, dir, name],
@@ -150,14 +156,31 @@ pub fn update_json(
             .map_err(db_err)?;
         }
 
-        // to_json_table: set columns on the json row itself
-        for key in &map.to_json_table {
-            let val = to_sql(data.get(key).unwrap_or(&Value::Null));
-            conn.execute(
-                &format!("UPDATE json SET {key} = ?1 WHERE json_id = ?2"),
-                rusqlite::params![val, jid],
-            )
-            .map_err(db_err)?;
+        // to_json_table: set columns on a json row - the matched file's own,
+        // or (with the map's `file_name`) its sibling's. EpixNet stores a
+        // user's cert_user_id from content.json onto the data.json row, where
+        // the post/topic queries join it from.
+        if !map.to_json_table.is_empty() {
+            let target_jid = match &map.file_name {
+                Some(file_name) => {
+                    let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    let sibling = if dir.is_empty() {
+                        file_name.clone()
+                    } else {
+                        format!("{dir}/{file_name}")
+                    };
+                    json_id(conn, schema, &sibling, site)?
+                }
+                None => jid,
+            };
+            for key in &map.to_json_table {
+                let val = to_sql(data.get(key).unwrap_or(&Value::Null));
+                conn.execute(
+                    &format!("UPDATE json SET {key} = ?1 WHERE json_id = ?2"),
+                    rusqlite::params![val, target_jid],
+                )
+                .map_err(db_err)?;
+            }
         }
 
         // to_table
@@ -313,8 +336,89 @@ pub fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<i64> {
 /// Run a read query whose params are a JSON value: an object binds by name
 /// (`{"post_id": 1}` -> `:post_id`), an array binds positionally, null/absent
 /// means no params. This is the shape the `dbQuery` WS command receives.
+/// Keep only characters that can appear in a column reference - the dict keys
+/// become SQL identifiers (EpixNet's safe_sql_identifier).
+fn safe_sql_identifier(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.').collect()
+}
+
+/// Quote a JSON value for embedding directly in SQL (only used for the
+/// >100-element IN lists, like EpixNet's sqlquote).
+fn sql_quote(v: &Value) -> String {
+    match v {
+        Value::Number(n) => n.to_string(),
+        other => {
+            let s = match other {
+                Value::String(s) => s.clone(),
+                v => v.to_string(),
+            };
+            format!("'{}'", s.replace('\'', "''"))
+        }
+    }
+}
+
+/// EpixNet's `WHERE ?` + dict convention (DbCursor.parseQuery): the LAST `?`
+/// in a SELECT/DELETE/UPDATE expands to conditions built from the dict -
+/// a list value becomes `key IN (...)`, scalars `key = ?`, with `not__`,
+/// `__like`, and trailing `>`/`<` key modifiers. Sites query this way
+/// (Epix Post: `... FROM comment ... WHERE ? AND date_added < n` with
+/// `{post_uri: [...]}`).
+fn expand_where_dict(sql: &str, map: &Map<String, Value>) -> Option<(String, Vec<SqlValue>)> {
+    let pos = sql.rfind('?')?;
+    let head = sql.trim_start().split_whitespace().next().unwrap_or("").to_uppercase();
+    if !matches!(head.as_str(), "SELECT" | "DELETE" | "UPDATE") {
+        return None;
+    }
+    let mut wheres: Vec<String> = Vec::new();
+    let mut values: Vec<SqlValue> = Vec::new();
+    for (key, value) in map {
+        match value {
+            Value::Array(items) => {
+                let (field, op) = match key.strip_prefix("not__") {
+                    Some(k) => (safe_sql_identifier(k.trim()), "NOT IN"),
+                    None => (safe_sql_identifier(key.trim()), "IN"),
+                };
+                if items.len() > 100 {
+                    // Embed values to avoid "too many SQL variables".
+                    let embedded: Vec<String> = items.iter().map(sql_quote).collect();
+                    wheres.push(format!("{field} {op} ({})", embedded.join(",")));
+                } else {
+                    let marks = vec!["?"; items.len()].join(",");
+                    wheres.push(format!("{field} {op} ({marks})"));
+                    values.extend(items.iter().map(to_sql));
+                }
+            }
+            v => {
+                let cond = if let Some(k) = key.strip_prefix("not__") {
+                    format!("{} != ?", safe_sql_identifier(k.trim()))
+                } else if let Some(k) = key.strip_suffix("__like") {
+                    format!("{} LIKE ?", safe_sql_identifier(k.trim()))
+                } else if let Some(k) = key.strip_suffix('>') {
+                    format!("{} > ?", safe_sql_identifier(k.trim()))
+                } else if let Some(k) = key.strip_suffix('<') {
+                    format!("{} < ?", safe_sql_identifier(k.trim()))
+                } else {
+                    format!("{} = ?", safe_sql_identifier(key.trim()))
+                };
+                wheres.push(cond);
+                values.push(to_sql(v));
+            }
+        }
+    }
+    let clause = if wheres.is_empty() { "1".to_string() } else { wheres.join(" AND ") };
+    let out = format!("{}{}{}", &sql[..pos], clause, &sql[pos + 1..]);
+    Some((out, values))
+}
+
 pub fn query_value(conn: &Connection, sql: &str, params: &Value) -> Result<Vec<Value>> {
     match params {
+        Value::Object(map) if sql.contains('?') => {
+            let Some((sql, values)) = expand_where_dict(sql, map) else {
+                return query(conn, sql, &[]);
+            };
+            let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+            collect(&mut stmt, rusqlite::params_from_iter(values.iter()))
+        }
         Value::Object(map) => {
             // A list-valued param expands `IN :key` into `IN (:key__0, :key__1,
             // …)`, binding each element (matching EpixNet's DbCursor). This is
