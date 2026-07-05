@@ -282,4 +282,77 @@ impl Xite {
         self.content = Some(content);
         Ok(())
     }
+
+    /// Sign a non-root content.json - a user content.json or include - with
+    /// `privatekey`, mirroring EpixNet's `ContentManager.sign`: rebuild the
+    /// `files` map by hashing the files in its own directory, fill in the
+    /// `extend` fields (cert data; only keys not already present), stamp
+    /// `modified`/`address`/`inner_path`, sign, then verify against the
+    /// parent's rules (signers, cert) and store - so anything the network
+    /// would reject fails here instead of after publishing.
+    pub fn sign_child(
+        &self,
+        inner_path: &str,
+        privatekey: &str,
+        modified: f64,
+        extend: &serde_json::Map<String, Value>,
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Value> {
+        let Some((dir, name)) = inner_path.rsplit_once('/') else {
+            return Err(Error::Protocol(format!("not a child content.json: {inner_path}")));
+        };
+        if name != "content.json" {
+            return Err(Error::Protocol(format!("can only sign content.json files: {inner_path}")));
+        }
+
+        let mut content: Value = match self.storage.read(inner_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(_) => json!({}),
+        };
+        let map = content
+            .as_object_mut()
+            .ok_or_else(|| Error::Protocol("content.json is not a JSON object".into()))?;
+        for (key, val) in extend {
+            let missing = map.get(key).map(|v| v.is_null()).unwrap_or(true);
+            if missing {
+                map.insert(key.clone(), val.clone());
+            }
+        }
+
+        // Hash this directory's files. Nested content.json files are their own
+        // signed units; entries already declared optional keep their metadata
+        // (they may not be on disk).
+        let optional: std::collections::HashSet<String> = map
+            .get("files_optional")
+            .and_then(|v| v.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let prefix = format!("{dir}/");
+        let mut files = serde_json::Map::new();
+        for inner in self.storage.list_files() {
+            let Some(rel) = inner.strip_prefix(&prefix) else { continue };
+            if rel == "content.json" || rel.ends_with("/content.json") || optional.contains(rel) {
+                continue;
+            }
+            let bytes = self.storage.read(&inner)?;
+            files.insert(
+                rel.to_string(),
+                json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) }),
+            );
+        }
+        map.insert("files".into(), Value::Object(files));
+        if modified.fract() == 0.0 {
+            map.insert("modified".into(), json!(modified as i64));
+        } else {
+            map.insert("modified".into(), json!(modified));
+        }
+        map.insert("address".into(), json!(self.address.as_str()));
+        map.insert("inner_path".into(), json!(inner_path));
+
+        epix_content::sign(&mut content, privatekey)?;
+        let bytes = serde_json::to_vec(&content).map_err(Error::from)?;
+        // add_content verifies (signer allowed, cert valid, sizes) and stores.
+        self.add_content(inner_path, &bytes, xid_map)?;
+        Ok(content)
+    }
 }
