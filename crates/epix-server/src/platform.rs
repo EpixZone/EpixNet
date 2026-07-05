@@ -5,35 +5,16 @@
 
 use std::path::PathBuf;
 
-/// The shared data root: `EPIX_DATA_DIR` if set, else the conventional per-OS
-/// application-data location (`~/Library/Application Support/EpixNet` on macOS,
+/// The shared data root: `EPIX_DATA_DIR` if set, else the `data_dir`
+/// configured in the default location's `epixnet.conf` (the same file and key
+/// the Python client uses), else the conventional per-OS application-data
+/// location (`~/Library/Application Support/EpixNet` on macOS,
 /// `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
 /// `~/.local/share/EpixNet` on Linux). Laid out like Python EpixNet - node
 /// files (`users.json`, `sites.json`, config) under `private/`, per-xite dirs
 /// under `data/` - so a Python install's identity and xites carry over as-is.
 pub fn data_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("EPIX_DATA_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    let base = if cfg!(target_os = "macos") {
-        home().join("Library/Application Support")
-    } else if cfg!(target_os = "windows") {
-        std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| home().join("AppData/Roaming"))
-    } else {
-        std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home().join(".local/share"))
-    };
-    base.join("EpixNet")
-}
-
-fn home() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+    epix_node::data_root()
 }
 
 /// Acquire the single-instance lock in `root/lock.pid`. Returns the held lock
@@ -95,8 +76,9 @@ mod tests {
         std::env::set_var("EPIX_DATA_DIR", "/tmp/epix-test-root");
         assert_eq!(data_root(), PathBuf::from("/tmp/epix-test-root"));
         std::env::remove_var("EPIX_DATA_DIR");
-        // Without the override it lands under a real per-OS base, ending in EpixNet.
-        assert!(data_root().ends_with("EpixNet"));
+        // Without the override the machine's epixnet.conf may point anywhere,
+        // so only the env behavior is asserted here (the default-location
+        // resolution is covered in epix-ui's paths tests).
     }
 
     #[test]
