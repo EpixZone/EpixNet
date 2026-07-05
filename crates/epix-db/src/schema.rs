@@ -56,6 +56,11 @@ pub struct MapSettings {
     pub to_keyvalue: Vec<String>,
     #[serde(default)]
     pub to_json_table: Vec<String>,
+    /// `to_json_table` writes onto the json row of THIS sibling file instead
+    /// of the matched file's own row (EpixNet: a user's content.json carries
+    /// cert_user_id, but queries join it from the data.json row).
+    #[serde(default)]
+    pub file_name: Option<String>,
 }
 
 /// A `to_table` entry: either a bare table/node name, or a spec.
