@@ -1376,24 +1376,45 @@ async fn ws_upgrade(
 
 async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
     use futures_util::{SinkExt, StreamExt};
-    let session = WsSession::new(ctx.state.clone(), xite);
+    let session = std::sync::Arc::new(WsSession::new(ctx.state.clone(), xite));
     let mut events = ctx.state.subscribe_events();
     let (mut sink, mut stream) = socket.split();
+    // Replies from concurrently-running command handlers (the sink has one
+    // writer: this loop).
+    let (reply_tx, mut replies) = tokio::sync::mpsc::unbounded_channel::<String>();
     loop {
         tokio::select! {
-            // Xite -> server requests.
+            // Xite -> server requests. Each command runs on its OWN task
+            // (EpixNet runs every ws action in its own greenlet): the wrapper
+            // and the inner page share this single connection, so a command
+            // that waits on the user (certXid's account dialog, a confirm) or
+            // on the network (fileGet's download wait) must not stall it -
+            // the dialog events AND the user's answer ride this same socket,
+            // and every later command (the page's boot queries) would queue
+            // behind the wait forever.
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        let reply = handle_text(&ctx, &session, &text).await;
-                        // An empty reply (e.g. a response to a pushed callback)
-                        // isn't sent back.
-                        if !reply.is_empty() && sink.send(Message::Text(reply)).await.is_err() {
-                            break;
-                        }
+                        let ctx = ctx.clone();
+                        let session = session.clone();
+                        let reply_tx = reply_tx.clone();
+                        tokio::spawn(async move {
+                            let reply = handle_text(&ctx, &session, &text).await;
+                            // An empty reply (e.g. a response to a pushed
+                            // callback) isn't sent back.
+                            if !reply.is_empty() {
+                                let _ = reply_tx.send(reply);
+                            }
+                        });
                     }
                     Some(Ok(_)) => {} // ignore non-text frames (ping/pong/binary)
                     _ => break, // stream closed or errored
+                }
+            }
+            // A finished command's response.
+            Some(reply) = replies.recv() => {
+                if sink.send(Message::Text(reply)).await.is_err() {
+                    break;
                 }
             }
             // Server -> xite pushed events (setSiteInfo, setAnnouncerInfo, …).
