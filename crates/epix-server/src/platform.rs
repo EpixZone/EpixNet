@@ -8,8 +8,9 @@ use std::path::PathBuf;
 /// The shared data root: `EPIX_DATA_DIR` if set, else the conventional per-OS
 /// application-data location (`~/Library/Application Support/EpixNet` on macOS,
 /// `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
-/// `~/.local/share/EpixNet` on Linux). Holds `sites.json`, `users.json`,
-/// `config.json`, the resolve cache, logs, and per-xite subdirectories.
+/// `~/.local/share/EpixNet` on Linux). Laid out like Python EpixNet - node
+/// files (`users.json`, `sites.json`, config) under `private/`, per-xite dirs
+/// under `data/` - so a Python install's identity and xites carry over as-is.
 pub fn data_root() -> PathBuf {
     if let Ok(dir) = std::env::var("EPIX_DATA_DIR") {
         if !dir.is_empty() {
