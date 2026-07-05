@@ -1410,10 +1410,15 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                         let target_ok = match (&ev.target, &ev.channel) {
                             (None, _) => true,
                             // Bound xite matches, or the connection joined this
-                            // channel for all sites (channelJoinAllsite).
+                            // channel for all sites (channelJoinAllsite), or the
+                            // event is for a site merged into this connection's
+                            // merger site (EpixNet forwards merged sites' events
+                            // to their merger's sockets - Git Epix's repo pages
+                            // track their repo site's download this way).
                             (Some(addr), channel) => {
                                 session.xite.as_deref() == Some(addr.as_str())
                                     || channel.as_deref().is_some_and(|ch| session.in_allsite(ch))
+                                    || merger_receives(&ctx.state, session.xite.as_deref(), addr).await
                             }
                         };
                         if channel_ok && target_ok && sink.send(Message::Text(ev.payload)).await.is_err() {
@@ -1427,6 +1432,24 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             }
         }
     }
+}
+
+/// Whether a session bound to `session_xite` should also receive events
+/// targeted at `target` because `target` is merged into it: the session's
+/// site holds a `Merger:<type>` permission matching the target's
+/// `merged_type`. Mirrors EpixNet's MergerSite plugin, which notifies a
+/// merger site's websockets about its merged sites' changes.
+async fn merger_receives(
+    state: &Arc<AppState>,
+    session_xite: Option<&str>,
+    target: &str,
+) -> bool {
+    let Some(merger) = session_xite else { return false };
+    if merger == target {
+        return false;
+    }
+    let Some(merged_type) = state.site_merged_type(target).await else { return false };
+    state.merger_types(merger).await.contains(&merged_type)
 }
 
 /// Parse one `{cmd, id, params}` request and format the EpixFrame response.

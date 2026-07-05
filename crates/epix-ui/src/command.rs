@@ -489,15 +489,46 @@ impl WsCommand for FileGet {
         "fileGet"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        // params may be a bare inner_path string or an object with `inner_path`.
+        // Params: a bare inner_path string, EpixNet's positional form
+        // `[inner_path, required, format, timeout]` (what EpixFS sends), or an
+        // object with those keys.
+        let arr = p.as_array();
         let inner_path = p
             .as_str()
+            .or_else(|| arr.and_then(|a| a.first()).and_then(|v| v.as_str()))
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
-            .ok_or("fileGet: missing inner_path")?;
+            .ok_or("fileGet: missing inner_path")?
+            .to_string();
+        let required = arr
+            .and_then(|a| a.get(1))
+            .and_then(|v| v.as_bool())
+            .or_else(|| p.get("required").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        let format = arr
+            .and_then(|a| a.get(2))
+            .and_then(|v| v.as_str())
+            .or_else(|| p.get("format").and_then(|v| v.as_str()))
+            .unwrap_or("text")
+            .to_string();
         // Route `cors-…` (Cors permission) and `merged-…` (MergerSite) paths.
-        let (target, inner) = s.resolve_target(inner_path).await?;
-        match s.state.read_file(&target, &inner).await {
-            Some(bytes) => Ok(Value::from(String::from_utf8_lossy(&bytes).into_owned())),
+        let (target, inner) = s.resolve_target(&inner_path).await?;
+        let mut bytes = s.state.read_file(&target, &inner).await;
+        if bytes.is_none() && required {
+            // EpixNet's needFile blocks (up to `timeout`, default 300s) until
+            // the file arrives. Our command handling is serial per connection,
+            // so a long wait here would freeze the session's other commands -
+            // wait briefly (covers a file landing mid-clone), then answer null.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while bytes.is_none() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                bytes = s.state.read_file(&target, &inner).await;
+            }
+        }
+        match bytes {
+            // base64 is how sites read binary files (git packs, images) over
+            // the WS; lossy text corrupts them.
+            Some(b) if format == "base64" => Ok(Value::from(b64_encode(&b))),
+            Some(b) => Ok(Value::from(String::from_utf8_lossy(&b).into_owned())),
             None => Ok(Value::Null),
         }
     }
@@ -1036,7 +1067,6 @@ impl WsCommand for FileWrite {
         "fileWrite"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let a = p.as_array();
         let inner_path = a
             .and_then(|a| a.first())
@@ -1049,7 +1079,10 @@ impl WsCommand for FileWrite {
             .and_then(|v| v.as_str())
             .ok_or("fileWrite: content_base64 required")?;
         let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
-        s.state.write_file(&address, inner_path, &bytes).await?;
+        // Route merged-/cors- prefixed paths to their real site (a merger page
+        // writes into its merged sites, e.g. starring a repo in the index).
+        let (target, inner) = s.resolve_target(inner_path).await?;
+        s.state.write_file(&target, &inner, &bytes).await?;
         Ok(Value::from("ok"))
     }
 }
