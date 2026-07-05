@@ -568,54 +568,101 @@ async fn sync_included_content(
     let mut ordered: Vec<(String, f64)> = paths.into_iter().collect();
     ordered.sort_by_key(|(p, _)| p.matches('/').count());
 
+    // Pre-warm the xID resolver cache: resolve every user's linked signers
+    // concurrently up front. The verification loop below then hits the warm
+    // cache instead of making one blocking chain call per user in sequence -
+    // over a phone's slow TLS that serialized 15+ resolves into minutes,
+    // which is why EpixTalk/EpixPost content took so long to appear on iOS.
+    let mut warm = tokio::task::JoinSet::new();
+    for (path, _) in &ordered {
+        if let Some(name) = user_dir_name(path) {
+            if name.contains('.') {
+                let name = name.to_string();
+                warm.spawn(async move {
+                    let (label, tld) = name.rsplit_once('.').unwrap_or((&name, "epix"));
+                    epix_chain::xid_signers::resolve(label, tld).await;
+                });
+            }
+        }
+    }
+    while warm.join_next().await.is_some() {}
+
     let mut child_files: Vec<epix_xite::FileEntry> = Vec::new();
     let mut arrived: Vec<String> = Vec::new();
-    let mut queue: std::collections::VecDeque<(String, f64)> = ordered.into();
     let mut seen: HashSet<String> = HashSet::new();
-    while let Some((path, peer_modified)) = queue.pop_front() {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        // The on-disk copy serves unless a peer advertises a newer version
-        // (new posts); add_content re-verifies either way before trusting it.
-        let disk = xite.storage().read(&path).ok();
-        let disk_modified = disk
-            .as_deref()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
-            .and_then(|j| j.get("modified").and_then(|v| v.as_f64()))
-            .unwrap_or(-1.0);
-        let mut fetched = false;
-        let bytes = if disk.is_some() && peer_modified <= disk_modified {
-            disk
-        } else {
-            match fetch_inner_file(transport.as_ref(), peers, address, &path).await {
-                Some(b) => {
-                    fetched = true;
-                    Some(b)
-                }
-                None => disk,
+    // Process content.json one depth level at a time: a level's files are
+    // fetched concurrently (the slow network I/O), then verified sequentially
+    // (add_content is CPU-only and needs the parent level's rules registered
+    // first). Shallower paths - data/users/content.json, whose user_contents
+    // rules the per-user files verify against - are their own earlier level,
+    // so they always land before the children that need them. Fetching one
+    // file at a time serialized 15+ slow per-peer round trips on iOS into
+    // minutes, so the data files at the end never got their turn.
+    //
+    // Concurrency is bounded: firing every user's fetch at once floods the
+    // handful of connected peers and starves some requests (including the
+    // parent's), so a semaphore caps in-flight fetches.
+    let fetch_cap = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut pending: std::collections::BTreeMap<usize, Vec<(String, f64)>> =
+        std::collections::BTreeMap::new();
+    for (p, m) in ordered {
+        pending.entry(p.matches('/').count()).or_default().push((p, m));
+    }
+    while let Some((_, level)) = pending.pop_first() {
+        let mut fetches = tokio::task::JoinSet::new();
+        for (path, peer_modified) in level {
+            if !seen.insert(path.clone()) {
+                continue;
             }
-        };
-        let Some(bytes) = bytes else { continue };
-        let xid_map = resolve_user_signers(&path).await;
-        match xite.add_content(&path, &bytes, &xid_map) {
-            Ok(files) => {
-                if fetched {
-                    arrived.push(path.clone());
+            let transport = transport.clone();
+            let peers = peers.to_vec();
+            let address = address.to_string();
+            let disk = xite.storage().read(&path).ok();
+            let cap = fetch_cap.clone();
+            fetches.spawn(async move {
+                let _permit = cap.acquire().await;
+                let disk_modified = disk
+                    .as_deref()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                    .and_then(|j| j.get("modified").and_then(|v| v.as_f64()))
+                    .unwrap_or(-1.0);
+                // The on-disk copy serves unless a peer advertises a newer
+                // version (new posts); add_content re-verifies either way.
+                if disk.is_some() && peer_modified <= disk_modified {
+                    return (path, disk, false);
                 }
-                child_files.extend(files);
-                // Recurse into nested includes this child declares.
-                for inc in xite.child_includes(&path) {
-                    if !seen.contains(&inc) {
-                        queue.push_back((inc, 0.0));
+                match fetch_inner_file(transport.as_ref(), &peers, &address, &path).await {
+                    Some(b) => (path, Some(b), true),
+                    None => (path, disk, false),
+                }
+            });
+        }
+        let mut fetched: Vec<(String, Vec<u8>, bool)> = Vec::new();
+        while let Some(res) = fetches.join_next().await {
+            if let Ok((path, Some(bytes), was_fetched)) = res {
+                fetched.push((path, bytes, was_fetched));
+            }
+        }
+        for (path, bytes, was_fetched) in fetched {
+            let xid_map = resolve_user_signers(&path).await; // warm cache: cheap
+            match xite.add_content(&path, &bytes, &xid_map) {
+                Ok(files) => {
+                    if was_fetched {
+                        arrived.push(path.clone());
+                    }
+                    child_files.extend(files);
+                    // A nested include lands in its own (deeper) level.
+                    for inc in xite.child_includes(&path) {
+                        if !seen.contains(&inc) {
+                            pending.entry(inc.matches('/').count()).or_default().push((inc, 0.0));
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                if let Some(state) = progress {
-                    state.log("WARNING", format!("Skipped {path}: {e}")).await;
+                Err(e) => {
+                    if let Some(state) = progress {
+                        state.log("WARNING", format!("Skipped {path}: {e}")).await;
+                    }
                 }
-                continue;
             }
         }
     }
@@ -670,6 +717,17 @@ fn walk_disk_content_json(root: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// The user-directory name in `data/users/<name>/content.json`, if the path has
+/// that shape (else `None`).
+fn user_dir_name(inner_path: &str) -> Option<&str> {
+    let parts: Vec<&str> = inner_path.split('/').collect();
+    if parts.len() >= 3 && parts[0] == "data" && parts[1] == "users" {
+        Some(parts[2])
+    } else {
+        None
+    }
+}
+
 /// Resolve the xID user-directory name in `data/users/<name>/content.json` to
 /// the chain addresses that may sign that user's content: the domain owner and
 /// its active identities. EpixTalk stores each user's posts under their xID and
@@ -679,11 +737,7 @@ async fn resolve_user_signers(
     inner_path: &str,
 ) -> std::collections::HashMap<String, Vec<String>> {
     let mut map = std::collections::HashMap::new();
-    let parts: Vec<&str> = inner_path.split('/').collect();
-    if parts.len() < 3 || parts[0] != "data" || parts[1] != "users" {
-        return map;
-    }
-    let name = parts[2];
+    let Some(name) = user_dir_name(inner_path) else { return map };
     if !name.contains('.') {
         return map;
     }
