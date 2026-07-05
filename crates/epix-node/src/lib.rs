@@ -1019,7 +1019,21 @@ impl OnDemand {
             // file_done per user-content file already fired as each file
             // landed (ingest_file), with the db updated first - the page,
             // served progressively, re-queried and showed each one live.
-            let _ = user_files;
+            //
+            // A complete-on-disk core short-circuits the clone WITHOUT the
+            // user-content pass - but "core complete" says nothing about the
+            // per-user files. An interrupted earlier clone (crash, restart)
+            // leaves exactly that state, and waiting for the next resync tick
+            // (minutes) shows a working page with an empty forum. Backfill in
+            // the background right away; it is one listModified when nothing
+            // is missing.
+            if bytes == 0 && user_files.is_empty() {
+                let state = self.state.clone();
+                let address = address.clone();
+                tokio::spawn(async move {
+                    state.sync_user_content(&address).await;
+                });
+            }
         }
         // The `.epix` name is display metadata on the address-keyed entry.
         if host != address {
