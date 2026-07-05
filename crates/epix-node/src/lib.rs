@@ -1020,13 +1020,6 @@ impl OnDemand {
             // landed (ingest_file), with the db updated first - the page,
             // served progressively, re-queried and showed each one live.
             let _ = user_files;
-            // Hide the loading screen: the wrapper closes on the file_done of
-            // its own index.html.
-            self.state.push_clone_event(
-                &address,
-                serde_json::json!(["file_done", "index.html"]),
-                serde_json::json!({ "content": content }),
-            );
         }
         // The `.epix` name is display metadata on the address-keyed entry.
         if host != address {

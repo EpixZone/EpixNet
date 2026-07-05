@@ -1597,17 +1597,33 @@ impl AppState {
             // before the db exists (a page served progressively mid-clone)
             // creates the schema and returns real (if still empty) rows.
             // Sites crash on an error here - their query callbacks iterate
-            // the result - and their boot never recovers.
-            let has_schema = self
-                .xites
-                .read()
-                .await
-                .get(address)
-                .map(|x| x.storage.exists("dbschema.json"))
-                .unwrap_or(false);
-            if has_schema {
-                self.rebuild_xite_db(address).await;
-                db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+            // the result - and their boot never recovers
+            // EpixNet's needFile, WAIT for the schema (bounded) instead of
+            // erroring - unless the root content.json is already known and
+            // declares no dbschema.json, in which case a db will never exist.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let (exists, declared) = {
+                    let xites = self.xites.read().await;
+                    match xites.get(address) {
+                        Some(x) => (
+                            x.storage.exists("dbschema.json"),
+                            x.content.as_ref().map(|c| {
+                                c.get("files").and_then(|f| f.get("dbschema.json")).is_some()
+                            }),
+                        ),
+                        None => (false, Some(false)),
+                    }
+                };
+                if exists {
+                    self.rebuild_xite_db(address).await;
+                    db = self.xites.read().await.get(address).and_then(|x| x.db.clone());
+                    break;
+                }
+                if declared == Some(false) || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
         }
         let db = db.ok_or_else(|| "xite has no database".to_string())?;
