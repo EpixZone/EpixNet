@@ -376,8 +376,8 @@ pub fn verify_content_file(
     let mut valid = 0u64;
     for address in &signers {
         if let Some(sig) = signs.get(address).and_then(|v| v.as_str()) {
-            // Epix accepts two signature schemes: the classic double-SHA256
-            // (ZeroNet) and keccak256 (chain / ethsecp256k1). User_contents
+            // Epix accepts two signature schemes: the classic
+            // double-SHA256 and keccak256 (chain / ethsecp256k1). User_contents
             // content is signed with keccak, so try both.
             if epix_crypt::verify(&data, address, sig)
                 || epix_crypt::verify_keccak(&data, address, sig)
@@ -416,7 +416,7 @@ fn is_valid_relative_path(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') || path.contains("..") {
         return false;
     }
-    // Reject characters ZeroNet/EpixNet forbid in inner paths.
+    // Reject characters EpixNet forbids in inner paths.
     !path.chars().any(|c| c.is_control() || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
 }
 

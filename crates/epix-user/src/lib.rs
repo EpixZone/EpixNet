@@ -302,6 +302,35 @@ impl User {
         self.auth_address(address)
     }
 
+    /// The standalone identity addresses (`_identity_*` entries), in index
+    /// order. These are the addresses a user links to an xID name; the cert
+    /// dialog checks them for an already-linked name and offers the first
+    /// unlinked one as "New". Site-derived auth addresses are not included.
+    pub fn identity_addresses(&self) -> Vec<String> {
+        let mut entries: Vec<(u64, String)> = self
+            .sites
+            .iter()
+            .filter_map(|(key, s)| {
+                let idx = key.strip_prefix("_identity_")?.parse::<u64>().ok()?;
+                Some((idx, s.auth_address.clone()))
+            })
+            .collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+        entries.into_iter().map(|(_, addr)| addr).collect()
+    }
+
+    /// The private key (WIF) for `address`: the master key, or a site/identity
+    /// auth key. `None` if this user doesn't control it.
+    pub fn privatekey_for(&self, address: &str) -> Option<String> {
+        if address == self.master_address {
+            return Some(self.master_seed.clone());
+        }
+        self.sites
+            .values()
+            .find(|s| s.auth_address == address)
+            .map(|s| s.auth_privatekey.clone())
+    }
+
     /// Generate a fresh standalone identity address from a dedicated index
     /// range, stored so its private key can be found later (for cert creation).
     /// Returns `(address, privatekey)`. Mirrors `generateNewIdentityAddress`.
@@ -447,26 +476,26 @@ mod tests {
         assert_eq!(u.cert_user_id("talk.epix"), None);
 
         // Add a cert bound to the site's own auth address, then select it.
-        assert_eq!(u.add_cert(&own, "zeroid.bit", "web", "alice", "sig").unwrap(), Some(true));
-        u.set_cert("talk.epix", Some("zeroid.bit")).unwrap();
-        assert_eq!(u.cert_user_id("talk.epix").as_deref(), Some("alice@zeroid.bit"));
+        assert_eq!(u.add_cert(&own, "xid.epix", "xid", "alice", "sig").unwrap(), Some(true));
+        u.set_cert("talk.epix", Some("xid.epix")).unwrap();
+        assert_eq!(u.cert_user_id("talk.epix").as_deref(), Some("alice@xid.epix"));
         // Cert shares the site's auth address here (bound to it), so auth is same.
         assert_eq!(u.auth_address("talk.epix").unwrap(), own);
 
         // Re-adding the same cert is a no-op; a different one needs confirmation.
-        assert_eq!(u.add_cert(&own, "zeroid.bit", "web", "alice", "sig").unwrap(), None);
-        assert_eq!(u.add_cert(&own, "zeroid.bit", "web", "bob", "sig2").unwrap(), Some(false));
+        assert_eq!(u.add_cert(&own, "xid.epix", "xid", "alice", "sig").unwrap(), None);
+        assert_eq!(u.add_cert(&own, "xid.epix", "xid", "bob", "sig2").unwrap(), Some(false));
     }
 
     #[test]
     fn cert_list_marks_selected() {
         let mut u = User::generate();
         let own = u.site_data("talk.epix").unwrap().auth_address.clone();
-        u.add_cert(&own, "zeroid.bit", "web", "alice", "s").unwrap();
-        u.set_cert("talk.epix", Some("zeroid.bit")).unwrap();
+        u.add_cert(&own, "xid.epix", "xid", "alice", "s").unwrap();
+        u.set_cert("talk.epix", Some("xid.epix")).unwrap();
         let list = u.cert_list("talk.epix");
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0]["domain"], "zeroid.bit");
+        assert_eq!(list[0]["domain"], "xid.epix");
         assert_eq!(list[0]["selected"], true);
     }
 
@@ -482,26 +511,50 @@ mod tests {
     }
 
     #[test]
+    fn identity_addresses_are_ordered_and_exclude_site_auths() {
+        let mut u = User::generate();
+        // A site-derived auth key (not an identity).
+        u.site_data("talk.epix").unwrap();
+        let site_auth = u.sites["talk.epix"].auth_address.clone();
+        // Two standalone identities, minted in order.
+        let (id1, pk1) = u.generate_new_identity_address().unwrap();
+        let (id2, _pk2) = u.generate_new_identity_address().unwrap();
+
+        let ids = u.identity_addresses();
+        assert_eq!(ids, vec![id1.clone(), id2.clone()], "identity order by index");
+        assert!(!ids.contains(&site_auth), "site auth is not an identity");
+
+        // privatekey_for finds identity keys, the site auth key, and master.
+        assert_eq!(u.privatekey_for(&id1).as_deref(), Some(pk1.as_str()));
+        assert_eq!(
+            u.privatekey_for(&site_auth).as_deref(),
+            Some(u.sites["talk.epix"].auth_privatekey.as_str())
+        );
+        assert_eq!(u.privatekey_for(&u.master_address).as_deref(), Some(u.master_seed.as_str()));
+        assert_eq!(u.privatekey_for("epix1nope"), None);
+    }
+
+    #[test]
     fn users_json_is_python_keyed_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.json");
         let mut u = User::generate();
         u.site_data("talk.epix").unwrap();
         let own = u.sites["talk.epix"].auth_address.clone();
-        u.add_cert(&own, "zeroid.bit", "web", "alice", "sig").unwrap();
-        u.set_cert("talk.epix", Some("zeroid.bit")).unwrap();
+        u.add_cert(&own, "xid.epix", "xid", "alice", "sig").unwrap();
+        u.set_cert("talk.epix", Some("xid.epix")).unwrap();
         u.save(&path).unwrap();
 
         // The file is keyed by master address, with a top-level certs map.
         let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let entry = &raw[&u.master_address];
         assert_eq!(entry["master_seed"], u.master_seed);
-        assert_eq!(entry["certs"]["zeroid.bit"]["auth_user_name"], "alice");
-        assert_eq!(entry["sites"]["talk.epix"]["cert"], "zeroid.bit");
+        assert_eq!(entry["certs"]["xid.epix"]["auth_user_name"], "alice");
+        assert_eq!(entry["sites"]["talk.epix"]["cert"], "xid.epix");
 
         let loaded = User::load_or_create(&path).unwrap();
         assert_eq!(loaded.master_seed, u.master_seed);
-        assert_eq!(loaded.cert_user_id("talk.epix").as_deref(), Some("alice@zeroid.bit"));
+        assert_eq!(loaded.cert_user_id("talk.epix").as_deref(), Some("alice@xid.epix"));
     }
 
     #[test]
