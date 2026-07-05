@@ -838,16 +838,21 @@ impl WsCommand for SiteInfo {
         let address = s.address()?;
         let mut info = s.state.site_info(address).await;
         // file_status (EpixNet's actionSiteInfo): the loading-screen wrapper
-        // asks about its index.html on connect. If the file already landed,
-        // answer with its file_done event - the live event fires early in the
-        // download and is missed when the WS connects after it, which left
-        // the loading screen up until the whole clone finished.
+        // asks about its index.html on connect. If the file already landed
+        // AND the core set is complete, answer with its file_done event - the
+        // live event is missed when the WS connects after it fired, which
+        // left the loading screen up forever. The core-complete gate matters
+        // on a refresh mid-clone: index.html downloads first, and dismissing
+        // on it alone drops the user into a site with its styles and scripts
+        // still missing.
         let file_status = p
             .get("file_status")
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_str());
         if let (Some(path), Value::Object(m)) = (file_status, &mut info) {
-            if s.state.xite_file_exists(address, path).await {
+            if s.state.xite_file_exists(address, path).await
+                && s.state.xite_core_complete(address).await
+            {
                 m.insert("event".to_string(), json!(["file_done", path]));
             }
         }

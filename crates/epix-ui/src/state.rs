@@ -3002,6 +3002,22 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// Whether every file the ROOT content.json declares is present and
+    /// hash-verified on disk (the core set: html/css/js - not per-user
+    /// content). The loading screen dismisses on this, not on index.html
+    /// alone: index.html downloads first, and entering a half-downloaded
+    /// site with its styles and scripts still missing reads as broken.
+    pub async fn xite_core_complete(&self, address: &str) -> bool {
+        let (storage, canonical) = {
+            let xites = self.xites.read().await;
+            let Some(x) = self.resolve_xite(&xites, address) else { return false };
+            (x.storage.clone(), canonical_address(x.content.as_ref(), address))
+        };
+        let Ok(addr) = Address::parse(canonical) else { return false };
+        let mut xite = Xite::new(addr, storage);
+        xite.load_content().unwrap_or(false) && xite.files_needed().is_empty()
+    }
+
     /// Progressive serve during an on-demand clone: the state of one file of a
     /// xite that is downloading but not yet registered.
     pub fn loading_file(&self, address: &str, inner_path: &str) -> LoadingFile {
