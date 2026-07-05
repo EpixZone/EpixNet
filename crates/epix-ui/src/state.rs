@@ -3018,11 +3018,16 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// Whether every file the ROOT content.json declares is present and
-    /// hash-verified on disk (the core set: html/css/js - not per-user
+    /// Whether every file the ROOT content.json declares is present on disk
+    /// with its declared size (the core set: html/css/js - not per-user
     /// content). The loading screen dismisses on this, not on index.html
     /// alone: index.html downloads first, and entering a half-downloaded
     /// site with its styles and scripts still missing reads as broken.
+    ///
+    /// Size check only, EpixNet's quick_check: the files were hash-verified
+    /// when the workers wrote them, and this runs on EVERY wrapper connect
+    /// (the file_status probe) - reading and SHA512ing a whole site per page
+    /// load would make big sites expensive to open.
     pub async fn xite_core_complete(&self, address: &str) -> bool {
         let (storage, canonical) = {
             let xites = self.xites.read().await;
@@ -3030,8 +3035,17 @@ impl AppState {
             (x.storage.clone(), canonical_address(x.content.as_ref(), address))
         };
         let Ok(addr) = Address::parse(canonical) else { return false };
-        let mut xite = Xite::new(addr, storage);
-        xite.load_content().unwrap_or(false) && xite.files_needed().is_empty()
+        let mut xite = Xite::new(addr, storage.clone());
+        if !xite.load_content().unwrap_or(false) {
+            return false;
+        }
+        xite.files().iter().all(|f| {
+            storage
+                .path(&f.inner_path)
+                .ok()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .is_some_and(|m| m.len() as i64 == f.size)
+        })
     }
 
     /// Progressive serve during an on-demand clone: the state of one file of a
