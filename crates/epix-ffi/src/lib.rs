@@ -62,6 +62,11 @@ struct Inner {
     /// Set once the node boots; drives status/resolve queries.
     node: Option<Arc<AppState>>,
     error: Option<String>,
+    /// The UI bind that actually succeeded (from the running node, so it is
+    /// right even when the requested port was 0 or taken).
+    ui_addr: Option<std::net::SocketAddr>,
+    /// The display name (`dashboard.epix` or the raw address) the node opened.
+    display: Option<String>,
 }
 
 /// The embedded Epix node. One per app; `start()` boots it on its own runtime.
@@ -83,7 +88,13 @@ impl EpixNode {
             .expect("build tokio runtime");
         Arc::new(Self {
             rt,
-            inner: Mutex::new(Inner { state: NodeState::Idle, node: None, error: None }),
+            inner: Mutex::new(Inner {
+                state: NodeState::Idle,
+                node: None,
+                error: None,
+                ui_addr: None,
+                display: None,
+            }),
         })
     }
 
@@ -123,6 +134,8 @@ impl EpixNode {
         let mut inner = self.inner.lock().unwrap();
         match booted {
             Ok(running) => {
+                inner.ui_addr = Some(running.ui_addr);
+                inner.display = Some(running.display.clone());
                 inner.node = Some(running.state);
                 inner.state = NodeState::Serving;
                 Ok(())
@@ -152,10 +165,13 @@ impl EpixNode {
         if inner.state != NodeState::Serving {
             return None;
         }
-        // The display name is stored on the state's served xites; the shell
-        // opened `target`, so reconstruct the base URL from the bind. The shell
-        // appends the resolved display itself if it needs a specific xite.
-        Some(format!("http://{}/", ui_bind_of(&inner)))
+        // The bind and display recorded from the RUNNING node - correct even
+        // when the shell asked for port 0 or a non-default bind. (This used to
+        // return the compile-time default port regardless of config, sending
+        // shells to a port nothing listened on.)
+        let addr = inner.ui_addr?;
+        let display = inner.display.as_deref()?;
+        Some(format!("http://{addr}/{display}/"))
     }
 
     /// Our onion address (no `.onion` suffix), once the onion service has
@@ -207,9 +223,3 @@ pub struct TorStatus {
     pub status: String,
 }
 
-/// The UI bind recorded on the running node (falls back to the default).
-fn ui_bind_of(_inner: &Inner) -> String {
-    // The AppState doesn't expose its bind; the shell passes ui_addr in and
-    // knows it. This keeps the default in one place for the common case.
-    epix_node::DEFAULT_UI_ADDR.to_string()
-}

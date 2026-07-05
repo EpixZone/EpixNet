@@ -42,3 +42,4 @@ PLAN.md
 **/mutants.out*/
 dist/
 app-icon.png
+ios/Generated/
