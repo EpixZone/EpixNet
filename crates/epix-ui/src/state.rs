@@ -2886,7 +2886,12 @@ impl AppState {
     /// subscription (`None` = ungated); `target` gates by xite (`None` = any).
     /// No-op if nothing is listening.
     fn push_event(&self, cmd: &str, params: Value, channel: Option<&str>, target: Option<String>) {
-        let payload = json!({ "cmd": cmd, "params": params, "to": Value::Null }).to_string();
+        // Every pushed command carries a unique id, like EpixNet's
+        // UiWebsocket.cmd - the wrapper keys notification toasts on it
+        // (`notification-ws-<id>`), so without one every toast shares a key
+        // and replaces the previous.
+        let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
+        let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
         let _ = self.events.send(UiEvent { channel: channel.map(str::to_string), target, payload });
     }
 
@@ -3151,7 +3156,12 @@ impl AppState {
         let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.callbacks.lock().unwrap().insert(id, tx);
-        let payload = json!({ "cmd": cmd, "params": params, "to": id }).to_string();
+        // The wrapper answers a pushed confirm/prompt with
+        // `{cmd:"response", to: message.id}` - so the callback key must go out
+        // as `id` (EpixNet's UiWebsocket.cmd does the same). Sent as `to`, the
+        // reply comes back without an id and the waiting future times out
+        // silently: an "Add N new site?" dialog whose Add button does nothing.
+        let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
         let _ = self.events.send(UiEvent { channel: None, target, payload });
         rx
     }
@@ -5708,14 +5718,15 @@ mod tests {
         let s2 = s.clone();
         let handle = tokio::spawn(async move { s2.confirm("talk.epix", "Sure?", "Yes").await });
 
-        // The pushed confirm event carries a `to` id we reply to.
+        // The pushed confirm event carries an `id` the wrapper replies to
+        // (`{cmd:"response", to: message.id}`, EpixNet's shape).
         let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
             .await
             .unwrap()
             .unwrap();
         let payload: Value = serde_json::from_str(&ev.payload).unwrap();
         assert_eq!(payload["cmd"], "confirm");
-        let to = payload["to"].as_i64().unwrap();
+        let to = payload["id"].as_i64().unwrap();
         assert!(s.resolve_callback(to, json!(true)));
 
         // confirm() now resolves to the wrapper's answer.
