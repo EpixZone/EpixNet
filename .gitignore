@@ -43,3 +43,6 @@ PLAN.md
 dist/
 app-icon.png
 ios/Generated/
+# Xcode per-user / generated state
+ios/**/xcuserdata/
+ios/**/project.xcworkspace/
