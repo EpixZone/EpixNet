@@ -3996,14 +3996,19 @@ impl AppState {
             return None;
         }
         let mut out = Vec::new();
-        let mut stack = vec![start];
+        let mut stack = vec![start.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if let Ok(rel) = path.strip_prefix(&root) {
+                } else if let Ok(rel) = path.strip_prefix(&start) {
+                    // Relative to the REQUESTED dir, not the site root:
+                    // EpixNet's storage.walk(inner_path) yields the same, and
+                    // sites join the names back onto the dir they asked for
+                    // (git.js builds "objects/pack/" + name to load pack
+                    // indexes - root-relative paths broke that).
                     out.push(rel.to_string_lossy().replace('\\', "/"));
                 }
             }
