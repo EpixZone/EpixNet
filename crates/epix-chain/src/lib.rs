@@ -16,6 +16,19 @@ pub use resolver::{XidResolver, DEFAULT_RPC_URL};
 pub use types::{DomainSnapshot, Identity};
 pub use vrf::{combine_beacons, derive_random, Beacon, Vrf};
 
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// One process-wide `XidResolver` against the default RPC, so every resolve
+/// reuses its HTTP connection pool (one TLS handshake instead of one per call)
+/// and its short-lived digest cache (one digest fetch per burst, not per
+/// name). Built lazily on first use so it captures the chain-socks setting the
+/// node configured at boot.
+pub fn shared_resolver() -> Arc<XidResolver> {
+    static SHARED: OnceLock<Arc<XidResolver>> = OnceLock::new();
+    SHARED.get_or_init(|| Arc::new(XidResolver::new(DEFAULT_RPC_URL))).clone()
+}
+
 use thiserror::Error;
 
 /// The SOCKS proxy every chain RPC routes through, if set - the node's Arti
@@ -74,7 +87,6 @@ pub type Result<T> = std::result::Result<T, ChainError>;
 /// and cache the result. A rarely-changing mapping that would otherwise cost
 /// one RPC per user per resync cycle.
 pub mod xid_signers {
-    use super::XidResolver;
     use std::collections::HashMap;
     use std::sync::RwLock;
     use std::time::{Duration, Instant};
@@ -110,8 +122,7 @@ pub mod xid_signers {
         if let Some(hit) = cached(&key) {
             return hit;
         }
-        let resolver = XidResolver::new(super::DEFAULT_RPC_URL);
-        let Ok(domain) = resolver.resolve(name, tld).await else {
+        let Ok(domain) = super::shared_resolver().resolve(name, tld).await else {
             return Vec::new();
         };
         let signers: Vec<String> =
@@ -130,7 +141,7 @@ pub mod xid_signers {
 /// briefly (transient failures don't cache at all), positives cache long -
 /// this is what stops sites from hammering the chain once per render.
 pub mod xid_identity {
-    use super::{XidResolver, DEFAULT_RPC_URL};
+    use super::DEFAULT_RPC_URL;
     use std::collections::HashMap;
     use std::sync::RwLock;
     use std::time::{Duration, Instant};
@@ -197,8 +208,7 @@ pub mod xid_identity {
             return None;
         }
         // Step 2: confirm through the Merkle-verified forward resolve.
-        let resolver = XidResolver::new(DEFAULT_RPC_URL);
-        let domain = resolver.resolve(name, tld).await.ok()?;
+        let domain = super::shared_resolver().resolve(name, tld).await.ok()?;
         let Some(ident) = domain.identities.iter().find(|i| i.address == address) else {
             // Verified domain doesn't actually contain this identity.
             store(address.to_string(), None);
@@ -228,8 +238,7 @@ pub mod xid_identity {
         if let Some(hit) = cached(fqdn) {
             return hit;
         }
-        let resolver = XidResolver::new(DEFAULT_RPC_URL);
-        let domain = match resolver.resolve(name, tld).await {
+        let domain = match super::shared_resolver().resolve(name, tld).await {
             Ok(d) => d,
             Err(super::ChainError::NotFound(_)) => {
                 store(fqdn.to_string(), None);

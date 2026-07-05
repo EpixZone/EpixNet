@@ -17,7 +17,18 @@ pub struct XidResolver {
     rpc_url: String,
     cache: RwLock<HashMap<String, (DomainSnapshot, Instant)>>,
     ttl: Duration,
+    /// The last digest confirmed finalized, cached briefly. Every resolve
+    /// checks its proof against the current attested + finalized digest; that
+    /// digest is global chain state, identical for every name resolved in the
+    /// same moment. Caching it turns a burst of N resolves from 3N HTTP calls
+    /// (proof + digest + attestations, each) into N + 2.
+    digest: RwLock<Option<(String, Instant)>>,
 }
+
+/// How long a confirmed-finalized digest is reused. Short: the digest advances
+/// each block, so a proof for a just-changed name must still be verifiable, but
+/// long enough that one burst of resolves shares a single digest fetch.
+const DIGEST_TTL: Duration = Duration::from_secs(3);
 
 impl XidResolver {
     pub fn new(rpc_url: impl Into<String>) -> Self {
@@ -27,6 +38,7 @@ impl XidResolver {
             rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
             cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(30 * 60),
+            digest: RwLock::new(None),
         }
     }
 
@@ -79,21 +91,16 @@ impl XidResolver {
             return Err(ChainError::MerkleInvalid);
         }
 
-        // Step 2 - proof root must equal the current attested state digest.
-        let digest_info = self
-            .get_json(&format!("{}/xid/v1/state_digest", self.rpc_url))
-            .await?;
-        let attested = str_field(&digest_info, "digest")?;
-        if proof_root != attested {
+        // Step 2+3 - the proof root must equal a state digest that validators
+        // have finalized. The finalized digest is cached briefly (it is global
+        // chain state), so a burst of resolves shares one digest fetch. A
+        // proof that doesn't match the cached digest (its name changed since)
+        // forces a fresh fetch before we reject it, so caching never yields a
+        // false negative.
+        if !self.digest_matches(proof_root, false).await?
+            && !self.digest_matches(proof_root, true).await?
+        {
             return Err(ChainError::DigestMismatch);
-        }
-
-        // Step 3 - digest must be finalized by validators.
-        let att = self
-            .get_json(&format!("{}/xid/v1/attestations?digest={attested}", self.rpc_url))
-            .await?;
-        if !att.get("finalized").and_then(|v| v.as_bool()).unwrap_or(false) {
-            return Err(ChainError::NotFinalized);
         }
 
         let snapshot = parse_domain(name, tld, domain)?;
@@ -102,6 +109,32 @@ impl XidResolver {
             .await
             .insert(key, (snapshot.clone(), Instant::now()));
         Ok(snapshot)
+    }
+
+    /// Whether `proof_root` equals the current attested + finalized state
+    /// digest. `force_fresh` bypasses the short-lived digest cache and fetches
+    /// (and re-verifies finalization of) a fresh digest.
+    async fn digest_matches(&self, proof_root: &str, force_fresh: bool) -> Result<bool> {
+        if !force_fresh {
+            if let Some((digest, at)) = self.digest.read().await.as_ref() {
+                if at.elapsed() < DIGEST_TTL {
+                    return Ok(digest == proof_root);
+                }
+            }
+        }
+        // Fetch the current digest and confirm validators finalized it.
+        let digest_info =
+            self.get_json(&format!("{}/xid/v1/state_digest", self.rpc_url)).await?;
+        let attested = str_field(&digest_info, "digest")?.to_string();
+        let att = self
+            .get_json(&format!("{}/xid/v1/attestations?digest={attested}", self.rpc_url))
+            .await?;
+        if !att.get("finalized").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(ChainError::NotFinalized);
+        }
+        let matches = attested == proof_root;
+        *self.digest.write().await = Some((attested, Instant::now()));
+        Ok(matches)
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
