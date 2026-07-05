@@ -156,6 +156,17 @@ impl User {
         })
     }
 
+    /// The private key that signs as [`Self::auth_address`] - the selected
+    /// cert's if one is active, otherwise the xite's own derived key. Mirrors
+    /// EpixNet's `getAuthPrivatekey` (what signs the user's content.json).
+    pub fn auth_privatekey(&mut self, address: &str) -> Result<String, String> {
+        let own = self.site_data(address)?.auth_privatekey.clone();
+        Ok(match self.get_cert(address) {
+            Some(cert) => cert.auth_privatekey.clone(),
+            None => own,
+        })
+    }
+
     /// The per-xite CryptMessage **encryption** private key (WIF), derived like
     /// EpixNet: `hd_privatekey(master_seed, auth_index(address) + 1000 + index)`.
     pub fn encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {

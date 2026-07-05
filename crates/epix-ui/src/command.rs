@@ -1110,6 +1110,12 @@ impl WsCommand for FileWrite {
         // writes into its merged sites, e.g. starring a repo in the index).
         let (target, inner) = s.resolve_target(inner_path).await?;
         s.state.write_file(&target, &inner, &bytes).await?;
+        // Ingest written data files into the xite's database right away (like
+        // EpixNet's storage.onUpdated), so the page's dbQuery sees the change
+        // before the sign/publish round-trip.
+        if inner.ends_with(".json") && !inner.ends_with("content.json") {
+            s.state.ingest_file(&target, &inner).await;
+        }
         Ok(Value::from("ok"))
     }
 }
@@ -1273,6 +1279,9 @@ impl WsCommand for SiteUpdate {
 }
 
 /// `siteSign(privatekey, inner_path)` - rebuild + sign content.json.
+/// `siteSign(privatekey, inner_path)` - sign the content.json governing
+/// `inner_path`: the root one with the site's own key, a user/include one as
+/// the current user (cert + auth key), like EpixNet's `actionSiteSign`.
 struct SiteSign;
 #[async_trait]
 impl WsCommand for SiteSign {
@@ -1280,18 +1289,20 @@ impl WsCommand for SiteSign {
         "siteSign"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
-        let privatekey = match sign_privatekey(p) {
-            Some(pk) => pk,
-            None => s.state.site_privatekey(&address).await.ok_or("siteSign: privatekey required")?,
-        };
-        s.state.sign_xite(&address, &privatekey).await?;
+        let inner_path = p
+            .get("inner_path")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str())
+            .unwrap_or("content.json");
+        // Merger sites sign into their merged site (`merged-…/` paths).
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        sign_for(s, &address, &inner_path, sign_privatekey(p)).await?;
         Ok(Value::from("ok"))
     }
 }
 
 /// `sitePublish(privatekey, inner_path, sign)` - sign (unless told not to) then
-/// push the content.json to peers.
+/// push the governing content.json to peers.
 struct SitePublish;
 #[async_trait]
 impl WsCommand for SitePublish {
@@ -1299,26 +1310,58 @@ impl WsCommand for SitePublish {
         "sitePublish"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let inner_path = p
             .get("inner_path")
             .or_else(|| p.as_array().and_then(|a| a.get(1)))
             .and_then(|v| v.as_str())
-            .unwrap_or("content.json")
-            .to_string();
-        // Sign first with the given key, or the saved site key; if neither, the
-        // file is assumed already signed.
-        let key = sign_privatekey(p);
-        let key = match key {
-            Some(pk) => Some(pk),
-            None => s.state.site_privatekey(&address).await,
-        };
-        if let Some(pk) = key {
-            s.state.sign_xite(&address, &pk).await?;
+            .unwrap_or("content.json");
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        let sign = p.get("sign").and_then(|v| v.as_bool()).unwrap_or(true);
+        let inner_path = s.state.content_inner_path(&address, &inner_path).await;
+        if sign {
+            if inner_path == "content.json" {
+                // Root: sign with the given key or the saved site key; with
+                // neither, the file is assumed already signed.
+                let key = match sign_privatekey(p) {
+                    Some(pk) => Some(pk),
+                    None => s.state.site_privatekey(&address).await,
+                };
+                if let Some(pk) = key {
+                    s.state.sign_xite(&address, &pk).await?;
+                }
+            } else {
+                s.state.sign_user_content(&address, &inner_path, sign_privatekey(p)).await?;
+            }
         }
         let published = s.state.publish(&address, &inner_path).await?;
         Ok(json!(format!("Published to {published} peers.")))
     }
+}
+
+/// Sign the content.json governing `inner_path` and return its path: the root
+/// content.json needs the site's own key (explicit or stored); any other one
+/// is user/include content signed as the current user.
+async fn sign_for(
+    s: &WsSession,
+    address: &str,
+    inner_path: &str,
+    privatekey: Option<String>,
+) -> Result<String, String> {
+    let content_path = s.state.content_inner_path(address, inner_path).await;
+    if content_path == "content.json" {
+        let key = match privatekey {
+            Some(pk) => pk,
+            None => s
+                .state
+                .site_privatekey(address)
+                .await
+                .ok_or("siteSign: privatekey required")?,
+        };
+        s.state.sign_xite(address, &key).await?;
+    } else {
+        s.state.sign_user_content(address, &content_path, privatekey).await?;
+    }
+    Ok(content_path)
 }
 
 /// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON

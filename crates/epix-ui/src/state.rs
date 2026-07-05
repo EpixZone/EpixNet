@@ -4226,6 +4226,119 @@ impl AppState {
         Ok(bytes)
     }
 
+    /// The content.json that governs `inner_path`: itself when it already is
+    /// one, else the nearest content.json up the directory tree that exists on
+    /// disk, falling back to the root (EpixNet's
+    /// `getFileInfo()["content_inner_path"]`). EpixTalk publishes with the
+    /// data file's path (`data/users/<xid>/data.json`), so this picks the
+    /// user's own content.json to sign.
+    pub async fn content_inner_path(&self, address: &str, inner_path: &str) -> String {
+        if inner_path == "content.json" || inner_path.ends_with("/content.json") {
+            return inner_path.to_string();
+        }
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return "content.json".to_string();
+        };
+        let mut dir = inner_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        loop {
+            if dir.is_empty() {
+                return "content.json".to_string();
+            }
+            let candidate = format!("{dir}/content.json");
+            if let Ok(bytes) = storage.read(&candidate) {
+                // A user_contents parent governs per-user dirs below it: the
+                // file's content.json is <user dir>/content.json even when it
+                // doesn't exist yet (a user's first post creates it).
+                let has_user_contents = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .is_some_and(|c| c.get("user_contents").is_some());
+                if has_user_contents {
+                    let rel = inner_path.strip_prefix(&format!("{dir}/")).unwrap_or("");
+                    if let Some((user_seg, _)) = rel.split_once('/') {
+                        return format!("{dir}/{user_seg}/content.json");
+                    }
+                }
+                return candidate;
+            }
+            dir = dir.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        }
+    }
+
+    /// Sign a non-root content.json as the current user (EpixNet's
+    /// `actionSiteSign` for user content): attach the selected cert's fields,
+    /// sign with the cert identity's key (or the xite's derived auth key, or
+    /// an explicit `privatekey`), verify against the parent's rules, store,
+    /// and ingest into the xite's database so the change shows immediately.
+    pub async fn sign_user_content(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        privatekey: Option<String>,
+    ) -> Result<(), String> {
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+
+        // The cert fields to extend the content.json with, and the signing key.
+        let (extend, key) = {
+            let mut user = self.user.write().await;
+            let mut extend = serde_json::Map::new();
+            if privatekey.is_none() {
+                if let Some(id) = user.cert_user_id(address) {
+                    if let Some(cert) = user.get_cert(address) {
+                        extend.insert("cert_auth_type".into(), json!(cert.auth_type));
+                        extend.insert("cert_sign".into(), json!(cert.cert_sign));
+                    }
+                    extend.insert("cert_user_id".into(), json!(id));
+                }
+            }
+            let key = match privatekey {
+                Some(k) => k,
+                None => user.auth_privatekey(address)?,
+            };
+            (extend, key)
+        };
+        self.save_user().await; // auth_privatekey may have derived the site entry
+
+        // An xID-named user directory (`data/users/facts.epix/…`) is signed by
+        // the identity that xID belongs to; resolve the allowed signers from
+        // the chain so verification can match the signature (as inbound
+        // updates do).
+        let mut xid_map = std::collections::HashMap::new();
+        let dir_name = content_inner_path
+            .rsplit_once('/')
+            .map(|(d, _)| d)
+            .and_then(|d| d.rsplit_once('/').map(|(_, n)| n).or(Some(d)))
+            .unwrap_or("");
+        if dir_name.contains('.') {
+            let (label, tld) = dir_name.rsplit_once('.').unwrap_or((dir_name, "epix"));
+            let signers = epix_chain::xid_signers::resolve(label, tld).await;
+            if !signers.is_empty() {
+                xid_map.insert(dir_name.to_string(), signers);
+            }
+        }
+
+        let prev = storage
+            .read(content_inner_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let modified = (now_secs() as f64).max(prev + 1.0);
+
+        let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
+        let xite = Xite::new(addr, storage);
+        xite.sign_child(content_inner_path, &key, modified, &extend, &xid_map)
+            .map_err(|e| e.to_string())?;
+        self.log("INFO", format!("Signed {content_inner_path} on {address}")).await;
+        self.ingest_file(address, content_inner_path).await;
+        Ok(())
+    }
+
     /// Publish `inner_path` to the xite's connectable peers via the `update`
     /// command. Returns how many peers accepted it. `sitePublish`.
     pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
@@ -4257,18 +4370,36 @@ impl AppState {
         let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
         let peers = self.connectable_peers(address, limit).await;
 
-        let mut published = 0;
+        // Push to every candidate concurrently (EpixNet publishes with
+        // parallel workers): a page waits on the sitePublish reply, so dead
+        // peers must cost one bounded timeout, not a serial sum of them.
+        let mut set = tokio::task::JoinSet::new();
         for peer in peers {
-            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else { continue };
-            if conn.handshake().await.is_err() {
-                continue;
-            }
-            if conn.update(address, inner_path, &body, modified).await.is_ok() {
+            let transport = transport.clone();
+            let address = address.to_string();
+            let inner_path = inner_path.to_string();
+            let body = body.clone();
+            set.spawn(async move {
+                let push = async {
+                    let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
+                    conn.handshake().await.ok()?;
+                    conn.update(&address, &inner_path, &body, modified).await.ok()?;
+                    // Live-hook: tell the peer (acting as a propagation node)
+                    // about the new version so peers that are offline now can
+                    // pull it later.
+                    let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
+                    Some(peer)
+                };
+                // Bounds the whole sitePublish reply: reachable peers answer in
+                // ~1-3s, so 10s only ever pays for dead candidates.
+                tokio::time::timeout(std::time::Duration::from_secs(10), push).await.ok().flatten()
+            });
+        }
+        let mut published = 0;
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(peer)) = res {
                 self.set_peer_connected(address, &peer, true).await;
                 published += 1;
-                // Live-hook: tell the peer (acting as a propagation node) about
-                // the new version so peers that are offline now can pull it later.
-                let _ = epix_propagation::announce_update(&mut conn, address, modified as i64).await;
             }
         }
         Ok(published)
@@ -4799,7 +4930,16 @@ impl AppState {
             .auth_address(address)
             .unwrap_or_default();
         let cert_user_id = self.user.read().await.cert_user_id(address);
-        let xid_directory = format!("users/{auth_address}");
+        // The user's directory name under data/users/ (EpixNet's
+        // `getUserDirectory`): the xID cert's `<name>.epix` when one is
+        // selected, else the auth address. EpixTalk-style pages build their
+        // write paths from this.
+        let xid_directory = match self.user.read().await.get_cert(address) {
+            Some(cert) if cert.auth_type == "xid" && !cert.auth_user_name.is_empty() => {
+                format!("{}.epix", cert.auth_user_name)
+            }
+            _ => auth_address.clone(),
+        };
 
         let address_hash = hex::encode(Sha256::digest(address.as_bytes()));
         let short = if address.len() > 6 { &address[..6] } else { address };
@@ -5386,7 +5526,9 @@ mod tests {
         );
         // Real derived identity.
         assert!(info["auth_address"].as_str().unwrap().starts_with("epix1"));
-        assert_eq!(info["xid_directory"].as_str().unwrap(), format!("users/{}", info["auth_address"].as_str().unwrap()));
+        // No cert selected: the user directory is the bare auth address
+        // (EpixNet's getUserDirectory; an xid cert would make it <name>.epix).
+        assert_eq!(info["xid_directory"], info["auth_address"]);
 
         // Real stats from content.json.
         assert_eq!(info["settings"]["size"], 350);
@@ -6007,6 +6149,57 @@ mod tests {
         let s = AppState::with_data_dir("test", dir.path());
         assert_eq!(s.user.read().await.master_address, master);
         assert_eq!(s.xite_dir("epix1xite").unwrap(), dir.path().join("data/epix1xite"));
+    }
+
+    #[tokio::test]
+    async fn user_content_signs_with_the_users_auth_key() {
+        // The EpixTalk topic flow: fileWrite the data file, then siteSign /
+        // sitePublish with its inner_path - the node maps it to the user's own
+        // content.json, hashes the dir, and signs as the user. A classic
+        // auth-address-named user dir needs no chain resolution.
+        let root = tempdir().unwrap();
+        let site = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        let storage = XiteStorage::new(root.path().join("data").join(&site));
+        let users_content = json!({
+            "address": site,
+            "inner_path": "data/users/content.json",
+            "user_contents": { "permissions": {}, "cert_signers": {} }
+        });
+        storage
+            .write("data/users/content.json", &serde_json::to_vec(&users_content).unwrap())
+            .unwrap();
+        state
+            .add_xite(&site, XiteEntry {
+                storage: storage.clone(),
+                content: Some(json!({ "address": site, "files": {} })),
+            })
+            .await;
+
+        let auth = state.user.write().await.auth_address(&site).unwrap();
+        let dir = format!("data/users/{auth}");
+        let data_path = format!("{dir}/data.json");
+        state.write_file(&site, &data_path, br#"{"topic":[{"topic_id":1}]}"#).await.unwrap();
+
+        // The data file maps to the governing (user's own) content.json.
+        let content_path = state.content_inner_path(&site, &data_path).await;
+        assert_eq!(content_path, format!("{dir}/content.json"));
+
+        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        let signed: Value =
+            serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
+        assert!(signed["signs"][&auth].is_string(), "signed by the user's auth key: {signed}");
+        assert!(signed["files"]["data.json"]["sha512"].is_string(), "data.json hashed");
+        assert_eq!(signed["inner_path"], json!(content_path));
+        assert_eq!(signed["address"], json!(site));
+
+        // Re-signing after an edit bumps modified and re-verifies.
+        let first = signed["modified"].as_f64().unwrap();
+        state.write_file(&site, &data_path, br#"{"topic":[{"topic_id":1},{"topic_id":2}]}"#).await.unwrap();
+        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        let resigned: Value =
+            serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
+        assert!(resigned["modified"].as_f64().unwrap() > first);
     }
 
     #[tokio::test]
