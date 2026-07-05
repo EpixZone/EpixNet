@@ -3456,18 +3456,110 @@ impl AppState {
                 self.rebuild_merger_dbs().await;
             }
             self.log("INFO", format!("Synced user content for {address} ({bytes} bytes)")).await;
-            // file_done per arrived file (EpixNet fires these as files land):
-            // open pages re-query their db on it - EpixSites' list, EpixTalk's
-            // topics. Must come after the rebuild so the query finds the rows.
-            if files.is_empty() {
-                self.push_site_info(address).await;
-            } else {
-                for f in &files {
-                    self.push_site_info_file_done(address, f).await;
+            // Per-file file_done events already fired as each file landed
+            // (ingest_file); one site_info refreshes the aggregate counts.
+            let _ = files;
+            self.push_site_info(address).await;
+        }
+        bytes
+    }
+
+    /// Ingest ONE just-arrived file into the xite's database (and, when the
+    /// xite is a merged site, into every merger database aggregating it),
+    /// then push its `file_done` event so open pages re-query. EpixNet does
+    /// this per file as it is written (`SiteStorage.onUpdated` ->
+    /// `Db.updateJson` -> websocket `file_done`), which is what makes
+    /// topics/posts pop in one by one while a site is still syncing; batching
+    /// it into one rebuild at the end of the pass left pages empty until the
+    /// whole sync (minutes when peers are slow) finished.
+    pub async fn ingest_file(&self, address: &str, inner_path: &str) {
+        // ContentFilter: a muted author's file stays out of the db, and gets
+        // no event - nothing changed for the page.
+        if self.muted_authors().await.iter().any(|m| inner_path.contains(m.as_str())) {
+            return;
+        }
+        // Snapshot the db handle out of the lock; file + SQL work runs unlocked.
+        let mut build_first = false;
+        let own: Option<(Database, DbSchema)> = {
+            let xites = self.xites.read().await;
+            match xites.get(address) {
+                None => None,
+                Some(x) => match (&x.db, &x.db_schema) {
+                    // A version-3 merger db fills from its merged sites, not
+                    // its own tree - only the merger loop below applies.
+                    (Some(db), Some(schema)) if schema.version != 3 => {
+                        Some((db.clone(), schema.clone()))
+                    }
+                    (Some(_), _) => None,
+                    // No db yet but the schema has arrived (a clone in
+                    // progress): the first data file triggers the build, which
+                    // ingests everything on disk so far, this file included.
+                    (None, _) => {
+                        build_first = x.storage.exists("dbschema.json");
+                        None
+                    }
+                },
+            }
+        };
+        if build_first {
+            self.rebuild_xite_db(address).await;
+        } else if let Some((db, schema)) = own {
+            let db_dir = {
+                let xites = self.xites.read().await;
+                xites.get(address).map(|x| db_file_dir(x.storage.root(), &schema.db_file))
+            };
+            if let Some(db_dir) = db_dir {
+                // Paths are matched relative to the db file's directory
+                // (EpixNet's db_dir); a file outside it can't match any map.
+                let db_sub = schema.db_file.replace('\\', "/");
+                let db_sub = db_sub.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                let rel = if db_sub.is_empty() {
+                    Some(inner_path)
+                } else {
+                    inner_path.strip_prefix(db_sub).and_then(|p| p.strip_prefix('/'))
+                };
+                if let Some(rel) = rel {
+                    let _ = db.update_file(&schema, &db_dir, rel, "", "");
                 }
             }
         }
-        bytes
+        // A merged site's file must also reach the mergers aggregating it:
+        // their pages (Git Epix's repo list, Epix Post's feed) query only
+        // their own version-3 db.
+        let merged_type = self.site_merged_type(address).await;
+        if let Some(mt) = merged_type {
+            let root = {
+                let xites = self.xites.read().await;
+                xites.get(address).map(|x| x.storage.root().to_path_buf())
+            };
+            let mergers: Vec<(Database, DbSchema)> = {
+                let xites = self.xites.read().await;
+                xites
+                    .values()
+                    .filter_map(|x| {
+                        let schema = x.db_schema.clone()?;
+                        if schema.version != 3 {
+                            return None;
+                        }
+                        let accepts = x
+                            .settings
+                            .permissions
+                            .iter()
+                            .any(|p| p.strip_prefix("Merger:") == Some(mt.as_str()));
+                        accepts.then_some((x.db.clone()?, schema))
+                    })
+                    .collect()
+            };
+            if let Some(root) = root {
+                for (db, schema) in mergers {
+                    // db_dir is the merged site's root; the regex match sees
+                    // the path keyed under the merged site's address, and the
+                    // rows are tagged with it (populate_site's convention).
+                    let _ = db.update_file(&schema, &root, inner_path, address, address);
+                }
+            }
+        }
+        self.push_site_info_file_done(address, inner_path).await;
     }
 
     /// Ensure `host` (a `.epix` name) is served, resolving + cloning it on demand
@@ -4931,6 +5023,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    /// A data file arriving mid-sync is queryable the moment `ingest_file`
+    /// runs - no full rebuild needed (this is what makes topics pop in one by
+    /// one during a clone).
+    #[tokio::test]
+    async fn ingest_file_makes_a_new_data_file_queryable_incrementally() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"data/users/db.db","version":2,
+                     "maps": { ".*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        let addr = "1BlogAddress";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+
+        // The page queried while the db was still empty.
+        let rows = state
+            .db_query(addr, "SELECT COUNT(*) AS n FROM post", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["n"], 0);
+
+        // A user's data.json lands; ingest it without a rebuild.
+        XiteStorage::new(dir.path())
+            .write(
+                "data/users/alice.epix/data.json",
+                br#"{ "posts": [ {"post_id":1,"title":"First"} ] }"#,
+            )
+            .unwrap();
+        state.ingest_file(addr, "data/users/alice.epix/data.json").await;
+
+        let rows = state
+            .db_query(addr, "SELECT title FROM post", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "First");
+
+        // A file outside the db dir is ignored without error.
+        state.ingest_file(addr, "index.html").await;
     }
 
     #[tokio::test]

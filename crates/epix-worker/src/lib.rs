@@ -197,6 +197,7 @@ pub async fn sync_files_list(
     peers: &[PeerAddr],
     transport: Arc<dyn Transport>,
     max_workers: usize,
+    on_file: Option<FileProgress>,
 ) -> Result<SyncReport> {
     if needed.is_empty() || peers.is_empty() {
         let mut report = SyncReport::default();
@@ -204,7 +205,7 @@ pub async fn sync_files_list(
         return Ok(report);
     }
     let max_workers = scale_workers(max_workers, needed.len());
-    let ctx = SyncCtx::new(needed, xite, transport, None);
+    let ctx = SyncCtx::new(needed, xite, transport, on_file);
     let worker_count = peers.len().min(max_workers.max(1));
     let mut handles = Vec::new();
     for i in 0..worker_count {
@@ -302,6 +303,90 @@ pub async fn sync_files_streaming(
         }
     }
     Ok(ctx.finish().await)
+}
+
+/// Fetch a set of files RAW - returned to the caller instead of
+/// hash-verified and written (used for included / per-user content.json,
+/// whose integrity is a signature check the caller performs). Same worker
+/// model as [`sync_files`]: one persistent connection per peer pulling from
+/// a shared queue, so N files cost N round trips on a live connection.
+/// Racing a fresh connection per file per peer stalled for a full timeout
+/// on every dead peer - and seeders that limit concurrent handshakes made
+/// even live peers time out.
+pub async fn fetch_files_raw(
+    paths: Vec<String>,
+    address: &str,
+    peers: &[PeerAddr],
+    transport: Arc<dyn Transport>,
+    max_workers: usize,
+) -> std::collections::HashMap<String, Vec<u8>> {
+    use std::collections::{HashMap, HashSet};
+    let total = paths.len();
+    if total == 0 || peers.is_empty() {
+        return HashMap::new();
+    }
+    let queue: Arc<Mutex<VecDeque<(String, u8)>>> =
+        Arc::new(Mutex::new(paths.into_iter().map(|p| (p, 0u8)).collect()));
+    let got: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let workers = peers.len().min(max_workers.max(1));
+    let mut handles = Vec::new();
+    for i in 0..workers {
+        let peer = peers[i % peers.len()].clone();
+        let queue = queue.clone();
+        let got = got.clone();
+        let transport = transport.clone();
+        let address = address.to_string();
+        handles.push(tokio::spawn(async move {
+            let Some(mut conn) = connect(transport.as_ref(), &peer).await else { return };
+            // Files this peer already failed to deliver: one shot per file
+            // per peer, like run_worker.
+            let mut refused: HashSet<String> = HashSet::new();
+            loop {
+                if got.lock().await.len() >= total {
+                    break;
+                }
+                let next = {
+                    let mut q = queue.lock().await;
+                    let mut next = None;
+                    for _ in 0..q.len() {
+                        if let Some((p, a)) = q.pop_front() {
+                            if refused.contains(&p) {
+                                q.push_back((p, a));
+                            } else {
+                                next = Some((p, a));
+                                break;
+                            }
+                        }
+                    }
+                    next
+                };
+                let Some((path, attempts)) = next else { break };
+                let fetched =
+                    tokio::time::timeout(FILE_TIMEOUT, conn.get_file(&address, &path)).await;
+                match fetched {
+                    Ok(Ok(bytes)) => {
+                        got.lock().await.insert(path, bytes);
+                    }
+                    _ => {
+                        refused.insert(path.clone());
+                        if attempts + 1 < MAX_ATTEMPTS {
+                            queue.lock().await.push_back((path, attempts + 1));
+                        }
+                        // The connection may be unhealthy; reconnect.
+                        match connect(transport.as_ref(), &peer).await {
+                            Some(c) => conn = c,
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    let map = got.lock().await.clone();
+    map
 }
 
 /// EpixNet's `getMaxWorkers`: triple the worker cap when the task list is

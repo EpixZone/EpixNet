@@ -542,11 +542,19 @@ async fn sync_included_content(
     for peer in peers.iter().take(8).cloned() {
         let transport = transport.clone();
         let address = address.to_string();
-        probes.spawn(async move { fetch_list_modified(transport.as_ref(), &peer, &address).await });
+        probes.spawn(async move {
+            let list = fetch_list_modified(transport.as_ref(), &peer, &address).await;
+            (peer, list)
+        });
     }
+    let mut live_peer: Option<PeerAddr> = None;
     while let Some(res) = probes.join_next().await {
-        if let Ok(Some(list)) = res {
+        if let Ok((peer, Some(list))) = res {
+            if live_peer.is_none() {
+                live_peer = Some(peer.clone());
+            }
             if !list.is_empty() {
+                live_peer = Some(peer);
                 for (p, modified) in list {
                     if p.ends_with("content.json") && p != "content.json" {
                         let entry = paths.entry(p).or_insert(0.0);
@@ -560,6 +568,18 @@ async fn sync_included_content(
         }
     }
     probes.abort_all();
+    // The peer that answered goes FIRST: every fetch below races peers in
+    // groups from the front of this list, so a front full of dead peers costs
+    // a full timeout per group per file. One known-live peer up front means
+    // each file lands on the first try.
+    let mut peers: Vec<PeerAddr> = peers.to_vec();
+    if let Some(lp) = &live_peer {
+        if let Some(pos) = peers.iter().position(|p| p.to_string() == lp.to_string()) {
+            let p = peers.remove(pos);
+            peers.insert(0, p);
+        }
+    }
+    let peers = &peers[..];
     if paths.is_empty() {
         return (0, Vec::new());
     }
@@ -591,56 +611,62 @@ async fn sync_included_content(
     let mut arrived: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     // Process content.json one depth level at a time: a level's files are
-    // fetched concurrently (the slow network I/O), then verified sequentially
+    // fetched together (the slow network I/O), then verified sequentially
     // (add_content is CPU-only and needs the parent level's rules registered
     // first). Shallower paths - data/users/content.json, whose user_contents
     // rules the per-user files verify against - are their own earlier level,
-    // so they always land before the children that need them. Fetching one
-    // file at a time serialized 15+ slow per-peer round trips on iOS into
-    // minutes, so the data files at the end never got their turn.
+    // so they always land before the children that need them.
     //
-    // Concurrency is bounded: firing every user's fetch at once floods the
-    // handful of connected peers and starves some requests (including the
-    // parent's), so a semaphore caps in-flight fetches.
-    let fetch_cap = Arc::new(tokio::sync::Semaphore::new(8));
+    // The fetch itself is a worker pass over PERSISTENT connections
+    // (fetch_files_raw): one connect per peer for the whole level, files
+    // pulled from a shared queue. Opening a fresh connection per file per
+    // peer burned a full timeout on every dead peer - and on seeders that
+    // limit concurrent handshakes - which serialized a fresh clone's posts
+    // into minutes of nothing.
     let mut pending: std::collections::BTreeMap<usize, Vec<(String, f64)>> =
         std::collections::BTreeMap::new();
     for (p, m) in ordered {
         pending.entry(p.matches('/').count()).or_default().push((p, m));
     }
     while let Some((_, level)) = pending.pop_first() {
-        let mut fetches = tokio::task::JoinSet::new();
+        let mut fetched: Vec<(String, Vec<u8>, bool)> = Vec::new();
+        let mut to_fetch: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         for (path, peer_modified) in level {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            let transport = transport.clone();
-            let peers = peers.to_vec();
-            let address = address.to_string();
             let disk = xite.storage().read(&path).ok();
-            let cap = fetch_cap.clone();
-            fetches.spawn(async move {
-                let _permit = cap.acquire().await;
-                let disk_modified = disk
-                    .as_deref()
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
-                    .and_then(|j| j.get("modified").and_then(|v| v.as_f64()))
-                    .unwrap_or(-1.0);
+            let disk_modified = disk
+                .as_deref()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+                .and_then(|j| j.get("modified").and_then(|v| v.as_f64()))
+                .unwrap_or(-1.0);
+            match disk {
                 // The on-disk copy serves unless a peer advertises a newer
                 // version (new posts); add_content re-verifies either way.
-                if disk.is_some() && peer_modified <= disk_modified {
-                    return (path, disk, false);
-                }
-                match fetch_inner_file(transport.as_ref(), &peers, &address, &path).await {
-                    Some(b) => (path, Some(b), true),
-                    None => (path, disk, false),
-                }
-            });
+                Some(d) if peer_modified <= disk_modified => fetched.push((path, d, false)),
+                disk => to_fetch.push((path, disk)),
+            }
         }
-        let mut fetched: Vec<(String, Vec<u8>, bool)> = Vec::new();
-        while let Some(res) = fetches.join_next().await {
-            if let Ok((path, Some(bytes), was_fetched)) = res {
-                fetched.push((path, bytes, was_fetched));
+        if !to_fetch.is_empty() {
+            let mut results = epix_worker::fetch_files_raw(
+                to_fetch.iter().map(|(p, _)| p.clone()).collect(),
+                address,
+                peers,
+                transport.clone(),
+                8,
+            )
+            .await;
+            for (path, disk) in to_fetch {
+                match results.remove(&path) {
+                    Some(bytes) => fetched.push((path, bytes, true)),
+                    // Unfetchable: fall back to the (stale) disk copy if any.
+                    None => {
+                        if let Some(d) = disk {
+                            fetched.push((path, d, false));
+                        }
+                    }
+                }
             }
         }
         for (path, bytes, was_fetched) in fetched {
@@ -649,6 +675,13 @@ async fn sync_included_content(
                 Ok(files) => {
                     if was_fetched {
                         arrived.push(path.clone());
+                        // Ingest + file_done NOW (EpixNet fires these as each
+                        // file is written): a user's content.json carries db
+                        // columns (cert_user_id), and the event makes open
+                        // pages re-query instead of waiting out the pass.
+                        if let Some(state) = progress {
+                            state.ingest_file(address, &path).await;
+                        }
                     }
                     child_files.extend(files);
                     // A nested include lands in its own (deeper) level.
@@ -680,7 +713,22 @@ async fn sync_included_content(
             .await;
     }
     let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
-    match epix_worker::sync_files_list(needed, xite, peers, transport, 8).await {
+    // Each data file is ingested into the site's db (and its mergers') the
+    // moment it verifies, with its file_done pushed right after - this is
+    // what makes topics/posts appear one by one while the sync is running.
+    let on_file = progress.map(|state| {
+        let state = state.clone();
+        let addr = address.to_string();
+        Arc::new(move |inner: &str, _done: usize, _total: usize| {
+            let state = state.clone();
+            let addr = addr.clone();
+            let inner = inner.to_string();
+            tokio::spawn(async move {
+                state.ingest_file(&addr, &inner).await;
+            });
+        }) as epix_worker::FileProgress
+    });
+    match epix_worker::sync_files_list(needed, xite, peers, transport, 8, on_file).await {
         Ok(report) => {
             // Report only the files that actually landed - a partial sync
             // (dead peers) must not fire file_done for missing files.
@@ -777,29 +825,6 @@ async fn fetch_list_modified(
     .await
     .ok()
     .flatten()
-}
-
-/// Fetch one inner file from the first cooperative peer.
-async fn fetch_inner_file(
-    transport: &dyn Transport,
-    peers: &[PeerAddr],
-    address: &str,
-    inner_path: &str,
-) -> Option<Vec<u8>> {
-    for peer in peers {
-        let got = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let mut conn = Connection::connect(transport, peer).await.ok()?;
-            conn.handshake().await.ok()?;
-            conn.get_file(address, inner_path).await.ok()
-        })
-        .await
-        .ok()
-        .flatten();
-        if got.is_some() {
-            return got;
-        }
-    }
-    None
 }
 
 /// One bounded attempt to pull content.json from a peer (phase 1 of a clone).
@@ -975,13 +1000,10 @@ impl OnDemand {
                 self.state.rebuild_merger_dbs().await;
             }
             self.state.push_site_info(&address).await;
-            // file_done per user-content file, AFTER the rebuild: the page is
-            // already up (served progressively) and ran its first db query
-            // against an empty db - these events make it re-query, or the
-            // list stays empty until a manual reload.
-            for f in &user_files {
-                self.state.push_site_info_file_done(&address, f).await;
-            }
+            // file_done per user-content file already fired as each file
+            // landed (ingest_file), with the db updated first - the page,
+            // served progressively, re-queried and showed each one live.
+            let _ = user_files;
             // Hide the loading screen: the wrapper closes on the file_done of
             // its own index.html.
             self.state.push_clone_event(
