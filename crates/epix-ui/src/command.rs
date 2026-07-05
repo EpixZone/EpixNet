@@ -499,11 +499,17 @@ impl WsCommand for FileGet {
             .or_else(|| p.get("inner_path").and_then(|v| v.as_str()))
             .ok_or("fileGet: missing inner_path")?
             .to_string();
-        let required = arr
-            .and_then(|a| a.get(1))
-            .and_then(|v| v.as_bool())
-            .or_else(|| p.get("required").and_then(|v| v.as_bool()))
-            .unwrap_or(true);
+        // required defaults true when ABSENT, but an explicit null is falsy
+        // (Python's `if required:`). EpixFS sends it positionally, often as
+        // null, and sites probe maybe-missing files that way (git.js reads
+        // packed-refs, which many repos don't have) - treating null as true
+        // made every probe wait out the miss timeout, turning an instant page
+        // into a tens-of-seconds load.
+        let required_param = arr.and_then(|a| a.get(1)).or_else(|| p.get("required"));
+        let required = match required_param {
+            Some(v) => v.as_bool().unwrap_or(false),
+            None => true,
+        };
         let format = arr
             .and_then(|a| a.get(2))
             .and_then(|v| v.as_str())
@@ -518,8 +524,15 @@ impl WsCommand for FileGet {
             // the file arrives. Our command handling is serial per connection,
             // so a long wait here would freeze the session's other commands -
             // wait briefly (covers a file landing mid-clone), then answer null.
+            // A file the site doesn't declare can never arrive: answer now.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while bytes.is_none() && std::time::Instant::now() < deadline {
+                if matches!(
+                    s.state.loading_file(&target, &inner),
+                    crate::state::LoadingFile::NotInSite
+                ) {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 bytes = s.state.read_file(&target, &inner).await;
             }
