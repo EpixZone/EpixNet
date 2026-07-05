@@ -461,10 +461,16 @@ async fn clone_xite_with_progress(
         let addr = address.to_string();
         let peers_n = peer_count.max(1);
         Arc::new(move |inner: &str, done: usize, total: usize| {
-            // index.html downloads first (priority queue) and the file route
-            // serves it progressively, so its file_done hides the loading
-            // screen the moment the page is actually viewable.
             let left = total.saturating_sub(done);
+            // The wrapper hides the loading screen on index.html's file_done
+            // - and index.html downloads FIRST (priority queue). Firing it
+            // mid-sync dropped the user into a half-downloaded site (styles
+            // and scripts still missing, forum data not even started), which
+            // reads as broken. Hold it back unless it is the last core file;
+            // the pass below pushes it when the core set is complete.
+            if inner == "index.html" && left > 0 {
+                return;
+            }
             state.push_clone_event(
                 &addr,
                 serde_json::json!(["file_done", inner]),
@@ -482,6 +488,16 @@ async fn clone_xite_with_progress(
         epix_worker::sync_files_streaming(&xite, sync_rx, transport.clone(), 8, on_file).await
     {
         bytes_recv = report.bytes;
+    }
+    // Core set done: NOW dismiss the loading screen. The site opens fully
+    // styled, and the user-content pass below streams topics/posts into the
+    // already-rendered page (db ingest + file_done per file).
+    if let Some(state) = progress {
+        state.push_clone_event(
+            address,
+            serde_json::json!(["file_done", "index.html"]),
+            serde_json::json!({ "peers": peer_count.max(1), "bad_files": 0, "tasks": 0 }),
+        );
     }
 
     // Recursive content: user_contents sites (EpixTalk, EpixPost, ...) keep their
