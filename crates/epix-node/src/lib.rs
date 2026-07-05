@@ -1059,6 +1059,14 @@ async fn serve(
     if let Some(log_file) = &opts.log_file {
         state.set_log_file(log_file);
     }
+    // The Config page's "Data directory" works only when the root is the
+    // user-relocatable desktop one (not pinned by EPIX_DATA_DIR or set
+    // programmatically by an embedding shell). The choice persists as
+    // `data_dir` in the default location's epixnet.conf, Python-style.
+    let env_pinned = std::env::var("EPIX_DATA_DIR").map(|v| !v.is_empty()).unwrap_or(false);
+    if !env_pinned && opts.data_root == epix_ui::paths::data_root() {
+        state.set_data_dir_conf(epix_ui::paths::default_data_root().join("epixnet.conf"));
+    }
 
     // Expand the GeoIP db off the startup path (first run unzips ~62MB).
     if let Some(gz) = opts.geoip_gz.clone() {
@@ -1339,36 +1347,14 @@ mod tests {
     }
 }
 
-/// The shared data root: `EPIX_DATA_DIR` if set, else the conventional per-OS
-/// application-data location (`~/Library/Application Support/EpixNet` on macOS,
-/// `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
+/// The shared data root: `EPIX_DATA_DIR` if set, else the `data_dir`
+/// configured in the default location's `epixnet.conf`, else the conventional
+/// per-OS application-data location (`~/Library/Application Support/EpixNet`
+/// on macOS, `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
 /// `~/.local/share/EpixNet` on Linux). Shared by the server binary and the
 /// desktop browser so they use one identity, site set, and Tor state.
 pub fn data_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("EPIX_DATA_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    let base = if cfg!(target_os = "macos") {
-        home_dir().join("Library/Application Support")
-    } else if cfg!(target_os = "windows") {
-        std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir().join("AppData/Roaming"))
-    } else {
-        std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir().join(".local/share"))
-    };
-    base.join("EpixNet")
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+    epix_ui::paths::data_root()
 }
 
 /// Open `url` in the default browser (best effort, platform-specific).

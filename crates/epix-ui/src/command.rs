@@ -780,6 +780,14 @@ impl WsCommand for ConfigSet {
             _ => (None, Value::Null),
         };
         let key = key.ok_or("configSet: key required")?;
+        // data_dir persists to epixnet.conf (and copies the data over), not
+        // config.json - config.json lives inside the directory it would name.
+        if key == "data_dir" {
+            let dir = value.as_str().unwrap_or_default();
+            let message = s.state.set_data_dir(dir).await?;
+            s.state.push_notification("done", &message, 15000);
+            return Ok(Value::from("ok"));
+        }
         s.state.config_set(key, value).await;
         if key == "language" {
             s.state.push_notification(

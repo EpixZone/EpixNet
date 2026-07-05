@@ -135,6 +135,16 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "disable",
         "soon:select:Custom=custom|Tor=tor|Disable=disable",
     ),
+    // --- Storage. `data_dir` is special: the value is the live data root and
+    // the setting persists to `epixnet.conf` (see `AppState::set_data_dir`),
+    // not config.json - config.json lives inside the directory it would name.
+    (
+        "Storage",
+        "data_dir",
+        "Data directory (existing data is copied there; restart EpixNet to apply)",
+        "",
+        "text",
+    ),
     // --- Performance
     (
         "Performance",
@@ -310,6 +320,10 @@ pub struct AppState {
     /// Path to `private/sites.json` (the persistent served-xite registry,
     /// EpixNet's SiteManager). None for in-memory nodes.
     sites_path: Option<PathBuf>,
+    /// Path to the `epixnet.conf` at the default per-OS location, when this
+    /// node's data root is user-relocatable (a desktop node not pinned by
+    /// `EPIX_DATA_DIR`). `set_data_dir` persists the choice there.
+    data_dir_conf: std::sync::Mutex<Option<PathBuf>>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -435,6 +449,7 @@ impl AppState {
             launch_homepage: std::sync::Mutex::new(None),
             data_root: None,
             sites_path: None,
+            data_dir_conf: std::sync::Mutex::new(None),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -535,6 +550,7 @@ impl AppState {
             // it, so an EpixNet install's site list carries over as-is.
             sites_path: Some(dir.join("sites.json")),
             data_root: Some(data_root),
+            data_dir_conf: std::sync::Mutex::new(None),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -774,13 +790,98 @@ impl AppState {
             if is_config_action(kind) {
                 continue;
             }
-            let value = self.config_get(key).await.unwrap_or_else(|| json!(default));
-            back.insert(
-                key.to_string(),
-                json!({ "value": value, "default": default, "pending": false }),
-            );
+            let (value, default) = if *key == "data_dir" {
+                (json!(self.data_dir_value()), json!(self.data_dir_default()))
+            } else {
+                (self.config_get(key).await.unwrap_or_else(|| json!(default)), json!(default))
+            };
+            back.insert(key.to_string(), json!({ "value": value, "default": default, "pending": false }));
         }
         Value::Object(back)
+    }
+
+    // --- Data directory (the `data_dir` config key) --------------------------
+
+    /// Where `set_data_dir` persists the choice: the `epixnet.conf` at the
+    /// default per-OS location. Set only for desktop nodes whose root is
+    /// user-relocatable (not pinned by `EPIX_DATA_DIR` or an embedding shell).
+    pub fn set_data_dir_conf(&self, conf: impl Into<PathBuf>) {
+        *self.data_dir_conf.lock().unwrap() = Some(conf.into());
+    }
+
+    /// The current data root as shown on the Config page.
+    pub fn data_dir_value(&self) -> String {
+        self.data_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+    }
+
+    /// The per-OS default root as shown on the Config page.
+    pub fn data_dir_default(&self) -> String {
+        crate::paths::default_data_root().display().to_string()
+    }
+
+    /// Change where EpixNet stores its data. Copies `private/` and `data/`
+    /// to the new location (unless it already holds an identity), then records
+    /// the choice as `data_dir` in `epixnet.conf` - the same key the Python
+    /// client uses. The old directory is left in place as a backup; the node
+    /// switches to the new one on the next start. An empty path resets to the
+    /// per-OS default. Returns the message to show the user.
+    pub async fn set_data_dir(&self, new_dir: &str) -> Result<String, String> {
+        let conf = self
+            .data_dir_conf
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("The data directory is fixed for this node (set via EPIX_DATA_DIR or the embedding app)")?;
+        let current = self.data_root.clone().ok_or("This node keeps no data on disk")?;
+
+        // Resolve the input: empty resets to the default; "~" expands.
+        let mut input = new_dir.trim().to_string();
+        if let Some(rest) = input.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+                input = format!("{}/{}", home.trim_end_matches('/'), rest);
+            }
+        }
+        let default = crate::paths::default_data_root();
+        let target = if input.is_empty() { default.clone() } else { PathBuf::from(&input) };
+        if !target.is_absolute() {
+            return Err(format!("The data directory must be an absolute path (got: {input})"));
+        }
+        if target == current {
+            // Nothing to copy, but the conf must still match (e.g. resetting a
+            // stale data_dir line while already running on the default root).
+            crate::paths::write_conf_data_dir(&conf, (target != default).then_some(target.as_path()))
+                .map_err(|e| format!("Could not save {}: {e}", conf.display()))?;
+            return Ok(format!("Data directory is already {}", target.display()));
+        }
+        if target.starts_with(&current) || current.starts_with(&target) {
+            return Err("The new data directory can't be inside the current one (or contain it)".to_string());
+        }
+
+        // Copy the node's data over unless the target already holds an
+        // identity of its own (then switching must not overwrite it).
+        if !target.join("private/users.json").exists() && current.join("private").exists() {
+            let (from, to) = (current.clone(), target.clone());
+            tokio::task::spawn_blocking(move || {
+                for sub in ["private", "data"] {
+                    let src = from.join(sub);
+                    if src.exists() {
+                        copy_dir_all(&src, &to.join(sub))?;
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await
+            .map_err(|e| format!("copy task failed: {e}"))?
+            .map_err(|e| format!("Could not copy the data to {}: {e}", target.display()))?;
+        }
+
+        crate::paths::write_conf_data_dir(&conf, (target != default).then_some(target.as_path()))
+            .map_err(|e| format!("Could not save {}: {e}", conf.display()))?;
+        self.log("INFO", format!("Data directory set to {} (was {})", target.display(), current.display())).await;
+        Ok(format!(
+            "Data directory set to {}. Restart EpixNet to start using it; the old directory is kept as a backup.",
+            target.display()
+        ))
     }
 
     /// Set a node config value (`configSet`), persisted to `data_dir/config.json`.
@@ -5082,6 +5183,23 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
 
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
 /// current directory). Uses `statvfs` on unix.
+/// Recursively copy a directory (for `set_data_dir`'s move to a new root).
+/// Follows the file tree only - no symlink chasing surprises are expected in
+/// a data dir the node wrote itself.
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
 fn free_space(path: Option<&std::path::Path>) -> i64 {
     #[cfg(unix)]
     {
@@ -5889,6 +6007,30 @@ mod tests {
         let s = AppState::with_data_dir("test", dir.path());
         assert_eq!(s.user.read().await.master_address, master);
         assert_eq!(s.xite_dir("epix1xite").unwrap(), dir.path().join("data/epix1xite"));
+    }
+
+    #[tokio::test]
+    async fn set_data_dir_copies_data_and_persists_to_conf() {
+        let old = tempdir().unwrap();
+        let new = tempdir().unwrap();
+        let conf_dir = tempdir().unwrap();
+        let conf = conf_dir.path().join("epixnet.conf");
+        let s = AppState::with_data_dir("test", old.path());
+        // Not relocatable until the server marks the root as such.
+        assert!(s.set_data_dir("/anywhere").await.is_err());
+        s.set_data_dir_conf(&conf);
+
+        // Relative and nested targets are refused.
+        assert!(s.set_data_dir("relative/path").await.is_err());
+        assert!(s.set_data_dir(old.path().join("inside").to_str().unwrap()).await.is_err());
+
+        let target = new.path().join("EpixData");
+        s.set_data_dir(target.to_str().unwrap()).await.unwrap();
+        // The identity was copied and the choice recorded Python-style.
+        assert!(target.join("private/users.json").exists());
+        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(target.clone()));
+        // The old root stays in place as a backup.
+        assert!(old.path().join("private/users.json").exists());
     }
 
     #[tokio::test]

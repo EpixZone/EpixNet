@@ -13,6 +13,7 @@ pub mod command;
 pub mod conn_pool;
 pub mod fileserve;
 pub mod geoip;
+pub mod paths;
 pub mod state;
 #[cfg(feature = "ui-password")]
 pub mod uipassword;
@@ -645,9 +646,20 @@ async fn serve_config_page(
         return Redirect::to("/Config").into_response();
     }
     if params.contains_key("save") {
+        // data_dir is special: it persists to epixnet.conf and copies the data
+        // to the new location, so its outcome is reported back on the page.
+        let mut flash: Option<(bool, String)> = None;
+        if let Some(dir) = params.get("data_dir") {
+            if dir.trim() != ctx.state.data_dir_value() {
+                flash = Some(match ctx.state.set_data_dir(dir).await {
+                    Ok(msg) => (true, msg),
+                    Err(e) => (false, e),
+                });
+            }
+        }
         for (_section, key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
             // Disabled ("coming soon") controls and action buttons aren't saved.
-            if kind.starts_with("soon:") || crate::state::is_config_action(kind) {
+            if *key == "data_dir" || kind.starts_with("soon:") || crate::state::is_config_action(kind) {
                 continue;
             }
             if *kind == "bool" {
@@ -658,22 +670,53 @@ async fn serve_config_page(
                 ctx.state.config_set(key, Value::from(val.as_str())).await;
             }
         }
-        return Redirect::to("/Config").into_response();
+        let to = match &flash {
+            Some((ok, msg)) => {
+                format!("/Config?{}={}", if *ok { "done" } else { "error" }, url_encode(msg))
+            }
+            None => "/Config".to_string(),
+        };
+        return Redirect::to(&to).into_response();
     }
     let mut values = Vec::new();
     for (section, key, label, default, kind) in crate::state::CONFIG_SCHEMA {
-        let val = ctx
-            .state
-            .config_get(key)
-            .await
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| default.to_string());
-        values.push((*section, *key, *label, val, *default, *kind));
+        // data_dir isn't in config.json: its value is the live data root and
+        // its default the per-OS conventional location.
+        let (val, default) = if *key == "data_dir" {
+            (ctx.state.data_dir_value(), ctx.state.data_dir_default())
+        } else {
+            let val = ctx
+                .state
+                .config_get(key)
+                .await
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| default.to_string());
+            (val, default.to_string())
+        };
+        values.push((*section, *key, *label, val, default, *kind));
     }
-    let cleared = params.contains_key("cleared");
+    let flash = if params.contains_key("cleared") {
+        Some((true, "xID cache cleared.".to_string()))
+    } else if let Some(msg) = params.get("done") {
+        Some((true, msg.clone()))
+    } else {
+        params.get("error").map(|msg| (false, msg.clone()))
+    };
     let homepage = ctx.state.homepage().await.unwrap_or_default();
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, cleared, &homepage))
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, flash, &homepage))
         .into_response()
+}
+
+/// Percent-encode a string for use as a query-parameter value.
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// `GET /StatsJson` - the lightweight public stats endpoint the NoNewSites
@@ -729,8 +772,8 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 /// Config) with a widget per config kind. Keys whose backend isn't built yet
 /// (Tor, tracker proxy) render disabled with a "coming soon" note.
 fn render_config_page(
-    values: &[(&str, &str, &str, String, &str, &str)],
-    cleared: bool,
+    values: &[(&str, &str, &str, String, String, &str)],
+    flash: Option<(bool, String)>,
     homepage: &str,
 ) -> String {
     let esc = |s: &str| {
@@ -832,10 +875,13 @@ fn render_config_page(
         sections.push_str("</div>");
     }
 
-    let flash = if cleared {
-        "<div class='notification notification-done'>xID cache cleared.</div>"
-    } else {
-        ""
+    let flash = match &flash {
+        Some((ok, msg)) => format!(
+            "<div class='notification notification-{kind}'>{msg}</div>",
+            kind = if *ok { "done" } else { "error" },
+            msg = esc(msg),
+        ),
+        None => String::new(),
     };
     let body = format!(
         "{flash}<form method='get' action='/Config'>\
@@ -975,6 +1021,7 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
           .config{{margin-bottom:10px}}\
           .notification{{padding:12px 18px;border-radius:4px;margin:0 0 20px;font-size:14px}}\
           .notification-done{{background:#E8F8EF;border:1px solid #2ECC71;color:#227a48}}\
+          .notification-error{{background:#FDEDEC;border:1px solid #E74C3C;color:#96281B}}\
           .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer;display:inline-block;text-decoration:none}}\
           .config-item .value .button{{margin-top:0;padding:8px 22px;font-size:15px;color:#fff}}\
           a{{color:#9760F9;text-decoration:none}}\
