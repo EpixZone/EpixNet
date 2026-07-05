@@ -44,6 +44,13 @@ impl VerifyContext for ChildCtx<'_> {
     }
 }
 
+/// Files signing never hashes into a content.json (EpixNet's `hashFiles`):
+/// hidden dot-files and the `-old`/`-new` publish-diff snapshots.
+fn skip_hashing(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
+}
+
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -251,6 +258,9 @@ impl Xite {
             if inner == "content.json" || inner.ends_with("/content.json") || optional.contains(&inner) {
                 continue;
             }
+            if skip_hashing(&inner) {
+                continue;
+            }
             let bytes = self.storage.read(&inner)?;
             files.insert(
                 inner,
@@ -332,6 +342,9 @@ impl Xite {
         for inner in self.storage.list_files() {
             let Some(rel) = inner.strip_prefix(&prefix) else { continue };
             if rel == "content.json" || rel.ends_with("/content.json") || optional.contains(rel) {
+                continue;
+            }
+            if skip_hashing(rel) {
                 continue;
             }
             let bytes = self.storage.read(&inner)?;

@@ -344,6 +344,40 @@ fn parse_diffs(v: Option<&Value>) -> std::collections::HashMap<String, Vec<epix_
     out
 }
 
+/// Encode per-file diff actions as an `update`'s `diffs` wire value - the
+/// inverse of [`parse_diffs`]. Insert lines go as binary so a Python receiver
+/// patches with raw bytes.
+pub(crate) fn encode_diffs(
+    diffs: &std::collections::HashMap<String, Vec<epix_content::DiffAction>>,
+) -> Value {
+    use epix_content::DiffAction;
+    Value::Map(
+        diffs
+            .iter()
+            .map(|(path, actions)| {
+                let wire = actions
+                    .iter()
+                    .map(|a| match a {
+                        DiffAction::Equal(n) => {
+                            Value::Array(vec!["=".into(), (*n as u64).into()])
+                        }
+                        DiffAction::Remove(n) => {
+                            Value::Array(vec!["-".into(), (*n as u64).into()])
+                        }
+                        DiffAction::Insert(lines) => Value::Array(vec![
+                            "+".into(),
+                            Value::Array(
+                                lines.iter().map(|l| Value::Binary(l.clone())).collect(),
+                            ),
+                        ]),
+                    })
+                    .collect();
+                (Value::from(path.as_str()), Value::Array(wire))
+            })
+            .collect(),
+    )
+}
+
 /// Parse one rmpv diff action (`["=",n]` / `["-",n]` / `["+",[lines]]`).
 fn rmpv_to_diff_action(v: &Value) -> Option<epix_content::DiffAction> {
     use epix_content::DiffAction;
