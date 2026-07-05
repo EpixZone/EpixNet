@@ -112,12 +112,48 @@ impl SyncCtx {
     async fn finish(self) -> SyncReport {
         let leftover: Vec<String> =
             self.queue.lock().await.drain(..).map(|(f, _)| f.inner_path).collect();
-        let mut report = Arc::try_unwrap(self.report)
-            .map(|m| m.into_inner())
-            .unwrap_or_default();
+        let r = self.report.lock().await;
+        let mut report = SyncReport {
+            downloaded: r.downloaded,
+            bytes: r.bytes,
+            failed: r.failed.clone(),
+        };
+        drop(r);
         report.failed.extend(leftover);
         report
     }
+
+    /// Every file accounted for: downloaded, or given up after retries. Once
+    /// true, workers still dialing dead peers are pure tail latency.
+    async fn all_done(&self) -> bool {
+        let failed = self.report.lock().await.failed.len();
+        self.done.load(std::sync::atomic::Ordering::Relaxed) + failed >= self.total
+    }
+}
+
+/// Await the pass's workers, but abort the stragglers the moment every file
+/// is accounted for. Without this the pass ends only when the LAST worker
+/// exits - and a worker stuck dialing a dead peer (connect timeout 15s) with
+/// an already-empty queue kept the finished download waiting, which is where
+/// most of a fresh clone's "site is up but still nothing new" time went.
+async fn drain_workers(mut join: tokio::task::JoinSet<()>, ctx: &SyncCtx) {
+    loop {
+        if ctx.all_done().await {
+            join.abort_all();
+            break;
+        }
+        tokio::select! {
+            res = join.join_next() => {
+                if res.is_none() {
+                    break; // every worker exited (queue drained or gave up)
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
+    }
+    // Reap aborted tasks so their SyncCtx clones drop before finish().
+    join.abort_all();
+    while join.join_next().await.is_some() {}
 }
 
 /// One worker: connect to `peer` and pull files from the shared queue until
@@ -167,8 +203,8 @@ async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
                         r.downloaded += 1;
                         r.bytes += bytes.len() as u64;
                     }
+                    let n = ctx.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if let Some(cb) = &ctx.on_file {
-                        let n = ctx.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         cb(&file.inner_path, n, ctx.total);
                     }
                 } else {
@@ -207,13 +243,11 @@ pub async fn sync_files_list(
     let max_workers = scale_workers(max_workers, needed.len());
     let ctx = SyncCtx::new(needed, xite, transport, on_file);
     let worker_count = peers.len().min(max_workers.max(1));
-    let mut handles = Vec::new();
+    let mut join = tokio::task::JoinSet::new();
     for i in 0..worker_count {
-        handles.push(tokio::spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone())));
+        join.spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone()));
     }
-    for h in handles {
-        let _ = h.await;
-    }
+    drain_workers(join, &ctx).await;
     Ok(ctx.finish().await)
 }
 
@@ -235,13 +269,11 @@ pub async fn sync_files_with_progress(
     let max_workers = scale_workers(max_workers, needed.len());
     let ctx = SyncCtx::new(needed, xite, transport, on_file);
     let worker_count = peers.len().min(max_workers.max(1));
-    let mut handles = Vec::new();
+    let mut join = tokio::task::JoinSet::new();
     for i in 0..worker_count {
-        handles.push(tokio::spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone())));
+        join.spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone()));
     }
-    for h in handles {
-        let _ = h.await;
-    }
+    drain_workers(join, &ctx).await;
     Ok(ctx.finish().await)
 }
 
@@ -269,6 +301,13 @@ pub async fn sync_files_streaming(
     let mut channel_open = true;
 
     loop {
+        // Every file accounted for: abort workers still dialing dead peers -
+        // waiting them out kept the finished download (and the loading
+        // screen's dismissal) hostage for a full connect timeout.
+        if ctx.all_done().await {
+            join.abort_all();
+            break;
+        }
         // No workers running: done, respawn from a spare, or (channel closed)
         // give up on whatever is left.
         if join.is_empty() {
@@ -299,9 +338,13 @@ pub async fn sync_files_streaming(
             Some(_) = join.join_next(), if !join.is_empty() => {
                 // A worker finished; the top of the loop decides what's next.
             }
-            else => break,
+            // Periodic wake: a worker stuck in a connect must not delay the
+            // all_done check above.
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
         }
     }
+    join.abort_all();
+    while join.join_next().await.is_some() {}
     Ok(ctx.finish().await)
 }
 
@@ -329,14 +372,14 @@ pub async fn fetch_files_raw(
         Arc::new(Mutex::new(paths.into_iter().map(|p| (p, 0u8)).collect()));
     let got: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
     let workers = peers.len().min(max_workers.max(1));
-    let mut handles = Vec::new();
+    let mut join = tokio::task::JoinSet::new();
     for i in 0..workers {
         let peer = peers[i % peers.len()].clone();
         let queue = queue.clone();
         let got = got.clone();
         let transport = transport.clone();
         let address = address.to_string();
-        handles.push(tokio::spawn(async move {
+        join.spawn(async move {
             let Some(mut conn) = connect(transport.as_ref(), &peer).await else { return };
             // Files this peer already failed to deliver: one shot per file
             // per peer, like run_worker.
@@ -380,11 +423,26 @@ pub async fn fetch_files_raw(
                     }
                 }
             }
-        }));
+        });
     }
-    for h in handles {
-        let _ = h.await;
+    // Abort stragglers the moment every file arrived: a worker stuck dialing
+    // a dead peer must not keep the finished fetch waiting.
+    loop {
+        if got.lock().await.len() >= total {
+            join.abort_all();
+            break;
+        }
+        tokio::select! {
+            res = join.join_next() => {
+                if res.is_none() {
+                    break; // every worker exited (queue drained or gave up)
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+        }
     }
+    join.abort_all();
+    while join.join_next().await.is_some() {}
     let map = got.lock().await.clone();
     map
 }
