@@ -304,12 +304,11 @@ pub struct AppState {
     /// The launch xite (name or address) the node was started with - where the
     /// wrapper's corner home button and the admin pages' back link return to.
     launch_homepage: std::sync::Mutex<Option<String>>,
-    /// The shared data root (holds `sites.json` + per-xite subdirectories), so
-    /// the served-xite list can be restored on the next start. None for
-    /// in-memory nodes.
+    /// The shared data root, laid out like Python EpixNet: node files under
+    /// `private/`, per-xite dirs under `data/`. None for in-memory nodes.
     data_root: Option<PathBuf>,
-    /// Path to `sites.json` (the persistent served-xite registry, EpixNet's
-    /// SiteManager). None for in-memory nodes.
+    /// Path to `private/sites.json` (the persistent served-xite registry,
+    /// EpixNet's SiteManager). None for in-memory nodes.
     sites_path: Option<PathBuf>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
@@ -443,14 +442,16 @@ impl AppState {
         })
     }
 
-    /// Node whose user identity persists in `data_dir/users.json`, so the same
-    /// per-xite auth addresses are used across restarts.
-    pub fn with_data_dir(version: impl Into<String>, data_dir: impl Into<PathBuf>) -> Arc<Self> {
-        let dir = data_dir.into();
+    /// Node backed by a persistent data root, laid out exactly like Python
+    /// EpixNet: node-level files (users.json, sites.json, config, permissions)
+    /// live in `<root>/private/` and each xite's files in `<root>/data/<addr>/`.
+    /// Upgrading from the Python client to this node therefore needs no
+    /// migration - the identity, certs, and downloaded xites are read in place.
+    pub fn with_data_dir(version: impl Into<String>, data_root: impl Into<PathBuf>) -> Arc<Self> {
+        let data_root = data_root.into();
+        let dir = data_root.join("private");
         let _ = std::fs::create_dir_all(&dir);
-        // The shared root holds the cross-xite registry (sites.json) and the
-        // per-xite subdirectories; a per-xite `dir` sits directly under it.
-        let data_root = dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| dir.clone());
+        let _ = std::fs::create_dir_all(data_root.join("data"));
         let user_path = dir.join("users.json");
         let user = User::load_or_create(&user_path).unwrap_or_else(|_| User::generate());
         let filters_path = dir.join("filters.json");
@@ -530,10 +531,10 @@ impl AppState {
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
-            // The served-xite registry lives in the shared root (the parent of a
-            // per-xite dir), so it spans every xite that shares this root.
-            data_root: Some(data_root.clone()),
-            sites_path: Some(data_root.join("sites.json")),
+            // The served-xite registry lives where Python's SiteManager keeps
+            // it, so an EpixNet install's site list carries over as-is.
+            sites_path: Some(dir.join("sites.json")),
+            data_root: Some(data_root),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -921,6 +922,13 @@ impl AppState {
         self.resolve_name(address_or_name).await.unwrap_or_else(|| address_or_name.to_string())
     }
 
+    /// A xite's on-disk directory: `<root>/data/<address>` (Python EpixNet's
+    /// layout, so an existing install's downloads are found in place). None
+    /// for in-memory nodes.
+    pub fn xite_dir(&self, address: &str) -> Option<PathBuf> {
+        Some(self.data_root.as_ref()?.join("data").join(address))
+    }
+
     // --- SiteManager: persist the served-xite list across restarts ----------
 
     /// Persist the served xites to `sites.json` (keyed by signed content
@@ -950,12 +958,13 @@ impl AppState {
     }
 
     /// Restore xites recorded in `sites.json`: for each, point storage at
-    /// `<root>/<canonical>`, load + verify the on-disk content.json, and add it
+    /// `<root>/data/<canonical>`, load + verify the on-disk content.json, and add it
     /// (plus its display alias). Skips entries already served and any whose
     /// content.json is missing or fails verification. Returns how many were
     /// restored. Call once at startup before serving.
     pub async fn restore_sites(self: &Arc<Self>) -> usize {
         let (Some(path), Some(root)) = (&self.sites_path, &self.data_root) else { return 0 };
+        let root = root.join("data");
         let map: serde_json::Map<String, Value> = match std::fs::read(path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
             Err(_) => return 0,
@@ -3365,8 +3374,8 @@ impl AppState {
     /// Progressive serve during an on-demand clone: the state of one file of a
     /// xite that is downloading but not yet registered.
     pub fn loading_file(&self, address: &str, inner_path: &str) -> LoadingFile {
-        let Some(root) = &self.data_root else { return LoadingFile::Pending };
-        let storage = epix_xite::XiteStorage::new(root.join(address));
+        let Some(dir) = self.xite_dir(address) else { return LoadingFile::Pending };
+        let storage = epix_xite::XiteStorage::new(dir);
         // Workers verify every file's hash (against the signature-verified
         // content.json) before writing, so anything on disk is safe to serve.
         if let Ok(bytes) = storage.read(inner_path) {
@@ -5638,8 +5647,9 @@ mod tests {
         // write it back, so it came back after a restart.
         let root = tempdir().unwrap();
         let addr = "1DeleteMe";
-        let state = AppState::with_data_dir("test", root.path().join(addr));
-        let site_dir = root.path().join(addr);
+        let state = AppState::with_data_dir("test", root.path());
+        let site_dir = root.path().join("data").join(addr);
+        std::fs::create_dir_all(&site_dir).unwrap();
         std::fs::write(site_dir.join("index.html"), b"hi").unwrap();
         let content = json!({ "address": addr, "files": {} });
         let entry = || XiteEntry {
@@ -5659,7 +5669,7 @@ mod tests {
         assert!(!site_dir.exists());
         // sites.json no longer records it, so a restart won't restore it.
         let sites: serde_json::Map<String, Value> =
-            std::fs::read(root.path().join("sites.json"))
+            std::fs::read(root.path().join("private/sites.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
@@ -5679,11 +5689,8 @@ mod tests {
         // (derived auth identity, feed follows), like `user.deleteSiteData`.
         let root = tempdir().unwrap();
         let addr = "1ForgetMe";
-        // Keep the node's users.json outside the site dir (as in production,
-        // where it lives in the launch xite's dir) so deleting the site does
-        // not delete the store itself.
-        let state = AppState::with_data_dir("test", root.path().join("node"));
-        let site_dir = root.path().join(addr);
+        let state = AppState::with_data_dir("test", root.path());
+        let site_dir = root.path().join("data").join(addr);
         std::fs::create_dir_all(&site_dir).unwrap();
         state
             .add_xite(addr, XiteEntry {
@@ -5863,6 +5870,25 @@ mod tests {
         assert_eq!(out.as_deref(), Some(&b"hi from the pack"[..]));
         // A missing entry is None, not an error.
         assert!(state.read_file("1Pack", "pack.tar.gz/nope.txt").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn data_dir_uses_the_python_epixnet_layout() {
+        // Upgrading from the Python client needs no migration: the identity
+        // is read from private/users.json and xites from data/<address>,
+        // exactly where EpixNet keeps them.
+        let dir = tempdir().unwrap();
+        let master = {
+            let s = AppState::with_data_dir("test", dir.path());
+            let master = s.user.read().await.master_address.clone();
+            master
+        };
+        assert!(dir.path().join("private/users.json").exists());
+        assert!(!dir.path().join("users.json").exists(), "no node files at the root");
+        // A fresh node over the same root loads the same identity.
+        let s = AppState::with_data_dir("test", dir.path());
+        assert_eq!(s.user.read().await.master_address, master);
+        assert_eq!(s.xite_dir("epix1xite").unwrap(), dir.path().join("data/epix1xite"));
     }
 
     #[tokio::test]

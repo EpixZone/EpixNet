@@ -25,8 +25,9 @@ pub const DEFAULT_UI_ADDR: &str = "127.0.0.1:43110";
 
 /// How the embedded node should boot and serve.
 pub struct NodeOptions {
-    /// The shared data root (holds `sites.json`, `resolve-cache.json`, and a
-    /// per-xite subdirectory). Tor keeps its state under `<root>/tor`.
+    /// The shared data root, laid out like Python EpixNet: node files
+    /// (users.json, sites.json) under `<root>/private/`, each xite under
+    /// `<root>/data/<address>/`. Tor keeps its state under `<root>/tor`.
     pub data_root: PathBuf,
     /// A raw `epix1…` xite address or a `.epix` name (or bare label) to open.
     pub target: String,
@@ -38,7 +39,7 @@ pub struct NodeOptions {
     /// shells that own their own webview pass `false`).
     pub open_browser: bool,
     /// Optional gzipped GeoIP City db for the dashboard world map; expanded to
-    /// `<data>/geoip-city.mmdb` in the background. `None` disables the map.
+    /// `<root>/geoip-city.mmdb` in the background. `None` disables the map.
     pub geoip_gz: Option<Vec<u8>>,
     /// Optional file the node appends its log to (rotated by the caller).
     pub log_file: Option<PathBuf>,
@@ -165,7 +166,7 @@ pub async fn boot(
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
-    let data_dir = opts.data_root.join(&address);
+    let data_dir = opts.data_root.join("data").join(&address);
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
     let trackers = vec![PeerAddr::parse(DEFAULT_TRACKER).unwrap()];
@@ -915,7 +916,7 @@ impl epix_ui::OnDemandResolver for OnDemand {
 #[async_trait::async_trait]
 impl epix_ui::ContentSyncer for OnDemand {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>) {
-        let dir = self.data_root.join(address);
+        let dir = self.data_root.join("data").join(address);
         let Ok(addr) = Address::parse(address.to_string()) else { return (0, Vec::new()) };
         let mut xite = Xite::new(addr, XiteStorage::new(dir));
         // Only user_contents sites (with includes) have out-of-tree content.
@@ -967,7 +968,7 @@ impl OnDemand {
             }
         };
 
-        let data_dir = self.data_root.join(&address);
+        let data_dir = self.data_root.join("data").join(&address);
         // If we already serve the raw address, just alias the name to it.
         if !self.state.has_xite(&address).await {
             // Register the xite empty BEFORE the download (EpixNet's
@@ -1054,7 +1055,7 @@ async fn serve(
     content: Option<serde_json::Value>,
     bytes_recv: u64,
 ) -> Result<(UiServer, RunningNode), String> {
-    let state = AppState::with_data_dir(&opts.version, &data_dir);
+    let state = AppState::with_data_dir(&opts.version, &opts.data_root);
     if let Some(log_file) = &opts.log_file {
         state.set_log_file(log_file);
     }
@@ -1062,7 +1063,7 @@ async fn serve(
     // Expand the GeoIP db off the startup path (first run unzips ~62MB).
     if let Some(gz) = opts.geoip_gz.clone() {
         let state = state.clone();
-        let mmdb = data_dir.join("geoip-city.mmdb");
+        let mmdb = opts.data_root.join("geoip-city.mmdb");
         tokio::spawn(async move {
             let geoip = tokio::task::spawn_blocking(move || {
                 epix_ui::geoip::GeoIp::ensure(&gz, &mmdb)
