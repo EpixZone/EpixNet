@@ -4146,6 +4146,19 @@ impl AppState {
             .get(address)
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
+        // Keep the previous version as `<file>-old` (EpixNet's actionFileWrite):
+        // the next publish diffs old vs new so peers patch their copies instead
+        // of fetching the file back - which they often can't, when the
+        // publisher is unreachable from outside (NAT, port taken).
+        if inner_path.ends_with(".json")
+            && !inner_path.ends_with("content.json")
+            && storage.exists(inner_path)
+            && !storage.exists(&format!("{inner_path}-old"))
+        {
+            if let Ok(old) = storage.read(inner_path) {
+                let _ = storage.write(&format!("{inner_path}-old"), &old);
+            }
+        }
         storage.write(inner_path, bytes).map_err(|e| e.to_string())
     }
 
@@ -4340,10 +4353,55 @@ impl AppState {
         Ok(())
     }
 
+    /// The per-file diffs for a publish (EpixNet's `getDiffs`): for each file
+    /// of `content_inner_path` with a `<file>-old` snapshot (kept by
+    /// [`Self::write_file`]), diff old vs current and drop the snapshot. Keys
+    /// are relative to the content.json's directory, as Python peers expect.
+    pub async fn take_diffs(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+    ) -> HashMap<String, Vec<epix_content::DiffAction>> {
+        let mut out = HashMap::new();
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone())
+        else {
+            return out;
+        };
+        let Some(files) = storage
+            .read(content_inner_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|c| c.get("files").and_then(|f| f.as_object()).cloned())
+        else {
+            return out;
+        };
+        let dir =
+            content_inner_path.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_default();
+        for rel in files.keys() {
+            let full = format!("{dir}{rel}");
+            let old_path = format!("{full}-old");
+            if !storage.exists(&old_path) {
+                continue;
+            }
+            if let (Ok(old), Ok(new)) = (storage.read(&old_path), storage.read(&full)) {
+                // An over-limit (or degenerate) diff is just omitted: the
+                // receiver falls back to downloading the file.
+                if let Some(actions) = epix_content::diff::diff(&old, &new, Some(30 * 1024)) {
+                    out.insert(rel.clone(), actions);
+                }
+            }
+            let _ = storage.delete(&old_path);
+        }
+        out
+    }
+
     /// Publish `inner_path` to the xite's connectable peers via the `update`
-    /// command. Returns how many peers accepted it. `sitePublish`.
+    /// command, with per-file diffs so receivers can patch their data files in
+    /// place, and progress pushed to the xite's pages (EpixNet's publish
+    /// progress bar). Returns how many peers accepted it. `sitePublish`.
     pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
-        self.publish_to(address, inner_path, 20).await
+        let diffs = self.take_diffs(address, inner_path).await;
+        self.publish_to(address, inner_path, 20, diffs, true).await
     }
 
     /// Publish to at most `limit` connectable peers. The re-broadcast of an
@@ -4354,6 +4412,8 @@ impl AppState {
         address: &str,
         inner_path: &str,
         limit: usize,
+        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+        progress: bool,
     ) -> Result<usize, String> {
         let body = self
             .xites
@@ -4370,6 +4430,23 @@ impl AppState {
             .unwrap_or(0.0);
         let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
         let peers = self.connectable_peers(address, limit).await;
+        let total = peers.len();
+        let wire_diffs = (!diffs.is_empty()).then(|| crate::fileserve::encode_diffs(&diffs));
+        let push_progress = |published: usize, done: usize| {
+            if progress && total > 0 {
+                self.push_event(
+                    "progress",
+                    json!([
+                        "publish",
+                        format!("Content published to {published}/{total} peers."),
+                        (100 * done / total) as i64,
+                    ]),
+                    None,
+                    Some(address.to_string()),
+                );
+            }
+        };
+        push_progress(0, 0);
 
         // Push to every candidate concurrently (EpixNet publishes with
         // parallel workers): a page waits on the sitePublish reply, so dead
@@ -4380,11 +4457,12 @@ impl AppState {
             let address = address.to_string();
             let inner_path = inner_path.to_string();
             let body = body.clone();
+            let diffs = wire_diffs.clone();
             set.spawn(async move {
                 let push = async {
                     let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
                     conn.handshake().await.ok()?;
-                    conn.update(&address, &inner_path, &body, modified).await.ok()?;
+                    conn.update(&address, &inner_path, &body, modified, diffs).await.ok()?;
                     // Live-hook: tell the peer (acting as a propagation node)
                     // about the new version so peers that are offline now can
                     // pull it later.
@@ -4397,11 +4475,14 @@ impl AppState {
             });
         }
         let mut published = 0;
+        let mut done = 0;
         while let Some(res) = set.join_next().await {
+            done += 1;
             if let Ok(Some(peer)) = res {
                 self.set_peer_connected(address, &peer, true).await;
                 published += 1;
             }
+            push_progress(published, done);
         }
         Ok(published)
     }
@@ -4612,8 +4693,9 @@ impl AppState {
                     self.update_content(k, xite.content.clone()).await;
                 }
             }
-            // EpixNet re-publishes an accepted update to up to 3 more peers.
-            let _ = self.publish_to(&key, &inner_path, 3).await;
+            // EpixNet re-publishes an accepted update to up to 3 more peers,
+            // forwarding the diffs it received so they spread with the push.
+            let _ = self.publish_to(&key, &inner_path, 3, diffs, false).await;
         }
         self.updates_in_flight.lock().unwrap().remove(&uri);
         // Flash the dashboard row: a peer pushed a new version and it landed.
@@ -6201,6 +6283,62 @@ mod tests {
         let resigned: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(resigned["modified"].as_f64().unwrap() > first);
+    }
+
+    #[tokio::test]
+    async fn publish_diffs_come_from_old_snapshots() {
+        // fileWrite keeps a `-old` snapshot of a data file; take_diffs turns it
+        // into the patch an update push carries (so peers that can't connect
+        // back still get the change) and drops the snapshot; signing never
+        // hashes snapshots into content.json.
+        let root = tempdir().unwrap();
+        let site = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        let storage = XiteStorage::new(root.path().join("data").join(&site));
+        storage
+            .write(
+                "data/users/content.json",
+                &serde_json::to_vec(&json!({
+                    "address": site,
+                    "inner_path": "data/users/content.json",
+                    "user_contents": { "permissions": {}, "cert_signers": {} }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        state
+            .add_xite(&site, XiteEntry {
+                storage: storage.clone(),
+                content: Some(json!({ "address": site, "files": {} })),
+            })
+            .await;
+
+        let auth = state.user.write().await.auth_address(&site).unwrap();
+        let dir = format!("data/users/{auth}");
+        let data_path = format!("{dir}/data.json");
+        let content_path = format!("{dir}/content.json");
+        let v1 = br#"{"topic":[]}"#.to_vec();
+        let v2 = br#"{"topic":[{"topic_id":1,"title":"hello"}]}"#.to_vec();
+
+        state.write_file(&site, &data_path, &v1).await.unwrap();
+        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        // No previous file, so nothing to diff on the first publish.
+        assert!(state.take_diffs(&site, &content_path).await.is_empty());
+
+        state.write_file(&site, &data_path, &v2).await.unwrap();
+        assert!(storage.exists(&format!("{data_path}-old")), "snapshot kept");
+        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        let signed: Value =
+            serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
+        assert!(signed["files"]["data.json-old"].is_null(), "snapshot never hashed: {signed}");
+
+        let diffs = state.take_diffs(&site, &content_path).await;
+        let actions = diffs.get("data.json").expect("diff for the changed file");
+        // The diff reconstructs the new file from what peers hold (v1).
+        assert_eq!(epix_content::patch(&v1, actions).unwrap(), v2);
+        // The snapshot is consumed with the publish.
+        assert!(!storage.exists(&format!("{data_path}-old")));
+        assert!(state.take_diffs(&site, &content_path).await.is_empty());
     }
 
     #[tokio::test]

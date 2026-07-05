@@ -1334,7 +1334,22 @@ impl WsCommand for SitePublish {
             }
         }
         let published = s.state.publish(&address, &inner_path).await?;
-        Ok(json!(format!("Published to {published} peers.")))
+        // The page checks for the literal "ok" (EpixNet's actionSitePublish
+        // responds "ok"; the peer count arrives as a notification).
+        if published > 0 {
+            s.state.push_notification(
+                "done",
+                &format!("Content published to {published} peers."),
+                5000,
+            );
+        } else {
+            s.state.push_notification(
+                "info",
+                "Content publish failed: no peers reachable right now. It will spread on the next sync.",
+                7000,
+            );
+        }
+        Ok(Value::from("ok"))
     }
 }
 

@@ -185,16 +185,23 @@ impl Connection {
         inner_path: &str,
         body: &[u8],
         modified: f64,
+        diffs: Option<Value>,
     ) -> Result<Value> {
-        let params = vmap(vec![
+        let mut fields = vec![
             ("site", Value::from(xite)),
             ("inner_path", Value::from(inner_path)),
             ("body", Value::Binary(body.to_vec())),
             // The version being pushed; receivers skip validation when they
             // already have this or newer (EpixNet peers send it too).
             ("modified", Value::from(modified)),
-        ]);
-        self.request("update", params).await
+        ];
+        // Per-file line diffs (`file -> [["=",n]|["-",n]|["+",[lines]]]`) so
+        // receivers patch their copies of changed data files instead of
+        // fetching them back - which they often can't (publisher behind NAT).
+        if let Some(diffs) = diffs {
+            fields.push(("diffs", diffs));
+        }
+        self.request("update", vmap(fields)).await
     }
 
     /// Exchange peers (`pex`): send some of our connectable peers (packed by
