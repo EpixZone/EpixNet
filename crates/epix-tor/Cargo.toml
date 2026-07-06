@@ -6,16 +6,24 @@ edition = "2021"
 [dependencies]
 epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
-arti-client = { version = "0.44", features = [
+# rustls instead of the default native-tls: pure Rust, so the same build works
+# on desktop and Android (native-tls needs an OpenSSL for the NDK target).
+arti-client = { version = "0.44", default-features = false, features = [
     "tokio",
+    "rustls",
+    "compression",
+    "flowctl-cc",
     "onion-service-client",
     "onion-service-service",
 ] }
 tor-hsservice = "0.44"
 safelog = "0.9"
-tor-rtcompat = { version = "0.44", features = ["tokio", "native-tls"] }
+tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
 tor-cell = "0.44"
 tor-proto = "0.44"
+# rustls 0.23 won't auto-pick a crypto provider when several are in the tree;
+# we install `ring` explicitly before bootstrap (see `install_crypto_provider`).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros", "time"] }
