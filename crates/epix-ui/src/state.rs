@@ -404,6 +404,17 @@ fn html_escape(s: &str) -> String {
 
 /// A random lowercase-hex string of `bytes` random bytes (2 hex chars each).
 /// Used for wrapper/CSP nonces.
+/// SQL-literal-quote a JSON scalar (EpixNet's `helper.sqlquote`), for inlining
+/// `:params` into subscribed notification queries.
+fn sql_quote(v: &Value) -> String {
+    match v {
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => (*b as i64).to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        _ => "null".into(),
+    }
+}
+
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     let _ = getrandom::getrandom(&mut buf);
@@ -698,6 +709,32 @@ impl AppState {
         }
     }
 
+    /// The user's directory name under data/users/ (EpixNet's
+    /// `getUserDirectory`): the xID cert's `<name>.epix` when one is selected,
+    /// else the auth address. EpixTalk-style pages build their write paths
+    /// from this, and notification queries reference it as `{xid_directory}`.
+    pub async fn user_directory(&self, address: &str, auth_address: &str) -> String {
+        match self.user.read().await.get_cert(address) {
+            Some(cert) if cert.auth_type == "xid" && !cert.auth_user_name.is_empty() => {
+                format!("{}.epix", cert.auth_user_name)
+            }
+            _ => auth_address.to_string(),
+        }
+    }
+
+    /// A xite's stored per-user settings (`userGetSettings`).
+    pub async fn user_site_settings(&self, address: &str) -> Value {
+        self.user.read().await.site_settings(address)
+    }
+
+    /// Store a xite's per-user settings (`userSetSettings`), persisted to
+    /// users.json like EpixNet's `setSiteSettings`.
+    pub async fn set_user_site_settings(&self, address: &str, settings: Value) -> Result<(), String> {
+        self.user.write().await.set_site_settings(address, settings)?;
+        self.save_user().await;
+        Ok(())
+    }
+
     // --- Notification plugin -------------------------------------------------
 
     /// `notificationSubscribe` - save a site's notification queries
@@ -739,56 +776,150 @@ impl AppState {
         json!({ "global_muted": global, "site_mutes": site_mutes })
     }
 
-    /// `notificationQuery` - run every subscribed site's notification queries and
-    /// return the row counts (`{results, num, sites, muted}`).
+    /// `notificationQuery` - run every subscribed site's notification queries
+    /// and return the counts, mirroring EpixNet's `actionNotificationQuery`:
+    /// global/per-site mutes, `:params` inlining, the `{xid_directory}` and
+    /// `{last_seen}` placeholders, the `notification_seen` baseline from the
+    /// site's per-user settings, and per-entry `site`/`title`/`icon` metadata
+    /// (icons from the site's `notification_icons` in content.json).
     pub async fn notification_query(&self) -> Value {
         if self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false) {
             return json!({ "results": [], "num": 0, "sites": 0, "muted": true });
         }
         let subs = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
         let site_muted = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        let dismissed_all =
+            self.config_get("notification_dismissed").await.unwrap_or_else(|| json!({}));
         let mut results = Vec::new();
-        let mut num = 0i64;
         let mut sites = 0i64;
-        if let Value::Object(by_site) = &subs {
-            for (address, site_subs) in by_site {
-                if site_muted.get(address).and_then(|v| v.as_bool()).unwrap_or(false) {
+        let Value::Object(by_site) = &subs else {
+            return json!({ "results": [], "num": 0, "sites": 0, "muted": false });
+        };
+        for (address, site_subs) in by_site {
+            if site_muted.get(address).and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let Value::Object(queries) = site_subs else { continue };
+            // Like EpixNet, only sites that have (or can have) a database run.
+            let (has_db, title, icons) = {
+                let xites = self.xites.read().await;
+                match xites.get(address) {
+                    Some(x) => (
+                        x.db.is_some() || x.storage.exists("dbschema.json"),
+                        x.content
+                            .as_ref()
+                            .and_then(|c| c.get("title"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or(address)
+                            .to_string(),
+                        x.content
+                            .as_ref()
+                            .and_then(|c| c.get("notification_icons"))
+                            .and_then(|v| v.as_object().cloned())
+                            .unwrap_or_default(),
+                    ),
+                    None => (false, address.clone(), Default::default()),
+                }
+            };
+            if !has_db {
+                continue;
+            }
+            sites += 1;
+            let seen = self
+                .user_site_settings(address)
+                .await
+                .get("notification_seen")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let dismissed = dismissed_all.get(address).cloned().unwrap_or_else(|| json!({}));
+            for (name, spec) in queries {
+                let (query_raw, params) = match spec {
+                    Value::Array(a) => (
+                        a.first().and_then(|v| v.as_str()).unwrap_or(""),
+                        a.get(1).cloned().unwrap_or(Value::Null),
+                    ),
+                    Value::String(q) => (q.as_str(), Value::Null),
+                    _ => continue,
+                };
+                if !query_raw.trim_start().to_uppercase().starts_with("SELECT") {
                     continue;
                 }
-                let Value::Object(queries) = site_subs else { continue };
-                let mut any = false;
-                for (name, spec) in queries {
-                    let (query, params) = match spec {
-                        Value::Array(a) => (
-                            a.first().and_then(|v| v.as_str()).unwrap_or(""),
-                            a.get(1).cloned().unwrap_or(Value::Null),
-                        ),
-                        Value::String(q) => (q.as_str(), Value::Null),
-                        _ => continue,
-                    };
-                    if let Ok(rows) = self.db_query(address, query, &params).await {
-                        // A notification query is usually `SELECT COUNT(*) AS count`,
-                        // so the real total is a column on the first row - not the
-                        // number of rows returned. Fall back to the row count only
-                        // when neither `count` nor `COUNT(*)` is present.
-                        let count = rows
+                let mut query = query_raw.to_string();
+                if query.contains(":params") {
+                    let inlined = params
+                        .as_array()
+                        .map(|a| a.iter().map(sql_quote).collect::<Vec<_>>().join(","))
+                        .unwrap_or_default();
+                    query = query.replace(":params", &inlined);
+                }
+                if query.contains("{xid_directory}") {
+                    let auth = self.user.write().await.auth_address(address).unwrap_or_default();
+                    if auth.is_empty() {
+                        continue;
+                    }
+                    let dir = self.user_directory(address, &auth).await;
+                    query = query.replace("{xid_directory}", &dir);
+                }
+                let last_seen = dismissed.get(name).and_then(|v| v.as_i64()).unwrap_or(0);
+                if query.contains("{last_seen}") {
+                    query = query.replace("{last_seen}", &last_seen.to_string());
+                }
+                let mut entry = json!({
+                    "site": address,
+                    "title": title,
+                    "name": name,
+                    "count": 0,
+                    "last_seen": last_seen,
+                });
+                match self.db_query(address, &query, &Value::Null).await {
+                    Ok(rows) => {
+                        // A notification query is `SELECT COUNT(*) AS count`
+                        // shaped: the total is a column on the first row.
+                        let mut count = rows
                             .first()
                             .and_then(|r| r.get("count").or_else(|| r.get("COUNT(*)")))
                             .and_then(|v| v.as_i64())
-                            .unwrap_or(rows.len() as i64);
-                        if count > 0 {
-                            num += count;
-                            any = true;
-                            results.push(json!({ "address": address, "name": name, "count": count }));
+                            .unwrap_or(0);
+                        // Subtract the "seen" baseline the site stored via
+                        // userSetSettings when the user last visited.
+                        let baseline =
+                            seen.get(name).and_then(|v| v.as_i64()).unwrap_or(0);
+                        if baseline > 0 && count > 0 {
+                            count = (count - baseline).max(0);
                         }
+                        entry["count"] = json!(count);
+                    }
+                    Err(e) => {
+                        entry["error"] = json!(e);
                     }
                 }
-                if any {
-                    sites += 1;
+                if let Some(icon) = icons.get(name.as_str()).and_then(|v| v.as_str()) {
+                    entry["icon"] = json!(icon);
                 }
+                results.push(entry);
             }
         }
-        json!({ "results": results, "num": num, "sites": sites, "muted": false })
+        json!({ "results": results, "num": results.len(), "sites": sites, "muted": false })
+    }
+
+    /// `notificationDismiss` - record when the user cleared a site's
+    /// notification, so `{last_seen}` queries can filter to newer items.
+    /// Stored as milliseconds, like EpixNet.
+    pub async fn notification_mark_dismissed(&self, site: &str, name: &str) {
+        let mut all =
+            self.config_get("notification_dismissed").await.unwrap_or_else(|| json!({}));
+        if !all.is_object() {
+            all = json!({});
+        }
+        let entry = all
+            .as_object_mut()
+            .unwrap()
+            .entry(site.to_string())
+            .or_insert_with(|| json!({}));
+        if let Value::Object(m) = entry {
+            m.insert(name.to_string(), json!(now_secs() * 1000));
+        }
+        self.config_set("notification_dismissed", all).await;
     }
 
     /// `configList` - the editable config keys with current value + default.
@@ -5090,20 +5221,6 @@ impl AppState {
         self.user_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
     }
 
-    /// Remember a dismissed notification center id (`notificationDismiss`), so a
-    /// dismissed banner stays dismissed across reloads.
-    pub async fn notification_dismiss(&self, center: &str) {
-        let mut list = self
-            .config_get("notification_dismissed")
-            .await
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        if !list.iter().any(|v| v.as_str() == Some(center)) {
-            list.push(json!(center));
-            self.config_set("notification_dismissed", json!(list)).await;
-        }
-    }
-
     /// Build the `siteInfo` response for a xite - EpixNet's `formatSiteInfo`.
     /// Returns `Null` if the xite isn't served here.
     pub async fn site_info(&self, address: &str) -> Value {
@@ -5120,16 +5237,7 @@ impl AppState {
             .auth_address(address)
             .unwrap_or_default();
         let cert_user_id = self.user.read().await.cert_user_id(address);
-        // The user's directory name under data/users/ (EpixNet's
-        // `getUserDirectory`): the xID cert's `<name>.epix` when one is
-        // selected, else the auth address. EpixTalk-style pages build their
-        // write paths from this.
-        let xid_directory = match self.user.read().await.get_cert(address) {
-            Some(cert) if cert.auth_type == "xid" && !cert.auth_user_name.is_empty() => {
-                format!("{}.epix", cert.auth_user_name)
-            }
-            _ => auth_address.clone(),
-        };
+        let xid_directory = self.user_directory(address, &auth_address).await;
 
         let address_hash = hex::encode(Sha256::digest(address.as_bytes()));
         let short = if address.len() > 6 { &address[..6] } else { address };
@@ -6013,14 +6121,51 @@ mod tests {
             .unwrap();
         let addr = "1BlogAddr";
         let state = AppState::new("test");
-        state.add_xite(addr, XiteEntry { storage, content: None }).await;
-        // A COUNT(*) subscription must report the column value (3), not 1 row.
+        state
+            .add_xite(addr, XiteEntry {
+                storage,
+                content: Some(json!({
+                    "address": addr, "title": "Blog", "files": {},
+                    "notification_icons": { "unread": "img/bell.png" },
+                })),
+            })
+            .await;
+        // A COUNT(*) subscription must report the column value (3), not 1 row,
+        // with the EpixNet result shape (site/title/icon, num = entry count).
         state
             .notification_subscribe(addr, json!({ "unread": ["SELECT COUNT(*) AS count FROM post", null] }))
             .await;
         let q = state.notification_query().await;
-        assert_eq!(q["num"], 3);
-        assert_eq!(q["results"][0]["count"], 3);
+        assert_eq!(q["num"], 1, "num counts entries, not totals: {q}");
+        let entry = &q["results"][0];
+        assert_eq!(entry["count"], 3);
+        assert_eq!(entry["site"], addr);
+        assert_eq!(entry["title"], "Blog");
+        assert_eq!(entry["icon"], "img/bell.png");
+
+        // A `{last_seen}` query filters by the dismiss timestamp.
+        state
+            .notification_subscribe(
+                addr,
+                json!({ "unread": ["SELECT COUNT(*) AS count FROM post WHERE post_id > {last_seen}", null] }),
+            )
+            .await;
+        state.notification_mark_dismissed(addr, "unread").await;
+        let q = state.notification_query().await;
+        // last_seen is a fresh ms timestamp, far above every post_id.
+        assert_eq!(q["results"][0]["count"], 0);
+        assert!(q["results"][0]["last_seen"].as_i64().unwrap() > 0);
+
+        // The notification_seen baseline (stored via userSetSettings) subtracts.
+        state
+            .notification_subscribe(addr, json!({ "unread": ["SELECT COUNT(*) AS count FROM post", null] }))
+            .await;
+        state
+            .set_user_site_settings(addr, json!({ "notification_seen": { "unread": 2 } }))
+            .await
+            .unwrap();
+        let q = state.notification_query().await;
+        assert_eq!(q["results"][0]["count"], 1, "3 total minus 2 seen: {q}");
     }
 
     #[tokio::test]

@@ -360,8 +360,6 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(PeerAdd),
         Arc::new(ServerShowdirectory),
         Arc::new(XidClearCache),
-        Arc::new(NotificationDismiss { cmd: "notificationDismiss" }),
-        Arc::new(NotificationDismiss { cmd: "notificationDismissSelf" }),
         Arc::new(SiteblockIgnoreAddSite),
         // CryptMessage
         Arc::new(UserPublickey),
@@ -380,8 +378,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(XidResolveName),
         Arc::new(EccPrivToPub),
         Arc::new(EccPubToAddr),
-        Arc::new(simple("userGetSettings", json!({}))),
-        Arc::new(simple("userSetSettings", json!("ok"))),
+        Arc::new(UserGetSettings),
+        Arc::new(UserSetSettings),
         // OptionalManager
         Arc::new(FileNeed),
         Arc::new(OptionalFileList),
@@ -413,6 +411,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(NotificationList),
         Arc::new(NotificationMute),
         Arc::new(NotificationMuteStatus),
+        Arc::new(NotificationDismiss),
+        Arc::new(NotificationDismissSelf),
         Arc::new(FeedQuery),
         Arc::new(FeedFollow),
         Arc::new(FeedListFollow),
@@ -644,6 +644,76 @@ impl WsCommand for NotificationMuteStatus {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(s.state.notification_mute_status().await)
+    }
+}
+
+/// `notificationDismiss(site_address, name)` - mark a site's notification as
+/// seen (admin; the dashboard bell's clear button).
+struct NotificationDismiss;
+#[async_trait]
+impl WsCommand for NotificationDismiss {
+    fn name(&self) -> &'static str {
+        "notificationDismiss"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = arg_str(p, "site_address", 0)
+            .ok_or("notificationDismiss: site_address required")?
+            .to_string();
+        let name =
+            arg_str(p, "name", 1).ok_or("notificationDismiss: name required")?.to_string();
+        s.state.notification_mark_dismissed(&site, &name).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `notificationDismissSelf(name)` - a site marks its own notification as seen
+/// (non-admin: only its own subscriptions).
+struct NotificationDismissSelf;
+#[async_trait]
+impl WsCommand for NotificationDismissSelf {
+    fn name(&self) -> &'static str {
+        "notificationDismissSelf"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        let name =
+            arg_str(p, "name", 0).ok_or("notificationDismissSelf: name required")?.to_string();
+        s.state.notification_mark_dismissed(&site, &name).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `userGetSettings()` - the current site's stored per-user settings.
+struct UserGetSettings;
+#[async_trait]
+impl WsCommand for UserGetSettings {
+    fn name(&self) -> &'static str {
+        "userGetSettings"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        Ok(s.state.user_site_settings(&site).await)
+    }
+}
+
+/// `userSetSettings(settings)` - store the current site's per-user settings
+/// (EpixNet keeps them in users.json; sites use this for notification_seen
+/// baselines, visited markers, and other private state).
+struct UserSetSettings;
+#[async_trait]
+impl WsCommand for UserSetSettings {
+    fn name(&self) -> &'static str {
+        "userSetSettings"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let site = s.address()?.to_string();
+        let settings = p
+            .get("settings")
+            .cloned()
+            .or_else(|| p.as_array().and_then(|a| a.first()).cloned())
+            .unwrap_or_else(|| p.clone());
+        s.state.set_user_site_settings(&site, settings).await?;
+        Ok(Value::from("ok"))
     }
 }
 
@@ -1885,8 +1955,14 @@ fn split_feed(query_set: &Value) -> (&str, &Value) {
 /// Wrap a feed query as a subquery with the day filter, ordering, and limit,
 /// inlining `:params` (quoted) if present. Wrapping keeps `UNION` feeds intact.
 fn build_feed_query(raw: &str, day_limit: i64, limit: usize, params: &Value) -> String {
+    // CAST matters: strftime returns TEXT, and the subquery's date_added is an
+    // expression with no column affinity - SQLite orders every INTEGER below
+    // every TEXT, so without the cast the comparison is false for ALL rows and
+    // the whole feed comes back empty.
     let day_filter = if day_limit > 0 {
-        format!("WHERE date_added > strftime('%s','now','-{day_limit} day')")
+        format!(
+            "WHERE date_added > CAST(strftime('%s','now','-{day_limit} day') AS INTEGER)"
+        )
     } else {
         String::new()
     };
@@ -2457,22 +2533,6 @@ impl WsCommand for XidClearCache {
         "xidClearCache"
     }
     async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(Value::from("ok"))
-    }
-}
-
-/// `notificationDismiss(center)` - remember a dismissed notification banner.
-struct NotificationDismiss {
-    cmd: &'static str,
-}
-#[async_trait]
-impl WsCommand for NotificationDismiss {
-    fn name(&self) -> &'static str {
-        self.cmd
-    }
-    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let center = arg_str(p, "center", 0).ok_or("center required")?;
-        s.state.notification_dismiss(center).await;
         Ok(Value::from("ok"))
     }
 }
@@ -3427,7 +3487,9 @@ mod tests {
     fn build_feed_query_wraps_and_inlines_params() {
         let q = build_feed_query("SELECT * FROM post", 3, 10, &Value::Null);
         assert!(q.starts_with("SELECT * FROM (SELECT * FROM post)"));
-        assert!(q.contains("date_added > strftime"));
+        // CAST is load-bearing: strftime is TEXT and the subquery column has no
+        // affinity, so an uncast comparison is false for every integer row.
+        assert!(q.contains("date_added > CAST(strftime"), "cast day filter: {q}");
         assert!(q.ends_with("ORDER BY date_added DESC LIMIT 10"));
 
         let q = build_feed_query("SELECT * FROM post WHERE id IN (:params)", 0, 5, &json!([1, "a'b"]));
