@@ -126,6 +126,20 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Network", "ip_external", "File server external ip (blank = auto-detect via UPnP)", "", "textarea"),
     ("Network", "tor", "Tor", "enable", "select:Disable=disable|Enable=enable|Always=always"),
     ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
+    (
+        "Network",
+        "i2p",
+        "I2P (reach and host peers over I2P; the embedded router boots in the background)",
+        "disable",
+        "select:Disable=disable|Embedded router=embedded|External router=external",
+    ),
+    (
+        "Network",
+        "i2p_sam_port",
+        "I2P external router SAM port (only used with External)",
+        "7656",
+        "text",
+    ),
     ("Network", "trackers", "Trackers", "145.223.69.23:26959", "textarea"),
     ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
     (
@@ -227,8 +241,17 @@ pub struct AppState {
     /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
     filters: RwLock<Value>,
     filters_path: Option<PathBuf>,
-    /// Transport used to publish updates to peers (set by the node).
+    /// Transport used to publish updates to peers (set by the node). This is
+    /// the composed transport actually dialed with: the base (TCP, or Tor's
+    /// MixedTransport) with I2P dispatch layered on when I2P is up.
     transport: RwLock<Option<Arc<dyn Transport>>>,
+    /// The raw base transport (TCP / Tor mixed), kept so I2P can be composed in
+    /// or out without the base overwriting it and vice versa.
+    base_transport: RwLock<Option<Arc<dyn Transport>>>,
+    /// The I2P transport (dials `.b32.i2p` peers), once I2P is up.
+    i2p_transport: RwLock<Option<Arc<dyn Transport>>>,
+    /// Latest I2P status snapshot for the Stats page (JSON; `{}` when off).
+    i2p_status: RwLock<Value>,
     /// On-demand resolver: resolve + clone a `.epix` host not yet served (set by
     /// the node, which has the chain + worker). Lets the browser open any
     /// `talk.epix` by typing it, cloning it live.
@@ -418,6 +441,27 @@ fn html_escape(s: &str) -> String {
 
 /// A random lowercase-hex string of `bytes` random bytes (2 hex chars each).
 /// Used for wrapper/CSP nonces.
+/// Dispatches by transport: `.b32.i2p` peers to the I2P transport, everything
+/// else (clearnet, onion) to the base. Lets I2P be layered onto TCP or Tor's
+/// MixedTransport without either clobbering the other.
+struct OverlayTransport {
+    base: Arc<dyn Transport>,
+    i2p: Arc<dyn Transport>,
+}
+
+#[async_trait::async_trait]
+impl Transport for OverlayTransport {
+    fn scheme(&self) -> &'static str {
+        "overlay"
+    }
+    async fn dial(&self, addr: &PeerAddr) -> Result<epix_transport::PeerStream, epix_core::Error> {
+        match addr {
+            PeerAddr::I2p { .. } => self.i2p.dial(addr).await,
+            _ => self.base.dial(addr).await,
+        }
+    }
+}
+
 /// SQL-literal-quote a JSON scalar (EpixNet's `helper.sqlquote`), for inlining
 /// `:params` into subscribed notification queries.
 fn sql_quote(v: &Value) -> String {
@@ -448,6 +492,9 @@ impl AppState {
             filters: RwLock::new(empty_filters()),
             filters_path: None,
             transport: RwLock::new(None),
+            base_transport: RwLock::new(None),
+            i2p_transport: RwLock::new(None),
+            i2p_status: RwLock::new(json!({})),
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
@@ -549,6 +596,9 @@ impl AppState {
             filters: RwLock::new(filters),
             filters_path: Some(filters_path),
             transport: RwLock::new(None),
+            base_transport: RwLock::new(None),
+            i2p_transport: RwLock::new(None),
+            i2p_status: RwLock::new(json!({})),
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
@@ -1637,7 +1687,7 @@ impl AppState {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
             let Ok((tracker, peers)) = res else { continue };
-            self.record_tracker(&tracker.to_string(), peers.len()).await;
+            self.record_tracker(&tracker, peers.len()).await;
             // AnnounceShare: remember a tracker that answered, so it is reused
             // (and shared) across restarts.
             if !peers.is_empty() {
@@ -1662,8 +1712,11 @@ impl AppState {
     /// the dashboard's working-tracker count and Beacon's health check reflect
     /// which announcers actually answer (a dead onion/IPv6 entry shouldn't read
     /// as working just because it was tried).
-    async fn record_tracker(&self, tracker: &str, num_added: usize) {
-        let key = format!("epix://{tracker}");
+    async fn record_tracker(&self, tracker: &PeerAddr, num_added: usize) {
+        // Key (and show) trackers by their real transport, not a blanket
+        // `epix://` - `tcp://1.2.3.4:15441`, `onion://…`, `i2p://…` - so the
+        // dashboard's tracker pill reflects the actual protocol.
+        let key = format!("{}://{}", tracker.scheme(), tracker);
         let mut stats = self.tracker_stats.write().await;
         let entry = stats.entry(key).or_insert_with(|| {
             json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0 })
@@ -3460,6 +3513,38 @@ impl AppState {
             let _ = write!(h, "<div class='stat-row'>onion: {}.onion</div>", esc(&onion));
         }
 
+        // I2P.
+        h.push_str("<h2>I2P</h2>");
+        let i2p = self.i2p_status().await;
+        let i2p_str = |k: &str| i2p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let i2p_num = |k: &str| i2p.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        let mode = i2p_str("mode");
+        if mode.is_empty() || mode == "disable" {
+            h.push_str("<div class='stat-row'>status: <b>disabled</b></div>");
+        } else {
+            let _ = write!(
+                h,
+                "<div class='stat-row'>mode: <b>{}</b> &nbsp; status: <b>{}</b></div>",
+                esc(&mode),
+                esc(&i2p_str("phase"))
+            );
+            let _ = write!(
+                h,
+                "<div class='stat-row'>peers (routers): {} &nbsp; tunnels built: {} &nbsp; \
+                 tunnel failures: {} &nbsp; reseed routers: {}</div>",
+                i2p_num("connected_routers"),
+                i2p_num("tunnels_built"),
+                i2p_num("tunnel_failures"),
+                i2p_num("reseed_routers"),
+            );
+            let dest = i2p_str("destination");
+            if !dest.is_empty() {
+                // The destination is a long base64 blob; show a short prefix.
+                let short: String = dest.chars().take(24).collect();
+                let _ = write!(h, "<div class='stat-row'>destination: {}…</div>", esc(&short));
+            }
+        }
+
         // Sites.
         h.push_str("<h2>Sites</h2><table><tr><th>address</th><th>peers (conn/able/total)</th><th>onion</th><th>local</th><th>out</th><th>in</th><th>serving</th></tr>");
         for address in self.xite_addresses().await {
@@ -4202,14 +4287,44 @@ impl AppState {
 
     // --- publish / sign ------------------------------------------------------
 
-    /// The transport used to publish updates to peers.
+    /// Set the base peer transport (TCP, or Tor's MixedTransport). Recomposes
+    /// with I2P dispatch if I2P is up, so neither overwrites the other.
     pub async fn set_transport(&self, transport: Arc<dyn Transport>) {
-        *self.transport.write().await = Some(transport);
+        *self.base_transport.write().await = Some(transport);
+        self.recompose_transport().await;
     }
 
-    /// The transport set by the node, once available.
+    /// Set the I2P transport (dials `.b32.i2p` peers). Layered onto the base.
+    pub async fn set_i2p_transport(&self, transport: Arc<dyn Transport>) {
+        *self.i2p_transport.write().await = Some(transport);
+        self.recompose_transport().await;
+    }
+
+    /// Rebuild the composed transport from the base + optional I2P layer.
+    async fn recompose_transport(&self) {
+        let base = self.base_transport.read().await.clone();
+        let i2p = self.i2p_transport.read().await.clone();
+        let composed: Option<Arc<dyn Transport>> = match (base, i2p) {
+            (Some(base), Some(i2p)) => Some(Arc::new(OverlayTransport { base, i2p })),
+            (Some(base), None) => Some(base),
+            _ => None,
+        };
+        *self.transport.write().await = composed;
+    }
+
+    /// The (composed) transport set by the node, once available.
     pub async fn transport(&self) -> Option<Arc<dyn Transport>> {
         self.transport.read().await.clone()
+    }
+
+    /// Store the latest I2P status snapshot (JSON) for the Stats page.
+    pub async fn set_i2p_status(&self, status: Value) {
+        *self.i2p_status.write().await = status;
+    }
+
+    /// The latest I2P status snapshot (`{}` when I2P is off).
+    pub async fn i2p_status(&self) -> Value {
+        self.i2p_status.read().await.clone()
     }
 
     /// Install the on-demand resolver (set by the node).

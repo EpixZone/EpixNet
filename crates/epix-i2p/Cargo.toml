@@ -11,7 +11,7 @@ epix-transport = { path = "../epix-transport" }
 yosemite = "0.7"
 # Embedded pure-Rust I2P router (the no-sidecar default). Optional so a build
 # can drop it and use only an external router.
-emissary-core = { version = "0.4", optional = true }
+emissary-core = { version = "0.4", optional = true, features = ["events"] }
 emissary-util = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
 async-trait = "0.1"

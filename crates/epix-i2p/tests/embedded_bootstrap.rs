@@ -4,7 +4,7 @@
 //!
 //!   cargo test -p epix-i2p --test embedded_bootstrap -- --ignored --nocapture
 
-use epix_i2p::{I2p, I2pConfig, I2pMode};
+use epix_i2p::{I2p, I2pConfig, I2pMode, I2pPhase};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
@@ -16,15 +16,28 @@ async fn embedded_router_reseeds_and_gives_us_a_destination() {
         data_dir: dir.path().to_path_buf(),
     };
 
-    // start() reseeds, builds the router, and creates our inbound session -
-    // which only succeeds once the router has tunnels. Bound it generously.
-    let started = tokio::time::timeout(std::time::Duration::from_secs(300), I2p::start(cfg)).await;
-
-    let (i2p, _rx) = started.expect("embedded router bootstrap timed out (5 min)").expect("start");
-    let dest = i2p.destination();
-    println!("embedded i2p destination ({} chars): {dest}", dest.len());
-    // SAM returns the full base64 destination (~516+ chars) once the router has
-    // reseeded and built tunnels - a non-empty one proves the embedded router
-    // bootstrapped and gave us a live session.
-    assert!(dest.len() > 500, "got a real inbound destination (len {})", dest.len());
+    // spawn() returns immediately; the router reseeds + builds tunnels on its
+    // own task and reaches Ready once our inbound session exists. Poll for it.
+    let (i2p, _rx) = I2p::spawn(cfg);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let s = i2p.status().await;
+        if s.phase == I2pPhase::Ready {
+            println!(
+                "i2p ready: {} chars, {} peers, {} tunnels",
+                s.destination.len(),
+                s.connected_routers,
+                s.tunnels_built
+            );
+            // SAM returns the full base64 destination (~516+ chars) - a real
+            // one proves the embedded router bootstrapped and gave us a session.
+            assert!(s.destination.len() > 500, "got a real inbound destination");
+            return;
+        }
+        if let I2pPhase::Failed(e) = &s.phase {
+            panic!("i2p bringup failed: {e}");
+        }
+        assert!(std::time::Instant::now() < deadline, "embedded router bootstrap timed out (5 min)");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }

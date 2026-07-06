@@ -1168,6 +1168,26 @@ async fn serve(
         epix_runtime::TorMode::parse(&opts.tor_mode)
     };
 
+    // I2P config from the node config (Config page): mode + external SAM port.
+    #[cfg(feature = "i2p")]
+    let (i2p_mode, i2p_sam_port) = {
+        let mode = if offline {
+            "disable".to_string()
+        } else {
+            state
+                .config_get("i2p")
+                .await
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "disable".to_string())
+        };
+        let port = state
+            .config_get("i2p_sam_port")
+            .await
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(7656) as u16;
+        (mode, port)
+    };
+
     let runtime_config = epix_runtime::RuntimeConfig {
         fileserver_port: if offline { None } else { fileserver_port },
         offline,
@@ -1175,11 +1195,15 @@ async fn serve(
         tor_mode,
         #[cfg(feature = "tor")]
         tor_socks_port: Some(43111),
+        #[cfg(feature = "i2p")]
+        i2p_mode,
+        #[cfg(feature = "i2p")]
+        i2p_sam_port,
         ..Default::default()
     };
     let mut runtime =
         epix_runtime::NodeRuntime::with_config(state.clone(), trackers, runtime_config);
-    #[cfg(feature = "tor")]
+    #[cfg(any(feature = "tor", feature = "i2p"))]
     {
         runtime = runtime.with_data_dir(opts.data_root.clone());
     }
