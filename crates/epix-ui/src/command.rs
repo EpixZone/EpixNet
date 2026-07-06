@@ -103,6 +103,11 @@ const DELETE_SITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 /// Per-connection context handed to every command.
 pub struct WsSession {
     pub state: Arc<AppState>,
+    /// Unique id of this connection, for per-connection event routing: events
+    /// caused by this connection's own commands are not echoed back to it
+    /// (EpixNet's `ws != self`), and progress/notification replies to a
+    /// command go only to it (EpixNet's `self.cmd`).
+    pub id: u64,
     /// The xite address this WebSocket connection is bound to (if any).
     pub xite: Option<String>,
     /// Channels this connection has joined (`channelJoin`), e.g. `siteChanged`.
@@ -116,8 +121,10 @@ pub struct WsSession {
 
 impl WsSession {
     pub fn new(state: Arc<AppState>, xite: Option<String>) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             state,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             xite,
             channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1112,9 +1119,10 @@ impl WsCommand for FileWrite {
         s.state.write_file(&target, &inner, &bytes).await?;
         // Ingest written data files into the xite's database right away (like
         // EpixNet's storage.onUpdated), so the page's dbQuery sees the change
-        // before the sign/publish round-trip.
+        // before the sign/publish round-trip. The writing connection is
+        // excluded from the file_done echo (EpixNet notifies `ws != self`).
         if inner.ends_with(".json") && !inner.ends_with("content.json") {
-            s.state.ingest_file(&target, &inner).await;
+            s.state.ingest_file_from(&target, &inner, Some(s.id)).await;
         }
         Ok(Value::from("ok"))
     }
@@ -1135,7 +1143,7 @@ impl WsCommand for FileDelete {
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("fileDelete: inner_path required")?;
         let (address, inner_path) = s.resolve_target(inner_path).await?;
-        s.state.delete_file(&address, &inner_path).await?;
+        s.state.delete_file(&address, &inner_path, Some(s.id)).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -1330,20 +1338,25 @@ impl WsCommand for SitePublish {
                     s.state.sign_xite(&address, &pk).await?;
                 }
             } else {
-                s.state.sign_user_content(&address, &inner_path, sign_privatekey(p)).await?;
+                s.state
+                    .sign_user_content(&address, &inner_path, sign_privatekey(p), Some(s.id))
+                    .await?;
             }
         }
-        let published = s.state.publish(&address, &inner_path).await?;
+        let published = s.state.publish(&address, &inner_path, Some(s.id)).await?;
         // The page checks for the literal "ok" (EpixNet's actionSitePublish
-        // responds "ok"; the peer count arrives as a notification).
+        // responds "ok"; the peer count arrives as a notification - to the
+        // publishing page only, like EpixNet's self.cmd).
         if published > 0 {
-            s.state.push_notification(
+            s.state.push_notification_to(
+                s.id,
                 "done",
                 &format!("Content published to {published} peers."),
                 5000,
             );
         } else {
-            s.state.push_notification(
+            s.state.push_notification_to(
+                s.id,
                 "info",
                 "Content publish failed: no peers reachable right now. It will spread on the next sync.",
                 7000,
@@ -1374,7 +1387,7 @@ async fn sign_for(
         };
         s.state.sign_xite(address, &key).await?;
     } else {
-        s.state.sign_user_content(address, &content_path, privatekey).await?;
+        s.state.sign_user_content(address, &content_path, privatekey, Some(s.id)).await?;
     }
     Ok(content_path)
 }

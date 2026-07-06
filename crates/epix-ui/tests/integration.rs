@@ -171,6 +171,44 @@ async fn rejects_cross_origin_websocket() {
 }
 
 #[tokio::test]
+async fn own_write_is_not_echoed_back() {
+    // EpixNet notifies `ws != self`: the connection whose fileWrite produced a
+    // file_done must not receive the event (an echo re-renders the page
+    // mid-interaction), while every other connection on the site does.
+    use base64::Engine;
+    let (addr, _dir) = start_server().await;
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite");
+    let (mut writer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut watcher, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    call_params(&mut writer, "channelJoin", json!({ "channels": ["siteChanged"] }), 1).await;
+    call_params(&mut watcher, "channelJoin", json!({ "channels": ["siteChanged"] }), 1).await;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(br#"{"topic":[]}"#);
+    let res = call_params(&mut writer, "fileWrite", json!(["data/test.json", b64]), 2).await;
+    assert_eq!(res["result"], json!("ok"));
+
+    // The other connection gets the file_done push.
+    let evt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(Ok(Message::Text(t))) = watcher.next().await {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["cmd"] == "setSiteInfo" && v["params"]["event"][0] == "file_done" {
+                    return v;
+                }
+            }
+        }
+    })
+    .await
+    .expect("watcher receives the file_done event");
+    assert_eq!(evt["params"]["event"][1], "data/test.json");
+
+    // The writer must not: nothing arrives beyond its own command reply.
+    let echo =
+        tokio::time::timeout(std::time::Duration::from_millis(800), writer.next()).await;
+    assert!(echo.is_err(), "no event echoed to the writing connection: {echo:?}");
+}
+
+#[tokio::test]
 async fn handles_epixframe_websocket_commands() {
     let (addr, _dir) = start_server().await;
     let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite");

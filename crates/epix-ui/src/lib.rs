@@ -1468,6 +1468,23 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             event = events.recv() => {
                 match event {
                     Ok(ev) => {
+                        // Per-connection routing first: an event caused by this
+                        // connection's own command is never echoed back to it
+                        // (EpixNet's `ws != self` - the page already knows what
+                        // it did, and the echo re-renders it mid-interaction),
+                        // and a single-recipient event reaches only its
+                        // addressee (EpixNet's `self.cmd`).
+                        if ev.exclude == Some(session.id) {
+                            continue;
+                        }
+                        if let Some(only) = ev.only {
+                            if only == session.id
+                                && sink.send(Message::Text(ev.payload)).await.is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
                         // Deliver only if the connection joined the event's
                         // channel (ungated events always pass) and it is for this
                         // connection's xite (untargeted events always pass).

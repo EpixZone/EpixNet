@@ -56,7 +56,7 @@ async fn publish_pushes_an_update_a_second_node_accepts() {
         .await;
 
     // A pushes; B verifies and applies without ever polling.
-    let published = state_a.publish(&address, "content.json").await.unwrap();
+    let published = state_a.publish(&address, "content.json", None).await.unwrap();
     assert_eq!(published, 1);
     let applied = state_b.content(&address).await.unwrap();
     assert_eq!(applied.get("modified").and_then(|m| m.as_i64()), Some(2000));

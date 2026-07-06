@@ -345,6 +345,14 @@ pub struct UiEvent {
     pub channel: Option<String>,
     pub target: Option<String>,
     pub payload: String,
+    /// Connection id that must NOT receive this event: the one whose own
+    /// command produced it. EpixNet's actionFileWrite notifies `ws != self` -
+    /// echoing a file_done back to the page that wrote the file makes it
+    /// re-render mid-interaction.
+    pub exclude: Option<u64>,
+    /// Deliver ONLY to this connection id (EpixNet's `self.cmd(...)` - e.g.
+    /// publish progress goes to the page that asked, not every open tab).
+    pub only: Option<u64>,
 }
 
 /// Outcome of an accepted inbound `update` push (errors are `Err` strings that
@@ -2138,6 +2146,8 @@ impl AppState {
             channel: None,
             target: Some(address.to_string()),
             payload,
+            exclude: None,
+            only: None,
         });
         // Bind the dialog's `.select.cert` options to answer with their title.
         // The wrapper renders a `notification` under `.notification-ws-<id>`.
@@ -3326,13 +3336,33 @@ impl AppState {
     /// subscription (`None` = ungated); `target` gates by xite (`None` = any).
     /// No-op if nothing is listening.
     fn push_event(&self, cmd: &str, params: Value, channel: Option<&str>, target: Option<String>) {
+        self.push_event_routed(cmd, params, channel, target, None, None);
+    }
+
+    /// [`Self::push_event`] with per-connection routing: `exclude` skips the
+    /// originating connection, `only` delivers to a single one.
+    fn push_event_routed(
+        &self,
+        cmd: &str,
+        params: Value,
+        channel: Option<&str>,
+        target: Option<String>,
+        exclude: Option<u64>,
+        only: Option<u64>,
+    ) {
         // Every pushed command carries a unique id, like EpixNet's
         // UiWebsocket.cmd - the wrapper keys notification toasts on it
         // (`notification-ws-<id>`), so without one every toast shares a key
         // and replaces the previous.
         let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
         let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
-        let _ = self.events.send(UiEvent { channel: channel.map(str::to_string), target, payload });
+        let _ = self.events.send(UiEvent {
+            channel: channel.map(str::to_string),
+            target,
+            payload,
+            exclude,
+            only,
+        });
     }
 
     /// Push the latest `siteInfo` for a xite (`setSiteInfo`) on the `siteChanged`
@@ -3349,10 +3379,27 @@ impl AppState {
     /// so the dashboard's site row shows the spinner + "Updating…"/"Updated!"
     /// inline (matching EpixNet's `updateWebsocket(updating/updated)`).
     pub async fn push_site_info_event(&self, address: &str, event: &str) {
+        self.push_site_info_event_excluding(address, event, None).await;
+    }
+
+    /// [`Self::push_site_info_event`] skipping the originating connection.
+    pub async fn push_site_info_event_excluding(
+        &self,
+        address: &str,
+        event: &str,
+        exclude: Option<u64>,
+    ) {
         let mut info = self.site_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!([event, true]));
-            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+            self.push_event_routed(
+                "setSiteInfo",
+                info,
+                Some("siteChanged"),
+                Some(address.to_string()),
+                exclude,
+                None,
+            );
         }
     }
 
@@ -3360,12 +3407,41 @@ impl AppState {
     /// per-file signal. Sites re-query their db when a `.json` file lands
     /// (EpixSites' site list, EpixTalk's topics), so push this only after the
     /// db is rebuilt or the page re-queries into the old data.
-    pub async fn push_site_info_file_done(&self, address: &str, inner_path: &str) {
+    ///
+    /// `exclude` is the connection whose own write produced the file (EpixNet
+    /// notifies `ws != self`): the page already knows what it wrote, and an
+    /// echoed event re-renders it mid-interaction (detaching inline editors).
+    pub async fn push_site_info_file_done(
+        &self,
+        address: &str,
+        inner_path: &str,
+        exclude: Option<u64>,
+    ) {
         let mut info = self.site_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!(["file_done", inner_path]));
-            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+            self.push_event_routed(
+                "setSiteInfo",
+                info,
+                Some("siteChanged"),
+                Some(address.to_string()),
+                exclude,
+                None,
+            );
         }
+    }
+
+    /// A notification for a single connection (EpixNet's `self.cmd`), not
+    /// every open page.
+    pub fn push_notification_to(&self, only: u64, kind: &str, message: &str, timeout_ms: i64) {
+        self.push_event_routed(
+            "notification",
+            json!([kind, message, timeout_ms]),
+            None,
+            None,
+            None,
+            Some(only),
+        );
     }
 
     /// Push the outcome of an update check as the dashboard expects it
@@ -3632,7 +3708,8 @@ impl AppState {
         // reply comes back without an id and the waiting future times out
         // silently: an "Add N new site?" dialog whose Add button does nothing.
         let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
-        let _ = self.events.send(UiEvent { channel: None, target, payload });
+        let _ =
+            self.events.send(UiEvent { channel: None, target, payload, exclude: None, only: None });
         rx
     }
 
@@ -3943,6 +4020,13 @@ impl AppState {
     /// it into one rebuild at the end of the pass left pages empty until the
     /// whole sync (minutes when peers are slow) finished.
     pub async fn ingest_file(&self, address: &str, inner_path: &str) {
+        self.ingest_file_from(address, inner_path, None).await;
+    }
+
+    /// [`Self::ingest_file`] for a locally-written file: `origin` is the
+    /// connection whose command wrote it, excluded from the `file_done` echo
+    /// (EpixNet notifies `ws != self`).
+    pub async fn ingest_file_from(&self, address: &str, inner_path: &str, origin: Option<u64>) {
         // ContentFilter: a muted author's file stays out of the db, and gets
         // no event - nothing changed for the page.
         if self.muted_authors().await.iter().any(|m| inner_path.contains(m.as_str())) {
@@ -4029,7 +4113,7 @@ impl AppState {
                 }
             }
         }
-        self.push_site_info_file_done(address, inner_path).await;
+        self.push_site_info_file_done(address, inner_path, origin).await;
     }
 
     /// Ensure `host` (a `.epix` name) is served, resolving + cloning it on demand
@@ -4165,8 +4249,14 @@ impl AppState {
     /// Delete a file from a xite's storage (`fileDelete`). If the file is an
     /// optional file, its `files_optional` entry is removed from the stored
     /// content.json as well (matching EpixNet's `actionFileDelete`; the
-    /// content.json becomes changed-needs-signing).
-    pub async fn delete_file(&self, address: &str, inner_path: &str) -> Result<(), String> {
+    /// content.json becomes changed-needs-signing). `origin` is the deleting
+    /// connection, excluded from the event echo.
+    pub async fn delete_file(
+        &self,
+        address: &str,
+        inner_path: &str,
+        origin: Option<u64>,
+    ) -> Result<(), String> {
         let (storage, content) = {
             let x = self.xites.read().await;
             let e = x.get(address).ok_or("unknown xite")?;
@@ -4199,7 +4289,7 @@ impl AppState {
         } else if !is_optional {
             return Err("Delete error: file does not exist".into());
         }
-        self.push_site_info_event(address, "file_deleted").await;
+        self.push_site_info_event_excluding(address, "file_deleted", origin).await;
         Ok(())
     }
 
@@ -4287,6 +4377,7 @@ impl AppState {
         address: &str,
         content_inner_path: &str,
         privatekey: Option<String>,
+        origin: Option<u64>,
     ) -> Result<(), String> {
         let storage = self
             .xites
@@ -4349,7 +4440,7 @@ impl AppState {
         xite.sign_child(content_inner_path, &key, modified, &extend, &xid_map)
             .map_err(|e| e.to_string())?;
         self.log("INFO", format!("Signed {content_inner_path} on {address}")).await;
-        self.ingest_file(address, content_inner_path).await;
+        self.ingest_file_from(address, content_inner_path, origin).await;
         Ok(())
     }
 
@@ -4399,21 +4490,29 @@ impl AppState {
     /// command, with per-file diffs so receivers can patch their data files in
     /// place, and progress pushed to the xite's pages (EpixNet's publish
     /// progress bar). Returns how many peers accepted it. `sitePublish`.
-    pub async fn publish(&self, address: &str, inner_path: &str) -> Result<usize, String> {
+    pub async fn publish(
+        &self,
+        address: &str,
+        inner_path: &str,
+        origin: Option<u64>,
+    ) -> Result<usize, String> {
         let diffs = self.take_diffs(address, inner_path).await;
-        self.publish_to(address, inner_path, 20, diffs, true).await
+        self.publish_to(address, inner_path, 20, diffs, Some(origin)).await
     }
 
     /// Publish to at most `limit` connectable peers. The re-broadcast of an
     /// accepted inbound update uses a small limit (EpixNet uses 3) so a push
     /// floods the network without every node hammering every peer.
+    /// `progress`: `None` = silent (re-broadcasts); `Some(origin)` = push
+    /// progress events, to the originating connection only when known
+    /// (EpixNet's `self.cmd("progress", …)`), else to the xite's pages.
     pub async fn publish_to(
         &self,
         address: &str,
         inner_path: &str,
         limit: usize,
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
-        progress: bool,
+        progress: Option<Option<u64>>,
     ) -> Result<usize, String> {
         let body = self
             .xites
@@ -4433,18 +4532,22 @@ impl AppState {
         let total = peers.len();
         let wire_diffs = (!diffs.is_empty()).then(|| crate::fileserve::encode_diffs(&diffs));
         let push_progress = |published: usize, done: usize| {
-            if progress && total > 0 {
-                self.push_event(
-                    "progress",
-                    json!([
-                        "publish",
-                        format!("Content published to {published}/{total} peers."),
-                        (100 * done / total) as i64,
-                    ]),
-                    None,
-                    Some(address.to_string()),
-                );
+            let Some(origin) = progress else { return };
+            if total == 0 {
+                return;
             }
+            self.push_event_routed(
+                "progress",
+                json!([
+                    "publish",
+                    format!("Content published to {published}/{total} peers."),
+                    (100 * done / total) as i64,
+                ]),
+                None,
+                Some(address.to_string()),
+                None,
+                origin,
+            );
         };
         push_progress(0, 0);
 
@@ -4695,7 +4798,7 @@ impl AppState {
             }
             // EpixNet re-publishes an accepted update to up to 3 more peers,
             // forwarding the diffs it received so they spread with the push.
-            let _ = self.publish_to(&key, &inner_path, 3, diffs, false).await;
+            let _ = self.publish_to(&key, &inner_path, 3, diffs, None).await;
         }
         self.updates_in_flight.lock().unwrap().remove(&uri);
         // Flash the dashboard row: a peer pushed a new version and it landed.
@@ -6268,7 +6371,7 @@ mod tests {
         let content_path = state.content_inner_path(&site, &data_path).await;
         assert_eq!(content_path, format!("{dir}/content.json"));
 
-        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
         let signed: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(signed["signs"][&auth].is_string(), "signed by the user's auth key: {signed}");
@@ -6279,7 +6382,7 @@ mod tests {
         // Re-signing after an edit bumps modified and re-verifies.
         let first = signed["modified"].as_f64().unwrap();
         state.write_file(&site, &data_path, br#"{"topic":[{"topic_id":1},{"topic_id":2}]}"#).await.unwrap();
-        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
         let resigned: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(resigned["modified"].as_f64().unwrap() > first);
@@ -6321,13 +6424,13 @@ mod tests {
         let v2 = br#"{"topic":[{"topic_id":1,"title":"hello"}]}"#.to_vec();
 
         state.write_file(&site, &data_path, &v1).await.unwrap();
-        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
         // No previous file, so nothing to diff on the first publish.
         assert!(state.take_diffs(&site, &content_path).await.is_empty());
 
         state.write_file(&site, &data_path, &v2).await.unwrap();
         assert!(storage.exists(&format!("{data_path}-old")), "snapshot kept");
-        state.sign_user_content(&site, &content_path, None).await.unwrap();
+        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
         let signed: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(signed["files"]["data.json-old"].is_null(), "snapshot never hashed: {signed}");
