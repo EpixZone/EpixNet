@@ -24,7 +24,9 @@ async-trait = "0.1"
 default = ["tor", "i2p-embedded"]
 tor = ["epix-runtime/tor"]
 i2p = ["epix-runtime/i2p"]
-i2p-embedded = ["epix-runtime/i2p-embedded"]
+# i2p-embedded implies i2p, so the node's own #[cfg(feature = "i2p")] code
+# (config read, RuntimeConfig field) is compiled, not just the runtime's.
+i2p-embedded = ["i2p", "epix-runtime/i2p-embedded"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -1168,6 +1168,16 @@ async fn serve(
         epix_runtime::TorMode::parse(&opts.tor_mode)
     };
 
+    // Privacy by default on desktop: turn the embedded I2P router on the first
+    // time a node runs with no explicit `i2p` choice (persisted so the Config
+    // page shows it selected, and an explicit Disable is never overridden).
+    // Only where the embedded router is compiled in - mobile (external-only)
+    // and offline mode stay off.
+    #[cfg(feature = "i2p-embedded")]
+    if !offline && state.config_get("i2p").await.is_none() {
+        state.config_set("i2p", serde_json::json!("embedded")).await;
+    }
+
     // I2P config from the node config (Config page): mode + external SAM port.
     #[cfg(feature = "i2p")]
     let (i2p_mode, i2p_sam_port) = {
