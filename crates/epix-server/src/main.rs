@@ -57,6 +57,7 @@ async fn main() {
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
         log_file: Some(platform::log_path(&root, 8 * 1024 * 1024)),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        rev: env!("EPIX_GIT_REV").to_string(),
     };
 
     println!("· Epix node starting (data: {})", root.display());

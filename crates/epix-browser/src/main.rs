@@ -24,7 +24,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-const UI_ADDR: &str = "127.0.0.1:43110";
+const UI_ADDR: &str = "127.0.0.1:42222";
 const PROXY_ADDR: &str = "127.0.0.1:43112";
 const SOCKS_ADDR: &str = "127.0.0.1:43111";
 
@@ -83,6 +83,7 @@ async fn main() {
         geoip_gz: None,
         log_file: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        rev: env!("EPIX_GIT_REV").to_string(),
     };
     let (server, running) = match epix_node::boot(opts).await {
         Ok(v) => v,

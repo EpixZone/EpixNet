@@ -238,6 +238,12 @@ struct ManagedXite {
 /// Server-wide state shared across all HTTP/WebSocket handlers.
 pub struct AppState {
     pub version: String,
+    /// Short git commit of this build, reported in `serverInfo.rev` (the
+    /// dashboard shows it next to the version). Set by the binary after boot.
+    rev: RwLock<String>,
+    /// The UI port actually bound (default 42222, or 43110 fallback), reported
+    /// in `serverInfo.ui_port` so the dashboard builds correct links.
+    ui_port: RwLock<u16>,
     xites: RwLock<HashMap<String, ManagedXite>>,
     user: RwLock<User>,
     user_path: Option<PathBuf>,
@@ -498,6 +504,8 @@ impl AppState {
     pub fn new(version: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
             version: version.into(),
+            rev: RwLock::new("0".to_string()),
+            ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
             user: RwLock::new(User::generate()),
             user_path: None,
@@ -604,6 +612,8 @@ impl AppState {
         };
         Arc::new(Self {
             version: version.into(),
+            rev: RwLock::new("0".to_string()),
+            ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
             user: RwLock::new(user),
             user_path: Some(user_path),
@@ -1872,6 +1882,28 @@ impl AppState {
     /// Our `.b32.i2p` address (host without `.i2p`), if I2P inbound is ready.
     pub async fn i2p_address(&self) -> Option<String> {
         self.i2p_address.read().await.clone()
+    }
+
+    /// Record this build's short git commit (reported in `serverInfo.rev`).
+    pub async fn set_rev(&self, rev: &str) {
+        if !rev.is_empty() {
+            *self.rev.write().await = rev.to_string();
+        }
+    }
+
+    /// This build's short git commit (`serverInfo.rev`).
+    pub async fn rev(&self) -> String {
+        self.rev.read().await.clone()
+    }
+
+    /// Record the UI port actually bound (`serverInfo.ui_port`).
+    pub async fn set_ui_port(&self, port: u16) {
+        *self.ui_port.write().await = port;
+    }
+
+    /// The UI port actually bound.
+    pub async fn ui_port(&self) -> u16 {
+        *self.ui_port.read().await
     }
 
     /// Whether we answer `announce` as a tracker (config `tracker`, default on).
@@ -4065,9 +4097,11 @@ impl AppState {
         // mode; otherwise "*" (all interfaces), matching EpixNet's default - so
         // the dashboard doesn't wrongly warn "your browser is not safe".
         let fileserver_ip = if tor_status == "Always" { "127.0.0.1" } else { "*" };
+        let rev = self.rev().await;
+        let ui_port = self.ui_port().await;
         json!({
             "version": self.version,
-            "rev": 8192,
+            "rev": rev,
             "platform": std::env::consts::OS,
             "dist_type": "standalone",
             "ip_external": ip_external,
@@ -4079,7 +4113,7 @@ impl AppState {
             "tor_has_meek_bridges": false,
             "tor_use_bridges": false,
             "ui_ip": "127.0.0.1",
-            "ui_port": 43110,
+            "ui_port": ui_port,
             "debug": false,
             "offline": false,
             "multiuser": multiuser,

@@ -119,6 +119,7 @@ impl EpixNode {
             geoip_gz: None,
             log_file: None,
             version: config.version,
+            rev: env!("EPIX_GIT_REV").to_string(),
         };
         // Boot synchronously so the shell knows serving is ready (and can point
         // its web view at ui_url) before returning; then drive the server on a
