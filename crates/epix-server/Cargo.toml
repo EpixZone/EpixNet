@@ -24,4 +24,5 @@ desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
 # In-process Tor (Arti): onion dialing + hosting + SOCKS listener for the shell.
 tor = ["epix-node/tor"]
 i2p = ["epix-node/i2p"]
-i2p-embedded = ["epix-node/i2p-embedded"]
+# Desktop: compile the embedded router in AND auto-enable it on first run.
+i2p-embedded = ["epix-node/i2p-embedded", "epix-node/i2p-autostart"]
