@@ -168,8 +168,16 @@ impl User {
     }
 
     /// The per-xite CryptMessage **encryption** private key (WIF), derived like
-    /// EpixNet: `hd_privatekey(master_seed, auth_index(address) + 1000 + index)`.
-    pub fn encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {
+    /// EpixNet's `getEncryptPrivatekey`:
+    /// `hd_privatekey(master_seed, auth_index(address) + 1000 + index)`, where
+    /// a selected cert shifts `index` by the cert domain's auth index - the
+    /// certified identity keeps one stable encryption key per provider, and
+    /// mail encrypted to it on another node still decrypts here.
+    pub fn encrypt_privatekey(&self, address: &str, param_index: u64) -> Result<String, String> {
+        let index = match self.sites.get(address).and_then(|s| s.cert.as_deref()) {
+            Some(domain) => param_index + Self::address_auth_index(domain),
+            None => param_index,
+        };
         let crypt_index = Self::address_auth_index(address) + 1000 + index;
         epix_crypt::hd_privatekey(&self.master_seed, crypt_index)
     }
@@ -476,6 +484,36 @@ mod tests {
 
         let mut u2 = User::from_seed(seed).unwrap();
         assert_eq!(u2.site_data("talk.epix").unwrap().auth_address, a1.auth_address);
+    }
+
+    #[test]
+    fn encrypt_key_shifts_with_the_selected_cert() {
+        // EpixNet's getEncryptPrivatekey: a selected cert shifts the derivation
+        // index by the cert domain's auth index, so the certified identity has
+        // one stable encryption key per provider. Without the shift, mail
+        // encrypted to the Python-derived key can't be decrypted here.
+        let seed = "5f5e100000000000000000000000000000000000000000000000000000000001";
+        let mut u = User::from_seed(seed).unwrap();
+        u.site_data("talk.epix").unwrap();
+        let plain = u.encrypt_privatekey("talk.epix", 0).unwrap();
+        let expected_plain = epix_crypt::hd_privatekey(
+            seed,
+            User::address_auth_index("talk.epix") + 1000,
+        )
+        .unwrap();
+        assert_eq!(plain, expected_plain);
+
+        u.set_cert("talk.epix", Some("xid.epix")).unwrap();
+        let certified = u.encrypt_privatekey("talk.epix", 0).unwrap();
+        let expected_certified = epix_crypt::hd_privatekey(
+            seed,
+            User::address_auth_index("talk.epix")
+                + 1000
+                + User::address_auth_index("xid.epix"),
+        )
+        .unwrap();
+        assert_eq!(certified, expected_certified);
+        assert_ne!(plain, certified);
     }
 
     #[test]
