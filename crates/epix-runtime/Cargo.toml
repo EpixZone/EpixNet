@@ -15,7 +15,7 @@ epix-dht = { path = "../epix-dht" }
 epix-dht-net = { path = "../epix-dht-net" }
 epix-propagation = { path = "../epix-propagation" }
 epix-tor = { path = "../epix-tor", optional = true }
-epix-i2p = { path = "../epix-i2p", optional = true }
+epix-i2p = { path = "../epix-i2p", optional = true, default-features = false }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 async-trait = "0.1"
 serde_json = "1"
@@ -34,9 +34,13 @@ inbound-seeding = ["dep:igd-next"]
 # In-process Tor (Arti): dial .onion peers, host an onion service for inbound,
 # and a local SOCKS listener for the browser shells. On all platforms.
 tor = ["dep:epix-tor"]
-# In-process I2P (emissary embedded router or an external one): dial + host
-# .b32.i2p peers, backgrounded so clearnet works while it boots.
+# I2P support (External router mode): dial + host .b32.i2p peers via a running
+# router's SAM bridge. Light - no embedded router, no reseeder. Mobile uses
+# this.
 i2p = ["dep:epix-i2p"]
+# Adds the embedded pure-Rust I2P router (emissary) for the no-sidecar default.
+# Pulls a reseeder (reqwest/openssl), so it's desktop-only for now. Off mobile.
+i2p-embedded = ["i2p", "epix-i2p/embedded"]
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }
