@@ -414,6 +414,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(NotificationDismiss),
         Arc::new(NotificationDismissSelf),
         Arc::new(FeedQuery),
+        Arc::new(FeedSearch),
         Arc::new(FeedFollow),
         Arc::new(FeedListFollow),
         Arc::new(simple("FilterIncludeList", json!([]))),
@@ -442,7 +443,6 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteReload),
         Arc::new(SiteBadFiles),
         Arc::new(GetTrackers),
-        Arc::new(FeedSearch),
         // Bigfile authoring.
         Arc::new(BigfileUploadInit),
         Arc::new(SiteSetAutodownloadBigfileLimit),
@@ -1921,6 +1921,125 @@ impl WsCommand for FeedQuery {
     }
 }
 
+/// `feedSearch(search, limit, day_limit)` - search every served xite's
+/// dbschema-declared feeds (EpixNet's `actionFeedSearch`): the text becomes a
+/// LIKE over the outer `body`/`title` aliases, with `site:` and `type:`
+/// filters parsed out of the search string.
+struct FeedSearch;
+#[async_trait]
+impl WsCommand for FeedSearch {
+    fn name(&self) -> &'static str {
+        "feedSearch"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let search = arg_str(p, "search", 0).unwrap_or("").to_string();
+        let get = |key: &str, idx: usize, default: i64| -> i64 {
+            p.get(key)
+                .or_else(|| p.as_array().and_then(|a| a.get(idx)))
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok())))
+                .unwrap_or(default)
+        };
+        let limit = get("limit", 1, 30).max(0) as usize;
+        let day_limit = get("day_limit", 2, 30);
+        let (text, filters) = parse_search(&search);
+
+        let mut rows: Vec<Value> = Vec::new();
+        let mut num_sites = 0;
+        for (address, title, feeds) in s.state.feed_sources().await {
+            if let Some(want) = filters.get("site") {
+                let want = want.to_lowercase();
+                if want != address.to_lowercase() && want != title.to_lowercase() {
+                    continue;
+                }
+            }
+            num_sites += 1;
+            for (feed_name, query) in feeds {
+                if !is_safe_feed_sql(&query) {
+                    continue;
+                }
+                // The type filter matches the literal query text, like EpixNet.
+                if let Some(t) = filters.get("type") {
+                    if !query.contains(t.as_str()) {
+                        continue;
+                    }
+                }
+                // Filters go on the wrapped aliases: `body`/`title` exist on
+                // every feed's outer SELECT, and the CAST keeps the TEXT
+                // strftime comparable to integer timestamps (see feedQuery).
+                let mut wheres = vec!["1".to_string()];
+                if day_limit > 0 {
+                    wheres.push(format!(
+                        "date_added > CAST(strftime('%s','now','-{day_limit} day') AS INTEGER)"
+                    ));
+                }
+                let mut params: Vec<Value> = Vec::new();
+                if !text.is_empty() {
+                    wheres.push("(body LIKE ? OR title LIKE ?)".to_string());
+                    let like = format!("%{}%", text.replace(' ', "%"));
+                    params.push(json!(like));
+                    params.push(json!(like));
+                }
+                let full = format!(
+                    "SELECT * FROM ({query}) WHERE {} ORDER BY date_added DESC LIMIT {limit}",
+                    wheres.join(" AND ")
+                );
+                if !is_safe_feed_sql(&full) {
+                    continue;
+                }
+                let Ok(res) = s.state.db_query(&address, &full, &json!(params)).await else {
+                    continue;
+                };
+                for mut row in res {
+                    let Some(obj) = row.as_object_mut() else { continue };
+                    let Some(mut date) = obj.get("date_added").and_then(|v| v.as_f64()) else {
+                        continue;
+                    };
+                    if date > 1e12 {
+                        date /= 1000.0;
+                    }
+                    if date > now_secs() + 120.0 {
+                        continue;
+                    }
+                    obj.insert("date_added".into(), json!(date));
+                    obj.insert("site".into(), json!(address));
+                    obj.insert("feed_name".into(), json!(feed_name));
+                    rows.push(row);
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            let da = a["date_added"].as_f64().unwrap_or(0.0);
+            let db = b["date_added"].as_f64().unwrap_or(0.0);
+            db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
+    }
+}
+
+/// Split `site:`/`type:` filters out of a feedSearch string (EpixNet's
+/// `parseSearch`): everything before the first marker is the search text.
+fn parse_search(search: &str) -> (String, std::collections::HashMap<String, String>) {
+    let mut markers: Vec<(usize, &str)> = ["site:", "type:"]
+        .iter()
+        .flat_map(|m| search.match_indices(m).map(|(i, _)| (i, *m)).collect::<Vec<_>>())
+        .collect();
+    let mut filters = std::collections::HashMap::new();
+    if markers.is_empty() {
+        return (search.trim().to_string(), filters);
+    }
+    markers.sort();
+    let text = search[..markers[0].0].trim().to_string();
+    for (i, (pos, marker)) in markers.iter().enumerate() {
+        let start = pos + marker.len();
+        let end = markers.get(i + 1).map(|(p, _)| *p).unwrap_or(search.len());
+        filters.insert(
+            marker.trim_end_matches(':').to_string(),
+            search[start..end].trim().to_string(),
+        );
+    }
+    (text, filters)
+}
+
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2834,57 +2953,6 @@ impl WsCommand for GetTrackers {
     }
 }
 
-/// `feedSearch {search, limit?, day_limit?}` - search all followed feeds for a
-/// text match across their rows (title/body/…). Admin.
-struct FeedSearch;
-#[async_trait]
-impl WsCommand for FeedSearch {
-    fn name(&self) -> &'static str {
-        "feedSearch"
-    }
-    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let search = arg_str(p, "search", 0).unwrap_or("").to_lowercase();
-        let (limit, day_limit) = feed_limits(p);
-        let follows = s.state.all_follows().await;
-        let mut rows: Vec<Value> = Vec::new();
-        let mut num_sites = 0;
-        for (site, feeds) in &follows {
-            let Some(feeds) = feeds.as_object() else { continue };
-            num_sites += 1;
-            for (name, query_set) in feeds {
-                let (raw, params) = split_feed(query_set);
-                if !is_safe_feed_sql(raw) {
-                    continue;
-                }
-                let full = build_feed_query(raw, day_limit, limit.max(100), params);
-                if !is_safe_feed_sql(&full) {
-                    continue;
-                }
-                let Ok(res) = s.state.db_query(site, &full, &Value::Null).await else { continue };
-                for mut row in res {
-                    // Match the search text against any string field.
-                    let matched = search.is_empty()
-                        || row.as_object().is_some_and(|o| {
-                            o.values().any(|v| {
-                                v.as_str().is_some_and(|s| s.to_lowercase().contains(&search))
-                            })
-                        });
-                    if !matched {
-                        continue;
-                    }
-                    if let Some(obj) = row.as_object_mut() {
-                        obj.insert("site".into(), json!(site));
-                        obj.insert("feed_name".into(), json!(name));
-                    }
-                    rows.push(row);
-                }
-            }
-        }
-        rows.truncate(limit);
-        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
-    }
-}
-
 struct MuteAdd;
 #[async_trait]
 impl WsCommand for MuteAdd {
@@ -3481,6 +3549,24 @@ mod tests {
         assert!(!is_safe_feed_sql("DELETE FROM post"));
         assert!(!is_safe_feed_sql("SELECT 1 /* x */"));
         assert!(!is_safe_feed_sql("INSERT INTO post VALUES (1)"));
+    }
+
+    #[test]
+    fn parse_search_splits_site_and_type_filters() {
+        // EpixNet's parseSearch: everything before the first marker is the
+        // text; marker values run to the next marker or the end.
+        let (text, filters) = parse_search("hello world");
+        assert_eq!(text, "hello world");
+        assert!(filters.is_empty());
+
+        let (text, filters) = parse_search("exploit site: EpixTalk type: comment");
+        assert_eq!(text, "exploit");
+        assert_eq!(filters["site"], "EpixTalk");
+        assert_eq!(filters["type"], "comment");
+
+        let (text, filters) = parse_search("site:talk.epix");
+        assert_eq!(text, "");
+        assert_eq!(filters["site"], "talk.epix");
     }
 
     #[test]

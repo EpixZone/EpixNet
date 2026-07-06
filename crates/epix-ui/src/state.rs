@@ -1889,6 +1889,36 @@ impl AppState {
         db.query_value(query, params).map_err(|e| e.to_string())
     }
 
+    /// Every served xite's dbschema-declared feeds, with the xite's title:
+    /// `(address, title, {feed_name: query})`. What `feedSearch` sweeps.
+    pub async fn feed_sources(&self) -> Vec<(String, String, Vec<(String, String)>)> {
+        let xites = self.xites.read().await;
+        xites
+            .iter()
+            .filter_map(|(addr, x)| {
+                let schema: Value =
+                    serde_json::from_slice(&x.storage.read("dbschema.json").ok()?).ok()?;
+                let feeds: Vec<(String, String)> = schema
+                    .get("feeds")?
+                    .as_object()?
+                    .iter()
+                    .filter_map(|(n, q)| Some((n.clone(), q.as_str()?.to_string())))
+                    .collect();
+                if feeds.is_empty() {
+                    return None;
+                }
+                let title = x
+                    .content
+                    .as_ref()
+                    .and_then(|c| c.get("title"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(addr)
+                    .to_string();
+                Some((addr.clone(), title, feeds))
+            })
+            .collect()
+    }
+
     /// Set (and persist) a site's Newsfeed follows.
     pub async fn set_feed_follow(&self, address: &str, feeds: Value) {
         self.user.write().await.set_feed_follow(address, feeds);
