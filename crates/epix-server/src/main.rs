@@ -27,6 +27,13 @@ async fn main() {
     let raw = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
     let target = epix_node::parse_target(&raw);
 
+    // Headless mode (`EPIX_HEADLESS=1`): serve the node but don't open a browser
+    // window - for servers/seedboxes. The dashboard is still reachable at the UI
+    // address; open it yourself.
+    let headless = std::env::var("EPIX_HEADLESS")
+        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+
     // Persistent per-OS data directory with a single-instance lock. If already
     // running, hand off to the existing instance's browser tab and exit.
     let root = platform::data_root();
@@ -34,11 +41,10 @@ async fn main() {
     let _lock = match platform::acquire_lock(&root) {
         Ok(lock) => lock,
         Err(()) => {
-            eprintln!(
-                "Epix is already running (lock held in {}). Opening the existing instance.",
-                root.display()
-            );
-            epix_node::open_in_browser(&format!("http://{}/{target}/", ui_bind()));
+            eprintln!("Epix is already running (lock held in {}).", root.display());
+            if !headless {
+                epix_node::open_in_browser(&format!("http://{}/{target}/", ui_bind()));
+            }
             return;
         }
     };
@@ -53,7 +59,7 @@ async fn main() {
         target,
         ui_addr: ui_bind(),
         tor_mode,
-        open_browser: true,
+        open_browser: !headless,
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
         log_file: Some(platform::log_path(&root, 8 * 1024 * 1024)),
         version: env!("CARGO_PKG_VERSION").to_string(),
