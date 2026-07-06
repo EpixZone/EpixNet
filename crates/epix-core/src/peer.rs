@@ -11,6 +11,9 @@ pub enum IpType {
     Ipv4,
     Ipv6,
     Onion,
+    /// I2P destination (`<b32>.i2p`). PEX for I2P peers is not wired yet, so
+    /// they reach the network through I2P trackers rather than peer exchange.
+    I2p,
     Rns,
 }
 
@@ -22,7 +25,7 @@ impl IpType {
             IpType::Ipv4 => Some("peers"),
             IpType::Ipv6 => Some("peers_ipv6"),
             IpType::Onion => Some("peers_onion"),
-            IpType::Rns => None,
+            IpType::I2p | IpType::Rns => None,
         }
     }
 }
@@ -36,6 +39,10 @@ pub enum PeerAddr {
     Ip(SocketAddr),
     /// Tor onion service (`<host>.onion:<port>`), host without the `.onion`.
     Onion { host: String, port: u16 },
+    /// I2P destination: the `.b32.i2p` host (without the suffix) and the
+    /// vestigial port from the `epix://` URL (I2P streams are addressed by
+    /// destination, not port, so it round-trips but isn't dialed on).
+    I2p { dest: String, port: u16 },
     /// Reticulum 16-byte destination hash.
     Rns([u8; 16]),
 }
@@ -45,21 +52,39 @@ impl PeerAddr {
         match self {
             PeerAddr::Ip(_) => "tcp",
             PeerAddr::Onion { .. } => "onion",
+            PeerAddr::I2p { .. } => "i2p",
             PeerAddr::Rns(_) => "rns",
         }
     }
 
-    /// Parse `ip:port`, `<host>.onion:port`, or `rns:<32-hex>`.
+    /// The I2P destination host (`<b32>.i2p`) yosemite's SAM connect expects,
+    /// or None for non-I2P peers.
+    pub fn i2p_dest(&self) -> Option<String> {
+        match self {
+            PeerAddr::I2p { dest, .. } => Some(format!("{dest}.i2p")),
+            _ => None,
+        }
+    }
+
+    /// Parse `ip:port`, `<host>.onion:port`, `<b32>.i2p:port`, or `rns:<32-hex>`.
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(hash_hex) = s.strip_prefix("rns:") {
             let bytes = hex::decode(hash_hex).map_err(|_| Error::InvalidPeer(s.into()))?;
             let arr: [u8; 16] = bytes.try_into().map_err(|_| Error::InvalidPeer(s.into()))?;
             return Ok(PeerAddr::Rns(arr));
         }
+        // I2P: a `.b32.i2p` (or bare `.i2p`) host, port optional.
+        if let Some(host) = s.strip_suffix(".i2p") {
+            return Ok(PeerAddr::I2p { dest: host.to_string(), port: 0 });
+        }
         if let Some((host, port)) = s.rsplit_once(':') {
             if let Some(onion_host) = host.strip_suffix(".onion") {
                 let port: u16 = port.parse().map_err(|_| Error::InvalidPeer(s.into()))?;
                 return Ok(PeerAddr::Onion { host: onion_host.to_string(), port });
+            }
+            if let Some(dest) = host.strip_suffix(".i2p") {
+                let port: u16 = port.parse().map_err(|_| Error::InvalidPeer(s.into()))?;
+                return Ok(PeerAddr::I2p { dest: dest.to_string(), port });
             }
         }
         s.parse::<SocketAddr>()
@@ -73,6 +98,7 @@ impl PeerAddr {
             PeerAddr::Ip(SocketAddr::V4(_)) => IpType::Ipv4,
             PeerAddr::Ip(SocketAddr::V6(_)) => IpType::Ipv6,
             PeerAddr::Onion { .. } => IpType::Onion,
+            PeerAddr::I2p { .. } => IpType::I2p,
             PeerAddr::Rns(_) => IpType::Rns,
         }
     }
@@ -112,7 +138,9 @@ impl PeerAddr {
                 out.extend_from_slice(&port.to_le_bytes());
                 Some(out)
             }
-            PeerAddr::Rns(_) => None,
+            // I2P/Rns PEX packing isn't wired yet (those peers arrive via
+            // trackers, not peer exchange).
+            PeerAddr::I2p { .. } | PeerAddr::Rns(_) => None,
         }
     }
 
@@ -156,6 +184,7 @@ impl std::fmt::Display for PeerAddr {
         match self {
             PeerAddr::Ip(a) => write!(f, "{a}"),
             PeerAddr::Onion { host, port } => write!(f, "{host}.onion:{port}"),
+            PeerAddr::I2p { dest, port } => write!(f, "{dest}.i2p:{port}"),
             PeerAddr::Rns(h) => write!(f, "rns:{}", hex::encode(h)),
         }
     }
@@ -171,6 +200,7 @@ mod tests {
             ("127.0.0.1:20790", "tcp"),
             ("[::1]:8080", "tcp"),
             ("abcdefghij234567.onion:43110", "onion"),
+            ("ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.i2p:15441", "i2p"),
             ("rns:0123456789abcdef0123456789abcdef", "rns"),
         ] {
             let p = PeerAddr::parse(s).unwrap_or_else(|_| panic!("parse {s}"));

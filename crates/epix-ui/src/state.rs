@@ -1446,7 +1446,7 @@ impl AppState {
                         epix_core::IpType::Ipv4 => Some(&mut v4),
                         epix_core::IpType::Ipv6 => Some(&mut v6),
                         epix_core::IpType::Onion => Some(&mut onion),
-                        epix_core::IpType::Rns => None,
+                        epix_core::IpType::I2p | epix_core::IpType::Rns => None,
                     },
                     peer.addr.pack(),
                 ) else {
@@ -3408,6 +3408,7 @@ impl AppState {
                 .unwrap_or_else(|| "-".into());
             let kind = match &addr {
                 PeerAddr::Onion { .. } => "onion",
+                PeerAddr::I2p { .. } => "i2p",
                 PeerAddr::Rns(_) => "mesh",
                 PeerAddr::Ip(_) => "ip",
             };
