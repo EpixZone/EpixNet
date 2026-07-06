@@ -207,6 +207,48 @@ mod tests {
     }
 
     #[test]
+    fn dict_key_col_survives_import_cols_filter() {
+        // EpixMail's schema: conversations is a dict keyed by conv_id, with
+        // key_col storing the dict key and import_cols listing only the VALUE
+        // fields (EpixNet filters values first, then adds the key). The key
+        // column must land even though import_cols doesn't mention it.
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Mail", "db_file": "db/db.db", "version": 2,
+              "maps": {
+                ".+/data.json": {
+                  "to_table": [{"node": "conversations", "table": "conversation",
+                                "key_col": "conv_id",
+                                "import_cols": ["peer_xid", "established"]}]
+                }
+              },
+              "tables": {
+                "conversation": { "cols": [["conv_id","TEXT"],["peer_xid","TEXT"],
+                                            ["established","INTEGER"],["json_id","INTEGER"]] }
+              }
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("data/users/facts.epix");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(
+            user.join("data.json"),
+            r#"{ "conversations": {
+                   "abc123": { "peer_xid": "mud.epix", "established": 100,
+                               "messages": { "1": {"ct": "x"} } } } }"#,
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+        db.populate(&schema, dir.path()).unwrap();
+        let rows = db.query("SELECT conv_id, peer_xid FROM conversation", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["conv_id"], serde_json::json!("abc123"));
+        assert_eq!(rows[0]["peer_xid"], serde_json::json!("mud.epix"));
+    }
+
+    #[test]
     fn query_ignores_unreferenced_named_params() {
         // Python's sqlite3 ignores dict keys the query never references;
         // EpixPost sends helper keys (`{"directories": "all"}`) alongside SQL
