@@ -207,6 +207,33 @@ mod tests {
     }
 
     #[test]
+    fn query_ignores_unreferenced_named_params() {
+        // Python's sqlite3 ignores dict keys the query never references;
+        // EpixPost sends helper keys (`{"directories": "all"}`) alongside SQL
+        // that has no such placeholder, and the page dies if this errors.
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn().unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')", []).unwrap();
+        drop(conn);
+
+        let rows = db
+            .query_value(
+                "SELECT * FROM t WHERE id = :id",
+                &serde_json::json!({ "id": 1, "directories": "all", "unused_list": [1, 2] }),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], serde_json::json!("a"));
+
+        // A dict with no referenced keys at all still runs the query.
+        let rows = db
+            .query_value("SELECT * FROM t", &serde_json::json!({ "directories": "all" }))
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
     fn populates_from_data_files_and_queries() {
         // A blog-style schema: data/<user>/data.json -> post table + keyvalue.
         let schema = DbSchema::from_json(
