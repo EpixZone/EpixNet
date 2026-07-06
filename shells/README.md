@@ -90,16 +90,39 @@ notarized release build, and Windows/Linux installers.
 
 ### Android (`android/`) - Kotlin + GeckoView
 
+Verified end to end on an arm64 emulator (Android 16 / API 37): the node boots
+in-process, Tor bootstraps, the dashboard clones from the network and renders,
+and `epix://` deep links clone + open xites. Run from the repo root:
+
 ```
-# 1. Build the core for each Android ABI (needs the NDK + cargo-ndk):
-cargo ndk -t arm64-v8a -t armeabi-v7a -o app/src/main/jniLibs \
-    build -p epix-ffi --release --no-default-features --features tor
-# 2. Generate the Kotlin bindings:
+export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/<version>
+
+# 1. Build the core per ABI into jniLibs (needs the NDK + `cargo install cargo-ndk`
+#    and `rustup target add aarch64-linux-android`). Add `-t armeabi-v7a` for
+#    32-bit devices. Uses the default features (Tor on).
+cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
+    build -p epix-ffi --release
+
+# 2. Generate the Kotlin bindings from the built library:
 cargo run -p epix-ffi --features cli --bin uniffi-bindgen -- generate \
     --library target/aarch64-linux-android/release/libepix_ffi.so \
-    --language kotlin --out-dir app/src/main/java
-# 3. Open shells/android in Android Studio and run.
+    --language kotlin --out-dir shells/android/app/src/main/java
+
+# 3. Build the APK (Android Studio, or the Gradle wrapper directly). The JDK is
+#    the one bundled with Android Studio; local.properties points at the SDK.
+cd shells/android
+echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties
+JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+    ./gradlew assembleDebug
+
+# 4. Install + launch on a running emulator/device:
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n zone.epix.app/.MainActivity
 ```
+
+Step 1 rebuilds the `.so`; rerun step 2 after any core change that alters the
+FFI surface. Both outputs (`app/src/main/jniLibs`, `app/src/main/java/uniffi`)
+are gitignored - they are build artifacts.
 
 `MainActivity` loads the core (`System.loadLibrary("epix_ffi")`), boots the node
 on a coroutine, and points GeckoView at the local node URL. The `epix://`
