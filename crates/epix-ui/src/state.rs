@@ -156,6 +156,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "disable",
         "soon:select:Custom=custom|Tor=tor|Disable=disable",
     ),
+    (
+        "Network",
+        "tracker",
+        "Act as a tracker (answer other nodes' announces, incl. onion/i2p peers)",
+        "enable",
+        "select:Enable=enable|Disable=disable",
+    ),
     // --- Storage. `data_dir` is special: the value is the live data root and
     // the setting persists to `epixnet.conf` (see `AppState::set_data_dir`),
     // not config.json - config.json lives inside the directory it would name.
@@ -325,6 +332,9 @@ pub struct AppState {
     /// the I2P inbound session is ready. Advertised in PEX so peers can reach
     /// and gossip us over I2P. Set by the runtime's I2P loop.
     i2p_address: RwLock<Option<String>>,
+    /// In-memory announce tracker: peers other nodes announced to us, keyed by
+    /// xite hash, so this node answers `announce` like a Bootstrapper.
+    tracker: crate::tracker::TrackerDb,
     /// Inbound updates currently being verified/downloaded (`site/inner:modified`
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
@@ -524,6 +534,7 @@ impl AppState {
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
+            tracker: crate::tracker::TrackerDb::new(),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
@@ -630,6 +641,7 @@ impl AppState {
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
+            tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1673,6 +1685,16 @@ impl AppState {
                 .map(|x| canonical_address(x.content.as_ref(), address))
                 .unwrap_or_else(|| address.to_string())
         };
+        // How we advertise ourselves to trackers so they hand our address out:
+        // our fileserver port plus any onion/i2p addresses we host. Overlay
+        // addresses are the only route by which onion/i2p-only nodes get found.
+        let advert = std::sync::Arc::new(epix_xite::SelfAdvert {
+            port: self.fileserver_port().await,
+            onion: self.onion_address().await,
+            i2p: self.i2p_address().await,
+            want_onion: self.tor_status().await.0,
+            want_i2p: self.i2p_address().await.is_some(),
+        });
         // Announce to every tracker concurrently: with a Beacon-sized list
         // (dozens, some dead), serial announces would stretch one pass across
         // many timeouts and the dashboard's per-tracker stats would trickle in.
@@ -1680,10 +1702,11 @@ impl AppState {
         for tracker in trackers.iter().cloned() {
             let transport = transport.clone();
             let key = key.clone();
+            let advert = advert.clone();
             set.spawn(async move {
                 let peers = tokio::time::timeout(
                     std::time::Duration::from_secs(20),
-                    epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(&tracker), 0),
+                    epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
                 )
                 .await
                 .unwrap_or_default();
@@ -1849,6 +1872,41 @@ impl AppState {
     /// Our `.b32.i2p` address (host without `.i2p`), if I2P inbound is ready.
     pub async fn i2p_address(&self) -> Option<String> {
         self.i2p_address.read().await.clone()
+    }
+
+    /// Whether we answer `announce` as a tracker (config `tracker`, default on).
+    /// Off disables recording/serving peers for other nodes.
+    pub async fn tracker_enabled(&self) -> bool {
+        match self.config_get("tracker").await {
+            Some(v) => !matches!(v.as_str(), Some("disable") | Some("false") | Some("0")),
+            None => true,
+        }
+    }
+
+    /// Record `addr` in the tracker for each `hash` (announce server).
+    pub async fn tracker_announce(&self, hashes: &[[u8; 32]], addr: &PeerAddr) {
+        self.tracker.announce(hashes, addr, now_secs()).await;
+    }
+
+    /// Known tracker peers for `hash`, filtered as the announce request asked.
+    pub async fn tracker_peer_list(
+        &self,
+        hash: &[u8; 32],
+        exclude: &std::collections::HashSet<String>,
+        limit: usize,
+        need: crate::tracker::NeedTypes,
+    ) -> Vec<PeerAddr> {
+        self.tracker.peer_list(hash, exclude, limit, now_secs(), need).await
+    }
+
+    /// Drop stale tracker peers (called from the announce loop).
+    pub async fn tracker_expire(&self) {
+        self.tracker.expire(now_secs()).await;
+    }
+
+    /// `(hashes, peers)` the tracker currently holds, for the Stats page.
+    pub async fn tracker_stats(&self) -> (usize, usize) {
+        self.tracker.stats().await
     }
 
     /// Set the fileserver (seeding) port the node bound, for `serverInfo`.
@@ -3536,6 +3594,15 @@ impl AppState {
             h.push_str("<tr><td colspan=5 class='muted'>no announces yet</td></tr>");
         }
         h.push_str("</table>");
+
+        // Our own tracker (we answer other nodes' announces).
+        if self.tracker_enabled().await {
+            let (hashes, peers) = self.tracker_stats().await;
+            let _ = write!(
+                h,
+                "<div class='stat-row'>as tracker: serving <b>{peers}</b> peer(s) across <b>{hashes}</b> xite(s)</div>"
+            );
+        }
 
         // Tor.
         h.push_str("<h2>Tor</h2>");

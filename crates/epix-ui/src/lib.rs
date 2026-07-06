@@ -15,6 +15,7 @@ pub mod fileserve;
 pub mod geoip;
 pub mod paths;
 pub mod state;
+pub mod tracker;
 #[cfg(feature = "ui-password")]
 pub mod uipassword;
 

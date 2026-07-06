@@ -8,7 +8,7 @@ pub mod piecemap;
 pub mod xite;
 pub mod storage;
 
-pub use announcer::announce;
+pub use announcer::{announce, SelfAdvert};
 pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, XiteSettings};
 pub use piecefield::Piecefield;

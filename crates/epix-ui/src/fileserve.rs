@@ -11,7 +11,7 @@
 use crate::state::InboundUpdate;
 use crate::AppState;
 use async_trait::async_trait;
-use epix_core::PeerAddr;
+use epix_core::{IpType, PeerAddr};
 use epix_protocol::RequestHandler;
 use rmpv::Value;
 use std::collections::HashSet;
@@ -185,6 +185,86 @@ impl FileService {
         vmap(reply)
     }
 
+    /// `announce {hashes, port, need_types, need_num, add?, onions?, i2p?}` -
+    /// act as a tracker (like EpixNet's Bootstrapper). Record the announcing
+    /// peer for each hash - its clearnet source (if it asked to be added), plus
+    /// any onion/i2p self-addresses it sent - then return the peers we know for
+    /// each hash, bucketed by type. This is how a fresh node bootstraps peers
+    /// from a tracker address alone, and the only way onion/i2p-only nodes
+    /// (which clearnet trackers can't record) get discovered.
+    async fn announce(&self, peer: &PeerAddr, params: &Value) -> Value {
+        if !self.state.tracker_enabled().await {
+            return vmap(vec![("error", Value::from("Tracker disabled"))]);
+        }
+        let hashes = parse_hashes(params);
+        if hashes.is_empty() {
+            return vmap(vec![("peers", Value::Array(Vec::new()))]);
+        }
+        let port = vget_i64(params, "port").unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
+        let need_num = vget_i64(params, "need_num").unwrap_or(20).clamp(0, 100) as usize;
+        let add = string_list(params, "add");
+        let need = crate::tracker::NeedTypes::from_list(&string_list(params, "need_types"));
+
+        // Record the announcer's addresses, collecting them so it never gets
+        // itself back in the results.
+        let mut mine: HashSet<String> = HashSet::new();
+        // Clearnet: source IP + the port it announced, if it asked to be added.
+        if port != 0 {
+            if let PeerAddr::Ip(sa) = peer {
+                let wants = if sa.is_ipv6() {
+                    add.iter().any(|t| t == "ipv6")
+                } else {
+                    add.iter().any(|t| t == "ipv4" || t == "ip4")
+                };
+                if wants {
+                    let mut a = *sa;
+                    a.set_port(port);
+                    let addr = PeerAddr::Ip(a);
+                    self.state.tracker_announce(&hashes, &addr).await;
+                    mine.insert(addr.to_string());
+                }
+            }
+        }
+        // If the announce arrived over i2p, the source destination is authoritative.
+        if let PeerAddr::I2p { dest, .. } = peer {
+            if !dest.is_empty() {
+                self.state.tracker_announce(&hashes, peer).await;
+                mine.insert(peer.to_string());
+            }
+        }
+        // Onion / i2p self-addresses from the request. Parallel arrays map to
+        // hashes one-to-one; a single value applies to every hash.
+        for (field, is_onion) in [("onions", true), ("i2p", false)] {
+            let list = string_list(params, field);
+            for (i, host) in list.iter().enumerate() {
+                if host.is_empty() {
+                    continue;
+                }
+                let addr = if is_onion {
+                    PeerAddr::Onion { host: host.clone(), port }
+                } else {
+                    PeerAddr::I2p { dest: host.clone(), port }
+                };
+                let hs: &[[u8; 32]] = if list.len() == hashes.len() {
+                    std::slice::from_ref(&hashes[i])
+                } else {
+                    &hashes
+                };
+                self.state.tracker_announce(hs, &addr).await;
+                mine.insert(addr.to_string());
+            }
+        }
+
+        // Reply: the peers we know for each hash, bucketed by type.
+        let limit = need_num.min(30);
+        let mut per_hash: Vec<Value> = Vec::with_capacity(hashes.len());
+        for h in &hashes {
+            let peers = self.state.tracker_peer_list(h, &mine, limit, need).await;
+            per_hash.push(pack_peer_buckets(&peers));
+        }
+        vmap(vec![("peers", Value::Array(per_hash))])
+    }
+
     /// `listModified {site, since}` - report our content.json files modified
     /// after `since`, so a peer can pull only what changed instead of polling
     /// each file.
@@ -326,6 +406,7 @@ impl RequestHandler for FileService {
             "getFile" | "streamFile" => self.get_file(params).await,
             "update" => self.update(peer, params).await,
             "pex" => self.pex(peer, params).await,
+            "announce" => self.announce(peer, params).await,
             "listModified" => self.list_modified(params).await,
             "checkport" => self.checkport(peer, params).await,
             // AnnounceShare/Beacon: peers exchange their working announcer
@@ -468,6 +549,62 @@ fn vget<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
             .map(|(_, v)| v),
         _ => None,
     }
+}
+
+/// Read an announce `hashes` array (32-byte binary xite hashes).
+fn parse_hashes(params: &Value) -> Vec<[u8; 32]> {
+    match vget(params, "hashes") {
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(|v| match v {
+                Value::Binary(b) if b.len() == 32 => {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(b);
+                    Some(a)
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Read a msgpack array of strings (string or binary elements).
+fn string_list(params: &Value, key: &str) -> Vec<String> {
+    match vget(params, key) {
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => s.as_str().map(str::to_string),
+                Value::Binary(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Pack peers into an announce reply's per-hash bucket map (`ipv4`/`ip4`/
+/// `ipv6`/`onion`/`i2p`). `ip4` mirrors `ipv4` for old ZeroNet clients.
+fn pack_peer_buckets(peers: &[PeerAddr]) -> Value {
+    let (mut ipv4, mut ipv6, mut onion, mut i2p) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for p in peers {
+        let Some(packed) = p.pack() else { continue };
+        match p.ip_type() {
+            IpType::Ipv4 => ipv4.push(Value::Binary(packed)),
+            IpType::Ipv6 => ipv6.push(Value::Binary(packed)),
+            IpType::Onion => onion.push(Value::Binary(packed)),
+            IpType::I2p => i2p.push(Value::Binary(packed)),
+            IpType::Rns => {}
+        }
+    }
+    vmap(vec![
+        ("ipv4", Value::Array(ipv4.clone())),
+        ("ip4", Value::Array(ipv4)),
+        ("ipv6", Value::Array(ipv6)),
+        ("onion", Value::Array(onion)),
+        ("i2p", Value::Array(i2p)),
+    ])
 }
 
 #[cfg(test)]
@@ -694,6 +831,77 @@ mod tests {
         let ours = PeerAddr::I2p { dest: our_i2p.into(), port: 15441 };
         assert!(returned.contains(&ours), "reply should advertise our own i2p address");
         assert!(!returned.contains(&sent), "should not echo back their peer");
+    }
+
+    #[tokio::test]
+    async fn announce_tracker_records_and_serves_overlay_peers() {
+        let state = AppState::new("test");
+        let svc = FileService::new(state.clone());
+        let hash = vec![42u8; 32];
+
+        // Peer A (clearnet) announces the hash, requesting ipv4 + i2p peers.
+        let a = PeerAddr::parse("8.8.8.8:12345").unwrap();
+        let a_params = vmap(vec![
+            ("hashes", Value::Array(vec![Value::Binary(hash.clone())])),
+            ("port", Value::from(15441i64)),
+            ("add", Value::Array(vec![Value::from("ipv4")])),
+            ("need_types", Value::Array(vec![Value::from("ipv4"), Value::from("i2p")])),
+            ("need_num", Value::from(20i64)),
+        ]);
+        svc.handle(&a, "announce", &a_params).await;
+
+        // Peer B announces the same hash with a clearnet source + an i2p self-address.
+        let b = PeerAddr::parse("9.9.9.9:23456").unwrap();
+        let b_i2p = "narvewf7cmhowltv4vybkf4y4zgt63xxf2kbiantnzrb3slglw2q.b32";
+        let b_params = vmap(vec![
+            ("hashes", Value::Array(vec![Value::Binary(hash.clone())])),
+            ("port", Value::from(26552i64)),
+            ("add", Value::Array(vec![Value::from("ipv4"), Value::from("i2p")])),
+            ("i2p", Value::Array(vec![Value::from(b_i2p)])),
+            ("need_types", Value::Array(vec![Value::from("ipv4")])),
+            ("need_num", Value::from(20i64)),
+        ]);
+        svc.handle(&b, "announce", &b_params).await;
+
+        // A re-announces: it should now discover B's clearnet and i2p addresses,
+        // but never itself.
+        let resp = svc.handle(&a, "announce", &a_params).await;
+        let Some(Value::Array(per_hash)) = vget(&resp, "peers").cloned() else {
+            panic!("no peers in announce reply");
+        };
+        assert_eq!(per_hash.len(), 1);
+        let bucket = &per_hash[0];
+
+        let unpack = |b: &Value, key: &str, f: fn(&[u8]) -> Option<PeerAddr>| -> Vec<PeerAddr> {
+            match vget(b, key) {
+                Some(Value::Array(l)) => l.iter().filter_map(|v| match v {
+                    Value::Binary(bytes) => f(bytes),
+                    _ => None,
+                }).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let ipv4 = unpack(bucket, "ipv4", PeerAddr::unpack_ip);
+        let i2p = unpack(bucket, "i2p", PeerAddr::unpack_i2p);
+        assert!(ipv4.contains(&PeerAddr::parse("9.9.9.9:26552").unwrap()), "A discovers B's clearnet");
+        assert!(
+            i2p.contains(&PeerAddr::I2p { dest: b_i2p.into(), port: 26552 }),
+            "A discovers B's i2p address through the tracker"
+        );
+        assert!(!ipv4.contains(&PeerAddr::parse("8.8.8.8:15441").unwrap()), "A never gets itself");
+    }
+
+    #[tokio::test]
+    async fn announce_tracker_can_be_disabled() {
+        let state = AppState::new("test");
+        state.config_set("tracker", serde_json::json!("disable")).await;
+        let svc = FileService::new(state.clone());
+        let params = vmap(vec![
+            ("hashes", Value::Array(vec![Value::Binary(vec![1u8; 32])])),
+            ("port", Value::from(15441i64)),
+        ]);
+        let resp = svc.handle(&PeerAddr::parse("8.8.8.8:1").unwrap(), "announce", &params).await;
+        assert_eq!(vget_str(&resp, "error").as_deref(), Some("Tracker disabled"));
     }
 
     #[tokio::test]
