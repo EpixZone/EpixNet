@@ -1709,8 +1709,13 @@ impl WsCommand for XidResolveName {
         "xidResolveName"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let name = arg_str(p, "name", 0).ok_or("xidResolveName: name required")?;
-        let tld = arg_str(p, "tld", 1).unwrap_or("epix");
+        let raw = arg_str(p, "name", 0)
+            .or_else(|| arg_str(p, "xid_name", 0))
+            .ok_or("xidResolveName: name required")?;
+        let (name, tld) = match arg_str(p, "tld", 1) {
+            Some(tld) => (raw, tld),
+            None => raw.rsplit_once('.').unwrap_or((raw, "epix")),
+        };
         let resolver = epix_chain::XidResolver::new(s.state.chain_rpc_url().await);
         match resolver.resolve(name, tld).await {
             Ok(snap) => Ok(serde_json::to_value(snap).unwrap_or(Value::Null)),
