@@ -204,6 +204,12 @@ impl Connection {
         self.request("update", vmap(fields)).await
     }
 
+    /// Ask the peer for its working announcer list (`getTrackers`, the
+    /// AnnounceShare exchange): responds `{"trackers": ["epix://host:port"…]}`.
+    pub async fn get_trackers(&mut self) -> Result<Value> {
+        self.request("getTrackers", vmap(vec![])).await
+    }
+
     /// Exchange peers (`pex`): send some of our connectable peers (packed by
     /// type) and `need`, get back the peer's peers we don't have. Returns the
     /// packed peer byte-lists by bucket (`ipv4`, `ipv6`, `onion`); the caller

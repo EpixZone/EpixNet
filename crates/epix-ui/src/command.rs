@@ -2947,8 +2947,14 @@ impl WsCommand for GetTrackers {
         "getTrackers"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let trackers: Vec<String> =
+        let mut trackers: Vec<String> =
             s.state.shared_trackers().await.iter().map(|t| t.to_string()).collect();
+        for t in s.state.extra_trackers().await {
+            let t = t.to_string();
+            if !trackers.contains(&t) {
+                trackers.push(t);
+            }
+        }
         Ok(json!(trackers))
     }
 }

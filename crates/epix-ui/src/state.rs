@@ -130,6 +130,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
     (
         "Network",
+        "trackers_xite",
+        "Announcer list xite (optional: <address>/<inner path> of a published tracker list)",
+        "",
+        "text",
+    ),
+    (
+        "Network",
         "trackers_proxy",
         "Proxy for tracker connections",
         "disable",
@@ -324,6 +331,10 @@ pub struct AppState {
     /// node's data root is user-relocatable (a desktop node not pinned by
     /// `EPIX_DATA_DIR`). `set_data_dir` persists the choice there.
     data_dir_conf: std::sync::Mutex<Option<PathBuf>>,
+    /// Trackers contributed at runtime (the Syncronite plugin's live list),
+    /// folded into every announce alongside the configured ones. Replaced
+    /// wholesale on each refresh - not persisted, the source file is.
+    extra_trackers: RwLock<Vec<PeerAddr>>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -469,6 +480,7 @@ impl AppState {
             data_root: None,
             sites_path: None,
             data_dir_conf: std::sync::Mutex::new(None),
+            extra_trackers: RwLock::new(Vec::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -570,6 +582,7 @@ impl AppState {
             sites_path: Some(dir.join("sites.json")),
             data_root: Some(data_root),
             data_dir_conf: std::sync::Mutex::new(None),
+            extra_trackers: RwLock::new(Vec::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -691,6 +704,17 @@ impl AppState {
             .filter_map(|v| v.as_str())
             .filter_map(|s| PeerAddr::parse(s).ok())
             .collect()
+    }
+
+    /// Replace the runtime-contributed tracker list (the Syncronite plugin's
+    /// refresh). Every announce pass folds these in.
+    pub async fn set_extra_trackers(&self, trackers: Vec<PeerAddr>) {
+        *self.extra_trackers.write().await = trackers;
+    }
+
+    /// The runtime-contributed trackers (beyond the configured/static list).
+    pub async fn extra_trackers(&self) -> Vec<PeerAddr> {
+        self.extra_trackers.read().await.clone()
     }
 
     /// Remember a tracker that answered, so it is reused (and shared) later.
@@ -1167,6 +1191,12 @@ impl AppState {
     /// for in-memory nodes.
     pub fn xite_dir(&self, address: &str) -> Option<PathBuf> {
         Some(self.data_root.as_ref()?.join("data").join(address))
+    }
+
+    /// The shared data root itself (None for in-memory nodes) - where
+    /// node-level files like `trackers.json` live.
+    pub fn data_root_path(&self) -> Option<PathBuf> {
+        self.data_root.clone()
     }
 
     // --- SiteManager: persist the served-xite list across restarts ----------

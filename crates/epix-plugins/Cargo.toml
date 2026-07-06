@@ -9,8 +9,12 @@ epix-core = { path = "../epix-core" }
 epix-ui = { path = "../epix-ui" }
 epix-plugin = { path = "../epix-plugin" }
 epix-peer = { path = "../epix-peer" }
+epix-protocol = { path = "../epix-protocol" }
 async-trait = "0.1"
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
+epix-xite = { path = "../epix-xite" }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

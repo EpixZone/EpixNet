@@ -252,9 +252,11 @@ async fn announce_loop(
 ) {
     let announce = || async {
         // AnnounceShare: announce to the configured trackers plus any remembered
-        // from previous runs.
+        // from previous runs, plus the runtime-contributed list (Syncronite's
+        // live bootstrap) - re-read every pass, like EpixNet's loadTrackersFile
+        // in its announce loop.
         let mut all = trackers.clone();
-        for t in state.shared_trackers().await {
+        for t in state.shared_trackers().await.into_iter().chain(state.extra_trackers().await) {
             if !all.contains(&t) {
                 all.push(t);
             }

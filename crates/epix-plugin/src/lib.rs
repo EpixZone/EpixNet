@@ -42,6 +42,12 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Background behavior: called once when the node starts serving, on the
+    /// running Tokio runtime. A plugin spawns its own tasks and returns; the
+    /// task should check `state.plugin_enabled(name)` each cycle so disabling
+    /// the plugin takes effect without a restart.
+    fn start(&self, _state: &Arc<epix_ui::AppState>) {}
+
     // Future seams (added as the subsystems grow):
     //   fn on_site_loaded(&self, ...) {}
     //   fn verify_content(&self, ...) -> HookOutcome { HookOutcome::Continue }
@@ -70,6 +76,14 @@ impl PluginRegistry {
 
     pub fn names(&self) -> Vec<&str> {
         self.plugins.iter().map(|p| p.name()).collect()
+    }
+
+    /// Start every plugin's background behavior (call once, after the node is
+    /// serving and inside the Tokio runtime).
+    pub fn start_all(&self, state: &Arc<epix_ui::AppState>) {
+        for plugin in &self.plugins {
+            plugin.start(state);
+        }
     }
 
     /// Build the UI command registry: built-in commands plus every plugin's

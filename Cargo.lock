@@ -1687,8 +1687,11 @@ dependencies = [
  "epix-core",
  "epix-peer",
  "epix-plugin",
+ "epix-protocol",
  "epix-ui",
+ "epix-xite",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
