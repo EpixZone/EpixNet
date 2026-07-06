@@ -731,13 +731,24 @@ async fn i2p_loop(
 
     // Poll live status (phase, peers, tunnels, destination) into the app state
     // for the Stats page until shutdown.
+    let mut announced_b32 = false;
     loop {
         let s = i2p.status().await;
+        // Once ready, publish our `.b32.i2p` (minus the `.i2p` suffix) so PEX
+        // advertises us and peers can reach + gossip us over I2P.
+        if !announced_b32 {
+            if let Some(host) = s.b32.strip_suffix(".i2p") {
+                state.set_i2p_address(host).await;
+                state.log("INFO", format!("I2P: inbound address {}", s.b32)).await;
+                announced_b32 = true;
+            }
+        }
         state
             .set_i2p_status(serde_json::json!({
                 "mode": s.mode.as_str(),
                 "phase": s.phase.label(),
                 "destination": s.destination,
+                "b32": s.b32,
                 "sam_port": s.sam_port,
                 "reseed_routers": s.reseed_routers,
                 "connected_routers": s.connected_routers,
