@@ -24,3 +24,4 @@ embedded = ["dep:emissary-core", "dep:emissary-util"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"

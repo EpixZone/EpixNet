@@ -1886,6 +1886,7 @@ dependencies = [
  "emissary-util",
  "epix-core",
  "epix-transport",
+ "tempfile",
  "tokio",
  "tracing",
  "yosemite",
