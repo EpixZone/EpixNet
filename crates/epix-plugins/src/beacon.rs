@@ -154,15 +154,37 @@ fn parse_tracker_line(line: &str) -> Option<PeerAddr> {
     if s.is_empty() || s.contains(".i2p") {
         return None;
     }
-    if let Ok(addr) = PeerAddr::parse(&s) {
-        return Some(addr);
+    let addr = if let Ok(addr) = PeerAddr::parse(&s) {
+        addr
+    } else {
+        // A bare IPv6 host: the last colon separates the port; bracket the rest.
+        let (host, port) = s.rsplit_once(':')?;
+        if host.contains(':') && !host.starts_with('[') {
+            PeerAddr::parse(&format!("[{host}]:{port}")).ok()?
+        } else {
+            return None;
+        }
+    };
+    // Skip mesh-overlay addresses we have no transport for: a node only reaches
+    // Yggdrasil (0200::/7) or Lokinet (fd00::/8) addresses if it runs that
+    // daemon, which we don't. Including them would just pile up as permanent
+    // announce failures on the dashboard. i2p is skipped above for the same
+    // reason. Clearnet IPv4/IPv6 and Tor onion are kept - those we can reach.
+    if is_unreachable_overlay(&addr) {
+        return None;
     }
-    // A bare IPv6 host: the last colon separates the port; bracket the rest.
-    let (host, port) = s.rsplit_once(':')?;
-    if host.contains(':') && !host.starts_with('[') {
-        return PeerAddr::parse(&format!("[{host}]:{port}")).ok();
+    Some(addr)
+}
+
+/// True for an IPv6 address that only routes inside a mesh overlay we don't
+/// run: Yggdrasil (`0200::/7`) or Lokinet (`fd00::/8`).
+fn is_unreachable_overlay(addr: &PeerAddr) -> bool {
+    use std::net::SocketAddr;
+    if let PeerAddr::Ip(SocketAddr::V6(a)) = addr {
+        let first = a.ip().segments()[0];
+        return (first & 0xfe00) == 0x0200 || (first & 0xff00) == 0xfd00;
     }
-    None
+    false
 }
 
 /// The persistent announcer book: EpixNet AnnounceShare's `trackers.json`
@@ -345,20 +367,24 @@ mod tests {
             parse_tracker_line("epix://145.223.69.23:26959"),
             Some(PeerAddr::Ip(a)) if a.port() == 26959
         ));
-        assert!(matches!(
-            parse_tracker_line("epix://[201:57:d3b2:6291:174e:5643:413c:6c51]:15441"),
-            Some(PeerAddr::Ip(_))
-        ));
+        // Real global IPv6 (a RIR-allocated 2a05::) is kept - reachable given
+        // IPv6 connectivity.
         assert!(matches!(
             parse_tracker_line("epix://2a05:dfc1:4000:1e00::a:15441"),
             Some(PeerAddr::Ip(a)) if a.port() == 15441
         ));
+        // Tor onion is kept - we route it through arti.
         assert!(matches!(
             parse_tracker_line(
                 "epix://5vczpwawviukvd7grfhsfxp7a6huz77hlis4fstjkym5kmf4pu7i7myd.onion:15441"
             ),
             Some(PeerAddr::Onion { port: 15441, .. })
         ));
+        // Overlay addresses we have no transport for are skipped: Yggdrasil
+        // (0200::/7, bracketed and bare forms), Lokinet (fd00::/8), i2p.
+        assert!(parse_tracker_line("epix://[201:57:d3b2:6291:174e:5643:413c:6c51]:15441").is_none());
+        assert!(parse_tracker_line("epix://202:7d01:9137:6c29:afea:ce96:300e:336e:15441").is_none());
+        assert!(parse_tracker_line("epix://[fd00::1]:15441").is_none());
         assert!(parse_tracker_line(
             "epix://gv54ndn4fbtj3ermicvbapilptjmts3qosf7xmxuorybsvz7bbva.i2p :15441"
         )
