@@ -181,3 +181,22 @@ async fn global_settings_survive_a_restart() {
     assert_eq!(gs["theme"], json!("dark"));
     assert_eq!(gs["use_system_theme"], json!(false));
 }
+
+#[tokio::test]
+async fn language_survives_a_restart() {
+    let root = tempfile::tempdir().unwrap();
+
+    // Default language is English, and the wrapper renders it.
+    let fresh = AppState::with_data_dir("run-0", root.path());
+    assert_eq!(fresh.ui_language().await, "en");
+
+    // Toggle the language; it's a node config value, saved to config.json.
+    fresh.config_set("language", json!("de")).await;
+    assert!(root.path().join("private/config.json").exists());
+    drop(fresh);
+
+    // A new node on the same data dir reads it back and renders it.
+    let restarted = AppState::with_data_dir("run-1", root.path());
+    assert_eq!(restarted.ui_language().await, "de");
+    assert_eq!(restarted.server_info().await["language"], json!("de"));
+}

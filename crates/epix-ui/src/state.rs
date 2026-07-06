@@ -1166,6 +1166,24 @@ impl AppState {
         Value::Object(self.user.read().await.settings.clone())
     }
 
+    /// The interface language the wrapper renders (config `language`, default
+    /// `en`), sanitized to a bare language code so it's safe to inject into the
+    /// wrapper HTML/URLs. Xites load their translations off this.
+    pub async fn ui_language(&self) -> String {
+        let lang = self
+            .config_get("language")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let clean: String =
+            lang.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(16).collect();
+        if clean.is_empty() {
+            "en".to_string()
+        } else {
+            clean
+        }
+    }
+
     /// The initial `theme-<name>` body class the wrapper renders, from the
     /// user's stored theme (default light; only light/dark are emitted). For
     /// system theme this is the last resolved value; the client corrects it via
