@@ -331,10 +331,13 @@ pub struct AppState {
     /// node's data root is user-relocatable (a desktop node not pinned by
     /// `EPIX_DATA_DIR`). `set_data_dir` persists the choice there.
     data_dir_conf: std::sync::Mutex<Option<PathBuf>>,
-    /// Trackers contributed at runtime (the Syncronite plugin's live list),
+    /// Trackers contributed at runtime (the Beacon plugin's live list),
     /// folded into every announce alongside the configured ones. Replaced
-    /// wholesale on each refresh - not persisted, the source file is.
+    /// wholesale on each refresh - not persisted, the plugin's book is.
     extra_trackers: RwLock<Vec<PeerAddr>>,
+    /// Fired when the runtime-contributed tracker set changes, so the announce
+    /// loop can run early instead of waiting out its period.
+    trackers_changed: Arc<tokio::sync::Notify>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -481,6 +484,7 @@ impl AppState {
             sites_path: None,
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
+            trackers_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -583,6 +587,7 @@ impl AppState {
             data_root: Some(data_root),
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
+            trackers_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -706,15 +711,32 @@ impl AppState {
             .collect()
     }
 
-    /// Replace the runtime-contributed tracker list (the Syncronite plugin's
-    /// refresh). Every announce pass folds these in.
+    /// Replace the runtime-contributed tracker list (the Beacon plugin's
+    /// refresh). Every announce pass folds these in; a change wakes the
+    /// announce loop so new announcers are used right away.
     pub async fn set_extra_trackers(&self, trackers: Vec<PeerAddr>) {
-        *self.extra_trackers.write().await = trackers;
+        let changed = {
+            let mut current = self.extra_trackers.write().await;
+            let changed = *current != trackers;
+            *current = trackers;
+            changed
+        };
+        if changed {
+            // notify_one stores a permit: the announce loop is usually still
+            // inside its boot pass when Beacon's first refresh lands, and a
+            // waiterless notify_waiters would be lost.
+            self.trackers_changed.notify_one();
+        }
     }
 
     /// The runtime-contributed trackers (beyond the configured/static list).
     pub async fn extra_trackers(&self) -> Vec<PeerAddr> {
         self.extra_trackers.read().await.clone()
+    }
+
+    /// The signal fired when the runtime-contributed tracker set changes.
+    pub fn trackers_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.trackers_changed.clone()
     }
 
     /// Remember a tracker that answered, so it is reused (and shared) later.
@@ -1595,16 +1617,37 @@ impl AppState {
                 .map(|x| canonical_address(x.content.as_ref(), address))
                 .unwrap_or_else(|| address.to_string())
         };
-        let mut all = Vec::new();
-        for tracker in trackers {
-            let peers = epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(tracker), 0).await;
+        // Announce to every tracker concurrently: with a Beacon-sized list
+        // (dozens, some dead), serial announces would stretch one pass across
+        // many timeouts and the dashboard's per-tracker stats would trickle in.
+        let mut set = tokio::task::JoinSet::new();
+        for tracker in trackers.iter().cloned() {
+            let transport = transport.clone();
+            let key = key.clone();
+            set.spawn(async move {
+                let peers = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(&tracker), 0),
+                )
+                .await
+                .unwrap_or_default();
+                (tracker, peers)
+            });
+        }
+        let mut all: Vec<PeerAddr> = Vec::new();
+        while let Some(res) = set.join_next().await {
+            let Ok((tracker, peers)) = res else { continue };
             self.record_tracker(&tracker.to_string(), peers.len()).await;
             // AnnounceShare: remember a tracker that answered, so it is reused
             // (and shared) across restarts.
             if !peers.is_empty() {
                 self.add_shared_tracker(&tracker.to_string()).await;
             }
-            all.extend(peers);
+            for p in peers {
+                if !all.contains(&p) {
+                    all.push(p);
+                }
+            }
         }
         self.add_peers(address, all.clone()).await;
         self.log("INFO", format!("Announced {address}: {} peers", all.len())).await;
@@ -1614,7 +1657,11 @@ impl AppState {
         all
     }
 
-    /// Record a completed announce to `tracker` (found `num_added` peers).
+    /// Record a completed announce to `tracker` (found `num_added` peers). An
+    /// announce that returned no peers counts as an error, not a success, so
+    /// the dashboard's working-tracker count and Beacon's health check reflect
+    /// which announcers actually answer (a dead onion/IPv6 entry shouldn't read
+    /// as working just because it was tried).
     async fn record_tracker(&self, tracker: &str, num_added: usize) {
         let key = format!("epix://{tracker}");
         let mut stats = self.tracker_stats.write().await;
@@ -1626,11 +1673,16 @@ impl AppState {
             let v = o.get(k).and_then(|v| v.as_i64()).unwrap_or(0) + by;
             o.insert(k.to_string(), json!(v));
         };
-        obj.insert("status".into(), json!("announced"));
         obj.insert("time_request".into(), json!(now_secs()));
         bump(obj, "num_request", 1);
-        bump(obj, "num_success", 1);
         bump(obj, "num_added", num_added as i64);
+        if num_added > 0 {
+            obj.insert("status".into(), json!("announced"));
+            bump(obj, "num_success", 1);
+        } else {
+            obj.insert("status".into(), json!("error"));
+            bump(obj, "num_error", 1);
+        }
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
