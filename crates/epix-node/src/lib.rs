@@ -20,8 +20,13 @@ pub use epix_ui::AppState;
 
 /// The default Epix bootstrap tracker.
 pub const DEFAULT_TRACKER: &str = "145.223.69.23:26959";
-/// The default UI bind (loopback, EpixNet's port).
-pub const DEFAULT_UI_ADDR: &str = "127.0.0.1:43110";
+/// Epix's default UI port.
+pub const DEFAULT_UI_PORT: u16 = 42222;
+/// Legacy EpixNet UI port, used as a fallback when the default is taken (so a
+/// fresh Epix and an old EpixNet can coexist, and old 43110 links still resolve).
+pub const LEGACY_UI_PORT: u16 = 43110;
+/// The default UI bind (loopback, Epix's port).
+pub const DEFAULT_UI_ADDR: &str = "127.0.0.1:42222";
 
 /// How the embedded node should boot and serve.
 pub struct NodeOptions {
@@ -45,6 +50,8 @@ pub struct NodeOptions {
     pub log_file: Option<PathBuf>,
     /// Node version string reported in `serverInfo`.
     pub version: String,
+    /// Short git commit of this build, reported in `serverInfo.rev`.
+    pub rev: String,
 }
 
 impl NodeOptions {
@@ -59,6 +66,7 @@ impl NodeOptions {
             geoip_gz: None,
             log_file: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            rev: "0".to_string(),
         }
     }
 }
@@ -175,6 +183,32 @@ pub async fn boot(
 
     let running = serve(opts, address, display, data_dir, content, bytes_recv).await?;
     Ok(running)
+}
+
+/// Pick the UI bind address: the requested one if its port is free, otherwise -
+/// only when the requested port is Epix's default - fall back to the legacy
+/// EpixNet port so a fresh Epix and an old EpixNet can run side by side and old
+/// `127.0.0.1:43110` links still resolve. An explicitly chosen port is honored
+/// as-is (serve reports the bind error if it's taken).
+fn resolve_ui_bind(requested: std::net::SocketAddr) -> std::net::SocketAddr {
+    resolve_ui_bind_with(requested, |addr| std::net::TcpListener::bind(addr).is_ok())
+}
+
+/// The bind decision, with the port-availability check injected so it can be
+/// tested without touching real sockets.
+fn resolve_ui_bind_with(
+    requested: std::net::SocketAddr,
+    free: impl Fn(std::net::SocketAddr) -> bool,
+) -> std::net::SocketAddr {
+    if free(requested) || requested.port() != DEFAULT_UI_PORT {
+        return requested;
+    }
+    let fallback = std::net::SocketAddr::new(requested.ip(), LEGACY_UI_PORT);
+    if free(fallback) {
+        fallback
+    } else {
+        requested
+    }
 }
 
 /// Boot and then serve forever (blocks). The convenience entry point for the
@@ -1063,6 +1097,7 @@ async fn serve(
     bytes_recv: u64,
 ) -> Result<(UiServer, RunningNode), String> {
     let state = AppState::with_data_dir(&opts.version, &opts.data_root);
+    state.set_rev(&opts.rev).await;
     if let Some(log_file) = &opts.log_file {
         state.set_log_file(log_file);
     }
@@ -1261,10 +1296,17 @@ async fn serve(
     state.set_plugins(plugin_names).await;
     plugins.start_all(&state);
 
-    let bind: std::net::SocketAddr = opts
+    let requested: std::net::SocketAddr = opts
         .ui_addr
         .parse()
         .map_err(|_| format!("invalid ui_addr '{}'", opts.ui_addr))?;
+    let bind = resolve_ui_bind(requested);
+    if bind.port() != requested.port() {
+        state
+            .log("INFO", format!("UI port {} in use; using {}", requested.port(), bind.port()))
+            .await;
+    }
+    state.set_ui_port(bind.port()).await;
     state.log("INFO", format!("Serving {display} ({bytes_recv} bytes received)")).await;
 
     if opts.open_browser {
@@ -1339,6 +1381,25 @@ pub fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_bind_prefers_default_and_falls_back_to_legacy() {
+        let addr = |p: u16| std::net::SocketAddr::from(([127, 0, 0, 1], p));
+
+        // Default port free -> use it.
+        assert_eq!(resolve_ui_bind_with(addr(DEFAULT_UI_PORT), |_| true), addr(DEFAULT_UI_PORT));
+
+        // Default port taken -> fall back to the legacy EpixNet port.
+        let taken_default = |a: std::net::SocketAddr| a.port() != DEFAULT_UI_PORT;
+        assert_eq!(resolve_ui_bind_with(addr(DEFAULT_UI_PORT), taken_default), addr(LEGACY_UI_PORT));
+
+        // Default and legacy both taken -> keep the default (serve reports it).
+        assert_eq!(resolve_ui_bind_with(addr(DEFAULT_UI_PORT), |_| false), addr(DEFAULT_UI_PORT));
+
+        // An explicitly chosen (non-default) port is honored even if taken -
+        // no surprise jump to 43110.
+        assert_eq!(resolve_ui_bind_with(addr(9999), |_| false), addr(9999));
+    }
 
     #[test]
     fn parse_target_strips_scheme_and_path() {

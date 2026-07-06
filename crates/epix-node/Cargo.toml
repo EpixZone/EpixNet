@@ -1,6 +1,6 @@
 [package]
 name = "epix-node"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Embeddable Epix node: resolve a .epix name, clone + verify the xite, and serve the UI, reused by the server binary, the FFI layer, and the shells."
 
