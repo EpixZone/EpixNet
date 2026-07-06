@@ -58,11 +58,25 @@ pub struct Tor {
     client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
 }
 
+/// Install the process-wide rustls crypto provider (`ring`) once. rustls 0.23
+/// refuses to pick a default when more than one provider is compiled in (both
+/// `ring` and `aws-lc-rs` end up in the tree via arti's deps), so arti's TLS
+/// would panic on first use without this. Idempotent and safe to call from
+/// every bootstrap; a lost race just means the other thread installed it.
+fn install_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl Tor {
     /// Bootstrap a Tor client, keeping its state + directory cache under
     /// `data_dir` (`<data>/tor/state`, `<data>/tor/cache`) so later starts
     /// are fast. Returns once the client is usable.
     pub async fn bootstrap(data_dir: &Path) -> Result<Self> {
+        install_crypto_provider();
         let state = data_dir.join("tor").join("state");
         let cache = data_dir.join("tor").join("cache");
         let config = TorClientConfigBuilder::from_directories(state, cache)
