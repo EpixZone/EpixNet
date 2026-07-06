@@ -19,8 +19,9 @@ tempfile = "3"
 # Desktop bundles the auth/login plugins that a mobile build leaves off (the
 # phone UI is already local to the device). Build a mobile node with
 # `--no-default-features`.
-default = ["desktop", "tor", "i2p"]
+default = ["desktop", "tor", "i2p-embedded"]
 desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
 # In-process Tor (Arti): onion dialing + hosting + SOCKS listener for the shell.
 tor = ["epix-node/tor"]
 i2p = ["epix-node/i2p"]
+i2p-embedded = ["epix-node/i2p-embedded"]
