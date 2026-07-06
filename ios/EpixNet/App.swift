@@ -50,7 +50,7 @@ final class NodeModel: ObservableObject {
                     dataDir: dataDir,
                     target: self.homeXite,
                     uiAddr: self.uiBind,
-                    torMode: "disable",
+                    torMode: "enable",
                     version: appVersion()))
                 // The bind + resolved display, from the running node.
                 guard let ui = self.node.uiUrl(), let url = URL(string: ui) else {
@@ -80,8 +80,11 @@ final class NodeModel: ObservableObject {
             .appendingPathComponent("EpixNet")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         // Seed the node config once so the fileserver port stays off the
-        // desktop default (see uiBind note above).
-        let config = dir.appendingPathComponent("config.json")
+        // desktop default (see uiBind note above). The node keeps its config
+        // in private/ (the Python EpixNet layout).
+        let privateDir = dir.appendingPathComponent("private")
+        try FileManager.default.createDirectory(at: privateDir, withIntermediateDirectories: true)
+        let config = privateDir.appendingPathComponent("config.json")
         if !FileManager.default.fileExists(atPath: config.path) {
             let seed = "{\n  \"fileserver_port\": \(fileserverPort)\n}\n"
             try seed.write(to: config, atomically: true, encoding: .utf8)
