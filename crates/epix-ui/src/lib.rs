@@ -514,12 +514,14 @@ async fn render_wrapper(
 
     // wrapper_key == the bech32 address for this single-user local node, so
     // the WS session and every command bind to the address, never the name.
+    let themeclass = ctx.state.theme_class().await;
+    let lang = ctx.state.ui_language().await;
     let vars: Vec<(&str, String)> = vec![
         ("title", title),
         ("rev", "1".into()),
         ("meta_tags", String::new()),
         ("body_style", String::new()),
-        ("themeclass", "theme-light".into()),
+        ("themeclass", themeclass),
         ("script_nonce", script_nonce.clone()),
         ("homepage", homepage),
         ("site_file_server", String::new()),
@@ -535,7 +537,7 @@ async fn render_wrapper(
         ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
         ("sandbox_permissions", String::new()),
         ("server_url", String::new()),
-        ("lang", "en".into()),
+        ("lang", lang),
     ];
     let mut html = render(WRAPPER_HTML, &vars);
     // NoNewSites gateway: every page carries the read-only banner.
@@ -1224,8 +1226,8 @@ async fn substitute_html_vars(
         Ok(t) => t,
         Err(e) => return e.into_bytes(),
     };
-    text = text.replace("{themeclass}", "theme-light");
-    text = text.replace("lang={lang}", "lang=en");
+    text = text.replace("{themeclass}", &state.theme_class().await);
+    text = text.replace("lang={lang}", &format!("lang={}", state.ui_language().await));
     if text.contains("{site_modified}") {
         let modified = state
             .content(address)

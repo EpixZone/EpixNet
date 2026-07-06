@@ -248,9 +248,6 @@ pub struct AppState {
     user: RwLock<User>,
     user_path: Option<PathBuf>,
     nonce_counter: AtomicU64,
-    /// Persisted per-user global settings (theme, etc.). Must persist across a
-    /// connection or xites that reload on a settings change loop forever.
-    global_settings: RwLock<Value>,
     /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
     filters: RwLock<Value>,
     filters_path: Option<PathBuf>,
@@ -510,7 +507,6 @@ impl AppState {
             user: RwLock::new(User::generate()),
             user_path: None,
             nonce_counter: AtomicU64::new(1),
-            global_settings: RwLock::new(json!({ "theme": "light" })),
             filters: RwLock::new(empty_filters()),
             filters_path: None,
             transport: RwLock::new(None),
@@ -618,7 +614,6 @@ impl AppState {
             user: RwLock::new(user),
             user_path: Some(user_path),
             nonce_counter: AtomicU64::new(1),
-            global_settings: RwLock::new(json!({ "theme": "light" })),
             filters: RwLock::new(filters),
             filters_path: Some(filters_path),
             transport: RwLock::new(None),
@@ -1164,12 +1159,54 @@ impl AppState {
         }
     }
 
+    /// Global (per-user) settings - theme etc. Backed by the master user's
+    /// `settings` in users.json (like EpixNet's `user.settings`), so a chosen
+    /// theme survives restarts instead of resetting to the default.
     pub async fn global_settings(&self) -> Value {
-        self.global_settings.read().await.clone()
+        Value::Object(self.user.read().await.settings.clone())
     }
 
+    /// The interface language the wrapper renders (config `language`, default
+    /// `en`), sanitized to a bare language code so it's safe to inject into the
+    /// wrapper HTML/URLs. Xites load their translations off this.
+    pub async fn ui_language(&self) -> String {
+        let lang = self
+            .config_get("language")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let clean: String =
+            lang.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(16).collect();
+        if clean.is_empty() {
+            "en".to_string()
+        } else {
+            clean
+        }
+    }
+
+    /// The initial `theme-<name>` body class the wrapper renders, from the
+    /// user's stored theme (default light; only light/dark are emitted). For
+    /// system theme this is the last resolved value; the client corrects it via
+    /// prefers-color-scheme, so pages don't flash the wrong theme on every load.
+    pub async fn theme_class(&self) -> String {
+        let settings = self.global_settings().await;
+        match settings.get("theme").and_then(|v| v.as_str()) {
+            Some("dark") => "theme-dark".to_string(),
+            _ => "theme-light".to_string(),
+        }
+    }
+
+    /// Merge `value` into the user's settings and persist users.json. Merging
+    /// (rather than replacing) keeps node-managed keys like
+    /// `next_identity_index` even if the dashboard sends only theme fields.
     pub async fn set_global_settings(&self, value: Value) {
-        *self.global_settings.write().await = value;
+        if let Value::Object(incoming) = value {
+            let mut user = self.user.write().await;
+            for (k, v) in incoming {
+                user.settings.insert(k, v);
+            }
+        }
+        self.save_user().await;
     }
 
     /// Register a served xite, deriving its settings + stats from content.json.
@@ -4055,8 +4092,9 @@ impl AppState {
     pub async fn server_info(&self) -> Value {
         let mut user_settings = self.global_settings().await;
         if let Value::Object(m) = &mut user_settings {
+            // Default to following the OS theme when the user hasn't chosen one.
             m.entry("theme").or_insert(json!("light"));
-            m.entry("use_system_theme").or_insert(json!(false));
+            m.entry("use_system_theme").or_insert(json!(true));
         }
         let connections = self.connection_stats().await.total;
         let plugins = self.plugins().await;
