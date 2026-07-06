@@ -24,10 +24,12 @@ thiserror = "1"
 [features]
 # I2P is compiled into mobile builds (so the Config-page toggle works) but is
 # off by default at runtime - the embedded router's battery/memory cost is
-# opt-in on a phone.
-default = ["tor", "i2p"]
+# opt-in on a phone (no `i2p-autostart`). The embedded router now cross-compiles
+# to mobile because our emissary fork's reseeder uses rustls, not OpenSSL.
+default = ["tor", "i2p-embedded"]
 tor = ["epix-node/tor"]
 i2p = ["epix-node/i2p"]
+i2p-embedded = ["i2p", "epix-node/i2p-embedded"]
 # Generate the `uniffi-bindgen` CLI entry point (used by the mobile build
 # scripts to emit Kotlin/Swift). Kept behind a feature so the library builds
 # without pulling the CLI into every consumer.

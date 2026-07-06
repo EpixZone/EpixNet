@@ -1174,9 +1174,9 @@ async fn serve(
     // Privacy by default on desktop: turn the embedded I2P router on the first
     // time a node runs with no explicit `i2p` choice (persisted so the Config
     // page shows it selected, and an explicit Disable is never overridden).
-    // Only where the embedded router is compiled in - mobile (external-only)
-    // and offline mode stay off.
-    #[cfg(feature = "i2p-embedded")]
+    // Gated on `i2p-autostart` (desktop) - mobile compiles the embedded router
+    // in but leaves it opt-in, and offline mode stays off.
+    #[cfg(feature = "i2p-autostart")]
     if !offline && state.config_get("i2p").await.is_none() {
         state.config_set("i2p", serde_json::json!("embedded")).await;
     }
