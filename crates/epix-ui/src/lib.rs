@@ -514,12 +514,13 @@ async fn render_wrapper(
 
     // wrapper_key == the bech32 address for this single-user local node, so
     // the WS session and every command bind to the address, never the name.
+    let themeclass = ctx.state.theme_class().await;
     let vars: Vec<(&str, String)> = vec![
         ("title", title),
         ("rev", "1".into()),
         ("meta_tags", String::new()),
         ("body_style", String::new()),
-        ("themeclass", "theme-light".into()),
+        ("themeclass", themeclass),
         ("script_nonce", script_nonce.clone()),
         ("homepage", homepage),
         ("site_file_server", String::new()),
@@ -1224,7 +1225,7 @@ async fn substitute_html_vars(
         Ok(t) => t,
         Err(e) => return e.into_bytes(),
     };
-    text = text.replace("{themeclass}", "theme-light");
+    text = text.replace("{themeclass}", &state.theme_class().await);
     text = text.replace("lang={lang}", "lang=en");
     if text.contains("{site_modified}") {
         let modified = state

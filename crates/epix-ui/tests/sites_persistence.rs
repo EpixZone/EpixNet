@@ -158,3 +158,26 @@ async fn restore_skips_unverified_content() {
     assert_eq!(restored, 0, "tampered content.json is not restored");
     assert!(!state.has_any_alias(&address).await);
 }
+
+#[tokio::test]
+async fn global_settings_survive_a_restart() {
+    let root = tempfile::tempdir().unwrap();
+
+    // A fresh node defaults to following the system theme.
+    let fresh = AppState::with_data_dir("run-0", root.path());
+    let info = fresh.server_info().await;
+    assert_eq!(info["user_settings"]["use_system_theme"], json!(true));
+
+    // Choose a theme; it is stored in the master user's settings (users.json).
+    fresh
+        .set_global_settings(json!({ "theme": "dark", "use_system_theme": false }))
+        .await;
+    assert!(root.path().join("private/users.json").exists());
+    drop(fresh);
+
+    // A new node on the same data dir reads the chosen theme back.
+    let restarted = AppState::with_data_dir("run-1", root.path());
+    let gs = restarted.global_settings().await;
+    assert_eq!(gs["theme"], json!("dark"));
+    assert_eq!(gs["use_system_theme"], json!(false));
+}
