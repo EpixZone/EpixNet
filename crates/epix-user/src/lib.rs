@@ -182,6 +182,24 @@ impl User {
         epix_crypt::hd_privatekey(&self.master_seed, crypt_index)
     }
 
+    /// The per-site settings a xite stored via `userSetSettings` (EpixNet's
+    /// `site_data["settings"]` - e.g. notification_seen baselines).
+    pub fn site_settings(&self, address: &str) -> Value {
+        self.sites
+            .get(address)
+            .map(|s| Value::Object(s.settings.clone()))
+            .unwrap_or_else(|| Value::Object(Default::default()))
+    }
+
+    /// Replace a xite's stored per-site settings (`userSetSettings`).
+    pub fn set_site_settings(&mut self, address: &str, settings: Value) -> Result<(), String> {
+        self.site_data(address)?;
+        if let Some(site) = self.sites.get_mut(address) {
+            site.settings = settings.as_object().cloned().unwrap_or_default();
+        }
+        Ok(())
+    }
+
     /// Save the xite's own private key (from recovery or user input).
     pub fn set_site_privatekey(&mut self, address: &str, privatekey: &str) -> Result<(), String> {
         self.site_data(address)?;
