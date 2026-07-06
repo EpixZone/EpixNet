@@ -248,11 +248,13 @@ async fn clone_xite_with_progress(
                 // (the loading screen's tracker line).
                 Some(s) => s.announce_to_trackers(&address, std::slice::from_ref(&tracker)).await,
                 None => {
+                    // Bootstrap clone with no state yet: passive query (no
+                    // self-advertise), just fetch peers for the address.
                     epix_xite::announce(
                         transport.as_ref(),
                         &address,
                         std::slice::from_ref(&tracker),
-                        0,
+                        &epix_xite::SelfAdvert::default(),
                     )
                     .await
                 }

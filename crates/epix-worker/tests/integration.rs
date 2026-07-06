@@ -131,7 +131,7 @@ async fn live_clone_dashboard_from_network() {
         transport.as_ref(),
         DASH,
         &[PeerAddr::parse(LIVE_TRACKER).unwrap()],
-        0,
+        &epix_xite::SelfAdvert::default(),
     )
     .await;
     println!("discovered {} peers", peers.len());

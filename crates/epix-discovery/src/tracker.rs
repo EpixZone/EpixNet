@@ -12,10 +12,18 @@ pub struct AnnounceParams<'a> {
     pub hashes: &'a [[u8; 32]],
     /// Our fileserver port (0 if not accepting inbound).
     pub port: u16,
-    /// IP types we want back, e.g. `["ipv4", "ipv6"]`.
+    /// IP types we want back, e.g. `["ipv4", "ipv6", "onion", "i2p"]`.
     pub need_types: &'a [&'a str],
     /// Max peers per xite.
     pub need_num: i64,
+    /// Types the tracker should record us under (`onion`/`i2p`/`ipv4`...).
+    pub add: &'a [&'a str],
+    /// Our onion self-addresses (b32 host, no `.onion`), one per hash or shared,
+    /// so onion-capable trackers advertise us.
+    pub onions: &'a [String],
+    /// Our i2p self-addresses (b32 host, no `.i2p`, e.g. `<b32>.b32`), so i2p
+    /// trackers advertise us.
+    pub i2p: &'a [String],
 }
 
 /// Run an `announce` over an already-handshaked connection, returning the peers.
@@ -26,13 +34,17 @@ pub async fn announce(conn: &mut Connection, params: &AnnounceParams<'_>) -> Res
         .map(|h| Value::Binary(h.to_vec()))
         .collect();
     let need_types = params.need_types.iter().map(|t| Value::from(*t)).collect();
+    let add = params.add.iter().map(|t| Value::from(*t)).collect();
+    let onions = params.onions.iter().map(|o| Value::from(o.as_str())).collect();
+    let i2p = params.i2p.iter().map(|o| Value::from(o.as_str())).collect();
     let request = vmap(vec![
         ("hashes", Value::Array(hashes)),
-        ("onions", Value::Array(vec![])),
+        ("onions", Value::Array(onions)),
+        ("i2p", Value::Array(i2p)),
         ("port", Value::from(params.port as i64)),
         ("need_types", Value::Array(need_types)),
         ("need_num", Value::from(params.need_num)),
-        ("add", Value::Array(vec![])),
+        ("add", Value::Array(add)),
     ]);
 
     let res = conn.request("announce", request).await?;
@@ -42,6 +54,7 @@ pub async fn announce(conn: &mut Connection, params: &AnnounceParams<'_>) -> Res
 
     let mut peers = Vec::new();
     for xite in per_xite {
+        // Clearnet buckets (6/18-byte packed ip:port).
         for key in ["ipv4", "ip4", "ipv6"] {
             if let Some(list) = vget(xite, key).and_then(|v| v.as_array()) {
                 for packed in list {
@@ -49,6 +62,25 @@ pub async fn announce(conn: &mut Connection, params: &AnnounceParams<'_>) -> Res
                         if let Some(p) = unpack_address(bytes) {
                             peers.push(p);
                         }
+                    }
+                }
+            }
+        }
+        // Overlay buckets: onion (b32 host + port) and i2p (dest hash + port).
+        if let Some(list) = vget(xite, "onion").and_then(|v| v.as_array()) {
+            for packed in list {
+                if let Value::Binary(bytes) = packed {
+                    if let Some(p) = PeerAddr::unpack_onion(bytes) {
+                        peers.push(p);
+                    }
+                }
+            }
+        }
+        if let Some(list) = vget(xite, "i2p").and_then(|v| v.as_array()) {
+            for packed in list {
+                if let Value::Binary(bytes) = packed {
+                    if let Some(p) = PeerAddr::unpack_i2p(bytes) {
+                        peers.push(p);
                     }
                 }
             }

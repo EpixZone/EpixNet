@@ -310,6 +310,8 @@ async fn announce_loop(
         state.persist_peers().await;
         // Persist the served-xite list (settings/size may have changed).
         state.persist_sites().await;
+        // Drop tracker peers other nodes announced that have gone stale.
+        state.tracker_expire().await;
     };
     announce().await;
     let mut tick = interval(period);
