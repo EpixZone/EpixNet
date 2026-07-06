@@ -321,6 +321,10 @@ pub struct AppState {
     tor_enabled: RwLock<bool>,
     tor_status: RwLock<String>,
     onion_address: RwLock<Option<String>>,
+    /// Our own `.b32.i2p` short address (host without the `.i2p` suffix) once
+    /// the I2P inbound session is ready. Advertised in PEX so peers can reach
+    /// and gossip us over I2P. Set by the runtime's I2P loop.
+    i2p_address: RwLock<Option<String>>,
     /// Inbound updates currently being verified/downloaded (`site/inner:modified`
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
@@ -519,6 +523,7 @@ impl AppState {
             tor_enabled: RwLock::new(false),
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
+            i2p_address: RwLock::new(None),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
@@ -624,6 +629,7 @@ impl AppState {
             tor_enabled: RwLock::new(false),
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
+            i2p_address: RwLock::new(None),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1832,6 +1838,17 @@ impl AppState {
     /// Our onion address (no suffix), if the onion service has published one.
     pub async fn onion_address(&self) -> Option<String> {
         self.onion_address.read().await.clone()
+    }
+
+    /// Record our `.b32.i2p` address (host without the `.i2p` suffix, e.g.
+    /// `<b32>.b32`) once the I2P inbound session is ready.
+    pub async fn set_i2p_address(&self, host: &str) {
+        *self.i2p_address.write().await = Some(host.to_string());
+    }
+
+    /// Our `.b32.i2p` address (host without `.i2p`), if I2P inbound is ready.
+    pub async fn i2p_address(&self) -> Option<String> {
+        self.i2p_address.read().await.clone()
     }
 
     /// Set the fileserver (seeding) port the node bound, for `serverInfo`.
@@ -3342,7 +3359,8 @@ impl AppState {
         let ours = self.connectable_peers(address, 10).await;
         let mut known: std::collections::HashSet<String> =
             ours.iter().map(|p| p.to_string()).collect();
-        let (mut ipv4, mut ipv6, mut onion) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ipv4, mut ipv6, mut onion, mut i2p) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for p in &ours {
             if p.is_private() {
                 continue;
@@ -3351,7 +3369,21 @@ impl AppState {
                 (epix_core::IpType::Ipv4, Some(b)) => ipv4.push(b),
                 (epix_core::IpType::Ipv6, Some(b)) => ipv6.push(b),
                 (epix_core::IpType::Onion, Some(b)) => onion.push(b),
+                (epix_core::IpType::I2p, Some(b)) => i2p.push(b),
                 _ => {}
+            }
+        }
+        // Advertise our own reachable overlay addresses so the peers we reach
+        // add and gossip us (mirrors the server-side pex reply).
+        let fs_port = self.fileserver_port().await;
+        if let Some(host) = self.onion_address().await {
+            if let Some(b) = (PeerAddr::Onion { host, port: fs_port }).pack() {
+                onion.push(b);
+            }
+        }
+        if let Some(dest) = self.i2p_address().await {
+            if let Some(b) = (PeerAddr::I2p { dest, port: fs_port }).pack() {
+                i2p.push(b);
             }
         }
 
@@ -3360,7 +3392,9 @@ impl AppState {
             let got = tokio::time::timeout(std::time::Duration::from_secs(6), async {
                 let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
                 conn.handshake().await.ok()?;
-                conn.pex(&canonical, ipv4.clone(), ipv6.clone(), onion.clone(), need).await.ok()
+                conn.pex(&canonical, ipv4.clone(), ipv6.clone(), onion.clone(), i2p.clone(), need)
+                    .await
+                    .ok()
             })
             .await;
             let Ok(Some(reply)) = got else { continue };
@@ -3370,7 +3404,8 @@ impl AppState {
                 .iter()
                 .chain(reply.ipv6.iter())
                 .filter_map(|b| PeerAddr::unpack_ip(b))
-                .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)));
+                .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
+                .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)));
             for p in unpacked {
                 if known.insert(p.to_string()) {
                     learned.push(p);
@@ -3537,11 +3572,10 @@ impl AppState {
                 i2p_num("tunnel_failures"),
                 i2p_num("reseed_routers"),
             );
-            let dest = i2p_str("destination");
-            if !dest.is_empty() {
-                // The destination is a long base64 blob; show a short prefix.
-                let short: String = dest.chars().take(24).collect();
-                let _ = write!(h, "<div class='stat-row'>destination: {}…</div>", esc(&short));
+            let b32 = i2p_str("b32");
+            if !b32.is_empty() {
+                // Our reachable I2P address, advertised to peers via PEX.
+                let _ = write!(h, "<div class='stat-row'>address: <b>{}</b></div>", esc(&b32));
             }
         }
 

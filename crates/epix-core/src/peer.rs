@@ -5,27 +5,29 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// The peer-address category, matching EpixNet's `helper.getIpType` and the
-/// three PEX buckets (`ipv4`/`ipv6`/`onion`). Reticulum peers are `rns`.
+/// PEX buckets (`ipv4`/`ipv6`/`onion`/`i2p`). Reticulum peers are `rns`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpType {
     Ipv4,
     Ipv6,
     Onion,
-    /// I2P destination (`<b32>.i2p`). PEX for I2P peers is not wired yet, so
-    /// they reach the network through I2P trackers rather than peer exchange.
+    /// I2P destination (`<b32>.b32.i2p`). Carried in PEX as the 32-byte
+    /// destination hash so peers gossip I2P addresses like onion ones.
     I2p,
     Rns,
 }
 
 impl IpType {
     /// The PEX field name a peer of this type is packed into
-    /// (`peers`/`peers_ipv6`/`peers_onion`), or None for types PEX doesn't carry.
+    /// (`peers`/`peers_ipv6`/`peers_onion`/`peers_i2p`), or None for types PEX
+    /// doesn't carry.
     pub fn pex_field(self) -> Option<&'static str> {
         match self {
             IpType::Ipv4 => Some("peers"),
             IpType::Ipv6 => Some("peers_ipv6"),
             IpType::Onion => Some("peers_onion"),
-            IpType::I2p | IpType::Rns => None,
+            IpType::I2p => Some("peers_i2p"),
+            IpType::Rns => None,
         }
     }
 }
@@ -116,8 +118,9 @@ impl PeerAddr {
     }
 
     /// Pack to EpixNet's compact wire form: 6 bytes (ipv4) / 18 (ipv6) / onion
-    /// b32-decoded host + 2, all with a little-endian port. `None` for Rns
-    /// (PEX carries a separate `rns` field, added when the mesh transport lands).
+    /// b32-decoded host + 2 / i2p 32-byte destination hash + 2, all with a
+    /// little-endian port. `None` for Rns (PEX carries a separate `rns` field,
+    /// added when the mesh transport lands).
     pub fn pack(&self) -> Option<Vec<u8>> {
         match self {
             PeerAddr::Ip(SocketAddr::V4(a)) => {
@@ -138,9 +141,20 @@ impl PeerAddr {
                 out.extend_from_slice(&port.to_le_bytes());
                 Some(out)
             }
-            // I2P/Rns PEX packing isn't wired yet (those peers arrive via
-            // trackers, not peer exchange).
-            PeerAddr::I2p { .. } | PeerAddr::Rns(_) => None,
+            PeerAddr::I2p { dest, port } => {
+                // The `.b32.i2p` short address is base32(sha256(destination)).
+                // Pack the 32-byte hash (the b32 label, sans `.b32`) + LE port.
+                let b32 = dest.strip_suffix(".b32").unwrap_or(dest);
+                let raw = data_encoding::BASE32_NOPAD.decode(b32.to_uppercase().as_bytes()).ok()?;
+                if raw.len() != 32 {
+                    return None; // only the compact b32 form is PEX-packable
+                }
+                let mut out = raw;
+                out.extend_from_slice(&port.to_le_bytes());
+                Some(out)
+            }
+            // Rns PEX carries a separate `rns` field (added with the mesh transport).
+            PeerAddr::Rns(_) => None,
         }
     }
 
@@ -176,6 +190,18 @@ impl PeerAddr {
         let host = data_encoding::BASE32_NOPAD.encode(host_bytes).to_lowercase();
         let port = u16::from_le_bytes([port_bytes[0], port_bytes[1]]);
         Some(PeerAddr::Onion { host, port })
+    }
+
+    /// Unpack a compact i2p address (32-byte destination hash + little-endian
+    /// port) into a `.b32.i2p` peer.
+    pub fn unpack_i2p(packed: &[u8]) -> Option<Self> {
+        if packed.len() != 34 {
+            return None;
+        }
+        let (hash, port_bytes) = packed.split_at(32);
+        let b32 = data_encoding::BASE32_NOPAD.encode(hash).to_lowercase();
+        let port = u16::from_le_bytes([port_bytes[0], port_bytes[1]]);
+        Some(PeerAddr::I2p { dest: format!("{b32}.b32"), port })
     }
 }
 
@@ -235,6 +261,18 @@ mod tests {
         let p = PeerAddr::parse("abcdefghij234567.onion:43110").unwrap();
         let packed = p.pack().unwrap();
         assert_eq!(PeerAddr::unpack_onion(&packed).unwrap(), p);
+
+        // i2p: 32-byte destination hash + 2, roundtrips to the canonical
+        // `.b32.i2p` form. This b32 is base32(sha256(dest)) of a real
+        // destination, so it decodes to exactly 32 bytes.
+        let p = PeerAddr::I2p {
+            dest: "narvewf7cmhowltv4vybkf4y4zgt63xxf2kbiantnzrb3slglw2q.b32".into(),
+            port: 15441,
+        };
+        let packed = p.pack().unwrap();
+        assert_eq!(packed.len(), 34);
+        assert_eq!(&packed[32..], &15441u16.to_le_bytes());
+        assert_eq!(PeerAddr::unpack_i2p(&packed).unwrap(), p);
 
         // Rns doesn't pack (PEX carries it separately).
         assert!(PeerAddr::parse("rns:0123456789abcdef0123456789abcdef")

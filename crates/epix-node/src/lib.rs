@@ -302,7 +302,7 @@ async fn clone_xite_with_progress(
                 let reply = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                     let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
                     conn.handshake().await.ok()?;
-                    conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), 10).await.ok()
+                    conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), Vec::new(), 10).await.ok()
                 })
                 .await
                 .ok()
@@ -313,7 +313,8 @@ async fn clone_xite_with_progress(
                     .iter()
                     .chain(reply.ipv6.iter())
                     .filter_map(|b| PeerAddr::unpack_ip(b))
-                    .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)));
+                    .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
+                    .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)));
                 for p in unpacked {
                     if found.lock().unwrap().insert(p.to_string()) {
                         let _ = tx.send(p);

@@ -90,8 +90,11 @@ impl I2pPhase {
 pub struct I2pStatus {
     pub mode: I2pMode,
     pub phase: I2pPhase,
-    /// Our inbound `.b32.i2p`/base64 destination once ready (empty otherwise).
+    /// Our inbound base64 destination once ready (empty otherwise).
     pub destination: String,
+    /// Our short `.b32.i2p` address (from the destination), what peers dial and
+    /// what we advertise in PEX/trackers. Empty until ready.
+    pub b32: String,
     /// SAM TCP port in use (embedded router's discovered port, or external).
     pub sam_port: u16,
     /// Routers reseeded into the netdb at startup (embedded only).
@@ -111,6 +114,7 @@ impl I2pStatus {
             mode,
             phase,
             destination: String::new(),
+            b32: String::new(),
             sam_port: 0,
             reseed_routers: 0,
             connected_routers: 0,
@@ -199,9 +203,11 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
     // address; accept forever and hand streams to the node's server.
     let mut inbound = new_session(sam_port).await?;
     let destination = inbound.destination().to_string();
+    let b32 = b32_address(&destination).unwrap_or_default();
     {
         let mut s = status.write().await;
         s.destination = destination;
+        s.b32 = b32;
         s.phase = I2pPhase::Ready;
     }
     tokio::spawn(async move {
@@ -227,6 +233,33 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
 async fn new_session(sam_port: u16) -> Result<Session<Stream>> {
     let options = SessionOptions { samv3_tcp_port: sam_port, ..Default::default() };
     Session::<Stream>::new(options).await.map_err(|e| Error::Protocol(format!("i2p session: {e}")))
+}
+
+/// Compute the short `.b32.i2p` address from a full base64 I2P destination:
+/// `base32(sha256(destination_bytes)).lower() + ".b32.i2p"`. This is what other
+/// nodes dial and what we advertise in PEX/trackers. Returns `None` if the
+/// destination isn't valid I2P base64.
+pub fn b32_address(destination: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let raw = i2p_base64_decode(destination)?;
+    let hash = Sha256::digest(&raw);
+    let b32 = data_encoding::BASE32_NOPAD.encode(&hash).to_lowercase();
+    Some(format!("{b32}.b32.i2p"))
+}
+
+/// Decode an I2P-base64 string. I2P uses the standard base64 alphabet with
+/// `+`/`/` swapped for `-`/`~` and `=` padding. Tolerates missing padding.
+fn i2p_base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut spec = data_encoding::Specification::new();
+    spec.symbols
+        .push_str("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~");
+    spec.padding = Some('=');
+    let encoding = spec.encoding().ok()?;
+    let mut input = s.trim().to_string();
+    while input.len() % 4 != 0 {
+        input.push('=');
+    }
+    encoding.decode(input.as_bytes()).ok()
 }
 
 /// Dials `.b32.i2p` peers through the router's SAM bridge. Shares the status so
@@ -279,6 +312,22 @@ mod tests {
         assert_eq!(I2pMode::parse("disable"), I2pMode::Disable);
         assert_eq!(I2pMode::parse(""), I2pMode::Disable);
         assert_eq!(I2pMode::parse("on"), I2pMode::Embedded);
+    }
+
+    #[test]
+    fn b32_matches_i2p_reference() {
+        // A real 679-byte destination (with certificate) captured from the
+        // embedded router; b32 cross-checked against I2P's own algorithm.
+        let dest = "sgHFio~SvU1ncIhFyE4mFB7zRaSdvce0WjH58tBBQbRmvC3gFdp15wAHxXjdc7bAejcH75B5YjdjxEVQ3Z1cX-8-qQeAIp7ZstwGVaTHomhZTnFxzuzMJmQsYNbvQ~Q~eLBPej8YqEN1lf~KGfnA8QXon24hMhY9gDAMEsYUjsjZCI2JugvPfjKIQotFcoWaepAulv~4sxsASpV1F1lWfpwdJlI2CSKInS09uYbtP4PVoeyya7txoRRJHX5I07tU7tYn2A8YhMIHD4W4o7u0b5dUtqsFV8jznbbS1r0wRt8GVBMobwe18AdQ~-tMrMeMrR7YpgcBzZHJFft0dzVowJGsbiBThX78VTmCElJmzkfy8RdpM5btYWPUdBfvlkKL4kJcOe3dNXsnRT9-bGe05~0EB5FX4KwiUFuNrS3YID8alL~3fTj3iKmDGqqMFXzwwg7W-wFxO8gwWSY56U452NnOTZIdV3i7Yqiy3Cm5bysdIZl6FKdtjOmg~gbBygO3BQAEAAcAAM-dVR9APaUHHhJLbkLhkgpk8IS~StoM8SLicrE9NcCv305LV53IbmMAnk~RFWWVbCpeGw9T0LdhzDDUYxkpFFTkoGqSXLy3ocp0THFIvSiJobxkIquRNfdOg~JpfOx7Ucgn7EUOw5EMOrB7~JkyNqydCvs1GYpOhWIP1eN1HlSdD0m8YCuiy8ATb7POGIkgCxEda3IizJBAYjzeAWKuBAj7VRmSIYMDpUVKLNJ3mn0LfPuMozuH9-20MxAKfA1KiOpYqboYu1gn-TX2DFLrdRNTaztfq0M93HezFSnQgLzzLVRNJdz98C~hjCyskiKvaDvOX37K7cMWZS67Ek7tvm6gDsk0uQcW4YTLg~gKneXX-G~37zEr7l46aH9kArb6JQ";
+        assert_eq!(
+            b32_address(dest).unwrap(),
+            "narvewf7cmhowltv4vybkf4y4zgt63xxf2kbiantnzrb3slglw2q.b32.i2p"
+        );
+    }
+
+    #[test]
+    fn b32_rejects_garbage() {
+        assert!(b32_address("not valid base64 !!!").is_none());
     }
 
     #[tokio::test]

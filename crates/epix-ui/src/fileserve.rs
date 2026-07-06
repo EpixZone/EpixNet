@@ -119,14 +119,14 @@ impl FileService {
         // Collect the peers they sent (and their own address) to add + exclude
         // from the reply.
         let mut got: Vec<PeerAddr> = Vec::new();
-        for (field, onion) in [("peers", false), ("peers_ipv6", false), ("peers_onion", true)] {
+        for field in ["peers", "peers_ipv6", "peers_onion", "peers_i2p"] {
             if let Some(Value::Array(list)) = vget(params, field) {
                 for packed in list {
                     if let Value::Binary(bytes) = packed {
-                        let parsed = if onion {
-                            PeerAddr::unpack_onion(bytes)
-                        } else {
-                            PeerAddr::unpack_ip(bytes)
+                        let parsed = match field {
+                            "peers_onion" => PeerAddr::unpack_onion(bytes),
+                            "peers_i2p" => PeerAddr::unpack_i2p(bytes),
+                            _ => PeerAddr::unpack_ip(bytes),
                         };
                         if let Some(p) = parsed {
                             got.push(p);
@@ -151,12 +151,36 @@ impl FileService {
                 buckets.entry(field).or_default().push(Value::Binary(packed));
             }
         }
+
+        // Advertise our own reachable overlay addresses (onion + i2p) so peers
+        // can reach us over an anonymity network and gossip us on. Clearnet
+        // self-advertising is left to trackers (they see our source IP:port).
+        let fs_port = self.state.fileserver_port().await;
+        let mut self_addrs: Vec<PeerAddr> = Vec::new();
+        if let Some(onion) = self.state.onion_address().await {
+            self_addrs.push(PeerAddr::Onion { host: onion, port: fs_port });
+        }
+        if let Some(i2p) = self.state.i2p_address().await {
+            self_addrs.push(PeerAddr::I2p { dest: i2p, port: fs_port });
+        }
+        for p in self_addrs {
+            if exclude.contains(&p.to_string()) {
+                continue; // they already have us
+            }
+            if let (Some(field), Some(packed)) = (p.ip_type().pex_field(), p.pack()) {
+                buckets.entry(field).or_default().push(Value::Binary(packed));
+            }
+        }
+
         let mut reply = vec![("peers", Value::Array(buckets.remove("peers").unwrap_or_default()))];
         if let Some(v6) = buckets.remove("peers_ipv6") {
             reply.push(("peers_ipv6", Value::Array(v6)));
         }
         if let Some(onion) = buckets.remove("peers_onion") {
             reply.push(("peers_onion", Value::Array(onion)));
+        }
+        if let Some(i2p) = buckets.remove("peers_i2p") {
+            reply.push(("peers_i2p", Value::Array(i2p)));
         }
         vmap(reply)
     }
@@ -624,6 +648,52 @@ mod tests {
         let params = vmap(vec![("site", Value::from("1None")), ("need", Value::from(5i64))]);
         let resp = svc.handle(&requester, "pex", &params).await;
         assert_eq!(vget_str(&resp, "error").as_deref(), Some("Unknown site"));
+    }
+
+    #[tokio::test]
+    async fn pex_absorbs_and_advertises_i2p() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let state = AppState::new("test");
+        state
+            .add_xite("1Pex", XiteEntry { storage, content: Some(json!({ "address": "1Pex" })) })
+            .await;
+        state.set_fileserver_port(15441).await;
+        // We are reachable over I2P and should advertise it in PEX.
+        let our_i2p = "narvewf7cmhowltv4vybkf4y4zgt63xxf2kbiantnzrb3slglw2q.b32";
+        state.set_i2p_address(our_i2p).await;
+        let svc = FileService::new(state.clone());
+        let requester = PeerAddr::parse("9.9.9.9:15441").unwrap();
+
+        // Requester sends an i2p peer we don't have (packed 32-byte hash + port).
+        let mut packed = vec![7u8; 32];
+        packed.extend_from_slice(&0u16.to_le_bytes());
+        let sent = PeerAddr::unpack_i2p(&packed).unwrap();
+        let params = vmap(vec![
+            ("site", Value::from("1Pex")),
+            ("need", Value::from(10i64)),
+            ("peers_i2p", Value::Array(vec![Value::Binary(sent.pack().unwrap())])),
+        ]);
+        let resp = svc.handle(&requester, "pex", &params).await;
+
+        // We learned the sent i2p peer.
+        let known = state.connectable_peers("1Pex", 20).await;
+        assert!(known.contains(&sent), "should absorb the peers_i2p they sent");
+
+        // The reply advertises our own i2p address and not the one they sent.
+        let Some(Value::Array(returned)) = vget(&resp, "peers_i2p").cloned() else {
+            panic!("no peers_i2p in pex reply");
+        };
+        let returned: Vec<PeerAddr> = returned
+            .iter()
+            .filter_map(|v| match v {
+                Value::Binary(b) => PeerAddr::unpack_i2p(b),
+                _ => None,
+            })
+            .collect();
+        let ours = PeerAddr::I2p { dest: our_i2p.into(), port: 15441 };
+        assert!(returned.contains(&ours), "reply should advertise our own i2p address");
+        assert!(!returned.contains(&sent), "should not echo back their peer");
     }
 
     #[tokio::test]

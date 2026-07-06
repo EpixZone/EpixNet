@@ -1882,10 +1882,12 @@ name = "epix-i2p"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "data-encoding",
  "emissary-core",
  "emissary-util",
  "epix-core",
  "epix-transport",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
