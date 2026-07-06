@@ -27,9 +27,10 @@ i2p = ["epix-runtime/i2p"]
 # i2p-embedded implies i2p, so the node's own #[cfg(feature = "i2p")] code
 # (config read, RuntimeConfig field) is compiled, not just the runtime's.
 i2p-embedded = ["i2p", "epix-runtime/i2p-embedded"]
-# Auto-enable the embedded router on first run (privacy by default). Desktop
-# turns this on; mobile compiles i2p-embedded but leaves it off so the router
-# stays opt-in there (battery/data).
+# Auto-enable the embedded router on first run (privacy by default). Both
+# desktop and mobile turn this on - the router is a leaf (no transit, no
+# floodfill), so its footprint is Tor-client-like. A build can drop this
+# feature to compile the router in but leave it opt-in.
 i2p-autostart = ["i2p-embedded"]
 
 [dev-dependencies]

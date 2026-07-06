@@ -1171,11 +1171,11 @@ async fn serve(
         epix_runtime::TorMode::parse(&opts.tor_mode)
     };
 
-    // Privacy by default on desktop: turn the embedded I2P router on the first
-    // time a node runs with no explicit `i2p` choice (persisted so the Config
-    // page shows it selected, and an explicit Disable is never overridden).
-    // Gated on `i2p-autostart` (desktop) - mobile compiles the embedded router
-    // in but leaves it opt-in, and offline mode stays off.
+    // Privacy by default: turn the embedded I2P router on the first time a node
+    // runs with no explicit `i2p` choice (persisted so the Config page shows it
+    // selected, and an explicit Disable is never overridden). On both desktop
+    // and mobile - the router is a no-transit leaf, so its cost is Tor-like.
+    // Gated on `i2p-autostart`; offline mode stays off.
     #[cfg(feature = "i2p-autostart")]
     if !offline && state.config_get("i2p").await.is_none() {
         state.config_set("i2p", serde_json::json!("embedded")).await;

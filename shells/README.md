@@ -99,10 +99,10 @@ export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/<version>
 
 # 1. Build the core per ABI into jniLibs (needs the NDK + `cargo install cargo-ndk`
 #    and `rustup target add aarch64-linux-android`). Add `-t armeabi-v7a` for
-#    32-bit devices. Default features: Tor on, and the embedded I2P router
-#    bundled but off by default (toggle it in Config). The embedded router
-#    cross-compiles here because our emissary fork's reseeder uses rustls, not
-#    OpenSSL - see crates/epix-i2p/Cargo.toml.
+#    32-bit devices. Default features: Tor on, and the embedded I2P router on by
+#    default too (it's a no-transit leaf, so ~Tor-client footprint; switch it
+#    off in Config). The embedded router cross-compiles here because our
+#    emissary fork's reseeder uses rustls, not OpenSSL - see crates/epix-i2p.
 cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
     build -p epix-ffi --release
 
@@ -137,9 +137,9 @@ next step - GeckoView has no `shouldInterceptRequest`.
 
 ```
 # 1. Build the core as a staticlib for the device/simulator. Add `i2p-embedded`
-#    to bundle the I2P router (off by default at runtime); it needs no native
-#    deps beyond what the Tor build already links (rustls reuses ring), so it
-#    builds wherever this does.
+#    to bundle the I2P router (on by default, like desktop/Android); it needs no
+#    native deps beyond what the Tor build already links (rustls reuses ring),
+#    so it builds wherever this does.
 cargo build -p epix-ffi --release --no-default-features --features tor,i2p-embedded \
     --target aarch64-apple-ios
 # 2. Generate the Swift bindings:
