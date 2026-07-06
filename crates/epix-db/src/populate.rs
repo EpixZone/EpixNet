@@ -428,6 +428,17 @@ pub fn query_value(conn: &Connection, sql: &str, params: &Value) -> Result<Vec<V
             let mut named: Vec<(String, SqlValue)> = Vec::new();
             for (k, v) in map {
                 let base = k.strip_prefix(':').unwrap_or(k);
+                // Python's sqlite3 ignores dict keys the query never references
+                // (EpixPost passes helper keys like `directories` alongside its
+                // feed SQL); binding an unreferenced name errors in rusqlite,
+                // so skip them.
+                let referenced =
+                    Regex::new(&format!(r":{}([^0-9A-Za-z_]|$)", regex::escape(base)))
+                        .map_err(|e| Error::Db(e.to_string()))?
+                        .is_match(&sql);
+                if !referenced {
+                    continue;
+                }
                 match v {
                     Value::Array(items) => {
                         let placeholders: Vec<String> =
