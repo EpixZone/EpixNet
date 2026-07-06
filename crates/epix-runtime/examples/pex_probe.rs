@@ -40,6 +40,16 @@ async fn main() {
         }
     }
 
+    // Pull a file so the node accounts served bytes (Stats seeding graph).
+    if !site.is_empty() {
+        let mut conn = Connection::connect(&transport, &peer).await.expect("connect");
+        conn.handshake().await.expect("handshake");
+        match conn.get_file(&site, "content.json").await {
+            Ok(bytes) => println!("== getFile content.json ==\n{} bytes served", bytes.len()),
+            Err(e) => println!("== getFile content.json failed: {e} =="),
+        }
+    }
+
     // Announce to the node as if it were a tracker, requesting overlay peers.
     let hash = address_hash(&site);
     let params = AnnounceParams {

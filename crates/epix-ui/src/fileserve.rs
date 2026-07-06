@@ -43,7 +43,7 @@ impl FileService {
         vmap(vec![("piecefields_packed", Value::Map(map))])
     }
 
-    async fn get_file(&self, params: &Value) -> Value {
+    async fn get_file(&self, peer: &PeerAddr, params: &Value) -> Value {
         let site = vget_str(params, "site").unwrap_or_default();
         let inner_path = vget_str(params, "inner_path").unwrap_or_default();
         let location = vget_i64(params, "location").unwrap_or(0).max(0) as u64;
@@ -53,7 +53,11 @@ impl FileService {
 
         match self.state.serve_file_chunk(&site, &inner_path, location, read_bytes).await {
             Some((chunk, total)) => {
-                let next = location + chunk.len() as u64;
+                let sent = chunk.len() as u64;
+                let next = location + sent;
+                // Account for what we serve to peers so the Stats seeding graph
+                // (file_bytes_sent) reflects upload traffic, not just downloads.
+                self.state.record_transfer(&site, peer, 0, sent).await;
                 vmap(vec![
                     ("body", Value::Binary(chunk)),
                     ("size", Value::from(total as i64)),
@@ -403,7 +407,7 @@ impl RequestHandler for FileService {
     async fn handle(&self, peer: &PeerAddr, cmd: &str, params: &Value) -> Value {
         match cmd {
             "ping" => vmap(vec![("body", Value::Binary(b"Pong!".to_vec()))]),
-            "getFile" | "streamFile" => self.get_file(params).await,
+            "getFile" | "streamFile" => self.get_file(peer, params).await,
             "update" => self.update(peer, params).await,
             "pex" => self.pex(peer, params).await,
             "announce" => self.announce(peer, params).await,
@@ -623,7 +627,7 @@ mod tests {
         state
             .add_xite("1Seed", XiteEntry { storage, content: Some(json!({ "address": "1Seed" })) })
             .await;
-        let svc = FileService::new(state);
+        let svc = FileService::new(state.clone());
         let peer = PeerAddr::parse("1.2.3.4:1").unwrap();
 
         // ping
@@ -658,6 +662,10 @@ mod tests {
         ]);
         let resp = svc.handle(&peer, "getFile", &params).await;
         assert!(vget(&resp, "error").is_some());
+
+        // Served bytes are accounted as sent (feeds the Stats seeding graph):
+        // 19 for the whole file + 7 for the range, nothing for the miss.
+        assert_eq!(state.transfer("1Seed").await.1, 26);
     }
 
     /// Build a signed content.json for `address` at version `modified`.
