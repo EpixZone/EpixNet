@@ -288,10 +288,15 @@ async fn announce_loop(
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await; // consume the immediate first tick
+    // Re-announce early when the tracker set changes (Beacon loading its book
+    // or a xite list right after boot) - otherwise fresh announcers would sit
+    // unused until the next 20-minute pass.
+    let trackers_changed = state.trackers_changed();
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
             _ = tick.tick() => announce().await,
+            _ = trackers_changed.notified() => announce().await,
         }
     }
 }
