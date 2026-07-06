@@ -304,6 +304,21 @@ impl RequestHandler for FileService {
             "pex" => self.pex(peer, params).await,
             "listModified" => self.list_modified(params).await,
             "checkport" => self.checkport(peer, params).await,
+            // AnnounceShare/Beacon: peers exchange their working announcer
+            // lists (`epix://host:port` strings), so the tracker set spreads
+            // through the network itself.
+            "getTrackers" => {
+                let mut trackers: Vec<Value> = Vec::new();
+                for t in self.state.shared_trackers().await.into_iter()
+                    .chain(self.state.extra_trackers().await)
+                {
+                    let s = format!("epix://{t}");
+                    if !trackers.iter().any(|v| v.as_str() == Some(&s)) {
+                        trackers.push(Value::from(s));
+                    }
+                }
+                vmap(vec![("trackers", Value::Array(trackers))])
+            }
             "getHashfield" => self.get_hashfield(params).await,
             "setHashfield" => self.set_hashfield(peer, params).await,
             "findHashIds" => self.find_hash_ids(params).await,

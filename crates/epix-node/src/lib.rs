@@ -1216,11 +1216,13 @@ async fn serve(
     // Plugins + media.
     let mut plugins = epix_plugin::PluginRegistry::new();
     plugins.register(Arc::new(epix_plugins::SidebarPlugin));
+    plugins.register(Arc::new(epix_plugins::BeaconPlugin));
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
     plugin_names.sort();
     plugin_names.dedup();
     state.set_plugins(plugin_names).await;
+    plugins.start_all(&state);
 
     let bind: std::net::SocketAddr = opts
         .ui_addr

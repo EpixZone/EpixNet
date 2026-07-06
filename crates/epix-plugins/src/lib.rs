@@ -5,6 +5,8 @@
 //! [`epix_plugin::PluginRegistry`] and the UI server picks up their commands and
 //! media automatically.
 
+pub mod beacon;
 pub mod sidebar;
 
+pub use beacon::BeaconPlugin;
 pub use sidebar::SidebarPlugin;
