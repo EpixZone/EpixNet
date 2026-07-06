@@ -62,7 +62,8 @@ impl Peer {
         match &self.addr {
             PeerAddr::Ip(sa) => sa.port() != 0,
             PeerAddr::Onion { port, .. } => *port != 0,
-            PeerAddr::Rns(_) => true,
+            // I2P is addressed by destination, not port - always dialable.
+            PeerAddr::I2p { .. } | PeerAddr::Rns(_) => true,
         }
     }
 
