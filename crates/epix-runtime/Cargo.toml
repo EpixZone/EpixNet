@@ -15,8 +15,10 @@ epix-dht = { path = "../epix-dht" }
 epix-dht-net = { path = "../epix-dht-net" }
 epix-propagation = { path = "../epix-propagation" }
 epix-tor = { path = "../epix-tor", optional = true }
+epix-i2p = { path = "../epix-i2p", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 async-trait = "0.1"
+serde_json = "1"
 rmpv = "1"
 socket2 = "0.5"
 igd-next = { version = "0.16", features = ["aio_tokio"], optional = true }
@@ -32,6 +34,9 @@ inbound-seeding = ["dep:igd-next"]
 # In-process Tor (Arti): dial .onion peers, host an onion service for inbound,
 # and a local SOCKS listener for the browser shells. On all platforms.
 tor = ["dep:epix-tor"]
+# In-process I2P (emissary embedded router or an external one): dial + host
+# .b32.i2p peers, backgrounded so clearnet works while it boots.
+i2p = ["dep:epix-i2p"]
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }

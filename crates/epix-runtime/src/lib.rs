@@ -50,6 +50,12 @@ pub struct RuntimeConfig {
     /// via Tor). `None` disables the listener. Ignored without `tor`.
     #[cfg(feature = "tor")]
     pub tor_socks_port: Option<u16>,
+    /// I2P mode (`disable`/`embedded`/`external`). Ignored without `i2p`.
+    #[cfg(feature = "i2p")]
+    pub i2p_mode: String,
+    /// External I2P router's SAM TCP port (only used in `external` mode).
+    #[cfg(feature = "i2p")]
+    pub i2p_sam_port: u16,
 }
 
 impl Default for RuntimeConfig {
@@ -65,6 +71,10 @@ impl Default for RuntimeConfig {
             tor_mode: epix_tor::TorMode::default(),
             #[cfg(feature = "tor")]
             tor_socks_port: None,
+            #[cfg(feature = "i2p")]
+            i2p_mode: "disable".to_string(),
+            #[cfg(feature = "i2p")]
+            i2p_sam_port: 7656,
         }
     }
 }
@@ -83,9 +93,9 @@ pub struct NodeRuntime {
     /// Store-and-forward propagation store peers announce updates into (served
     /// by the propagation handler so offline peers can catch up later).
     prop_store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
-    /// Data root for Tor state/cache (`<root>/tor/...`). Set via
-    /// [`NodeRuntime::with_data_dir`] before `start()` to enable Tor.
-    #[cfg(feature = "tor")]
+    /// Data root for Tor/I2P state (`<root>/tor`, `<root>/i2p`). Set via
+    /// [`NodeRuntime::with_data_dir`] before `start()`.
+    #[cfg(any(feature = "tor", feature = "i2p"))]
     data_dir: Option<std::path::PathBuf>,
 }
 
@@ -116,14 +126,13 @@ impl NodeRuntime {
             handles: Vec::new(),
             dht,
             prop_store,
-            #[cfg(feature = "tor")]
+            #[cfg(any(feature = "tor", feature = "i2p"))]
             data_dir: None,
         }
     }
 
-    /// Set the data root Tor keeps its state + directory cache under. Required
-    /// for the `tor` feature to actually bootstrap a client.
-    #[cfg(feature = "tor")]
+    /// Set the data root Tor/I2P keep their state under.
+    #[cfg(any(feature = "tor", feature = "i2p"))]
     pub fn with_data_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.data_dir = Some(dir.into());
         self
@@ -193,6 +202,24 @@ impl NodeRuntime {
                 port,
                 self.shutdown.clone(),
             )));
+        }
+        // In-process I2P: bring up the router (embedded or external) on its own
+        // task so clearnet keeps working while it reseeds/builds tunnels, layer
+        // .b32.i2p dialing onto the transport, feed inbound I2P streams to the
+        // node handler, and poll live status for the Stats page.
+        #[cfg(feature = "i2p")]
+        if epix_i2p::I2pMode::parse(&self.config.i2p_mode) != epix_i2p::I2pMode::Disable {
+            if let Some(dir) = self.data_dir.clone() {
+                self.handles.push(tokio::spawn(i2p_loop(
+                    self.state.clone(),
+                    self.node_handler(),
+                    dir.join("i2p"),
+                    self.config.i2p_mode.clone(),
+                    self.config.i2p_sam_port,
+                    self.config.fileserver_port,
+                    self.shutdown.clone(),
+                )));
+            }
         }
         // In-process Tor: bootstrap Arti, set the peer transport (onion dials,
         // or all traffic in Always mode), host an onion service that feeds the
@@ -654,6 +681,75 @@ async fn tor_loop(
 
     shutdown.notified().await;
     state.set_tor_status(false, "Disabled").await;
+}
+
+/// Bring up I2P and run its surfaces until shutdown, none of it on the startup
+/// path: the embedded (or external) router boots on its own task, `.b32.i2p`
+/// dialing is layered onto the peer transport, inbound I2P streams feed the
+/// same node handler as the TCP/onion loops, and the live status is polled into
+/// the app state for the Stats page. The node keeps working over clearnet/Tor
+/// throughout the (minutes-long) embedded bootstrap.
+#[cfg(feature = "i2p")]
+async fn i2p_loop(
+    state: Arc<AppState>,
+    handler: Arc<handler::NodeHandler>,
+    data_dir: std::path::PathBuf,
+    mode: String,
+    sam_port: u16,
+    fileserver_port: Option<u16>,
+    shutdown: Arc<Notify>,
+) {
+    use epix_protocol::RequestHandler;
+    let config = epix_i2p::I2pConfig {
+        mode: epix_i2p::I2pMode::parse(&mode),
+        sam_tcp_port: sam_port,
+        data_dir,
+    };
+    state.log("INFO", format!("I2P: starting ({mode} router) in the background")).await;
+    let (i2p, mut inbound) = epix_i2p::I2p::spawn(config);
+
+    // Layer .b32.i2p dialing onto the transport (composed with TCP/Tor).
+    state.set_i2p_transport(Arc::new(i2p.transport())).await;
+
+    // Feed inbound I2P peer streams to the same handler the TCP listener uses.
+    if fileserver_port.is_some() {
+        let handler = handler.clone();
+        let (version, rev) = epix_protocol::PeerServer::new(handler.clone()).banner();
+        tokio::spawn(async move {
+            while let Some(stream) = inbound.recv().await {
+                let handler = handler.clone() as Arc<dyn RequestHandler>;
+                let version = version.clone();
+                // Inbound I2P peers have no dial-back IP (they're reached by
+                // destination); use an empty i2p addr like the onion path does.
+                let peer = epix_core::PeerAddr::I2p { dest: String::new(), port: 0 };
+                tokio::spawn(async move {
+                    epix_protocol::serve_stream(handler, peer, stream, &version, rev).await;
+                });
+            }
+        });
+    }
+
+    // Poll live status (phase, peers, tunnels, destination) into the app state
+    // for the Stats page until shutdown.
+    loop {
+        let s = i2p.status().await;
+        state
+            .set_i2p_status(serde_json::json!({
+                "mode": s.mode.as_str(),
+                "phase": s.phase.label(),
+                "destination": s.destination,
+                "sam_port": s.sam_port,
+                "reseed_routers": s.reseed_routers,
+                "connected_routers": s.connected_routers,
+                "tunnels_built": s.tunnels_built,
+                "tunnel_failures": s.tunnel_failures,
+            }))
+            .await;
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+    }
 }
 
 /// Keep the fileserver `port` mapped through the home router with UPnP so peers

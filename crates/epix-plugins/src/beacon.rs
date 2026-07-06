@@ -76,7 +76,19 @@ async fn run_cycle(state: &Arc<AppState>, book: &mut TrackerBook, path: &PathBuf
         }
     }
 
-    let live = book.addresses();
+    // I2P trackers (`.b32.i2p`) are only reachable when I2P is enabled; drop
+    // them from the announce set otherwise so they don't pile up as failures.
+    let i2p_enabled = state
+        .config_get("i2p")
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))
+        .map(|m| m != "disable" && !m.is_empty())
+        .unwrap_or(false);
+    let live: Vec<PeerAddr> = book
+        .addresses()
+        .into_iter()
+        .filter(|a| i2p_enabled || !matches!(a, PeerAddr::I2p { .. }))
+        .collect();
     let prev = state.extra_trackers().await;
     if live != prev {
         state
@@ -151,9 +163,11 @@ fn parse_tracker_line(line: &str) -> Option<PeerAddr> {
     let s = line.trim();
     let s = s.strip_prefix("epix://").unwrap_or(s);
     let s = s.replace(' ', "");
-    if s.is_empty() || s.contains(".i2p") {
+    if s.is_empty() {
         return None;
     }
+    // i2p is kept (parsed into PeerAddr::I2p); whether it's announced to is
+    // gated on the I2P config at announce-set build time (run_cycle).
     let addr = if let Ok(addr) = PeerAddr::parse(&s) {
         addr
     } else {
@@ -380,15 +394,19 @@ mod tests {
             ),
             Some(PeerAddr::Onion { port: 15441, .. })
         ));
-        // Overlay addresses we have no transport for are skipped: Yggdrasil
-        // (0200::/7, bracketed and bare forms), Lokinet (fd00::/8), i2p.
+        // Yggdrasil (0200::/7, bracketed and bare) and Lokinet (fd00::/8) have
+        // no transport - always skipped.
         assert!(parse_tracker_line("epix://[201:57:d3b2:6291:174e:5643:413c:6c51]:15441").is_none());
         assert!(parse_tracker_line("epix://202:7d01:9137:6c29:afea:ce96:300e:336e:15441").is_none());
         assert!(parse_tracker_line("epix://[fd00::1]:15441").is_none());
-        assert!(parse_tracker_line(
-            "epix://gv54ndn4fbtj3ermicvbapilptjmts3qosf7xmxuorybsvz7bbva.i2p :15441"
-        )
-        .is_none());
+        // i2p now parses (we have an I2P transport); whether it's announced to
+        // is gated on the I2P config at announce time, not here.
+        assert!(matches!(
+            parse_tracker_line(
+                "epix://gv54ndn4fbtj3ermicvbapilptjmts3qosf7xmxuorybsvz7bbva.i2p :15441"
+            ),
+            Some(PeerAddr::I2p { .. })
+        ));
         assert!(parse_tracker_line("").is_none());
     }
 }

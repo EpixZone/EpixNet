@@ -3,8 +3,9 @@
 //! Mirrors what `emissary-cli` does to stand up a working router: open storage,
 //! reseed if the netdb is thin, build a [`Config`] with a SAMv3 server on an
 //! OS-assigned port, construct the [`Router`] (a `Future`), and drive it on the
-//! node's Tokio runtime. We then hand the discovered SAM port back so the
-//! [`yosemite`] client can connect.
+//! node's Tokio runtime. We hand the discovered SAM port back for the
+//! [`yosemite`] client, and poll the router's event stream to keep the shared
+//! [`crate::I2pStatus`] (peers, tunnels) fresh for the UI.
 //!
 //! Without the `embedded` feature this compiles to a stub whose `start` errors,
 //! so a build can ship External-only.
@@ -17,12 +18,13 @@ pub use stub::EmbeddedRouter;
 
 #[cfg(not(feature = "embedded"))]
 mod stub {
+    use crate::SharedStatus;
     use epix_core::{Error, Result};
 
     pub struct EmbeddedRouter;
 
     impl EmbeddedRouter {
-        pub async fn start(_data_dir: &std::path::Path) -> Result<Self> {
+        pub async fn start(_data_dir: &std::path::Path, _status: SharedStatus) -> Result<Self> {
             Err(Error::Protocol(
                 "embedded I2P router not built in; use External mode with a running router".into(),
             ))
@@ -35,7 +37,8 @@ mod stub {
 
 #[cfg(feature = "embedded")]
 mod imp {
-    use emissary_core::{router::Router, Config, Ntcp2Config, SamConfig, Ssu2Config};
+    use crate::SharedStatus;
+    use emissary_core::{events::Event, router::Router, Config, Ntcp2Config, SamConfig, Ssu2Config};
     use emissary_util::{reseeder::Reseeder, runtime::tokio::Runtime, storage::Storage};
     use epix_core::{Error, Result};
     use std::sync::Arc;
@@ -46,11 +49,12 @@ mod imp {
     /// A running embedded emissary router. Dropping it stops the router task.
     pub struct EmbeddedRouter {
         sam_port: u16,
-        _task: tokio::task::JoinHandle<()>,
+        _router_task: tokio::task::JoinHandle<()>,
+        _stats_task: tokio::task::JoinHandle<()>,
     }
 
     impl EmbeddedRouter {
-        pub async fn start(data_dir: &std::path::Path) -> Result<Self> {
+        pub async fn start(data_dir: &std::path::Path, status: SharedStatus) -> Result<Self> {
             let _ = std::fs::create_dir_all(data_dir);
             let base = data_dir.to_path_buf();
 
@@ -70,8 +74,7 @@ mod imp {
             fill_random(&mut ssu2_static);
 
             let mut config = Config {
-                // I2P main network.
-                net_id: Some(2),
+                net_id: Some(2), // I2P main network.
                 ntcp2: Some(Ntcp2Config {
                     ipv4: true,
                     ipv4_host: None,
@@ -117,11 +120,8 @@ mod imp {
                                 .await;
                             config.routers.push(info.router_info);
                         }
-                        tracing::info!(
-                            target: "epix::i2p",
-                            "i2p reseeded: {} routers",
-                            config.routers.len()
-                        );
+                        status.write().await.reseed_routers = config.routers.len();
+                        tracing::info!(target: "epix::i2p", "i2p reseeded: {} routers", config.routers.len());
                     }
                     Err(e) if config.routers.is_empty() => {
                         return Err(Error::Protocol(format!("i2p reseed failed: {e}")));
@@ -130,15 +130,17 @@ mod imp {
                         tracing::warn!(target: "epix::i2p", "i2p reseed failed, using cached netdb: {e}");
                     }
                 }
+            } else {
+                status.write().await.reseed_routers = config.routers.len();
             }
 
-            let (router, _events, _local_info) =
+            let (router, events, _local_info) =
                 Router::<Runtime>::new(config, None, Some(Arc::new(storage)))
                     .await
                     .map_err(|e| Error::Protocol(format!("i2p router: {e}")))?;
 
-            // The SAM server binds when the router starts; its actual address
-            // is known now (we asked for port 0).
+            // The SAM server binds when the router starts; we asked for port 0,
+            // so its actual address is known now.
             let sam_port = router
                 .protocol_address_info()
                 .sam_tcp
@@ -146,12 +148,14 @@ mod imp {
                 .ok_or_else(|| Error::Protocol("i2p router did not expose a SAM port".into()))?;
 
             // Drive the router future for the process lifetime.
-            let task = tokio::spawn(async move {
+            let router_task = tokio::spawn(async move {
                 router.await;
             });
+            // Poll router status into the shared UI status.
+            let stats_task = tokio::spawn(poll_stats(events, status));
 
             tracing::info!(target: "epix::i2p", "embedded i2p router up, SAM on 127.0.0.1:{sam_port}");
-            Ok(Self { sam_port, _task: task })
+            Ok(Self { sam_port, _router_task: router_task, _stats_task: stats_task })
         }
 
         pub fn sam_port(&self) -> u16 {
@@ -159,7 +163,23 @@ mod imp {
         }
     }
 
-    /// Fill `buf` with OS randomness (avoids pulling a rand dep for 16 bytes).
+    /// Poll the router's event stream and fold its live counts (connected
+    /// routers = I2P peers, tunnels built/failed) into the shared status.
+    async fn poll_stats(mut events: emissary_core::events::EventSubscriber, status: SharedStatus) {
+        loop {
+            while let Some(event) = events.router_status() {
+                if let Event::RouterStatus { transport, tunnel, .. } = event {
+                    let mut s = status.write().await;
+                    s.connected_routers = transport.num_connected_routers;
+                    s.tunnels_built = tunnel.num_tunnels_built;
+                    s.tunnel_failures = tunnel.num_tunnel_build_failures;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    /// Fill `buf` with OS randomness (avoids a rand dep for a few keys).
     fn fill_random(buf: &mut [u8]) {
         use std::hash::{BuildHasher, Hasher, RandomState};
         let mut i = 0;
