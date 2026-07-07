@@ -169,6 +169,9 @@ async fn main() {
     // Install the Epix Wallet extension (wallet + clearnet-block + Tor/I2P
     // panel) and its native host.
     if ext_capable {
+        // Existing profiles: drop the retired browser-ext and give the wallet
+        // its toolbar slot.
+        ext::migrate_legacy_extension(&profile);
         if let Err(e) = ext::install_extension(&profile) {
             eprintln!("· note: could not install the wallet extension: {e}");
         }

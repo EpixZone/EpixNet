@@ -22,6 +22,10 @@ use std::path::{Path, PathBuf};
 /// The wallet extension files, embedded at build time.
 static EXT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/wallet-ext");
 
+/// The retired standalone extension's id (pre-wallet); cleaned out of existing
+/// profiles by [`migrate_legacy_extension`].
+pub const LEGACY_EXT_ID: &str = "browser-ext@epix.zone";
+
 /// The starter chrome theme, embedded at build time.
 static THEME: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-theme");
 
@@ -29,6 +33,36 @@ static THEME: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-t
 pub const EXT_ID: &str = "wallet@epix.zone";
 /// The native-messaging host name (must match the wallet's native bridge).
 pub const NMH_NAME: &str = "zone.epix.nmh";
+
+/// Migrate a profile off the retired standalone `browser-ext`: delete its
+/// stale XPI (Firefox removes the add-on when the file is gone) and hand its
+/// toolbar slot to the wallet. Firefox pins the widget placement in prefs.js's
+/// `browser.uiCustomization.state`; new extensions start unpinned behind the
+/// puzzle-piece menu, so without this the old Tor icon stays in the toolbar
+/// and the wallet is invisible. Must run before Firefox launches (it rewrites
+/// prefs.js on exit).
+pub fn migrate_legacy_extension(profile: &Path) {
+    let _ = std::fs::remove_file(
+        profile.join("extensions").join(format!("{LEGACY_EXT_ID}.xpi")),
+    );
+    let prefs = profile.join("prefs.js");
+    let Ok(s) = std::fs::read_to_string(&prefs) else { return };
+    // Widget ids are the extension id with `@`/`.` mapped to `_`, plus
+    // "-browser-action", JSON-escaped inside the pref's JS string.
+    let old_widget = "browser-ext_epix_zone-browser-action";
+    let new_widget = "wallet_epix_zone-browser-action";
+    if !s.contains(old_widget) {
+        return;
+    }
+    // Drop any existing (unpinned) wallet placement so the rename below
+    // doesn't duplicate it, then give the wallet the old icon's slot.
+    let out = s
+        .replace(&format!("\\\"{new_widget}\\\","), "")
+        .replace(&format!(",\\\"{new_widget}\\\""), "")
+        .replace(&format!("\\\"{new_widget}\\\""), "")
+        .replace(old_widget, new_widget);
+    let _ = std::fs::write(&prefs, out);
+}
 
 /// Write the extension as an XPI into the profile's `extensions/` dir. Firefox
 /// installs it on startup (with the unsigned-extensions pref, on ESR/Developer).
