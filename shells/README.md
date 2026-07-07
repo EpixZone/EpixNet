@@ -156,7 +156,9 @@ cargo build -p epix-ffi --release --no-default-features --features tor,i2p-embed
 cargo run -p epix-ffi --features cli --bin uniffi-bindgen -- generate \
     --library target/aarch64-apple-ios/release/libepix_ffi.a \
     --language swift --out-dir ios/EpixBrowser/Generated
-# 3. Open the Xcode project, link libepix_ffi.a + the generated module, run.
+# 3. Open the Xcode project, link libepix_ffi.a + the generated module, and add
+#    ios/EpixBrowser/epix-icon.png as a bundle resource (the Epix button's
+#    logo; the app falls back to a system glyph without it). Run.
 ```
 
 `AppDelegate` boots the node and loads the local URL in a WKWebView. `epix://`

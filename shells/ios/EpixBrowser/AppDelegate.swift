@@ -90,11 +90,22 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate {
         field.translatesAutoresizingMaskIntoConstraints = false
         self.addressBar = field
 
-        // The Epix button (Brave-style): the diamond with the Tor state as a
-        // badge; tapping opens the Epix panel.
-        let button = UIButton(type: .system)
-        button.setImage(UIImage(systemName: "diamond.fill"), for: .normal)
-        button.tintColor = Self.torReady
+        // The Epix button (Brave-style): the logo with the Tor state as a
+        // badge; tapping opens the Epix panel. The logo ships as epix-icon.png
+        // in the bundle (the same asset the Android shell uses), with the
+        // system diamond as a fallback if the resource wasn't packaged.
+        let button = UIButton(type: .custom)
+        if let path = Bundle.main.path(forResource: "epix-icon", ofType: "png"),
+            let logo = UIImage(contentsOfFile: path) {
+            let size = CGSize(width: 36, height: 36)
+            let scaled = UIGraphicsImageRenderer(size: size).image { _ in
+                logo.draw(in: CGRect(origin: .zero, size: size))
+            }
+            button.setImage(scaled.withRenderingMode(.alwaysOriginal), for: .normal)
+        } else {
+            button.setImage(UIImage(systemName: "diamond.fill"), for: .normal)
+            button.tintColor = Self.torReady
+        }
         button.accessibilityLabel = "Epix panel"
         button.addTarget(self, action: #selector(showEpixPanel), for: .touchUpInside)
         button.translatesAutoresizingMaskIntoConstraints = false
