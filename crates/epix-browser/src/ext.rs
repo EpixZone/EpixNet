@@ -66,18 +66,66 @@ pub fn migrate_legacy_extension(profile: &Path) {
 
 /// Write the extension as an XPI into the profile's `extensions/` dir. Firefox
 /// installs it on startup (with the unsigned-extensions pref, on ESR/Developer).
+///
+/// The `manifest.json` version is stamped with a short hash of the whole
+/// embedded extension, so it changes exactly when the wallet build changes.
+/// Firefox reloads an add-on only when its version changes (a same-version XPI,
+/// even rewritten, keeps serving cached bytecode) - stamping guarantees a fresh
+/// build is actually picked up, without reinstalling on every unchanged launch.
 pub fn install_extension(profile: &Path) -> Result<(), String> {
     let ext_dir = profile.join("extensions");
     std::fs::create_dir_all(&ext_dir).map_err(|e| format!("extensions dir: {e}"))?;
     let xpi_path = ext_dir.join(format!("{EXT_ID}.xpi"));
 
+    let salt = ext_content_hash(&EXT);
     let file = std::fs::File::create(&xpi_path).map_err(|e| format!("create xpi: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
     let opts: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    write_dir_to_zip(&mut zip, &EXT, "", &opts)?;
+    write_dir_to_zip(&mut zip, &EXT, "", &opts, salt)?;
     zip.finish().map_err(|e| format!("finish xpi: {e}"))?;
     Ok(())
+}
+
+/// A stable short hash of every embedded extension file (path + contents), used
+/// as a build-identifying version salt.
+fn ext_content_hash(dir: &Dir) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    fn walk(dir: &Dir, h: &mut impl Hasher) {
+        for file in dir.files() {
+            file.path().to_string_lossy().hash(h);
+            file.contents().hash(h);
+        }
+        for sub in dir.dirs() {
+            walk(sub, h);
+        }
+    }
+    walk(dir, &mut h);
+    // Keep it in a range Firefox accepts as a version component.
+    (h.finish() % 1_000_000) as u32
+}
+
+/// Rewrite `manifest.json`'s `"version": "X.Y.Z"` to `"X.Y.Z.<salt>"` so the
+/// add-on version tracks the build.
+fn stamp_manifest_version(contents: &[u8], salt: u32) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(contents) else { return contents.to_vec() };
+    let needle = "\"version\":";
+    let Some(vpos) = text.find(needle) else { return contents.to_vec() };
+    let after = &text[vpos + needle.len()..];
+    // Find the value string: first quote, then the closing quote.
+    let Some(q1) = after.find('"') else { return contents.to_vec() };
+    let rest = &after[q1 + 1..];
+    let Some(q2) = rest.find('"') else { return contents.to_vec() };
+    let version = &rest[..q2];
+    let stamped = format!("{version}.{salt}");
+    let start = vpos + needle.len() + q1 + 1;
+    let end = start + q2;
+    let mut out = String::with_capacity(text.len() + 8);
+    out.push_str(&text[..start]);
+    out.push_str(&stamped);
+    out.push_str(&text[end..]);
+    out.into_bytes()
 }
 
 fn write_dir_to_zip(
@@ -85,17 +133,24 @@ fn write_dir_to_zip(
     dir: &Dir,
     prefix: &str,
     opts: &zip::write::FileOptions<'_, ()>,
+    salt: u32,
 ) -> Result<(), String> {
     for file in dir.files() {
         let name = file.path().file_name().unwrap().to_string_lossy();
         let entry = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
         zip.start_file(&entry, *opts).map_err(|e| format!("zip entry {entry}: {e}"))?;
-        zip.write_all(file.contents()).map_err(|e| format!("zip write {entry}: {e}"))?;
+        // Stamp only the root manifest so the add-on version tracks the build.
+        if entry == "manifest.json" {
+            let stamped = stamp_manifest_version(file.contents(), salt);
+            zip.write_all(&stamped).map_err(|e| format!("zip write {entry}: {e}"))?;
+        } else {
+            zip.write_all(file.contents()).map_err(|e| format!("zip write {entry}: {e}"))?;
+        }
     }
     for sub in dir.dirs() {
         let name = sub.path().file_name().unwrap().to_string_lossy();
         let p = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
-        write_dir_to_zip(zip, sub, &p, opts)?;
+        write_dir_to_zip(zip, sub, &p, opts, salt)?;
     }
     Ok(())
 }

@@ -265,10 +265,14 @@ async fn health() -> &'static str {
 async fn serve_status(State(ctx): State<Ctx>) -> Response {
     let (tor_enabled, tor_status) = ctx.state.tor_status().await;
     let onion = ctx.state.onion_address().await;
-    // I2P: the runtime keeps a status object (phase, b32, tunnels, ...); surface
-    // a concise view. `i2p_enabled` is true once the router has an address.
+    // I2P: the runtime keeps a status object (mode, phase, b32, tunnels, ...);
+    // surface a concise view. `i2p_status` is the phase label ("Off",
+    // "Starting…", "Ready", "Failed: …"), `i2p_mode` is
+    // disable/embedded/external, and `i2p_enabled` is true once the router has
+    // published our address (fully ready).
     let i2p = ctx.state.i2p_status().await;
-    let i2p_phase = i2p.get("phase").and_then(|v| v.as_str()).unwrap_or("Disabled").to_string();
+    let i2p_phase = i2p.get("phase").and_then(|v| v.as_str()).unwrap_or("Off").to_string();
+    let i2p_mode = i2p.get("mode").and_then(|v| v.as_str()).unwrap_or("disable").to_string();
     let i2p_address = ctx.state.i2p_address().await;
     let body = json!({
         "serving": true,
@@ -277,6 +281,7 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
         "onion_address": onion,
         "i2p_enabled": i2p_address.is_some(),
         "i2p_status": i2p_phase,
+        "i2p_mode": i2p_mode,
         "i2p_address": i2p_address,
     });
     (
