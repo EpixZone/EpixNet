@@ -1,12 +1,17 @@
 package zone.epix.app
 
+import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
 import android.widget.FrameLayout
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.mozilla.geckoview.GeckoRuntime
@@ -16,6 +21,7 @@ import org.mozilla.geckoview.GeckoView
 import uniffi.epix_ffi.EpixNode
 import uniffi.epix_ffi.NodeConfig
 import uniffi.epix_ffi.NodeState
+import uniffi.epix_ffi.TorStatus
 
 /**
  * The Android shell: a GeckoView browser over the embedded Epix node.
@@ -27,11 +33,16 @@ import uniffi.epix_ffi.NodeState
  * (installBuiltIn + webRequest) - the GeckoView way, since it has no
  * shouldInterceptRequest. That extension is a follow-up; this scaffold wires the
  * core + a working browser surface first.
+ *
+ * A small floating dot mirrors the desktop extension's Tor toolbar icon
+ * (gray off, amber connecting, purple ready, green when all traffic routes
+ * through Tor); tapping it shows the status and our onion address.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var geckoView: GeckoView
     private lateinit var session: GeckoSession
+    private lateinit var torDot: GradientDrawable
     private val node = EpixNode()
     private val scope = CoroutineScope(Dispatchers.Main)
 
@@ -39,7 +50,25 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         geckoView = GeckoView(this)
-        setContentView(geckoView, FrameLayout.LayoutParams(-1, -1))
+        val root = FrameLayout(this)
+        root.addView(geckoView, FrameLayout.LayoutParams(-1, -1))
+
+        // The Tor status dot: a 44dp touch target holding a 14dp circle,
+        // floating over the page like the desktop extension's toolbar icon.
+        torDot = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(COLOR_OFF)
+        }
+        val dot = View(this).apply { background = torDot }
+        val touch = FrameLayout(this).apply {
+            contentDescription = "Tor status"
+            setOnClickListener { showTorStatus() }
+            addView(dot, FrameLayout.LayoutParams(dp(14), dp(14), Gravity.CENTER))
+        }
+        val lp = FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.END)
+        lp.topMargin = dp(28)
+        root.addView(touch, lp)
+        setContentView(root)
 
         val runtime = GeckoRuntime.getDefault(this)
         session = GeckoSession().apply { open(runtime) }
@@ -54,6 +83,14 @@ class MainActivity : AppCompatActivity() {
                 session.loadUri("http://127.0.0.1:43110/$display/")
             } else {
                 session.loadUri("about:blank") // TODO: show a boot-error page
+            }
+        }
+
+        // Reflect the Tor state in the dot, at the extension's cadence.
+        scope.launch {
+            while (true) {
+                torStatus()?.let { torDot.setColor(colorFor(it)) }
+                delay(5_000)
             }
         }
     }
@@ -85,6 +122,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** The node's Tor state, fetched off the main thread (the call blocks). */
+    private suspend fun torStatus(): TorStatus? = withContext(Dispatchers.IO) {
+        runCatching { node.torStatus() }.getOrNull()
+    }
+
+    /** Same color language as the desktop extension's toolbar icon. */
+    private fun colorFor(st: TorStatus): Int = when {
+        st.enabled && st.status == "Always" -> COLOR_ROUTED
+        st.enabled -> COLOR_READY
+        st.status == "Bootstrapping" -> COLOR_BOOT
+        else -> COLOR_OFF
+    }
+
+    /** The extension popup's content: status line + our onion address. */
+    private fun showTorStatus() {
+        scope.launch {
+            val st = torStatus()
+            val onion = withContext(Dispatchers.IO) {
+                runCatching { node.onionAddress() }.getOrNull()
+            }
+            val message = buildString {
+                append(
+                    when {
+                        st == null -> "Tor: unknown"
+                        st.enabled && st.status == "Always" ->
+                            "Tor: on - all traffic routed through Tor"
+                        st.enabled -> "Tor: ready - onion peers reachable"
+                        st.status == "Bootstrapping" -> "Tor: connecting…"
+                        st.status == "Failed" -> "Tor: failed to start"
+                        else -> "Tor: off"
+                    }
+                )
+                if (onion != null) {
+                    append("\n\nYour onion address:\n$onion.onion")
+                }
+            }
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle("Tor")
+                .setMessage(message)
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
     private suspend fun resolveDisplay(target: String): String =
         withContext(Dispatchers.IO) { displayOf(target) }
 
@@ -103,5 +186,11 @@ class MainActivity : AppCompatActivity() {
             // The Rust core (libepix_ffi.so, one per ABI) packaged in jniLibs.
             System.loadLibrary("epix_ffi")
         }
+
+        // The desktop extension's icon colors: off/boot/ready/routed.
+        private val COLOR_OFF = 0xFF64748B.toInt()
+        private val COLOR_BOOT = 0xFFF5C450.toInt()
+        private val COLOR_READY = 0xFFA78BFA.toInt()
+        private val COLOR_ROUTED = 0xFF4ADE80.toInt()
     }
 }

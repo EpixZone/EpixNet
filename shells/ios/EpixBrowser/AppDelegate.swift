@@ -9,6 +9,10 @@ import EpixFFI
 /// UniFFI Swift bindings. We boot the node, then load the local node URL in a
 /// WKWebView.
 ///
+/// A small floating dot mirrors the desktop extension's Tor toolbar icon
+/// (gray off, amber connecting, purple ready, green when all traffic routes
+/// through Tor); tapping it shows the status and our onion address.
+///
 /// KNOWN SPIKE (Phase 8b #1): custom-scheme pages in WKWebView are NOT secure
 /// contexts (no service workers, no crypto.subtle). This scaffold loads the
 /// loopback `http://127.0.0.1` origin directly, which sidesteps the custom
@@ -20,6 +24,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
     let node = EpixNode()
     var webView: WKWebView?
+    var torDot: UIView?
+    var torTimer: Timer?
+
+    // The desktop extension's icon colors: off/boot/ready/routed.
+    static let torOff = UIColor(red: 0x64 / 255.0, green: 0x74 / 255.0, blue: 0x8B / 255.0, alpha: 1)
+    static let torBoot = UIColor(red: 0xF5 / 255.0, green: 0xC4 / 255.0, blue: 0x50 / 255.0, alpha: 1)
+    static let torReady = UIColor(red: 0xA7 / 255.0, green: 0x8B / 255.0, blue: 0xFA / 255.0, alpha: 1)
+    static let torRouted = UIColor(red: 0x4A / 255.0, green: 0xDE / 255.0, blue: 0x80 / 255.0, alpha: 1)
 
     func application(
         _ application: UIApplication,
@@ -27,8 +39,37 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     ) -> Bool {
         let window = UIWindow(frame: UIScreen.main.bounds)
         let controller = UIViewController()
-        let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
-        controller.view = webView
+        let container = UIView(frame: UIScreen.main.bounds)
+        let webView = WKWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(webView)
+
+        // The Tor status dot: a 44pt touch target holding a 14pt circle,
+        // floating over the page like the desktop extension's toolbar icon.
+        let dot = UIView()
+        dot.backgroundColor = Self.torOff
+        dot.layer.cornerRadius = 7
+        dot.isUserInteractionEnabled = false
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        let touch = UIButton(type: .custom)
+        touch.accessibilityLabel = "Tor status"
+        touch.addTarget(self, action: #selector(showTorStatus), for: .touchUpInside)
+        touch.translatesAutoresizingMaskIntoConstraints = false
+        touch.addSubview(dot)
+        container.addSubview(touch)
+        NSLayoutConstraint.activate([
+            touch.widthAnchor.constraint(equalToConstant: 44),
+            touch.heightAnchor.constraint(equalToConstant: 44),
+            touch.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor),
+            touch.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -4),
+            dot.widthAnchor.constraint(equalToConstant: 14),
+            dot.heightAnchor.constraint(equalToConstant: 14),
+            dot.centerXAnchor.constraint(equalTo: touch.centerXAnchor),
+            dot.centerYAnchor.constraint(equalTo: touch.centerYAnchor),
+        ])
+        self.torDot = dot
+
+        controller.view = container
         window.rootViewController = controller
         window.makeKeyAndVisible()
         self.window = window
@@ -37,6 +78,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // The launch URL, if opened via an epix:// link.
         let target = (launchOptions?[.url] as? URL).flatMap(targetFrom) ?? "dashboard.epix"
         bootNode(target: target)
+
+        // Reflect the Tor state in the dot, at the extension's cadence.
+        torTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.pollTor()
+        }
+        pollTor()
         return true
     }
 
@@ -67,6 +114,51 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
                 DispatchQueue.main.async { self.load(display: target) }
             } catch {
                 DispatchQueue.main.async { self.showError("\(error)") }
+            }
+        }
+    }
+
+    /// Same color language as the desktop extension's toolbar icon.
+    private static func colorFor(_ st: TorStatus) -> UIColor {
+        if st.enabled { return st.status == "Always" ? torRouted : torReady }
+        if st.status == "Bootstrapping" { return torBoot }
+        return torOff
+    }
+
+    /// Fetch the Tor state off the main thread (the call blocks) and tint the dot.
+    private func pollTor() {
+        DispatchQueue.global(qos: .utility).async {
+            let st = self.node.torStatus()
+            DispatchQueue.main.async {
+                self.torDot?.backgroundColor = Self.colorFor(st)
+            }
+        }
+    }
+
+    /// The extension popup's content: status line + our onion address.
+    @objc private func showTorStatus() {
+        DispatchQueue.global(qos: .utility).async {
+            let st = self.node.torStatus()
+            let onion = self.node.onionAddress()
+            var message: String
+            if st.enabled {
+                message = st.status == "Always"
+                    ? "Tor: on - all traffic routed through Tor"
+                    : "Tor: ready - onion peers reachable"
+            } else if st.status == "Bootstrapping" {
+                message = "Tor: connecting…"
+            } else if st.status == "Failed" {
+                message = "Tor: failed to start"
+            } else {
+                message = "Tor: off"
+            }
+            if let onion = onion {
+                message += "\n\nYour onion address:\n\(onion).onion"
+            }
+            DispatchQueue.main.async {
+                let alert = UIAlertController(title: "Tor", message: message, preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.window?.rootViewController?.present(alert, animated: true)
             }
         }
     }

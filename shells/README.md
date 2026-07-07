@@ -133,6 +133,12 @@ intent-filter is in `AndroidManifest.xml`. Interception the Tor-Browser-Android
 way (a bundled built-in WebExtension via `installBuiltIn` + `webRequest`) is the
 next step - GeckoView has no `shouldInterceptRequest`.
 
+A floating dot in the top-right corner mirrors the desktop extension's Tor
+toolbar icon (gray off, amber connecting, purple ready, green when all traffic
+routes through Tor). Tapping it shows the status and the node's onion address.
+It polls `torStatus()` / `onionAddress()` on the FFI every 5 seconds, like the
+extension polls the native host. The iOS shell has the same dot.
+
 ### iOS (`ios/`) - Swift + WKWebView
 
 ```
