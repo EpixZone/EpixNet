@@ -918,8 +918,15 @@ struct OnDemand {
 impl epix_ui::OnDemandResolver for OnDemand {
     async fn ensure(&self, host: &str) -> Result<(), String> {
         // Served already? (name -> address via display metadata / resolve cache)
+        // A registered xite whose core files are still missing (an interrupted
+        // clone - the periodic resync only fetches files when a NEWER
+        // content.json shows up, so it never heals one) falls through and
+        // resumes its download. Never for owned sites: their local edits must
+        // not be overwritten with the signed versions from peers.
         let key = self.state.canonical_key(host).await;
-        if self.state.has_xite(&key).await {
+        if self.state.has_xite(&key).await
+            && (self.state.xite_owned(&key).await || self.state.xite_core_complete(&key).await)
+        {
             return Ok(());
         }
         // Coalesce concurrent clones of the same name: the first does the work,
@@ -1010,21 +1017,32 @@ impl OnDemand {
         };
 
         let data_dir = self.data_root.join("data").join(&address);
-        // If we already serve the raw address, just alias the name to it.
-        if !self.state.has_xite(&address).await {
-            // Register the xite empty BEFORE the download (EpixNet's
-            // SiteManager.need): siteInfo/dbQuery/permissions are real for the
-            // page the moment it renders progressively, peers accumulate on
-            // the live entry, and the dashboard shows the row mid-clone.
-            self.state
-                .add_xite(
-                    &address,
-                    XiteEntry { storage: XiteStorage::new(&data_dir), content: None },
-                )
-                .await;
-            if host != address {
-                self.state.set_display(&address, host).await;
+        // Clone when the address isn't served yet, or resume when it is served
+        // but its core files are incomplete (an interrupted earlier clone).
+        // Owned sites never re-clone: local edits stay.
+        let was_registered = self.state.has_xite(&address).await;
+        let resume = was_registered
+            && !self.state.xite_owned(&address).await
+            && !self.state.xite_core_complete(&address).await;
+        if !was_registered || resume {
+            if !was_registered {
+                // Register the xite empty BEFORE the download (EpixNet's
+                // SiteManager.need): siteInfo/dbQuery/permissions are real for the
+                // page the moment it renders progressively, peers accumulate on
+                // the live entry, and the dashboard shows the row mid-clone.
+                self.state
+                    .add_xite(
+                        &address,
+                        XiteEntry { storage: XiteStorage::new(&data_dir), content: None },
+                    )
+                    .await;
+                if host != address {
+                    self.state.set_display(&address, host).await;
+                }
             }
+            // Mark the download in flight: the html serving gate holds the
+            // page document back until the core set is on disk.
+            self.state.begin_clone(&address);
             let cloned = clone_xite_with_progress(
                 &address,
                 &data_dir,
@@ -1033,18 +1051,22 @@ impl OnDemand {
                 Some(&self.state),
             )
             .await;
+            self.state.end_clone(&address);
             let (content, bytes, user_files) = match cloned {
                 Ok(r) => r,
                 Err(e) => {
                     // Tell the loading screen ("index.html download failed",
                     // "No peers found" when none), and unregister the failed
-                    // clone so a revisit starts fresh.
+                    // clone so a revisit starts fresh - unless it was already
+                    // serving (a failed resume keeps what is on disk).
                     self.state.push_clone_event(
                         &address,
                         serde_json::json!(["file_failed", "index.html"]),
                         serde_json::json!({}),
                     );
-                    self.state.remove_xite(&address).await;
+                    if !was_registered {
+                        self.state.remove_xite(&address).await;
+                    }
                     return Err(e);
                 }
             };
