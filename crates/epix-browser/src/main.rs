@@ -378,6 +378,11 @@ fn write_profile(
         "function FindProxyForURL(url, host) {{\n\
          \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {proxy_addr}\"; }}\n\
          \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
+         \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
+         \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\
+         \x20 // refuse Tor exits, so routing chain RPC through Tor would break the\n\
+         \x20 // wallet. Tor-clearnet stays for general browsing.\n\
+         \x20 if (shExpMatch(host, \"*.epix.zone\")) {{ return \"DIRECT\"; }}\n\
          \x20 {clearnet}\n\
          }}\n"
     );
