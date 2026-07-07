@@ -517,12 +517,41 @@ class MainActivity : AppCompatActivity() {
         walletDialog?.dismiss()
         val popupSession = GeckoSession().apply { open(runtime) }
         val view = GeckoView(this).apply { setSession(popupSession) }
-        // The wallet popup lays out at the extension-popup size; give it most
-        // of the screen, dashboard-dark behind it.
-        val height = (resources.displayMetrics.heightPixels * heightFraction).toInt()
-        val holder = FrameLayout(this).apply {
+        // A slim header with an explicit close control: the sheet covers the
+        // browser, and the back gesture / tap-outside affordances are not
+        // discoverable on their own.
+        val closeButton = TextView(this).apply {
+            text = "✕"
+            textSize = 16f
+            setTextColor(COLOR_TEXT)
+            gravity = Gravity.CENTER
+            contentDescription = "Close wallet"
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            setOnClickListener { walletDialog?.dismiss() }
+        }
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(COLOR_CHROME_BG)
-            addView(view, FrameLayout.LayoutParams(-1, height))
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "Epix Wallet"
+                    textSize = 14f
+                    setTextColor(COLOR_TEXT)
+                    setPadding(dp(16), dp(6), 0, dp(6))
+                },
+                LinearLayout.LayoutParams(0, -2, 1f),
+            )
+            addView(closeButton)
+        }
+        // The wallet popup lays out at the extension-popup size; give it most
+        // of the screen (minus the header), dashboard-dark behind it.
+        val height = (resources.displayMetrics.heightPixels * heightFraction).toInt() - dp(40)
+        val holder = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(COLOR_CHROME_BG)
+            addView(header, LinearLayout.LayoutParams(-1, -2))
+            addView(view, LinearLayout.LayoutParams(-1, height))
         }
         popupSession.contentDelegate = object : GeckoSession.ContentDelegate {
             override fun onCloseRequest(session: GeckoSession) {
@@ -545,19 +574,26 @@ class MainActivity : AppCompatActivity() {
                 },
             )
         }
-        walletDialog = AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setView(holder)
-            .setOnDismissListener {
-                walletDialog = null
-                popupSession.close()
-            }
             .create()
-            .also {
-                it.show()
-                // Full width: the wallet pages are laid out for a browser
-                // surface, not a margined dialog.
-                it.window?.setLayout(-1, -2)
+        dialog.setOnDismissListener {
+            popupSession.close()
+            // Only clear the field if it still points at this dialog: when one
+            // popup replaces another (popup -> register tab), dismiss() runs
+            // its listener asynchronously, so this can fire after the
+            // replacement dialog was already stored - clearing it then would
+            // drop the reference to the visible dialog and break its close
+            // button.
+            if (walletDialog === dialog) {
+                walletDialog = null
             }
+        }
+        walletDialog = dialog
+        dialog.show()
+        // Full width: the wallet pages are laid out for a browser surface, not
+        // a margined dialog.
+        dialog.window?.setLayout(-1, -2)
         return popupSession
     }
 
