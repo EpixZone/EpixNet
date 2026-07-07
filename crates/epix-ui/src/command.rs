@@ -1345,12 +1345,24 @@ impl WsCommand for SiteUpdate {
         let state = s.state.clone();
         tokio::spawn(async move {
             state.push_site_info_event(&address, "updating").await;
-            let ok = state.resync_xite(&address).await.is_ok();
-            // Root files alone miss a user_contents site's actual data
-            // (topics and posts live in per-user files) - sync those too,
-            // like the periodic resync cycle does.
-            state.sync_user_content(&address).await;
-            state.push_update_result(&address, ok).await;
+            state.begin_site_update(&address);
+            // Own task so a panic mid-sync still reaches the outcome push
+            // below - without it the row's "Updating..." pill never clears.
+            let joined = tokio::spawn({
+                let state = state.clone();
+                let address = address.clone();
+                async move {
+                    let ok = state.resync_xite(&address).await.is_ok();
+                    // Root files alone miss a user_contents site's actual data
+                    // (topics and posts live in per-user files) - sync those
+                    // too, like the periodic resync cycle does.
+                    state.sync_user_content(&address).await;
+                    ok
+                }
+            })
+            .await;
+            state.end_site_update(&address);
+            state.push_update_result(&address, joined.unwrap_or(false)).await;
         });
         Ok(Value::from("Updated"))
     }

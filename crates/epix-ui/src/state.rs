@@ -342,6 +342,13 @@ pub struct AppState {
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
     updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Xite addresses with an update pass (periodic resync or `siteUpdate`)
+    /// currently running, bracketed by [`Self::begin_site_update`] /
+    /// [`Self::end_site_update`]. A websocket whose event stream lagged
+    /// (dropped events under load) uses this to re-send the closing `updated`
+    /// event for finished sites only - an in-flight site's real outcome event
+    /// is still coming, and a premature one would clear its pill early.
+    site_updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Pending wrapper callbacks (`confirm`/`prompt`): a pushed event's `to` id
     /// maps to the oneshot awaiting the wrapper's `{cmd:"response", to}` reply.
     callbacks: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
@@ -524,7 +531,7 @@ impl AppState {
             optional_limit_path: None,
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
-            events: tokio::sync::broadcast::channel(256).0,
+            events: tokio::sync::broadcast::channel(4096).0,
             config: RwLock::new(serde_json::Map::new()),
             config_path: None,
             plugins: RwLock::new(Vec::new()),
@@ -541,6 +548,7 @@ impl AppState {
             tracker: crate::tracker::TrackerDb::new(),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
@@ -631,7 +639,7 @@ impl AppState {
             optional_limit_path: Some(optional_limit_path),
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
-            events: tokio::sync::broadcast::channel(256).0,
+            events: tokio::sync::broadcast::channel(4096).0,
             config: RwLock::new(config),
             config_path: Some(config_path),
             plugins: RwLock::new(Vec::new()),
@@ -648,6 +656,7 @@ impl AppState {
             i2p_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
@@ -3960,6 +3969,44 @@ impl AppState {
                 m.insert("content_updated".to_string(), json!(false));
             }
             self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
+        }
+    }
+
+    /// Mark an update pass (periodic resync or `siteUpdate`) as running for a
+    /// xite. Pair with [`Self::end_site_update`] before pushing the outcome.
+    pub fn begin_site_update(&self, address: &str) {
+        self.site_updates_in_flight.lock().unwrap().insert(address.to_string());
+    }
+
+    /// The update pass for a xite finished (its outcome event is about to be
+    /// pushed).
+    pub fn end_site_update(&self, address: &str) {
+        self.site_updates_in_flight.lock().unwrap().remove(address);
+    }
+
+    /// Re-send the closing `updated` event, to one connection, for every xite
+    /// with no update pass in flight. Called when that connection's event
+    /// stream reports it dropped events (broadcast lag): the dashboard's
+    /// "Updating..." pill only ever clears on an outcome event, so if the
+    /// dropped window held one the pill would stay up forever. Sites still
+    /// mid-update are skipped - their real outcome event is coming.
+    pub async fn push_missed_update_results(&self, only: u64) {
+        for address in self.xite_addresses().await {
+            if self.site_updates_in_flight.lock().unwrap().contains(&address) {
+                continue;
+            }
+            let mut info = self.site_info(&address).await;
+            if let Value::Object(m) = &mut info {
+                m.insert("event".to_string(), json!(["updated", true]));
+                self.push_event_routed(
+                    "setSiteInfo",
+                    info,
+                    Some("siteChanged"),
+                    Some(address.clone()),
+                    None,
+                    Some(only),
+                );
+            }
         }
     }
 
@@ -7389,6 +7436,46 @@ mod tests {
 
         // An unknown callback id resolves nothing.
         assert!(!s.resolve_callback(999999, json!(true)));
+    }
+
+    #[tokio::test]
+    async fn lag_recovery_resends_closing_updates_for_finished_sites_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        s.add_xite(
+            "epix1done",
+            XiteEntry { storage: XiteStorage::new(dir.path().join("a")), content: None },
+        )
+        .await;
+        s.add_xite(
+            "epix1busy",
+            XiteEntry { storage: XiteStorage::new(dir.path().join("b")), content: None },
+        )
+        .await;
+        s.begin_site_update("epix1busy");
+        let mut events = s.subscribe_events();
+
+        // Only the finished site gets its closing event re-sent, and only to
+        // the asking connection - the busy one's real outcome is still coming.
+        s.push_missed_update_results(7).await;
+        let ev = events.try_recv().unwrap();
+        assert_eq!(ev.only, Some(7));
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "setSiteInfo");
+        assert_eq!(payload["params"]["address"], "epix1done");
+        assert_eq!(payload["params"]["event"][0], "updated");
+        assert!(events.try_recv().is_err(), "no event for the in-flight site");
+
+        // Once its pass ends, a later recovery covers it too.
+        s.end_site_update("epix1busy");
+        s.push_missed_update_results(7).await;
+        let mut addrs = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            let p: Value = serde_json::from_str(&ev.payload).unwrap();
+            addrs.push(p["params"]["address"].as_str().unwrap().to_string());
+        }
+        addrs.sort();
+        assert_eq!(addrs, ["epix1busy", "epix1done"]);
     }
 
     #[tokio::test]

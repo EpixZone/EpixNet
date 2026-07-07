@@ -558,10 +558,33 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
                     // the error pill on failure. The pill only clears on a
                     // matching outcome event, never on a plain refresh.
                     state.push_site_info_event(&address, "updating").await;
-                    let ok = state.resync_xite(&address).await.is_ok();
-                    // New and updated user content (posts, comments) rides the
-                    // same cycle.
-                    state.sync_user_content(&address).await;
+                    state.begin_site_update(&address);
+                    // The pass runs on its own task so a panic in one xite's
+                    // sync can't kill this loop (which would strand the pill
+                    // and end all future resyncs) - it surfaces as a JoinError
+                    // and counts as a failed update.
+                    let joined = tokio::spawn({
+                        let state = state.clone();
+                        let address = address.clone();
+                        async move {
+                            let ok = state.resync_xite(&address).await.is_ok();
+                            // New and updated user content (posts, comments)
+                            // rides the same cycle.
+                            state.sync_user_content(&address).await;
+                            ok
+                        }
+                    })
+                    .await;
+                    state.end_site_update(&address);
+                    let ok = match joined {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            state
+                                .log("ERROR", format!("Resync pass for {address} died: {e}"))
+                                .await;
+                            false
+                        }
+                    };
                     state.push_update_result(&address, ok).await;
                 }
                 // OptionalManager: keep optional files under the size cap.

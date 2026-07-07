@@ -1425,10 +1425,39 @@ async fn ws_upgrade(
     ws.on_upgrade(move |socket| handle_ws(socket, ctx, xite))
 }
 
+/// One item pumped from the shared event broadcast to a connection's queue.
+enum Pumped {
+    Event(state::UiEvent),
+    /// The broadcast wrapped past this connection's cursor and events were
+    /// lost. The forwarder repairs the damage it can: a lost `updated` event
+    /// would strand a site row's "Updating..." pill forever.
+    Lagged,
+}
+
 async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
     use futures_util::{SinkExt, StreamExt};
     let session = std::sync::Arc::new(WsSession::new(ctx.state.clone(), xite));
-    let mut events = ctx.state.subscribe_events();
+    // Don't read the broadcast directly in the select loop below: while
+    // `sink.send` waits on a slow socket (a backgrounded tab that stops
+    // reading), a sync burst - one setSiteInfo per arriving file - wraps the
+    // broadcast's ring buffer and events are dropped, updating/updated pairs
+    // included. A pump task that does nothing but move events into this
+    // connection's own unbounded queue can't fall behind, so nothing is
+    // dropped (EpixNet writes to each websocket's own queue the same way).
+    let mut broadcast_rx = ctx.state.subscribe_events();
+    let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<Pumped>();
+    let pump = tokio::spawn(async move {
+        loop {
+            let item = match broadcast_rx.recv().await {
+                Ok(ev) => Pumped::Event(ev),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Pumped::Lagged,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if event_tx.send(item).is_err() {
+                break; // connection gone
+            }
+        }
+    });
     let (mut sink, mut stream) = socket.split();
     // Replies from concurrently-running command handlers (the sink has one
     // writer: this loop).
@@ -1471,7 +1500,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             // Server -> xite pushed events (setSiteInfo, setAnnouncerInfo, …).
             event = events.recv() => {
                 match event {
-                    Ok(ev) => {
+                    Some(Pumped::Event(ev)) => {
                         // Per-connection routing first: an event caused by this
                         // connection's own command is never echoed back to it
                         // (EpixNet's `ws != self` - the page already knows what
@@ -1514,13 +1543,20 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                             break;
                         }
                     }
-                    // Lagged: dropped some events under load - keep going.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    // Events were dropped before reaching this connection's
+                    // queue. Re-send the closing `updated` event for every
+                    // finished site: if the drop swallowed one, its row's
+                    // "Updating..." pill would never clear (a harmless extra
+                    // "Updated!" flash otherwise).
+                    Some(Pumped::Lagged) => {
+                        ctx.state.push_missed_update_results(session.id).await;
+                    }
+                    None => break, // pump ended (state shutting down)
                 }
             }
         }
     }
+    pump.abort();
 }
 
 /// Whether a session bound to `session_xite` should also receive events
