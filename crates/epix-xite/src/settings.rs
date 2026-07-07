@@ -99,11 +99,15 @@ impl XiteSettings {
         }
     }
 
-    /// Fold in sizes/modified computed from content.json.
+    /// Fold in sizes/modified computed from content.json. `modified` only
+    /// advances (EpixNet semantics): it is the newest `modified` seen across
+    /// EVERY content.json of the site, per-user ones included - a hub whose
+    /// root rarely changes still reads "hours ago" on the dashboard when
+    /// users post. Reloading the (older) root must not walk it back.
     pub fn apply_content_stats(&mut self, stats: &ContentStats) {
         self.size = stats.size;
         self.size_optional = stats.size_optional;
-        self.modified = stats.modified;
+        self.modified = self.modified.max(stats.modified);
     }
 
     /// The effective size limit in bytes: the per-xite override or `default`.

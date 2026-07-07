@@ -1427,8 +1427,24 @@ impl AppState {
                     if saved.added > 0 {
                         x.settings.added = saved.added;
                     }
+                    // add_xite derived modified from the ROOT content.json;
+                    // the saved value also folds in per-user content seen
+                    // last run (user posts), so keep whichever is newest.
+                    x.settings.modified = x.settings.modified.max(saved.modified);
                 }
             }
+            // Per-user content already on disk counts too (sites synced before
+            // settings.modified folded it in would show the root's old date
+            // until the next post arrives): take the newest content.json
+            // anywhere in the tree, once, at restore. New arrivals keep it
+            // fresh incrementally from here.
+            let newest = walk_content_json(&dir)
+                .into_iter()
+                .filter_map(|p| std::fs::read(dir.join(&p)).ok())
+                .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
+                .filter_map(|c| c.get("modified").and_then(|v| v.as_f64()))
+                .fold(0.0_f64, f64::max);
+            self.bump_modified(&canonical, newest).await;
             // The `.epix` name is display metadata, not a second serving key.
             if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
                 if display != canonical {
@@ -4007,6 +4023,21 @@ impl AppState {
         self.clones_in_flight.lock().unwrap().contains(address)
     }
 
+    /// Advance a xite's `settings.modified` (the dashboard's "last updated")
+    /// to `modified` if newer. Far-future timestamps are capped at now + 10
+    /// minutes like EpixNet, so one bogus clock can't pin the display.
+    pub async fn bump_modified(&self, address: &str, modified: f64) {
+        let capped = modified.min(now_secs() as f64 + 600.0);
+        if capped <= 0.0 {
+            return;
+        }
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if capped > x.settings.modified {
+                x.settings.modified = capped;
+            }
+        }
+    }
+
     /// Whether this xite is marked owned (its files are edited locally and
     /// must never be overwritten with the signed versions from peers).
     pub async fn xite_owned(&self, address: &str) -> bool {
@@ -4675,6 +4706,20 @@ impl AppState {
         // no event - nothing changed for the page.
         if self.muted_authors().await.iter().any(|m| inner_path.contains(m.as_str())) {
             return;
+        }
+        // A content.json (a synced per-user file, or one we just signed)
+        // carries a `modified` clock: fold it into settings.modified so the
+        // dashboard's "last updated" reflects user posts, not just the root
+        // (EpixNet advances settings.modified on every content.json load).
+        if inner_path.ends_with("content.json") {
+            let modified = {
+                let xites = self.xites.read().await;
+                xites.get(address).and_then(|x| x.storage.read(inner_path).ok())
+            }
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+            self.bump_modified(address, modified).await;
         }
         // Snapshot the db handle out of the lock; file + SQL work runs unlocked.
         let mut build_first = false;
@@ -7505,6 +7550,47 @@ mod tests {
 
         // An unknown callback id resolves nothing.
         assert!(!s.resolve_callback(999999, json!(true)));
+    }
+
+    #[tokio::test]
+    async fn user_content_advances_the_dashboard_modified_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let s = AppState::new("test");
+        s.add_xite(
+            "epix1x",
+            XiteEntry {
+                storage: storage.clone(),
+                content: Some(json!({ "modified": 1000.0, "files": {} })),
+            },
+        )
+        .await;
+        // The root content.json sets the baseline.
+        assert_eq!(s.site_info("epix1x").await["settings"]["modified"], 1000.0);
+
+        // A per-user content.json lands (someone posted): the clock advances,
+        // so the dashboard row reads "hours ago" instead of the root's date.
+        storage.write("data/users/1A/content.json", br#"{"modified": 2000}"#).unwrap();
+        s.ingest_file("epix1x", "data/users/1A/content.json").await;
+        assert_eq!(s.site_info("epix1x").await["settings"]["modified"], 2000.0);
+
+        // Reloading the (older) root does not walk it back.
+        s.update_content("epix1x", Some(json!({ "modified": 1000.0, "files": {} }))).await;
+        assert_eq!(s.site_info("epix1x").await["settings"]["modified"], 2000.0);
+
+        // A far-future timestamp is capped at now + 10 minutes.
+        let future = now_secs() as f64 + 100_000.0;
+        storage
+            .write(
+                "data/users/1B/content.json",
+                format!("{{\"modified\": {future}}}").as_bytes(),
+            )
+            .unwrap();
+        s.ingest_file("epix1x", "data/users/1B/content.json").await;
+        let capped =
+            s.site_info("epix1x").await["settings"]["modified"].as_f64().unwrap();
+        assert!(capped <= now_secs() as f64 + 601.0, "capped: {capped}");
+        assert!(capped >= 2000.0);
     }
 
     #[tokio::test]
