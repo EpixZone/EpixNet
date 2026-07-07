@@ -133,11 +133,15 @@ intent-filter is in `AndroidManifest.xml`. Interception the Tor-Browser-Android
 way (a bundled built-in WebExtension via `installBuiltIn` + `webRequest`) is the
 next step - GeckoView has no `shouldInterceptRequest`.
 
-A floating dot in the top-right corner mirrors the desktop extension's Tor
-toolbar icon (gray off, amber connecting, purple ready, green when all traffic
-routes through Tor). Tapping it shows the status and the node's onion address.
-It polls `torStatus()` / `onionAddress()` on the FFI every 5 seconds, like the
-extension polls the native host. The iOS shell has the same dot.
+The shell looks like a browser: an address bar (type `talk.epix`, an `epix1…`
+address, a bare word for `<word>.epix`, or any URL) and, Brave-style, the Epix
+icon next to it. The bar shows `talk.epix/…`, not the local node plumbing. The
+icon wears the Tor state as a badge with the desktop extension's colors (gray
+off, amber connecting, purple ready, green when all traffic routes through
+Tor); tapping it opens the Epix panel - current xite, Tor status, our onion
+address. It polls `torStatus()` / `onionAddress()` on the FFI every 5 seconds,
+like the extension polls the native host. Hardware back navigates page
+history. The iOS shell has the same chrome.
 
 ### iOS (`ios/`) - Swift + WKWebView
 
