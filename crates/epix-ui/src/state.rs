@@ -349,6 +349,11 @@ pub struct AppState {
     /// event for finished sites only - an in-flight site's real outcome event
     /// is still coming, and a premature one would clear its pill early.
     site_updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Xite addresses with an on-demand clone currently downloading files,
+    /// bracketed by [`Self::begin_clone`] / [`Self::end_clone`]. The html
+    /// serving gate reads this: while a clone runs, the page document waits
+    /// for the whole core set instead of booting half-downloaded.
+    clones_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Pending wrapper callbacks (`confirm`/`prompt`): a pushed event's `to` id
     /// maps to the oneshot awaiting the wrapper's `{cmd:"response", to}` reply.
     callbacks: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
@@ -549,6 +554,7 @@ impl AppState {
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
@@ -657,6 +663,7 @@ impl AppState {
             tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
@@ -3984,6 +3991,45 @@ impl AppState {
         self.site_updates_in_flight.lock().unwrap().remove(address);
     }
 
+    /// Mark an on-demand clone as downloading a xite's files. Pair with
+    /// [`Self::end_clone`] (on failure too).
+    pub fn begin_clone(&self, address: &str) {
+        self.clones_in_flight.lock().unwrap().insert(address.to_string());
+    }
+
+    /// The clone for a xite finished (or failed).
+    pub fn end_clone(&self, address: &str) {
+        self.clones_in_flight.lock().unwrap().remove(address);
+    }
+
+    /// Whether an on-demand clone is currently downloading this xite's files.
+    pub fn is_cloning(&self, address: &str) -> bool {
+        self.clones_in_flight.lock().unwrap().contains(address)
+    }
+
+    /// Whether this xite is marked owned (its files are edited locally and
+    /// must never be overwritten with the signed versions from peers).
+    pub async fn xite_owned(&self, address: &str) -> bool {
+        let xites = self.xites.read().await;
+        self.resolve_xite(&xites, address).map(|x| x.settings.own).unwrap_or(false)
+    }
+
+    /// Whether serving an html document for this xite should keep waiting: its
+    /// core set (every file the root content.json declares) is not fully on
+    /// disk yet, and it isn't ours. The document is the page itself - serving
+    /// it as soon as it lands boots the page with its styles, scripts and lazy
+    /// chunks still downloading, which reads as broken (the wrapper also drops
+    /// its loading screen once the iframe loads). Non-html assets are only
+    /// requested by an already-running page, so they serve as they land.
+    pub async fn html_doc_gated(&self, address: &str) -> bool {
+        // Without an on-demand resolver nothing can complete the download -
+        // serve what is on disk (also keeps bare embedded servers, which add
+        // xites programmatically, out of the gate).
+        self.has_on_demand().await
+            && !self.xite_owned(address).await
+            && !self.xite_core_complete(address).await
+    }
+
     /// Re-send the closing `updated` event, to one connection, for every xite
     /// with no update pass in flight. Called when that connection's event
     /// stream reports it dropped events (broadcast lag): the dashboard's
@@ -4031,6 +4077,21 @@ impl AppState {
     /// extra keys (e.g. `peers`, `bad_files`) over the minimal shape the
     /// wrapper JS reads.
     pub fn push_clone_event(&self, address: &str, event: Value, fields: Value) {
+        // Once content.json has been verified mid-clone, the title is known:
+        // carry it so the dashboard's "Connecting sites" row shows the xite's
+        // name instead of its bech32 address (and the wrapper's tab title
+        // doesn't read "undefined"). try_read because this is called from
+        // sync per-file progress callbacks: under momentary write contention
+        // the title just rides the next event instead.
+        let title = self
+            .xites
+            .try_read()
+            .ok()
+            .and_then(|xites| xites.get(address)?.content.as_ref()?.get("title").cloned());
+        let content = match title {
+            Some(t) => json!({ "title": t }),
+            None => json!({}),
+        };
         let mut params = json!({
             "address": address,
             "peers": 0,
@@ -4040,7 +4101,7 @@ impl AppState {
             "size_limit": 10,
             "settings": { "size": 0 },
             // Always an object - dashboard rows read `content.title` unchecked.
-            "content": {},
+            "content": content,
             "event": event,
         });
         if let (Value::Object(p), Value::Object(f)) = (&mut params, fields) {
@@ -4704,12 +4765,20 @@ impl AppState {
     /// now served. Used by the browser proxy path so typing any `talk.epix`
     /// clones and opens it live.
     pub async fn ensure_xite(&self, host: &str) -> bool {
-        if self.has_xite(host).await {
+        // Served AND complete (or ours): done. A registered xite whose core
+        // files are missing (an interrupted clone) still goes to the resolver
+        // so its download resumes - the periodic resync only fetches files
+        // when a newer content.json shows up, so it never heals one. Owned
+        // sites never re-download: local edits stay.
+        if self.has_xite(host).await
+            && (self.xite_owned(host).await || self.xite_core_complete(host).await)
+        {
             return true;
         }
-        // NoNewSites: the node's site set is locked - nothing new gets cloned.
+        // NoNewSites: the node's site set is locked - nothing new gets cloned
+        // (an already-served xite still counts as served).
         if self.no_new_sites().await {
-            return false;
+            return self.has_xite(host).await;
         }
         let hook = self.on_demand.read().await.clone();
         match hook {
@@ -7436,6 +7505,56 @@ mod tests {
 
         // An unknown callback id resolves nothing.
         assert!(!s.resolve_callback(999999, json!(true)));
+    }
+
+    #[tokio::test]
+    async fn clone_events_carry_the_title_once_content_is_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        s.add_xite(
+            "epix1x",
+            XiteEntry { storage: XiteStorage::new(dir.path()), content: None },
+        )
+        .await;
+        let mut events = s.subscribe_events();
+
+        // Before content.json is verified there is no title to show.
+        s.push_clone_event("epix1x", json!(["peers_added", 1]), json!({}));
+        let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
+        assert_eq!(p["params"]["content"], json!({}));
+
+        // Once it is, every clone event names the row (the dashboard's
+        // "Connecting sites" list shows the name, not the bech32 address).
+        s.update_content("epix1x", Some(json!({ "title": "xID" }))).await;
+        s.push_clone_event("epix1x", json!(["file_done", "content.json"]), json!({}));
+        let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
+        assert_eq!(p["params"]["content"]["title"], "xID");
+    }
+
+    #[tokio::test]
+    async fn owned_xites_are_never_html_gated() {
+        struct AlwaysClone;
+        #[async_trait::async_trait]
+        impl OnDemandResolver for AlwaysClone {
+            async fn ensure(&self, _host: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        s.add_xite(
+            "epix1x",
+            XiteEntry { storage: XiteStorage::new(dir.path()), content: None },
+        )
+        .await;
+        // No resolver: nothing can complete a download, so nothing is gated.
+        assert!(!s.html_doc_gated("epix1x").await);
+        s.set_on_demand(Arc::new(AlwaysClone)).await;
+        // Incomplete on disk (no verified core set): the document waits.
+        assert!(s.html_doc_gated("epix1x").await);
+        // But never for an owned site - local edits must keep serving.
+        s.set_owned("epix1x", true).await;
+        assert!(!s.html_doc_gated("epix1x").await);
     }
 
     #[tokio::test]

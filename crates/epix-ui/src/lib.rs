@@ -399,6 +399,11 @@ async fn render_wrapper(
             state.has_xite(&addr).await
                 && state.content(&addr).await.is_some()
                 && state.xite_file_exists(&addr, "index.html").await
+                // index.html alone isn't ready: it downloads first, and the
+                // core set (styles, scripts, chunks) may still be coming. Show
+                // the loading screen; the iframe's document request waits on
+                // the same condition, so the two dismiss together.
+                && !state.html_doc_gated(&addr).await
         }
     };
     if !ready(&ctx.state, address.clone()).await {
@@ -1135,20 +1140,45 @@ async fn serve_file(
         return (StatusCode::FORBIDDEN, "Adding new sites is disabled on this node")
             .into_response();
     }
-    let still_loading = !registered || !ctx.state.xite_file_exists(&address, &path).await;
+    // An html document is the page itself: while its xite's core set (every
+    // file the root content.json declares) is still downloading, hold it back
+    // instead of serving it the moment it lands. index.html downloads first,
+    // so serving it right away boots the page with its styles, scripts and
+    // lazy chunks missing - and the wrapper drops its loading screen once the
+    // iframe loads, stranding the user in a half-downloaded site. Non-html
+    // assets still serve as they land: only an already-running page asks for
+    // them, and each request waits for its own file (EpixNet's needFile).
+    let is_html = content_type(&path).starts_with("text/html");
+    let still_loading = !registered
+        || !ctx.state.xite_file_exists(&address, &path).await
+        || (is_html && ctx.state.html_doc_gated(&address).await);
     if still_loading && plausible_xite_ref(&requested) && ctx.state.has_on_demand().await {
-        {
+        // Kick the clone off; also resumes an interrupted clone (a registered
+        // xite with core files missing). Keep the handle: the html gate must
+        // lift when no clone can run (failed, NoNewSites, nothing to resume),
+        // or an incomplete-but-servable site would stall until the deadline.
+        let ensure = {
             let state = ctx.state.clone();
             let target = requested.clone();
             tokio::spawn(async move {
                 state.ensure_xite(&target).await;
-            });
-        }
+            })
+        };
         let ct = content_type(&path).to_string();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             let key = ctx.state.canonical_key(&requested).await;
-            if ctx.state.has_xite(&key).await && ctx.state.xite_file_exists(&key, &path).await {
+            // Hold an html document while its core set is still incomplete AND
+            // someone is working on completing it (a running clone, or our
+            // ensure call still deciding whether to start one).
+            let gated = is_html
+                && ctx.state.html_doc_gated(&key).await
+                && (ctx.state.is_cloning(&key) || !ensure.is_finished())
+                && std::time::Instant::now() < deadline;
+            if !gated
+                && ctx.state.has_xite(&key).await
+                && ctx.state.xite_file_exists(&key, &path).await
+            {
                 address = key; // the file is on disk - serve the normal path
                 break;
             }
@@ -1161,6 +1191,7 @@ async fn serve_file(
             };
             if let Some(k) = disk_key {
                 match ctx.state.loading_file(&k, &path) {
+                    crate::state::LoadingFile::Ready(_) if gated => {} // wait for the core set
                     crate::state::LoadingFile::Ready(bytes) => {
                         let bytes = substitute_html_vars(&ctx.state, &k, &ct, bytes).await;
                         return (file_headers(&ct, StatusCode::OK), bytes).into_response();
