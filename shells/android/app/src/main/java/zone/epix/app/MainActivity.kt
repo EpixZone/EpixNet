@@ -1,14 +1,29 @@
 package zone.epix.app
 
+import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageButton
+import android.widget.LinearLayout
+import android.widget.Switch
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.mozilla.geckoview.GeckoPreferenceController
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
@@ -16,34 +31,68 @@ import org.mozilla.geckoview.GeckoView
 import uniffi.epix_ffi.EpixNode
 import uniffi.epix_ffi.NodeConfig
 import uniffi.epix_ffi.NodeState
+import uniffi.epix_ffi.TorStatus
 
 /**
- * The Android shell: a GeckoView browser over the embedded Epix node.
+ * The Android shell: a browser over the embedded Epix node.
  *
  * The Rust core runs in-process (loaded as a cdylib via the generated UniFFI
  * bindings). We boot the node on a background coroutine, then point GeckoView at
  * the local node URL. `.epix` navigation and the EpixNet #15 CSP/clearnet policy
  * are enforced by the engine (server-side CSP) plus a bundled WebExtension
  * (installBuiltIn + webRequest) - the GeckoView way, since it has no
- * shouldInterceptRequest. That extension is a follow-up; this scaffold wires the
- * core + a working browser surface first.
+ * shouldInterceptRequest. That extension is a follow-up.
+ *
+ * The surface looks like a browser: an address bar (type `talk.epix`, an
+ * `epix1…` address, or any URL) and, Brave-style, the Epix icon next to it.
+ * The icon wears the Tor state as a badge (the desktop extension's colors:
+ * gray off, amber connecting, purple ready, green when all traffic routes
+ * through Tor) and opens the Epix panel - current xite, Tor status, our onion
+ * address - when tapped.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var geckoView: GeckoView
     private lateinit var session: GeckoSession
+    private lateinit var addressBar: EditText
+    private lateinit var torBadge: GradientDrawable
     private val node = EpixNode()
     private val scope = CoroutineScope(Dispatchers.Main)
+    private var canGoBack = false
+    private var currentDisplay: String = ""
+    /// Route clearnet browsing through the node's Tor SOCKS listener. Default
+    /// on (opt-out), like the desktop extension. Persisted across launches.
+    private var torClearnet = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        geckoView = GeckoView(this)
-        setContentView(geckoView, FrameLayout.LayoutParams(-1, -1))
+        torClearnet = getPreferences(Context.MODE_PRIVATE).getBoolean(PREF_TOR_CLEARNET, true)
+
+        setContentView(buildBrowserChrome())
 
         val runtime = GeckoRuntime.getDefault(this)
         session = GeckoSession().apply { open(runtime) }
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onLocationChange(
+                session: GeckoSession,
+                url: String?,
+                perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
+                hasUserGesture: Boolean,
+            ) {
+                if (url != null && !addressBar.hasFocus()) {
+                    addressBar.setText(friendlyUrl(url))
+                }
+            }
+
+            override fun onCanGoBack(session: GeckoSession, value: Boolean) {
+                canGoBack = value
+            }
+        }
         geckoView.setSession(session)
+        // The page, not the address bar, starts focused - otherwise the
+        // keyboard pops over the app on every launch.
+        geckoView.requestFocus()
 
         // The xite to open: from an epix:// launch intent, else the dashboard.
         val target = intentTarget(intent) ?: "dashboard.epix"
@@ -51,21 +100,147 @@ class MainActivity : AppCompatActivity() {
         scope.launch {
             val display = bootNode(target)
             if (display != null) {
-                session.loadUri("http://127.0.0.1:43110/$display/")
+                currentDisplay = display
+                // Apply the saved clearnet-through-Tor routing before the first
+                // page load, so clearnet requests are proxied from the start.
+                applyClearnetRouting()
+                session.loadUri(nodeUrl(display))
             } else {
                 session.loadUri("about:blank") // TODO: show a boot-error page
             }
         }
+
+        // Reflect the Tor state in the icon's badge, at the extension's cadence.
+        scope.launch {
+            while (true) {
+                torStatus()?.let { torBadge.setColor(colorFor(it)) }
+                delay(5_000)
+            }
+        }
+    }
+
+    /** Hardware/gesture back navigates the page history first. */
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (canGoBack) session.goBack() else @Suppress("DEPRECATION") super.onBackPressed()
     }
 
     /** A second epix:// link while running: navigate the existing session. */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val target = intentTarget(intent) ?: return
-        scope.launch {
-            val display = resolveDisplay(target)
-            session.loadUri("http://127.0.0.1:43110/$display/")
+        currentDisplay = target
+        session.loadUri(nodeUrl(target))
+    }
+
+    /** The browser chrome: address bar + Epix icon on top, the page below. */
+    private fun buildBrowserChrome(): View {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            fitsSystemWindows = true
+            setBackgroundColor(COLOR_CHROME_BG)
         }
+
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(8), dp(6), dp(4), dp(6))
+        }
+
+        addressBar = EditText(this).apply {
+            hint = "Type a .epix name or address"
+            setHintTextColor(COLOR_HINT)
+            setTextColor(COLOR_TEXT)
+            textSize = 14f
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
+            imeOptions = EditorInfo.IME_ACTION_GO
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(18).toFloat()
+                setColor(COLOR_FIELD_BG)
+            }
+            setSelectAllOnFocus(true)
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_GO) {
+                    navigate(text.toString())
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+        bar.addView(addressBar, LinearLayout.LayoutParams(0, -2, 1f))
+
+        // The Epix button (Brave-style): the logo with the Tor state as a
+        // badge; tapping opens the Epix panel.
+        torBadge = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(COLOR_OFF)
+            setStroke(dp(2), COLOR_CHROME_BG)
+        }
+        val icon = android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.epix_icon)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            adjustViewBounds = true
+        }
+        val badge = View(this).apply { background = torBadge }
+        val holder = FrameLayout(this).apply {
+            contentDescription = "Epix panel"
+            addView(icon, FrameLayout.LayoutParams(dp(36), dp(36), Gravity.CENTER))
+            addView(
+                badge,
+                FrameLayout.LayoutParams(dp(13), dp(13), Gravity.BOTTOM or Gravity.END).apply {
+                    bottomMargin = dp(3)
+                    marginEnd = dp(3)
+                },
+            )
+            setOnClickListener { showEpixPanel() }
+        }
+        bar.addView(holder, LinearLayout.LayoutParams(dp(44), dp(44)))
+
+        root.addView(bar, LinearLayout.LayoutParams(-1, -2))
+        geckoView = GeckoView(this)
+        root.addView(geckoView, LinearLayout.LayoutParams(-1, 0, 1f))
+        return root
+    }
+
+    /** Turn what the user typed into somewhere to go. */
+    private fun navigate(input: String) {
+        val t = input.trim()
+        if (t.isEmpty()) return
+        val url = when {
+            t.startsWith("http://") || t.startsWith("https://") -> t
+            t.startsWith("epix://") -> {
+                val host = t.removePrefix("epix://").substringBefore('/')
+                currentDisplay = host
+                nodeUrl(host)
+            }
+            t.startsWith("epix1") || t.endsWith(".epix") -> {
+                currentDisplay = t
+                nodeUrl(t)
+            }
+            // Looks like a clearnet domain: browse it over https.
+            t.contains('.') && !t.contains(' ') -> "https://$t"
+            // A bare word is a .epix name.
+            else -> {
+                currentDisplay = "$t.epix"
+                nodeUrl("$t.epix")
+            }
+        }
+        session.loadUri(url)
+        addressBar.clearFocus()
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(addressBar.windowToken, 0)
+    }
+
+    /** Show `talk.epix/…` in the bar, not the local node plumbing. */
+    private fun friendlyUrl(url: String): String {
+        val prefix = "http://127.0.0.1:43110/"
+        if (!url.startsWith(prefix)) return url
+        val rest = url.removePrefix(prefix).trimEnd('/')
+        rest.substringBefore('/').takeIf { it.isNotEmpty() }?.let { currentDisplay = it }
+        return rest
     }
 
     /** Boot the node off the main thread; return the display name to open. */
@@ -79,17 +254,127 @@ class MainActivity : AppCompatActivity() {
                 version = "0.1.0",
             )
             node.start(config)
-            if (node.state() == NodeState.SERVING) displayOf(target) else null
+            if (node.state() == NodeState.SERVING) target else null
         } catch (e: Exception) {
             null
         }
     }
 
-    private suspend fun resolveDisplay(target: String): String =
-        withContext(Dispatchers.IO) { displayOf(target) }
+    /** The node's Tor state, fetched off the main thread (the call blocks). */
+    private suspend fun torStatus(): TorStatus? = withContext(Dispatchers.IO) {
+        runCatching { node.torStatus() }.getOrNull()
+    }
 
-    /** `.epix` names keep their display; raw addresses serve under themselves. */
-    private fun displayOf(target: String): String = target
+    /**
+     * Same color language as the desktop extension's toolbar icon: green when
+     * Tor is on AND clearnet is routed through it, purple when Tor is ready but
+     * clearnet goes direct, amber connecting, gray off.
+     */
+    private fun colorFor(st: TorStatus): Int = when {
+        st.enabled -> if (torClearnet) COLOR_ROUTED else COLOR_READY
+        st.status == "Bootstrapping" -> COLOR_BOOT
+        else -> COLOR_OFF
+    }
+
+    /**
+     * The Epix panel: current xite, Tor status, our onion address, and the
+     * "route clearnet through Tor" switch (the desktop extension's popup).
+     */
+    private fun showEpixPanel() {
+        scope.launch {
+            val st = torStatus()
+            val onion = withContext(Dispatchers.IO) {
+                runCatching { node.onionAddress() }.getOrNull()
+            }
+            val torLine = when {
+                st == null -> "Tor: unknown"
+                st.enabled && torClearnet -> "Tor: on - clearnet routed through Tor"
+                st.enabled -> "Tor: ready - onion peers reachable"
+                st.status == "Bootstrapping" -> "Tor: connecting…"
+                st.status == "Failed" -> "Tor: failed to start"
+                else -> "Tor: off"
+            }
+
+            val pad = dp(20)
+            val layout = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(pad, dp(12), pad, 0)
+            }
+            if (currentDisplay.isNotEmpty()) {
+                layout.addView(label("Xite: $currentDisplay"))
+            }
+            layout.addView(label(torLine))
+            if (onion != null) {
+                layout.addView(label("\nYour onion address:\n$onion.onion"))
+            }
+            val row = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(14), 0, 0)
+            }
+            row.addView(
+                label("Route clearnet through Tor"),
+                LinearLayout.LayoutParams(0, -2, 1f),
+            )
+            val toggle = Switch(this@MainActivity).apply {
+                isChecked = torClearnet
+                setOnCheckedChangeListener { _, checked -> setTorClearnet(checked) }
+            }
+            row.addView(toggle)
+            layout.addView(row)
+
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle("Epix")
+                .setView(layout)
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    private fun label(text: String): TextView =
+        TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            setPadding(0, dp(4), 0, dp(4))
+        }
+
+    /** Flip the clearnet-through-Tor routing, persist it, and apply it live. */
+    private fun setTorClearnet(on: Boolean) {
+        if (torClearnet == on) return
+        torClearnet = on
+        getPreferences(Context.MODE_PRIVATE).edit().putBoolean(PREF_TOR_CLEARNET, on).apply()
+        applyClearnetRouting()
+        // The badge reflects the new routing state at once, not on the next poll.
+        torBadge.setColor(if (on) COLOR_ROUTED else COLOR_READY)
+    }
+
+    /**
+     * Point GeckoView's proxy at the node's Tor SOCKS listener (or direct).
+     * When on, all non-loopback (clearnet) requests go through Tor; the node's
+     * own loopback - the UI and every `.epix` page served from 127.0.0.1 - is
+     * never proxied (allow_hijacking_localhost stays false), so xites keep
+     * loading directly. socks_remote_dns keeps DNS inside Tor. This is the
+     * runtime equivalent of the desktop launcher's file PAC.
+     */
+    private fun applyClearnetRouting() {
+        val user = GeckoPreferenceController.PREF_BRANCH_USER
+        if (torClearnet) {
+            GeckoPreferenceController.setGeckoPref("network.proxy.type", 1, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks", "127.0.0.1", user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_port", SOCKS_PORT, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_version", 5, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_remote_dns", true, user)
+            GeckoPreferenceController.setGeckoPref(
+                "network.proxy.allow_hijacking_localhost", false, user,
+            )
+        } else {
+            GeckoPreferenceController.setGeckoPref("network.proxy.type", 0, user)
+        }
+    }
+
+    private fun nodeUrl(name: String): String = "http://127.0.0.1:43110/$name/"
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     /** Pull the xite target out of an `epix://host/path` VIEW intent. */
     private fun intentTarget(intent: Intent?): String? {
@@ -103,5 +388,19 @@ class MainActivity : AppCompatActivity() {
             // The Rust core (libepix_ffi.so, one per ABI) packaged in jniLibs.
             System.loadLibrary("epix_ffi")
         }
+
+        // The node's local Tor SOCKS listener (epix-node boot: 43111).
+        private const val SOCKS_PORT = 43111
+        private const val PREF_TOR_CLEARNET = "torClearnet"
+
+        // The dashboard's dark chrome + the desktop extension's icon colors.
+        private val COLOR_CHROME_BG = Color.parseColor("#0b0e14")
+        private val COLOR_FIELD_BG = Color.parseColor("#1e293b")
+        private val COLOR_TEXT = Color.parseColor("#cbd5e1")
+        private val COLOR_HINT = Color.parseColor("#64748b")
+        private val COLOR_OFF = Color.parseColor("#64748b")
+        private val COLOR_BOOT = Color.parseColor("#f5c450")
+        private val COLOR_READY = Color.parseColor("#a78bfa")
+        private val COLOR_ROUTED = Color.parseColor("#4ade80")
     }
 }

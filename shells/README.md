@@ -133,6 +133,25 @@ intent-filter is in `AndroidManifest.xml`. Interception the Tor-Browser-Android
 way (a bundled built-in WebExtension via `installBuiltIn` + `webRequest`) is the
 next step - GeckoView has no `shouldInterceptRequest`.
 
+The shell looks like a browser: an address bar (type `talk.epix`, an `epix1…`
+address, a bare word for `<word>.epix`, or any URL) and, Brave-style, the Epix
+icon next to it. The bar shows `talk.epix/…`, not the local node plumbing. The
+icon wears the Tor state as a badge with the desktop extension's colors (gray
+off, amber connecting, purple ready, green when clearnet is routed through
+Tor); tapping it opens the Epix panel - current xite, Tor status, our onion
+address, and the "Route clearnet through Tor" switch. It polls `torStatus()` /
+`onionAddress()` on the FFI every 5 seconds, like the extension polls the
+native host. Hardware back navigates page history. The iOS shell has the same
+chrome.
+
+The "Route clearnet through Tor" switch (default on, opt-out, like the desktop
+extension) points the web engine's proxy at the node's Tor SOCKS listener
+(127.0.0.1:43111, the same one the desktop launcher's PAC uses). The node's own
+loopback is excluded, so the UI and every `.epix` page (served from 127.0.0.1)
+load directly while clearnet requests exit through Tor. Android sets GeckoView's
+`network.proxy.*` prefs live; iOS 17+ sets `WKWebsiteDataStore.proxyConfigurations`.
+Both apply immediately, no relaunch (the desktop version applies on relaunch).
+
 ### iOS (`ios/`) - Swift + WKWebView
 
 ```
@@ -146,7 +165,9 @@ cargo build -p epix-ffi --release --no-default-features --features tor,i2p-embed
 cargo run -p epix-ffi --features cli --bin uniffi-bindgen -- generate \
     --library target/aarch64-apple-ios/release/libepix_ffi.a \
     --language swift --out-dir ios/EpixBrowser/Generated
-# 3. Open the Xcode project, link libepix_ffi.a + the generated module, run.
+# 3. Open the Xcode project, link libepix_ffi.a + the generated module, and add
+#    ios/EpixBrowser/epix-icon.png as a bundle resource (the Epix button's
+#    logo; the app falls back to a system glyph without it). Run.
 ```
 
 `AppDelegate` boots the node and loads the local URL in a WKWebView. `epix://`
