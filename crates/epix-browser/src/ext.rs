@@ -1,26 +1,33 @@
-//! Install the bundled WebExtension + native-messaging host into a Firefox
-//! profile.
+//! Install the bundled Epix Wallet WebExtension + native-messaging host into a
+//! Firefox profile.
 //!
-//! The extension source (`shells/browser-ext`) is embedded in the binary and
-//! written out as an XPI into `<profile>/extensions/<id>.xpi`. The
-//! native-messaging manifest is written to Firefox's per-user host directory,
-//! pointing at the `epix-nmh` binary (a sibling of this launcher). Prefs to
-//! allow the unsigned extension (Developer Edition / ESR) are set by the
-//! profile writer.
+//! The wallet extension (the forked Keplr build, staged at `shells/wallet-ext`)
+//! is embedded in the binary and written out as an XPI into
+//! `<profile>/extensions/<id>.xpi`. It carries the whole Epix browser policy -
+//! the wallet, the clearnet-block enforcement, and the Tor/I2P panel - so it
+//! fully replaces the old standalone `browser-ext`. The native-messaging
+//! manifest is written to Firefox's per-user host directory, pointing at the
+//! `epix-nmh` binary (a sibling of this launcher) and allowing the wallet id.
+//! Prefs to allow the unsigned extension (Developer Edition / ESR) are set by
+//! the profile writer.
+//!
+//! `shells/wallet-ext` is a build artifact (gitignored): produce it with the
+//! wallet's `yarn build` and stage it before compiling this crate (see
+//! `shells/README.md`). A committed placeholder keeps a fresh checkout building.
 
 use include_dir::{include_dir, Dir};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// The extension files, embedded at build time.
-static EXT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-ext");
+/// The wallet extension files, embedded at build time.
+static EXT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/wallet-ext");
 
 /// The starter chrome theme, embedded at build time.
 static THEME: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-theme");
 
-/// The extension id (must match `manifest.json`'s gecko id).
-pub const EXT_ID: &str = "browser-ext@epix.zone";
-/// The native-messaging host name (must match `background.js`).
+/// The extension id (must match the wallet `manifest.json`'s Firefox gecko id).
+pub const EXT_ID: &str = "wallet@epix.zone";
+/// The native-messaging host name (must match the wallet's native bridge).
 pub const NMH_NAME: &str = "zone.epix.nmh";
 
 /// Write the extension as an XPI into the profile's `extensions/` dir. Firefox

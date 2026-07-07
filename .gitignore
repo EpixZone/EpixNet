@@ -46,3 +46,9 @@ ios/Generated/
 # Xcode per-user / generated state
 ios/**/xcuserdata/
 ios/**/project.xcworkspace/
+
+# Epix Wallet build artifact (produced by the wallet's `yarn build`, staged
+# here before compiling epix-browser). Only the placeholder manifest + README
+# are committed so a fresh checkout still compiles; run the build to populate.
+/shells/wallet-ext/*
+!/shells/wallet-ext/README.md

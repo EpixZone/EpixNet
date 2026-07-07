@@ -259,16 +259,25 @@ async fn health() -> &'static str {
 }
 
 /// `GET /EpixNet-Internal/Status` - a small JSON status the browser's native
-/// host polls to drive the Tor toolbar icon: whether the node is serving, the
-/// Tor state (`tor_enabled`/`tor_status`), and our onion address if published.
+/// host polls to drive the wallet's Epix panel: whether the node is serving,
+/// the Tor state (`tor_enabled`/`tor_status`) + our onion address, and the I2P
+/// state (`i2p_enabled`/`i2p_status`) + our `.b32.i2p` address if published.
 async fn serve_status(State(ctx): State<Ctx>) -> Response {
     let (tor_enabled, tor_status) = ctx.state.tor_status().await;
     let onion = ctx.state.onion_address().await;
+    // I2P: the runtime keeps a status object (phase, b32, tunnels, ...); surface
+    // a concise view. `i2p_enabled` is true once the router has an address.
+    let i2p = ctx.state.i2p_status().await;
+    let i2p_phase = i2p.get("phase").and_then(|v| v.as_str()).unwrap_or("Disabled").to_string();
+    let i2p_address = ctx.state.i2p_address().await;
     let body = json!({
         "serving": true,
         "tor_enabled": tor_enabled,
         "tor_status": tor_status,
         "onion_address": onion,
+        "i2p_enabled": i2p_address.is_some(),
+        "i2p_status": i2p_phase,
+        "i2p_address": i2p_address,
     });
     (
         [

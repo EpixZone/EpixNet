@@ -166,15 +166,16 @@ async fn main() {
         eprintln!("· note: could not install the theme: {e}");
     }
 
-    // Install the WebExtension (clearnet-block + CSP) and its native host.
+    // Install the Epix Wallet extension (wallet + clearnet-block + Tor/I2P
+    // panel) and its native host.
     if ext_capable {
         if let Err(e) = ext::install_extension(&profile) {
-            eprintln!("· note: could not install the extension: {e}");
+            eprintln!("· note: could not install the wallet extension: {e}");
         }
         if let Err(e) = ext::install_native_host() {
             eprintln!("· note: could not install the native host: {e}");
         }
-        println!("· extension + native host installed");
+        println!("· wallet extension + native host installed");
     } else {
         println!(
             "· note: {} enforces extension signing, so the clearnet-block extension \
