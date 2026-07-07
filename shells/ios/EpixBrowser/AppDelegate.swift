@@ -204,7 +204,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate {
     }
 
     private func friendlyUrl(_ url: String) -> String {
-        let prefix = "http://127.0.0.1:43110/"
+        let prefix = "http://127.0.0.1:42222/"
         guard url.hasPrefix(prefix) else { return url }
         var rest = String(url.dropFirst(prefix.count))
         while rest.hasSuffix("/") { rest = String(rest.dropLast()) }
@@ -233,7 +233,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate {
             let config = NodeConfig(
                 dataDir: dataDir,
                 target: target,
-                uiAddr: "127.0.0.1:43110",
+                uiAddr: "127.0.0.1:42222",
                 torMode: "enable",
                 version: "0.1.0"
             )
@@ -385,7 +385,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate {
     }
 
     private func nodeUrl(_ name: String) -> String {
-        "http://127.0.0.1:43110/\(name)/"
+        "http://127.0.0.1:42222/\(name)/"
     }
 
     private func showError(_ message: String) {

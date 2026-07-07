@@ -52,3 +52,6 @@ ios/**/project.xcworkspace/
 # are committed so a fresh checkout still compiles; run the build to populate.
 /shells/wallet-ext/*
 !/shells/wallet-ext/README.md
+
+# Android copy of the wallet build artifact (staged by gradle stageWalletExt)
+/shells/android/app/src/main/assets/extensions/

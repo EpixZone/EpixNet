@@ -1734,6 +1734,7 @@ dependencies = [
  "hyper-util",
  "include_dir",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde_json",
  "tokio",
