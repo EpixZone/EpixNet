@@ -25,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import org.mozilla.gecko.util.GeckoBundle
 import org.mozilla.geckoview.GeckoPreferenceController
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
@@ -406,13 +407,35 @@ class MainActivity : AppCompatActivity() {
         ): GeckoResult<Any>? {
             val req = message as? JSONObject ?: return null
             val result = GeckoResult<Any>()
-            scope.launch { result.complete(handleNmh(req)) }
+            // The response rides Gecko's EventDispatcher, which only accepts
+            // its own bundle type, not JSONObject ("Invalid event data").
+            scope.launch {
+                result.complete(GeckoBundle.fromJSONObject(handleNmh(req)))
+            }
             return result
         }
     }
 
+    /**
+     * GeckoView's message bridge rejects JSON null values ("Invalid event
+     * data"); the node's status JSON uses them for absent addresses. Absent
+     * key and null mean the same to the wallet, so drop them.
+     */
+    private fun stripNulls(o: JSONObject): JSONObject {
+        val out = JSONObject()
+        for (key in o.keys()) {
+            val v = o.get(key)
+            if (v == JSONObject.NULL) continue
+            out.put(key, if (v is JSONObject) stripNulls(v) else v)
+        }
+        return out
+    }
+
     /** Answer one native-host command with the same JSON shapes as epix-nmh. */
-    private suspend fun handleNmh(req: JSONObject): JSONObject {
+    private suspend fun handleNmh(req: JSONObject): JSONObject =
+        stripNulls(handleNmhRaw(req))
+
+    private suspend fun handleNmhRaw(req: JSONObject): JSONObject {
         return when (req.optString("cmd")) {
             "status" -> withContext(Dispatchers.IO) {
                 try {
