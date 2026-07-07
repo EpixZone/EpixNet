@@ -137,11 +137,20 @@ The shell looks like a browser: an address bar (type `talk.epix`, an `epix1…`
 address, a bare word for `<word>.epix`, or any URL) and, Brave-style, the Epix
 icon next to it. The bar shows `talk.epix/…`, not the local node plumbing. The
 icon wears the Tor state as a badge with the desktop extension's colors (gray
-off, amber connecting, purple ready, green when all traffic routes through
+off, amber connecting, purple ready, green when clearnet is routed through
 Tor); tapping it opens the Epix panel - current xite, Tor status, our onion
-address. It polls `torStatus()` / `onionAddress()` on the FFI every 5 seconds,
-like the extension polls the native host. Hardware back navigates page
-history. The iOS shell has the same chrome.
+address, and the "Route clearnet through Tor" switch. It polls `torStatus()` /
+`onionAddress()` on the FFI every 5 seconds, like the extension polls the
+native host. Hardware back navigates page history. The iOS shell has the same
+chrome.
+
+The "Route clearnet through Tor" switch (default on, opt-out, like the desktop
+extension) points the web engine's proxy at the node's Tor SOCKS listener
+(127.0.0.1:43111, the same one the desktop launcher's PAC uses). The node's own
+loopback is excluded, so the UI and every `.epix` page (served from 127.0.0.1)
+load directly while clearnet requests exit through Tor. Android sets GeckoView's
+`network.proxy.*` prefs live; iOS 17+ sets `WKWebsiteDataStore.proxyConfigurations`.
+Both apply immediately, no relaunch (the desktop version applies on relaunch).
 
 ### iOS (`ios/`) - Swift + WKWebView
 

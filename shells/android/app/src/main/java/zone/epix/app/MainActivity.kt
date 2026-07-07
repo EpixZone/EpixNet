@@ -15,12 +15,15 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.Switch
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.mozilla.geckoview.GeckoPreferenceController
 import org.mozilla.geckoview.GeckoRuntime
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
@@ -57,9 +60,14 @@ class MainActivity : AppCompatActivity() {
     private val scope = CoroutineScope(Dispatchers.Main)
     private var canGoBack = false
     private var currentDisplay: String = ""
+    /// Route clearnet browsing through the node's Tor SOCKS listener. Default
+    /// on (opt-out), like the desktop extension. Persisted across launches.
+    private var torClearnet = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        torClearnet = getPreferences(Context.MODE_PRIVATE).getBoolean(PREF_TOR_CLEARNET, true)
 
         setContentView(buildBrowserChrome())
 
@@ -93,6 +101,9 @@ class MainActivity : AppCompatActivity() {
             val display = bootNode(target)
             if (display != null) {
                 currentDisplay = display
+                // Apply the saved clearnet-through-Tor routing before the first
+                // page load, so clearnet requests are proxied from the start.
+                applyClearnetRouting()
                 session.loadUri(nodeUrl(display))
             } else {
                 session.loadUri("about:blank") // TODO: show a boot-error page
@@ -254,45 +265,110 @@ class MainActivity : AppCompatActivity() {
         runCatching { node.torStatus() }.getOrNull()
     }
 
-    /** Same color language as the desktop extension's toolbar icon. */
+    /**
+     * Same color language as the desktop extension's toolbar icon: green when
+     * Tor is on AND clearnet is routed through it, purple when Tor is ready but
+     * clearnet goes direct, amber connecting, gray off.
+     */
     private fun colorFor(st: TorStatus): Int = when {
-        st.enabled && st.status == "Always" -> COLOR_ROUTED
-        st.enabled -> COLOR_READY
+        st.enabled -> if (torClearnet) COLOR_ROUTED else COLOR_READY
         st.status == "Bootstrapping" -> COLOR_BOOT
         else -> COLOR_OFF
     }
 
-    /** The Epix panel: current xite, Tor status, our onion address. */
+    /**
+     * The Epix panel: current xite, Tor status, our onion address, and the
+     * "route clearnet through Tor" switch (the desktop extension's popup).
+     */
     private fun showEpixPanel() {
         scope.launch {
             val st = torStatus()
             val onion = withContext(Dispatchers.IO) {
                 runCatching { node.onionAddress() }.getOrNull()
             }
-            val message = buildString {
-                if (currentDisplay.isNotEmpty()) {
-                    append("Xite: $currentDisplay\n\n")
-                }
-                append(
-                    when {
-                        st == null -> "Tor: unknown"
-                        st.enabled && st.status == "Always" ->
-                            "Tor: on - all traffic routed through Tor"
-                        st.enabled -> "Tor: ready - onion peers reachable"
-                        st.status == "Bootstrapping" -> "Tor: connecting…"
-                        st.status == "Failed" -> "Tor: failed to start"
-                        else -> "Tor: off"
-                    }
-                )
-                if (onion != null) {
-                    append("\n\nYour onion address:\n$onion.onion")
-                }
+            val torLine = when {
+                st == null -> "Tor: unknown"
+                st.enabled && torClearnet -> "Tor: on - clearnet routed through Tor"
+                st.enabled -> "Tor: ready - onion peers reachable"
+                st.status == "Bootstrapping" -> "Tor: connecting…"
+                st.status == "Failed" -> "Tor: failed to start"
+                else -> "Tor: off"
             }
+
+            val pad = dp(20)
+            val layout = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(pad, dp(12), pad, 0)
+            }
+            if (currentDisplay.isNotEmpty()) {
+                layout.addView(label("Xite: $currentDisplay"))
+            }
+            layout.addView(label(torLine))
+            if (onion != null) {
+                layout.addView(label("\nYour onion address:\n$onion.onion"))
+            }
+            val row = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(14), 0, 0)
+            }
+            row.addView(
+                label("Route clearnet through Tor"),
+                LinearLayout.LayoutParams(0, -2, 1f),
+            )
+            val toggle = Switch(this@MainActivity).apply {
+                isChecked = torClearnet
+                setOnCheckedChangeListener { _, checked -> setTorClearnet(checked) }
+            }
+            row.addView(toggle)
+            layout.addView(row)
+
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("Epix")
-                .setMessage(message)
+                .setView(layout)
                 .setPositiveButton("OK", null)
                 .show()
+        }
+    }
+
+    private fun label(text: String): TextView =
+        TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            setPadding(0, dp(4), 0, dp(4))
+        }
+
+    /** Flip the clearnet-through-Tor routing, persist it, and apply it live. */
+    private fun setTorClearnet(on: Boolean) {
+        if (torClearnet == on) return
+        torClearnet = on
+        getPreferences(Context.MODE_PRIVATE).edit().putBoolean(PREF_TOR_CLEARNET, on).apply()
+        applyClearnetRouting()
+        // The badge reflects the new routing state at once, not on the next poll.
+        torBadge.setColor(if (on) COLOR_ROUTED else COLOR_READY)
+    }
+
+    /**
+     * Point GeckoView's proxy at the node's Tor SOCKS listener (or direct).
+     * When on, all non-loopback (clearnet) requests go through Tor; the node's
+     * own loopback - the UI and every `.epix` page served from 127.0.0.1 - is
+     * never proxied (allow_hijacking_localhost stays false), so xites keep
+     * loading directly. socks_remote_dns keeps DNS inside Tor. This is the
+     * runtime equivalent of the desktop launcher's file PAC.
+     */
+    private fun applyClearnetRouting() {
+        val user = GeckoPreferenceController.PREF_BRANCH_USER
+        if (torClearnet) {
+            GeckoPreferenceController.setGeckoPref("network.proxy.type", 1, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks", "127.0.0.1", user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_port", SOCKS_PORT, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_version", 5, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_remote_dns", true, user)
+            GeckoPreferenceController.setGeckoPref(
+                "network.proxy.allow_hijacking_localhost", false, user,
+            )
+        } else {
+            GeckoPreferenceController.setGeckoPref("network.proxy.type", 0, user)
         }
     }
 
@@ -312,6 +388,10 @@ class MainActivity : AppCompatActivity() {
             // The Rust core (libepix_ffi.so, one per ABI) packaged in jniLibs.
             System.loadLibrary("epix_ffi")
         }
+
+        // The node's local Tor SOCKS listener (epix-node boot: 43111).
+        private const val SOCKS_PORT = 43111
+        private const val PREF_TOR_CLEARNET = "torClearnet"
 
         // The dashboard's dark chrome + the desktop extension's icon colors.
         private val COLOR_CHROME_BG = Color.parseColor("#0b0e14")
