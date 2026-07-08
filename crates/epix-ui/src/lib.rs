@@ -106,6 +106,11 @@ impl UiServer {
             .route("/Plugins/", get(|| async { Redirect::permanent("/Plugins") }))
             .route("/Config/", get(|| async { Redirect::permanent("/Config") }))
             .route("/Stats/", get(|| async { Redirect::permanent("/Stats") }))
+            // The Epix Wallet web app for the mobile shells (see
+            // AppState::wallet_ui_dir); 404s when nothing is staged.
+            .route("/EpixWallet", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
+            .route("/EpixWallet/", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
+            .route("/EpixWallet/*path", get(serve_wallet))
             .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
@@ -339,6 +344,25 @@ async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Resp
     match UIMEDIA.get_file(&path) {
         Some(file) => ([(header::CONTENT_TYPE, ct)], file.contents().to_vec()).into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// Serve the Epix Wallet web app from `<data_root>/wallet-ui`, where the
+/// mobile shells stage their bundled wallet build (their WebViews cannot run
+/// the WebExtension the desktop browser embeds, so the wallet runs as a
+/// plain web app served from this loopback origin - see the wallet repo's
+/// mobile.html). 404s when nothing is staged.
+async fn serve_wallet(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    let Some(root) = ctx.state.wallet_ui_dir() else {
+        return (StatusCode::NOT_FOUND, "no wallet staged").into_response();
+    };
+    // Plain relative components only - no traversal out of the staging dir.
+    if path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match tokio::fs::read(root.join(&path)).await {
+        Ok(body) => ([(header::CONTENT_TYPE, content_type(&path))], body).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 

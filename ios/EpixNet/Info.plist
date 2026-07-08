@@ -34,5 +34,17 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!-- epix:// links open the app directly (the Android intent-filter). -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>zone.epix.EpixNet</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>epix</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
