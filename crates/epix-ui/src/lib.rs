@@ -112,6 +112,19 @@ impl UiServer {
             .route("/EpixWallet/", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
             .route("/EpixWallet/*path", get(serve_wallet))
             .route("/list/*path", get(serve_file_manager))
+            // Browsers ask for /favicon.ico at the origin root.
+            .route(
+                "/favicon.ico",
+                get(|| async { Redirect::permanent("/uimedia/img/favicon.ico") }),
+            )
+            // EpixNet's /raw/<site>/<path>: the file without the wrapper,
+            // under the restrictive noscript CSP.
+            .route("/raw/:address/*path", get(serve_raw))
+            // EpixNet's /add/<site> confirmation flow maps onto this node's
+            // on-demand design: navigating to a xite already resolves +
+            // clones it (gated by NoNewSites), so /add is a redirect.
+            .route("/add/:address", get(redirect_add))
+            .route("/add/:address/", get(redirect_add))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
             .route("/:address/*path", get(serve_file));
@@ -735,11 +748,43 @@ async fn render_wrapper(
     // the WS session and every command bind to the address, never the name.
     let themeclass = ctx.state.theme_class().await;
     let lang = ctx.state.ui_language().await;
+    // Wrapper page hints from the root content.json (UiRequest parity):
+    // `background-color` (with a per-theme variant) styles the page behind
+    // the iframe, `viewport` and `favicon` become head tags.
+    let (meta_tags, body_style) = {
+        let mut meta = String::new();
+        let mut style = String::new();
+        if let Some(content) = ctx.state.content(&address).await {
+            let theme = themeclass.trim_start_matches("theme-");
+            let themed_key = format!("background-color-{theme}");
+            let background = content
+                .get(&themed_key)
+                .or_else(|| content.get("background-color"))
+                .and_then(|v| v.as_str());
+            if let Some(color) = background {
+                style.push_str(&format!("background-color: {};", html_escape(color)));
+            }
+            if let Some(viewport) = content.get("viewport").and_then(|v| v.as_str()) {
+                meta.push_str(&format!(
+                    "<meta name=\"viewport\" id=\"viewport\" content=\"{}\">",
+                    html_escape(viewport)
+                ));
+            }
+            if let Some(favicon) = content.get("favicon").and_then(|v| v.as_str()) {
+                let root = if proxy_mode { "/".to_string() } else { format!("/{requested}/") };
+                meta.push_str(&format!(
+                    "<link rel=\"icon\" href=\"{root}{}\">",
+                    html_escape(favicon)
+                ));
+            }
+        }
+        (meta, style)
+    };
     let vars: Vec<(&str, String)> = vec![
         ("title", title),
         ("rev", "1".into()),
-        ("meta_tags", String::new()),
-        ("body_style", String::new()),
+        ("meta_tags", meta_tags),
+        ("body_style", body_style),
         ("themeclass", themeclass),
         ("script_nonce", script_nonce.clone()),
         ("homepage", homepage),
@@ -1309,6 +1354,34 @@ fn render(template: &str, vars: &[(&str, String)]) -> String {
 }
 
 /// Serve a xite's own file (the inner iframe content + its assets).
+/// `/raw/<site>/<path>`: the file bytes with no wrapper and EpixNet's
+/// noscript Content-Security-Policy, so active content cannot run - the
+/// share-a-file view (`actionSiteMedia(raw=True)`).
+async fn serve_raw(
+    State(ctx): State<Ctx>,
+    Path((address, path)): Path<(String, String)>,
+) -> Response {
+    let address = ctx.state.canonical_key(&address).await;
+    let Some(bytes) = ctx.state.read_file(&address, &path).await else {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    };
+    let mut headers = file_headers(content_type(&path), StatusCode::OK);
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; sandbox allow-top-navigation allow-forms; img-src *;          font-src * data:; media-src *; style-src * 'unsafe-inline';"
+            .parse()
+            .unwrap(),
+    );
+    (headers, bytes).into_response()
+}
+
+/// `/add/<site>` -> `/<site>/`: the wrapper route resolves + clones unknown
+/// xites on demand (and NoNewSites gates it), so the EpixNet add-confirmation
+/// page reduces to a redirect here.
+async fn redirect_add(Path(address): Path<String>) -> Redirect {
+    Redirect::temporary(&format!("/{address}/"))
+}
+
 async fn serve_file(
     State(ctx): State<Ctx>,
     Path((address, path)): Path<(String, String)>,
@@ -1620,6 +1693,15 @@ fn wrapper_csp(script_nonce: &str) -> String {
     )
 }
 
+/// Minimal HTML attribute escaping for wrapper-injected values.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
         "html" | "htm" => "text/html; charset=utf-8",
@@ -1635,6 +1717,23 @@ fn content_type(path: &str) -> &'static str {
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
         "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "webmanifest" => "application/manifest+json",
+        "xml" => "text/xml; charset=utf-8",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "application/ogg",
+        "oga" => "audio/ogg",
+        "ogv" => "video/ogg",
+        "otf" => "font/otf",
+        "eot" => "font/eot",
+        "asc" => "application/pgp-keys",
+        "gpg" => "application/pgp-encrypted",
+        "sig" => "application/pgp-signature",
         _ => "application/octet-stream",
     }
 }
