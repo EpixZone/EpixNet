@@ -45,6 +45,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// The wallet sheet (the forked Keplr web app served by the node).
     var walletVC: UIViewController?
     var walletWebView: WKWebView?
+    let walletUIDelegate = WalletUIDelegate()
 
     // The node's local Tor SOCKS listener (epix-node boot: 43111).
     static let socksPort: UInt16 = 43111
@@ -475,8 +476,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                 WKUserScript(source: logHook, injectionTime: .atDocumentStart, forMainFrameOnly: false)
             )
         #endif
+        // Keystone hardware-wallet pairing scans animated QR codes: let the
+        // camera preview render inline, and answer the capture-permission ask
+        // in walletUIDelegate below (the OS NSCameraUsageDescription prompt
+        // still shows the first time).
+        config.allowsInlineMediaPlayback = true
         let web = WKWebView(frame: .zero, configuration: config)
         if #available(iOS 16.4, *) { web.isInspectable = true }
+        web.uiDelegate = walletUIDelegate
         web.translatesAutoresizingMaskIntoConstraints = false
         walletWebView = web
 
@@ -781,5 +788,23 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         return url.host ?? url.absoluteString
             .replacingOccurrences(of: "epix://", with: "")
             .components(separatedBy: "/").first
+    }
+}
+
+/// UI delegate for the wallet sheet: answers the camera capture ask from the
+/// Keystone QR scanner. Grants camera only, and only to our own wallet pages
+/// on the node's loopback origin; everything else is denied. The OS-level
+/// camera prompt (NSCameraUsageDescription) still shows once per install.
+final class WalletUIDelegate: NSObject, WKUIDelegate {
+    @available(iOS 15.0, *)
+    func webView(
+        _ webView: WKWebView,
+        requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+        initiatedByFrame frame: WKFrameInfo,
+        type: WKMediaCaptureType,
+        decisionHandler: @escaping (WKPermissionDecision) -> Void
+    ) {
+        let isLoopback = origin.host == "127.0.0.1" || origin.host == "localhost"
+        decisionHandler(type == .camera && isLoopback ? .grant : .deny)
     }
 }

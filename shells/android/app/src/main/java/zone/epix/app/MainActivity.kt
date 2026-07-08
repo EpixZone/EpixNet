@@ -3,6 +3,7 @@ package zone.epix.app
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -73,6 +74,10 @@ class MainActivity : AppCompatActivity() {
     /// built-in); tapping the Epix button opens its popup document.
     private var wallet: WebExtension? = null
     private var walletDialog: AlertDialog? = null
+    /// A GeckoView permission callback parked while the Android runtime
+    /// permission dialog (e.g. CAMERA for the wallet's Keystone QR scanner)
+    /// is up; resolved in onRequestPermissionsResult.
+    private var pendingGeckoPermission: GeckoSession.PermissionDelegate.Callback? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -510,6 +515,63 @@ class MainActivity : AppCompatActivity() {
         ): GeckoResult<GeckoSession>? = GeckoResult.fromValue(openPopupSession())
     }
 
+    /**
+     * Camera access for the wallet's Keystone QR scanner. Set only on the
+     * wallet's popup sessions, and media is granted only to the extension's
+     * own pages - regular browsing keeps the default (no camera).
+     */
+    private val walletPermissionDelegate = object : GeckoSession.PermissionDelegate {
+        override fun onAndroidPermissionsRequest(
+            session: GeckoSession,
+            permissions: Array<out String>?,
+            callback: GeckoSession.PermissionDelegate.Callback,
+        ) {
+            val missing = permissions.orEmpty().filter {
+                checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isEmpty()) {
+                callback.grant()
+                return
+            }
+            pendingGeckoPermission = callback
+            requestPermissions(missing.toTypedArray(), REQ_GECKO_PERMISSIONS)
+        }
+
+        override fun onMediaPermissionRequest(
+            session: GeckoSession,
+            uri: String,
+            video: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
+            audio: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
+            callback: GeckoSession.PermissionDelegate.MediaCallback,
+        ) {
+            val camera = video?.firstOrNull()
+            if (camera != null && uri.startsWith("moz-extension://")) {
+                callback.grant(camera, null)
+            } else {
+                callback.reject()
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_GECKO_PERMISSIONS) {
+            val callback = pendingGeckoPermission
+            pendingGeckoPermission = null
+            if (grantResults.isNotEmpty() &&
+                grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+            ) {
+                callback?.grant()
+            } else {
+                callback?.reject()
+            }
+        }
+    }
+
     /** Open the wallet UI: its popup document in a dialog over the browser. */
     private fun showWalletPopup(ext: WebExtension) {
         walletDialog?.let {
@@ -526,6 +588,7 @@ class MainActivity : AppCompatActivity() {
         // sign approval) replaces the popup's dialog.
         walletDialog?.dismiss()
         val popupSession = GeckoSession().apply { open(runtime) }
+        popupSession.permissionDelegate = walletPermissionDelegate
         val view = GeckoView(this).apply { setSession(popupSession) }
         // A slim header with an explicit close control: the sheet covers the
         // browser, and the back gesture / tap-outside affordances are not
@@ -682,6 +745,7 @@ class MainActivity : AppCompatActivity() {
         private const val NMH_NAME = "zone.epix.nmh"
 
         // The dashboard's dark chrome + the desktop extension's icon colors.
+        private const val REQ_GECKO_PERMISSIONS = 1001
         private val COLOR_CHROME_BG = Color.parseColor("#0b0e14")
         private val COLOR_FIELD_BG = Color.parseColor("#1e293b")
         private val COLOR_TEXT = Color.parseColor("#cbd5e1")

@@ -15,6 +15,10 @@ tokio = { version = "1", features = ["rt", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Ledger hardware wallet over HID: Firefox/GeckoView/WKWebView have no
+# WebHID/WebUSB, so the wallet bridges APDUs to this host, which talks to the
+# device directly (the Ledger HID framing is in src/ledger.rs).
+hidapi = "2"
 
 [dev-dependencies]
 tempfile = "3"
