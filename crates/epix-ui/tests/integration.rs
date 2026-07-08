@@ -126,6 +126,7 @@ async fn transparent_proxy_serves_epix_host() {
     let wrapper = client
         .get(format!("http://{addr}/"))
         .header("host", "talk.epix")
+        .header("sec-fetch-mode", "navigate")
         .send()
         .await
         .unwrap();
@@ -139,6 +140,7 @@ async fn transparent_proxy_serves_epix_host() {
     let inner = client
         .get(format!("http://{addr}/index.html"))
         .header("host", "talk.epix")
+        .header("sec-fetch-mode", "navigate")
         .send()
         .await
         .unwrap();
@@ -146,7 +148,12 @@ async fn transparent_proxy_serves_epix_host() {
     assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
 
     // Normal localhost path mode is unchanged: path-prefixed URLs.
-    let path_mode = client.get(format!("http://{addr}/talk.epix/")).send().await.unwrap();
+    let path_mode = client
+        .get(format!("http://{addr}/talk.epix/"))
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
     let path_html = path_mode.text().await.unwrap();
     assert!(path_html.contains("/talk.epix/index.html"), "path mode keeps the prefix");
 }
