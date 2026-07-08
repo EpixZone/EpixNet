@@ -4,6 +4,7 @@
 //! adds the desktop concerns: platform data dir, single-instance lock, file
 //! logging, the bundled GeoIP asset, and `epix://` argument handling.
 
+mod actions;
 mod platform;
 
 use epix_node::{NodeOptions, DEFAULT_UI_ADDR};
@@ -22,6 +23,17 @@ fn ui_bind() -> String {
 
 #[tokio::main]
 async fn main() {
+    // CLI actions (siteCreate, siteSign, peerPing, ...) run and exit; the
+    // action name is the first argument, Python-CLI style. Anything else is
+    // a xite target and starts the node.
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(action) = cli.first().map(String::as_str).filter(|a| actions::is_action(a)) {
+        let root = platform::data_root();
+        std::fs::create_dir_all(&root).expect("create data root");
+        let code = actions::run(action, &cli[1..], &root, env!("CARGO_PKG_VERSION")).await;
+        std::process::exit(code);
+    }
+
     // Accept a raw `epix1…` address, a `.epix` name, or an `epix://…` deep link
     // (from the OS handing off a clicked link). Default to the dashboard.
     let raw = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());

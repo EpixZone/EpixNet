@@ -2140,6 +2140,111 @@ impl AppState {
         Ok(address)
     }
 
+    /// Author a brand-new empty xite (`siteCreate`): a fresh key derived from
+    /// the master seed, a starter index.html, a signed content.json, served
+    /// and owned. Returns (address, privatekey WIF) - the caller shows the
+    /// key to the author once.
+    pub async fn create_xite(self: &Arc<Self>) -> Result<(String, String), String> {
+        let (address, privatekey) = self.user.write().await.new_site_data()?;
+        self.save_user().await;
+        let dir = self.xite_dir(&address).ok_or("No data root")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let storage = XiteStorage::new(&dir);
+        storage
+            .write(
+                "index.html",
+                format!(
+                    "<!DOCTYPE html><html><body><h1>New Epix xite</h1>\
+                     <p>{address}</p><p>Replace this page and run siteSign.</p></body></html>"
+                )
+                .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+        let content = json!({ "address": address, "title": "My new xite", "files": {} });
+        storage
+            .write("content.json", &serde_json::to_vec(&content).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        self.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
+        self.sign_xite(&address, &privatekey).await?;
+        self.set_owned(&address, true).await;
+        self.log("INFO", format!("Created new xite {address}")).await;
+        Ok((address, privatekey))
+    }
+
+    /// Import a bundle (`importBundle`): a zip whose top-level directories are
+    /// xite addresses (optionally under one wrapper directory). Each is
+    /// extracted into the data dir, verified, and served. Returns the
+    /// addresses that imported cleanly.
+    pub async fn import_bundle(self: &Arc<Self>, bundle: &std::path::Path) -> Result<Vec<String>, String> {
+        let file = std::fs::File::open(bundle).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let root = self.data_root_path().ok_or("No data root")?.join("data");
+
+        // A single non-address top-level dir wraps the real content.
+        let tops: std::collections::HashSet<String> = (0..zip.len())
+            .filter_map(|i| {
+                let name = zip.by_index(i).ok()?.name().to_string();
+                Some(name.split('/').next()?.to_string())
+            })
+            .filter(|t| !t.is_empty())
+            .collect();
+        let prefix = match tops.len() {
+            1 => {
+                let top = tops.iter().next().unwrap();
+                if Address::parse(top.clone()).is_ok() { String::new() } else { format!("{top}/") }
+            }
+            _ => String::new(),
+        };
+
+        let mut addresses: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry.name().to_string();
+            let Some(rel) = name.strip_prefix(&prefix) else { continue };
+            let Some((address, inner)) = rel.split_once('/') else { continue };
+            if Address::parse(address.to_string()).is_err() || inner.is_empty() {
+                continue;
+            }
+            // Extract via XiteStorage so path traversal is rejected.
+            let storage = XiteStorage::new(root.join(address));
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| e.to_string())?;
+            storage.write(inner, &bytes).map_err(|e| e.to_string())?;
+            addresses.insert(address.to_string());
+        }
+
+        // Verify + serve each imported xite; drop ones whose root fails.
+        let mut imported = Vec::new();
+        for address in addresses {
+            if self.has_any_alias(&address).await {
+                imported.push(address);
+                continue;
+            }
+            let storage = XiteStorage::new(root.join(&address));
+            let Ok(addr) = Address::parse(address.clone()) else { continue };
+            let mut xite = Xite::new(addr, storage.clone());
+            match xite.load_content() {
+                Ok(true) => {
+                    let content = xite.content.clone();
+                    self.add_xite(&address, XiteEntry { storage, content }).await;
+                    imported.push(address);
+                }
+                _ => {
+                    self.log(
+                        "WARNING",
+                        format!("importBundle: {address} has no valid content.json, skipped"),
+                    )
+                    .await;
+                }
+            }
+        }
+        imported.sort();
+        Ok(imported)
+    }
+
     /// EpixNet's `QueryJson`: list rows from JSON files under a xite
     /// directory. `dir_inner_path` may hold one `*` segment
     /// (`data/users/*/data.json`); `query` is empty (whole file / the array
