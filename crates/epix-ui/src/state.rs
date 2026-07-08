@@ -335,6 +335,9 @@ pub struct AppState {
     /// the I2P inbound session is ready. Advertised in PEX so peers can reach
     /// and gossip us over I2P. Set by the runtime's I2P loop.
     i2p_address: RwLock<Option<String>>,
+    /// Whether the UI listener is bound to loopback - drives the
+    /// cross-origin gate's default (EpixNet enables it only there).
+    ui_loopback: RwLock<bool>,
     /// In-memory announce tracker: peers other nodes announced to us, keyed by
     /// xite hash, so this node answers `announce` like a Bootstrapper.
     tracker: crate::tracker::TrackerDb,
@@ -550,6 +553,7 @@ impl AppState {
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
+            ui_loopback: RwLock::new(false),
             tracker: crate::tracker::TrackerDb::new(),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -660,6 +664,7 @@ impl AppState {
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
+            ui_loopback: RwLock::new(false),
             tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1961,6 +1966,37 @@ impl AppState {
     /// Our `.b32.i2p` address (host without `.i2p`), if I2P inbound is ready.
     pub async fn i2p_address(&self) -> Option<String> {
         self.i2p_address.read().await.clone()
+    }
+
+    /// Record whether the UI listener bound to loopback (set at serve time).
+    pub async fn set_ui_loopback(&self, loopback: bool) {
+        *self.ui_loopback.write().await = loopback;
+    }
+
+    /// Whether the cross-origin request gate is on: the `ui_check_cors`
+    /// config key when set, else on for loopback binds only (a LAN/public
+    /// bind is a deliberate multi-client deployment), like EpixNet.
+    pub async fn ui_check_cors(&self) -> bool {
+        match self.config_get("ui_check_cors").await {
+            Some(v) => v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")),
+            None => *self.ui_loopback.read().await,
+        }
+    }
+
+    /// Whether `source` (a served xite, by address or alias) holds the
+    /// `Cors:<target>` permission - the grant that lets one xite read
+    /// another's files cross-origin (EpixNet's `hasCorsPermission`).
+    pub async fn has_cors_permission(&self, source: &str, target: &str) -> bool {
+        let xites = self.xites.read().await;
+        let Some(src) = self.resolve_xite(&xites, source) else { return false };
+        let target_canonical = self
+            .resolve_xite(&xites, target)
+            .map(|x| canonical_address(x.content.as_ref(), target));
+        src.settings.permissions.iter().any(|p| {
+            p.strip_prefix("Cors:").is_some_and(|granted| {
+                granted == target || Some(granted.to_string()) == target_canonical
+            })
+        })
     }
 
     /// Record this build's short git commit (reported in `serverInfo.rev`).

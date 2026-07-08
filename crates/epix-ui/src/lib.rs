@@ -118,6 +118,13 @@ impl UiServer {
         // Benchmark: a diagnostics page timing the node's hot paths.
         #[cfg(feature = "benchmark")]
         let router = router.route("/Benchmark", get(serve_benchmark));
+        // Tier 1 UI security (EpixNet's UiRequest.route entry checks): the
+        // Host allowlist (DNS-rebinding protection), the OPTIONS preflight
+        // answer, and the cross-origin request gate.
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            self.ctx.clone(),
+            security_gate,
+        ));
         // UiPassword: mount the login/logout routes and the session gate.
         #[cfg(feature = "ui-password")]
         let router = router
@@ -132,6 +139,10 @@ impl UiServer {
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        // EpixNet enables the cross-origin gate by default only on a loopback
+        // bind (a LAN/public bind is a deliberate multi-client deployment);
+        // the `ui_check_cors` config key overrides either way.
+        self.ctx.state.set_ui_loopback(addr.ip().is_loopback()).await;
         // Wrap the router so a transparent-proxy request (Firefox routing a
         // `*.epix` host to us) is rewritten from host form to the path form the
         // routes already understand, BEFORE routing. `Router::layer` runs after
@@ -143,6 +154,168 @@ impl UiServer {
         );
         axum::serve(listener, tower::make::Shared::new(app)).await
     }
+}
+
+/// The route-entry security checks, ported from EpixNet's `UiRequest.route`:
+///
+/// 1. **Host allowlist** (DNS-rebinding protection, `isHostAllowed`): a
+///    request must carry a Host we recognize - an IP literal, `localhost`, a
+///    `.epix` name (the transparent-proxy wildcard), or an operator-listed
+///    `ui_host` config entry. A rebinding attacker's DNS name matches none.
+/// 2. **OPTIONS preflight**: answered directly with the same headers EpixNet
+///    sends (`Access-Control-Allow-Origin: null` + the allow-list), never
+///    routed.
+/// 3. **Cross-origin gate** (`isCrossOriginRequest`): blocks non-navigation
+///    requests that are untraceable or from another origin, so a clearnet
+///    page cannot probe which xites this node serves. Cross-xite reads are
+///    allowed when the source xite holds the `Cors:<target>` permission.
+async fn security_gate(
+    State(ctx): State<Ctx>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host_raw = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !host_allowed(&ctx, &host_raw).await {
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "Invalid host: {host_raw}
+Add it to the ui_host config key, or access the UI                  by IP."
+            ),
+        )
+            .into_response();
+    }
+
+    if req.method() == axum::http::Method::OPTIONS {
+        return (
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "null".to_string()),
+                (
+                    header::ACCESS_CONTROL_ALLOW_HEADERS,
+                    "Origin, X-Requested-With, Content-Type, Accept, Cookie, Range, Referer"
+                        .to_string(),
+                ),
+                (header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".to_string()),
+            ],
+            "",
+        )
+            .into_response();
+    }
+
+    if ctx.state.ui_check_cors().await
+        && is_cross_origin_request(&ctx, req.headers(), req.uri().path(), &host_raw).await
+    {
+        return (StatusCode::FORBIDDEN, "Cross-origin request blocked").into_response();
+    }
+
+    next.run(req).await
+}
+
+/// EpixNet's `isHostAllowed`. The `.epix` wildcard covers transparent-proxy
+/// requests (the desktop browser routes every `*.epix` host to the node).
+async fn host_allowed(ctx: &Ctx, host: &str) -> bool {
+    if host.is_empty() {
+        return true; // HTTP/1.0-style, nothing to rebind
+    }
+    let bare = strip_port(host);
+    if bare == "localhost" || bare.parse::<std::net::IpAddr>().is_ok() {
+        return true; // IPs are not affected by DNS rebinding
+    }
+    if bare.ends_with(".epix") {
+        return true;
+    }
+    // Operator-listed extra hosts (reverse proxies etc.), one per line.
+    ctx.state
+        .config_get("ui_host")
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case(bare))
+}
+
+/// `host:port` -> `host`, handling `[v6]:port` and bare `[v6]`.
+fn strip_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+}
+
+/// EpixNet's `isCrossOriginRequest`, same decision order.
+async fn is_cross_origin_request(
+    ctx: &Ctx,
+    headers: &header::HeaderMap,
+    path: &str,
+    host: &str,
+) -> bool {
+    // User navigation is always allowed.
+    if headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) == Some("navigate") {
+        return false;
+    }
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+    // Untraceable requests are blocked for site paths (checked below for /).
+    if origin.is_none() && referer.is_none() && !is_public_ui_path(path) {
+        return true;
+    }
+    // A foreign origin never reads site content.
+    if let Some(origin) = origin {
+        if !url_is_same_host(origin, host) {
+            return true;
+        }
+    }
+    // Non-site-specific routes carry nothing to probe.
+    if is_public_ui_path(path) {
+        return false;
+    }
+    let Some(target) = path.trim_start_matches('/').split('/').next().filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    // Same-xite requests pass; cross-xite needs the Cors:<target> permission
+    // on the source xite.
+    let source = referer.and_then(|r| referer_site(ctx, r, host));
+    match source {
+        Some(source) if source == target => false,
+        Some(source) => !ctx.state.has_cors_permission(&source, target).await,
+        None => true,
+    }
+}
+
+/// Routes that identify no xite (safe to answer regardless of referer).
+fn is_public_ui_path(path: &str) -> bool {
+    path == "/" || is_global_path(path)
+}
+
+/// Whether `url`'s host equals the request `host` (both with ports ignored).
+fn url_is_same_host(url: &str, host: &str) -> bool {
+    let url_host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    strip_port(url_host) == strip_port(host)
+}
+
+/// The xite a referer URL points at: its first path segment, or - in
+/// transparent-proxy mode - the `.epix` host itself.
+fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
+    let after_scheme = referer
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let (ref_host, ref_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let ref_host = strip_port(ref_host);
+    if ref_host.ends_with(".epix") {
+        return Some(ref_host.to_string());
+    }
+    ref_path.split('/').next().filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 /// Global routes that are served the same regardless of Host (the UI chrome and
