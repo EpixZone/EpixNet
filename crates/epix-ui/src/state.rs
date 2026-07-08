@@ -1481,6 +1481,7 @@ impl AppState {
                     x.settings.serving = saved.serving;
                     x.settings.size_limit = saved.size_limit;
                     x.settings.autodownloadoptional = saved.autodownloadoptional;
+                    x.settings.optional_help = saved.optional_help;
                     x.settings.favorite = saved.favorite;
                     if saved.added > 0 {
                         x.settings.added = saved.added;
@@ -6301,6 +6302,46 @@ impl AppState {
             self.push_site_info(address).await;
         }
         ok
+    }
+
+    /// Mark a directory of optional files for distribution help
+    /// (`optionalHelp`): record `{directory: title}` and report the file
+    /// count + total size under it. Returns (num, size).
+    pub async fn optional_help_add(&self, address: &str, directory: &str, title: &str) -> Option<(i64, i64)> {
+        let mut xites = self.xites.write().await;
+        let x = xites.get_mut(address)?;
+        x.settings.optional_help.insert(directory.to_string(), json!(title));
+        // Tally the optional files under this directory prefix.
+        let (mut num, mut size) = (0i64, 0i64);
+        if let Some(content) = &x.content {
+            if let Some(files) = content.get("files_optional").and_then(|f| f.as_object()) {
+                for (path, info) in files {
+                    if path.starts_with(directory) {
+                        num += 1;
+                        size += info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+                    }
+                }
+            }
+        }
+        drop(xites);
+        self.persist_sites().await;
+        Some((num, size))
+    }
+
+    /// Stop helping distribute a directory (`optionalHelpRemove`). Returns
+    /// whether it was set.
+    pub async fn optional_help_remove(&self, address: &str, directory: &str) -> bool {
+        let removed = {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) => x.settings.optional_help.remove(directory).is_some(),
+                None => false,
+            }
+        };
+        if removed {
+            self.persist_sites().await;
+        }
+        removed
     }
 
     /// Set a xite's auto-download-optional flag (`siteSetAutodownloadoptional`).

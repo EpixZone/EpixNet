@@ -4,7 +4,7 @@
 //! plus the sizes/counts computed from its content.json.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Transient per-xite cache persisted with settings.
@@ -66,6 +66,11 @@ pub struct XiteSettings {
     pub size_limit: Option<i64>,
     #[serde(default)]
     pub autodownloadoptional: bool,
+    /// Directories the user opted to help distribute (optionalHelp):
+    /// `{dir_prefix: title}`. Files under these auto-download like
+    /// autodownloadoptional does for the whole site.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub optional_help: Map<String, Value>,
     /// Whether the user favourited this xite (sidebar star).
     #[serde(default)]
     pub favorite: bool,
@@ -97,6 +102,7 @@ impl XiteSettings {
             modified_files_notification: None,
             size_limit: None,
             autodownloadoptional: false,
+            optional_help: Map::new(),
             favorite: false,
             wrapper_key: epix_crypt::new_seed(),
             ajax_key: epix_crypt::new_seed(),
