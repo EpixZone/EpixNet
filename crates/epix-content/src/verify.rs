@@ -55,6 +55,12 @@ pub trait VerifyContext {
     fn resolve_xid(&self, _name: &str) -> Vec<String> {
         Vec::new()
     }
+    /// Read a stored (data) file by inner_path - used by the `max_items` rule,
+    /// which counts entries in the data.json files a content.json declares.
+    /// Contexts without storage return None, which skips that check.
+    fn read_file(&self, _inner_path: &str) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// The valid signer addresses for `inner_path`: the declared `signers` (root
@@ -111,7 +117,7 @@ pub fn verify_cert_sign(
 
 /// Resolve the rules for a non-root file by walking up to the nearest parent
 /// content.json that declares it under `includes` or `user_contents`.
-fn get_rules(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> Option<Value> {
+pub fn get_rules(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> Option<Value> {
     if inner_path == "content.json" {
         return Some(serde_json::json!({
             "signers": valid_signers(inner_path, content, ctx),
@@ -433,6 +439,28 @@ fn verify_content_rules(
             }
         }
     }
+    // `max_items`: cap the entry count of arrays in the declared data.json
+    // files (a spam guard for user content: {"comment": 100} allows at most
+    // 100 comments). Only checkable when the context can read storage.
+    if let Some(max_items) = rules.get("max_items").and_then(|v| v.as_object()) {
+        let dir = inner_path.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_default();
+        for rel in content.get("files").and_then(|v| v.as_object()).into_iter().flat_map(|m| m.keys())
+        {
+            if !rel.ends_with("data.json") {
+                continue;
+            }
+            let Some(bytes) = ctx.read_file(&format!("{dir}{rel}")) else { continue };
+            let Ok(data) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            for (key, limit) in max_items {
+                let Some(limit) = limit.as_i64() else { continue };
+                let count =
+                    data.get(key).and_then(|v| v.as_array()).map(|a| a.len() as i64).unwrap_or(0);
+                if count > limit {
+                    return err(format!("Too many items in {rel}.{key}: {count} > {limit}"));
+                }
+            }
+        }
+    }
     if rules.get("includes_allowed") == Some(&Value::Bool(false))
         && content.get("includes").and_then(|v| v.as_object()).is_some_and(|m| !m.is_empty())
     {
@@ -473,6 +501,13 @@ pub fn verify_content_file(
         return err("Invalid cert!");
     }
 
+    // EpixNet's `isArchived`: a parent may archive a user directory (or
+    // everything before a timestamp); content at or before that time is
+    // revoked and can no longer be pushed.
+    if inner_path != "content.json" && is_archived(inner_path, content, ctx) {
+        return err("This file is archived!");
+    }
+
     // Count valid signatures from the valid signers.
     let data = signed_data(content);
     let mut valid = 0u64;
@@ -498,6 +533,29 @@ pub fn verify_content_file(
     verify_content_rules(inner_path, content, raw_len, ctx)
 }
 
+/// EpixNet's `isArchived`: whether the parent's `user_contents` marks this
+/// file's directory as archived (`archived[dirname] >= modified`) or the whole
+/// tree as archived before a time (`archived_before >= modified`).
+fn is_archived(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> bool {
+    let parent_path = parent_content_path(inner_path);
+    let Some(dirname) = inner_path
+        .strip_suffix("/content.json")
+        .and_then(|d| d.rsplit_once('/').map(|(_, name)| name))
+    else {
+        return false;
+    };
+    let Some(parent) = ctx.loaded_content(&parent_path) else { return false };
+    let Some(uc) = parent.get("user_contents") else { return false };
+    let modified = content.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let before = uc.get("archived_before").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let dir_archived = uc
+        .get("archived")
+        .and_then(|a| a.get(dirname))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    modified <= before || modified <= dir_archived
+}
+
 fn sum_file_sizes(content: &Value, node: &str) -> i64 {
     content
         .get(node)
@@ -513,13 +571,31 @@ fn sum_file_sizes(content: &Value, node: &str) -> i64 {
 }
 
 /// EpixNet's `isValidRelativePath`: no `..`, no leading slash, no control/quote
-/// characters, not absolute.
+/// characters, not absolute, and no Windows-reserved device names (a xite
+/// carrying `CON/x.txt` would be undownloadable on Windows peers).
 fn is_valid_relative_path(path: &str) -> bool {
     if path.is_empty() || path.starts_with('/') || path.contains("..") {
         return false;
     }
     // Reject characters EpixNet forbids in inner paths.
-    !path.chars().any(|c| c.is_control() || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    if path
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return false;
+    }
+    // Reserved on Windows, as a directory segment or a file's base name
+    // (`CON`, `CON.txt`, and `a/PRN/b` are all invalid there). Uppercase only,
+    // exactly like EpixNet's regex - being stricter would reject content that
+    // Python nodes accept and split the network.
+    !path.split('/').any(|segment| {
+        let base = segment.split('.').next().unwrap_or(segment);
+        matches!(base, "CON" | "PRN" | "AUX" | "NUL" | "CONOUT$" | "CONIN$")
+            || (base.len() == 4
+                && (base.starts_with("COM") || base.starts_with("LPT"))
+                && base.as_bytes()[3].is_ascii_digit()
+                && base.as_bytes()[3] != b'0')
+    })
 }
 
 /// Anchored full-string regex match (`^pat$`), as EpixNet's `SafeRe.match` with
@@ -806,5 +882,125 @@ mod tests {
         assert!(!is_valid_relative_path("../secret"));
         assert!(!is_valid_relative_path("/etc/passwd"));
         assert!(!is_valid_relative_path("a\\b"));
+        // Windows-reserved device names, matching EpixNet's (uppercase-only)
+        // regex: as a segment or a base name, at any depth.
+        assert!(!is_valid_relative_path("CON"));
+        assert!(!is_valid_relative_path("CON.txt"));
+        assert!(!is_valid_relative_path("data/PRN/file.txt"));
+        assert!(!is_valid_relative_path("COM1.log"));
+        assert!(!is_valid_relative_path("js/LPT9"));
+        assert!(is_valid_relative_path("CONFIG.txt")); // prefix only, allowed
+        assert!(is_valid_relative_path("COM0.txt")); // COM0 is not reserved
+        assert!(is_valid_relative_path("con.txt")); // lowercase, like EpixNet
+    }
+
+    /// A user content.json signed by its own dir keypair, with a permissive
+    /// user_contents parent - the shared fixture for the rules tests below.
+    fn user_content_fixture(
+        parent_extra: Value,
+        content_extra: Value,
+    ) -> (String, Value, Vec<u8>, std::collections::HashMap<String, Value>) {
+        let user_pk = epix_crypt::new_seed();
+        let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let mut parent = json!({
+            "address": "1Site", "inner_path": "data/users/content.json", "modified": 1,
+            "user_contents": { "cert_signers": {}, "permissions": {} },
+        });
+        merge(&mut parent["user_contents"], parent_extra);
+        let inner = format!("data/users/{user_addr}/content.json");
+        let mut content = json!({
+            "address": "1Site", "inner_path": inner, "modified": 100, "files": {},
+        });
+        merge(&mut content, content_extra);
+        let (content, bytes) = sign_content(content, &user_pk);
+        let mut loaded = std::collections::HashMap::new();
+        loaded.insert("data/users/content.json".to_string(), parent);
+        (inner, content, bytes, loaded)
+    }
+
+    fn merge(into: &mut Value, from: Value) {
+        if let (Some(a), Some(b)) = (into.as_object_mut(), from.as_object()) {
+            for (k, v) in b {
+                a.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn archived_user_directory_is_revoked() {
+        // The parent archives this user dir at t=500: content modified at or
+        // before that is rejected; newer content is accepted again.
+        let (inner, content, bytes, loaded) = user_content_fixture(json!({}), json!({}));
+        let dirname = inner.split('/').nth(2).unwrap().to_string();
+
+        // archived[dirname] = 500 >= modified 100 -> revoked.
+        let mut loaded_archived = loaded.clone();
+        loaded_archived.get_mut("data/users/content.json").unwrap()["user_contents"]["archived"] =
+            json!({ dirname.clone(): 500 });
+        let ctx = Ctx { address: "1Site".into(), loaded: loaded_archived, limit: i64::MAX };
+        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+        assert!(e.0.contains("archived"), "{}", e.0);
+
+        // archived_before = 500 >= modified 100 -> also revoked.
+        let mut loaded_before = loaded.clone();
+        loaded_before.get_mut("data/users/content.json").unwrap()["user_contents"]
+            ["archived_before"] = json!(500);
+        let ctx = Ctx { address: "1Site".into(), loaded: loaded_before, limit: i64::MAX };
+        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+        assert!(e.0.contains("archived"), "{}", e.0);
+
+        // No archive rules -> passes.
+        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+        assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
+    }
+
+    /// Ctx variant whose read_file serves an in-memory data.json, for the
+    /// max_items check.
+    struct DataCtx {
+        inner: Ctx,
+        data: std::collections::HashMap<String, Vec<u8>>,
+    }
+    impl VerifyContext for DataCtx {
+        fn site_address(&self) -> &str {
+            self.inner.site_address()
+        }
+        fn loaded_content(&self, inner_path: &str) -> Option<Value> {
+            self.inner.loaded_content(inner_path)
+        }
+        fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
+            self.data.get(inner_path).cloned()
+        }
+    }
+
+    #[test]
+    fn max_items_rule_caps_data_json_arrays() {
+        // permission_rules grant max_items {comment: 2}; a data.json with 3
+        // comments is rejected, 2 pass.
+        let (inner, content, bytes, loaded) = user_content_fixture(
+            json!({ "permission_rules": { ".*": { "max_items": { "comment": 2 } } } }),
+            json!({ "files": { "data.json": { "size": 1, "sha512": "00" } } }),
+        );
+        let dir = inner.rsplit_once('/').unwrap().0;
+        let base = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+
+        let mut data = std::collections::HashMap::new();
+        data.insert(
+            format!("{dir}/data.json"),
+            serde_json::to_vec(&json!({ "comment": [1, 2, 3] })).unwrap(),
+        );
+        let ctx = DataCtx { inner: base, data };
+        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+        assert!(e.0.contains("Too many items"), "{}", e.0);
+
+        let mut data = std::collections::HashMap::new();
+        data.insert(
+            format!("{dir}/data.json"),
+            serde_json::to_vec(&json!({ "comment": [1, 2] })).unwrap(),
+        );
+        let ctx = DataCtx {
+            inner: Ctx { address: "1Site".into(), loaded: ctx.inner.loaded, limit: i64::MAX },
+            data,
+        };
+        assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
     }
 }
