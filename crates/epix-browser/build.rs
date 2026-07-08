@@ -77,7 +77,11 @@ fn stage_wallet_ext() {
         return;
     }
 
-    println!("cargo:warning=shells/wallet-ext is empty; downloading the prebuilt wallet from {WALLET_DIST_URL}");
+    // Informational, not a warning: fetching the prebuilt wallet is the normal
+    // path on a fresh checkout (the dir is a build-time staging area, gitignored
+    // except its README). A plain build-script message shows only under
+    // `cargo build -vv`; a real failure still panics below.
+    println!("epix-browser: staging the Epix Wallet from {WALLET_DIST_URL}");
     if let Err(e) = download_wallet(&dest) {
         panic!(
             "could not stage the Epix Wallet extension: {e}\n\
