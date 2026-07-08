@@ -11,10 +11,14 @@
 //! - `{"cmd":"getClearnetAllow","site":"talk.epix"}` -> `{ allow: bool }`
 //! - `{"cmd":"setClearnetAllow","site":"talk.epix","allow":true}` -> `{ ok }`
 //! - `{"cmd":"listClearnetAllow"}` -> `{ sites: [..] }`
+//! - `{"cmd":"ledgerList"}` -> `{ devices: [..] }` (Ledger over HID)
+//! - `{"cmd":"ledgerExchange","apdu":"<hex>"}` -> `{ response: "<hex>" }`
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+pub mod ledger;
 
 /// Per-browser settings persisted next to the node data (which sites may reach
 /// clearnet). The extension enforces the block; this is the source of truth.
@@ -176,6 +180,15 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             json!({ "ok": true, "site": site, "allow": allow })
         }
         "listClearnetAllow" => json!({ "sites": settings.allowed_sites() }),
+        // Ledger hardware wallet over HID (see src/ledger.rs). Blocking HID
+        // I/O, so run it off the async runtime's worker.
+        "ledgerList" => ledger::list(),
+        "ledgerExchange" => {
+            let req = req.clone();
+            tokio::task::spawn_blocking(move || ledger::exchange(&req))
+                .await
+                .unwrap_or_else(|e| json!({ "error": format!("ledger task: {e}") }))
+        }
         other => json!({ "error": format!("unknown command: {other}") }),
     }
 }

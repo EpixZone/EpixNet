@@ -54,6 +54,27 @@ yarn && yarn build:libs
 yarn workspace @keplr-wallet/extension build   # -> apps/extension/build/firefox
 ```
 
+### Hardware wallets
+
+Keplr's stock hardware flows use WebHID/WebUSB, which only Chromium has. The
+fork routes every Ledger transport open through one chokepoint
+(`utils/ledger-transport.ts` in the wallet repo): on Chromium it uses
+WebHID/WebUSB as before; on the Epix shells it bridges APDUs over the
+extension's native messaging to `epix-nmh`, which talks to the device with
+`hidapi` (`ledgerList` / `ledgerExchange` commands, Ledger HID framing in
+`crates/epix-nmh/src/ledger.rs`). This works on desktop today; Android (USB
+OTG) and iOS (BLE) transports are not implemented yet, so Ledger there is
+desktop-only for now. End-to-end signing still needs a physical Ledger to
+verify; the host side is verified down to "no device connected".
+
+Keystone needs no bridge: its QR mode pairs and signs with animated QR codes
+and the camera, which works in all three shells. The register flow only offers
+its USB mode where WebUSB exists. Camera plumbing per shell: desktop Firefox
+prompts natively; Android grants it to the wallet's own pages through a
+`PermissionDelegate` (plus the `CAMERA` manifest permission); iOS answers the
+capture ask for the wallet sheet's loopback origin (plus
+`NSCameraUsageDescription`).
+
 ## Running the desktop browser locally
 
 ```

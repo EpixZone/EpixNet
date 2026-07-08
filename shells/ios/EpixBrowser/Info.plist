@@ -32,5 +32,9 @@
     <!-- BLE mesh (Reticulum). -->
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Epix uses Bluetooth to sync sites over the mesh when offline.</string>
+
+    <!-- Wallet: Keystone hardware-wallet pairing scans animated QR codes. -->
+    <key>NSCameraUsageDescription</key>
+    <string>Epix uses the camera to scan QR codes when pairing a Keystone hardware wallet.</string>
 </dict>
 </plist>
