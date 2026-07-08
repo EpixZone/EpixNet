@@ -35,8 +35,11 @@ impl PeerServer {
         (self.version.clone(), self.rev)
     }
 
-    /// Serve inbound TCP connections until the listener errors.
+    /// Serve inbound TCP connections until the listener errors. The listener's
+    /// own port is advertised as `fileserver_port` in handshake replies (a
+    /// Python peer requires the field and adopts it as our dial-back port).
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
         loop {
             let (sock, addr) = listener.accept().await?;
             let _ = sock.set_nodelay(true);
@@ -45,7 +48,7 @@ impl PeerServer {
             let rev = self.rev;
             tokio::spawn(async move {
                 let stream: epix_transport::PeerStream = Box::pin(sock);
-                serve_stream(handler, PeerAddr::Ip(addr), stream, &version, rev).await;
+                serve_stream(handler, PeerAddr::Ip(addr), stream, &version, rev, port).await;
             });
         }
     }
@@ -61,6 +64,7 @@ pub async fn serve_stream(
     mut stream: epix_transport::PeerStream,
     version: &str,
     rev: i64,
+    fileserver_port: u16,
 ) {
     let mut buf = Vec::new();
     while let Ok(req) = read_msg(&mut stream, &mut buf).await {
@@ -81,7 +85,7 @@ pub async fn serve_stream(
                     peer = PeerAddr::Ip(dialable);
                 }
             }
-            handshake_response(version, rev)
+            handshake_response(version, rev, fileserver_port)
         } else {
             handler.handle(&peer, &cmd, &params).await
         };
@@ -128,7 +132,7 @@ fn split_stream_body(body: Value) -> (Value, Option<Vec<u8>>) {
     (Value::Map(fields), raw)
 }
 
-fn handshake_response(version: &str, rev: i64) -> Value {
+fn handshake_response(version: &str, rev: i64, fileserver_port: u16) -> Value {
     vmap(vec![
         ("version", Value::from(version)),
         ("rev", Value::from(rev)),
@@ -136,6 +140,11 @@ fn handshake_response(version: &str, rev: i64) -> Value {
         ("use_bin_type", Value::from(true)),
         ("peer_id", Value::from("")),
         ("crypt_supported", Value::Array(vec![])),
+        ("crypt", Value::Nil),
+        // A Python peer requires this field (KeyError without it) and adopts
+        // it as our dial-back port; 0 means "not connectable back" there.
+        ("fileserver_port", Value::from(fileserver_port)),
+        ("port_opened", Value::from(fileserver_port != 0)),
     ])
 }
 

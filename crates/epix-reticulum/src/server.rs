@@ -55,7 +55,8 @@ impl ReticulumServer {
             let version = self.version.clone();
             let rev = self.rev;
             tokio::spawn(async move {
-                serve_stream(handler, PeerAddr::Rns(addr), stream, &version, rev).await;
+                // Mesh destinations aren't port-addressed; advertise 0.
+                serve_stream(handler, PeerAddr::Rns(addr), stream, &version, rev, 0).await;
             });
         }
     }
