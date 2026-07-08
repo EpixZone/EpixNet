@@ -52,8 +52,8 @@ You should see a version number.
 ## 3. Download EpixNet
 
 ```sh
-git clone https://github.com/EpixZone/Epix.git
-cd Epix
+git clone https://github.com/EpixZone/EpixNet.git
+cd EpixNet
 ```
 
 ## 4. Build it

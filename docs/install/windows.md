@@ -36,8 +36,8 @@ You should see a version number.
 ## 4. Download EpixNet
 
 ```powershell
-git clone https://github.com/EpixZone/Epix.git
-cd Epix
+git clone https://github.com/EpixZone/EpixNet.git
+cd EpixNet
 ```
 
 ## 5. Build it

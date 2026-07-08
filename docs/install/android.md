@@ -28,8 +28,8 @@ cargo install cargo-ndk
 ## 4. Get the code
 
 ```sh
-git clone https://github.com/EpixZone/Epix.git
-cd Epix
+git clone https://github.com/EpixZone/EpixNet.git
+cd EpixNet
 ```
 
 ## 5. Build the EpixNet core for Android
