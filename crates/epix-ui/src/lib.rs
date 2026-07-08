@@ -1164,6 +1164,9 @@ fn render_config_page(
 /// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
 /// directory inside a xite with links to navigate and open files.
 async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    if !ctx.state.plugin_enabled("UiFileManager").await {
+        return (StatusCode::NOT_FOUND, "UiFileManager plugin is disabled").into_response();
+    }
     let (address, inner) = match path.split_once('/') {
         Some((a, i)) => (a.to_string(), i.trim_end_matches('/').to_string()),
         None => (path.clone(), String::new()),
@@ -1576,6 +1579,9 @@ async fn bigfile_upload(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if !ctx.state.bigfile_enabled().await {
+        return (StatusCode::FORBIDDEN, "Bigfile plugin is disabled").into_response();
+    }
     let Some(nonce) = q.upload_nonce else {
         return (StatusCode::BAD_REQUEST, "missing upload_nonce").into_response();
     };
