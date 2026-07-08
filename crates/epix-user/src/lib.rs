@@ -145,6 +145,26 @@ impl User {
         Ok(&self.sites[address])
     }
 
+    /// Derive a brand-new owned-site keypair from the master seed (EpixNet's
+    /// `getNewSiteData`): a random index into `hd_privatekey`, recorded with
+    /// the privatekey so publishes auto-sign. Returns (address, privatekey).
+    pub fn new_site_data(&mut self) -> Result<(String, String), String> {
+        // Index from fresh key entropy (no extra RNG dependency).
+        let entropy = epix_crypt::new_seed();
+        let index = u64::from_str_radix(&entropy[..12], 16).map_err(|e| e.to_string())?
+            % 100_000_000;
+        let privatekey = epix_crypt::hd_privatekey(&self.master_seed, index)?;
+        let address = epix_crypt::privatekey_to_address(&privatekey)?;
+        if self.sites.contains_key(&address) {
+            return Err("Random collision: site already exists".into());
+        }
+        self.site_data(&address)?;
+        if let Some(auth) = self.sites.get_mut(&address) {
+            auth.privatekey = Some(privatekey.clone());
+        }
+        Ok((address, privatekey))
+    }
+
     /// The auth address shown for `address` - the selected cert's if one is
     /// active, otherwise the xite's own derived auth address.
     pub fn auth_address(&mut self, address: &str) -> Result<String, String> {

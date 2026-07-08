@@ -361,6 +361,9 @@ pub struct AppState {
     /// Whether the UI listener is bound to loopback - drives the
     /// cross-origin gate's default (EpixNet enables it only there).
     ui_loopback: RwLock<bool>,
+    /// Cert signatures the user marked bad (`badCert`); inbound user content
+    /// carrying one is rejected. Session-scoped.
+    bad_certs: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Our Reticulum mesh address (destination hash, hex), once the mesh is up.
     rns_address: RwLock<Option<String>>,
     /// In-memory announce tracker: peers other nodes announced to us, keyed by
@@ -589,6 +592,7 @@ impl AppState {
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
             ui_loopback: RwLock::new(false),
+            bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
             rns_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             pins_path: None,
@@ -702,6 +706,7 @@ impl AppState {
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
             ui_loopback: RwLock::new(false),
+            bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
             rns_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2019,6 +2024,286 @@ impl AppState {
             Some(v) => v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")),
             None => *self.ui_loopback.read().await,
         }
+    }
+
+    /// EpixNet's `Site.clone`: copy the source xite's template files into a
+    /// brand-new site (or a given target we own), rewrite content.json for
+    /// the new owner, sign it with the new key, and serve it. Template
+    /// convention: paths containing `-default` are the clean starting state -
+    /// they are copied with the suffix stripped, and the source's live
+    /// counterparts (e.g. `data/` next to `data-default/`) are NOT copied, so
+    /// a cloned blog starts empty instead of with the author's posts.
+    /// Returns the new site's address.
+    pub async fn clone_xite(
+        self: &Arc<Self>,
+        source: &str,
+        root_inner_path: &str,
+        target_address: Option<String>,
+    ) -> Result<String, String> {
+        let src_storage = {
+            let xites = self.xites.read().await;
+            self.resolve_xite(&xites, source).map(|x| x.storage.clone()).ok_or("Unknown site")?
+        };
+        // Refuse mid-sync sources (EpixNet: "Site still in sync").
+        let bad = self.bad_files(source).await;
+        if bad.iter().any(|f| !f.ends_with("content.json") && !f.contains("data/users/")) {
+            return Err("Site still in sync".into());
+        }
+        let root = root_inner_path.trim_matches('/');
+        let prefix = if root.is_empty() { String::new() } else { format!("{root}/") };
+
+        // The new owner's key: a fresh derivation, or the target's saved key.
+        let (address, privatekey) = match target_address {
+            Some(target) => {
+                let key = self
+                    .site_privatekey(&target)
+                    .await
+                    .ok_or("Target site private key not known")?;
+                (target, key)
+            }
+            None => {
+                let pair = self.user.write().await.new_site_data()?;
+                self.save_user().await;
+                pair
+            }
+        };
+
+        // The template content.json: `content.json-default` wins over the live
+        // one (template sites ship their clean copy there).
+        let template = src_storage
+            .read(&format!("{prefix}content.json-default"))
+            .or_else(|_| src_storage.read(&format!("{prefix}content.json")))
+            .map_err(|_| "Source has no content.json".to_string())?;
+        let mut content: Value =
+            serde_json::from_slice(&template).map_err(|_| "Invalid template content.json")?;
+        let map = content.as_object_mut().ok_or("Invalid template content.json")?;
+        for key in ["domain", "xid_name", "signs", "signers_sign", "address_index", "inner_path"] {
+            map.remove(key);
+        }
+        let title = map.get("title").and_then(|v| v.as_str()).unwrap_or("New Epix Site");
+        map.insert("title".into(), json!(format!("My {title}")));
+        map.insert("cloned_from".into(), json!(source));
+        if !root.is_empty() {
+            map.insert("clone_root".into(), json!(root));
+        }
+        map.insert("address".into(), json!(address));
+        map.insert("files".into(), json!({}));
+
+        // Copy the files. Normal files are skipped when a `-default` variant
+        // owns their target path; `-default` paths land de-suffixed.
+        let dst_dir = self.xite_dir(&address).ok_or("No data root")?;
+        std::fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
+        let dst_storage = XiteStorage::new(&dst_dir);
+        let files = src_storage.list_files();
+        // Target prefixes owned by -default sources (e.g. `data-default/…`
+        // owns `data/…`).
+        let default_roots: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.strip_prefix(&prefix))
+            .filter(|rel| rel.contains("-default"))
+            .filter_map(|rel| {
+                rel.split("-default").next().map(|head| format!("{head}"))
+            })
+            .collect();
+        for inner in &files {
+            let Some(rel) = inner.strip_prefix(&prefix) else { continue };
+            if rel == "content.json"
+                || rel == "content.json-default"
+                || rel.ends_with("-old")
+                || rel.ends_with("-new")
+            {
+                continue;
+            }
+            let target_rel = if rel.contains("-default") {
+                rel.replace("-default", "")
+            } else if default_roots.iter().any(|d| !d.is_empty() && rel.starts_with(d.as_str())) {
+                continue; // the -default variant supplies this tree
+            } else {
+                rel.to_string()
+            };
+            if let Ok(bytes) = src_storage.read(inner) {
+                let _ = dst_storage.write(&target_rel, &bytes);
+            }
+        }
+        if !dst_storage.exists("index.html") {
+            let _ = dst_storage.write("index.html", b"<h1>My new site</h1>");
+        }
+        dst_storage
+            .write("content.json", &serde_json::to_vec(&content).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+
+        // Serve it, sign it as the new owner, and mark it ours.
+        self.add_xite(&address, XiteEntry { storage: dst_storage, content: Some(content) }).await;
+        self.sign_xite(&address, &privatekey).await?;
+        self.set_owned(&address, true).await;
+        self.log("INFO", format!("Cloned {source} -> {address} (root: {root:?})")).await;
+        Ok(address)
+    }
+
+    /// EpixNet's `QueryJson`: list rows from JSON files under a xite
+    /// directory. `dir_inner_path` may hold one `*` segment
+    /// (`data/users/*/data.json`); `query` is empty (whole file / the array
+    /// at a dotted path) or `dotted.path=intval` filtering a list of objects.
+    /// Each row carries `inner_path` (the wildcard match). `fileQuery`.
+    pub async fn query_json_files(
+        &self,
+        address: &str,
+        dir_inner_path: &str,
+        query: &str,
+    ) -> Vec<Value> {
+        let storage = {
+            let xites = self.xites.read().await;
+            match self.resolve_xite(&xites, address) {
+                Some(x) => x.storage.clone(),
+                None => return Vec::new(),
+            }
+        };
+        // Expand the single `*` wildcard against the file list.
+        let matches: Vec<(String, String)> = if let Some((head, tail)) =
+            dir_inner_path.split_once("*")
+        {
+            let head = head.to_string();
+            let tail = tail.trim_start_matches('/').to_string();
+            storage
+                .list_files()
+                .into_iter()
+                .filter_map(|f| {
+                    let rest = f.strip_prefix(&head)?;
+                    let (dir, file) = rest.split_once('/')?;
+                    (file == tail).then(|| (f.clone(), dir.to_string()))
+                })
+                .collect()
+        } else {
+            vec![(dir_inner_path.to_string(), String::new())]
+        };
+
+        let (filter_path, filter_val) = match query.split_once('=') {
+            Some((p, v)) => (p.trim(), v.trim().parse::<i64>().ok()),
+            None => (query.trim(), None),
+        };
+        let mut rows = Vec::new();
+        for (inner, wildcard) in matches {
+            let Ok(bytes) = storage.read(&inner) else { continue };
+            let Ok(mut data) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            // Walk the dotted path.
+            if !filter_path.is_empty() {
+                for key in filter_path.split('.') {
+                    data = match data.get(key) {
+                        Some(v) => v.clone(),
+                        None => Value::Null,
+                    };
+                }
+            }
+            match (&data, filter_val) {
+                // A list filtered by `key=val` on the LAST path segment is
+                // handled below; a plain list expands to rows.
+                (Value::Array(items), None) => {
+                    for item in items {
+                        let mut row = item.clone();
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert("inner_path".into(), json!(wildcard));
+                        }
+                        rows.push(row);
+                    }
+                }
+                _ => {
+                    if filter_val.is_some() {
+                        // `list.key=val`: the path minus its last segment is
+                        // the list, the last segment the field to match.
+                        let mut parts: Vec<&str> = filter_path.split('.').collect();
+                        let field = parts.pop().unwrap_or("");
+                        let mut node = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+                        for key in &parts {
+                            node = node.get(*key).cloned().unwrap_or(Value::Null);
+                        }
+                        if let Some(items) = node.as_array() {
+                            for item in items {
+                                if item.get(field).and_then(|v| v.as_i64()) == filter_val {
+                                    let mut row = item.clone();
+                                    if let Some(obj) = row.as_object_mut() {
+                                        obj.insert("inner_path".into(), json!(wildcard));
+                                    }
+                                    rows.push(row);
+                                }
+                            }
+                        }
+                    } else if !data.is_null() {
+                        let mut row = data.clone();
+                        if let Some(obj) = row.as_object_mut() {
+                            obj.insert("inner_path".into(), json!(wildcard));
+                        }
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Files whose on-disk bytes differ from what the signed content.json
+    /// declares - possibly-unsigned local changes (`siteListModifiedFiles`).
+    /// Paths under an `includes` entry are separately-signed units and are
+    /// skipped, like EpixNet.
+    pub async fn list_modified_files(&self, address: &str) -> Vec<String> {
+        let (storage, content) = {
+            let xites = self.xites.read().await;
+            match self.resolve_xite(&xites, address) {
+                Some(x) => (x.storage.clone(), x.content.clone()),
+                None => return Vec::new(),
+            }
+        };
+        let Some(content) = content else { return Vec::new() };
+        let include_dirs: Vec<String> = content
+            .get("includes")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.keys()
+                    .filter_map(|k| k.rsplit_once('/').map(|(d, _)| format!("{d}/")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        if let Some(files) = content.get("files").and_then(|v| v.as_object()) {
+            for (rel, info) in files {
+                if include_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
+                    continue;
+                }
+                let declared_size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let declared_hash = info.get("sha512").and_then(|v| v.as_str()).unwrap_or("");
+                match storage.read(rel) {
+                    Err(_) => out.push(rel.clone()), // missing = modified
+                    Ok(bytes) => {
+                        if bytes.len() as i64 != declared_size
+                            || XiteStorage::hash_bytes(&bytes) != declared_hash
+                        {
+                            out.push(rel.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Set the one per-site settings key EpixNet lets a page change
+    /// (`siteSetSettingsValue`): `modified_files_notification`.
+    pub async fn set_modified_files_notification(&self, address: &str, value: bool) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.settings.modified_files_notification = Some(value);
+        }
+        self.persist_sites().await;
+    }
+
+    /// Record a cert signature as bad (`badCert`): inbound user content
+    /// carrying it is rejected from now on. In-memory, like a session-scoped
+    /// revocation; the authoritative revocation is the parent's archive rules.
+    pub fn add_bad_cert(&self, sign: &str) {
+        self.bad_certs.lock().unwrap().insert(sign.to_string());
+    }
+
+    /// Whether a cert signature was marked bad this session.
+    pub fn is_bad_cert(&self, sign: &str) -> bool {
+        self.bad_certs.lock().unwrap().contains(sign)
     }
 
     /// Whether `source` (a served xite, by address or alias) holds the
@@ -5537,6 +5822,12 @@ impl AppState {
             // An include / user content.json: verified against its on-disk
             // parent's rules (signers, cert, max_size, files_allowed), with
             // any xID-name signers resolved on-chain first.
+            if let Some(sign) = new.get("cert_sign").and_then(|v| v.as_str()) {
+                if self.is_bad_cert(sign) {
+                    self.updates_in_flight.lock().unwrap().remove(&uri);
+                    return Err(format!("File {inner_path} invalid: Invalid cert!"));
+                }
+            }
             let xid_map = Self::resolve_xid_map(&xite.storage, inner_path).await;
             match xite.add_content(inner_path, &bytes, &xid_map) {
                 Ok(files) => {
