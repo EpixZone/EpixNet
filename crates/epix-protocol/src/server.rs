@@ -86,10 +86,46 @@ pub async fn serve_stream(
             handler.handle(&peer, &cmd, &params).await
         };
 
+        // `streamFile` uses EpixNet's raw-stream framing: the msgpack reply
+        // carries `stream_bytes` (no `body`) and the file bytes follow raw on
+        // the socket. Handlers answer it like `getFile`; the reframe happens
+        // here so it holds for every handler and transport.
+        let (body, raw_tail) =
+            if cmd == "streamFile" { split_stream_body(body) } else { (body, None) };
+
         if send_msg(&mut stream, &response(req_id, body)).await.is_err() {
             break;
         }
+        if let Some(bytes) = raw_tail {
+            use tokio::io::AsyncWriteExt;
+            if stream.write_all(&bytes).await.is_err() || stream.flush().await.is_err() {
+                break;
+            }
+        }
     }
+}
+
+/// Turn a `getFile`-shaped body (`{body, size, location}`) into the
+/// `streamFile` reply shape: drop `body`, add `stream_bytes`, and hand the
+/// raw bytes back to be written after the msgpack message. Error replies (no
+/// `body`) pass through unchanged.
+fn split_stream_body(body: Value) -> (Value, Option<Vec<u8>>) {
+    let Value::Map(mut fields) = body else { return (body, None) };
+    let mut raw: Option<Vec<u8>> = None;
+    fields.retain(|(k, v)| {
+        if k.as_str() == Some("body") {
+            if let Value::Binary(b) = v {
+                raw = Some(b.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(bytes) = &raw {
+        fields.push((Value::from("stream_bytes"), Value::from(bytes.len() as i64)));
+    }
+    (Value::Map(fields), raw)
 }
 
 fn handshake_response(version: &str, rev: i64) -> Value {
