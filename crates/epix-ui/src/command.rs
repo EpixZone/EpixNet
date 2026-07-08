@@ -304,6 +304,39 @@ impl CommandRegistry {
             session.state.push_notification("error", msg, 0);
             return Err(msg.into());
         }
+        // `as`: run another command in the context of a different xite
+        // (EpixNet's actionAs). Allowed for the bound xite itself, or when the
+        // CALLER's bound xite holds ADMIN; the inner command re-enters this
+        // dispatcher on a rebound session, so its own gates still apply.
+        if cmd == "as" {
+            let target = params
+                .get("address")
+                .or_else(|| params.as_array().and_then(|a| a.first()))
+                .and_then(|v| v.as_str())
+                .ok_or("Missing address")?
+                .to_string();
+            let inner_cmd = params
+                .get("cmd")
+                .or_else(|| params.as_array().and_then(|a| a.get(1)))
+                .and_then(|v| v.as_str())
+                .ok_or("Missing cmd")?
+                .to_string();
+            let inner_params = params
+                .get("params")
+                .or_else(|| params.as_array().and_then(|a| a.get(2)))
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let allowed = session.xite.as_deref() == Some(target.as_str())
+                || match &session.xite {
+                    Some(addr) => session.state.site_has_admin(addr).await,
+                    None => req_id >= WRAPPER_ID_BASE,
+                };
+            if !allowed {
+                return Err(format!("No permission to run commands as {target}"));
+            }
+            let rebound = WsSession::new(session.state.clone(), Some(target));
+            return Box::pin(self.dispatch(&rebound, &inner_cmd, &inner_params, req_id)).await;
+        }
         // A command from a disabled plugin behaves as if unregistered.
         if let Some(plugin) = self.command_plugin.get(cmd) {
             if !session.state.plugin_enabled(plugin).await {
@@ -338,7 +371,15 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(MergerSiteAdd),
         Arc::new(MergerSiteDelete),
         Arc::new(ConfigSet),
-        Arc::new(simple("siteListModifiedFiles", json!({ "modified_files": [] }))),
+        Arc::new(SiteListModifiedFiles),
+        Arc::new(SiteAdd),
+        Arc::new(SiteClone),
+        Arc::new(ServerPortcheck),
+        Arc::new(ServerUpdate),
+        Arc::new(ServerShutdown),
+        Arc::new(FileQuery),
+        Arc::new(BadCert),
+        Arc::new(SiteSetSettingsValue),
         Arc::new(SiteSign),
         Arc::new(SitePublish),
         Arc::new(FileWrite),
@@ -901,6 +942,213 @@ impl WsCommand for AnnouncerStats {
     }
 }
 
+/// `siteAdd(address)` - ADMIN: start serving + downloading a xite by
+/// address (EpixNet's `SiteManager.need`).
+struct SiteAdd;
+#[async_trait]
+impl WsCommand for SiteAdd {
+    fn name(&self) -> &'static str {
+        "siteAdd"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = p
+            .get("address")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("Missing address")?
+            .to_string();
+        if s.state.has_xite(&address).await {
+            return Ok(json!({ "error": "Site already added" }));
+        }
+        if s.state.ensure_xite(&address).await {
+            Ok(Value::from("ok"))
+        } else {
+            Ok(json!({ "error": "Invalid address" }))
+        }
+    }
+}
+
+/// `siteClone(address, root_inner_path?, target_address?)` - copy a xite's
+/// template into a new site we own (EpixNet's Site.clone).
+struct SiteClone;
+#[async_trait]
+impl WsCommand for SiteClone {
+    fn name(&self) -> &'static str {
+        "siteClone"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let source = p
+            .get("address")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("Missing address")?
+            .to_string();
+        // Don't reveal whether an unserved address exists (EpixNet returns
+        // silently); serving it is the precondition anyway.
+        if !s.state.has_any_alias(&source).await {
+            return Ok(Value::Null);
+        }
+        let root = p
+            .get("root_inner_path")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let target = p
+            .get("target_address")
+            .or_else(|| p.as_array().and_then(|a| a.get(2)))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let address = s.state.clone_xite(&source, &root, target).await?;
+        // The wrapper follows this to the new site, like EpixNet's redirect.
+        s.state.push_notification(
+            "done",
+            &format!("Site cloned: <a href=\"/{address}/\">open it</a>"),
+            8000,
+        );
+        Ok(json!({ "address": address }))
+    }
+}
+
+/// `serverPortcheck` - ADMIN: report whether our fileserver port is reachable
+/// (the runtime's port checker keeps this current; UPnP retries in its loop).
+struct ServerPortcheck;
+#[async_trait]
+impl WsCommand for ServerPortcheck {
+    fn name(&self) -> &'static str {
+        "serverPortcheck"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let (opened, _ip) = s.state.port_status().await;
+        Ok(Value::from(opened))
+    }
+}
+
+/// `serverUpdate` - ADMIN. This node has no self-updater: updates ship
+/// through the platform packages (installer, app store, cargo). Answer
+/// honestly instead of pretending to restart.
+struct ServerUpdate;
+#[async_trait]
+impl WsCommand for ServerUpdate {
+    fn name(&self) -> &'static str {
+        "serverUpdate"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let msg = "This node updates through its installer or package, not in place; \
+                   install the new version and restart";
+        s.state.push_notification("info", msg, 12000);
+        Ok(json!({ "error": msg }))
+    }
+}
+
+/// `serverShutdown` - ADMIN: stop the node process. The shells supervise the
+/// process, so exit is the shutdown; state persists continuously.
+struct ServerShutdown;
+#[async_trait]
+impl WsCommand for ServerShutdown {
+    fn name(&self) -> &'static str {
+        "serverShutdown"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        s.state.push_notification("info", "Shutting down...", 5000);
+        s.state.log("INFO", "Shutdown requested over the WS API".to_string()).await;
+        s.state.persist_peers().await;
+        s.state.persist_sites().await;
+        tokio::spawn(async {
+            // Give the response + notification a moment to flush.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            std::process::exit(0);
+        });
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `fileQuery(dir_inner_path, query?)` - rows from JSON files under a xite
+/// directory, with the one-`*` wildcard and `dotted.path=val` filter of
+/// EpixNet's QueryJson.
+struct FileQuery;
+#[async_trait]
+impl WsCommand for FileQuery {
+    fn name(&self) -> &'static str {
+        "fileQuery"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let dir = p
+            .get("dir_inner_path")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("Missing dir_inner_path")?;
+        let query = p
+            .get("query")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        Ok(Value::Array(s.state.query_json_files(&address, dir, query).await))
+    }
+}
+
+/// `badCert(sign)` - mark a cert signature bad; inbound user content carrying
+/// it is rejected from then on.
+struct BadCert;
+#[async_trait]
+impl WsCommand for BadCert {
+    fn name(&self) -> &'static str {
+        "badCert"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let sign = p
+            .get("sign")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("Missing sign")?;
+        s.state.add_bad_cert(sign);
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteSetSettingsValue(key, value)` - ADMIN; EpixNet whitelists exactly one
+/// key.
+struct SiteSetSettingsValue;
+#[async_trait]
+impl WsCommand for SiteSetSettingsValue {
+    fn name(&self) -> &'static str {
+        "siteSetSettingsValue"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let key = p
+            .get("key")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if key != "modified_files_notification" {
+            return Ok(json!({ "error": "Can't change this key" }));
+        }
+        let value = p
+            .get("value")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let address = s.address()?.to_string();
+        s.state.set_modified_files_notification(&address, value).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `siteListModifiedFiles` - files whose on-disk bytes differ from the signed
+/// content.json (possibly-unsigned local changes).
+struct SiteListModifiedFiles;
+#[async_trait]
+impl WsCommand for SiteListModifiedFiles {
+    fn name(&self) -> &'static str {
+        "siteListModifiedFiles"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        Ok(json!({ "modified_files": s.state.list_modified_files(&address).await }))
+    }
+}
+
 struct WrapperNonce;
 #[async_trait]
 impl WsCommand for WrapperNonce {
@@ -955,8 +1203,14 @@ impl WsCommand for AnnouncerInfo {
         "announcerInfo"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let address = s.address().unwrap_or_default().to_string();
-        Ok(json!({ "address": address, "stats": s.state.announcer_stats().await }))
+        let address = s.address()?.to_string();
+        // EpixNet blanks the stats unless the asking site holds ADMIN.
+        let stats = if s.state.site_has_admin(&address).await {
+            s.state.announcer_stats().await
+        } else {
+            json!({})
+        };
+        Ok(json!({ "address": address, "stats": stats }))
     }
 }
 

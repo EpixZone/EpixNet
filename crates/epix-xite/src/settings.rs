@@ -57,6 +57,10 @@ pub struct XiteSettings {
     /// Last known peer count for the xite.
     #[serde(default)]
     pub peers: i64,
+    /// Whether the sidebar warns about possibly-unsigned modified files
+    /// (`siteSetSettingsValue`, the one key EpixNet lets a page toggle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_files_notification: Option<bool>,
     /// Per-xite size limit override (bytes); falls back to the global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_limit: Option<i64>,
@@ -90,6 +94,7 @@ impl XiteSettings {
             optional_downloaded: 0,
             size_files_optional: 0,
             peers: 0,
+            modified_files_notification: None,
             size_limit: None,
             autodownloadoptional: false,
             favorite: false,
