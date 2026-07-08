@@ -20,7 +20,7 @@ async fn main() {
     let mut conn = Connection::connect(&transport, &peer).await.expect("connect");
     conn.handshake().await.expect("handshake");
     let reply = conn
-        .pex(&site, Vec::new(), Vec::new(), Vec::new(), Vec::new(), 50)
+        .pex(&site, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 50)
         .await
         .expect("pex");
 

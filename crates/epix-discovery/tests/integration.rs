@@ -66,6 +66,9 @@ async fn discovers_peers_via_epix_tracker() {
         port: 0,
         need_types: &["ipv4", "ipv6"],
         need_num: 20,
+        add: &[],
+        onions: &[],
+        i2p: &[],
     };
     let peers = discover_via_epix_tracker(&TcpTransport, &PeerAddr::Ip(tracker), &params)
         .await
@@ -85,6 +88,9 @@ async fn live_tracker_discovers_real_peers() {
         port: 0,
         need_types: &["ipv4", "ipv6"],
         need_num: 20,
+        add: &[],
+        onions: &[],
+        i2p: &[],
     };
     let peers = discover_via_epix_tracker(&TcpTransport, &tracker, &params)
         .await
@@ -109,6 +115,9 @@ async fn live_full_discover_connect_download_verify() {
         port: 0,
         need_types: &["ipv4"],
         need_num: 20,
+        add: &[],
+        onions: &[],
+        i2p: &[],
     };
     let peers = discover_via_epix_tracker(&TcpTransport, &PeerAddr::parse(LIVE_TRACKER).unwrap(), &params)
         .await

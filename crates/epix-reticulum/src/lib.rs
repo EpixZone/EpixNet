@@ -18,8 +18,10 @@
 //!
 //! [`PeerStream`]: epix_transport::PeerStream
 
+mod node;
 mod server;
 mod transport;
+pub use node::{MeshConfig, MeshNode};
 pub use server::ReticulumServer;
 pub use transport::ReticulumTransport;
 

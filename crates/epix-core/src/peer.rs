@@ -27,7 +27,7 @@ impl IpType {
             IpType::Ipv6 => Some("peers_ipv6"),
             IpType::Onion => Some("peers_onion"),
             IpType::I2p => Some("peers_i2p"),
-            IpType::Rns => None,
+            IpType::Rns => Some("peers_rns"),
         }
     }
 }
@@ -119,8 +119,8 @@ impl PeerAddr {
 
     /// Pack to EpixNet's compact wire form: 6 bytes (ipv4) / 18 (ipv6) / onion
     /// b32-decoded host + 2 / i2p 32-byte destination hash + 2, all with a
-    /// little-endian port. `None` for Rns (PEX carries a separate `rns` field,
-    /// added when the mesh transport lands).
+    /// little-endian port / rns 16-byte destination hash (no port - Reticulum
+    /// destinations aren't port-addressed).
     pub fn pack(&self) -> Option<Vec<u8>> {
         match self {
             PeerAddr::Ip(SocketAddr::V4(a)) => {
@@ -153,8 +153,7 @@ impl PeerAddr {
                 out.extend_from_slice(&port.to_le_bytes());
                 Some(out)
             }
-            // Rns PEX carries a separate `rns` field (added with the mesh transport).
-            PeerAddr::Rns(_) => None,
+            PeerAddr::Rns(hash) => Some(hash.to_vec()),
         }
     }
 
@@ -190,6 +189,16 @@ impl PeerAddr {
         let host = data_encoding::BASE32_NOPAD.encode(host_bytes).to_lowercase();
         let port = u16::from_le_bytes([port_bytes[0], port_bytes[1]]);
         Some(PeerAddr::Onion { host, port })
+    }
+
+    /// Unpack a Reticulum destination hash (16 raw bytes).
+    pub fn unpack_rns(packed: &[u8]) -> Option<Self> {
+        if packed.len() != 16 {
+            return None;
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(packed);
+        Some(PeerAddr::Rns(hash))
     }
 
     /// Unpack a compact i2p address (32-byte destination hash + little-endian
@@ -274,11 +283,11 @@ mod tests {
         assert_eq!(&packed[32..], &15441u16.to_le_bytes());
         assert_eq!(PeerAddr::unpack_i2p(&packed).unwrap(), p);
 
-        // Rns doesn't pack (PEX carries it separately).
-        assert!(PeerAddr::parse("rns:0123456789abcdef0123456789abcdef")
-            .unwrap()
-            .pack()
-            .is_none());
+        // Rns packs as the 16 raw destination-hash bytes (no port).
+        let p = PeerAddr::parse("rns:0123456789abcdef0123456789abcdef").unwrap();
+        let packed = p.pack().unwrap();
+        assert_eq!(packed.len(), 16);
+        assert_eq!(PeerAddr::unpack_rns(&packed).unwrap(), p);
     }
 
     #[test]

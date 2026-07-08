@@ -452,6 +452,7 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
     let i2p_phase = i2p.get("phase").and_then(|v| v.as_str()).unwrap_or("Off").to_string();
     let i2p_mode = i2p.get("mode").and_then(|v| v.as_str()).unwrap_or("disable").to_string();
     let i2p_address = ctx.state.i2p_address().await;
+    let mesh_address = ctx.state.rns_address().await;
     let body = json!({
         "serving": true,
         "tor_enabled": tor_enabled,
@@ -461,6 +462,8 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
         "i2p_status": i2p_phase,
         "i2p_mode": i2p_mode,
         "i2p_address": i2p_address,
+        "mesh_enabled": mesh_address.is_some(),
+        "mesh_address": mesh_address,
     });
     (
         [

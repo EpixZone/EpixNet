@@ -16,6 +16,7 @@ epix-dht-net = { path = "../epix-dht-net" }
 epix-propagation = { path = "../epix-propagation" }
 epix-tor = { path = "../epix-tor", optional = true }
 epix-i2p = { path = "../epix-i2p", optional = true, default-features = false }
+epix-reticulum = { path = "../epix-reticulum", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 async-trait = "0.1"
 serde_json = "1"
@@ -41,6 +42,9 @@ i2p = ["dep:epix-i2p"]
 # Adds the embedded pure-Rust I2P router (emissary) for the no-sidecar default.
 # Pulls a reseeder (reqwest/openssl), so it's desktop-only for now. Off mobile.
 i2p-embedded = ["i2p", "epix-i2p/embedded"]
+# Reticulum mesh: dial + serve peers over mesh links (TCP interfaces now,
+# LoRa/BLE radios later). All platforms.
+mesh = ["dep:epix-reticulum"]
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }
