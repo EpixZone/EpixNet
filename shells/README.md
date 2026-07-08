@@ -14,6 +14,46 @@ engine through one of two entry points:
 One engine, one code path. A change to resolution, verification, or Tor is made
 once in the core and every shell gets it.
 
+## The Epix Wallet
+
+All three shells also embed the **Epix Wallet** - a fork of Keplr, rebranded,
+with the EPIX chain built in as a first-class chain. The source lives in the
+separate `EpixZone/epix-wallet` repo (branch `epix`); the shells consume a
+prebuilt artifact, so you do not need a wallet checkout to build them.
+
+- The wallet's CI builds the Firefox WebExtension on every push to `epix` and
+  publishes it to a rolling `wallet-dist` GitHub release
+  (`epix-wallet-firefox.zip`).
+- `shells/wallet-ext/` is the staging directory (gitignored except its
+  README). When empty, `epix-browser`'s `build.rs` downloads the release into
+  it before compiling; the Android build stages it into assets and the iOS
+  build references it as a bundle resource.
+- Overrides for wallet development: `EPIX_WALLET_DIST=/path/to/epix-wallet/apps/extension/build/firefox`
+  copies a local build instead of downloading; `EPIX_WALLET_SKIP=1` builds
+  without the wallet (desktop only). See `shells/wallet-ext/README.md`.
+
+How each shell runs it:
+
+- **Desktop (Firefox)**: the wallet is a real WebExtension, installed into the
+  managed profile. It carries the whole browser policy (the clearnet block and
+  the Tor/I2P shield) and its own popup UI.
+- **Android (GeckoView)**: the same WebExtension, installed with
+  `ensureBuiltIn`; the Epix button opens its popup in a sheet and the app
+  answers the wallet's `zone.epix.nmh` native messages itself.
+- **iOS (WKWebView)**: WKWebView cannot run WebExtensions, so the wallet runs
+  as a plain web app. The node serves it at `/EpixWallet/` from
+  `<data_root>/wallet-ui` (staged on launch from the app bundle), and a small
+  WebExtension shim (`mobile-shim.ts` in the wallet repo) provides the
+  `browser.*` surface, backed by the host app for storage and the native-host
+  commands. The Epix button opens it in a sheet.
+
+To build the wallet artifact from source, from a checkout of `epix-wallet`:
+
+```
+yarn && yarn build:libs
+yarn workspace @keplr-wallet/extension build   # -> apps/extension/build/firefox
+```
+
 ## Running the desktop browser locally
 
 ```
@@ -129,20 +169,22 @@ are gitignored - they are build artifacts.
 
 `MainActivity` loads the core (`System.loadLibrary("epix_ffi")`), boots the node
 on a coroutine, and points GeckoView at the local node URL. The `epix://`
-intent-filter is in `AndroidManifest.xml`. Interception the Tor-Browser-Android
-way (a bundled built-in WebExtension via `installBuiltIn` + `webRequest`) is the
-next step - GeckoView has no `shouldInterceptRequest`.
+intent-filter is in `AndroidManifest.xml`. It installs the Epix Wallet as a
+built-in WebExtension (`ensureBuiltIn`) - the same `installBuiltIn` +
+`webRequest` mechanism also carries the browser policy, since GeckoView has no
+`shouldInterceptRequest`. The `stageWalletExt` Gradle task stages the wallet
+build into `app/src/main/assets/extensions/wallet/` (see "The Epix Wallet").
 
 The shell looks like a browser: an address bar (type `talk.epix`, an `epix1…`
 address, a bare word for `<word>.epix`, or any URL) and, Brave-style, the Epix
-icon next to it. The bar shows `talk.epix/…`, not the local node plumbing. The
-icon wears the Tor state as a badge with the desktop extension's colors (gray
-off, amber connecting, purple ready, green when clearnet is routed through
-Tor); tapping it opens the Epix panel - current xite, Tor status, our onion
-address, and the "Route clearnet through Tor" switch. It polls `torStatus()` /
-`onionAddress()` on the FFI every 5 seconds, like the extension polls the
-native host. Hardware back navigates page history. The iOS shell has the same
-chrome.
+icon next to it. The bar shows `talk.epix/…`, not the local node plumbing.
+Tapping the icon opens the wallet (its shield carries the Tor/I2P status and the
+route-clearnet toggle); long-press opens the plain Tor panel - current xite, Tor
+status, our onion address, and the "Route clearnet through Tor" switch. The
+icon's badge wears the Tor state in the desktop extension's colors (gray off,
+amber connecting, purple ready, green when clearnet is routed through Tor),
+polling `torStatus()` / `onionAddress()` on the FFI every 5 seconds. Hardware
+back navigates page history. The iOS shell has the same chrome.
 
 The "Route clearnet through Tor" switch (default on, opt-out, like the desktop
 extension) points the web engine's proxy at the node's Tor SOCKS listener
@@ -154,24 +196,38 @@ Both apply immediately, no relaunch (the desktop version applies on relaunch).
 
 ### iOS (`ios/`) - Swift + WKWebView
 
+Open `ios/EpixNet.xcodeproj` in Xcode, pick a simulator, and Run - or from the
+command line:
+
 ```
-# 1. Build the core as a staticlib for the device/simulator. Add `i2p-embedded`
-#    to bundle the I2P router (on by default, like desktop/Android); it needs no
-#    native deps beyond what the Tor build already links (rustls reuses ring),
-#    so it builds wherever this does.
-cargo build -p epix-ffi --release --no-default-features --features tor,i2p-embedded \
-    --target aarch64-apple-ios
-# 2. Generate the Swift bindings:
-cargo run -p epix-ffi --features cli --bin uniffi-bindgen -- generate \
-    --library target/aarch64-apple-ios/release/libepix_ffi.a \
-    --language swift --out-dir ios/EpixBrowser/Generated
-# 3. Open the Xcode project, link libepix_ffi.a + the generated module, and add
-#    ios/EpixBrowser/epix-icon.png as a bundle resource (the Epix button's
-#    logo; the app falls back to a system glyph without it). Run.
+xcodebuild -project ios/EpixNet.xcodeproj -scheme EpixNet \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
-`AppDelegate` boots the node and loads the local URL in a WKWebView. `epix://`
-is registered via `CFBundleURLTypes` in `Info.plist`.
+The Xcode target's first build phase runs `ios/build-rust.sh`, which builds
+`epix-ffi` (release, for the active simulator/device triple) and generates the
+Swift bindings into `ios/Generated/`. The app target compiles those alongside
+the shell source. Both outputs are gitignored build artifacts.
+
+The shell source is `shells/ios/EpixBrowser/AppDelegate.swift` (the Xcode
+target references it directly, so the browser chrome is shared with the docs
+here). It bundles two resources: `epix-icon.png` (the Epix button's logo,
+falling back to a system glyph) and `shells/wallet-ext/` (the wallet build; see
+"The Epix Wallet" above - stage it, or let the build download it).
+
+`AppDelegate` boots the node, loads the xite in the main WKWebView, and wires
+the Epix button: tap opens the wallet sheet, long-press opens the plain Tor/I2P
+panel. The wallet runs as a served web app (`/EpixWallet/`) with the host app
+bridging its storage and native-host commands over `WKScriptMessageHandler`.
+`epix://` is registered via `CFBundleURLTypes` in `Info.plist`.
+
+**Not yet on iOS - the dApp provider.** The desktop and Android shells expose
+`window.keplr` / `window.ethereum` to browsed pages via the WebExtension; on
+iOS that needs the provider injected into the browsed page's WebView and
+bridged to the wallet's background (a separate WebView) through the host app,
+with approval UIs presented from the background. The wallet itself works (send,
+receive, stake); the browsed-page provider is the remaining iOS wallet work and
+needs on-device testing against a real dApp.
 
 **Open spike (Phase 8b #1):** custom-scheme pages in WKWebView are not secure
 contexts. This scaffold loads the loopback origin directly (sidesteps the custom
