@@ -50,6 +50,8 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Linux build deps (libudev for the Ledger HID bridge)
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh linux
       - name: Build Linux tarball
