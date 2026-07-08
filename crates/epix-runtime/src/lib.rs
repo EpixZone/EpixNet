@@ -681,7 +681,8 @@ async fn tor_loop(
                             port: 0,
                         };
                         tokio::spawn(async move {
-                            epix_protocol::serve_stream(handler, peer, stream, &version, rev).await;
+                            epix_protocol::serve_stream(handler, peer, stream, &version, rev, port)
+                                .await;
                         });
                     }
                 });
@@ -747,8 +748,9 @@ async fn i2p_loop(
                 // Inbound I2P peers have no dial-back IP (they're reached by
                 // destination); use an empty i2p addr like the onion path does.
                 let peer = epix_core::PeerAddr::I2p { dest: String::new(), port: 0 };
+                let port = fileserver_port.unwrap_or(0);
                 tokio::spawn(async move {
-                    epix_protocol::serve_stream(handler, peer, stream, &version, rev).await;
+                    epix_protocol::serve_stream(handler, peer, stream, &version, rev, port).await;
                 });
             }
         });
