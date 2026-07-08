@@ -1513,8 +1513,8 @@ impl AppState {
     }
 
     /// content.json files modified after `since` (ms), as `{inner_path:
-    /// modified}` - the `listModified` reply. Only the root content.json is
-    /// tracked until includes land, so this returns it when newer than `since`.
+    /// modified}` - the `listModified` reply, covering the root plus every
+    /// include / per-user content.json on disk.
     pub async fn list_modified(&self, address: &str, since: f64) -> serde_json::Map<String, Value> {
         let mut out = serde_json::Map::new();
         let xites = self.xites.read().await;
@@ -5115,24 +5115,9 @@ impl AppState {
         };
         self.save_user().await; // auth_privatekey may have derived the site entry
 
-        // Resolve every xID name verification will need: the user directory's
-        // own name (`data/users/user.epix/…` is signed by the identity that
-        // xID belongs to) plus any name-form signers the parent rules grant
-        // (a site's admins may sign every user's content for moderation).
-        let parent_path = epix_content::verify::parent_content_path(content_inner_path);
-        let parent = storage
-            .read(&parent_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .unwrap_or_else(|| json!({ "inner_path": parent_path }));
-        let mut xid_map = std::collections::HashMap::new();
-        for name in epix_content::verify::user_content_xid_names(&parent, content_inner_path) {
-            let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-            let signers = epix_chain::xid_signers::resolve(label, tld).await;
-            if !signers.is_empty() {
-                xid_map.insert(name, signers);
-            }
-        }
+        // Resolve every xID name verification will need (the user dir's own
+        // name + any name-form signers the parent rules grant).
+        let xid_map = Self::resolve_xid_map(&storage, content_inner_path).await;
 
         let prev = storage
             .read(content_inner_path)
@@ -5335,30 +5320,34 @@ impl AppState {
         if !self.is_serving(&key).await {
             return Err("Unknown site".into());
         }
-        // Only accept pushes for sites we voluntarily downloaded.
+        if !inner_path.ends_with("content.json") {
+            return Err("Only content.json update allowed".into());
+        }
+        let is_root = inner_path == "content.json";
+        // Only accept pushes for sites we voluntarily downloaded. The version
+        // to beat is the root's in-memory clock, or - for an include / user
+        // content.json - the on-disk child's own `modified`.
         let (downloaded, current_modified) = {
             let xites = self.xites.read().await;
             let x = xites.get(&key).ok_or("Unknown site")?;
-            let current = x
-                .content
-                .as_ref()
-                .and_then(|c| c.get("modified"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+            let current = if is_root {
+                x.content
+                    .as_ref()
+                    .and_then(|c| c.get("modified"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+            } else {
+                x.storage
+                    .read(inner_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
+                    .unwrap_or(0.0)
+            };
             (x.settings.downloaded.is_some(), current)
         };
         if !downloaded {
             return Err("Site not yet downloaded".into());
-        }
-        if !inner_path.ends_with("content.json") {
-            return Err("Only content.json update allowed".into());
-        }
-        // The engine verifies the root signature only so far; nested/user
-        // content.json verification is the content-rules parity work (Tier 0).
-        if inner_path != "content.json" {
-            return Err(format!(
-                "File {inner_path} invalid: non-root content.json updates not supported yet"
-            ));
         }
 
         // Same or older version than ours: record the sender as a peer and stop.
@@ -5424,13 +5413,33 @@ impl AppState {
                 return Err(e);
             }
         };
-        let limit = self.size_limit_bytes(&key).await;
-        if let Err(e) = xite.set_content_limited(&bytes, limit) {
-            self.updates_in_flight.lock().unwrap().remove(&uri);
-            return Err(format!("File {inner_path} invalid: {e}"));
-        }
-        for k in &keys {
-            self.update_content(k, xite.content.clone()).await;
+        let mut child_files: Option<Vec<epix_xite::FileEntry>> = None;
+        if is_root {
+            let limit = self.size_limit_bytes(&key).await;
+            if let Err(e) = xite.set_content_limited(&bytes, limit) {
+                self.updates_in_flight.lock().unwrap().remove(&uri);
+                return Err(format!("File {inner_path} invalid: {e}"));
+            }
+            for k in &keys {
+                self.update_content(k, xite.content.clone()).await;
+            }
+        } else {
+            // An include / user content.json: verified against its on-disk
+            // parent's rules (signers, cert, max_size, files_allowed), with
+            // any xID-name signers resolved on-chain first.
+            let xid_map = Self::resolve_xid_map(&xite.storage, inner_path).await;
+            match xite.add_content(inner_path, &bytes, &xid_map) {
+                Ok(files) => {
+                    child_files = Some(files);
+                    // Fold the child's modified clock into settings and its
+                    // db columns (cert_user_id) into the site db.
+                    self.ingest_file_from(&key, inner_path, None).await;
+                }
+                Err(e) => {
+                    self.updates_in_flight.lock().unwrap().remove(&uri);
+                    return Err(format!("File {inner_path} invalid: {e}"));
+                }
+            }
         }
         if let Some(s) = &sender {
             self.add_peers(&key, [s.clone()]).await;
@@ -5441,9 +5450,37 @@ impl AppState {
         let state = self.clone();
         let inner = inner_path.to_string();
         tokio::spawn(async move {
-            state.finish_inbound_update(keys, xite, sender, inner, uri, diffs).await;
+            state
+                .finish_inbound_update(keys, xite, sender, inner, uri, diffs, child_files)
+                .await;
         });
         Ok(InboundUpdate::Applied)
+    }
+
+    /// Resolve every xID name that verifying `content_inner_path` may need -
+    /// the user directory's own name (`data/users/user.epix/…` is signed by
+    /// the identity that xID belongs to) plus any name-form signers the
+    /// parent's rules grant (a site's admins may sign every user's content
+    /// for moderation) - to their on-chain signer addresses.
+    async fn resolve_xid_map(
+        storage: &XiteStorage,
+        content_inner_path: &str,
+    ) -> HashMap<String, Vec<String>> {
+        let parent_path = epix_content::verify::parent_content_path(content_inner_path);
+        let parent = storage
+            .read(&parent_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or_else(|| json!({ "inner_path": parent_path }));
+        let mut xid_map = HashMap::new();
+        for name in epix_content::verify::user_content_xid_names(&parent, content_inner_path) {
+            let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
+            let signers = epix_chain::xid_signers::resolve(label, tld).await;
+            if !signers.is_empty() {
+                xid_map.insert(name, signers);
+            }
+        }
+        xid_map
     }
 
     /// The deferred half of [`Self::apply_inbound_update`]: apply any diffs the
@@ -5458,22 +5495,32 @@ impl AppState {
         inner_path: String,
         uri: String,
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+        child_files: Option<Vec<epix_xite::FileEntry>>,
     ) {
         let key = keys[0].clone();
+        // Diff keys are relative to the pushed content.json's directory (the
+        // root for a root push, the user/include dir for a child push).
+        let diff_dir =
+            inner_path.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_default();
         // Apply diffs first: patch our old copy of each changed file and keep it
         // only if the result matches the new content.json's declared hash. A
         // bad/mismatched diff is ignored - the file just gets downloaded below.
         if !diffs.is_empty() {
             let mut patched = 0;
             for (file_path, actions) in &diffs {
-                let Some(info) = xite.file_info(file_path) else { continue };
-                if xite.storage.verify(file_path, &info.sha512) {
+                let full = format!("{diff_dir}{file_path}");
+                let info = match &child_files {
+                    Some(list) => list.iter().find(|f| f.inner_path == full).cloned(),
+                    None => xite.file_info(&full),
+                };
+                let Some(info) = info else { continue };
+                if xite.storage.verify(&full, &info.sha512) {
                     continue; // already current
                 }
-                let Ok(old) = xite.storage.read(file_path) else { continue };
+                let Ok(old) = xite.storage.read(&full) else { continue };
                 let Ok(new) = epix_content::patch(&old, actions) else { continue };
                 if XiteStorage::hash_bytes(&new) == info.sha512
-                    && xite.storage.write(file_path, &new).is_ok()
+                    && xite.storage.write(&full, &new).is_ok()
                 {
                     patched += 1;
                 }
@@ -5489,18 +5536,43 @@ impl AppState {
                     peers.insert(0, s);
                 }
             }
-            let needed = xite.files_needed().len();
-            if needed > 0 && !peers.is_empty() {
-                self.set_worker_stats(&key, needed, peers.len().min(8), needed).await;
+            // The files to fetch: for a root push, whatever the new root
+            // declares and we lack; for a child push, the child's declared
+            // files that are missing or stale.
+            let needed: Vec<epix_xite::FileEntry> = match &child_files {
+                Some(list) => list
+                    .iter()
+                    .filter(|f| !xite.storage.verify(&f.inner_path, &f.sha512))
+                    .cloned()
+                    .collect(),
+                None => xite.files_needed(),
+            };
+            if !needed.is_empty() && !peers.is_empty() {
+                let needed_paths: Vec<String> =
+                    needed.iter().map(|f| f.inner_path.clone()).collect();
+                self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
+                    .await;
                 if let Ok(report) =
-                    epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await
+                    epix_worker::sync_files_list(needed, &xite, &peers, transport.clone(), 8, None)
+                        .await
                 {
                     self.add_transfer(&key, report.bytes, 0).await;
                 }
                 self.set_worker_stats(&key, 0, 0, 0).await;
-                // Data files changed - rebuild the db views under every alias.
-                for k in &keys {
-                    self.update_content(k, xite.content.clone()).await;
+                if child_files.is_none() {
+                    // Root data files changed - rebuild the db views under
+                    // every alias.
+                    for k in &keys {
+                        self.update_content(k, xite.content.clone()).await;
+                    }
+                } else {
+                    // Child data files (user posts) feed the db per file, so
+                    // open pages see them without a full rebuild.
+                    for path in needed_paths {
+                        if xite.storage.exists(&path) {
+                            self.ingest_file_from(&key, &path, None).await;
+                        }
+                    }
                 }
             }
             // EpixNet re-publishes an accepted update to up to 3 more peers,

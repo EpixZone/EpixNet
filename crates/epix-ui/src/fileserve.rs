@@ -742,6 +742,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_update_accepts_user_content() {
+        // A peer pushes a per-user content.json (an EpixTalk post): it is
+        // verified against the parent's user_contents rules and stored, a
+        // forged bump is rejected, and a replay short-circuits.
+        let site_key = epix_crypt::new_seed();
+        let site = epix_crypt::privatekey_to_address(&site_key).unwrap();
+        let users_content = json!({
+            "address": site,
+            "inner_path": "data/users/content.json",
+            "user_contents": { "permissions": {}, "cert_signers": {} }
+        });
+        let users_bytes = serde_json::to_vec(&users_content).unwrap();
+
+        // A "sender" node signs a user data file with its own auth key.
+        let sender_root = tempfile::tempdir().unwrap();
+        let sender = AppState::with_data_dir("test", sender_root.path());
+        let sender_storage = XiteStorage::new(sender_root.path().join("data").join(&site));
+        sender_storage.write("data/users/content.json", &users_bytes).unwrap();
+        sender
+            .add_xite(&site, XiteEntry {
+                storage: sender_storage.clone(),
+                content: Some(json!({ "address": site, "files": {} })),
+            })
+            .await;
+        let auth = sender.user_auth_address(&site).await.unwrap();
+        let user_path = format!("data/users/{auth}/content.json");
+        sender
+            .write_file(&site, &format!("data/users/{auth}/data.json"), br#"{"topic":[]}"#)
+            .await
+            .unwrap();
+        sender.sign_user_content(&site, &user_path, None, None).await.unwrap();
+        let signed = sender_storage.read(&user_path).unwrap();
+        let modified = serde_json::from_slice::<serde_json::Value>(&signed).unwrap()["modified"]
+            .as_f64()
+            .unwrap();
+
+        // The receiver serves the site (root + the user_contents parent) but
+        // has never seen this user.
+        let recv_root = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(recv_root.path());
+        storage.write("data/users/content.json", &users_bytes).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(&site, XiteEntry {
+                storage: storage.clone(),
+                content: Some(json!({ "address": site, "files": {} })),
+            })
+            .await;
+        let svc = FileService::new(state.clone());
+        let peer = PeerAddr::parse("1.2.3.4:1234").unwrap();
+
+        let push = |body: Vec<u8>, hint: f64| {
+            vmap(vec![
+                ("site", Value::from(site.as_str())),
+                ("inner_path", Value::from(user_path.as_str())),
+                ("body", Value::Binary(body)),
+                ("modified", Value::from(hint)),
+            ])
+        };
+        let resp = svc.handle(&peer, "update", &push(signed.clone(), modified)).await;
+        assert_eq!(
+            vget_str(&resp, "ok").as_deref(),
+            Some(format!("Thanks, file {user_path} updated!").as_str())
+        );
+        assert_eq!(storage.read(&user_path).unwrap(), signed, "child stored verbatim");
+        // The accepted child now shows up in our listModified reply.
+        assert!(state.list_modified(&site, 0.0).await.contains_key(&user_path));
+
+        // Replaying the same version is a no-op (hint vs the on-disk child).
+        let resp = svc.handle(&peer, "update", &push(signed.clone(), modified)).await;
+        assert_eq!(vget_str(&resp, "ok").as_deref(), Some("File not changed"));
+
+        // A forged bump (modified raised without re-signing) is rejected and
+        // the stored child is untouched.
+        let mut forged: serde_json::Value = serde_json::from_slice(&signed).unwrap();
+        forged["modified"] = json!(modified + 100.0);
+        let forged_bytes = serde_json::to_vec(&forged).unwrap();
+        let resp = svc.handle(&peer, "update", &push(forged_bytes, modified + 100.0)).await;
+        assert!(vget_str(&resp, "error").unwrap().contains("invalid"));
+        assert_eq!(storage.read(&user_path).unwrap(), signed);
+    }
+
+    #[tokio::test]
     async fn pex_absorbs_and_returns_peers() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
