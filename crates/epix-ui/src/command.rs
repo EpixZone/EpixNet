@@ -394,6 +394,9 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteServing { cmd: "siteResume", serving: true }),
         Arc::new(SiteDelete),
         Arc::new(SiteSetAutodownloadoptional),
+        Arc::new(OptionalHelp),
+        Arc::new(OptionalHelpRemove),
+        Arc::new(OptionalHelpAll),
         Arc::new(DbRebuild { cmd: "dbReload" }),
         Arc::new(DbRebuild { cmd: "dbRebuild" }),
         Arc::new(SiteFavourite { cmd: "siteFavourite", favorite: true }),
@@ -2794,6 +2797,79 @@ impl WsCommand for SiteDelete {
 }
 
 /// `siteSetAutodownloadoptional` - toggle auto-downloading optional files.
+/// `optionalHelp(directory, title, address?)` - opt into helping distribute
+/// the optional files under a directory. Returns the count and total size.
+struct OptionalHelp;
+#[async_trait]
+impl WsCommand for OptionalHelp {
+    fn name(&self) -> &'static str {
+        "optionalHelp"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = match arg_str(p, "address", 2) {
+            Some(a) => a.to_string(),
+            None => s.address()?.to_string(),
+        };
+        let directory = arg_str(p, "directory", 0).ok_or("optionalHelp: directory required")?;
+        let title = arg_str(p, "title", 1).unwrap_or_default();
+        let (num, size) = s
+            .state
+            .optional_help_add(&address, &directory, &title)
+            .await
+            .ok_or("Unknown site")?;
+        s.state.push_notification(
+            "done",
+            &format!("You started to help distribute {title}. Directory: {directory}"),
+            10000,
+        );
+        Ok(json!({ "num": num, "size": size }))
+    }
+}
+
+/// `optionalHelpRemove(directory, address?)` - stop helping a directory.
+struct OptionalHelpRemove;
+#[async_trait]
+impl WsCommand for OptionalHelpRemove {
+    fn name(&self) -> &'static str {
+        "optionalHelpRemove"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = match arg_str(p, "address", 1) {
+            Some(a) => a.to_string(),
+            None => s.address()?.to_string(),
+        };
+        let directory = arg_str(p, "directory", 0).ok_or("optionalHelpRemove: directory required")?;
+        if s.state.optional_help_remove(&address, &directory).await {
+            Ok(Value::from("ok"))
+        } else {
+            Ok(json!({ "error": "Not found" }))
+        }
+    }
+}
+
+/// `optionalHelpAll(value, address?)` - toggle auto-downloading every new
+/// optional file on the site.
+struct OptionalHelpAll;
+#[async_trait]
+impl WsCommand for OptionalHelpAll {
+    fn name(&self) -> &'static str {
+        "optionalHelpAll"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = match arg_str(p, "address", 1) {
+            Some(a) => a.to_string(),
+            None => s.address()?.to_string(),
+        };
+        let value = p
+            .get("value")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        s.state.set_autodownloadoptional(&address, value).await;
+        Ok(Value::from(value))
+    }
+}
+
 struct SiteSetAutodownloadoptional;
 #[async_trait]
 impl WsCommand for SiteSetAutodownloadoptional {
