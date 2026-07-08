@@ -138,7 +138,7 @@ jobs:
         if: steps.signcfg.outputs.sign == 'true'
         # Pin bumped as Microsoft releases the action; check the latest tag at
         # github.com/Azure/trusted-signing-action before a release.
-        uses: azure/trusted-signing-action@v0.5.9
+        uses: azure/trusted-signing-action@v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
