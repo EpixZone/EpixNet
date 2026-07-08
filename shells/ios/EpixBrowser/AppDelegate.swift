@@ -615,6 +615,17 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             reply(["ok": true])
         case "listClearnetAllow":
             reply(["sites": allowedSites()])
+        case "openConfig":
+            // Close the wallet sheet and point the browser at the node's
+            // config page (the dashboard's Config lives at the UI origin).
+            DispatchQueue.main.async {
+                self.dismissWallet()
+                if let u = URL(string: "\(self.nodeBase)/Config") {
+                    self.currentDisplay = "Config"
+                    self.webView?.load(URLRequest(url: u))
+                }
+            }
+            reply(["ok": true])
         default:
             reply(["error": "unknown command: \(cmd)"])
         }
