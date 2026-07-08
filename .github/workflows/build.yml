@@ -24,6 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (mesh transport build dep)
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh osx
       - name: Build (ad-hoc signed, unnotarized)
@@ -42,6 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (mesh transport build dep)
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh linux
       - name: Build Linux tarball
@@ -59,6 +67,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (mesh transport build dep)
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
         with:
           targets: x86_64-pc-windows-msvc
       - name: Install NSIS
