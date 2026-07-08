@@ -158,7 +158,7 @@ jobs:
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
           azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
           endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
           files-folder: ${{ github.workspace }}/dist
           files-folder-filter: exe
