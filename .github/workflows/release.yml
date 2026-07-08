@@ -27,7 +27,7 @@ jobs:
   macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set version from tag
         id: v
@@ -35,9 +35,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc (mesh transport build dep)
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: brew install protobuf
 
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh osx
@@ -76,7 +74,7 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: packaging/macos/build-app.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: epix-macos
           path: dist/Epix-*.dmg
@@ -84,17 +82,13 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set version from tag
         id: v
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc (mesh transport build dep)
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Install Linux build deps (libudev for the Ledger HID bridge)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+      - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libudev-dev pkg-config
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh linux
       - name: Build Linux tarball
@@ -102,7 +96,7 @@ jobs:
           EPIX_VERSION: ${{ steps.v.outputs.version }}
           EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
         run: packaging/linux/build-linux.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: epix-linux
           path: dist/epix-linux-*.tar.gz
@@ -110,7 +104,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set version from tag
         id: v
         shell: bash
@@ -119,9 +113,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - name: Install protoc (mesh transport build dep)
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        run: choco install protoc -y --no-progress
       - name: Install NSIS
         run: choco install nsis -y --no-progress
       - name: Fetch Firefox ESR to bundle
@@ -163,7 +155,7 @@ jobs:
           files-folder: ${{ github.workspace }}/dist
           files-folder-filter: exe
           files-folder-recurse: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: epix-windows
           path: dist/Epix-Setup-*.exe
@@ -173,7 +165,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Publish GitHub Release
