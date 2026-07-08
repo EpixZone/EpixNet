@@ -468,6 +468,16 @@ class MainActivity : AppCompatActivity() {
             }
             "listClearnetAllow" ->
                 JSONObject().put("sites", JSONArray(allowedSites().toList()))
+            "openConfig" -> {
+                // Close the wallet sheet and point the browser at the node's
+                // config page (the dashboard's Config lives at the UI origin).
+                withContext(Dispatchers.Main) {
+                    walletDialog?.dismiss()
+                    currentDisplay = "Config"
+                    session.loadUri("$NODE_BASE/Config")
+                }
+                JSONObject().put("ok", true)
+            }
             else -> JSONObject().put("error", "unknown command: ${req.optString("cmd")}")
         }
     }
