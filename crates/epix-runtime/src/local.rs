@@ -89,7 +89,12 @@ pub async fn local_discovery_loop(
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
-            _ = tick.tick() => broadcast_discover(&socket, &id).await,
+            _ = tick.tick() => {
+                // The AnnounceLocal plugin toggle pauses LAN broadcasts.
+                if state.plugin_enabled("AnnounceLocal").await {
+                    broadcast_discover(&socket, &id).await;
+                }
+            }
         }
     }
     receiver.abort();

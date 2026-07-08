@@ -546,6 +546,10 @@ async fn chart_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duratio
         tokio::select! {
             _ = shutdown.notified() => break,
             _ = tick.tick() => {
+                // The Chart plugin toggle pauses collection (data kept).
+                if !state.plugin_enabled("Chart").await {
+                    continue;
+                }
                 state.collect_chart().await;
                 ticks += 1;
                 if ticks % archive_every == 0 {

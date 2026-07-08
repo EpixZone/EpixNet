@@ -1759,6 +1759,9 @@ impl AppState {
     /// Persist every served xite's peers to `peers.json` (keyed by signed content
     /// address, so aliases share one list). Called periodically by the runtime.
     pub async fn persist_peers(&self) {
+        if !self.plugin_enabled("PeerDb").await {
+            return;
+        }
         let Some(path) = &self.peers_path else { return };
         let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
         for (key, x) in self.xites.read().await.iter() {
@@ -1854,9 +1857,9 @@ impl AppState {
         while let Some(res) = set.join_next().await {
             let Ok((tracker, peers)) = res else { continue };
             self.record_tracker(&tracker, peers.len()).await;
-            // AnnounceShare: remember a tracker that answered, so it is reused
-            // (and shared) across restarts.
-            if !peers.is_empty() {
+            // AnnounceShare: remember a tracker that answered, so it is
+            // reused (and shared) across restarts - while the plugin is on.
+            if !peers.is_empty() && self.plugin_enabled("AnnounceShare").await {
                 self.add_shared_tracker(&tracker.to_string()).await;
             }
             for p in peers {
@@ -3224,6 +3227,9 @@ impl AppState {
     /// point). Checks both the plain address and its `sha256` hash, matching
     /// EpixNet's hashed-address blocklists.
     pub async fn siteblock_reason(&self, site_address: &str) -> Option<String> {
+        if !self.plugin_enabled("ContentFilter").await {
+            return None;
+        }
         let hashed = {
             use sha2::{Digest, Sha256};
             hex::encode(Sha256::digest(site_address.as_bytes()))
@@ -3242,7 +3248,12 @@ impl AppState {
 
     /// The muted authors' auth-addresses (`ContentFilter` enforcement point).
     /// Content signed by these is excluded when (re)building a xite's database.
+    /// Empty while the ContentFilter plugin is toggled off - mutes stay stored
+    /// but stop applying, like disabling the plugin in EpixNet.
     pub async fn muted_authors(&self) -> Vec<String> {
+        if !self.plugin_enabled("ContentFilter").await {
+            return Vec::new();
+        }
         self.filters.read().await["mutes"]
             .as_object()
             .map(|m| m.keys().cloned().collect())
@@ -3483,6 +3494,11 @@ impl AppState {
     /// upload under a fresh nonce, and return `(nonce, piece_size,
     /// file_relative_path)`. The caller POSTs the bytes to
     /// `/EpixNet-Internal/BigfileUpload?upload_nonce=<nonce>`.
+    /// Whether Bigfile uploads are accepted (the plugin toggle).
+    pub async fn bigfile_enabled(&self) -> bool {
+        self.plugin_enabled("Bigfile").await
+    }
+
     pub async fn bigfile_upload_init(
         &self,
         address: &str,
@@ -6120,6 +6136,9 @@ impl AppState {
         // FilePack: `<pack>.zip/<inner>` or `<pack>.tar.gz/<inner>` serves a file
         // from inside the archive.
         if let Some((archive, within)) = split_archive_path(inner_path) {
+            if !self.plugin_enabled("FilePack").await {
+                return None;
+            }
             let bytes = self.xites.read().await.get(address)?.storage.read(&archive).ok()?;
             return read_from_archive(&archive, &bytes, &within);
         }
