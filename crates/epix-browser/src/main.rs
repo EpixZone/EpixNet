@@ -166,15 +166,19 @@ async fn main() {
         eprintln!("· note: could not install the theme: {e}");
     }
 
-    // Install the WebExtension (clearnet-block + CSP) and its native host.
+    // Install the Epix Wallet extension (wallet + clearnet-block + Tor/I2P
+    // panel) and its native host.
     if ext_capable {
+        // Existing profiles: drop the retired browser-ext and give the wallet
+        // its toolbar slot.
+        ext::migrate_legacy_extension(&profile);
         if let Err(e) = ext::install_extension(&profile) {
-            eprintln!("· note: could not install the extension: {e}");
+            eprintln!("· note: could not install the wallet extension: {e}");
         }
         if let Err(e) = ext::install_native_host() {
             eprintln!("· note: could not install the native host: {e}");
         }
-        println!("· extension + native host installed");
+        println!("· wallet extension + native host installed");
     } else {
         println!(
             "· note: {} enforces extension signing, so the clearnet-block extension \
@@ -374,6 +378,11 @@ fn write_profile(
         "function FindProxyForURL(url, host) {{\n\
          \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {proxy_addr}\"; }}\n\
          \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
+         \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
+         \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\
+         \x20 // refuse Tor exits, so routing chain RPC through Tor would break the\n\
+         \x20 // wallet. Tor-clearnet stays for general browsing.\n\
+         \x20 if (shExpMatch(host, \"*.epix.zone\")) {{ return \"DIRECT\"; }}\n\
          \x20 {clearnet}\n\
          }}\n"
     );

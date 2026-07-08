@@ -1088,6 +1088,16 @@ impl AppState {
         self.data_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
     }
 
+    /// The staged Epix Wallet web app (`<data_root>/wallet-ui`), if present.
+    /// The mobile shells copy their bundled wallet build here so the UI
+    /// server can serve it as a plain web app - their WebViews cannot run
+    /// the WebExtension the desktop browser embeds. None (404s) when nothing
+    /// is staged.
+    pub fn wallet_ui_dir(&self) -> Option<PathBuf> {
+        let dir = self.data_root.as_ref()?.join("wallet-ui");
+        dir.is_dir().then_some(dir)
+    }
+
     /// The per-OS default root as shown on the Config page.
     pub fn data_dir_default(&self) -> String {
         crate::paths::default_data_root().display().to_string()

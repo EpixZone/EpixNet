@@ -7,13 +7,17 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		E00000000000000000000020 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000010 /* App.swift */; };
+		E00000000000000000000020 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000010 /* AppDelegate.swift */; };
+		E00000000000000000000023 /* epix-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000015 /* epix-icon.png */; };
+		E00000000000000000000024 /* wallet-ext in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000016 /* wallet-ext */; };
 		E00000000000000000000021 /* epix_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000013 /* epix_ffi.swift */; };
 		E00000000000000000000022 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000012 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		E00000000000000000000010 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		E00000000000000000000010 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = "../../shells/ios/EpixBrowser/AppDelegate.swift"; sourceTree = "<group>"; };
+		E00000000000000000000015 /* epix-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = "epix-icon.png"; path = "../../shells/ios/EpixBrowser/epix-icon.png"; sourceTree = "<group>"; };
+		E00000000000000000000016 /* wallet-ext */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "wallet-ext"; path = "../../shells/wallet-ext"; sourceTree = "<group>"; };
 		E00000000000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		E00000000000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		E00000000000000000000013 /* epix_ffi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = epix_ffi.swift; sourceTree = "<group>"; };
@@ -33,7 +37,9 @@
 		E00000000000000000000003 /* EpixNet */ = {
 			isa = PBXGroup;
 			children = (
-				E00000000000000000000010 /* App.swift */,
+				E00000000000000000000010 /* AppDelegate.swift */,
+				E00000000000000000000015 /* epix-icon.png */,
+				E00000000000000000000016 /* wallet-ext */,
 				E00000000000000000000012 /* Assets.xcassets */,
 				E00000000000000000000011 /* Info.plist */,
 			);
@@ -109,6 +115,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				E00000000000000000000022 /* Assets.xcassets in Resources */,
+				E00000000000000000000023 /* epix-icon.png in Resources */,
+				E00000000000000000000024 /* wallet-ext in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -144,7 +152,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				E00000000000000000000020 /* App.swift in Sources */,
+				E00000000000000000000020 /* AppDelegate.swift in Sources */,
 				E00000000000000000000021 /* epix_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

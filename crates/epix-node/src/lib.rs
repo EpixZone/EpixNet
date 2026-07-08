@@ -1329,6 +1329,11 @@ async fn serve(
             .await;
     }
     state.set_ui_port(bind.port()).await;
+    // Record the actual UI port so the native-messaging host (a separate
+    // process Firefox launches) can find this node's status endpoint instead
+    // of guessing a fixed port - the bind may be the default, the legacy
+    // fallback, or a user-chosen one.
+    let _ = std::fs::write(opts.data_root.join("ui_port"), bind.port().to_string());
     state.log("INFO", format!("Serving {display} ({bytes_recv} bytes received)")).await;
 
     if opts.open_browser {

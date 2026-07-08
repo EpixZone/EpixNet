@@ -106,6 +106,11 @@ impl UiServer {
             .route("/Plugins/", get(|| async { Redirect::permanent("/Plugins") }))
             .route("/Config/", get(|| async { Redirect::permanent("/Config") }))
             .route("/Stats/", get(|| async { Redirect::permanent("/Stats") }))
+            // The Epix Wallet web app for the mobile shells (see
+            // AppState::wallet_ui_dir); 404s when nothing is staged.
+            .route("/EpixWallet", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
+            .route("/EpixWallet/", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
+            .route("/EpixWallet/*path", get(serve_wallet))
             .route("/list/*path", get(serve_file_manager))
             .route("/:address", get(redirect_to_slash))
             .route("/:address/", get(serve_wrapper))
@@ -259,16 +264,30 @@ async fn health() -> &'static str {
 }
 
 /// `GET /EpixNet-Internal/Status` - a small JSON status the browser's native
-/// host polls to drive the Tor toolbar icon: whether the node is serving, the
-/// Tor state (`tor_enabled`/`tor_status`), and our onion address if published.
+/// host polls to drive the wallet's Epix panel: whether the node is serving,
+/// the Tor state (`tor_enabled`/`tor_status`) + our onion address, and the I2P
+/// state (`i2p_enabled`/`i2p_status`) + our `.b32.i2p` address if published.
 async fn serve_status(State(ctx): State<Ctx>) -> Response {
     let (tor_enabled, tor_status) = ctx.state.tor_status().await;
     let onion = ctx.state.onion_address().await;
+    // I2P: the runtime keeps a status object (mode, phase, b32, tunnels, ...);
+    // surface a concise view. `i2p_status` is the phase label ("Off",
+    // "Starting…", "Ready", "Failed: …"), `i2p_mode` is
+    // disable/embedded/external, and `i2p_enabled` is true once the router has
+    // published our address (fully ready).
+    let i2p = ctx.state.i2p_status().await;
+    let i2p_phase = i2p.get("phase").and_then(|v| v.as_str()).unwrap_or("Off").to_string();
+    let i2p_mode = i2p.get("mode").and_then(|v| v.as_str()).unwrap_or("disable").to_string();
+    let i2p_address = ctx.state.i2p_address().await;
     let body = json!({
         "serving": true,
         "tor_enabled": tor_enabled,
         "tor_status": tor_status,
         "onion_address": onion,
+        "i2p_enabled": i2p_address.is_some(),
+        "i2p_status": i2p_phase,
+        "i2p_mode": i2p_mode,
+        "i2p_address": i2p_address,
     });
     (
         [
@@ -325,6 +344,25 @@ async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Resp
     match UIMEDIA.get_file(&path) {
         Some(file) => ([(header::CONTENT_TYPE, ct)], file.contents().to_vec()).into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+/// Serve the Epix Wallet web app from `<data_root>/wallet-ui`, where the
+/// mobile shells stage their bundled wallet build (their WebViews cannot run
+/// the WebExtension the desktop browser embeds, so the wallet runs as a
+/// plain web app served from this loopback origin - see the wallet repo's
+/// mobile.html). 404s when nothing is staged.
+async fn serve_wallet(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    let Some(root) = ctx.state.wallet_ui_dir() else {
+        return (StatusCode::NOT_FOUND, "no wallet staged").into_response();
+    };
+    // Plain relative components only - no traversal out of the staging dir.
+    if path.split('/').any(|c| c.is_empty() || c == "." || c == "..") {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match tokio::fs::read(root.join(&path)).await {
+        Ok(body) => ([(header::CONTENT_TYPE, content_type(&path))], body).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
