@@ -49,6 +49,34 @@ The dashboard lives at **http://127.0.0.1:42222/**. Open a specific site by pass
 cargo run -p epix-server talk.epix
 ```
 
+## Command line actions
+
+The same binary doubles as the authoring and diagnostics CLI, with the
+action name as the first argument (the EpixNet CLI shape):
+
+```sh
+epix-server siteCreate                          # new xite: address + private key
+epix-server siteSign <address> [privatekey]     # re-sign after editing files
+epix-server siteVerify <address>                # check files against the signed content.json
+epix-server dbRebuild <address>                 # rebuild the xite's sql cache
+epix-server dbQuery <address> "<sql>"           # query the xite db, JSON out
+epix-server importBundle <bundle.zip>           # import xites from a zip
+
+epix-server cryptSign <message> <privatekey>
+epix-server cryptVerify <message> <sign> <address>
+epix-server cryptGetPrivatekey <master_seed> [index]
+epix-server cryptPrivatekeyToAddress <privatekey>
+
+epix-server peerPing <ip> <port>                # wire-protocol ping
+epix-server peerGetFile <ip> <port> <site> <inner_path>
+epix-server peerCmd <ip> <port> <cmd> '<json params>'
+```
+
+The authoring actions work against the data dir directly (no running
+node needed). `siteSign` uses the key saved at `siteCreate` when you
+don't pass one. Anything that is not an action name is treated as a
+xite to open, as before.
+
 ## Settings you can change
 
 Set these before you start EpixNet to change how it runs:

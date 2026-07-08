@@ -2028,9 +2028,15 @@ dependencies = [
 name = "epix-server"
 version = "0.3.0"
 dependencies = [
+ "epix-core",
+ "epix-crypt",
  "epix-node",
+ "epix-protocol",
+ "epix-transport",
  "epix-ui",
  "libc",
+ "rmpv",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
