@@ -794,11 +794,6 @@ impl AppState {
         (self.config_str_list("plugins_disabled").await, self.config_str_list("plugins_enabled").await)
     }
 
-    /// The persisted list of disabled plugin names.
-    async fn disabled_plugins(&self) -> Vec<String> {
-        self.config_str_list("plugins_disabled").await
-    }
-
     /// Read a config value as a list of strings.
     async fn config_str_list(&self, key: &str) -> Vec<String> {
         self.config_get(key)
