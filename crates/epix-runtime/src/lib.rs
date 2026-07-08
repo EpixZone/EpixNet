@@ -279,6 +279,13 @@ impl NodeRuntime {
                 });
             }
         }
+        // Wakeup watcher: detect a wall-clock jump (the machine slept) and
+        // force a fresh announce + connection sweep on resume, like EpixNet's
+        // FileServer.wakeupWatcher. Cheap: a 30s self-check.
+        self.handles.push(tokio::spawn(wakeup_loop(
+            self.state.clone(),
+            self.shutdown.clone(),
+        )));
         // AnnounceLocal: discover peers on the LAN over UDP broadcast. When the
         // file server is up, advertise its port so discovered peers can reach us.
         #[cfg(feature = "local-discovery")]
@@ -556,6 +563,42 @@ async fn chart_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duratio
                     state.archive_chart().await;
                 }
             }
+        }
+    }
+}
+
+/// Detect a large wall-clock jump between ticks - the signature of the
+/// machine sleeping and resuming (tokio's interval is monotonic, so after a
+/// suspend the loops just resume with stale peers and a stale announce). On a
+/// jump, kick a fresh announce (via the trackers-changed notify the announce
+/// loop already waits on) and a connection sweep, so a laptop that closes and
+/// reopens rejoins the network at once instead of on the next 20-minute pass.
+async fn wakeup_loop(state: Arc<AppState>, shutdown: Arc<Notify>) {
+    let check = Duration::from_secs(30);
+    // A jump longer than a few checks means real suspended time, not scheduler
+    // jitter (EpixNet uses 3 minutes).
+    let jump_threshold = Duration::from_secs(3 * 60);
+    let mut last = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tokio::time::sleep(check) => {}
+        }
+        let elapsed = last.elapsed();
+        last = tokio::time::Instant::now();
+        if elapsed > jump_threshold {
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "Wakeup: {}s wall-clock jump detected, re-announcing",
+                        elapsed.as_secs()
+                    ),
+                )
+                .await;
+            // Kick the announce loop (it selects on this) and refresh peers.
+            state.trackers_changed().notify_waiters();
+            state.manage_connections().await;
         }
     }
 }

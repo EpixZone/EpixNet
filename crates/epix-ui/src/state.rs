@@ -1839,7 +1839,12 @@ impl AppState {
         // (dozens, some dead), serial announces would stretch one pass across
         // many timeouts and the dashboard's per-tracker stats would trickle in.
         let mut set = tokio::task::JoinSet::new();
+        let mut skipped = 0;
         for tracker in trackers.iter().cloned() {
+            if self.tracker_backed_off(&tracker).await {
+                skipped += 1;
+                continue;
+            }
             let transport = transport.clone();
             let key = key.clone();
             let advert = advert.clone();
@@ -1869,7 +1874,8 @@ impl AppState {
             }
         }
         self.add_peers(address, all.clone()).await;
-        self.log("INFO", format!("Announced {address}: {} peers", all.len())).await;
+        let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
+        self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
         // Push the fresh peer count + tracker status to any connected UI.
         self.push_site_info(address).await;
         self.push_announcer_info(&key).await;
@@ -1905,6 +1911,23 @@ impl AppState {
             obj.insert("status".into(), json!("error"));
             bump(obj, "num_error", 1);
         }
+    }
+
+    /// EpixNet's tracker back-off (`SiteAnnouncer.announce`): skip a tracker
+    /// that has failed more than 5 times and was tried within the last
+    /// `60 * min(30, num_error)` seconds, so a reliably-dead tracker is not
+    /// hammered every pass. `force` (a manual `siteAnnounce`) bypasses it.
+    async fn tracker_backed_off(&self, tracker: &PeerAddr) -> bool {
+        let key = format!("{}://{}", tracker.scheme(), tracker);
+        let stats = self.tracker_stats.read().await;
+        let Some(entry) = stats.get(&key) else { return false };
+        let num_error = entry.get("num_error").and_then(|v| v.as_i64()).unwrap_or(0);
+        let time_request = entry.get("time_request").and_then(|v| v.as_i64()).unwrap_or(0);
+        if num_error <= 5 {
+            return false;
+        }
+        let wait = 60 * num_error.min(30);
+        now_secs() as i64 - time_request < wait
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
@@ -6898,6 +6921,32 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn tracker_back_off_after_repeated_errors() {
+        let state = AppState::new("test");
+        let tracker = PeerAddr::parse("1.2.3.4:26959").unwrap();
+        // Fresh tracker: never backed off.
+        assert!(!state.tracker_backed_off(&tracker).await);
+        // Six failed announces (num_added == 0 records an error).
+        for _ in 0..6 {
+            state.record_tracker(&tracker, 0).await;
+        }
+        // >5 errors and just tried -> backed off this round.
+        assert!(state.tracker_backed_off(&tracker).await);
+        // A success resets the error count, so it is tried again.
+        state.record_tracker(&tracker, 3).await;
+        // num_error is still 6 in the running total, but a fresh look uses the
+        // recorded time; force the stat's time_request into the past to prove
+        // the window, not the count alone, gates it.
+        {
+            let mut stats = state.tracker_stats.write().await;
+            let key = format!("{}://{}", tracker.scheme(), tracker);
+            let e = stats.get_mut(&key).unwrap().as_object_mut().unwrap();
+            e.insert("time_request".into(), json!(0));
+        }
+        assert!(!state.tracker_backed_off(&tracker).await, "old enough to retry");
+    }
 
     #[tokio::test]
     async fn chart_collect_then_query_returns_datapoints() {
