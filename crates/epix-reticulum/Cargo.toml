@@ -12,6 +12,7 @@ epix-protocol = { path = "../epix-protocol" }
 # pinned to a commit so builds reproduce.
 reticulum = { git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs", rev = "dc4e03bb08a2069d03ba038bcc63eb9358201dd5" }
 async-trait = "0.1"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
 tokio = { version = "1", features = ["sync", "rt", "io-util", "macros", "time"] }
 
 [dev-dependencies]

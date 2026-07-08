@@ -56,6 +56,15 @@ pub struct RuntimeConfig {
     /// External I2P router's SAM TCP port (only used in `external` mode).
     #[cfg(feature = "i2p")]
     pub i2p_sam_port: u16,
+    /// Reticulum mesh enable. Ignored without the `mesh` feature.
+    #[cfg(feature = "mesh")]
+    pub mesh_enabled: bool,
+    /// Mesh TCP interfaces to dial (`host:port` hubs/peers).
+    #[cfg(feature = "mesh")]
+    pub mesh_peers: Vec<String>,
+    /// Mesh TCP interface to listen on (`ip:port`), if any.
+    #[cfg(feature = "mesh")]
+    pub mesh_listen: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -75,6 +84,12 @@ impl Default for RuntimeConfig {
             i2p_mode: "disable".to_string(),
             #[cfg(feature = "i2p")]
             i2p_sam_port: 7656,
+            #[cfg(feature = "mesh")]
+            mesh_enabled: false,
+            #[cfg(feature = "mesh")]
+            mesh_peers: Vec::new(),
+            #[cfg(feature = "mesh")]
+            mesh_listen: None,
         }
     }
 }
@@ -95,7 +110,7 @@ pub struct NodeRuntime {
     prop_store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
     /// Data root for Tor/I2P state (`<root>/tor`, `<root>/i2p`). Set via
     /// [`NodeRuntime::with_data_dir`] before `start()`.
-    #[cfg(any(feature = "tor", feature = "i2p"))]
+    #[cfg(any(feature = "tor", feature = "i2p", feature = "mesh"))]
     data_dir: Option<std::path::PathBuf>,
 }
 
@@ -126,13 +141,13 @@ impl NodeRuntime {
             handles: Vec::new(),
             dht,
             prop_store,
-            #[cfg(any(feature = "tor", feature = "i2p"))]
+            #[cfg(any(feature = "tor", feature = "i2p", feature = "mesh"))]
             data_dir: None,
         }
     }
 
     /// Set the data root Tor/I2P keep their state under.
-    #[cfg(any(feature = "tor", feature = "i2p"))]
+    #[cfg(any(feature = "tor", feature = "i2p", feature = "mesh"))]
     pub fn with_data_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.data_dir = Some(dir.into());
         self
@@ -220,6 +235,22 @@ impl NodeRuntime {
                     self.shutdown.clone(),
                 )));
             }
+        }
+        // Reticulum mesh: join the configured mesh interfaces, layer `rns:`
+        // dialing onto the transport, serve the wire protocol to peers that
+        // link to us, and announce our destination so they can.
+        #[cfg(feature = "mesh")]
+        if self.config.mesh_enabled {
+            let identity_path =
+                self.data_dir.clone().map(|d| d.join("mesh").join("identity"));
+            self.handles.push(tokio::spawn(mesh_loop(
+                self.state.clone(),
+                self.node_handler(),
+                identity_path,
+                self.config.mesh_peers.clone(),
+                self.config.mesh_listen.clone(),
+                self.shutdown.clone(),
+            )));
         }
         // In-process Tor: bootstrap Arti, set the peer transport (onion dials,
         // or all traffic in Always mode), host an onion service that feeds the
@@ -715,6 +746,60 @@ async fn tor_loop(
 /// same node handler as the TCP/onion loops, and the live status is polled into
 /// the app state for the Stats page. The node keeps working over clearnet/Tor
 /// throughout the (minutes-long) embedded bootstrap.
+/// Join the Reticulum mesh and run its surfaces until shutdown: bring up the
+/// mesh node (identity + destination + TCP interfaces), layer `rns:` dialing
+/// onto the peer transport, feed inbound mesh links to the same node handler
+/// as the TCP/onion/I2P loops, and announce our destination on an interval so
+/// peers can find a path to us. LoRa/BLE radios become further interface
+/// types on the same mesh node later; this loop does not change.
+#[cfg(feature = "mesh")]
+async fn mesh_loop(
+    state: Arc<AppState>,
+    handler: Arc<handler::NodeHandler>,
+    identity_path: Option<std::path::PathBuf>,
+    tcp_peers: Vec<String>,
+    tcp_listen: Option<String>,
+    shutdown: Arc<Notify>,
+) {
+    use epix_protocol::RequestHandler;
+    let config = epix_reticulum::MeshConfig {
+        identity_path,
+        tcp_peers: tcp_peers.clone(),
+        tcp_listen: tcp_listen.clone(),
+    };
+    let node = match epix_reticulum::MeshNode::spawn(config).await {
+        Ok(node) => node,
+        Err(e) => {
+            state.log("WARNING", format!("Mesh: bring-up failed: {e}")).await;
+            return;
+        }
+    };
+    let listen_note = tcp_listen.map(|l| format!(", listening on {l}")).unwrap_or_default();
+    state
+        .log(
+            "INFO",
+            format!(
+                "Mesh: up, our address rns:{} ({} interface peer(s){listen_note})",
+                node.dest_hash_hex(),
+                tcp_peers.len(),
+            ),
+        )
+        .await;
+
+    // Layer `rns:` dialing onto the transport (composed with TCP/Tor/I2P).
+    state.set_rns_transport(Arc::new(node.transport())).await;
+    state.set_rns_address(&node.dest_hash_hex()).await;
+
+    // Announce our destination and serve inbound links until shutdown.
+    let announce = node.spawn_announce(Duration::from_secs(60));
+    let handler: Arc<dyn RequestHandler> = handler;
+    let serve = tokio::spawn(async move { node.serve(handler).await });
+
+    shutdown.notified().await;
+    announce.abort();
+    serve.abort();
+}
+
 #[cfg(feature = "i2p")]
 async fn i2p_loop(
     state: Arc<AppState>,

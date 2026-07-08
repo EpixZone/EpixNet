@@ -123,13 +123,14 @@ impl FileService {
         // Collect the peers they sent (and their own address) to add + exclude
         // from the reply.
         let mut got: Vec<PeerAddr> = Vec::new();
-        for field in ["peers", "peers_ipv6", "peers_onion", "peers_i2p"] {
+        for field in ["peers", "peers_ipv6", "peers_onion", "peers_i2p", "peers_rns"] {
             if let Some(Value::Array(list)) = vget(params, field) {
                 for packed in list {
                     if let Value::Binary(bytes) = packed {
                         let parsed = match field {
                             "peers_onion" => PeerAddr::unpack_onion(bytes),
                             "peers_i2p" => PeerAddr::unpack_i2p(bytes),
+                            "peers_rns" => PeerAddr::unpack_rns(bytes),
                             _ => PeerAddr::unpack_ip(bytes),
                         };
                         if let Some(p) = parsed {
@@ -156,9 +157,10 @@ impl FileService {
             }
         }
 
-        // Advertise our own reachable overlay addresses (onion + i2p) so peers
-        // can reach us over an anonymity network and gossip us on. Clearnet
-        // self-advertising is left to trackers (they see our source IP:port).
+        // Advertise our own reachable overlay addresses (onion + i2p + mesh)
+        // so peers can reach us over an anonymity network or mesh link and
+        // gossip us on. Clearnet self-advertising is left to trackers (they
+        // see our source IP:port).
         let fs_port = self.state.fileserver_port().await;
         let mut self_addrs: Vec<PeerAddr> = Vec::new();
         if let Some(onion) = self.state.onion_address().await {
@@ -166,6 +168,11 @@ impl FileService {
         }
         if let Some(i2p) = self.state.i2p_address().await {
             self_addrs.push(PeerAddr::I2p { dest: i2p, port: fs_port });
+        }
+        if let Some(hex) = self.state.rns_address().await {
+            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
+                self_addrs.push(p);
+            }
         }
         for p in self_addrs {
             if exclude.contains(&p.to_string()) {
@@ -185,6 +192,9 @@ impl FileService {
         }
         if let Some(i2p) = buckets.remove("peers_i2p") {
             reply.push(("peers_i2p", Value::Array(i2p)));
+        }
+        if let Some(rns) = buckets.remove("peers_rns") {
+            reply.push(("peers_rns", Value::Array(rns)));
         }
         vmap(reply)
     }

@@ -18,13 +18,15 @@ pub struct HandshakeInfo {
 }
 
 /// A `pex` reply's peers, packed by bucket. Unpack with `PeerAddr::unpack_ip`
-/// (ipv4/ipv6), `PeerAddr::unpack_onion` (onion), `PeerAddr::unpack_i2p` (i2p).
+/// (ipv4/ipv6), `PeerAddr::unpack_onion` (onion), `PeerAddr::unpack_i2p`
+/// (i2p), `PeerAddr::unpack_rns` (rns).
 #[derive(Debug, Clone, Default)]
 pub struct PexReply {
     pub ipv4: Vec<Vec<u8>>,
     pub ipv6: Vec<Vec<u8>>,
     pub onion: Vec<Vec<u8>>,
     pub i2p: Vec<Vec<u8>>,
+    pub rns: Vec<Vec<u8>>,
 }
 
 /// A `findHashIds` reply: which peers hold each optional-file hash id (packed
@@ -222,6 +224,7 @@ impl Connection {
         peers_ipv6: Vec<Vec<u8>>,
         peers_onion: Vec<Vec<u8>>,
         peers_i2p: Vec<Vec<u8>>,
+        peers_rns: Vec<Vec<u8>>,
         need: i64,
     ) -> Result<PexReply> {
         let pack = |list: Vec<Vec<u8>>| Value::Array(list.into_iter().map(Value::Binary).collect());
@@ -238,6 +241,9 @@ impl Connection {
         }
         if !peers_i2p.is_empty() {
             params.push(("peers_i2p", pack(peers_i2p)));
+        }
+        if !peers_rns.is_empty() {
+            params.push(("peers_rns", pack(peers_rns)));
         }
         let resp = self.request("pex", vmap(params)).await?;
         let extract = |field: &str| -> Vec<Vec<u8>> {
@@ -257,6 +263,7 @@ impl Connection {
             ipv6: extract("peers_ipv6"),
             onion: extract("peers_onion"),
             i2p: extract("peers_i2p"),
+            rns: extract("peers_rns"),
         })
     }
 

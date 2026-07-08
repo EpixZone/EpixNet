@@ -338,7 +338,9 @@ async fn clone_xite_with_progress(
                 let reply = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                     let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
                     conn.handshake().await.ok()?;
-                    conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), Vec::new(), 10).await.ok()
+                    conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 10)
+                        .await
+                        .ok()
                 })
                 .await
                 .ok()
@@ -350,7 +352,8 @@ async fn clone_xite_with_progress(
                     .chain(reply.ipv6.iter())
                     .filter_map(|b| PeerAddr::unpack_ip(b))
                     .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
-                    .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)));
+                    .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)))
+                    .chain(reply.rns.iter().filter_map(|b| PeerAddr::unpack_rns(b)));
                 for p in unpacked {
                     if found.lock().unwrap().insert(p.to_string()) {
                         let _ = tx.send(p);
@@ -1258,6 +1261,34 @@ async fn serve(
         (mode, port)
     };
 
+    // Mesh config from the node config (Config page): enable + TCP interfaces.
+    #[cfg(feature = "mesh")]
+    let (mesh_enabled, mesh_peers, mesh_listen) = {
+        let enabled = !offline
+            && state
+                .config_get("mesh")
+                .await
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "disable".to_string())
+                == "enable";
+        let peers: Vec<String> = state
+            .config_get("mesh_peers")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        let listen = state
+            .config_get("mesh_listen")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.trim().is_empty());
+        (enabled, peers, listen)
+    };
+
     let runtime_config = epix_runtime::RuntimeConfig {
         fileserver_port: if offline { None } else { fileserver_port },
         offline,
@@ -1269,6 +1300,12 @@ async fn serve(
         i2p_mode,
         #[cfg(feature = "i2p")]
         i2p_sam_port,
+        #[cfg(feature = "mesh")]
+        mesh_enabled,
+        #[cfg(feature = "mesh")]
+        mesh_peers,
+        #[cfg(feature = "mesh")]
+        mesh_listen,
         ..Default::default()
     };
     let mut runtime =

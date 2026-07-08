@@ -140,6 +140,27 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "7656",
         "text",
     ),
+    (
+        "Network",
+        "mesh",
+        "Reticulum mesh (reach and host peers over mesh links)",
+        "disable",
+        "select:Disable=disable|Enable=enable",
+    ),
+    (
+        "Network",
+        "mesh_peers",
+        "Mesh TCP interfaces to join (host:port, one per line)",
+        "",
+        "textarea",
+    ),
+    (
+        "Network",
+        "mesh_listen",
+        "Mesh TCP listen address (blank = do not accept mesh links over IP)",
+        "",
+        "text",
+    ),
     ("Network", "trackers", "Trackers", "145.223.69.23:26959", "textarea"),
     ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
     (
@@ -260,6 +281,8 @@ pub struct AppState {
     base_transport: RwLock<Option<Arc<dyn Transport>>>,
     /// The I2P transport (dials `.b32.i2p` peers), once I2P is up.
     i2p_transport: RwLock<Option<Arc<dyn Transport>>>,
+    /// The Reticulum mesh transport (dials `rns:` dest hashes), once up.
+    rns_transport: RwLock<Option<Arc<dyn Transport>>>,
     /// Latest I2P status snapshot for the Stats page (JSON; `{}` when off).
     i2p_status: RwLock<Value>,
     /// On-demand resolver: resolve + clone a `.epix` host not yet served (set by
@@ -338,6 +361,8 @@ pub struct AppState {
     /// Whether the UI listener is bound to loopback - drives the
     /// cross-origin gate's default (EpixNet enables it only there).
     ui_loopback: RwLock<bool>,
+    /// Our Reticulum mesh address (destination hash, hex), once the mesh is up.
+    rns_address: RwLock<Option<String>>,
     /// In-memory announce tracker: peers other nodes announced to us, keyed by
     /// xite hash, so this node answers `announce` like a Bootstrapper.
     tracker: crate::tracker::TrackerDb,
@@ -473,12 +498,14 @@ fn html_escape(s: &str) -> String {
 
 /// A random lowercase-hex string of `bytes` random bytes (2 hex chars each).
 /// Used for wrapper/CSP nonces.
-/// Dispatches by transport: `.b32.i2p` peers to the I2P transport, everything
-/// else (clearnet, onion) to the base. Lets I2P be layered onto TCP or Tor's
-/// MixedTransport without either clobbering the other.
+/// Dispatches by transport: `.b32.i2p` peers to the I2P transport, `rns:`
+/// dest hashes to the Reticulum mesh, everything else (clearnet, onion) to
+/// the base. Lets the overlays be layered onto TCP or Tor's MixedTransport
+/// without any of them clobbering another.
 struct OverlayTransport {
     base: Arc<dyn Transport>,
-    i2p: Arc<dyn Transport>,
+    i2p: Option<Arc<dyn Transport>>,
+    rns: Option<Arc<dyn Transport>>,
 }
 
 #[async_trait::async_trait]
@@ -488,7 +515,14 @@ impl Transport for OverlayTransport {
     }
     async fn dial(&self, addr: &PeerAddr) -> Result<epix_transport::PeerStream, epix_core::Error> {
         match addr {
-            PeerAddr::I2p { .. } => self.i2p.dial(addr).await,
+            PeerAddr::I2p { .. } => match &self.i2p {
+                Some(i2p) => i2p.dial(addr).await,
+                None => self.base.dial(addr).await,
+            },
+            PeerAddr::Rns(_) => match &self.rns {
+                Some(rns) => rns.dial(addr).await,
+                None => self.base.dial(addr).await,
+            },
             _ => self.base.dial(addr).await,
         }
     }
@@ -527,6 +561,7 @@ impl AppState {
             transport: RwLock::new(None),
             base_transport: RwLock::new(None),
             i2p_transport: RwLock::new(None),
+            rns_transport: RwLock::new(None),
             i2p_status: RwLock::new(json!({})),
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
@@ -554,6 +589,7 @@ impl AppState {
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
             ui_loopback: RwLock::new(false),
+            rns_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -637,6 +673,7 @@ impl AppState {
             transport: RwLock::new(None),
             base_transport: RwLock::new(None),
             i2p_transport: RwLock::new(None),
+            rns_transport: RwLock::new(None),
             i2p_status: RwLock::new(json!({})),
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
@@ -665,6 +702,7 @@ impl AppState {
             onion_address: RwLock::new(None),
             i2p_address: RwLock::new(None),
             ui_loopback: RwLock::new(false),
+            rns_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1997,6 +2035,16 @@ impl AppState {
                 granted == target || Some(granted.to_string()) == target_canonical
             })
         })
+    }
+
+    /// Record our Reticulum mesh address (destination hash, hex).
+    pub async fn set_rns_address(&self, hex: &str) {
+        *self.rns_address.write().await = Some(hex.to_string());
+    }
+
+    /// Our mesh destination hash (hex), once the mesh is up.
+    pub async fn rns_address(&self) -> Option<String> {
+        self.rns_address.read().await.clone()
     }
 
     /// Record this build's short git commit (reported in `serverInfo.rev`).
@@ -3566,6 +3614,7 @@ impl AppState {
             ours.iter().map(|p| p.to_string()).collect();
         let (mut ipv4, mut ipv6, mut onion, mut i2p) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut rns: Vec<Vec<u8>> = Vec::new();
         for p in &ours {
             if p.is_private() {
                 continue;
@@ -3575,6 +3624,7 @@ impl AppState {
                 (epix_core::IpType::Ipv6, Some(b)) => ipv6.push(b),
                 (epix_core::IpType::Onion, Some(b)) => onion.push(b),
                 (epix_core::IpType::I2p, Some(b)) => i2p.push(b),
+                (epix_core::IpType::Rns, Some(b)) => rns.push(b),
                 _ => {}
             }
         }
@@ -3591,15 +3641,30 @@ impl AppState {
                 i2p.push(b);
             }
         }
+        if let Some(hex) = self.rns_address().await {
+            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
+                if let Some(b) = p.pack() {
+                    rns.push(b);
+                }
+            }
+        }
 
         let mut learned: Vec<PeerAddr> = Vec::new();
         for peer in ours.iter().take(max_peers) {
             let got = tokio::time::timeout(std::time::Duration::from_secs(6), async {
                 let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
                 conn.handshake().await.ok()?;
-                conn.pex(&canonical, ipv4.clone(), ipv6.clone(), onion.clone(), i2p.clone(), need)
-                    .await
-                    .ok()
+                conn.pex(
+                    &canonical,
+                    ipv4.clone(),
+                    ipv6.clone(),
+                    onion.clone(),
+                    i2p.clone(),
+                    rns.clone(),
+                    need,
+                )
+                .await
+                .ok()
             })
             .await;
             let Ok(Some(reply)) = got else { continue };
@@ -3610,7 +3675,8 @@ impl AppState {
                 .chain(reply.ipv6.iter())
                 .filter_map(|b| PeerAddr::unpack_ip(b))
                 .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
-                .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)));
+                .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)))
+                .chain(reply.rns.iter().filter_map(|b| PeerAddr::unpack_rns(b)));
             for p in unpacked {
                 if known.insert(p.to_string()) {
                     learned.push(p);
@@ -4658,13 +4724,21 @@ impl AppState {
         self.recompose_transport().await;
     }
 
-    /// Rebuild the composed transport from the base + optional I2P layer.
+    /// Set the Reticulum mesh transport (dials `rns:` dest hashes). Layered
+    /// onto the base like I2P.
+    pub async fn set_rns_transport(&self, transport: Arc<dyn Transport>) {
+        *self.rns_transport.write().await = Some(transport);
+        self.recompose_transport().await;
+    }
+
+    /// Rebuild the composed transport from the base + the overlay layers.
     async fn recompose_transport(&self) {
         let base = self.base_transport.read().await.clone();
         let i2p = self.i2p_transport.read().await.clone();
-        let composed: Option<Arc<dyn Transport>> = match (base, i2p) {
-            (Some(base), Some(i2p)) => Some(Arc::new(OverlayTransport { base, i2p })),
-            (Some(base), None) => Some(base),
+        let rns = self.rns_transport.read().await.clone();
+        let composed: Option<Arc<dyn Transport>> = match (base, i2p, rns) {
+            (Some(base), None, None) => Some(base),
+            (Some(base), i2p, rns) => Some(Arc::new(OverlayTransport { base, i2p, rns })),
             _ => None,
         };
         *self.transport.write().await = composed;
