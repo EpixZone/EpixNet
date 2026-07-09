@@ -87,7 +87,7 @@ async fn main() {
         open_browser: false,
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
         log_file: None,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: env!("EPIX_VERSION").to_string(),
         rev: env!("EPIX_GIT_REV").to_string(),
     };
     let (server, running) = match epix_node::boot(opts).await {
