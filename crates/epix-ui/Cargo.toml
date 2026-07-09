@@ -54,7 +54,7 @@ epix-reticulum = { path = "../epix-reticulum" }
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false }
