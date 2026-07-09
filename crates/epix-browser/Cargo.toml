@@ -14,7 +14,7 @@ epix-ui = { path = "../epix-ui" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
 # Secure origins: a per-install local CA that signs on-the-fly leaf certs for
 # `*.epix`, so Firefox loads `https://dashboard.epix/` as a real secure context.
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 hyper = { version = "1", features = ["server", "http1"] }
