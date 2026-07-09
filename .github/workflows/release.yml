@@ -7,9 +7,10 @@ name: Release
 
 on:
   push:
-    # Both `v0.3.1` and a bare `0.3.1` trigger a release; the version step
-    # strips a leading `v` either way.
-    tags: ["v*", "[0-9]+.[0-9]+.[0-9]+*"]
+    # Release tags must start with `v` (e.g. `v0.3.1`); the version step strips
+    # the leading `v`. A tag without it does not trigger a release. To reject
+    # such tags at creation time, add a repository tag ruleset (see below).
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
