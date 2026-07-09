@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: google/osv-scanner-action/osv-scanner-action@v2.0.2
+      - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
         with:
           # osv-scanner.toml holds the accepted-advisory ignore list.
           scan-args: |-
