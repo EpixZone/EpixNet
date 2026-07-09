@@ -263,11 +263,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Epix $GITHUB_REF_NAME" \
-            --generate-notes \
-            artifacts/epix-macos/*.dmg \
-            artifacts/epix-linux/*.tar.gz \
-            artifacts/epix-windows/*.exe \
+          files=(
+            artifacts/epix-macos/*.dmg
+            artifacts/epix-linux/*.tar.gz
+            artifacts/epix-windows/*.exe
             artifacts/epix-android/*.apk
+          )
+          # A release may already exist for this tag: creating one in the GitHub
+          # UI makes the tag (which triggers this workflow), and a re-run finds
+          # its own earlier release. In that case attach the artifacts to the
+          # existing release (--clobber replaces same-named assets on a re-run)
+          # instead of failing on "release already exists". Otherwise (a bare
+          # `git push` of the tag) create the release.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --clobber "${files[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Epix $GITHUB_REF_NAME" \
+              --generate-notes \
+              "${files[@]}"
+          fi
