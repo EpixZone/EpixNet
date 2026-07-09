@@ -26,7 +26,11 @@ pub struct GeoIp {
 impl GeoIp {
     /// Memory-map a `.mmdb` file.
     pub fn open(path: impl AsRef<Path>) -> Option<Self> {
-        Reader::open_mmap(path).ok().map(|reader| Self { reader })
+        // SAFETY: the .mmdb is written once by `ensure` (or shipped read-only)
+        // and not mutated while mapped, so the mapping stays valid for its life.
+        unsafe { Reader::open_mmap(path) }
+            .ok()
+            .map(|reader| Self { reader })
     }
 
     /// Ensure the database exists at `mmdb_path` (decompressing `gz` into it on
@@ -46,16 +50,14 @@ impl GeoIp {
 
     /// Resolve an IP to a location, or `None` if it is not in the database.
     pub fn locate(&self, ip: IpAddr) -> Option<Loc> {
-        let city: geoip2::City = self.reader.lookup(ip).ok().flatten()?;
-        let location = city.location?;
-        let en = |names: Option<std::collections::BTreeMap<&str, &str>>| {
-            names.and_then(|n| n.get("en").map(|s| s.to_string()))
-        };
+        let city: geoip2::City = self.reader.lookup(ip).ok()?.decode().ok().flatten()?;
+        // In maxminddb 0.27 the sub-records are plain structs (not Option), and
+        // localized names are typed fields (`names.english`) rather than a map.
         Some(Loc {
-            lat: location.latitude?,
-            lon: location.longitude?,
-            city: en(city.city.and_then(|c| c.names)),
-            country: en(city.country.and_then(|c| c.names)),
+            lat: city.location.latitude?,
+            lon: city.location.longitude?,
+            city: city.city.names.english.map(|s| s.to_string()),
+            country: city.country.names.english.map(|s| s.to_string()),
         })
     }
 }

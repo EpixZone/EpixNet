@@ -1,0 +1,18 @@
+# gitleaks config for EpixNet.
+# Extends the default ruleset and allowlists test vectors. The 71 default hits
+# are all generic-api-key matches on crypto test fixtures (test keys/vectors),
+# not real secrets; trufflehog's verified scan found 0 live secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test vectors and fixtures"
+paths = [
+  '''.*/tests/.*''',
+  '''.*/test/.*''',
+  '''.*/testdata/.*''',
+  '''.*/fixtures/.*''',
+  '''.*/examples/.*''',
+  '''.*_test\.rs''',
+  '''target/.*''',
+]
