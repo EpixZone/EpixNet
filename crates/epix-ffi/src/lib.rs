@@ -110,13 +110,18 @@ impl EpixNode {
             inner.state = NodeState::Starting;
             inner.error = None;
         }
+        // GeoIP city DB for the sidebar globe's peer-location dots. Bundled the
+        // same way the standalone server ships it; without it the node disables
+        // the map and no dots render (the mobile shells used to pass None here).
+        const GEOIP_CITY_GZ: &[u8] =
+            include_bytes!("../../epix-server/assets/dbip-city-lite.mmdb.gz");
         let opts = NodeOptions {
             data_root: config.data_dir.into(),
             target: config.target,
             ui_addr: config.ui_addr,
             tor_mode: config.tor_mode,
             open_browser: false,
-            geoip_gz: None,
+            geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
             log_file: None,
             version: config.version,
             rev: env!("EPIX_GIT_REV").to_string(),

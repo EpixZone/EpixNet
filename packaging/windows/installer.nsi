@@ -18,6 +18,11 @@ Unicode true
   !define OUT_FILE "Epix-Setup.exe"
 !endif
 
+; Installer/uninstaller icon, prebuilt from the assets repo
+; (images/icons/generated/windows/app.ico). Path is relative to this script.
+!define MUI_ICON "app.ico"
+!define MUI_UNICON "app.ico"
+
 Name "Epix"
 OutFile "${OUT_FILE}"
 InstallDir "$LOCALAPPDATA\Epix"
@@ -53,7 +58,7 @@ Section "Epix" SecMain
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr   HKCU "${UNINST_KEY}" "DisplayName"     "Epix"
   WriteRegStr   HKCU "${UNINST_KEY}" "DisplayVersion"  "${VERSION}"
-  WriteRegStr   HKCU "${UNINST_KEY}" "Publisher"       "EpixNet"
+  WriteRegStr   HKCU "${UNINST_KEY}" "Publisher"       "Epix"
   WriteRegStr   HKCU "${UNINST_KEY}" "DisplayIcon"     "$INSTDIR\epix-browser.exe"
   WriteRegStr   HKCU "${UNINST_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegDWORD HKCU "${UNINST_KEY}" "NoModify" 1

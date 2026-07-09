@@ -164,6 +164,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
         let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
         webView.translatesAutoresizingMaskIntoConstraints = false
+        // Dark behind the page: WKWebView paints white before content arrives
+        // (the node may still be booting on a cold start).
+        webView.isOpaque = false
+        webView.backgroundColor = Self.chromeBg
+        webView.scrollView.backgroundColor = Self.chromeBg
         container.addSubview(webView)
         container.addSubview(field)
         container.addSubview(button)
@@ -485,6 +490,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         if #available(iOS 16.4, *) { web.isInspectable = true }
         web.uiDelegate = walletUIDelegate
         web.translatesAutoresizingMaskIntoConstraints = false
+        // Dark behind the wallet page until its inline splash paints; the
+        // default white flashes while the bundles parse.
+        web.isOpaque = false
+        web.backgroundColor = Self.chromeBg
+        web.scrollView.backgroundColor = Self.chromeBg
         walletWebView = web
 
         let vc = UIViewController()

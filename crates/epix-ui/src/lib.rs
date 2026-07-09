@@ -317,14 +317,27 @@ fn url_is_same_host(url: &str, host: &str) -> bool {
     strip_port(url_host) == strip_port(host)
 }
 
-/// The xite a referer URL points at: its first path segment, or - in
-/// transparent-proxy mode - the `.epix` host itself.
+/// The xite a referer URL points at: the nested path segment if it is itself a
+/// xite (`/epix1…/` or `/name.epix/`), else - in transparent-proxy mode - the
+/// `.epix` host itself, else the first path segment.
 fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
     let after_scheme = referer
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     let (ref_host, ref_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
     let ref_host = strip_port(ref_host);
+    // A xite can be served nested under another xite's proxy host: clicking a
+    // site in the dashboard lands the iframe on `dashboard.epix/epix1talk…/`,
+    // so that page's OWN resources carry a referer like
+    // `dashboard.epix/epix1talk…/index.html`. The nested path segment is the
+    // real source xite (a page loading its own files is same-origin), so it
+    // wins over the host - mirroring the target routing in `rewrite_proxy_host`.
+    // Without this the cross-origin gate reads the source as the host and
+    // 403s the nested xite's stylesheet, scripts, and images.
+    let first_seg = ref_path.split('/').next().unwrap_or("");
+    if plausible_xite_ref(first_seg) {
+        return Some(first_seg.to_string());
+    }
     if ref_host.ends_with(".epix") {
         return Some(ref_host.to_string());
     }
@@ -565,9 +578,11 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
         format!("<p>Reason: {}</p>", esc(reason))
     };
     format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>Site blocked</title></head>\
-         <body style='font-family:Segoe UI,Helvetica,Arial;background:#323C4D;color:#fff;text-align:center;padding-top:15%'>\
-         <h1>This site is blocked</h1><p style='opacity:.7'>{}</p>{}</body></html>",
+        "<!doctype html><html><head><meta charset='utf-8'><title>Site blocked</title>\
+         <meta name='viewport' content='width=device-width, initial-scale=1'></head>\
+         <body style='font-family:Inter,-apple-system,Segoe UI,Roboto,sans-serif;background:#09090A;color:#F6F6F9;text-align:center;margin:0;padding:15vh 24px 0'>\
+         <h1 style='font-size:24px;font-weight:600'>This site is blocked</h1>\
+         <p style='color:#ABABB5;overflow-wrap:anywhere'>{}</p>{}</body></html>",
         esc(address),
         reason_html,
     )
@@ -836,7 +851,8 @@ async fn serve_plugins_page(State(ctx): State<Ctx>, Query(q): Query<PluginsQuery
     }
     let states = ctx.state.plugin_states().await;
     let homepage = ctx.state.homepage().await.unwrap_or_default();
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_plugins_page(&states, &homepage))
+    let theme = ctx.state.theme_class().await;
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_plugins_page(&states, &homepage, &theme))
         .into_response()
 }
 
@@ -871,10 +887,10 @@ fn plugin_description(name: &str) -> &'static str {
     }
 }
 
-/// Render the plugin manager page, styled like EpixNet's (light theme, gradient
-/// header, sliding toggle switches). The toggle is a link (`/Plugins?toggle=…`)
-/// so it works without JS/WebSocket.
-fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str) -> String {
+/// Render the plugin manager page (sliding toggle switches, one row per
+/// plugin). The toggle is a link (`/Plugins?toggle=…`) so it works without
+/// JS/WebSocket.
+fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str, theme: &str) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
     for (name, enabled, default_enabled) in states {
@@ -895,7 +911,7 @@ fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str) -> Strin
     if rows.is_empty() {
         rows.push_str("<div class='description'>No plugins loaded.</div>");
     }
-    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"), homepage)
+    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"), homepage, theme)
 }
 
 /// `GET /Config` - the node settings page. `?save=1&<key>=<value>` persists the
@@ -971,7 +987,8 @@ async fn serve_config_page(
         params.get("error").map(|msg| (false, msg.clone()))
     };
     let homepage = ctx.state.homepage().await.unwrap_or_default();
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, flash, &homepage))
+    let theme = ctx.state.theme_class().await;
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, flash, &homepage, &theme))
         .into_response()
 }
 
@@ -998,7 +1015,7 @@ async fn serve_stats_json(State(ctx): State<Ctx>) -> Response {
 /// The public-gateway banner the NoNewSites plugin injects into every wrapper
 /// page (ported from the original): a fixed top bar telling visitors this is
 /// a read-only gateway, with the iframe shifted down to make room.
-const GATEWAY_BANNER_HTML: &str = "<style>#epix-gateway-banner {    position: fixed; top: 0; left: 0; right: 0; z-index: 1;    height: 38px;    background: #0d1117; color: #e6edf3;    font: 13px/38px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;    text-align: center; padding: 0 16px;    box-sizing: border-box;}#epix-gateway-banner strong { color: #f0f6fc; font-weight: 600; }#epix-gateway-banner a {    color: #fff; background: #238636; text-decoration: none;    padding: 5px 12px; border-radius: 4px; margin-left: 10px;    font-weight: 600; transition: background 0.15s;}#epix-gateway-banner a:hover { background: #2ea043; }#inner-iframe { top: 38px !important; height: calc(100% - 38px) !important; }</style><div id='epix-gateway-banner'>    <strong>Public gateway - read-only.</strong>    Install EpixNet to use your own identity, browse the full network, and host sites.    <a href='https://epixnet.io/#download' target='_blank' rel='noopener'>Get EpixNet</a></div>";
+const GATEWAY_BANNER_HTML: &str = "<style>#epix-gateway-banner {    position: fixed; top: 0; left: 0; right: 0; z-index: 1;    height: 38px;    background: #151517; color: #DCDCE3;    font: 13px/1.45 Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;    display: flex; align-items: center; justify-content: center;    text-align: center; padding: 0 16px;    box-sizing: border-box; white-space: nowrap; overflow: hidden;}#epix-gateway-banner .banner-inner { display: inline-block; max-width: 1200px; }#epix-gateway-banner strong { color: #FEFEFE; font-weight: 600; }#epix-gateway-banner a {    color: #09090A; background: #2DCE89; text-decoration: none;    padding: 5px 12px; border-radius: 4px; margin-left: 10px;    font-weight: 600; display: inline-block;}#epix-gateway-banner a:hover { text-decoration: underline; }#inner-iframe { top: 38px !important; height: calc(100% - 38px) !important; }@media (max-width: 900px) {#epix-gateway-banner { height: 76px; padding: 8px 12px; white-space: normal; }#inner-iframe { top: 76px !important; height: calc(100% - 76px) !important; }}@media (max-width: 640px) {#epix-gateway-banner { height: 112px; font-size: 12px; }#epix-gateway-banner a { padding: 0 16px; display: inline-flex; align-items: center; justify-content: center; min-height: 44px; }#inner-iframe { top: 112px !important; height: calc(100% - 112px) !important; }}</style><div id='epix-gateway-banner'><span class='banner-inner'>    <strong>Public gateway - read-only.</strong>    Install EpixNet to use your own identity, browse the full network, and host sites.    <a href='https://epixnet.io/#download' target='_blank' rel='noopener'>Get EpixNet</a></span></div>";
 
 /// Inject the gateway banner just before the wrapper's closing body tag.
 fn inject_gateway_banner(html: String) -> String {
@@ -1015,23 +1032,31 @@ fn inject_gateway_banner(html: String) -> String {
 /// `GET /Stats` - the diagnostics page (EpixNet's `/Stats`): node identity,
 /// live connections, tracker stats, Tor state, and a per-site table.
 async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
-    let body = ctx.state.stats_html().await;
+    // Each table gets an overflow-x scroll container so wide rows (peer
+    // addresses) scroll inside the content card instead of the page.
+    let body = ctx
+        .state
+        .stats_html()
+        .await
+        .replace("<table>", "<div class='overflow'><table>")
+        .replace("</table>", "</table></div>");
     let homepage = ctx.state.homepage().await.unwrap_or_default();
+    let theme = ctx.state.theme_class().await;
     let styled = format!(
         "<style>\
-         .stats-wrap{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}}\
-         .stats-wrap h2{{margin:22px 0 6px;font-size:15px}}\
-         .stats-wrap table{{border-collapse:collapse;width:100%;margin-bottom:6px}}\
-         .stats-wrap th,.stats-wrap td{{text-align:left;padding:3px 12px 3px 0;border-bottom:1px solid #eef0f3;white-space:nowrap}}\
-         .stats-wrap th{{color:#7a828c;font-weight:600}}\
-         .stats-wrap tr.muted td,.stats-wrap .muted{{opacity:.5}}\
-         .stats-wrap .stat-head{{padding:8px 0;color:#4a515a;border-bottom:1px solid #e6e8eb}}\
-         .stats-wrap .stat-row{{padding:2px 0}}\
-         .stats-wrap .overflow{{overflow-x:auto}}\
+         .stats-wrap{{font-family:var(--epix-font-mono);font-size:12.5px}}\
+         .stats-wrap h2{{margin:24px 0 8px;font-size:14px;font-family:var(--epix-font-sans)}}\
+         .stats-wrap table{{border-collapse:collapse;width:100%;max-width:100%;margin-bottom:6px}}\
+         .stats-wrap th,.stats-wrap td{{text-align:left;padding:4px 12px 4px 0;border-bottom:1px solid var(--epix-border);white-space:nowrap}}\
+         .stats-wrap th{{color:var(--epix-text-mid);font-weight:600}}\
+         .stats-wrap tr.muted td,.stats-wrap .muted{{color:var(--epix-text-low)}}\
+         .stats-wrap .stat-head{{padding:8px 0;color:var(--epix-text-mid);border-bottom:1px solid var(--epix-border);overflow-wrap:anywhere}}\
+         .stats-wrap .stat-row{{padding:2px 0;overflow-wrap:anywhere}}\
+         .stats-wrap .overflow{{overflow-x:auto;max-width:100%}}\
          </style>\
          <div class='stats-wrap'>{body}</div>"
     );
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page_shell("Stats", "Stats", "Node diagnostics", &styled, &homepage))
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page_shell("Stats", "Stats", "Node diagnostics", &styled, &homepage, &theme))
         .into_response()
 }
 
@@ -1043,6 +1068,7 @@ fn render_config_page(
     values: &[(&str, &str, &str, String, String, &str)],
     flash: Option<(bool, String)>,
     homepage: &str,
+    theme: &str,
 ) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -1158,7 +1184,7 @@ fn render_config_page(
            <button class='button button-submit' type='submit'>Save</button>\
          </form>"
     );
-    page_shell("Configuration", "Configuration", "", &body, homepage)
+    page_shell("Configuration", "Configuration", "", &body, homepage, theme)
 }
 
 /// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
@@ -1176,12 +1202,13 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
     let Some(entries) = ctx.state.list_dir(&address, &inner).await else {
         return (StatusCode::NOT_FOUND, "unknown xite or path").into_response();
     };
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries))
+    let theme = ctx.state.theme_class().await;
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries, &theme))
         .into_response()
 }
 
 /// Render the file browser for a xite directory.
-fn render_file_manager(address: &str, inner: &str, entries: &[Value]) -> String {
+fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
     };
@@ -1226,24 +1253,131 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value]) -> String 
             ));
         }
     }
+    // Breadcrumb heading: the address and every parent directory link back to
+    // their own /list page; the current (last) segment stays plain text.
     let heading = if inner.is_empty() {
         format!("Files: {}", esc(address))
     } else {
-        format!("Files: {}/{}", esc(address), esc(inner))
+        let mut heading =
+            format!("Files: <a href='/list/{a}'>{a}</a>", a = esc(address));
+        let segs: Vec<&str> = inner.split('/').filter(|s| !s.is_empty()).collect();
+        let mut prefix = String::new();
+        for (i, seg) in segs.iter().enumerate() {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(seg);
+            if i + 1 == segs.len() {
+                heading.push_str(&format!("/{}", esc(seg)));
+            } else {
+                heading.push_str(&format!(
+                    "/<a href='/list/{}/{}'>{}</a>",
+                    esc(address),
+                    esc(&prefix),
+                    esc(seg),
+                ));
+            }
+        }
+        heading
     };
     let body = format!(
-        "<style>.row{{padding:8px 0;border-bottom:1px solid #f0f2f5}}\
-          .name{{font-size:16px}} .name.dir{{font-weight:600}}\
-          .size{{float:right;color:#999;font-size:13px}}</style>\
+        "<style>.row{{padding:10px 0;border-bottom:1px solid var(--epix-border);overflow:hidden}}\
+          .name{{font-size:15px;overflow-wrap:anywhere}} .name.dir{{font-weight:600}}\
+          .size{{float:right;color:var(--epix-text-low);font-size:13px;margin-left:12px}}</style>\
          <div class='files'>{rows}</div>"
     );
     // From the file browser, the fixbutton returns to the xite being browsed.
-    page_shell("Files", &heading, "", &body, address)
+    page_shell("Files", &heading, "", &body, address, theme)
 }
 
-/// Shared page shell for the server-rendered admin pages, styled to match
-/// EpixNet (light theme, gradient header, sliding toggles, config inputs).
-fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: &str) -> String {
+/// Design tokens + shared styles for the server-rendered admin pages, adapted
+/// from the Epix UI kit (assets/ui-kit/epix-tokens.css, trimmed to what these
+/// pages use). Light values live on :root/.theme-light; dark values apply
+/// through prefers-color-scheme (guarded so body.theme-light still wins) and
+/// through the explicit .theme-dark class the server renders on <body> from
+/// the user's stored theme (see AppState::theme_class).
+const PAGE_CSS: &str = "\
+:root,.theme-light{color-scheme:light;\
+--epix-purple:#8A4BDB;--epix-cyan:#69E9F5;\
+--epix-neutral-0:#FEFEFE;--epix-neutral-1:#F6F6F9;--epix-neutral-2:#F2F2F6;--epix-neutral-3:#DCDCE3;--epix-neutral-4:#ABABB5;--epix-neutral-5:#72747B;--epix-neutral-6:#404045;--epix-neutral-7:#2E2E32;--epix-neutral-8:#242428;--epix-neutral-9:#1D1D1F;--epix-neutral-11:#09090A;\
+--epix-success-soft:#E8F8F0;--epix-danger-soft:#FDEDEC;--epix-ink-soft:#1D1D1F;\
+--epix-bg:var(--epix-neutral-1);--epix-surface:var(--epix-neutral-0);--epix-surface-2:var(--epix-neutral-2);--epix-border:var(--epix-neutral-3);--epix-border-strong:var(--epix-neutral-4);\
+--epix-text:var(--epix-neutral-9);--epix-text-mid:var(--epix-neutral-6);--epix-text-low:var(--epix-neutral-5);\
+--epix-accent:var(--epix-purple);--epix-on-accent:#FEFEFE;--epix-focus:var(--epix-purple);--epix-link:var(--epix-purple);\
+--epix-font-sans:Inter,-apple-system,'Segoe UI',Roboto,sans-serif;--epix-font-mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;\
+--epix-shadow:0 1px 3px rgba(2,2,2,.12)}\
+@media (prefers-color-scheme:dark){:root:not(.theme-light){color-scheme:dark;\
+--epix-bg:var(--epix-neutral-11);--epix-surface:var(--epix-neutral-9);--epix-surface-2:var(--epix-neutral-8);--epix-border:var(--epix-neutral-7);--epix-border-strong:var(--epix-neutral-6);\
+--epix-text:var(--epix-neutral-1);--epix-text-mid:var(--epix-neutral-3);--epix-text-low:var(--epix-neutral-4);\
+--epix-focus:var(--epix-cyan);--epix-link:var(--epix-cyan)}}\
+.theme-dark{color-scheme:dark;\
+--epix-bg:var(--epix-neutral-11);--epix-surface:var(--epix-neutral-9);--epix-surface-2:var(--epix-neutral-8);--epix-border:var(--epix-neutral-7);--epix-border-strong:var(--epix-neutral-6);\
+--epix-text:var(--epix-neutral-1);--epix-text-mid:var(--epix-neutral-3);--epix-text-low:var(--epix-neutral-4);\
+--epix-focus:var(--epix-cyan);--epix-link:var(--epix-cyan)}\
+*{box-sizing:border-box}\
+body{margin:0;padding:0;background:var(--epix-bg);color:var(--epix-text);font-family:var(--epix-font-sans);font-size:14px;line-height:1.5}\
+h1{background:var(--epix-purple);color:#FEFEFE;margin:0;padding:20px max(16px,calc((100% - 800px)/2 + 32px));font-size:24px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}\
+h1 a{color:#FEFEFE;text-decoration:none}\
+h1 a:hover{text-decoration:underline}\
+.content{max-width:min(800px,calc(100% - 32px));margin:24px auto 80px;background:var(--epix-surface);border:1px solid var(--epix-border);border-radius:12px;padding:28px 32px 48px}\
+.sub{color:var(--epix-text-mid);font-size:14px;margin:0 0 24px}\
+a{color:var(--epix-link);text-decoration:none}\
+.plugin,.config-item{position:relative;padding:16px 0;border-bottom:1px solid var(--epix-border)}\
+.plugin{padding-right:66px}\
+.plugin .title h3,.config-item .title h3{font-size:15px;font-weight:600;margin:0;line-height:1.4}\
+.plugin .description,.config-item .description{font-size:13px;color:var(--epix-text-mid);line-height:1.5;margin-top:2px}\
+.default{color:var(--epix-text-low);font-size:12px}\
+.plugin .value-right{position:absolute;right:0;top:50%;transform:translateY(-50%)}\
+.config-item .value{margin-top:10px}\
+.config-item:has(.checkbox){padding-right:66px}\
+.config-item:has(.value .button){padding-right:180px}\
+.config-item:has(.checkbox) .value,.config-item:has(.value .button) .value{position:absolute;right:0;top:50%;transform:translateY(-50%);margin-top:0}\
+.checkbox{display:inline-block;cursor:pointer}\
+.checkbox-skin{background:var(--epix-border-strong);width:50px;height:24px;border-radius:12px;transition:background .2s ease;display:inline-block;vertical-align:middle}\
+.checkbox-skin:before{content:'';position:relative;width:20px;height:20px;background:#FEFEFE;display:block;border-radius:50%;margin:2px 0 0 2px;transition:margin .25s ease}\
+.checkbox.checked .checkbox-skin{background:var(--epix-accent)}\
+.checkbox.checked .checkbox-skin:before{margin-left:27px}\
+.checkbox input{position:absolute;opacity:0;width:0;height:0}\
+.checkbox input:checked + .checkbox-skin{background:var(--epix-accent)}\
+.checkbox input:checked + .checkbox-skin:before{margin-left:27px}\
+.checkbox input:disabled + .checkbox-skin{opacity:.45;cursor:not-allowed}\
+a.checkbox:focus-visible,.button:focus-visible{outline:2px solid var(--epix-focus);outline-offset:2px}\
+.input-text{width:100%;padding:9px 12px;border:1px solid var(--epix-border-strong);border-radius:8px;font-size:14px;font-family:var(--epix-font-sans);background:var(--epix-surface);color:var(--epix-text)}\
+.input-text:focus{border-color:var(--epix-focus);outline:1px solid var(--epix-focus)}\
+textarea.input-text{resize:vertical;line-height:1.5}\
+.input-text:disabled{background:var(--epix-surface-2);color:var(--epix-text-low);border-color:var(--epix-border);cursor:not-allowed}\
+.section-title{font-size:12px;font-weight:600;color:var(--epix-text-mid);text-transform:uppercase;letter-spacing:.08em;margin:32px 0 4px;padding-bottom:8px;border-bottom:1px solid var(--epix-border)}\
+.config{margin-bottom:8px}\
+.notification{padding:12px 16px;border-radius:8px;margin:0 0 20px;font-size:14px;color:var(--epix-ink-soft)}\
+.notification-done{background:var(--epix-success-soft)}\
+.notification-error{background:var(--epix-danger-soft)}\
+.button{margin-top:24px;background:var(--epix-accent);color:var(--epix-on-accent);border:none;border-radius:8px;height:44px;padding:0 24px;font-size:15px;font-weight:600;font-family:var(--epix-font-sans);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none}\
+.button:hover{box-shadow:var(--epix-shadow)}\
+.button:active{transform:translateY(1px)}\
+.config-item .value .button{margin-top:0;height:36px;padding:0 16px;font-size:14px;color:var(--epix-on-accent)}\
+.fixbutton{position:fixed;right:23px;top:9px;width:48px;height:48px;z-index:999;border-radius:50%;background:#020202 url('/uimedia/img/logo.png') center/48px no-repeat;display:block;transition:box-shadow .3s,transform .15s}\
+.fixbutton{-webkit-user-select:none;user-select:none;-webkit-user-drag:none}\
+.fixbutton:hover{box-shadow:var(--epix-shadow)}\
+@media (max-width:640px){\
+.content{max-width:100%;margin:0;border:none;border-radius:0;padding:20px 16px 64px}\
+h1{padding:18px 84px 18px 16px;font-size:20px}\
+.config-item:has(.value .button){padding-right:0}\
+.config-item:has(.value .button) .value{position:static;transform:none;margin-top:10px}\
+.button,.config-item .value .button{height:44px;min-height:44px}\
+.checkbox{padding:10px 0 10px 10px}\
+}";
+
+/// Shared page shell for the server-rendered admin pages, on the flat Epix
+/// design tokens (purple header bar, centered content card, themed light/dark
+/// from the user's setting with a prefers-color-scheme fallback).
+fn page_shell(
+    title: &str,
+    heading: &str,
+    subtitle: &str,
+    body: &str,
+    homepage: &str,
+    theme: &str,
+) -> String {
     let sub = if subtitle.is_empty() {
         String::new()
     } else {
@@ -1264,42 +1398,7 @@ fn page_shell(title: &str, heading: &str, subtitle: &str, body: &str, homepage: 
          <meta name='viewport' content='width=device-width, initial-scale=1'>\
          <link rel='icon' type='image/x-icon' href='/uimedia/img/favicon.ico'>\
          <link rel='apple-touch-icon' href='/uimedia/img/apple-touch-icon.png'>\
-         <style>\
-          body{{background:#EDF2F5;font-family:Roboto,'Segoe UI',Arial,'Helvetica Neue',sans-serif;margin:0;padding:0;color:#333}}\
-          h1{{background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;padding:16px 30px;margin:0;font-weight:200;font-size:30px}}\
-          .content{{max-width:800px;margin:auto;background:#fff;padding:40px 30px 120px;box-sizing:border-box;min-height:100vh}}\
-          .sub{{color:#666;font-size:15px;margin:0 0 26px}}\
-          .plugin,.config-item{{position:relative;padding:16px 0;border-bottom:1px solid #f0f2f5}}\
-          .plugin .title,.config-item .title{{display:inline-block}}\
-          .plugin .title h3,.config-item .title h3{{font-size:20px;font-weight:lighter;margin:0;line-height:32px}}\
-          .plugin .description{{font-size:14px;color:#777;line-height:22px;margin-top:2px}}\
-          .default{{color:#aaa;font-size:12px}}\
-          .value-right{{right:0;position:absolute;top:16px}}\
-          .checkbox{{display:inline-block;cursor:pointer}}\
-          .checkbox-skin{{background:#CCC;width:50px;height:24px;border-radius:15px;transition:all .3s ease-in-out;display:inline-block}}\
-          .checkbox-skin:before{{content:'';position:relative;width:20px;height:20px;background:#fff;display:block;border-radius:100%;margin:2px 0 0 2px;transition:all .5s cubic-bezier(.785,.135,.15,.86)}}\
-          .checkbox.checked .checkbox-skin{{background:#2ECC71}}\
-          .checkbox.checked .checkbox-skin:before{{margin-left:27px}}\
-          .checkbox input{{position:absolute;opacity:0;width:0;height:0}}\
-          .checkbox input:checked + .checkbox-skin{{background:#2ECC71}}\
-          .checkbox input:checked + .checkbox-skin:before{{margin-left:27px}}\
-          .input-text{{padding:8px 18px;border:1px solid #CCC;border-radius:3px;font-size:15px;box-sizing:border-box;min-width:280px;font-family:'Segoe UI',Arial,sans-serif}}\
-          .input-text:focus{{border-color:#3396ff;outline:none}}\
-          textarea.input-text{{resize:vertical;line-height:20px}}\
-          .input-text:disabled{{background:#f5f5f5;color:#aaa;cursor:not-allowed}}\
-          .checkbox input:disabled + .checkbox-skin{{opacity:.45;cursor:not-allowed}}\
-          .section-title{{font-size:15px;font-weight:500;color:#4C4C4C;text-transform:uppercase;letter-spacing:1px;margin:34px 0 4px;padding-bottom:6px;border-bottom:2px solid #EDF2F5}}\
-          .config{{margin-bottom:10px}}\
-          .notification{{padding:12px 18px;border-radius:4px;margin:0 0 20px;font-size:14px}}\
-          .notification-done{{background:#E8F8EF;border:1px solid #2ECC71;color:#227a48}}\
-          .notification-error{{background:#FDEDEC;border:1px solid #E74C3C;color:#96281B}}\
-          .button{{margin-top:26px;background:linear-gradient(33deg,#af3bff,#0d99c9);color:#fff;border:none;border-radius:4px;padding:12px 30px;font-size:16px;cursor:pointer;display:inline-block;text-decoration:none}}\
-          .config-item .value .button{{margin-top:0;padding:8px 22px;font-size:15px;color:#fff}}\
-          a{{color:#9760F9;text-decoration:none}}\
-          .fixbutton{{position:fixed;right:23px;top:9px;width:48px;height:48px;z-index:999;border-radius:50%;background:#000 url('/uimedia/img/logo.png') center/48px no-repeat;display:block;transition:box-shadow .3s,transform .15s}}\
-          .fixbutton{{-webkit-user-select:none;user-select:none;-webkit-user-drag:none}}\
-          .fixbutton:hover{{box-shadow:0 5px 30px rgba(0,0,0,.3)}}\
-         </style></head><body>\
+         <style>{PAGE_CSS}</style></head><body class='{theme}'>\
          {fixbutton}<h1>{heading}</h1><div class='content'>{sub}{body}</div>{script}</body></html>"
     )
 }

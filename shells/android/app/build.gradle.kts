@@ -1,6 +1,21 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Release signing config lives outside the repo. Put the key details in
+// shells/android/keystore.properties (gitignored; copy keystore.properties.example)
+// or the EPIX_KEYSTORE_* env vars. When neither is present, `assembleRelease`
+// still builds but is left unsigned, and debug builds are unaffected. See
+// shells/android/RELEASE-SIGNING.md for the one-time keystore setup.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) {
+        FileInputStream(keystorePropsFile).use { load(it) }
+    }
 }
 
 android {
@@ -17,9 +32,32 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    signingConfigs {
+        create("release") {
+            val storeFilePath =
+                keystoreProps.getProperty("storeFile") ?: System.getenv("EPIX_KEYSTORE_FILE")
+            if (!storeFilePath.isNullOrBlank()) {
+                storeFile = file(storeFilePath)
+                storePassword =
+                    keystoreProps.getProperty("storePassword") ?: System.getenv("EPIX_KEYSTORE_PASSWORD")
+                keyAlias =
+                    keystoreProps.getProperty("keyAlias") ?: System.getenv("EPIX_KEY_ALIAS")
+                keyPassword =
+                    keystoreProps.getProperty("keyPassword") ?: System.getenv("EPIX_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Only sign when the keystore is actually configured; otherwise the
+            // release APK is unsigned rather than failing the build.
+            signingConfigs.getByName("release").let { cfg ->
+                if (cfg.storeFile != null) {
+                    signingConfig = cfg
+                }
+            }
         }
     }
 

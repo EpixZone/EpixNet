@@ -67,15 +67,16 @@ const LOGIN_HTML: &str = r#"<html>
  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 </head>
 <style>
-body { background-color: #323C4D; font-family: "Segoe UI", Helvetica, Arial; font-weight: lighter; font-size: 22px; color: white; overflow: hidden; }
-.login { left: 50%; position: absolute; top: 50%; transform: translateX(-50%) translateY(-50%); width: 100%; max-width: 370px; text-align: center; }
+body { background-color: #09090A; font-family: Inter, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 16px; color: #F6F6F9; overflow: hidden; margin: 0; }
+.login { left: 50%; position: absolute; top: 50%; transform: translateX(-50%) translateY(-50%); width: calc(100% - 32px); max-width: 400px; text-align: center; background-color: #151517; border: 1px solid #2E2E32; border-radius: 12px; padding: 40px 28px; box-sizing: border-box; }
 *:focus { outline: 0; }
-input[type=password] { padding: 10px 0px; border: 0px; display: block; margin: 15px 0px; width: 100%; border-radius: 30px; transition: 0.3s ease-out; background-color: #DDD; text-align: center; font-family: "Segoe UI", Helvetica, Arial; font-weight: lighter; font-size: 28px; border: 2px solid #323C4D; color: #333; }
-input[type=password]:focus { border: 2px solid #FFF; background-color: #FFF; }
-input.error { border: 2px solid #F44336 !important; animation: shake 1s }
-.button { padding: 13px; display: inline-block; margin: 15px 0px; width: 100%; border-radius: 30px; text-align: center; white-space: nowrap; font-size: 28px; background: linear-gradient(45deg, #6B14D3 0, #7A26E2 25%, #4962DD 90%); box-sizing: border-box; margin-top: 50px; color: white; text-decoration: none; transition: 0.3s ease-out; border: 0; cursor: pointer; }
-.button:hover, .button:focus { box-shadow: 0px 5px 30px rgba(0,0,0,0.3); }
-.button:active { transform: translateY(1px); box-shadow: 0px 0px 20px rgba(0,0,0,0.5); transition: none; }
+input[type=password] { padding: 12px 16px; display: block; margin: 0; width: 100%; border-radius: 8px; transition: border-color 0.2s ease-out; background-color: #242428; text-align: center; font-family: inherit; font-size: 16px; border: 1px solid #404045; color: #F6F6F9; box-sizing: border-box; }
+input[type=password]::placeholder { color: #ABABB5; }
+input[type=password]:focus { border-color: #69E9F5; }
+input.error { border-color: #F0224B !important; animation: shake 1s }
+.button { padding: 0; display: inline-block; margin: 20px 0 0; width: 100%; height: 44px; line-height: 44px; border-radius: 8px; text-align: center; white-space: nowrap; font-size: 16px; font-weight: 600; font-family: inherit; background: #8A4BDB; box-sizing: border-box; color: #FEFEFE; text-decoration: none; transition: box-shadow 0.2s ease-out; border: 0; cursor: pointer; }
+.button:hover, .button:focus { box-shadow: 0 1px 3px rgba(2,2,2,0.12); }
+.button:active { transform: translateY(1px); transition: none; }
 @keyframes shake { 0%, 100% { transform: translateX(0); } 10%, 30%, 50%, 70%, 90% { transform: translateX(-10px); } 20%, 40%, 60%, 80% { transform: translateX(10px); } }
 </style>
 <body>

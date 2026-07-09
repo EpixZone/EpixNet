@@ -225,6 +225,9 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(bar, LinearLayout.LayoutParams(-1, -2))
         geckoView = GeckoView(this)
+        // Dark until the page's first paint; GeckoView otherwise flashes
+        // white while the node boots and the page loads.
+        geckoView.coverUntilFirstPaint(COLOR_CHROME_BG)
         root.addView(geckoView, LinearLayout.LayoutParams(-1, 0, 1f))
         return root
     }
@@ -589,7 +592,13 @@ class MainActivity : AppCompatActivity() {
         walletDialog?.dismiss()
         val popupSession = GeckoSession().apply { open(runtime) }
         popupSession.permissionDelegate = walletPermissionDelegate
-        val view = GeckoView(this).apply { setSession(popupSession) }
+        val view = GeckoView(this).apply {
+            setSession(popupSession)
+            // Dark until the wallet page paints (it flashes white otherwise
+            // while the bundles parse; the page itself then shows the inline
+            // splash from mobile.html).
+            coverUntilFirstPaint(COLOR_CHROME_BG)
+        }
         // A slim header with an explicit close control: the sheet covers the
         // browser, and the back gesture / tap-outside affordances are not
         // discoverable on their own.

@@ -28,6 +28,7 @@ const WALLET_DIST_URL: &str =
 
 fn main() {
     stage_wallet_ext();
+    embed_windows_icon();
 
     let rev = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=EPIX_GIT_REV={rev}");
@@ -46,6 +47,30 @@ fn main() {
         }
     }
 }
+
+/// Embed `packaging/windows/app.ico` in the exe so Explorer, the taskbar and
+/// Add/Remove Programs show the Epix icon. Only compiled on Windows hosts
+/// (winresource is a cfg(windows) build-dependency, absent elsewhere, and the
+/// Windows release builds on a Windows runner); the target_os check skips
+/// cross-target checks on that host. The reverse (a Windows host building a
+/// non-Windows target) is unsupported: winresource resolves against the
+/// target, so this cfg(windows) code would not compile. Our build matrix
+/// never does that.
+#[cfg(windows)]
+fn embed_windows_icon() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let ico = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packaging/windows/app.ico");
+    println!("cargo:rerun-if-changed={}", ico.display());
+    winresource::WindowsResource::new()
+        .set_icon(ico.to_str().expect("icon path is valid utf-8"))
+        .compile()
+        .expect("embed packaging/windows/app.ico into epix-browser.exe");
+}
+
+#[cfg(not(windows))]
+fn embed_windows_icon() {}
 
 /// Make sure `shells/wallet-ext` holds a wallet build before `include_dir!`
 /// embeds it. See the module docs for the resolution order.

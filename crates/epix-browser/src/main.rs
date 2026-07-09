@@ -18,6 +18,11 @@ mod proxy;
 
 use ca::LocalCa;
 use std::io::Write;
+
+// GeoIP city DB for the sidebar globe's peer-location dots. Bundled the same way
+// the standalone server ships it; without it the node disables the map and no
+// dots render (the desktop browser used to pass None here).
+const GEOIP_CITY_GZ: &[u8] = include_bytes!("../../epix-server/assets/dbip-city-lite.mmdb.gz");
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,7 +85,7 @@ async fn main() {
         ui_addr: UI_ADDR.to_string(),
         tor_mode: tor_mode.clone(),
         open_browser: false,
-        geoip_gz: None,
+        geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
         log_file: None,
         version: env!("CARGO_PKG_VERSION").to_string(),
         rev: env!("EPIX_GIT_REV").to_string(),

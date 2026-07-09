@@ -85,8 +85,6 @@ TWEEN.Easing.Bounce.EaseInOut=function(a){if(a<0.5)return TWEEN.Easing.Bounce.Ea
 
 
 /* ---- plugins/Sidebar/media_globe/globe.js ---- */
-
-
 /**
  * dat.globe Javascript WebGL Globe Toolkit
  * http://dataarts.github.com/dat.globe
@@ -175,6 +173,9 @@ DAT.Globe = function(container, opts) {
   var padding = 10;
   var PI_HALF = Math.PI / 2;
 
+  // Touch drag/pinch state (added for mobile: the upstream globe is mouse-only).
+  var pinchStart = null, pinchDistanceOnStart = distanceTarget;
+
   function init() {
 
     container.style.color = '#fff';
@@ -240,6 +241,7 @@ DAT.Globe = function(container, opts) {
     container.appendChild(renderer.domElement);
 
     container.addEventListener('mousedown', onMouseDown, false);
+    container.addEventListener('touchstart', onTouchStart, { passive: false });
 
     if ('onwheel' in document) {
       container.addEventListener('wheel', onMouseWheel, false);
@@ -409,6 +411,72 @@ DAT.Globe = function(container, opts) {
     container.removeEventListener('mouseout', onMouseOut, false);
   }
 
+  function touchSpread(event) {
+    var dx = event.touches[0].clientX - event.touches[1].clientX;
+    var dy = event.touches[0].clientY - event.touches[1].clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function onTouchStart(event) {
+    if (event.touches.length === 1) {
+      event.preventDefault();
+      overRenderer = true;
+      pinchStart = null;
+      container.addEventListener('touchmove', onTouchMove, { passive: false });
+      container.addEventListener('touchend', onTouchEnd, false);
+      container.addEventListener('touchcancel', onTouchEnd, false);
+      mouseOnDown.x = - event.touches[0].clientX;
+      mouseOnDown.y = event.touches[0].clientY;
+      targetOnDown.x = target.x;
+      targetOnDown.y = target.y;
+    } else if (event.touches.length === 2) {
+      event.preventDefault();
+      pinchStart = touchSpread(event);
+      pinchDistanceOnStart = distanceTarget;
+      container.addEventListener('touchmove', onTouchMove, { passive: false });
+      container.addEventListener('touchend', onTouchEnd, false);
+      container.addEventListener('touchcancel', onTouchEnd, false);
+    }
+  }
+
+  function onTouchMove(event) {
+    if (event.touches.length >= 2 && pinchStart != null) {
+      event.preventDefault();
+      var spread = touchSpread(event);
+      distanceTarget = pinchDistanceOnStart - (spread - pinchStart) * 2;
+      distanceTarget = distanceTarget > 855 ? 855 : distanceTarget;
+      distanceTarget = distanceTarget < 350 ? 350 : distanceTarget;
+    } else if (event.touches.length === 1 && pinchStart == null) {
+      event.preventDefault();
+      mouse.x = - event.touches[0].clientX;
+      mouse.y = event.touches[0].clientY;
+
+      var zoomDamp = distance / 1000;
+
+      target.x = targetOnDown.x + (mouse.x - mouseOnDown.x) * 0.005 * zoomDamp;
+      target.y = targetOnDown.y + (mouse.y - mouseOnDown.y) * 0.005 * zoomDamp;
+
+      target.y = target.y > PI_HALF ? PI_HALF : target.y;
+      target.y = target.y < - PI_HALF ? - PI_HALF : target.y;
+    }
+  }
+
+  function onTouchEnd(event) {
+    if (event.touches.length === 0) {
+      container.removeEventListener('touchmove', onTouchMove, { passive: false });
+      container.removeEventListener('touchend', onTouchEnd, false);
+      container.removeEventListener('touchcancel', onTouchEnd, false);
+      pinchStart = null;
+    } else if (event.touches.length === 1) {
+      // Second finger lifted mid-pinch: resume single-finger rotation cleanly.
+      pinchStart = null;
+      mouseOnDown.x = - event.touches[0].clientX;
+      mouseOnDown.y = event.touches[0].clientY;
+      targetOnDown.x = target.x;
+      targetOnDown.y = target.y;
+    }
+  }
+
   function onMouseWheel(event) {
     if (container.style.cursor != "move") return false;
     event.preventDefault();
@@ -472,6 +540,10 @@ DAT.Globe = function(container, opts) {
   function unload() {
     running = false
     container.removeEventListener('mousedown', onMouseDown, false);
+    container.removeEventListener('touchstart', onTouchStart, { passive: false });
+    container.removeEventListener('touchmove', onTouchMove, { passive: false });
+    container.removeEventListener('touchend', onTouchEnd, false);
+    container.removeEventListener('touchcancel', onTouchEnd, false);
     if ('onwheel' in document) {
       container.removeEventListener('wheel', onMouseWheel, false);
     } else {
@@ -523,8 +595,6 @@ DAT.Globe = function(container, opts) {
   return this;
 
 };
-
-
 
 /* ---- plugins/Sidebar/media_globe/three.min.js ---- */
 
