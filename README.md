@@ -49,6 +49,35 @@ The dashboard lives at **http://127.0.0.1:42222/**. Open a specific site by pass
 cargo run -p epix-server talk.epix
 ```
 
+## Testing a local wallet build
+
+By default `epix-browser` embeds the wallet from the epix-wallet repo's rolling
+`wallet-dist` GitHub release. To test **local, unpushed** wallet changes instead,
+point the build at your wallet checkout with `EPIX_WALLET_DIST`.
+
+Important: `build.rs` only stages the wallet when `shells/wallet-ext` is empty.
+If a wallet is already staged (from an earlier build), it is left alone, so
+setting `EPIX_WALLET_DIST` on its own does nothing. Clear the staged copy first:
+
+```sh
+# 1. build the wallet (in your epix-wallet checkout)
+cd ../epix-wallet
+yarn install && yarn workspace @keplr-wallet/extension build   # yarn install only needed if deps changed
+
+# 2. clear the stale staged wallet, then rebuild the browser against your build
+cd ../EpixNet
+find shells/wallet-ext -mindepth 1 ! -name README.md -delete
+EPIX_WALLET_DIST=../epix-wallet/apps/extension/build/firefox cargo run --release -p epix-browser
+```
+
+To go back to the released wallet, clear the dir again and build without the
+env var; `build.rs` will re-download the `wallet-dist` release:
+
+```sh
+find shells/wallet-ext -mindepth 1 ! -name README.md -delete
+cargo build --release -p epix-browser
+```
+
 ## Command line actions
 
 The same binary doubles as the authoring and diagnostics CLI, with the
