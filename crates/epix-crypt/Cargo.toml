@@ -5,7 +5,7 @@ edition = "2021"
 description = "EpixNet cryptography: epix1 addresses (Keccak256+bech32), recoverable secp256k1 signatures, custom HD derivation. Bit-for-bit compatible with CryptEpix.py."
 
 [dependencies]
-k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+k256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
 sha2 = "0.10"
 sha3 = "0.10"
 hmac = "0.12"
