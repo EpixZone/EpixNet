@@ -278,7 +278,7 @@ class MainActivity : AppCompatActivity() {
                 target = target,
                 uiAddr = "127.0.0.1:$UI_PORT",
                 torMode = "enable",
-                version = "0.1.0",
+                version = BuildConfig.VERSION_NAME,
             )
             node.start(config)
             if (node.state() == NodeState.SERVING) target else null

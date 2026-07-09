@@ -18,16 +18,31 @@ val keystoreProps = Properties().apply {
     }
 }
 
+// Version from the release tag (EPIX_VERSION, set by CI), else a dev default.
+// versionCode must be a monotonically increasing integer for the Play Store,
+// so derive it from the semver: major*1_000_000 + minor*1_000 + patch (a
+// higher versionName always yields a higher code). BuildConfig.VERSION_NAME
+// carries the name into the app so the node reports the tagged version too.
+val epixVersion = System.getenv("EPIX_VERSION")?.takeIf { it.isNotBlank() } ?: "0.3.0"
+val epixVersionCode = run {
+    val n = Regex("""\d+""").findAll(epixVersion).map { it.value.toIntOrNull() ?: 0 }.toList()
+    (n.getOrElse(0) { 0 }) * 1_000_000 + (n.getOrElse(1) { 0 }) * 1_000 + (n.getOrElse(2) { 0 })
+}
+
 android {
     namespace = "zone.epix.app"
     compileSdk = 36
+
+    buildFeatures {
+        buildConfig = true
+    }
 
     defaultConfig {
         applicationId = "zone.epix.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = epixVersionCode
+        versionName = epixVersion
         // The Rust core is prebuilt per-ABI into src/main/jniLibs by cargo-ndk.
         ndk { abiFilters += listOf("arm64-v8a") }
     }

@@ -3,21 +3,13 @@ name: Release
 # Build official, signed release artifacts when a version tag is pushed
 # (e.g. `git tag v0.2.0 && git push origin v0.2.0`), and attach them to a
 # GitHub Release. Also runnable by hand (workflow_dispatch) for a dry run.
-#
-# Required repo secrets for the signed + notarized macOS build (Settings ->
-# Secrets and variables -> Actions). If they are absent the macOS job still
-# builds an ad-hoc-signed (unnotarized) app, so you can test the pipeline first.
-#   APPLE_CERT_P12          base64 of your "Developer ID Application" .p12
-#   APPLE_CERT_PASSWORD     password for that .p12
-#   APPLE_SIGN_IDENTITY     e.g. "Developer ID Application: Your Org (TEAMID)"
-#   APPLE_ID                your Apple ID email (for notarization)
-#   APPLE_TEAM_ID           your 10-char team id
-#   APPLE_APP_PASSWORD      an app-specific password for notarytool
-# See packaging/RELEASING.md for how to create each.
+
 
 on:
   push:
-    tags: ["v*"]
+    # Both `v0.3.1` and a bare `0.3.1` trigger a release; the version step
+    # strips a leading `v` either way.
+    tags: ["v*", "[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
 
 permissions:
@@ -230,6 +222,8 @@ jobs:
       - name: Build release APK
         working-directory: shells/android
         env:
+          # Stamps versionName/versionCode and the node's reported version.
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
           # The Gradle signingConfig reads these (see app/build.gradle.kts). When
           # sign=false the file is empty, so assembleRelease leaves it unsigned.
           # Only the base64 keystore + its password are required: the alias

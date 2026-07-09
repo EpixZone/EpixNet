@@ -30,7 +30,7 @@ async fn main() {
     if let Some(action) = cli.first().map(String::as_str).filter(|a| actions::is_action(a)) {
         let root = platform::data_root();
         std::fs::create_dir_all(&root).expect("create data root");
-        let code = actions::run(action, &cli[1..], &root, env!("CARGO_PKG_VERSION")).await;
+        let code = actions::run(action, &cli[1..], &root, env!("EPIX_VERSION")).await;
         std::process::exit(code);
     }
 
@@ -74,7 +74,7 @@ async fn main() {
         open_browser: !headless,
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
         log_file: Some(platform::log_path(&root, 8 * 1024 * 1024)),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: env!("EPIX_VERSION").to_string(),
         rev: env!("EPIX_GIT_REV").to_string(),
     };
 
