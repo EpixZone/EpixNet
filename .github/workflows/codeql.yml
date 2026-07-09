@@ -18,12 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           # Rust support is in public preview. If the build step fails on your
           # runner, switch to build-mode: none.
           languages: rust
           build-mode: none
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:rust"
