@@ -3,13 +3,17 @@
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Fail on security advisories from the RustSec database.
+# Fail on security advisories from the RustSec database, except the accepted
+# ones below. A green check means no NEW advisory has appeared.
 yanked = "warn"
 ignore = [
     # RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa`. No fixed upstream
     # release yet. Tracked; revisit when rsa publishes a patched version.
-    # Remove this ignore once a fix is available and the dep is bumped.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0141: bincode unmaintained. Migration tracked separately.
+    "RUSTSEC-2025-0141",
+    # RUSTSEC-2024-0436: paste unmaintained (proc-macro, low risk).
+    "RUSTSEC-2024-0436",
 ]
 
 [bans]
@@ -34,6 +38,9 @@ allow = [
     "CC0-1.0",
 ]
 confidence-threshold = 0.9
+# The workspace's own epix-* crates do not declare a license field; skip them
+# rather than failing the license check on our own unpublished crates.
+private = { ignore = true }
 
 [sources]
 # arti/tor crates are pulled from git; allow known git sources.

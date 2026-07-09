@@ -1,0 +1,15 @@
+# osv-scanner ignore list for accepted advisories.
+# A green scan means no NEW vulnerability has appeared. Revisit these when
+# upstream fixes or maintained replacements are available.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa Marvin timing side-channel: no upstream fix yet; tracked."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0141"
+reason = "bincode unmaintained; migration tracked separately."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste unmaintained (proc-macro, low risk)."
