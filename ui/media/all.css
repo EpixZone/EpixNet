@@ -1,41 +1,132 @@
-/* ---- Wrapper.css ---- */
+/* ---- all.css: EpixNet wrapper chrome ----
+   Flat, minimal restyle on the Epix UI kit tokens. Light is the default;
+   dark comes from body.theme-dark (set by the server from user settings)
+   with a prefers-color-scheme fallback. No gradients anywhere. */
 
+
+/* Design tokens (adapted from assets/ui-kit/epix-tokens.css).
+   The wrapper puts theme-dark / theme-light on <body>, so the class blocks
+   below shadow the :root values and always win over the media query. */
+
+:root,
+.theme-light {
+	color-scheme: light;
+
+	/* Brand */
+	--epix-cyan: #69E9F5;
+	--epix-teal: #31BDC6;
+	--epix-indigo: #5954CD;
+	--epix-purple: #8A4BDB;
+
+	/* Neutral ramp */
+	--epix-neutral-0: #FEFEFE;
+	--epix-neutral-1: #F6F6F9;
+	--epix-neutral-2: #F2F2F6;
+	--epix-neutral-3: #DCDCE3;
+	--epix-neutral-4: #ABABB5;
+	--epix-neutral-5: #72747B;
+	--epix-neutral-6: #404045;
+	--epix-neutral-7: #2E2E32;
+	--epix-neutral-8: #242428;
+	--epix-neutral-9: #1D1D1F;
+	--epix-neutral-10: #151517;
+	--epix-neutral-11: #09090A;
+	--epix-neutral-12: #020202;
+
+	/* Semantic: strong + soft pairs. Strong colors are fills, not text on
+	   soft tints; use the ink colors for text on semantic fills. */
+	--epix-success: #2DCE89;
+	--epix-success-soft: #E8F8F0;
+	--epix-warning: #F0B622;
+	--epix-warning-soft: #FCF6E3;
+	--epix-danger: #F0224B;
+	--epix-danger-soft: #FDEDEC;
+	--epix-info: #31BDC6;
+	--epix-info-soft: #E7F8FA;
+	--epix-ink-soft: #1D1D1F;
+	--epix-ink-strong: #09090A;
+
+	/* Theme aliases - light */
+	--epix-bg: var(--epix-neutral-0);
+	--epix-surface: var(--epix-neutral-0);
+	--epix-surface-2: var(--epix-neutral-1);
+	--epix-border: var(--epix-neutral-3);
+	--epix-border-strong: var(--epix-neutral-4);
+	--epix-text: var(--epix-neutral-9);
+	--epix-text-mid: var(--epix-neutral-6);
+	--epix-text-low: var(--epix-neutral-5);
+	--epix-accent: var(--epix-purple);
+	--epix-on-accent: #FEFEFE;
+	--epix-link: var(--epix-purple);
+	--epix-focus: var(--epix-purple);
+
+	/* Type */
+	--epix-font-sans: Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;
+	--epix-font-mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
+
+	/* Radii */
+	--epix-radius-sm: 4px;
+	--epix-radius-md: 8px;
+	--epix-radius-lg: 12px;
+
+	/* Shadows (flat: nothing stronger than 0 1px 3px .12) */
+	--epix-shadow-sm: 0 1px 2px rgba(2, 2, 2, 0.08);
+	--epix-shadow: 0 1px 3px rgba(2, 2, 2, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+	:root:not(.theme-light) {
+		color-scheme: dark;
+		--epix-bg: var(--epix-neutral-10);
+		--epix-surface: var(--epix-neutral-9);
+		--epix-surface-2: var(--epix-neutral-8);
+		--epix-border: var(--epix-neutral-7);
+		--epix-border-strong: var(--epix-neutral-6);
+		--epix-text: var(--epix-neutral-1);
+		--epix-text-mid: var(--epix-neutral-3);
+		--epix-text-low: var(--epix-neutral-4);
+		--epix-link: var(--epix-cyan);
+		--epix-focus: var(--epix-cyan);
+	}
+}
+
+.theme-dark {
+	color-scheme: dark;
+	--epix-bg: var(--epix-neutral-10);
+	--epix-surface: var(--epix-neutral-9);
+	--epix-surface-2: var(--epix-neutral-8);
+	--epix-border: var(--epix-neutral-7);
+	--epix-border-strong: var(--epix-neutral-6);
+	--epix-text: var(--epix-neutral-1);
+	--epix-text-mid: var(--epix-neutral-3);
+	--epix-text-low: var(--epix-neutral-4);
+	--epix-link: var(--epix-cyan);
+	--epix-focus: var(--epix-cyan);
+}
+
+
+/* Base */
 
 body {
 	margin: 0;
 	padding: 0;
 	height: 100%;
-	background-color: #D2CECD;
-	overflow: hidden
+	background-color: var(--epix-bg);
+	color: var(--epix-text);
+	font-family: var(--epix-font-sans);
+	overflow: hidden;
 }
 
 body.back {
-	background-color: #090909
+	background-color: var(--epix-neutral-11);
 }
 
 a {
-	color: black
-}
-
-.unsupported {
-	text-align: center;
-	z-index: 999;
-	position: relative;
-	margin: auto;
-	width: 480px;
-	background-color: white;
-	padding: 20px;
-	border-bottom: 2px solid #e74c3c;
-	-webkit-box-shadow: 0px 0px 15px #DDD;
-	-moz-box-shadow: 0px 0px 15px #DDD;
-	-o-box-shadow: 0px 0px 15px #DDD;
-	-ms-box-shadow: 0px 0px 15px #DDD;
-	box-shadow: 0px 0px 15px #DDD;
-	font-family: monospace;
+	color: var(--epix-link);
 }
 
 .template {
-	display: none !important
+	display: none !important;
 }
 
 #inner-iframe {
@@ -45,95 +136,122 @@ a {
 	border: 0;
 }
 
-/*; transition: all 0.8s cubic-bezier(0.68, -0.55, 0.265, 1.55), opacity 0.8s ease-in-out*/
 #inner-iframe.back {
-	-webkit-transform: scale(0.95) translate(-300px, 0);
-	-moz-transform: scale(0.95) translate(-300px, 0);
-	-o-transform: scale(0.95) translate(-300px, 0);
-	-ms-transform: scale(0.95) translate(-300px, 0);
 	transform: scale(0.95) translate(-300px, 0);
-	opacity: 0.4
+	opacity: 0.4;
 }
 
+.unsupported {
+	position: relative;
+	z-index: 999;
+	box-sizing: border-box;
+	max-width: 480px;
+	width: calc(100% - 48px);
+	margin: 40px auto;
+	padding: 20px 24px;
+	background-color: var(--epix-surface);
+	color: var(--epix-text);
+	border: 1px solid var(--epix-border);
+	border-left: 3px solid var(--epix-danger);
+	border-radius: var(--epix-radius-md);
+	box-shadow: var(--epix-shadow);
+	font-family: var(--epix-font-sans);
+	font-size: 14px;
+	line-height: 1.5;
+}
+
+.unsupported h3 {
+	margin: 0 0 8px;
+	font-size: 16px;
+}
+
+
+/* Buttons */
+
 .button {
-	padding: 5px 10px;
+	display: inline-block;
+	box-sizing: border-box;
+	min-height: 32px;
+	padding: 6px 14px;
 	margin-left: 10px;
-	background-color: #FFF85F;
-	border-bottom: 2px solid #CDBD1E;
-	-webkit-border-radius: 2px;
-	-moz-border-radius: 2px;
-	-o-border-radius: 2px;
-	-ms-border-radius: 2px;
-	border-radius: 2px;
+	background-color: var(--epix-accent);
+	color: var(--epix-on-accent);
+	border: 0;
+	border-radius: var(--epix-radius-md);
+	font-family: var(--epix-font-sans);
+	font-size: 13px;
+	font-weight: 600;
+	line-height: 20px;
 	text-decoration: none;
-	-webkit-transition: all 0.5s;
-	-moz-transition: all 0.5s;
-	-o-transition: all 0.5s;
-	-ms-transition: all 0.5s;
-	transition: all 0.5s;
-	background-position: left center;
 	white-space: nowrap;
+	cursor: pointer;
+	transition: background-color 0.15s ease;
 }
 
 .button:hover {
-	background-color: #FFF400;
-	border-bottom: 2px solid #4D4D4C;
-	-webkit-transition: none;
-	-moz-transition: none;
-	-o-transition: none;
-	-ms-transition: none;
-	transition: none
+	background-color: var(--epix-indigo);
 }
 
 .button:active {
 	position: relative;
-	top: 1px
+	top: 1px;
 }
 
 .button:focus {
-	outline: none
+	outline: none;
 }
 
-.button-Delete {
-	background-color: #e74c3c;
-	border-bottom-color: #c0392b;
-	color: white
-}
-
-.button-Delete:hover {
-	background-color: #FF5442;
-	border-bottom-color: #8E2B21
+.button:focus-visible {
+	outline: 2px solid var(--epix-focus);
+	outline-offset: 2px;
 }
 
 .button.loading {
 	color: rgba(0, 0, 0, 0);
-	background: #999 url(img/loading.gif) no-repeat center center;
-	-webkit-transition: all 0.5s ease-out;
-	-moz-transition: all 0.5s ease-out;
-	-o-transition: all 0.5s ease-out;
-	-ms-transition: all 0.5s ease-out;
+	background: var(--epix-neutral-4) url(img/loading.gif) no-repeat center center;
 	transition: all 0.5s ease-out;
 	pointer-events: none;
-	border-bottom: 2px solid #666
 }
 
 .button.disabled {
 	pointer-events: none;
-	border-bottom: 2px solid #666;
-	background-color: #999;
-	opacity: 0.5
+	background-color: var(--epix-neutral-4);
+	color: var(--epix-neutral-0);
+	opacity: 0.6;
 }
 
-.button.button-2 {
+/* Secondary buttons (2nd+ choice in multi-button confirms) */
+.button.button-2,
+.button.button-3,
+.button.button-4 {
 	background-color: transparent;
-	border: 1px solid #EEE;
-	color: #555
+	border: 1px solid var(--epix-border);
+	color: var(--epix-text-mid);
+	padding: 5px 13px;
 }
 
-.button.button-2:hover {
-	border: 1px solid #CCC;
-	color: #000
+.button.button-2:hover,
+.button.button-3:hover,
+.button.button-4:hover {
+	background-color: transparent;
+	border-color: var(--epix-border-strong);
+	color: var(--epix-text);
 }
+
+/* Danger stays red; declared after the secondary styles so a Delete caption
+   wins even when it is not the first button. */
+.button.button-Delete {
+	background-color: var(--epix-danger);
+	border: 0;
+	color: var(--epix-ink-strong);
+	padding: 6px 14px;
+}
+
+.button.button-Delete:hover {
+	background-color: var(--epix-danger);
+	filter: brightness(0.94);
+}
+
 
 /* Fixbutton #50, #53 */
 
@@ -144,30 +262,18 @@ a {
 	width: 40px;
 	z-index: 999;
 	text-align: center;
-	color: white;
-	font-family: Consolas, Monaco, monospace;
+	color: var(--epix-neutral-0);
+	font-family: var(--epix-font-mono);
 	font-size: 25px;
 }
 
 .fixbutton-bg {
-	-webkit-border-radius: 80px;
-	-moz-border-radius: 80px;
-	-o-border-radius: 80px;
-	-ms-border-radius: 80px;
 	border-radius: 80px;
-	background-color: #000;
+	background-color: var(--epix-neutral-12);
 	display: block;
 	width: 80px;
 	height: 80px;
-	-webkit-transition: background-color 0.2s, box-shadow 0.5s;
-	-moz-transition: background-color 0.2s, box-shadow 0.5s;
-	-o-transition: background-color 0.2s, box-shadow 0.5s;
-	-ms-transition: background-color 0.2s, box-shadow 0.5s;
 	transition: background-color 0.2s, box-shadow 0.5s;
-	-webkit-transform: scale(0.6);
-	-moz-transform: scale(0.6);
-	-o-transform: scale(0.6);
-	-ms-transform: scale(0.6);
 	transform: scale(0.6);
 	margin-left: -20px;
 	margin-top: -20px;
@@ -189,371 +295,343 @@ a {
 	cursor: url('img/fixbutton-left-up.png') 4 12, auto;
 }
 
-/* Notification */
+
+/* Progress bar: slim flat accent line */
+
+.progressbar {
+	background: var(--epix-accent);
+	position: fixed;
+	width: 100%;
+	z-index: 100;
+	top: 0;
+	left: 0;
+	transform: scaleX(0);
+	transform-origin: 0% 0%;
+	height: 3px;
+	transition: transform 1s, opacity 1s;
+	display: none;
+	backface-visibility: hidden;
+}
+
+.progressbar .peg {
+	display: block;
+	position: absolute;
+	right: 0;
+	width: 100px;
+	height: 100%;
+	box-shadow: none;
+	transform: none;
+	opacity: 1.0;
+}
+
+
+/* Notifications: fixed-width flat cards anchored to the top right of the
+   viewport, with a 3px left accent border in the semantic color. The JS
+   animates inline width on .notification and .body while opening; the
+   !important widths below keep the cards at a fixed size (the scale pop-in
+   and the close fade/slide still animate). */
 
 .notifications {
-	position: absolute;
+	position: fixed;
 	top: 0;
-	right: 80px;
-	display: inline-block;
+	right: 72px;
+	box-sizing: border-box;
+	width: 396px;
+	padding: 0 8px 8px;
+	max-height: 100vh;
+	overflow-y: auto;
 	z-index: 999;
-	white-space: nowrap
+	/* the container never blocks the site; the cards take events back */
+	pointer-events: none;
+}
+
+.notification {
+	pointer-events: auto;
 }
 
 .notification {
 	position: relative;
-	float: right;
-	clear: both;
-	margin: 10px;
-	-webkit-box-sizing: border-box;
-	-moz-box-sizing: border-box;
-	-o-box-sizing: border-box;
-	-ms-box-sizing: border-box;
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
 	box-sizing: border-box;
+	width: 380px !important;
+	margin: 12px 0 0;
+	padding: 12px 36px 12px 12px;
+	background-color: var(--epix-surface);
+	color: var(--epix-text);
+	border: 1px solid var(--epix-border);
+	/* error is the template default accent; type classes override below */
+	border-left: 3px solid var(--epix-danger);
+	border-radius: var(--epix-radius-md);
+	box-shadow: var(--epix-shadow);
 	overflow: hidden;
-	-webkit-backface-visibility: hidden;
-	-moz-backface-visibility: hidden;
-	-o-backface-visibility: hidden;
-	-ms-backface-visibility: hidden;
 	backface-visibility: hidden;
-	-webkit-perspective: 1000px;
-	-moz-perspective: 1000px;
-	-o-perspective: 1000px;
-	-ms-perspective: 1000px;
-	perspective: 1000px;
-	padding-bottom: 5px;
-	color: #4F4F4F;
-	font-family: 'Lucida Grande', 'Segoe UI', Helvetica, Arial, sans-serif;
+	font-family: var(--epix-font-sans);
 	font-size: 14px;
 	line-height: 20px;
-	/*border: 1px solid rgba(210, 206, 205, 0.2)*/
-}
-
-.notification-icon {
-	display: block;
-	width: 50px;
-	height: 50px;
-	position: absolute;
-	float: left;
-	z-index: 2;
-	text-align: center;
-	background-color: #e74c3c;
-	line-height: 45px;
-	vertical-align: bottom;
-	font-size: 40px;
-	color: white;
-}
-
-.notification .body {
-	padding-left: 14px;
-	padding-right: 60px;
-	height: 50px;
-	vertical-align: middle;
-	display: table;
-	padding-right: 20px;
-	-webkit-box-sizing: border-box;
-	-moz-box-sizing: border-box;
-	-o-box-sizing: border-box;
-	-ms-box-sizing: border-box;
-	box-sizing: border-box;
-	background-color: white;
-	left: 50px;
-	top: 0;
-	position: relative;
-	padding-top: 5px;
-	padding-bottom: 5px;
-}
-
-.notification .message-outer {
-	display: table-row
-}
-
-.notification .buttons {
-	display: table-cell;
-	vertical-align: top;
-	padding-top: 9px;
-	padding-right: 20px;
-	text-align: right;
-}
-
-.notification.long .body {
-	padding-top: 10px;
-	padding-bottom: 10px
-}
-
-.notification .message {
-	display: table-cell;
-	vertical-align: middle;
-	max-width: 500px;
 	white-space: normal;
 }
 
-.notification.visible {
-	max-width: 350px
+.notification-ask {
+	border-left-color: var(--epix-warning);
 }
 
-.notification .close {
-	position: absolute;
-	top: 0;
-	right: 0;
-	font-size: 19px;
-	line-height: 13px;
-	color: #DDD;
-	padding: 7px;
-	text-decoration: none
+.notification-info {
+	border-left-color: var(--epix-info);
 }
 
-.notification .close:hover {
-	color: black
+.notification-done {
+	border-left-color: var(--epix-success);
 }
 
-.notification .close:active,
-.notification .close:focus {
-	color: #AF3BFF
+/* Small glyph: semantic fill circle with dark ink glyph */
+.notification-icon {
+	position: relative;
+	z-index: 2;
+	flex: 0 0 22px;
+	display: block;
+	width: 22px;
+	height: 22px;
+	margin-top: 1px;
+	border-radius: 50%;
+	text-align: center;
+	font-size: 13px;
+	font-weight: 700;
+	line-height: 22px;
+	color: var(--epix-ink-strong);
+	background-color: var(--epix-danger);
 }
 
-.notification small {
-	color: #AAA
+.notification-ask .notification-icon {
+	background-color: var(--epix-warning);
+}
+
+.notification-info .notification-icon {
+	background-color: var(--epix-info);
+	font-style: italic;
+}
+
+.notification-done .notification-icon {
+	background-color: var(--epix-success);
+}
+
+/* Check mark glyph (done / finished progress) */
+.icon-success {
+	box-sizing: border-box;
+	width: 6px;
+	height: 11px;
+	border-width: 0 2px 2px 0;
+	border-style: solid;
+	border-color: var(--epix-ink-strong);
+	margin: 4px auto 0;
+	transform: rotate(45deg);
+}
+
+.notification .body {
+	flex: 1;
+	min-width: 0;
+	display: block;
+	position: static;
+	width: auto !important;
+	/* the JS sets an inline box-shadow on .body after opening */
+	box-shadow: none !important;
+	height: auto;
+	padding: 1px 0 0;
+	background: none;
+	box-sizing: border-box;
+}
+
+.notification .message-outer {
+	display: block;
+}
+
+.notification .message {
+	display: block;
+	max-width: none;
+	white-space: normal;
+	word-break: break-word;
 }
 
 .notification .multiline {
 	white-space: normal;
 	word-break: break-word;
-	max-width: 300px;
+	max-width: none;
 }
 
-.body-white .notification {
-	-webkit-box-shadow: 0 1px 9px rgba(0, 0, 0, 0.1);
-	-moz-box-shadow: 0 1px 9px rgba(0, 0, 0, 0.1);
-	-o-box-shadow: 0 1px 9px rgba(0, 0, 0, 0.1);
-	-ms-box-shadow: 0 1px 9px rgba(0, 0, 0, 0.1);
-	box-shadow: 0 1px 9px rgba(0, 0, 0, 0.1)
+/* !important also beats the inline color the JS puts on permission
+   request details */
+.notification small {
+	color: var(--epix-text-low) !important;
+	font-size: 12px;
 }
 
-/* Notification select */
+.notification .buttons {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	justify-content: flex-end;
+	padding: 10px 0 0;
+	text-align: right;
+}
+
+.notification .buttons .button {
+	margin-left: 0;
+}
+
+.notification .close {
+	position: absolute;
+	top: 6px;
+	right: 6px;
+	width: 24px;
+	height: 24px;
+	line-height: 24px;
+	text-align: center;
+	font-size: 16px;
+	color: var(--epix-text-low);
+	text-decoration: none;
+	border-radius: var(--epix-radius-sm);
+}
+
+.notification .close:hover {
+	color: var(--epix-text);
+	background-color: var(--epix-surface-2);
+}
+
+.notification .close:active,
+.notification .close:focus {
+	color: var(--epix-accent);
+}
+
+/* Notification select (identity / cert selection rows) */
 .notification .select {
 	display: block;
-	padding: 10px;
-	margin-right: -32px;
+	margin: 1px 0 0;
+	padding: 10px 12px;
 	text-decoration: none;
-	border-left: 3px solid #EEE;
-	margin-top: 1px;
-	-webkit-transition: all 0.3s;
-	-moz-transition: all 0.3s;
-	-o-transition: all 0.3s;
-	-ms-transition: all 0.3s;
-	transition: all 0.3s;
-	color: #666
+	color: var(--epix-text-mid);
+	border-left: 3px solid var(--epix-border);
+	border-radius: 0 var(--epix-radius-sm) var(--epix-radius-sm) 0;
+	transition: all 0.15s ease;
 }
 
 .notification .select:hover,
 .notification .select.active {
-	background-color: #007AFF;
-	border-left: 3px solid #5D68FF;
-	color: white;
-	-webkit-transition: none;
-	-moz-transition: none;
-	-o-transition: none;
-	-ms-transition: none;
-	transition: none
+	background-color: var(--epix-accent);
+	border-left-color: var(--epix-accent);
+	color: var(--epix-on-accent);
+	transition: none;
 }
 
 .notification .select:active,
 .notification .select:focus {
-	background-color: #3396FF;
-	color: white;
-	-webkit-transition: none;
-	-moz-transition: none;
-	-o-transition: none;
-	-ms-transition: none;
+	background-color: var(--epix-indigo);
+	border-left-color: var(--epix-indigo);
+	color: var(--epix-on-accent);
 	transition: none;
-	border-left-color: #3396FF
 }
 
 .notification .select.disabled {
 	opacity: 0.5;
-	pointer-events: none
+	pointer-events: none;
 }
 
 .notification .select small {
-	color: inherit;
+	color: inherit !important;
 }
 
-/* Notification types */
-.notification-ask .notification-icon {
-	background-color: #f39c12;
-}
-
-.notification-info .notification-icon {
-	font-size: 22px;
-	font-weight: bold;
-	background-color: #2980b9;
-	line-height: 48px
-}
-
-.notification-done .notification-icon {
-	font-size: 22px;
-	background-color: #27ae60
-}
-
-/* Notification input */
+/* Notification input (prompt fields) */
 .notification .input {
-	padding: 6px;
-	border: 1px solid #DDD;
-	margin-left: 10px;
-	border-bottom: 2px solid #DDD;
-	-webkit-border-radius: 1px;
-	-moz-border-radius: 1px;
-	-o-border-radius: 1px;
-	-ms-border-radius: 1px;
-	border-radius: 1px;
-	margin-right: -11px;
-	-webkit-transition: all 0.3s;
-	-moz-transition: all 0.3s;
-	-o-transition: all 0.3s;
-	-ms-transition: all 0.3s;
-	transition: all 0.3s
+	box-sizing: border-box;
+	display: block;
+	width: 100%;
+	margin: 10px 0 8px;
+	padding: 8px 10px;
+	font-family: var(--epix-font-sans);
+	font-size: 14px;
+	color: var(--epix-text);
+	background-color: var(--epix-surface);
+	border: 1px solid var(--epix-border);
+	border-radius: var(--epix-radius-sm);
+	transition: border-color 0.15s ease;
 }
 
 .notification .input:focus {
-	border-color: #95a5a6;
-	outline: none
+	border-color: var(--epix-focus);
+	outline: none;
 }
 
-/* Notification progress */
+.notification .message .button {
+	margin: 2px 0 0;
+}
+
+/* Notification progress ring: success green on a neutral track, drawn over
+   the (hidden until done) icon slot */
 .notification .circle {
-	width: 50px;
-	height: 50px;
 	position: absolute;
-	left: -50px;
-	top: 0px;
-	background-color: #e2e9ec;
+	left: 8px;
+	top: 8px;
+	width: 30px;
+	height: 30px;
+	background: none;
 	z-index: 1;
-	background: -webkit-linear-gradient(405deg, rgba(226, 233, 236, 0.8), #efefef);
-	background: -moz-linear-gradient(405deg, rgba(226, 233, 236, 0.8), #efefef);
-	background: -o-linear-gradient(405deg, rgba(226, 233, 236, 0.8), #efefef);
-	background: -ms-linear-gradient(405deg, rgba(226, 233, 236, 0.8), #efefef);
-	background: linear-gradient(405deg, rgba(226, 233, 236, 0.8), #efefef);
 }
 
 .notification .circle-svg {
-	margin-left: 10px;
-	margin-top: 10px;
-	-webkit-transform: rotateZ(-90deg);
-	-moz-transform: rotateZ(-90deg);
-	-o-transform: rotateZ(-90deg);
-	-ms-transform: rotateZ(-90deg);
+	display: block;
+	margin: 0;
 	transform: rotateZ(-90deg);
 }
 
 .notification .circle-bg {
-	stroke: #FFF;
+	stroke: var(--epix-border);
 	stroke-width: 2px;
-	-webkit-animation: rolling 0.4s infinite linear;
-	-moz-animation: rolling 0.4s infinite linear;
-	-o-animation: rolling 0.4s infinite linear;
-	-ms-animation: rolling 0.4s infinite linear;
 	animation: rolling 0.4s infinite linear;
 	stroke-dasharray: 40px;
-	-webkit-transition: all 1s;
-	-moz-transition: all 1s;
-	-o-transition: all 1s;
-	-ms-transition: all 1s;
-	transition: all 1s
+	transition: all 1s;
 }
 
 .notification .circle-fg {
 	stroke-dashoffset: 200;
-	stroke: #2ecc71;
+	stroke: var(--epix-success);
 	stroke-width: 2px;
 	stroke-dasharray: 75px;
-	-webkit-transition: all 5s cubic-bezier(0.19, 1, 0.22, 1);
-	-moz-transition: all 5s cubic-bezier(0.19, 1, 0.22, 1);
-	-o-transition: all 5s cubic-bezier(0.19, 1, 0.22, 1);
-	-ms-transition: all 5s cubic-bezier(0.19, 1, 0.22, 1);
 	transition: all 5s cubic-bezier(0.19, 1, 0.22, 1);
 }
 
 .notification-progress .notification-icon {
 	opacity: 0;
-	-webkit-transform: scale(0);
-	-moz-transform: scale(0);
-	-o-transform: scale(0);
-	-ms-transform: scale(0);
 	transform: scale(0);
-	-webkit-transition: all 0.3s ease-in-out;
-	-moz-transition: all 0.3s ease-in-out;
-	-o-transition: all 0.3s ease-in-out;
-	-ms-transition: all 0.3s ease-in-out;
-	transition: all 0.3s ease-in-out
+	transition: all 0.3s ease-in-out;
 }
 
 .notification-progress .icon-success {
-	-webkit-transform: rotate(45deg) scale(0);
-	-moz-transform: rotate(45deg) scale(0);
-	-o-transform: rotate(45deg) scale(0);
-	-ms-transform: rotate(45deg) scale(0);
 	transform: rotate(45deg) scale(0);
-	-webkit-transition: all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-	-moz-transition: all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-	-o-transition: all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-	-ms-transition: all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
 	transition: all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55);
 }
 
 @keyframes rolling {
 	0% {
-		stroke-dashoffset: 80px
+		stroke-dashoffset: 80px;
 	}
 
 	100% {
-		stroke-dashoffset: 0px
-	}
-}
-
-@-webkit-keyframes rolling {
-	0% {
-		stroke-dashoffset: 80px
-	}
-
-	100% {
-		stroke-dashoffset: 0px
-	}
-}
-
-@-moz-keyframes rolling {
-	0% {
-		stroke-dashoffset: 80px
-	}
-
-	100% {
-		stroke-dashoffset: 0px
+		stroke-dashoffset: 0px;
 	}
 }
 
 
-/* Icons (based on http://nicolasgallagher.com/pure-css-gui-icons/demo/) */
+/* Infopanel ("N modified files" + Sign and Publish) */
 
-.icon-success {
-	left: 6px;
-	width: 5px;
-	height: 12px;
-	border-width: 0 5px 5px 0;
-	border-style: solid;
-	border-color: white;
-	margin-left: 20px;
-	margin-top: 15px;
-	transform: rotate(45deg)
-}
-
-
-/* Infopanel */
 .infopanel-container {
 	width: 100%;
 	height: 100%;
+	top: 0;
+	left: 0;
 	overflow: hidden;
 	position: absolute;
 	display: none;
+	pointer-events: none;
 }
 
 .infopanel-container.visible {
@@ -561,39 +639,24 @@ a {
 }
 
 .infopanel {
+	pointer-events: auto;
 	position: absolute;
 	z-index: 999;
-	padding: 15px 15px;
-	bottom: 25px;
-	right: 50px;
-	border: 1px solid #eff3fe;
-	font-family: 'Lucida Grande', 'Segoe UI', Helvetica, Arial, sans-serif;
-	-webkit-box-shadow: 0px 10px 55px rgba(58, 39, 176, 0.17);
-	-moz-box-shadow: 0px 10px 55px rgba(58, 39, 176, 0.17);
-	-o-box-shadow: 0px 10px 55px rgba(58, 39, 176, 0.17);
-	-ms-box-shadow: 0px 10px 55px rgba(58, 39, 176, 0.17);
-	box-shadow: 0px 10px 55px rgba(58, 39, 176, 0.17);
-	background-color: white;
-	border-left: 4px solid #9a61f8;
-	border-top-left-radius: 4px;
-	border-bottom-left-radius: 4px;
-	-webkit-transition: all 0.8s cubic-bezier(0.215, 0.61, 0.355, 1);
-	-moz-transition: all 0.8s cubic-bezier(0.215, 0.61, 0.355, 1);
-	-o-transition: all 0.8s cubic-bezier(0.215, 0.61, 0.355, 1);
-	-ms-transition: all 0.8s cubic-bezier(0.215, 0.61, 0.355, 1);
-	transition: all 0.8s cubic-bezier(0.215, 0.61, 0.355, 1);
+	right: 24px;
+	bottom: 24px;
+	padding: 12px 14px;
+	background-color: var(--epix-surface);
+	color: var(--epix-text);
+	border: 1px solid var(--epix-border);
+	border-left: 3px solid var(--epix-accent);
+	border-radius: var(--epix-radius-md);
+	box-shadow: var(--epix-shadow);
+	font-family: var(--epix-font-sans);
+	transition: transform 0.4s cubic-bezier(0.215, 0.61, 0.355, 1), box-shadow 0.4s, right 0.4s;
 }
 
 .infopanel.closed {
-	-webkit-box-shadow: none;
-	-moz-box-shadow: none;
-	-o-box-shadow: none;
-	-ms-box-shadow: none;
 	box-shadow: none;
-	-webkit-transform: translateX(100%);
-	-moz-transform: translateX(100%);
-	-o-transform: translateX(100%);
-	-ms-transform: translateX(100%);
 	transform: translateX(100%);
 	right: 0px;
 	cursor: pointer;
@@ -601,67 +664,79 @@ a {
 
 .infopanel .message {
 	font-size: 13px;
-	line-height: 15px;
+	line-height: 18px;
 	display: inline-block;
-	vertical-align: -9px;
+	vertical-align: middle;
 }
 
 .infopanel .message .line {
-	max-width: 200px;
-	display: inline-block;
+	max-width: 220px;
+	display: block;
 	white-space: nowrap;
 	text-overflow: ellipsis;
 	overflow: hidden;
 }
 
 .infopanel .message .line-1 {
-	font-weight: bold;
+	font-weight: 600;
+}
+
+.infopanel .message .line-2 {
+	font-family: var(--epix-font-mono);
+	font-size: 11px;
+	color: var(--epix-text-low);
+}
+
+.infopanel .button {
+	vertical-align: middle;
+	margin-left: 12px;
 }
 
 .infopanel .close {
 	font-size: 16px;
 	text-decoration: none;
-	color: #AAA;
-	padding: 5px;
-	margin-right: -12px;
-	vertical-align: 1px;
+	color: var(--epix-text-low);
+	padding: 5px 7px;
+	margin-left: 2px;
+	vertical-align: middle;
 	display: inline-block;
+	border-radius: var(--epix-radius-sm);
 }
 
 .infopanel .close:hover {
-	color: black
+	color: var(--epix-text);
+	background-color: var(--epix-surface-2);
 }
 
 .infopanel .close:active,
 .infopanel .close:focus {
-	color: #AF3BFF
-}
-
-.infopanel.closed .closed-num {
-	opacity: 1;
-	margin-left: -36px;
-	pointer-events: inherit;
+	color: var(--epix-accent);
 }
 
 .infopanel .closed-num {
 	position: absolute;
-	margin-top: 6px;
-	background-color: #6666663d;
-	color: white;
-	width: 10px;
+	/* just outside the panel's left edge (the 3px accent border) so the
+	   tab stays visible at the screen edge when the panel slides away */
+	right: calc(100% + 3px);
+	top: 10px;
+	min-width: 18px;
+	padding: 4px 6px;
+	box-sizing: border-box;
 	text-align: center;
-	padding: 4px;
-	border-top-left-radius: 6px;
-	border-bottom-left-radius: 6px;
-	font-size: 10px;
+	background-color: var(--epix-accent);
+	color: var(--epix-on-accent);
+	border-radius: var(--epix-radius-sm) 0 0 var(--epix-radius-sm);
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 14px;
 	opacity: 0;
-	margin-left: 0px;
 	pointer-events: none;
-	-webkit-transition: all 0.6s;
-	-moz-transition: all 0.6s;
-	-o-transition: all 0.6s;
-	-ms-transition: all 0.6s;
-	transition: all 0.6s;
+	transition: all 0.4s;
+}
+
+.infopanel.closed .closed-num {
+	opacity: 1;
+	pointer-events: inherit;
 }
 
 .infopanel.unfolded .message .line {
@@ -677,144 +752,59 @@ a {
 	right: 0px;
 }
 
-/* Loading screen */
+
+/* Loading screen: a centered app-like column. The stylesheet !important
+   overrides the JS inline display:block; the screen only becomes visible
+   once .ready lands anyway. */
 
 .loadingscreen {
 	width: 100%;
 	height: 100%;
 	position: absolute;
-	background-color: #EEE;
+	background-color: var(--epix-bg);
 	z-index: 1;
 	overflow: auto;
-	display: none
+	display: none;
 }
 
-.theme-dark .loadingscreen {
-	background-color: #180922;
+.loadingscreen.ready {
+	display: flex !important;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	padding: 24px;
+	box-sizing: border-box;
 }
 
-.loading-text {
-	text-align: center;
-	vertical-align: middle;
-	top: 50%;
-	position: absolute;
-	margin-top: 39px;
-	width: 100%
-}
-
+/* Config link: quiet, pinned to the top left corner */
 .loading-config {
-	margin: 20px;
-	display: inline-block;
-	text-transform: uppercase;
-	font-family: Consolas, monospace;
-	position: relative;
-	;
-	text-decoration: none;
-	letter-spacing: 1px;
+	position: absolute;
+	top: 14px;
+	left: 16px;
+	margin: 0;
+	font-family: var(--epix-font-sans);
 	font-size: 12px;
-	border-bottom: 1px solid #999;
-	top: -60px;
-	-webkit-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	-moz-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	-o-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	-ms-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	transition: all 1s cubic-bezier(1, 0, 0, 1);
-	transition-delay: 0.3s;
+	letter-spacing: 1px;
+	text-transform: uppercase;
+	text-decoration: none;
+	color: var(--epix-text-low);
+	transition: color 0.15s ease;
 }
 
 .loading-config:hover {
-	border-bottom-color: #000;
-	-webkit-transition: none;
-	-moz-transition: none;
-	-o-transition: none;
-	-ms-transition: none;
-	transition: none;
+	color: var(--epix-text);
 }
 
-.theme-dark .loading-config {
-	color: white
-}
-
-.loadingscreen.ready .loading-config {
-	top: 0px;
-}
-
-
-/* Loading console */
-.loadingscreen .console {
-	line-height: 24px;
-	font-family: monospace;
-	font-size: 14px;
-	color: #ADADAD;
-	text-transform: uppercase;
-	opacity: 0;
-	-webkit-transform: translateY(-20px);
-	-moz-transform: translateY(-20px);
-	-o-transform: translateY(-20px);
-	-ms-transform: translateY(-20px);
-	transform: translateY(-20px);
-}
-
-.loadingscreen .console-line:last-child {
-	color: #6C6767
-}
-
-.loadingscreen .console .cursor {
-	background-color: #999;
-	color: #999;
-	-webkit-animation: pulse 1.5s infinite ease-in-out;
-	-moz-animation: pulse 1.5s infinite ease-in-out;
-	-o-animation: pulse 1.5s infinite ease-in-out;
-	-ms-animation: pulse 1.5s infinite ease-in-out;
-	animation: pulse 1.5s infinite ease-in-out;
-	margin-right: -9px;
-	display: inline-block;
-	width: 9px;
-	height: 19px;
-	vertical-align: -4px;
-}
-
-.loadingscreen .console .console-error {
-	color: #e74c3c;
-	font-weight: bold;
-	-webkit-animation: pulse 2s infinite linear;
-	-moz-animation: pulse 2s infinite linear;
-	-o-animation: pulse 2s infinite linear;
-	-ms-animation: pulse 2s infinite linear;
-	animation: pulse 2s infinite linear
-}
-
-.loadingscreen .console .console-warning {
-	color: #8e44ad;
-}
-
-.loadingscreen .console .button {
-	margin: 20px;
-	display: inline-block;
-	text-transform: none;
-	padding: 10px 20px
-}
-
-
-/* Flipper loading anim with Epix logo */
+/* Flipper loading anim: the Epix logo frame with its inner square window
+   flipping between the brand purple and cyan */
 .flipper-container {
-	width: 200px;
-	height: 200px;
-	position: absolute;
-	top: 0%;
-	left: 50%;
-	-webkit-transform: translate3d(-50%, -50%, 0);
-	-moz-transform: translate3d(-50%, -50%, 0);
-	-o-transform: translate3d(-50%, -50%, 0);
-	-ms-transform: translate3d(-50%, -50%, 0);
-	transform: translate3d(-50%, -50%, 0);
-	-webkit-perspective: 1200;
-	-moz-perspective: 1200;
-	-o-perspective: 1200;
-	-ms-perspective: 1200;
-	perspective: 1200;
-	opacity: 0;
-	background-image: url('/uimedia/img/logo.png');
+	position: relative;
+	order: 1;
+	width: 84px;
+	height: 84px;
+	margin: 0 0 30px;
+	opacity: 1;
+	background-image: url('img/logo.png');
 	background-size: contain;
 	background-repeat: no-repeat;
 	background-position: center;
@@ -823,19 +813,12 @@ a {
 .flipper {
 	position: absolute;
 	display: block;
-	height: 50px;
-	width: 50px;
+	width: 30%;
+	height: 30%;
 	top: 50%;
 	left: 50%;
-	margin-top: -25px;
-	margin-left: -25px;
-	-webkit-animation: flip 1.2s infinite ease-in-out;
-	-moz-animation: flip 1.2s infinite ease-in-out;
-	-o-animation: flip 1.2s infinite ease-in-out;
-	-ms-animation: flip 1.2s infinite ease-in-out;
+	margin: -15% 0 0 -15%;
 	animation: flip 1.2s infinite ease-in-out;
-	-webkit-transform-style: preserve-3d;
-	-moz-transform-style: preserve-3d;
 	transform-style: preserve-3d;
 }
 
@@ -844,232 +827,222 @@ a {
 	position: absolute;
 	top: 0;
 	left: 0;
-	-webkit-backface-visibility: hidden;
-	-moz-backface-visibility: hidden;
-	-o-backface-visibility: hidden;
-	-ms-backface-visibility: hidden;
 	backface-visibility: hidden;
 	display: block;
-	background-color: #d50000;
+	background-color: var(--epix-purple);
 	height: 100%;
 	width: 100%;
-	border-radius: 4px;
-	/* outline: 1px solid transparent; /* FF AA fix */
 }
 
 .flipper .back {
-	background-color: white;
+	background-color: var(--epix-cyan);
 	z-index: 800;
-	-webkit-transform: rotateY(-180deg);
-	-moz-transform: rotateY(-180deg);
-	-o-transform: rotateY(-180deg);
-	-ms-transform: rotateY(-180deg);
-	transform: rotateY(-180deg)
+	transform: rotateY(-180deg);
 }
 
-/* Loading ready */
-/* Stage ticker: previous / current / next action, centered under the logo */
-.loadingscreen .loading-stage {
-	position: absolute;
-	top: 50%;
-	margin-top: 8px;
+/* Stage ticker: previous / current / next action under the logo */
+.loading-stage {
+	position: static;
+	order: 2;
+	margin: 0 0 26px;
 	width: 100%;
+	max-width: 560px;
 	text-align: center;
-	font-family: 'Lucida Console', monospace;
 	pointer-events: none;
-	opacity: 0;
-}
-.loadingscreen.ready .loading-stage {
 	opacity: 1;
-	transition: opacity .4s;
+	font-family: var(--epix-font-sans);
 }
-.loadingscreen.staged .loading-text {
-	margin-top: 128px;
-}
+
 .loading-stage .stage {
-	line-height: 22px;
-	transition: all .35s ease;
+	transition: all 0.35s ease;
 }
-.loading-stage .stage-prev, .loading-stage .stage-next {
+
+.loading-stage .stage-prev,
+.loading-stage .stage-next {
 	font-size: 12px;
-	opacity: .32;
-	color: #666;
+	line-height: 20px;
+	color: var(--epix-text-low);
 }
-.theme-dark .loading-stage .stage-prev, .theme-dark .loading-stage .stage-next {
-	color: #B098CC;
-}
+
 .loading-stage .stage-current {
-	font-size: 17px;
-	letter-spacing: 1px;
-	color: #333;
-	padding: 3px 0 1px;
+	font-size: 20px;
+	font-weight: 600;
+	letter-spacing: -0.2px;
+	line-height: 30px;
+	color: var(--epix-text);
+	padding: 4px 0 2px;
 }
-.theme-dark .loading-stage .stage-current {
-	color: #FFF;
-}
+
 .loading-stage .stage-current.error {
-	color: #e74c3c;
+	color: var(--epix-danger);
 }
+
 .loading-stage .stage-detail {
-	font-size: 11.5px;
-	opacity: .55;
-	min-height: 16px;
-	line-height: 16px;
-	color: #555;
+	font-family: var(--epix-font-mono);
+	font-size: 12px;
+	line-height: 20px;
+	min-height: 20px;
+	color: var(--epix-text-low);
 }
-.theme-dark .loading-stage .stage-detail {
-	color: #C9BBDD;
-}
+
 @keyframes stage-pop {
-	0% { opacity: 0; transform: translateY(12px); }
-	100% { opacity: 1; transform: none; }
+	0% {
+		opacity: 0;
+		transform: translateY(12px);
+	}
+
+	100% {
+		opacity: 1;
+		transform: none;
+	}
 }
+
 .loading-stage .stage-current.pop {
-	animation: stage-pop .4s ease;
+	animation: stage-pop 0.4s ease;
+}
+
+/* Console: a quiet six-line activity log, newest at the bottom */
+.loadingscreen .console {
+	position: static;
+	order: 3;
+	margin: 0;
+	width: 100%;
+	max-width: 560px;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: flex-end;
+	overflow: hidden;
+	height: 126px;
+	line-height: 21px;
+	font-family: var(--epix-font-mono);
+	font-size: 12px;
+	text-align: center;
+	color: var(--epix-text-low);
+	opacity: 0;
+	transform: translateY(-8px);
 }
 
 .loadingscreen.ready .console {
 	opacity: 1;
-	-webkit-transform: translateY(0px);
-	-moz-transform: translateY(0px);
-	-o-transform: translateY(0px);
-	-ms-transform: translateY(0px);
 	transform: translateY(0px);
-	-webkit-transition: all 0.3s;
-	-moz-transition: all 0.3s;
-	-o-transition: all 0.3s;
-	-ms-transition: all 0.3s;
-	transition: all 0.3s
+	transition: all 0.3s;
 }
 
-.loadingscreen.ready .flipper-container {
-	top: 35%;
-	opacity: 1;
-	-webkit-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	-moz-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	-o-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	-ms-transition: all 1s cubic-bezier(1, 0, 0, 1);
-	transition: all 1s cubic-bezier(1, 0, 0, 1);
+.loadingscreen .console-line {
+	flex-shrink: 0;
+	max-width: 100%;
 }
 
+.loadingscreen .console-line:last-child {
+	color: var(--epix-text-mid);
+}
 
-/* Loading done */
+.loadingscreen .console .cursor {
+	background-color: var(--epix-accent);
+	color: var(--epix-accent);
+	animation: pulse 1.5s infinite ease-in-out;
+	margin-right: -7px;
+	display: inline-block;
+	width: 7px;
+	height: 14px;
+	vertical-align: -2px;
+}
+
+/* Semantic console lines: dark ink on soft fills (strong semantic colors
+   are too low contrast as small text) */
+.loadingscreen .console .console-error {
+	display: inline-block;
+	padding: 0 6px;
+	border-radius: var(--epix-radius-sm);
+	background-color: var(--epix-danger-soft);
+	color: var(--epix-ink-soft);
+	font-weight: 600;
+}
+
+.loadingscreen .console .console-warning {
+	padding: 0 8px;
+	border-radius: var(--epix-radius-sm);
+	background-color: var(--epix-warning-soft);
+	color: var(--epix-ink-soft);
+}
+
+/* Size limit / tracker bridge prompt buttons inside the console */
+.loadingscreen .console .button {
+	margin: 14px 0 4px;
+	display: inline-block;
+	text-transform: none;
+	padding: 10px 20px;
+}
+
+/* Dismissal: fade the whole screen out in place; pointer-events off so the
+   invisible overlay never blocks the site while waiting for removal */
 .loadingscreen.done {
-	height: 0%;
-	-webkit-transition: all 1s cubic-bezier(0.6, -0.28, 0.735, 0.045);
-	-moz-transition: all 1s cubic-bezier(0.6, -0.28, 0.735, 0.045);
-	-o-transition: all 1s cubic-bezier(0.6, -0.28, 0.735, 0.045);
-	-ms-transition: all 1s cubic-bezier(0.6, -0.28, 0.735, 0.045);
-	transition: all 1s cubic-bezier(0.6, -0.28, 0.735, 0.045);
-}
-
-.loadingscreen.done .console {
-	-webkit-transform: translateY(300px);
-	-moz-transform: translateY(300px);
-	-o-transform: translateY(300px);
-	-ms-transform: translateY(300px);
-	transform: translateY(300px);
-	opacity: 0;
-	-webkit-transition: all 1.5s;
-	-moz-transition: all 1.5s;
-	-o-transition: all 1.5s;
-	-ms-transition: all 1.5s;
-	transition: all 1.5s
-}
-
-.loadingscreen.done .flipper-container {
-	opacity: 0;
-	-webkit-transition: all 1.5s;
-	-moz-transition: all 1.5s;
-	-o-transition: all 1.5s;
-	-ms-transition: all 1.5s;
-	transition: all 1.5s
-}
-
-
-.progressbar {
-	background: #26C281;
-	position: fixed;
-	width: 100%;
-	z-index: 100;
-	top: 0;
-	left: 0;
-	-webkit-transform: scaleX(0);
-	-moz-transform: scaleX(0);
-	-o-transform: scaleX(0);
-	-ms-transform: scaleX(0);
-	transform: scaleX(0);
-	transform-origin: 0% 0%;
-	transform: translate3d(0, 0, 0);
-	height: 2px;
-	-webkit-transition: transform 1s, opacity 1s;
-	-moz-transition: transform 1s, opacity 1s;
-	-o-transition: transform 1s, opacity 1s;
-	-ms-transition: transform 1s, opacity 1s;
-	transition: transform 1s, opacity 1s;
-	display: none;
-	-webkit-backface-visibility: hidden;
-	-moz-backface-visibility: hidden;
-	-o-backface-visibility: hidden;
-	-ms-backface-visibility: hidden;
-	backface-visibility: hidden;
-	transform-style: preserve-3d;
-}
-
-.progressbar .peg {
-	display: block;
-	position: absolute;
-	right: 0;
-	width: 100px;
 	height: 100%;
-	-webkit-box-shadow: 0 0 10px #AF3BFF, 0 0 5px #29d;
-	-moz-box-shadow: 0 0 10px #AF3BFF, 0 0 5px #29d;
-	-o-box-shadow: 0 0 10px #AF3BFF, 0 0 5px #29d;
-	-ms-box-shadow: 0 0 10px #AF3BFF, 0 0 5px #29d;
-	box-shadow: 0 0 10px #AF3BFF, 0 0 5px #29d;
-	opacity: 1.0;
-	-webkit-transform: rotate(3deg) translate(0px, -4px);
-	-moz-transform: rotate(3deg) translate(0px, -4px);
-	-o-transform: rotate(3deg) translate(0px, -4px);
-	-ms-transform: rotate(3deg) translate(0px, -4px);
-	transform: rotate(3deg) translate(0px, -4px);
+	opacity: 0;
+	transform: translateY(-12px);
+	transition: opacity 0.45s ease, transform 0.45s ease;
+	pointer-events: none;
 }
+
+.loadingscreen.done .console,
+.loadingscreen.done .flipper-container,
+.loadingscreen.done .loading-stage {
+	opacity: 0;
+	transform: none;
+	transition: opacity 0.3s ease;
+}
+
 
 /* Opener overlay */
+
 .opener-overlay {
 	position: fixed;
 	z-index: 9999;
+	top: 0;
+	left: 0;
 	width: 100%;
-	text-align: center;
-	background-color: rgba(100, 100, 100, 0.5);
 	height: 100%;
-	vertical-align: middle;
+	box-sizing: border-box;
+	background-color: rgba(2, 2, 2, 0.5);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	padding: 24px;
 }
 
 .opener-overlay .dialog {
-	background-color: white;
-	padding: 40px;
-	display: inline-block;
-	color: #4F4F4F;
-	font-family: 'Lucida Grande', 'Segoe UI', Helvetica, Arial, sans-serif;
+	box-sizing: border-box;
+	max-width: 560px;
+	padding: 32px;
+	background-color: var(--epix-surface);
+	color: var(--epix-text);
+	border: 1px solid var(--epix-border);
+	border-radius: var(--epix-radius-lg);
+	box-shadow: var(--epix-shadow);
+	font-family: var(--epix-font-sans);
 	font-size: 14px;
+	line-height: 1.5;
 }
 
-/* Icons */
+.opener-overlay .dialog .button {
+	display: table;
+	margin: 16px 0 0;
+}
+
+
+/* Icons (based on http://nicolasgallagher.com/pure-css-gui-icons/demo/) */
+
 .icon-profile {
 	font-size: 6px;
 	top: 0em;
-	-webkit-border-radius: 0.7em 0.7em 0 0;
-	-moz-border-radius: 0.7em 0.7em 0 0;
-	-o-border-radius: 0.7em 0.7em 0 0;
-	-ms-border-radius: 0.7em 0.7em 0 0;
 	border-radius: 0.7em 0.7em 0 0;
-	background: #FFFFFF;
+	background: currentColor;
 	width: 1.5em;
 	height: 0.7em;
 	position: relative;
 	display: inline-block;
-	margin-right: 4px
+	margin-right: 4px;
 }
 
 .icon-profile::before {
@@ -1079,158 +1052,46 @@ a {
 	left: 0.38em;
 	width: 0.8em;
 	height: 0.85em;
-	-webkit-border-radius: 50%;
-	-moz-border-radius: 50%;
-	-o-border-radius: 50%;
-	-ms-border-radius: 50%;
 	border-radius: 50%;
-	background: #FFFFFF
+	background: currentColor;
 }
+
 
 /* Animations */
 
 @keyframes flip {
 	0% {
-		-webkit-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-moz-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-o-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-ms-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
 		transform: perspective(120px) rotateX(0deg) rotateY(0deg);
 	}
 
 	50% {
-		-webkit-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-moz-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-o-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-ms-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg)
+		transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
 	}
 
 	100% {
-		-webkit-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-moz-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-o-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-ms-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
 		transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
 	}
 }
-
-@-webkit-keyframes flip {
-	0% {
-		-webkit-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-moz-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-o-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-ms-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-	}
-
-	50% {
-		-webkit-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-moz-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-o-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-ms-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg)
-	}
-
-	100% {
-		-webkit-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-moz-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-o-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-ms-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-	}
-}
-
-@-moz-keyframes flip {
-	0% {
-		-webkit-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-moz-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-o-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		-ms-transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-		transform: perspective(120px) rotateX(0deg) rotateY(0deg);
-	}
-
-	50% {
-		-webkit-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-moz-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-o-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		-ms-transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg);
-		transform: perspective(120px) rotateX(-180.1deg) rotateY(0deg)
-	}
-
-	100% {
-		-webkit-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-moz-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-o-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		-ms-transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-		transform: perspective(120px) rotateX(-180deg) rotateY(-179.9deg);
-	}
-}
-
 
 @keyframes pulse {
 	0% {
-		opacity: 0
+		opacity: 0;
 	}
 
 	5% {
-		opacity: 1
+		opacity: 1;
 	}
 
 	30% {
-		opacity: 1
+		opacity: 1;
 	}
 
 	70% {
-		opacity: 0
+		opacity: 0;
 	}
 
 	100% {
-		opacity: 0
-	}
-}
-
-@-webkit-keyframes pulse {
-	0% {
-		opacity: 0
-	}
-
-	5% {
-		opacity: 1
-	}
-
-	30% {
-		opacity: 1
-	}
-
-	70% {
-		opacity: 0
-	}
-
-	100% {
-		opacity: 0
-	}
-}
-
-@-moz-keyframes pulse {
-	0% {
-		opacity: 0
-	}
-
-	5% {
-		opacity: 1
-	}
-
-	30% {
-		opacity: 1
-	}
-
-	70% {
-		opacity: 0
-	}
-
-	100% {
-		opacity: 0
+		opacity: 0;
 	}
 }
 
@@ -1244,238 +1105,97 @@ a {
 	.progressbar,
 	.fixbutton,
 	.notifications,
+	.infopanel-container,
 	.loadingscreen {
 		visibility: hidden;
 	}
 }
 
-/* Small screen */
-@media screen and (max-width: 600px) {
-	.notification .message {
-		white-space: normal;
-	}
 
-	.notification .buttons {
-		padding-right: 22px;
-		padding-right: 40px;
-	}
-
-	.notification .button {
-		white-space: nowrap;
-	}
-
-	.notification {
-		margin: 0px;
-	}
-
-	.notifications {
-		right: 0px;
-		max-width: 80%;
-	}
-}
-/* ---- Loading screen: modern flat restyle (mobile-first, no gradients) ---- */
-.loadingscreen {
-	background-color: #FFF;
-}
-.theme-dark .loadingscreen {
-	background-color: #15111B;
-}
-/* App-like centered column (stylesheet !important overrides the JS inline
-   display:block; the screen is only visible once .ready lands anyway). */
-.loadingscreen.ready {
-	display: flex !important;
-	flex-direction: column;
-	align-items: center;
-	justify-content: center;
-	padding: 24px;
-	box-sizing: border-box;
-}
-.loadingscreen .flipper-container,
-.loadingscreen.ready .flipper-container {
-	position: relative;
-	top: auto;
-	left: auto;
-	order: 1;
-	width: 84px;
-	height: 84px;
-	margin: 0 0 30px;
-	transform: none;
-	opacity: 1;
-	transition: none;
-}
-.loadingscreen .loading-stage,
-.loadingscreen.ready .loading-stage {
-	position: static;
-	order: 2;
-	margin: 0 0 26px;
-	width: 100%;
-	max-width: 480px;
-	opacity: 1;
-}
-.loadingscreen .loading-text,
-.loadingscreen.ready .loading-text {
-	position: static;
-	order: 3;
-	margin: 0;
-	width: 100%;
-	max-width: 480px;
-}
-.loadingscreen.staged .loading-text {
-	margin-top: 0;
-}
-/* Stage ticker typography: app-like system type, mono only for data. */
-.loading-stage .stage {
-	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-}
-.loading-stage .stage-prev,
-.loading-stage .stage-next {
-	font-size: 12px;
-	line-height: 20px;
-	color: #9AA0A8;
-	opacity: 1;
-}
-.theme-dark .loading-stage .stage-prev,
-.theme-dark .loading-stage .stage-next {
-	color: #6F6580;
-}
-.loading-stage .stage-current {
-	font-size: 21px;
-	font-weight: 600;
-	letter-spacing: -0.2px;
-	line-height: 30px;
-	color: #17171C;
-	padding: 4px 0 2px;
-}
-.theme-dark .loading-stage .stage-current {
-	color: #F4F1F8;
-}
-.loading-stage .stage-current.error {
-	color: #E5484D;
-}
-.loading-stage .stage-detail {
-	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-	font-size: 12px;
-	line-height: 20px;
-	min-height: 20px;
-	color: #8A8F98;
-	opacity: 1;
-}
-.theme-dark .loading-stage .stage-detail {
-	color: #93889F;
-}
-/* Console: a quiet six-line activity log, newest at the bottom. */
-.loadingscreen .console {
-	display: flex;
-	flex-direction: column;
-	justify-content: flex-end;
-	overflow: hidden;
-	height: 126px;
-	line-height: 21px;
-	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-	font-size: 11.5px;
-	text-transform: none;
-	color: #B9BDC4;
-}
-.theme-dark .loadingscreen .console {
-	color: #5F5570;
-}
-.loadingscreen .console-line {
-	flex-shrink: 0;
-}
-.loadingscreen .console-line:last-child {
-	color: #55585F;
-}
-.theme-dark .loadingscreen .console-line:last-child {
-	color: #B9AECB;
-}
-.loadingscreen .console .cursor {
-	background-color: #8A4BDB;
-	color: #8A4BDB;
-	width: 7px;
-	height: 15px;
-	margin-right: -7px;
-}
-/* Progress bar: slim flat accent line, no glow. */
-.progressbar {
-	background: #8A4BDB;
-	height: 3px;
-}
-.progressbar .peg {
-	box-shadow: none;
-	transform: none;
-}
-/* Config link: quiet, pinned to the top left corner. */
-.loading-config,
-.loadingscreen.ready .loading-config {
-	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-	font-size: 12px;
-	color: #9AA0A8;
-	text-decoration: none;
-	position: absolute;
-	top: 14px;
-	left: 16px;
-	right: auto;
-	margin: 0;
-	border: none;
-	background: none;
-}
-/* Dismissal: fade the whole screen out in place. The old height-collapse
-   squeezed the centered stage ticker into a thin strip at the top while the
-   container shrank. pointer-events off so the invisible overlay never blocks
-   the site while it waits to be removed from the DOM. */
-.loadingscreen.done {
-	height: 100%;
-	opacity: 0;
-	transform: translateY(-12px);
-	transition: opacity 0.45s ease, transform 0.45s ease;
-	pointer-events: none;
-}
-.loadingscreen.done .console,
-.loadingscreen.done .flipper-container,
-.loadingscreen.done .loading-stage {
-	opacity: 0;
-	transform: none;
-	transition: opacity 0.3s ease;
-}
-/* Flat button (size-limit prompt on the loading screen). */
-.loadingscreen .console .button {
-	background: #8A4BDB;
-	color: #FFF;
-	border: none;
-	border-radius: 8px;
-	padding: 8px 18px;
-	box-shadow: none;
-	font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-	font-size: 13px;
-}
-/* Wider screens: a touch more air. */
-@media (min-width: 600px) {
-	.loadingscreen .flipper-container,
-	.loadingscreen.ready .flipper-container {
+/* Tablet and up: a touch more air on the loading column */
+@media screen and (min-width: 641px) {
+	.flipper-container {
 		width: 96px;
 		height: 96px;
 		margin-bottom: 36px;
 	}
+
 	.loading-stage .stage-current {
-		font-size: 23px;
+		font-size: 22px;
 	}
 }
 
-/* Flipper: the logo's inner square window (37.5% of the mark), inset a
-   touch so it visibly spins inside the black frame, scaled with the
-   responsive container, flipping between the brand purple and cyan. */
-.flipper {
-	width: 30%;
-	height: 30%;
-	top: 50%;
-	left: 50%;
-	margin: -15% 0 0 -15%;
-}
-.flipper .front,
-.flipper .back {
-	border-radius: 0;
-	background-color: #8A4BDB;
-}
-.flipper .back {
-	background-color: #69E9F5;
+
+/* Phone: notifications become full-width cards docked at the bottom, the
+   infopanel docks bottom-full-width, touch targets grow to 44px */
+@media screen and (max-width: 640px) {
+	.notifications {
+		top: auto;
+		bottom: 0;
+		left: 0;
+		right: 0;
+		width: auto;
+		max-height: 100vh;
+		padding: 8px 8px calc(8px + env(safe-area-inset-bottom));
+	}
+
+	.notification {
+		width: auto !important;
+		margin: 8px 0 0;
+	}
+
+	.notification .close {
+		top: 0;
+		right: 0;
+		width: 44px;
+		height: 44px;
+		line-height: 44px;
+	}
+
+	.notification .select {
+		padding: 12px;
+	}
+
+	.notification .buttons .button,
+	.notification .message .button,
+	.loadingscreen .console .button {
+		min-height: 44px;
+		padding: 12px 16px;
+	}
+
+	.notification .input {
+		min-height: 44px;
+	}
+
+	.infopanel {
+		left: 0;
+		right: 0;
+		bottom: 0;
+		border-radius: var(--epix-radius-md) var(--epix-radius-md) 0 0;
+		border-left-width: 3px;
+		padding-bottom: calc(12px + env(safe-area-inset-bottom));
+	}
+
+	.infopanel .message {
+		display: block;
+		margin: 0 32px 10px 0;
+	}
+
+	.infopanel .message .line {
+		max-width: none;
+	}
+
+	.infopanel .button {
+		margin-left: 0;
+	}
+
+	.infopanel .close {
+		position: absolute;
+		top: 8px;
+		right: 8px;
+	}
+
+	.body-sidebar .infopanel {
+		right: 0;
+	}
 }

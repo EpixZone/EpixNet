@@ -160,8 +160,105 @@ jobs:
           name: epix-windows
           path: dist/Epix-Setup-*.exe
 
+  # Signed Android APK for direct download (sideloading). Without
+  # ANDROID_KEYSTORE_BASE64 the job still builds an UNSIGNED APK (not
+  # installable, but proves the pipeline). See shells/android/RELEASE-SIGNING.md.
+  #   ANDROID_KEYSTORE_BASE64    (required) base64 of your epix-release.jks
+  #   ANDROID_KEYSTORE_PASSWORD  (required) the keystore password
+  #   ANDROID_KEY_ALIAS          (optional) defaults to epix-release
+  #   ANDROID_KEY_PASSWORD       (optional) defaults to the keystore password (PKCS12)
+  android:
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: "27.2.12479018"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK + NDK packages
+        run: |
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install protoc (mesh transport build dep) + cargo-ndk
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          cargo install cargo-ndk --locked
+
+      - name: Build Rust core into jniLibs
+        run: |
+          cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
+            build -p epix-ffi --release
+
+      - name: Generate Kotlin UniFFI bindings
+        run: |
+          cargo run -p epix-ffi --features cli --bin uniffi-bindgen -- generate \
+            --library target/aarch64-linux-android/release/libepix_ffi.so \
+            --language kotlin --out-dir shells/android/app/src/main/java
+
+      - name: Decode signing keystore
+        id: signcfg
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KS_B64" ]; then
+            echo "No ANDROID_KEYSTORE_BASE64 secret - the APK will be UNSIGNED."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$KS_B64" | base64 --decode > "$RUNNER_TEMP/epix-release.jks"
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build release APK
+        working-directory: shells/android
+        env:
+          # The Gradle signingConfig reads these (see app/build.gradle.kts). When
+          # sign=false the file is empty, so assembleRelease leaves it unsigned.
+          # Only the base64 keystore + its password are required: the alias
+          # defaults to epix-release, and for a PKCS12 keystore the key password
+          # is the keystore password. Set the two optional secrets only to
+          # override (e.g. a legacy JKS with a distinct alias or key password).
+          EPIX_KEYSTORE_FILE: ${{ steps.signcfg.outputs.sign == 'true' && format('{0}/epix-release.jks', runner.temp) || '' }}
+          EPIX_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          EPIX_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'epix-release' }}
+          EPIX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          ./gradlew assembleRelease
+          mv app/build/outputs/apk/release/app-release.apk \
+            "$GITHUB_WORKSPACE/epix-android-${{ steps.v.outputs.version }}.apk"
+
+      - name: Print signing fingerprint
+        if: steps.signcfg.outputs.sign == 'true'
+        run: |
+          "$ANDROID_SDK_ROOT"/build-tools/36.0.0/apksigner verify --print-certs \
+            "$GITHUB_WORKSPACE/epix-android-${{ steps.v.outputs.version }}.apk"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: epix-android
+          path: epix-android-*.apk
+
   release:
-    needs: [macos, linux, windows]
+    needs: [macos, linux, windows, android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -178,4 +275,5 @@ jobs:
             --generate-notes \
             artifacts/epix-macos/*.dmg \
             artifacts/epix-linux/*.tar.gz \
-            artifacts/epix-windows/*.exe
+            artifacts/epix-windows/*.exe \
+            artifacts/epix-android/*.apk

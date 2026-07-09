@@ -27,11 +27,20 @@ else
   echo "warning: no Firefox to bundle (run packaging/fetch-firefox-esr.sh linux)"
 fi
 
+# Hicolor icons for the .desktop entry, prebuilt from the assets repo
+# (images/icons/generated/linux) and checked in under packaging/linux/icons.
+for s in 48 64 128 256 512; do
+  mkdir -p "$STAGE/icons/hicolor/${s}x${s}/apps"
+  cp "$REPO_ROOT/packaging/linux/icons/epix-$s.png" \
+    "$STAGE/icons/hicolor/${s}x${s}/apps/epix.png"
+done
+
 # .desktop entry registering epix:// (installed to ~/.local/share/applications).
 cat > "$STAGE/epix.desktop" <<DESKTOP
 [Desktop Entry]
 Name=Epix
 Exec=$STAGE/epix-browser %u
+Icon=epix
 Type=Application
 Terminal=false
 Categories=Network;WebBrowser;
@@ -48,6 +57,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/.local/share/applications"
 sed "s|Exec=.*epix-browser|Exec=$HERE/epix-browser|" "$HERE/epix.desktop" \
   > "$HOME/.local/share/applications/epix.desktop"
+# Hicolor icons (Icon=epix in the .desktop resolves through this theme dir).
+for d in "$HERE"/icons/hicolor/*/apps; do
+  size="$(basename "$(dirname "$d")")"
+  mkdir -p "$HOME/.local/share/icons/hicolor/$size/apps"
+  cp "$d/epix.png" "$HOME/.local/share/icons/hicolor/$size/apps/epix.png"
+done
+gtk-update-icon-cache "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 xdg-mime default epix.desktop x-scheme-handler/epix 2>/dev/null || true
 echo "Epix installed. Run: $HERE/epix-browser"

@@ -1570,7 +1570,7 @@ if (window.getComputedStyle(document.body).transform) {
         })(this)), 3000);
         return $(".notification-icon", elem).data("done", true);
       } else if (percent < 0) {
-        $(".body .circle-fg", elem).css("stroke", "#ec6f47").css("transition", "transition: all 0.3s ease-in-out");
+        $(".body .circle-fg", elem).css("stroke", "#F0224B").css("transition", "transition: all 0.3s ease-in-out");
         setTimeout(((function (_this) {
           return function () {
             $(".notification-icon", elem).css({

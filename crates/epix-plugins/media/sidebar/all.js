@@ -623,7 +623,7 @@ window.initScrollable = function () {
       this.tag = null;
       this.container = null;
       this.opened = false;
-      this.width = 410;
+      this.width = 420;
       this.console = new Console(this);
       this.fixbutton = $(".fixbutton");
       this.fixbutton_addx = 0;
@@ -688,6 +688,7 @@ window.initScrollable = function () {
     Sidebar.prototype.resized = function() {
       this.page_width = $(window).width();
       this.page_height = $(window).height();
+      this.width = this.page_width <= 640 ? this.page_width : 420;
       this.fixbutton_initx = this.page_width - 75;
       if (this.opened) {
         return this.fixbutton.css({
@@ -1396,50 +1397,57 @@ window.initScrollable = function () {
               return _this.displayGlobe();
             }
           };
-        })(this)), 600);
+        })(this)), 150);
       }
     };
 
     Sidebar.prototype.displayGlobe = function() {
-      var img;
-      img = new Image();
-      img.src = "/uimedia/globe/world.jpg";
-      return img.onload = (function(_this) {
-        return function() {
-          return _this.wrapper.ws.cmd("sidebarGetPeers", [], function(globe_data) {
-            var e, ref, ref1, ref2;
-            if (_this.globe) {
+      var _this = this;
+      // Draw the sphere first, then drop peer points in when they arrive, so the
+      // globe appears immediately instead of waiting on the sidebarGetPeers round
+      // trip. The texture (world.jpg) is loaded once, by three.js, not twice.
+      var addPeers = function() {
+        return _this.wrapper.ws.cmd("sidebarGetPeers", [], function(globe_data) {
+          var ref;
+          if (!_this.globe) {
+            return;
+          }
+          try {
+            if (_this.globe.points) {
               _this.globe.scene.remove(_this.globe.points);
-              _this.globe.addData(globe_data, {
-                format: 'magnitude',
-                name: "hello",
-                animated: false
-              });
-              _this.globe.createPoints();
-              return (ref = _this.tag) != null ? ref.find(".globe").removeClass("loading") : void 0;
-            } else if (typeof DAT !== "undefined") {
-              try {
-                _this.globe = new DAT.Globe(_this.tag.find(".globe")[0], {
-                  "imgDir": "/uimedia/globe/"
-                });
-                _this.globe.addData(globe_data, {
-                  format: 'magnitude',
-                  name: "hello"
-                });
-                _this.globe.createPoints();
-                _this.globe.animate();
-              } catch (error) {
-                e = error;
-                console.log("WebGL error", e);
-                if ((ref1 = _this.tag) != null) {
-                  ref1.find(".globe").addClass("error").text("WebGL not supported");
-                }
-              }
-              return (ref2 = _this.tag) != null ? ref2.find(".globe").removeClass("loading") : void 0;
             }
-          });
-        };
-      })(this);
+            _this.globe.addData(globe_data, {
+              format: 'magnitude',
+              name: "hello",
+              animated: false
+            });
+            _this.globe.createPoints();
+          } catch (error) {
+            console.log("globe data error", error);
+          }
+          return (ref = _this.tag) != null ? ref.find(".globe").removeClass("loading") : void 0;
+        });
+      };
+      if (this.globe) {
+        return addPeers();
+      }
+      if (typeof DAT === "undefined") {
+        return;
+      }
+      try {
+        this.globe = new DAT.Globe(this.tag.find(".globe")[0], {
+          "imgDir": "/uimedia/globe/"
+        });
+        this.globe.animate();
+      } catch (error) {
+        console.log("WebGL error", error);
+        if (this.tag != null) {
+          this.tag.find(".globe").addClass("error").text("WebGL not supported");
+        }
+        return;
+      }
+      this.tag.find(".globe").removeClass("loading");
+      return addPeers();
     };
 
     Sidebar.prototype.unloadGlobe = function() {

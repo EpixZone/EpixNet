@@ -13,6 +13,7 @@
 
     <application
         android:label="Epix"
+        android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
         android:usesCleartextTraffic="true"
         android:allowBackup="false">
