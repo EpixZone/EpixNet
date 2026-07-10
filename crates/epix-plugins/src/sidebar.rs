@@ -63,7 +63,21 @@ impl WsCommand for SidebarGetHtmlTag {
         let info = s.state.site_info(&address).await;
         let counts = s.state.peer_counts(&address).await;
         let (recv, sent) = s.state.transfer(&address).await;
-        Ok(Value::String(render_sidebar(&address, &info, counts, recv, sent)))
+        // The signable content.json list: the root plus its includes
+        // (data/users/content.json and friends). siteInfo trims `includes` to
+        // a count, so read the names from the raw file.
+        let includes = s
+            .state
+            .read_file(&address, "content.json")
+            .await
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|c| {
+                c.get("includes")
+                    .and_then(|v| v.as_object())
+                    .map(|m| m.keys().cloned().collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        Ok(Value::String(render_sidebar(&address, &info, counts, recv, sent, &includes)))
     }
 }
 
@@ -117,6 +131,18 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// The "Choose:" list under Content publishing: the root content.json plus
+/// every include it declares, each clickable to fill the signing input (the
+/// bundled sidebar JS wires `.contents-content` clicks to `#input-contents`).
+fn signable_contents(includes: &[String]) -> String {
+    let mut links = vec!["<a href='content.json' class='contents-content'>content.json</a>".to_string()];
+    for inc in includes {
+        let e = esc(inc);
+        links.push(format!("<a href='{e}' class='contents-content'>{e}</a>"));
+    }
+    format!("<div class='contents'>Choose: {}</div>", links.join(" "))
+}
+
 fn pct(part: f64, total: f64) -> String {
     let p = if total > 0.0 { part / total * 100.0 } else { 0.0 };
     format!("{p:.0}%")
@@ -125,13 +151,20 @@ fn pct(part: f64, total: f64) -> String {
 /// Build the sidebar panel HTML from the real site runtime. Mirrors EpixNet's
 /// `sidebarGetHtmlTag` structure (the classes the bundled `all.js`/`all.css`
 /// expect), populated with our data.
-fn render_sidebar(address: &str, info: &Value, counts: PeerCounts, recv: u64, sent: u64) -> String {
+fn render_sidebar(
+    address: &str,
+    info: &Value,
+    counts: PeerCounts,
+    recv: u64,
+    sent: u64,
+    includes: &[String],
+) -> String {
     let content = &info["content"];
     let title = content.get("title").and_then(|v| v.as_str()).unwrap_or(address);
     let files = content.get("files").and_then(|v| v.as_i64()).unwrap_or(0);
     let size_bytes = info["settings"]["size"].as_i64().unwrap_or(0);
     let size_mb = size_bytes as f64 / 1024.0 / 1024.0;
-    let size_limit = info["size_limit"].as_i64().unwrap_or(10);
+    let size_limit = info["size_limit"].as_i64().unwrap_or(epix_ui::DEFAULT_SIZE_LIMIT_MB);
     let auth_address = info["auth_address"].as_str().unwrap_or("");
     let cert_user_id = info["cert_user_id"].as_str();
     let serving = info["settings"]["serving"].as_bool().unwrap_or(true);
@@ -307,11 +340,14 @@ fn render_sidebar(address: &str, info: &Value, counts: PeerCounts, recv: u64, se
            <div class='flex'>\
             <input type='text' class='text' value='content.json' id='input-contents'/>\
             <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>Sign and publish</a>\
-           </div></li>\
+            <a href='#Sign-or-Publish' id='menu-sign-publish'>\u{22EE}</a>\
+           </div>\
+           {contents_list}</li>\
          </div>",
         title = esc(title),
         desc = esc(description),
         xid = esc(xid_name),
+        contents_list = signable_contents(includes),
     ));
 
     b.push_str("</ul></div>");
@@ -337,7 +373,8 @@ mod tests {
             "content": { "title": "My Xite", "description": "desc", "files": 7 },
         });
         let counts = PeerCounts { total: 5, connected: 2, connectable: 4, onion: 1, local: 1 };
-        let html = render_sidebar("1abc.epix", &info, counts, 1_048_576, 524_288);
+        let includes = vec!["data/users/content.json".to_string()];
+        let html = render_sidebar("1abc.epix", &info, counts, 1_048_576, 524_288, &includes);
 
         assert!(html.contains("<h1>My Xite</h1>"));
         // New sections/controls.
@@ -364,12 +401,18 @@ mod tests {
         assert!(html.contains("checked='checked'"));
         assert!(html.contains("id='settings-title'"));
         assert!(html.contains("button-sign-publish"), "sign + publish button");
+        // The signable-contents list: root plus every include, clickable.
+        assert!(html.contains("<a href='content.json' class='contents-content'>content.json</a>"));
+        assert!(html.contains(
+            "<a href='data/users/content.json' class='contents-content'>data/users/content.json</a>"
+        ));
+        assert!(html.contains("id='menu-sign-publish'"), "sign-or-publish menu");
 
         // Not owned: the owner panel is still in the DOM (CSS hides it), but the
         // checkbox is unchecked.
         let mut info2 = info.clone();
         info2["settings"]["own"] = json!(false);
-        let html2 = render_sidebar("1abc.epix", &info2, counts, 0, 0);
+        let html2 = render_sidebar("1abc.epix", &info2, counts, 0, 0, &[]);
         assert!(html2.contains("id='checkbox-owned' />"), "owned checkbox unchecked when not owned");
         assert!(html2.contains("button-sign-publish"), "owner panel always present; CSS toggles it");
         assert!(html2.contains("class='settings-owned'"));
