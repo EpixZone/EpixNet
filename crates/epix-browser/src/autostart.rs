@@ -17,8 +17,11 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 const LABEL: &str = "zone.epix.EpixNet";
 
-/// The launcher executable, or an error if it can't be found.
+/// The launcher executable, so the login item relaunches this same binary.
+/// Only ever written into a per-user autostart entry, never used for a trust or
+/// privilege decision.
 fn exe() -> Result<std::path::PathBuf, String> {
+    // nosemgrep: rust.lang.security.current-exe.current-exe
     std::env::current_exe().map_err(|e| format!("current_exe: {e}"))
 }
 

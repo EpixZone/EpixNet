@@ -68,8 +68,9 @@ fn main() {
     // `--background`: bring up the node + tray but no browser window (the
     // "open at login" mode). The user opens the browser from the tray. Any
     // other non-flag argument is the launch target (a xite name / epix:// URL).
-    // nosemgrep: rust.lang.security.args.args - args are the launch target and
-    // a mode flag, not used for any security decision.
+    // These are the launch target and a mode flag, not used for any security
+    // decision.
+    // nosemgrep: rust.lang.security.args.args
     let args: Vec<String> = std::env::args().skip(1).collect();
     let background = args.iter().any(|a| a == "--background");
     let raw_arg = args
