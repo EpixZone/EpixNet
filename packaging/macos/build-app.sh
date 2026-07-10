@@ -77,6 +77,26 @@ if [ -n "$BUNDLED_FF" ]; then
     "$BUNDLED_FF/Contents/Info.plist" 2>/dev/null || true
   /usr/libexec/PlistBuddy -c "Set :CFBundleName EpixNet" \
     "$BUNDLED_FF/Contents/Info.plist" 2>/dev/null || true
+
+  # Firefox enterprise policy: trust the launcher's local CA so https://*.epix
+  # is a secure context on machines without NSS certutil. Must be baked in
+  # here, before signing - the launcher never edits the sealed .app at runtime.
+  # It writes the CA itself to ~/Library/Application Support/Mozilla/
+  # Certificates/epix-ca.pem at each run.
+  # SearchEngines (default DuckDuckGo) is ESR-only; the bundle is ESR.
+  mkdir -p "$BUNDLED_FF/Contents/Resources/distribution"
+  cat > "$BUNDLED_FF/Contents/Resources/distribution/policies.json" <<'POLICIES'
+{
+  "policies": {
+    "Certificates": {
+      "Install": ["epix-ca.pem"]
+    },
+    "SearchEngines": {
+      "Default": "DuckDuckGo"
+    }
+  }
+}
+POLICIES
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST

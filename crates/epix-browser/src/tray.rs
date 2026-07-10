@@ -132,6 +132,12 @@ pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
 
         refresh_menu_stats(&handles, &snap);
 
+        // Windows: keep the Epix icon on Firefox's windows. Applied to the
+        // live windows each tick (not patched into firefox.exe), so windows
+        // opened later get it too and a Firefox self-update can't revert it.
+        #[cfg(windows)]
+        crate::icon::stamp_firefox_windows(&firefox);
+
         // A later launch of EpixNet hands its target here instead of starting
         // a second node; open it in the running browser.
         while let Ok(arg) = open_rx.try_recv() {
@@ -373,14 +379,16 @@ fn target_url(scheme: &str, arg: &str) -> String {
 /// still running, asks Firefox (remote) to raise it - best-effort.
 fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str) {
     let spawn_fresh = |child: &mut Option<Child>| {
-        if let Ok(c) = Command::new(firefox)
-            .arg("--profile")
-            .arg(profile)
-            .arg("--no-remote")
-            .arg("--new-instance")
-            .arg(url)
-            .spawn()
-        {
+        let mut cmd = Command::new(firefox);
+        // --allow-downgrade: skip the "older version of Firefox" modal that
+        // would otherwise block startup if the profile was last opened by a
+        // newer Firefox (see launch_browser in main.rs).
+        cmd.arg("--allow-downgrade").arg("--profile").arg(profile).arg("--no-remote").arg("--new-instance");
+        // Linux: match our .desktop entry (StartupWMClass=EpixNet) so the
+        // shell shows the Epix icon for the browser window.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        cmd.args(["--class", "EpixNet", "--name", "EpixNet"]);
+        if let Ok(c) = cmd.arg(url).spawn() {
             *child = Some(c);
         }
     };
@@ -440,8 +448,11 @@ fn open_external(url: &str) {
     };
     #[cfg(target_os = "windows")]
     let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the launcher is a GUI app, so a bare `cmd` spawn
+        // would flash a console window.
         let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        c.args(["/C", "start", "", url]).creation_flags(0x0800_0000);
         c
     };
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -479,7 +490,20 @@ fn human(bytes: u64) -> String {
 }
 
 /// A convenience the caller uses on the fallback path: keep the launcher alive
-/// until the browser process exits, then let the node shut down.
-pub fn wait_for_browser(mut child: Child) {
+/// until the browser process exits, then let the node shut down. On Windows it
+/// also keeps the Epix icon stamped on the browser's windows (the tray path
+/// does that on its tick; this is the no-tray fallback).
+pub fn wait_for_browser(mut child: Child, #[allow(unused)] firefox: &Path) {
+    #[cfg(windows)]
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                crate::icon::stamp_firefox_windows(firefox);
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+            Err(_) => break,
+        }
+    }
     let _ = child.wait();
 }

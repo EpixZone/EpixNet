@@ -66,8 +66,12 @@ Section "EpixNet" SecMain
 SectionEnd
 
 Section "Uninstall"
-  Delete "$SMPROGRAMS\Epix.lnk"
-  Delete "$DESKTOP\Epix.lnk"
+  Delete "$SMPROGRAMS\EpixNet.lnk"
+  Delete "$DESKTOP\EpixNet.lnk"
+  ; The local-CA copy the launcher writes for the Firefox certificate policy
+  ; (the policy itself lives in $INSTDIR\firefox\distribution, removed below).
+  Delete "$LOCALAPPDATA\Mozilla\Certificates\epix-ca.pem"
+  Delete "$APPDATA\Mozilla\Certificates\epix-ca.pem"
   DeleteRegKey HKCU "Software\Classes\epix"
   DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\zone.epix.nmh"
   DeleteRegKey HKCU "${UNINST_KEY}"

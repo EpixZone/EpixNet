@@ -65,6 +65,50 @@ pub fn migrate_legacy_extension(profile: &Path) {
     let _ = std::fs::write(&prefs, out);
 }
 
+/// Pin the wallet's toolbar button for profiles where it sits unpinned in the
+/// unified-extensions (puzzle-piece) menu. Initial placement is decided only
+/// at install time - fresh installs land on the toolbar via `default_area` in
+/// the wallet manifest - and reinstalling to redo it would wipe the
+/// extension's storage, which holds the keyring. Same string-level prefs.js
+/// surgery as [`migrate_legacy_extension`]; runs before Firefox launches.
+/// A wallet the user deliberately dragged off the toolbar is not in that
+/// menu's placements, so it stays wherever the user put it.
+pub fn ensure_wallet_pinned(profile: &Path) {
+    let prefs = profile.join("prefs.js");
+    let Ok(s) = std::fs::read_to_string(&prefs) else { return };
+    // The widget id as it appears JSON-escaped inside the pref's JS string.
+    let widget = "\\\"wallet_epix_zone-browser-action\\\"";
+
+    let Some(ua_open) = find_area(&s, "unified-extensions-area") else { return };
+    let Some(ua_len) = s[ua_open..].find(']') else { return };
+    if !s[ua_open..ua_open + ua_len].contains(widget) {
+        return; // not unpinned-by-default; nothing to move
+    }
+    // Remove it from the menu placements…
+    let cleaned = s[ua_open..ua_open + ua_len]
+        .replace(&format!("{widget},"), "")
+        .replace(&format!(",{widget}"), "")
+        .replace(widget, "");
+    let s = format!("{}{}{}", &s[..ua_open], cleaned, &s[ua_open + ua_len..]);
+    // …and append it to the toolbar.
+    let Some(nav_open) = find_area(&s, "nav-bar") else { return };
+    let Some(nav_len) = s[nav_open..].find(']') else { return };
+    let insert =
+        if nav_len == 0 { widget.to_string() } else { format!(",{widget}") };
+    let mut out = s;
+    out.insert_str(nav_open + nav_len, &insert);
+    let _ = std::fs::write(&prefs, out);
+}
+
+/// Byte offset just past `\"<area>\":[` inside prefs.js's
+/// `browser.uiCustomization.state` line, or `None` when either is absent.
+fn find_area(s: &str, area: &str) -> Option<usize> {
+    let line = s.find("browser.uiCustomization.state")?;
+    let key = format!("\\\"{area}\\\":[");
+    let rel = s[line..].find(&key)?;
+    Some(line + rel + key.len())
+}
+
 /// Write the extension as an XPI into the profile's `extensions/` dir. Firefox
 /// installs it on startup (with the unsigned-extensions pref, on ESR/Developer).
 ///

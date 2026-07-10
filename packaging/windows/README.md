@@ -17,15 +17,26 @@ Ship a self-contained install directory:
 
 ```
 Epix\
-  epix-browser.exe        # the launcher
+  epix-browser.exe        # the launcher (GUI subsystem - no console window)
   epix-nmh.exe            # native-messaging host
   firefox\                # bundled Firefox ESR (extract the ESR installer)
     firefox.exe
+    distribution\
+      policies.json       # trusts the launcher's local CA (https://*.epix)
     ...
 ```
 
 The launcher already finds the bundled Firefox at `firefox\firefox.exe` next to
 itself (see `bundled_firefox()` in `crates/epix-browser/src/main.rs`).
+
+`distribution\policies.json` is the Firefox enterprise-policy file
+(`Certificates.Install`): Windows has no NSS `certutil`, so this is how the
+bundled Firefox trusts the launcher's per-install CA and `https://*.epix`
+stays a secure context. `build-windows.sh` bakes it into the stage; the
+launcher also writes it at runtime when missing (the install dir under
+`%LOCALAPPDATA%` is user-writable), which covers dev runs and older installs.
+The CA itself is written by the launcher to
+`%LOCALAPPDATA%\Mozilla\Certificates\epix-ca.pem` on each launch.
 
 ## Build steps
 
@@ -46,14 +57,30 @@ itself (see `bundled_firefox()` in `crates/epix-browser/src/main.rs`).
         "\"C:\path\to\epix-browser.exe\" \"%1\""
      ```
    - the native-messaging host manifest is written by the launcher at first run
-     to `%APPDATA%\Mozilla\NativeMessagingHosts\zone.epix.nmh.json` **and** must
-     be referenced from the registry key
+     to `%APPDATA%\Mozilla\NativeMessagingHosts\zone.epix.nmh.json` **and**
+     referenced from the registry key
      `HKCU\Software\Mozilla\NativeMessagingHosts\zone.epix.nmh` pointing at that
      JSON (Windows reads the manifest location from the registry, unlike
-     macOS/Linux which use a fixed dir). This registry step is the one Windows
-     specific bit still to add to `install_native_host()`.
+     macOS/Linux which use a fixed dir). Both are done by
+     `install_native_host()` in `crates/epix-browser/src/ext.rs`; the
+     uninstaller removes the key.
 
 ## Signing
 
-Sign `epix-browser.exe`, `epix-nmh.exe`, and the installer with an Authenticode
-certificate (`signtool sign /fd sha256 /tr <timestamp> /td sha256 ...`).
+Sign `epix-browser.exe` and `epix-nmh.exe` **before** the NSIS pack (so the
+copies inside the installer are signed - SmartScreen and Defender judge what
+runs after install, not just the download), then the installer itself. The
+release workflow does this with Azure Trusted Signing around the script's two
+phases:
+
+1. `EPIX_PHASE=stage packaging/windows/build-windows.sh` - build + assemble
+   `dist/epix-windows/`
+2. sign `dist/epix-windows/*.exe` (non-recursive: the `firefox/` subtree keeps
+   Mozilla's signatures and its self-update ability - the Epix window icon is
+   stamped at runtime by the launcher, not patched into firefox.exe)
+3. `EPIX_PHASE=pack packaging/windows/build-windows.sh` - makensis
+4. sign `dist/Epix-Setup-<version>.exe`
+
+Locally (`signtool sign /fd sha256 /tr <timestamp> /td sha256 ...`) follow the
+same order. The NSIS-generated `uninstall.exe` stays unsigned (signing it needs
+the `!uninstfinalize` dance; SmartScreen does not gate uninstalls).

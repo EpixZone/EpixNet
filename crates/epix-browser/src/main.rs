@@ -12,9 +12,13 @@
 //!    launches Firefox at `https://<xite>/`;
 //! 4. shuts the node down when Firefox exits.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod autostart;
 mod ca;
 mod ext;
+#[cfg(windows)]
+mod icon;
 mod ipc;
 mod proxy;
 mod tray;
@@ -65,6 +69,11 @@ pub struct Ready {
 }
 
 fn main() {
+    // Must run before anything prints: as a windows-subsystem app we have no
+    // console; adopt the parent's (dev runs from a terminal) or log to a file.
+    #[cfg(windows)]
+    attach_console_or_log(&epix_node::data_root());
+
     // `--background`: bring up the node + tray but no browser window (the
     // "open at login" mode). The user opens the browser from the tray. Any
     // other non-flag argument is the launch target (a xite name / epix:// URL).
@@ -113,6 +122,7 @@ fn main() {
     // (headless Linux, GTK failure, EPIX_NO_TRAY), `run` logs why and hands the
     // browser process back so we fall back to the old behaviour: run until the
     // window closes, then shut down.
+    let firefox_path = ready.firefox.clone();
     let ctx = tray::TrayContext {
         ready,
         child: firefox_child,
@@ -123,7 +133,7 @@ fn main() {
         match child {
             // We launched a browser: run until it closes, then shut down.
             Some(child) => {
-                tray::wait_for_browser(child);
+                tray::wait_for_browser(child, &firefox_path);
                 println!("· browser closed - shutting down the node");
             }
             // Background mode with no tray host and no window: keep the node
@@ -134,6 +144,47 @@ fn main() {
                 tray::park();
             }
         }
+    }
+}
+
+/// The launcher has no console of its own on Windows (GUI subsystem, so no
+/// terminal window pops up behind the browser). Printed output still has to
+/// land somewhere: attach to the parent process's console when there is one
+/// (`cargo run` / a terminal invocation keeps live output), else append both
+/// std streams to `<data_root>/log/epix-browser.log` so field problems stay
+/// diagnosable.
+#[cfg(windows)]
+fn attach_console_or_log(data_root: &Path) {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    // Launched from a terminal: adopt its console. AttachConsole also wires up
+    // the std handles unless they were explicitly redirected (`> file` wins).
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
+        return;
+    }
+    // Desktop launch (shortcut / epix:// / autostart): log to a file.
+    let dir = data_root.join("log");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("epix-browser.log");
+    // Single-file rotation keeps the log bounded across many launches.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
+        let old = dir.join("epix-browser.log.old");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&path, &old);
+    }
+    let Ok(f) = std::fs::File::options().create(true).append(true).open(&path) else {
+        return;
+    };
+    // The file handle becomes the process's stdout/stderr for its lifetime
+    // (children inherit it too). Deliberately leaked - it must outlive us.
+    let raw = f.into_raw_handle();
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, raw as _);
+        SetStdHandle(STD_ERROR_HANDLE, raw as _);
     }
 }
 
@@ -240,8 +291,10 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
 
     // Write the managed profile (CA injected so https://*.epix is trusted), then
     // install the theme + wallet extension into it.
-    let (profile, secure) =
-        setup_profile(&data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &ca);
+    let (profile, secure) = setup_profile(
+        &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca,
+    );
+    ensure_search_policy(&firefox);
     install_addons(&profile, &firefox, ext_capable);
 
     let scheme = if secure { "https" } else { "http" };
@@ -275,6 +328,7 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
 /// profile path and whether `https://*.epix` is trusted; a CA-install failure
 /// falls back to http (re-writing the profile without secure origins). A failure
 /// to write the profile at all is fatal.
+#[allow(clippy::too_many_arguments)]
 fn setup_profile(
     data_root: &Path,
     proxy_addr: SocketAddr,
@@ -282,6 +336,7 @@ fn setup_profile(
     display: &str,
     tor_clearnet: bool,
     ext_capable: bool,
+    firefox: &Path,
     ca: &LocalCa,
 ) -> (PathBuf, bool) {
     let profile = data_root.join("firefox-profile");
@@ -291,7 +346,7 @@ fn setup_profile(
         eprintln!("could not write the Firefox profile: {e}");
         std::process::exit(1);
     }
-    let secure = match install_ca(&profile, ca) {
+    let secure = match install_ca(&profile, firefox, ca) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("· note: could not install the local CA ({e}); falling back to http");
@@ -325,6 +380,9 @@ fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
     if let Err(e) = ext::install_extension(profile) {
         eprintln!("· note: could not install the wallet extension: {e}");
     }
+    // Profiles that installed the wallet before the manifest pinned it to the
+    // toolbar: move it out of the puzzle-piece menu.
+    ext::ensure_wallet_pinned(profile);
     if let Err(e) = ext::install_native_host() {
         eprintln!("· note: could not install the native host: {e}");
     }
@@ -346,15 +404,38 @@ fn launch_browser(
         return None;
     }
     println!("· launching Firefox at {start_url}");
-    match Command::new(firefox)
-        .arg("--profile")
-        .arg(profile)
-        .arg("--no-remote")
-        .arg("--new-instance")
-        .arg(start_url)
-        .spawn()
-    {
-        Ok(child) => Some(child),
+    let mut cmd = Command::new(firefox);
+    // --allow-downgrade: never let Firefox's profile-downgrade dialog block
+    // startup. It fires when the profile was last opened by a NEWER Firefox
+    // than this one - e.g. the user's system Firefox touched the managed
+    // profile once - and would otherwise leave the managed browser stuck on a
+    // modal ("You've launched an older version of Firefox") with no xite
+    // loaded. We manage this profile, so just proceed.
+    cmd.arg("--allow-downgrade").arg("--profile").arg(profile).arg("--no-remote").arg("--new-instance");
+    // Linux: the shell picks the window icon by matching the window class /
+    // app id against a .desktop entry - ours (StartupWMClass=EpixNet, with the
+    // Epix icon) matches these. --class covers X11, --name the Wayland app id.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    cmd.args(["--class", "EpixNet", "--name", "EpixNet"]);
+    match cmd.arg(start_url).spawn() {
+        Ok(mut child) => {
+            // `--no-remote --new-instance` on a profile another Firefox already
+            // holds exits at once (no window). Catch that quick exit so it is a
+            // clear log line instead of a tray with no browser - the usual
+            // cause is a previous EpixNet that was force-killed, orphaning its
+            // Firefox, which still locks the profile.
+            std::thread::sleep(Duration::from_millis(700));
+            if let Ok(Some(status)) = child.try_wait() {
+                eprintln!(
+                    "· note: Firefox exited immediately ({status}). Another EpixNet or a \
+                     Firefox on this profile is likely already running; close it (or quit \
+                     EpixNet from the tray) and reopen. Profile: {}",
+                    profile.display()
+                );
+                return None;
+            }
+            Some(child)
+        }
         Err(e) => {
             eprintln!("could not launch Firefox at {}: {e}", firefox.display());
             None
@@ -433,13 +514,56 @@ fn bundled_firefox() -> Option<PathBuf> {
 
 /// Whether this Firefox honors `xpinstall.signatures.required=false` (so it can
 /// load our unsigned extension): ESR, Developer Edition, and Nightly do;
-/// release Firefox does not. Detected from the app path.
+/// release Firefox does not. Detected from the app path, with an
+/// `application.ini` fallback for installs whose path doesn't say (the bundled
+/// Windows/Linux tree is a plain `firefox/` directory but contains ESR).
 fn firefox_allows_unsigned(firefox: &Path) -> bool {
     if let Ok(v) = std::env::var("EPIX_FIREFOX_UNSIGNED") {
         return v != "0" && !v.is_empty();
     }
     let p = firefox.to_string_lossy();
-    p.contains("ESR") || p.contains("Developer Edition") || p.contains("Nightly") || p.contains("firefox-esr")
+    if p.contains("ESR")
+        || p.contains("Developer Edition")
+        || p.contains("Nightly")
+        || p.contains("firefox-esr")
+    {
+        return true;
+    }
+    firefox_is_esr_build(firefox)
+}
+
+/// Path-independent ESR detection via the `application.ini` Mozilla ships next
+/// to the binary (Windows/Linux) or under `Contents/Resources` (macOS .app):
+/// ESR builds carry `RemotingName=firefox-esr`, an `…esr` release repo, and
+/// (on some trains) an `esr`-suffixed Version.
+fn firefox_is_esr_build(firefox: &Path) -> bool {
+    let Some(bin_dir) = firefox.parent() else { return false };
+    let mut candidates = vec![bin_dir.join("application.ini")];
+    if let Some(contents) = bin_dir.parent() {
+        candidates.push(contents.join("Resources").join("application.ini"));
+    }
+    candidates.iter().filter_map(|p| std::fs::read_to_string(p).ok()).any(|ini| {
+        ini.lines().map(str::trim).any(|l| {
+            l.eq_ignore_ascii_case("remotingname=firefox-esr")
+                || (l.starts_with("Version=") && l.ends_with("esr"))
+                || (l.starts_with("SourceRepository=") && l.contains("esr"))
+        })
+    })
+}
+
+/// Build a `Command` that can never pop a console window on Windows - the
+/// launcher is a GUI-subsystem app, so a spawned console tool (certutil, cmd)
+/// would otherwise flash its own terminal.
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 /// Locate `certutil` (NSS): PATH, then keg-only Homebrew locations.
@@ -457,8 +581,9 @@ fn find_certutil() -> Option<PathBuf> {
         "/usr/local/bin/certutil",
     ];
     candidates.iter().map(PathBuf::from).find(|p| p.exists()).or_else(|| {
-        // Fall back to whatever is on PATH.
-        std::process::Command::new("certutil")
+        // Fall back to whatever is on PATH. `--version` is an NSS flag, so
+        // Windows' unrelated system certutil.exe fails it and is skipped.
+        hidden_command("certutil")
             .arg("--version")
             .output()
             .ok()
@@ -467,14 +592,37 @@ fn find_certutil() -> Option<PathBuf> {
     })
 }
 
-/// Trust the local CA in the profile's NSS cert DB (`cert9.db`), so
-/// `https://*.epix` loads without a warning. Idempotent (re-add by nickname).
-fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
+/// Trust the local CA in the Firefox that will run the managed profile, so
+/// `https://*.epix` loads without a warning. Two mechanisms, tried in order:
+///
+/// 1. NSS `certutil` into the profile's `cert9.db` - scoped to the managed
+///    profile alone. Available where NSS is installed (macOS/Linux dev boxes);
+///    essentially never on Windows.
+/// 2. Firefox **enterprise policies** (`Certificates.Install`): write the CA
+///    PEM where the policy engine searches for bare filenames, and make sure
+///    the install's `distribution/policies.json` references it. Our shipped
+///    bundles bake that policies.json in at package time; when it is missing
+///    (dev runs, installs predating it) it is written here - possible wherever
+///    the install dir is user-writable, like the per-user Windows bundle under
+///    `%LOCALAPPDATA%\Epix`.
+fn install_ca(profile: &Path, firefox: &Path, ca: &LocalCa) -> Result<(), String> {
+    let pem = ca.cert_pem();
+    let certutil_err = match install_ca_certutil(profile, &pem) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    install_ca_policies(firefox, &pem)
+        .map_err(|e| format!("certutil: {certutil_err}; policies: {e}"))
+}
+
+/// Mechanism 1: `certutil -A` into the profile's NSS cert DB (`cert9.db`).
+/// Idempotent (re-add by nickname).
+fn install_ca_certutil(profile: &Path, pem: &str) -> Result<(), String> {
     let certutil = find_certutil().ok_or_else(|| {
         "certutil not found (install NSS, e.g. `brew install nss`, or set EPIX_CERTUTIL)".to_string()
     })?;
     let ca_path = profile.join("epix-ca.pem");
-    std::fs::write(&ca_path, ca.cert_pem()).map_err(|e| format!("write ca pem: {e}"))?;
+    std::fs::write(&ca_path, pem).map_err(|e| format!("write ca pem: {e}"))?;
 
     let db = format!("sql:{}", profile.display());
     // Create the NSS db only if it doesn't exist yet - `-N` on an existing db
@@ -482,17 +630,17 @@ fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
     // stdin so it can never block on a prompt.
     let null = || std::process::Stdio::null();
     if !profile.join("cert9.db").exists() {
-        let _ = Command::new(&certutil)
+        let _ = hidden_command(&certutil)
             .args(["-N", "--empty-password", "-d", &db])
             .stdin(null())
             .output();
     }
     // Remove any prior copy so this is idempotent, then add as a trusted CA.
-    let _ = Command::new(&certutil)
+    let _ = hidden_command(&certutil)
         .args(["-D", "-n", "Epix Local CA", "-d", &db])
         .stdin(null())
         .output();
-    let out = Command::new(&certutil)
+    let out = hidden_command(&certutil)
         .args(["-A", "-n", "Epix Local CA", "-t", "CT,C,C", "-d", &db])
         .arg("-i")
         .arg(&ca_path)
@@ -503,6 +651,154 @@ fn install_ca(profile: &Path, ca: &LocalCa) -> Result<(), String> {
         return Err(format!("certutil -A failed: {}", String::from_utf8_lossy(&out.stderr)));
     }
     Ok(())
+}
+
+/// The CA filename shared between the runtime and the packaged policies.json:
+/// the policy lists it bare, and Firefox resolves bare names against the
+/// per-user Mozilla certificates directories written below.
+const CA_POLICY_FILE: &str = "epix-ca.pem";
+
+/// Where Firefox's policy engine searches for a bare certificate filename
+/// (mozilla/policy-templates, `Certificates.Install`).
+fn mozilla_cert_dirs() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        ["LOCALAPPDATA", "APPDATA"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .map(|base| PathBuf::from(base).join("Mozilla").join("Certificates"))
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(|h| {
+                vec![PathBuf::from(h).join("Library/Application Support/Mozilla/Certificates")]
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("HOME")
+            .map(|h| vec![PathBuf::from(h).join(".mozilla/certificates")])
+            .unwrap_or_default()
+    }
+}
+
+/// The `distribution/` dir of the given Firefox install, where the policy
+/// engine reads `policies.json`: next to the binary on Windows/Linux, under
+/// `Contents/Resources` inside a macOS .app.
+fn firefox_distribution_dir(firefox: &Path) -> Option<PathBuf> {
+    let bin_dir = firefox.parent()?;
+    if cfg!(target_os = "macos") {
+        Some(bin_dir.parent()?.join("Resources").join("distribution"))
+    } else {
+        Some(bin_dir.join("distribution"))
+    }
+}
+
+/// Mechanism 2: trust the CA through Firefox enterprise policies. Writes the
+/// PEM into the per-user Mozilla certificates dir(s), then makes sure this
+/// install's `policies.json` lists it - reusing one baked in at package time,
+/// else writing it (never inside a macOS .app: the bundle is code-signed, and
+/// editing it would break the seal).
+fn install_ca_policies(firefox: &Path, pem: &str) -> Result<(), String> {
+    let wrote = mozilla_cert_dirs()
+        .iter()
+        .filter(|dir| {
+            std::fs::create_dir_all(dir).is_ok()
+                && std::fs::write(dir.join(CA_POLICY_FILE), pem).is_ok()
+        })
+        .count();
+    if wrote == 0 {
+        return Err("could not write the CA into a Mozilla certificates dir".to_string());
+    }
+
+    let dist = firefox_distribution_dir(firefox)
+        .ok_or_else(|| "cannot locate the Firefox distribution dir".to_string())?;
+    let path = dist.join("policies.json");
+    // Merge into an existing policies.json (ours from the package step or a
+    // previous run); an unparsable or non-object file starts fresh - the file
+    // only exists in installs we manage.
+    let mut root = match std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    {
+        Some(v) if v.is_object() => v,
+        _ => serde_json::json!({}),
+    };
+    let install = root
+        .as_object_mut()
+        .expect("root is an object")
+        .entry("policies")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("policies key is not an object")?
+        .entry("Certificates")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Certificates policy is not an object")?
+        .entry("Install")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Certificates.Install is not a list")?;
+    if install.iter().any(|v| v.as_str() == Some(CA_POLICY_FILE)) {
+        return Ok(()); // already referenced (baked in, or a prior run)
+    }
+    install.push(serde_json::Value::String(CA_POLICY_FILE.to_string()));
+    if cfg!(target_os = "macos") {
+        return Err(
+            "the bundled Firefox has no CA policy baked in (won't edit a signed .app; re-package)"
+                .to_string(),
+        );
+    }
+    std::fs::create_dir_all(&dist).map_err(|e| format!("create {}: {e}", dist.display()))?;
+    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Make DuckDuckGo the managed browser's default search engine (matching the
+/// mobile apps) via the `SearchEngines` enterprise policy - ESR-only, which
+/// the shipped bundle is. Merged into the same policies.json the CA lives in,
+/// and only when absent, so a deliberate later change sticks. Best-effort by
+/// design: never affects the https/CA decision, and macOS bundles (sealed
+/// .app) get it baked in at package time instead.
+fn ensure_search_policy(firefox: &Path) {
+    let Some(dist) = firefox_distribution_dir(firefox) else { return };
+    let path = dist.join("policies.json");
+    let mut root = match std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    {
+        Some(v) if v.is_object() => v,
+        _ => serde_json::json!({}),
+    };
+    let Some(engines) = root
+        .as_object_mut()
+        .expect("root is an object")
+        .entry("policies")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .and_then(|p| {
+            p.entry("SearchEngines")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        })
+    else {
+        return;
+    };
+    if engines.contains_key("Default") {
+        return;
+    }
+    engines.insert("Default".to_string(), serde_json::json!("DuckDuckGo"));
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    if std::fs::create_dir_all(&dist).is_ok() {
+        if let Ok(json) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
 }
 
 /// Write the managed profile: the PAC (routes `*.epix` to the proxy) and a
@@ -556,8 +852,19 @@ fn write_profile(
     let scheme = if secure { "https" } else { "http" };
     // With a trusted CA we want https; without it, http (and disable https-first
     // so Firefox doesn't upgrade the .epix navigation to a failing https).
+    //
+    // The secure branch must EXPLICITLY re-assert `https_first=true`, not leave
+    // it unset: Firefox persists user.js prefs into prefs.js, so a profile that
+    // once fell back to http (an early run before the CA was trusted, or a
+    // launch that found a non-bundle Firefox) keeps `https_first=false` and an
+    // `http://` homepage forever unless we overwrite them here - a healed
+    // profile would still open the xite over http ("Not Secure"). We only
+    // prefer https (https-first), never force it (https-only would break plain
+    // http clearnet sites the user browses through Tor).
     let https_prefs = if secure {
-        ""
+        "user_pref(\"dom.security.https_only_mode\", false);\n\
+         user_pref(\"dom.security.https_first\", true);\n\
+         user_pref(\"dom.security.https_first_pbm\", true);\n"
     } else {
         "user_pref(\"dom.security.https_only_mode\", false);\n\
          user_pref(\"dom.security.https_first\", false);\n\
@@ -576,14 +883,25 @@ fn write_profile(
 
     let prefs = format!(
         r#"// Managed by epix-browser - regenerated on launch.
-{proxy_prefs}{https_prefs}// A dotted host like dashboard.epix should navigate, not search.
+{proxy_prefs}{https_prefs}// A dotted host like dashboard.epix navigates; plain terms search with the
+// default engine (DuckDuckGo via the SearchEngines policy), like the mobile
+// apps. keyword.enabled is set back to true explicitly: earlier builds wrote
+// false, and Firefox persists user.js values into prefs.js, so merely
+// dropping the line would leave existing profiles searchless.
 user_pref("browser.fixup.dns_first_for_single_words", false);
-user_pref("keyword.enabled", false);
+user_pref("keyword.enabled", true);
 user_pref("browser.urlbar.suggest.searches", false);
 user_pref("browser.urlbar.suggest.quickactions", false);
 // Skip first-run noise so it opens straight on the xite.
 user_pref("browser.startup.homepage", "{scheme}://{display}/");
 user_pref("browser.startup.page", 1);
+// Always open fresh on the xite homepage: never restore the previous session
+// and never show the crash "restore session" prompt. The managed browser is an
+// appliance for the current xite, and a force-killed run (or the node quitting
+// under it) must not resurrect a stale tab - notably an old http:// fallback
+// tab, which would then show as "Not Secure" even after the CA is trusted.
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_resumed_crashes", 0);
 user_pref("browser.aboutwelcome.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
