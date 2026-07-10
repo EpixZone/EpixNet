@@ -12,7 +12,9 @@
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
 
-/// Identifier used for the login item across platforms.
+/// LaunchAgent label (macOS). Windows uses the "EpixNet" Run value name and
+/// Linux the `epixnet.desktop` filename instead.
+#[cfg(target_os = "macos")]
 const LABEL: &str = "zone.epix.EpixNet";
 
 /// The launcher executable, or an error if it can't be found.
@@ -130,7 +132,7 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=EpixNet\n\
-         Exec={} --background\n\
+         Exec=\"{}\" --background\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
         exe.display()
