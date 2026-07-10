@@ -74,6 +74,14 @@ class MainActivity : AppCompatActivity() {
     /// built-in); tapping the Epix button opens its popup document.
     private var wallet: WebExtension? = null
     private var walletDialog: AlertDialog? = null
+    /// The wallet extension opens pages (register, sign approvals) with
+    /// tabs.create. On first install it auto-opens its onboarding/register
+    /// page, which we do NOT want on launch - the user should land on the
+    /// dashboard and reach the wallet only by tapping the Epix button. So we
+    /// only present wallet-opened tabs once the user has actually opened the
+    /// wallet at least once; the register flow is still reachable from the
+    /// wallet popup after that first tap.
+    private var walletUserEngaged = false
     /// A GeckoView permission callback parked while the Android runtime
     /// permission dialog (e.g. CAMERA for the wallet's Keystone QR scanner)
     /// is up; resolved in onRequestPermissionsResult.
@@ -114,16 +122,17 @@ class MainActivity : AppCompatActivity() {
         val target = intentTarget(intent) ?: "dashboard.epix"
 
         scope.launch {
+            // Apply the saved clearnet-through-Tor routing before the first page
+            // load, so clearnet requests are proxied from the start. Loopback
+            // (the dashboard and every .epix page) is exempt, so this is safe to
+            // set before the node is up.
+            applyClearnetRouting()
             val display = bootNode(target)
-            if (display != null) {
-                currentDisplay = display
-                // Apply the saved clearnet-through-Tor routing before the first
-                // page load, so clearnet requests are proxied from the start.
-                applyClearnetRouting()
-                session.loadUri(nodeUrl(display))
-            } else {
-                session.loadUri("about:blank") // TODO: show a boot-error page
-            }
+            // Load the dashboard even if boot reported a problem: the node
+            // serves its own loading/error wrapper on loopback, which is more
+            // useful than a blank page and lets the user retry.
+            currentDisplay = display ?: target
+            session.loadUri(nodeUrl(currentDisplay))
         }
 
         // Reflect the Tor state in the icon's badge, at the extension's cadence.
@@ -387,7 +396,14 @@ class MainActivity : AppCompatActivity() {
                     override fun onNewTab(
                         source: WebExtension,
                         details: WebExtension.CreateTabDetails,
-                    ): GeckoResult<GeckoSession> {
+                    ): GeckoResult<GeckoSession>? {
+                        // Suppress the wallet's first-run auto-open (register
+                        // page) so launch lands on the dashboard. Once the user
+                        // has opened the wallet, its tabs (register, approvals)
+                        // are shown normally.
+                        if (!walletUserEngaged) {
+                            return null
+                        }
                         val session = openPopupSession(heightFraction = 0.95)
                         val url = details.url ?: ""
                         val resolved = when {
@@ -505,6 +521,7 @@ class MainActivity : AppCompatActivity() {
             extension: WebExtension,
             action: WebExtension.Action,
         ): GeckoResult<GeckoSession>? {
+            walletUserEngaged = true
             walletDialog?.let {
                 it.dismiss()
                 return null
@@ -515,7 +532,10 @@ class MainActivity : AppCompatActivity() {
         override fun onOpenPopup(
             extension: WebExtension,
             action: WebExtension.Action,
-        ): GeckoResult<GeckoSession>? = GeckoResult.fromValue(openPopupSession())
+        ): GeckoResult<GeckoSession>? {
+            walletUserEngaged = true
+            return GeckoResult.fromValue(openPopupSession())
+        }
     }
 
     /**
@@ -577,6 +597,9 @@ class MainActivity : AppCompatActivity() {
 
     /** Open the wallet UI: its popup document in a dialog over the browser. */
     private fun showWalletPopup(ext: WebExtension) {
+        // The user opened the wallet: from here on, wallet-opened tabs
+        // (register, sign approvals) are presented.
+        walletUserEngaged = true
         walletDialog?.let {
             it.dismiss()
             return
@@ -714,6 +737,15 @@ class MainActivity : AppCompatActivity() {
             GeckoPreferenceController.setGeckoPref("network.proxy.socks_remote_dns", true, user)
             GeckoPreferenceController.setGeckoPref(
                 "network.proxy.allow_hijacking_localhost", false, user,
+            )
+            // Exempt loopback explicitly, the way the desktop PAC returns DIRECT
+            // for 127.0.0.1/localhost. Relying on allow_hijacking_localhost
+            // alone let the dashboard (served on 127.0.0.1) get routed into the
+            // SOCKS proxy, so it hung until Tor finished bootstrapping - a blank
+            // screen on first launch. The node's UI and every .epix page load
+            // over loopback and must never go through Tor.
+            GeckoPreferenceController.setGeckoPref(
+                "network.proxy.no_proxies_on", "localhost, 127.0.0.1", user,
             )
         } else {
             GeckoPreferenceController.setGeckoPref("network.proxy.type", 0, user)
