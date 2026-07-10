@@ -105,6 +105,8 @@ pub async fn serve_stream(
             if stream.write_all(&bytes).await.is_err() || stream.flush().await.is_err() {
                 break;
             }
+            crate::msg::WIRE_SENT
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

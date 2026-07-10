@@ -8,7 +8,21 @@
 use epix_core::{Error, Result};
 use epix_transport::PeerStream;
 use rmpv::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Process-wide wire traffic totals. Every peer byte flows through
+/// [`send_msg`]/[`read_msg`] (plus the server's raw `streamFile` tail), so
+/// counting here covers all protocol traffic - handshakes, announces, pings,
+/// content checks - not just file payloads. The stats endpoint and the tray
+/// report these; they reset with the process, like EpixNet's counters did.
+pub static WIRE_RECV: AtomicU64 = AtomicU64::new(0);
+pub static WIRE_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// `(received, sent)` wire bytes since this process started.
+pub fn wire_totals() -> (u64, u64) {
+    (WIRE_RECV.load(Ordering::Relaxed), WIRE_SENT.load(Ordering::Relaxed))
+}
 
 /// Build a msgpack map from `(key, value)` pairs.
 pub fn vmap(pairs: Vec<(&str, Value)>) -> Value {
@@ -30,6 +44,7 @@ pub async fn send_msg(stream: &mut PeerStream, msg: &Value) -> Result<()> {
         .map_err(|e| Error::Protocol(format!("msgpack encode: {e}")))?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
+    WIRE_SENT.fetch_add(buf.len() as u64, Ordering::Relaxed);
     Ok(())
 }
 
@@ -54,6 +69,7 @@ pub async fn read_msg(stream: &mut PeerStream, buf: &mut Vec<u8>) -> Result<Valu
         if n == 0 {
             return Err(Error::Protocol("connection closed by peer".into()));
         }
+        WIRE_RECV.fetch_add(n as u64, Ordering::Relaxed);
         buf.extend_from_slice(&tmp[..n]);
     }
 }

@@ -442,10 +442,23 @@ impl User {
             .get("settings")
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
-        let follows = entry
+        let mut follows: HashMap<String, Value> = entry
             .get("follows")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // Migration: Python EpixNet stored Newsfeed follows per-site
+        // (`sites.<addr>.follow`), which the typed SiteAuth parse drops. Merge
+        // them into our top-level map (ours wins on conflict) so a data dir
+        // copied from the Python client keeps its dashboard feed.
+        if let Some(sites_obj) = entry.get("sites").and_then(|v| v.as_object()) {
+            for (addr, site_data) in sites_obj {
+                if let Some(f) = site_data.get("follow") {
+                    if f.is_object() && !follows.contains_key(addr) {
+                        follows.insert(addr.clone(), f.clone());
+                    }
+                }
+            }
+        }
         Some(Self {
             master_seed,
             master_address: master_address.to_string(),
@@ -642,6 +655,46 @@ mod tests {
         let loaded = User::load_or_create(&path).unwrap();
         assert_eq!(loaded.master_seed, u.master_seed);
         assert_eq!(loaded.cert_user_id("talk.epix").as_deref(), Some("alice@xid.epix"));
+    }
+
+    #[test]
+    fn python_per_site_follows_migrate_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("users.json");
+        // A Python-style users.json: follows live inside each site entry, and
+        // one address also has a Rust-style top-level follow that must win.
+        let seed_user = User::generate();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                seed_user.master_address.clone(): {
+                    "master_seed": seed_user.master_seed,
+                    "sites": {
+                        "epix1talk": {
+                            "auth_address": "a", "auth_privatekey": "k",
+                            "follow": { "Topics": ["SELECT 1", ""] }
+                        },
+                        "epix1mail": {
+                            "auth_address": "b", "auth_privatekey": "k",
+                            "follow": { "Old mail": ["SELECT 2", ""] }
+                        }
+                    },
+                    "certs": {}, "settings": {},
+                    "follows": { "epix1mail": { "New conversations": ["SELECT 3", ""] } }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = User::load_or_create(&path).unwrap();
+        // Python-only follow migrated; the Rust-style entry wins its conflict.
+        assert!(loaded.follows["epix1talk"].get("Topics").is_some(), "python follow migrated");
+        assert!(
+            loaded.follows["epix1mail"].get("New conversations").is_some(),
+            "rust follow kept over the python one"
+        );
+        assert!(loaded.follows["epix1mail"].get("Old mail").is_none());
     }
 
     #[test]

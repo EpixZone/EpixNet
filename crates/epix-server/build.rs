@@ -9,11 +9,17 @@ fn main() {
     println!("cargo:rustc-env=EPIX_GIT_REV={rev}");
 
     // Version reported by the node: the release tag (`EPIX_VERSION`, set by CI
-    // from the git tag) when present, else this crate's Cargo.toml version. A
-    // tagged build (`v0.3.1`) reports that version without editing Cargo.toml.
+    // from the git tag) when present; else the latest reachable git tag, so a
+    // dev build reports the release line it sits on; else this crate's
+    // Cargo.toml version (source tarballs, no git).
     let version = std::env::var("EPIX_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
+        .or_else(|| {
+            git(&["describe", "--tags", "--abbrev=0"])
+                .map(|t| t.trim_start_matches('v').to_string())
+                .filter(|v| !v.is_empty())
+        })
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     println!("cargo:rustc-env=EPIX_VERSION={version}");
     println!("cargo:rerun-if-env-changed=EPIX_VERSION");

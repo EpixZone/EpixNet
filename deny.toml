@@ -14,6 +14,31 @@ ignore = [
     "RUSTSEC-2025-0141",
     # RUSTSEC-2024-0436: paste unmaintained (proc-macro, low risk).
     "RUSTSEC-2024-0436",
+
+    # --- Desktop system-tray stack (Linux, epix-browser only) --------------
+    # tao/tray-icon need the gtk-rs GTK3 bindings for the Linux tray, and the
+    # gtk-rs project has deprecated every GTK3 binding (GTK3 is EOL upstream).
+    # This is the only cross-platform tray option; the Rust desktop ecosystem
+    # (Tauri included) carries the same ignores. All "unmaintained" bindings:
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+    # glib 0.18 `VariantStrIter` unsoundness (CVSS 6.9). Fixed in glib 0.20,
+    # but the GTK3 bindings pin glib 0.18, so it is unavoidable while the tray
+    # uses GTK3. glib here is used only internally by GTK for the tray's own
+    # menu/event loop - our code never iterates untrusted GVariants, so the
+    # unsound path is not reachable. Revisit if the tray moves off GTK3.
+    "RUSTSEC-2024-0429", # glib VariantStrIter unsoundness
+    # proc-macro-error + instant: unmaintained, pulled transitively by the same
+    # tao/GTK3 tray stack (a build-time proc-macro helper and a time shim).
+    "RUSTSEC-2024-0370", # proc-macro-error
+    "RUSTSEC-2024-0384", # instant
 ]
 
 [bans]

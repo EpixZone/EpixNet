@@ -2185,7 +2185,9 @@ impl WsCommand for FeedQuery {
             let db = b["date_added"].as_f64().unwrap_or(0.0);
             db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
-        rows.truncate(limit);
+        // No global cap: `limit` applies per feed query (in build_feed_query),
+        // like EpixNet - a global truncate would let one busy feed crowd every
+        // other site out of the merged view.
         Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
     }
 }
@@ -2202,14 +2204,17 @@ impl WsCommand for FeedSearch {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let search = arg_str(p, "search", 0).unwrap_or("").to_string();
-        let get = |key: &str, idx: usize, default: i64| -> i64 {
-            p.get(key)
-                .or_else(|| p.as_array().and_then(|a| a.get(idx)))
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok())))
-                .unwrap_or(default)
+        let lookup = |key: &str, idx: usize| -> Option<&Value> {
+            p.get(key).or_else(|| p.as_array().and_then(|a| a.get(idx)))
         };
-        let limit = get("limit", 1, 30).max(0) as usize;
-        let day_limit = get("day_limit", 2, 30);
+        let as_num = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|t| t.parse().ok()));
+        let limit = lookup("limit", 1).and_then(as_num).unwrap_or(30).max(0) as usize;
+        // Explicit null = no day filter, same as feedQuery.
+        let day_limit = match lookup("day_limit", 2) {
+            None => 30,
+            Some(Value::Null) => 0,
+            Some(v) => as_num(v).unwrap_or(30),
+        };
         let (text, filters) = parse_search(&search);
 
         let mut rows: Vec<Value> = Vec::new();
@@ -2317,15 +2322,22 @@ fn now_secs() -> f64 {
 }
 
 /// Parse `feedQuery`'s `(limit, day_limit)` from `[limit, day_limit]` or
-/// `{limit, day_limit}` (defaults 10 / 3).
+/// `{limit, day_limit}` (defaults 10 / 3). An explicit `null` day_limit means
+/// NO day filter (0) - the dashboard sends that to page back to the beginning
+/// of the feed's history, and EpixNet's plugin treats None as unfiltered.
+/// Only an absent key gets the 3-day default.
 fn feed_limits(p: &Value) -> (usize, i64) {
-    let get = |key: &str, idx: usize, default: i64| -> i64 {
-        p.get(key)
-            .or_else(|| p.as_array().and_then(|a| a.get(idx)))
-            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-            .unwrap_or(default)
+    let lookup = |key: &str, idx: usize| -> Option<&Value> {
+        p.get(key).or_else(|| p.as_array().and_then(|a| a.get(idx)))
     };
-    (get("limit", 0, 10).max(0) as usize, get("day_limit", 1, 3))
+    let as_num = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+    let limit = lookup("limit", 0).and_then(as_num).unwrap_or(10).max(0) as usize;
+    let day_limit = match lookup("day_limit", 1) {
+        None => 3,
+        Some(Value::Null) => 0,
+        Some(v) => as_num(v).unwrap_or(3),
+    };
+    (limit, day_limit)
 }
 
 /// A follow entry is `[query, params]` (or a bare query string).
@@ -3915,6 +3927,18 @@ mod tests {
         let (text, filters) = parse_search("site:talk.epix");
         assert_eq!(text, "");
         assert_eq!(filters["site"], "talk.epix");
+    }
+
+    #[test]
+    fn feed_limits_null_day_limit_means_unfiltered() {
+        // Absent -> the 3-day default.
+        assert_eq!(feed_limits(&json!({ "limit": 20 })), (20, 3));
+        // Explicit null -> no day filter (the dashboard pages back to the
+        // beginning of history this way; EpixNet treats None the same).
+        assert_eq!(feed_limits(&json!({ "limit": 20, "day_limit": null })), (20, 0));
+        assert_eq!(feed_limits(&json!([20, null])), (20, 0));
+        // A real value passes through.
+        assert_eq!(feed_limits(&json!({ "limit": 50, "day_limit": 8 })), (50, 8));
     }
 
     #[test]

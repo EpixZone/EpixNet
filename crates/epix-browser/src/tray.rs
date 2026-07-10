@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tao::event_loop::{ControlFlow, EventLoop};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tray_icon::{Icon, TrayIconBuilder};
 
 use crate::Ready;
@@ -34,6 +34,9 @@ pub struct TrayContext {
     pub ready: Ready,
     pub child: Child,
     pub rt: tokio::runtime::Handle,
+    /// Open-requests from later launches (single-instance): each is the raw
+    /// launch argument to open in the running browser.
+    pub open_rx: std::sync::mpsc::Receiver<String>,
 }
 
 /// A snapshot of node stats the menu shows, refreshed on a background task so
@@ -43,23 +46,35 @@ struct Snapshot {
     connections: i64,
     peers_connected: u64,
     peers_total: u64,
-    bytes_recv: u64,
-    bytes_sent: u64,
+    /// Wire-level totals (all protocol traffic, like EpixNet's counters), not
+    /// just file payloads - so they move even when an update finds nothing new.
+    wire_recv: u64,
+    wire_sent: u64,
     port_opened: bool,
+    /// The detected external IP, once the fileserver learns it.
+    ip: Option<String>,
+    /// Our onion service host (without `.onion`), once Tor publishes it.
+    onion: Option<String>,
+    /// Our I2P host (without `.i2p`), once the inbound session is ready.
+    i2p: Option<String>,
     tor_status: String,
 }
 
 async fn snapshot(state: &epix_ui::AppState) -> Snapshot {
     let s = state.stats_json().await;
     let (_enabled, tor_status) = state.tor_status().await;
+    let (port_opened, ip) = state.port_status().await;
     let g = |k: &str| s.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
     Snapshot {
         connections: s.get("connections").and_then(serde_json::Value::as_i64).unwrap_or(0),
         peers_connected: g("peers_connected"),
         peers_total: g("peers_total"),
-        bytes_recv: g("bytes_recv"),
-        bytes_sent: g("bytes_sent"),
-        port_opened: s.get("port_opened").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        wire_recv: g("wire_recv"),
+        wire_sent: g("wire_sent"),
+        port_opened,
+        ip,
+        onion: state.onion_address().await,
+        i2p: state.i2p_address().await,
         tor_status,
     }
 }
@@ -110,11 +125,12 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
     }
 
     let menu_rx = MenuEvent::receiver();
+    let open_rx = ctx.open_rx;
     let mut child = ctx.child;
-    let display = ctx.ready.display.clone();
     let firefox = ctx.ready.firefox.clone();
     let profile = ctx.ready.profile.clone();
     let start_url = ctx.ready.start_url.clone();
+    let scheme = ctx.ready.scheme.clone();
     // Keep the tray and menu alive for the whole run; dropping either removes
     // the icon. The loop below diverges, so these never actually drop.
     let _tray = tray;
@@ -124,8 +140,23 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1000));
 
         if let Ok(s) = snap.lock() {
-            let reach = if s.port_opened { " (active)" } else { " (passive)" };
-            handles.address.set_text(format!("Address: {display}{reach}"));
+            let reach = if s.port_opened { "active" } else { "passive" };
+            handles.ip.set_text(match &s.ip {
+                Some(ip) => format!("IP: {ip} ({reach})"),
+                None => format!("IP: - ({reach})"),
+            });
+            if let Some(tor) = &handles.tor {
+                tor.set_text(match &s.onion {
+                    Some(onion) => format!("Tor: {}", short_host(onion, ".onion")),
+                    None => format!("Tor: {}", s.tor_status),
+                });
+            }
+            if let Some(i2p) = &handles.i2p {
+                i2p.set_text(match &s.i2p {
+                    Some(addr) => format!("I2P: {}", short_host(addr, ".i2p")),
+                    None => "I2P: starting…".to_string(),
+                });
+            }
             handles.peers.set_text(format!(
                 "Peers: {} connected / {} known",
                 s.peers_connected, s.peers_total
@@ -133,15 +164,21 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
             handles.conns.set_text(format!("Connections: {}", s.connections));
             handles
                 .transfer
-                .set_text(format!("Received {} · Sent {}", human(s.bytes_recv), human(s.bytes_sent)));
-            let tor = if s.tor_status.is_empty() { "—" } else { s.tor_status.as_str() };
-            handles.tor.set_text(format!("Tor: {tor}"));
+                .set_text(format!("Received {} · Sent {}", human(s.wire_recv), human(s.wire_sent)));
+        }
+
+        // A later launch of EpixNet hands its target here instead of starting
+        // a second node; open it in the running browser.
+        while let Ok(arg) = open_rx.try_recv() {
+            let url = target_url(&scheme, &arg);
+            reopen_browser(&mut child, &firefox, &profile, &url);
         }
 
         while let Ok(ev) = menu_rx.try_recv() {
             if ev.id == handles.quit {
-                // Leave any open browser window alone (the user may still be
-                // reading); just stop the node by ending the process.
+                // Take the managed browser down with the node - without the
+                // node every .epix page in it is dead anyway.
+                close_browser(&mut child);
                 *control_flow = ControlFlow::Exit;
             } else if ev.id == handles.open {
                 reopen_browser(&mut child, &firefox, &profile, &start_url);
@@ -159,11 +196,13 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
 /// The dynamic menu items whose text updates, plus the ids of the actionable
 /// ones. muda items are cheap handles (clone-shares the native item).
 struct Handles {
-    address: MenuItem,
+    ip: MenuItem,
+    /// `None` when the transport is disabled for this run - no line at all.
+    tor: Option<MenuItem>,
+    i2p: Option<MenuItem>,
     peers: MenuItem,
     conns: MenuItem,
     transfer: MenuItem,
-    tor: MenuItem,
     open: muda::MenuId,
     github: muda::MenuId,
     issues: muda::MenuId,
@@ -177,40 +216,55 @@ type Built = (EventLoop<()>, tray_icon::TrayIcon, Menu, Handles);
 /// tray icon. Any step here may fail or panic on an unsupported host.
 fn build(ctx: &TrayContext) -> Result<Built, String> {
     // The event loop must exist before the tray on Linux (it inits GTK).
-    let event_loop = EventLoop::new();
+    #[allow(unused_mut)]
+    let mut event_loop: EventLoop<()> = EventLoopBuilder::new().build();
+    // macOS: run as an accessory (menu-bar only) - the default Regular policy
+    // would put a windowless generic "exec" icon in the Dock; the visible app
+    // is Firefox, the tray is just the background anchor.
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
 
     let menu = Menu::new();
+    let open = MenuItem::new("Open EpixNet", true, None);
     let header = MenuItem::new(format!("EpixNet {}", ctx.ready.version), false, None);
-    let address = MenuItem::new("Address: …", false, None);
+    let ip = MenuItem::new("IP: …", false, None);
+    // No Tor / I2P line at all when the transport is off for this run.
+    let tor = ctx.ready.tor_on.then(|| MenuItem::new("Tor: starting…", false, None));
+    let i2p = ctx.ready.i2p_on.then(|| MenuItem::new("I2P: starting…", false, None));
     let peers = MenuItem::new("Peers: …", false, None);
     let conns = MenuItem::new("Connections: …", false, None);
     let transfer = MenuItem::new("Transfer: …", false, None);
-    let tor = MenuItem::new("Tor: …", false, None);
-    let open = MenuItem::new("Open EpixNet", true, None);
     let github = MenuItem::new("GitHub", true, None);
     let issues = MenuItem::new("Report a bug", true, None);
     let x = MenuItem::new("EpixNet on X", true, None);
     let quit = MenuItem::new("Quit EpixNet", true, None);
 
     let sep = PredefinedMenuItem::separator;
-    menu.append_items(&[
-        &header,
-        &sep(),
-        &address,
-        &peers,
+    let s1 = sep();
+    let s2 = sep();
+    let s3 = sep();
+    let mut items: Vec<&dyn muda::IsMenuItem> = vec![&open, &s1, &header, &ip];
+    if let Some(t) = &tor {
+        items.push(t);
+    }
+    if let Some(i) = &i2p {
+        items.push(i);
+    }
+    items.extend([
+        &peers as &dyn muda::IsMenuItem,
         &conns,
         &transfer,
-        &tor,
-        &sep(),
-        &open,
-        &sep(),
+        &s2,
         &github,
         &issues,
         &x,
-        &sep(),
+        &s3,
         &quit,
-    ])
-    .map_err(|e| format!("build menu: {e}"))?;
+    ]);
+    menu.append_items(&items).map_err(|e| format!("build menu: {e}"))?;
 
     let handles = Handles {
         open: open.id().clone(),
@@ -218,11 +272,12 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
         issues: issues.id().clone(),
         x: x.id().clone(),
         quit: quit.id().clone(),
-        address,
+        ip,
+        tor,
+        i2p,
         peers,
         conns,
         transfer,
-        tor,
     };
 
     let tray = TrayIconBuilder::new()
@@ -254,6 +309,15 @@ fn load_icon() -> Icon {
     Icon::from_rgba(rgba, w, h).expect("static fallback icon is valid")
 }
 
+/// Build the browser URL for a raw launch argument (`dashboard.epix`,
+/// `epix://talk.epix/topic/1`, or a raw address), using the managed scheme.
+fn target_url(scheme: &str, arg: &str) -> String {
+    let host = epix_node::parse_target(arg);
+    let inner = epix_node::parse_inner_path(arg);
+    let path = if inner.is_empty() { "/" } else { &inner };
+    format!("{scheme}://{host}{path}")
+}
+
 /// Reopen the browser from the tray. If the previous window was closed, start a
 /// fresh managed instance; if it is still running, ask Firefox (remote) to
 /// raise it - best-effort, errors ignored.
@@ -278,6 +342,27 @@ fn reopen_browser(child: &mut Child, firefox: &Path, profile: &Path, url: &str) 
     }
 }
 
+/// Close the managed browser on quit: a graceful TERM first (unix - lets
+/// Firefox flush session state), then a hard kill if it lingers. No-op when
+/// the window is already closed.
+fn close_browser(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").arg(child.id().to_string()).status();
+        for _ in 0..20 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Open a clearnet URL in the user's default browser (fast; these links are
 /// public web, not `.epix`).
 fn open_external(url: &str) {
@@ -300,6 +385,16 @@ fn open_external(url: &str) {
         c
     };
     let _ = cmd.spawn();
+}
+
+/// Compact a long overlay host for the menu: onion/i2p hosts run 52-56 chars,
+/// which would stretch the whole menu. Keeps enough of both ends to recognise
+/// the address; the Stats page has the full string.
+fn short_host(host: &str, suffix: &str) -> String {
+    if host.len() <= 22 {
+        return format!("{host}{suffix}");
+    }
+    format!("{}…{}{}", &host[..10], &host[host.len() - 6..], suffix)
 }
 
 /// Human-readable byte size (KB/MB/GB), matching the dashboard's feel.
