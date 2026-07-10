@@ -31,6 +31,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1fc76eaeac4c9164506c466d4ffdd8ec9d0c5bf57ee97177c4d8eceb3a0e138"
+dependencies = [
+ "cipher 0.5.2",
+ "cpubits",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1380,7 +1391,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1747ed5fb4ab3a9f8253da3401efe7ca8f8e5ec373b2e700ff55c3304d84e31f"
 dependencies = [
  "heck",
- "indexmap 1.9.3",
+ "indexmap 2.14.0",
  "itertools",
  "proc-macro-crate",
  "proc-macro2",
@@ -1703,7 +1714,7 @@ name = "emissary-core"
 version = "0.4.0"
 source = "git+https://github.com/EpixZone/emissary?rev=3916e0f1d091929baa4d524ee5963fffb56880b3#3916e0f1d091929baa4d524ee5963fffb56880b3"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "bytes",
  "cbc 0.1.2",
  "chacha20 0.9.1",
@@ -1888,14 +1899,14 @@ dependencies = [
 name = "epix-crypt"
 version = "0.1.0"
 dependencies = [
- "aes",
+ "aes 0.9.1",
  "base64",
  "bech32",
  "bs58",
  "cbc 0.2.1",
  "getrandom 0.2.17",
  "hex",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "k256",
  "serde",
  "serde_json",
@@ -4362,7 +4373,7 @@ dependencies = [
  "derive-deftly",
  "libc",
  "paste",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4714,7 +4725,7 @@ name = "reticulum"
 version = "0.1.0"
 source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs?rev=dc4e03bb08a2069d03ba038bcc63eb9358201dd5#dc4e03bb08a2069d03ba038bcc63eb9358201dd5"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "cbc 0.1.2",
  "crypto-common 0.1.6",
  "ed25519-dalek 2.2.0",
@@ -6707,7 +6718,7 @@ version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ef0e63e805e9c1da61511a93eca502dc29bcb0b8635e9668ec750b63a1e53a1"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "base64ct",
  "ctr",
  "curve25519-dalek 4.1.3",

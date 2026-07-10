@@ -12,7 +12,8 @@
 //! we sign validates against the trusted copy regardless of serial).
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    BasicConstraints, Certificate, CertificateParams, DnType, Issuer, IsCa, KeyPair,
+    KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -73,8 +74,12 @@ impl LocalCa {
         let mut params = CertificateParams::new(vec![host.to_string()])
             .map_err(|e| format!("leaf params: {e}"))?;
         params.distinguished_name.push(DnType::CommonName, host);
+        // rcgen 0.14 signs against an Issuer (CA params + key) rather than the
+        // CA cert + key directly. Rebuild it from the same deterministic params.
+        let ca_params = Self::ca_params()?;
+        let issuer = Issuer::from_params(&ca_params, &self.ca_key);
         let leaf = params
-            .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
+            .signed_by(&leaf_key, &issuer)
             .map_err(|e| format!("sign leaf: {e}"))?;
 
         let leaf_der = leaf.der().clone();

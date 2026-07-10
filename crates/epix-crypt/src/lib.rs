@@ -11,10 +11,10 @@
 //! - HD derivation (`derive_child`): a custom single-level, BIP32-flavored step.
 
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use k256::elliptic_curve::ops::Reduce;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{FieldBytes, ProjectivePoint, Scalar, U256};
 use sha2::{Digest, Sha256, Sha512};
 use sha3::Keccak256;
@@ -32,13 +32,13 @@ pub fn private_to_compressed_pubkey(privatekey: &str) -> Result<Vec<u8>, String>
 /// EpixNet's `eccPubToAddr`.
 pub fn pubkey_to_address(pubkey: &[u8]) -> Result<String, String> {
     let pk = k256::PublicKey::from_sec1_bytes(pubkey).map_err(|e| e.to_string())?;
-    public_key_to_address(pk.to_encoded_point(false).as_bytes())
+    public_key_to_address(pk.to_sec1_point(false).as_bytes())
 }
 
 /// Reduce 32 big-endian bytes into a secp256k1 scalar (mod curve order n),
 /// matching Python's `BN(bytes) % order`.
 fn scalar_from_be_reduced(bytes: &[u8]) -> Scalar {
-    <Scalar as Reduce<U256>>::reduce(U256::from_be_slice(bytes))
+    <Scalar as Reduce<U256>>::reduce(&U256::from_be_slice(bytes))
 }
 
 /// secp256k1 base-point multiply: returns the affine public key for `scalar`.
@@ -48,12 +48,12 @@ fn pubkey_point(scalar: &Scalar) -> k256::AffinePoint {
 
 /// Compressed SEC1 pubkey (33 bytes: `0x02|0x03 ‖ X`) for a private scalar.
 fn compressed_pubkey(scalar: &Scalar) -> Vec<u8> {
-    pubkey_point(scalar).to_encoded_point(true).as_bytes().to_vec()
+    pubkey_point(scalar).to_sec1_point(true).as_bytes().to_vec()
 }
 
 /// Uncompressed SEC1 pubkey (65 bytes: `0x04 ‖ X ‖ Y`) for a private scalar.
 fn uncompressed_pubkey(scalar: &Scalar) -> Vec<u8> {
-    pubkey_point(scalar).to_encoded_point(false).as_bytes().to_vec()
+    pubkey_point(scalar).to_sec1_point(false).as_bytes().to_vec()
 }
 
 /// `derive_child(seed, child)` - exact port of sslcrypto's openssl backend.
@@ -203,9 +203,7 @@ fn sign_digest(digest: &[u8; 32], privatekey: &str) -> Result<String, String> {
         wif_to_private(privatekey)?.to_vec()
     };
     let sk = SigningKey::from_slice(&bytes).map_err(|e| format!("signingkey: {e}"))?;
-    let (sig, recid) = sk
-        .sign_prehash_recoverable(digest)
-        .map_err(|e| format!("sign: {e}"))?;
+    let (sig, recid) = sk.sign_prehash_recoverable(digest);
     let mut out = Vec::with_capacity(65);
     out.push(27 + recid.to_byte()); // uncompressed recid byte, matches sslcrypto
     out.extend_from_slice(&sig.to_bytes()); // r ‖ s, 64 bytes
@@ -236,7 +234,7 @@ fn recover_address(digest: &[u8; 32], sig_b64: &str) -> Result<String, String> {
         Signature::from_slice(&raw[1..65]).map_err(|e| format!("sig parse: {e}"))?;
     let vk = VerifyingKey::recover_from_prehash(digest, &signature, recovery_id)
         .map_err(|e| format!("recover: {e}"))?;
-    let pubkey = vk.to_encoded_point(false);
+    let pubkey = vk.to_sec1_point(false);
     public_key_to_address(pubkey.as_bytes())
 }
 

@@ -10,9 +10,9 @@
 //! computed over `iv ‖ pubkey ‖ ciphertext`.
 
 use crate::{priv_to_scalar, scalar_from_be_reduced, uncompressed_pubkey};
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use hmac::{Hmac, Mac};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
+use hmac::{Hmac, KeyInit, Mac};
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, PublicKey, Scalar};
 use sha2::{Digest, Sha512};
 
@@ -33,7 +33,7 @@ fn random<const N: usize>() -> [u8; N] {
 fn ecdh(scalar: &Scalar, pubkey: &[u8]) -> Result<[u8; 32], String> {
     let pk = PublicKey::from_sec1_bytes(pubkey).map_err(|e| format!("bad public key: {e}"))?;
     let shared = (ProjectivePoint::from(*pk.as_affine()) * scalar).to_affine();
-    let point = shared.to_encoded_point(false);
+    let point = shared.to_sec1_point(false);
     let x = point.x().ok_or("shared point at infinity")?;
     let mut out = [0u8; 32];
     out.copy_from_slice(x);
@@ -57,13 +57,13 @@ fn encode_pubkey(uncompressed: &[u8]) -> Vec<u8> {
 /// AES-256-CBC encrypt with PKCS#7 padding.
 pub fn aes_encrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
     let enc = Aes256CbcEnc::new_from_slices(key, iv).map_err(|e| e.to_string())?;
-    Ok(enc.encrypt_padded_vec_mut::<Pkcs7>(data))
+    Ok(enc.encrypt_padded_vec::<Pkcs7>(data))
 }
 
 /// AES-256-CBC decrypt (PKCS#7).
 pub fn aes_decrypt(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
     let dec = Aes256CbcDec::new_from_slices(key, iv).map_err(|e| e.to_string())?;
-    dec.decrypt_padded_vec_mut::<Pkcs7>(ciphertext).map_err(|e| e.to_string())
+    dec.decrypt_padded_vec::<Pkcs7>(ciphertext).map_err(|e| e.to_string())
 }
 
 /// Generate a fresh AES-256 key.
