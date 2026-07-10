@@ -1887,6 +1887,23 @@ impl AppState {
                 (tracker, peers)
             });
         }
+        let all = self.absorb_announce_results(set).await;
+        self.add_peers(address, all.clone()).await;
+        let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
+        self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
+        // Push the fresh peer count + tracker status to any connected UI.
+        self.push_site_info(address).await;
+        self.push_announcer_info(&key).await;
+        all
+    }
+
+    /// Drain the concurrent per-tracker announces: record each tracker's
+    /// stats, remember answering trackers for AnnounceShare, and return the
+    /// de-duplicated union of discovered peers.
+    async fn absorb_announce_results(
+        &self,
+        mut set: tokio::task::JoinSet<(epix_xite::Tracker, Vec<PeerAddr>)>,
+    ) -> Vec<PeerAddr> {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
             let Ok((tracker, peers)) = res else { continue };
@@ -1902,12 +1919,6 @@ impl AppState {
                 }
             }
         }
-        self.add_peers(address, all.clone()).await;
-        let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
-        self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
-        // Push the fresh peer count + tracker status to any connected UI.
-        self.push_site_info(address).await;
-        self.push_announcer_info(&key).await;
         all
     }
 
