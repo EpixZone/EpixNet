@@ -2066,6 +2066,7 @@ name = "epix-browser"
 version = "0.1.0"
 dependencies = [
  "axum 0.7.9",
+ "epix-build",
  "epix-node",
  "epix-ui",
  "hyper",
@@ -2086,6 +2087,10 @@ dependencies = [
  "winresource",
  "zip 8.6.0",
 ]
+
+[[package]]
+name = "epix-build"
+version = "0.1.0"
 
 [[package]]
 name = "epix-chain"
@@ -2371,6 +2376,7 @@ dependencies = [
 name = "epix-server"
 version = "0.3.0"
 dependencies = [
+ "epix-build",
  "epix-core",
  "epix-crypt",
  "epix-node",

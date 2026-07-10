@@ -67,6 +67,8 @@ fn main() {
     // Single instance: the node stays running in the background, so if EpixNet
     // is already up, hand this launch's target to it and exit instead of
     // booting a second node against the same data directory.
+    // nosemgrep: rust.lang.security.args.args - this is the launch target (a
+    // xite name / epix:// URL), not used for any security decision.
     let raw_arg = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
     let open_rx = match ipc::init(&raw_arg) {
         ipc::Role::Secondary => {

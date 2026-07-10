@@ -4,6 +4,9 @@ version = "0.3.0"
 edition = "2021"
 description = "Runnable Epix node: clones a xite from the network and serves it in a browser."
 
+[build-dependencies]
+epix-build = { path = "../epix-build" }
+
 [dependencies]
 epix-node = { path = "../epix-node", default-features = false }
 epix-ui = { path = "../epix-ui" }
