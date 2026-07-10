@@ -26,6 +26,15 @@ serde_json = "1"
 # managed profile at launch.
 include_dir = "0.7"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# Desktop system tray (macOS menu bar / Windows notification area / Linux
+# StatusNotifier-AppIndicator). Keeps the node's stats visible while it runs in
+# the background after the browser window closes. `tao` owns the main-thread
+# event loop the tray needs; `image` decodes the embedded PNG icon. All
+# best-effort - the launcher falls back to no-tray when the host can't show one.
+tray-icon = "0.19"
+muda = "0.15"
+tao = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows: register the native-messaging host via the registry.
 [target.'cfg(windows)'.dependencies]
