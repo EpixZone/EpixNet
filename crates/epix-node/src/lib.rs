@@ -1059,17 +1059,17 @@ impl OnDemand {
                 Ok(r) => r,
                 Err(e) => {
                     // Tell the loading screen ("index.html download failed",
-                    // "No peers found" when none), and unregister the failed
-                    // clone so a revisit starts fresh - unless it was already
-                    // serving (a failed resume keeps what is on disk).
+                    // "No peers found" when none). Keep the xite registered
+                    // even on a first-load failure: add_xite already persisted
+                    // it to sites.json, so it survives a restart and resumes on
+                    // a later visit (the resume path re-attempts an incomplete
+                    // clone). Dropping it here used to lose a freshly-added site
+                    // whose first load failed - e.g. no peers online yet.
                     self.state.push_clone_event(
                         &address,
                         serde_json::json!(["file_failed", "index.html"]),
                         serde_json::json!({}),
                     );
-                    if !was_registered {
-                        self.state.remove_xite(&address).await;
-                    }
                     return Err(e);
                 }
             };
