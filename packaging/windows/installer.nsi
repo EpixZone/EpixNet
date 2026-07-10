@@ -23,7 +23,7 @@ Unicode true
 !define MUI_ICON "app.ico"
 !define MUI_UNICON "app.ico"
 
-Name "Epix"
+Name "EpixNet"
 OutFile "${OUT_FILE}"
 InstallDir "$LOCALAPPDATA\Epix"
 RequestExecutionLevel user
@@ -40,7 +40,7 @@ ShowUninstDetails show
 
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Epix"
 
-Section "Epix" SecMain
+Section "EpixNet" SecMain
   SetOutPath "$INSTDIR"
   File /r "${STAGE_DIR}\*.*"
 
@@ -51,12 +51,12 @@ Section "Epix" SecMain
   WriteRegStr HKCU "Software\Classes\epix\shell\open\command" "" '"$INSTDIR\epix-browser.exe" "%1"'
 
   ; Shortcuts.
-  CreateShortcut "$SMPROGRAMS\Epix.lnk" "$INSTDIR\epix-browser.exe"
-  CreateShortcut "$DESKTOP\Epix.lnk" "$INSTDIR\epix-browser.exe"
+  CreateShortcut "$SMPROGRAMS\EpixNet.lnk" "$INSTDIR\epix-browser.exe"
+  CreateShortcut "$DESKTOP\EpixNet.lnk" "$INSTDIR\epix-browser.exe"
 
   ; Uninstaller + Add/Remove Programs entry.
   WriteUninstaller "$INSTDIR\uninstall.exe"
-  WriteRegStr   HKCU "${UNINST_KEY}" "DisplayName"     "Epix"
+  WriteRegStr   HKCU "${UNINST_KEY}" "DisplayName"     "EpixNet"
   WriteRegStr   HKCU "${UNINST_KEY}" "DisplayVersion"  "${VERSION}"
   WriteRegStr   HKCU "${UNINST_KEY}" "Publisher"       "Epix"
   WriteRegStr   HKCU "${UNINST_KEY}" "DisplayIcon"     "$INSTDIR\epix-browser.exe"

@@ -38,7 +38,7 @@ done
 # .desktop entry registering epix:// (installed to ~/.local/share/applications).
 cat > "$STAGE/epix.desktop" <<DESKTOP
 [Desktop Entry]
-Name=Epix
+Name=EpixNet
 Exec=$STAGE/epix-browser %u
 Icon=epix
 Type=Application
