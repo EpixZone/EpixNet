@@ -10,17 +10,20 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  security-events: write
+# No workflow-level permissions; each job requests only what it needs.
+permissions: {}
 
 jobs:
   cargo-audit:
     name: cargo audit (RustSec advisories)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # Ignore the accepted advisories (see deny.toml / osv-scanner.toml for the
@@ -34,9 +37,11 @@ jobs:
   cargo-deny:
     name: cargo deny (advisories, bans, licenses, sources)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: EmbarkStudios/cargo-deny-action@30f817c6f72275c6d54dc744fbca09ebc958599f # v2.0.12
         with:
           # Licenses are skipped for now: the workspace's own epix-* crates do
           # not declare a license field, which cargo-deny counts as unlicensed.
@@ -46,9 +51,11 @@ jobs:
   osv-scanner:
     name: osv-scanner (Cargo.lock CVEs)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: google/osv-scanner-action/osv-scanner-action@v2.0.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: google/osv-scanner-action/osv-scanner-action@e69cc6c86b31f1e7e23935bbe7031b50e51082de # v2.0.2
         with:
           # osv-scanner.toml holds the accepted-advisory ignore list.
           scan-args: |-
@@ -58,12 +65,15 @@ jobs:
   semgrep:
     name: semgrep (SAST)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: semgrep scan --config p/rust --config p/security-audit --config p/secrets --error --sarif --output semgrep.sarif crates || true
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@df409f7d9260372bd5f19e5b04e83cb3c43714ae # v3.27.9
         if: always()
         with:
           sarif_file: semgrep.sarif
@@ -71,8 +81,10 @@ jobs:
   gitleaks:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       # Run the gitleaks binary directly. The gitleaks-action requires a paid
