@@ -14,6 +14,9 @@ name = "epix_ffi"
 name = "uniffi-bindgen"
 required-features = ["cli"]
 
+[build-dependencies]
+epix-build = { path = "../epix-build" }
+
 [dependencies]
 epix-node = { path = "../epix-node", default-features = false }
 epix-chain = { path = "../epix-chain" }
