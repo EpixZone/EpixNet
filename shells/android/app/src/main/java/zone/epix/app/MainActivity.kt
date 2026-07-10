@@ -287,27 +287,25 @@ class MainActivity : AppCompatActivity() {
         val t = input.trim()
         if (t.isEmpty()) return
         val url = when {
+            // A leading "?" always searches (the Firefox convention), even
+            // for something that would otherwise parse as an address.
+            t.startsWith("?") -> searchUrl(t.removePrefix("?"))
             t.startsWith("http://") || t.startsWith("https://") -> t
             t.startsWith("epix://") -> {
                 val host = t.removePrefix("epix://").substringBefore('/')
                 currentDisplay = host
                 nodeUrl(host)
             }
+            // Only explicit xite addresses go to the resolver: epix1... or
+            // something.epix. A bare word is a search, not an implied .epix.
             t.startsWith("epix1") || t.endsWith(".epix") -> {
                 currentDisplay = t
                 nodeUrl(t)
             }
-            // A search: an explicit "?..." (the Firefox convention, and the
-            // only way to search a single word - those are .epix names), or
-            // anything with spaces, which no address can contain.
-            t.startsWith("?") || t.contains(' ') -> searchUrl(t.removePrefix("?"))
             // Looks like a clearnet domain: browse it over https.
-            t.contains('.') -> "https://$t"
-            // A bare word is a .epix name.
-            else -> {
-                currentDisplay = "$t.epix"
-                nodeUrl("$t.epix")
-            }
+            t.contains('.') && !t.contains(' ') -> "https://$t"
+            // Everything else - bare words, phrases - searches DuckDuckGo.
+            else -> searchUrl(t)
         }
         session.loadUri(url)
         addressBar.clearFocus()

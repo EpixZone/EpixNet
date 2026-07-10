@@ -217,27 +217,27 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         let t = input.trimmingCharacters(in: .whitespaces)
         if t.isEmpty { return }
         let url: String
-        if t.hasPrefix("http://") || t.hasPrefix("https://") {
+        if t.hasPrefix("?") {
+            // A leading "?" always searches (the Firefox convention), even
+            // for something that would otherwise parse as an address.
+            url = searchUrl(String(t.dropFirst()))
+        } else if t.hasPrefix("http://") || t.hasPrefix("https://") {
             url = t
         } else if t.hasPrefix("epix://") {
             let host = String(t.dropFirst("epix://".count)).components(separatedBy: "/")[0]
             currentDisplay = host
             url = nodeUrl(host)
         } else if t.hasPrefix("epix1") || t.hasSuffix(".epix") {
+            // Only explicit xite addresses go to the resolver: epix1... or
+            // something.epix. A bare word is a search, not an implied .epix.
             currentDisplay = t
             url = nodeUrl(t)
-        } else if t.hasPrefix("?") || t.contains(" ") {
-            // A search: an explicit "?..." (the Firefox convention, and the
-            // only way to search a single word - those are .epix names), or
-            // anything with spaces, which no address can contain.
-            url = searchUrl(t.hasPrefix("?") ? String(t.dropFirst()) : t)
-        } else if t.contains(".") {
+        } else if t.contains("."), !t.contains(" ") {
             // Looks like a clearnet domain: browse it over https.
             url = "https://\(t)"
         } else {
-            // A bare word is a .epix name.
-            currentDisplay = "\(t).epix"
-            url = nodeUrl("\(t).epix")
+            // Everything else - bare words, phrases - searches DuckDuckGo.
+            url = searchUrl(t)
         }
         if let u = URL(string: url) {
             webView?.load(URLRequest(url: u))
