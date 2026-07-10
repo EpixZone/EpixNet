@@ -214,7 +214,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         addressBar = EditText(this).apply {
-            hint = "Type a .epix name or address"
+            hint = "Search or type a .epix name"
             setHintTextColor(COLOR_HINT)
             setTextColor(COLOR_TEXT)
             textSize = 14f
@@ -297,8 +297,12 @@ class MainActivity : AppCompatActivity() {
                 currentDisplay = t
                 nodeUrl(t)
             }
+            // A search: an explicit "?..." (the Firefox convention, and the
+            // only way to search a single word - those are .epix names), or
+            // anything with spaces, which no address can contain.
+            t.startsWith("?") || t.contains(' ') -> searchUrl(t.removePrefix("?"))
             // Looks like a clearnet domain: browse it over https.
-            t.contains('.') && !t.contains(' ') -> "https://$t"
+            t.contains('.') -> "https://$t"
             // A bare word is a .epix name.
             else -> {
                 currentDisplay = "$t.epix"
@@ -310,6 +314,10 @@ class MainActivity : AppCompatActivity() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(addressBar.windowToken, 0)
     }
+
+    /** A DuckDuckGo search for typed input that is not an address. */
+    private fun searchUrl(query: String): String =
+        SEARCH_BASE + java.net.URLEncoder.encode(query.trim(), "UTF-8")
 
     /** Show `talk.epix/…` in the bar, not the local node plumbing. */
     private fun friendlyUrl(url: String): String {
@@ -867,6 +875,10 @@ class MainActivity : AppCompatActivity() {
         // How many failed loads of the node's own UI are retried (each retry
         // first waits for the port) before the inline error page shows.
         private const val MAX_NODE_LOAD_RETRIES = 5
+
+        // Where address-bar searches go. Clearnet, so it follows the
+        // clearnet-through-Tor routing like any other non-.epix page.
+        private const val SEARCH_BASE = "https://duckduckgo.com/?q="
 
         // The dashboard's dark chrome + the desktop extension's icon colors.
         private const val REQ_GECKO_PERMISSIONS = 1001
