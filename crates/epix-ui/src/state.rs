@@ -498,6 +498,21 @@ fn tracker_stat_key(tracker: &epix_xite::Tracker) -> String {
     tracker.to_string()
 }
 
+/// Whether the Tor state makes `tracker` unusable this pass. Tor Always
+/// routes every peer dial through Tor - but BitTorrent announces do their own
+/// networking (UDP cannot ride Tor at all, and a direct HTTP announce would
+/// leak the real IP), so they are skipped outright in that mode; Epix
+/// announcers keep working over the (Tor-routed) transport. Symmetrically,
+/// onion announcers are unreachable without Tor, so they are skipped while it
+/// is off rather than piling up failures.
+fn tracker_tor_gated(tracker: &epix_xite::Tracker, tor_on: bool, tor_status: &str) -> bool {
+    match tracker {
+        epix_xite::Tracker::Bt(_) => tor_on && tor_status == "Always",
+        epix_xite::Tracker::Epix(PeerAddr::Onion { .. }) => !tor_on,
+        epix_xite::Tracker::Epix(_) => false,
+    }
+}
+
 /// Escape a string for safe interpolation into dialog HTML (cert names,
 /// addresses shown in the certXid picker).
 fn html_escape(s: &str) -> String {
@@ -1825,16 +1840,7 @@ impl AppState {
         trackers: &[epix_xite::Tracker],
     ) -> Vec<PeerAddr> {
         let Some(transport) = self.transport.read().await.clone() else { return Vec::new() };
-        // Tor Always routes every peer dial through Tor - but BitTorrent
-        // announces do their own networking (UDP cannot ride Tor at all, and a
-        // direct HTTP announce would leak the real IP), so they are skipped
-        // outright in that mode. Epix announcers keep working: they go over
-        // the (Tor-routed) transport. Symmetrically, onion announcers are
-        // unreachable without Tor, so they are skipped when it is off rather
-        // than piling up failures.
         let (tor_on, tor_st) = self.tor_status().await;
-        let skip_bt = tor_on && tor_st == "Always";
-        let skip_onion = !tor_on;
         // Trackers key peers by the signed content address, so a `.epix` alias
         // must announce under that (not the display name) to find the same
         // peers as the raw address.
@@ -1861,12 +1867,7 @@ impl AppState {
         let mut set = tokio::task::JoinSet::new();
         let mut skipped = 0;
         for tracker in trackers.iter().cloned() {
-            if skip_bt && matches!(tracker, epix_xite::Tracker::Bt(_)) {
-                continue;
-            }
-            if skip_onion
-                && matches!(&tracker, epix_xite::Tracker::Epix(PeerAddr::Onion { .. }))
-            {
+            if tracker_tor_gated(&tracker, tor_on, &tor_st) {
                 continue;
             }
             if self.tracker_backed_off(&tracker).await {

@@ -25,6 +25,8 @@ const CANDIDATES: &[&str] = &[
 
 #[tokio::main]
 async fn main() {
+    // Extra tracker URLs to probe; a diagnostics example, no security decision.
+    // nosemgrep: rust.lang.security.args.args
     let args: Vec<String> = std::env::args().skip(1).collect();
     let list: Vec<String> = if args.is_empty() {
         CANDIDATES.iter().map(|s| s.to_string()).collect()
