@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>Epix</string>
+    <string>EpixNet</string>
     <key>CFBundleIdentifier</key>
     <string>zone.epix.browser</string>
     <key>CFBundleShortVersionString</key>

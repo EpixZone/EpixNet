@@ -14,7 +14,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${1:-$REPO_ROOT/dist}"
-APP="$OUT_DIR/Epix.app"
+APP="$OUT_DIR/EpixNet.app"
 IDENTIFIER="zone.epix.browser"
 # Version comes from the tag in CI (EPIX_VERSION), else a default.
 VERSION="${EPIX_VERSION:-0.1.0}"
@@ -68,8 +68,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Epix</string>
-  <key>CFBundleDisplayName</key><string>Epix</string>
+  <key>CFBundleName</key><string>EpixNet</string>
+  <key>CFBundleDisplayName</key><string>EpixNet</string>
   <key>CFBundleIdentifier</key><string>$IDENTIFIER</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
@@ -110,7 +110,7 @@ if [ -n "${EPIX_SIGN_ID:-}" ]; then
   fi
   if [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
     echo "· notarizing the app (this can take minutes)"
-    ZIP="$OUT_DIR/Epix.zip"
+    ZIP="$OUT_DIR/EpixNet.zip"
     ditto -c -k --keepParent "$APP" "$ZIP"
     xcrun notarytool submit "$ZIP" "${NOTARY_ARGS[@]}" --wait
     xcrun stapler staple "$APP"
@@ -135,7 +135,7 @@ if [ "${EPIX_MAKE_DMG:-0}" = "1" ]; then
   DMG="$OUT_DIR/Epix-$VERSION.dmg"
   echo "· building $DMG"
   rm -f "$DMG"
-  hdiutil create -volname "Epix" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+  hdiutil create -volname "EpixNet" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
   if [ -n "${EPIX_SIGN_ID:-}" ]; then
     codesign --force --sign "$EPIX_SIGN_ID" --timestamp "$DMG" || true
     if [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
