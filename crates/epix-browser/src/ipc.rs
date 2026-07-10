@@ -18,8 +18,10 @@ use std::time::Duration;
 /// port can fall back into that range, and other Epix services roam it, so a
 /// distinctive high port avoids colliding with them.
 const CONTROL_ADDR: &str = "127.0.0.1:47821";
-/// One-line request the secondary sends; the primary replies `OK`.
+/// One-line requests the secondary sends; the primary replies `OK`.
 const OPEN_PREFIX: &str = "EPIX-OPEN ";
+/// Detect-only ping (background launch): primary acks but opens nothing.
+const PING: &str = "EPIX-PING";
 const ACK: &str = "OK";
 
 /// Whether this process is the primary (owns the node) or a secondary that
@@ -32,11 +34,14 @@ pub enum Role {
     Primary(Receiver<String>),
 }
 
-/// Decide this process's role. If an instance is already running, forward the
-/// launch argument to it and return [`Role::Secondary`]. Otherwise claim the
-/// control port and return [`Role::Primary`] with the request receiver.
-pub fn init(arg: &str) -> Role {
-    if forward(arg) {
+/// Decide this process's role. If an instance is already running, detect it and
+/// return [`Role::Secondary`]; otherwise claim the control port and return
+/// [`Role::Primary`] with the request receiver. When `forward_open` is true a
+/// detected instance is also asked to open `arg` (a normal launch); in
+/// background mode it is false, so autostart doesn't pop a window on top of
+/// what the user is doing - it just detects and steps aside.
+pub fn init(arg: &str, forward_open: bool) -> Role {
+    if forward(arg, forward_open) {
         return Role::Secondary;
     }
     match TcpListener::bind(CONTROL_ADDR) {
@@ -45,7 +50,7 @@ pub fn init(arg: &str) -> Role {
             // Lost a startup race (or the port is otherwise taken). Try once
             // more to hand off; if that fails too, run as a best-effort primary
             // without a live control channel rather than refusing to start.
-            if forward(arg) {
+            if forward(arg, forward_open) {
                 Role::Secondary
             } else {
                 eprintln!("· note: could not bind the single-instance control port; running without it");
@@ -56,10 +61,10 @@ pub fn init(arg: &str) -> Role {
     }
 }
 
-/// Try to hand `arg` to a running primary. Returns true only if one answered
-/// and acknowledged - so a stray connection to some other service on the port
-/// doesn't count as a running instance.
-fn forward(arg: &str) -> bool {
+/// Reach a running primary. With `open`, ask it to open `arg`; without, just
+/// ping it. Returns true only if one answered and acknowledged - so a stray
+/// connection to some other service on the port doesn't count as an instance.
+fn forward(arg: &str, open: bool) -> bool {
     let addr = match CONTROL_ADDR.parse() {
         Ok(a) => a,
         Err(_) => return false,
@@ -69,7 +74,8 @@ fn forward(arg: &str) -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    if stream.write_all(format!("{OPEN_PREFIX}{arg}\n").as_bytes()).is_err() {
+    let msg = if open { format!("{OPEN_PREFIX}{arg}\n") } else { format!("{PING}\n") };
+    if stream.write_all(msg.as_bytes()).is_err() {
         return false;
     }
     let mut line = String::new();
@@ -100,8 +106,12 @@ fn handle_conn(mut stream: TcpStream, tx: &Sender<String>) {
     if BufReader::new(read_half).read_line(&mut line).is_err() {
         return;
     }
-    if let Some(arg) = line.trim().strip_prefix(OPEN_PREFIX) {
+    let trimmed = line.trim();
+    if let Some(arg) = trimmed.strip_prefix(OPEN_PREFIX) {
         let _ = tx.send(arg.to_string());
+        let _ = writeln!(stream, "{ACK}");
+    } else if trimmed == PING {
+        // Detect-only (a background launch): acknowledge, open nothing.
         let _ = writeln!(stream, "{ACK}");
     }
 }

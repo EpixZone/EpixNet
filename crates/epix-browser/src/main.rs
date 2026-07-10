@@ -12,6 +12,7 @@
 //!    launches Firefox at `https://<xite>/`;
 //! 4. shuts the node down when Firefox exits.
 
+mod autostart;
 mod ca;
 mod ext;
 mod ipc;
@@ -64,15 +65,29 @@ pub struct Ready {
 }
 
 fn main() {
+    // `--background`: bring up the node + tray but no browser window (the
+    // "open at login" mode). The user opens the browser from the tray. Any
+    // other non-flag argument is the launch target (a xite name / epix:// URL).
+    // These are the launch target and a mode flag, not used for any security
+    // decision.
+    // nosemgrep: rust.lang.security.args.args
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let background = args.iter().any(|a| a == "--background");
+    let raw_arg = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .cloned()
+        .unwrap_or_else(|| "dashboard.epix".to_string());
+
     // Single instance: the node stays running in the background, so if EpixNet
     // is already up, hand this launch's target to it and exit instead of
-    // booting a second node against the same data directory.
-    // nosemgrep: rust.lang.security.args.args - this is the launch target (a
-    // xite name / epix:// URL), not used for any security decision.
-    let raw_arg = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
-    let open_rx = match ipc::init(&raw_arg) {
+    // booting a second node against the same data directory. A background
+    // launch only detects a running instance (it does not pop a window).
+    let open_rx = match ipc::init(&raw_arg, !background) {
         ipc::Role::Secondary => {
-            println!("· EpixNet is already running - opened {raw_arg} in it");
+            if !background {
+                println!("· EpixNet is already running - opened {raw_arg} in it");
+            }
             return;
         }
         ipc::Role::Primary(rx) => rx,
@@ -91,7 +106,7 @@ fn main() {
         }
     };
 
-    let (ready, firefox_child) = rt.block_on(boot(&raw_arg));
+    let (ready, firefox_child) = rt.block_on(boot(&raw_arg, background));
 
     // Hand the main thread to the tray. It keeps the node alive after the
     // browser closes and quits it on demand. When no tray host is available
@@ -105,15 +120,28 @@ fn main() {
         open_rx,
     };
     if let Err(child) = tray::run(ctx) {
-        tray::wait_for_browser(child);
-        println!("· browser closed - shutting down the node");
+        match child {
+            // We launched a browser: run until it closes, then shut down.
+            Some(child) => {
+                tray::wait_for_browser(child);
+                println!("· browser closed - shutting down the node");
+            }
+            // Background mode with no tray host and no window: keep the node
+            // serving (there is nothing to wait on); the user stops it by
+            // killing the process.
+            None => {
+                eprintln!("· running headless (no tray, no window); the node keeps serving");
+                tray::park();
+            }
+        }
     }
 }
 
 /// Boot the node, write the managed profile, install the extension, and launch
-/// Firefox (non-blocking). Returns the running state the tray watches plus the
-/// browser process. Fatal setup errors exit the process directly.
-async fn boot(raw_arg: &str) -> (Ready, std::process::Child) {
+/// Firefox (non-blocking) unless `background`. Returns the running state the
+/// tray watches plus the browser process (`None` in background mode - the tray
+/// opens the browser on demand). Fatal setup errors exit the process directly.
+async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::Child>) {
     let target = epix_node::parse_target(raw_arg);
 
     let data_root = epix_node::data_root();
@@ -210,75 +238,15 @@ async fn boot(raw_arg: &str) -> (Ready, std::process::Child) {
         println!("· routing clearnet through Tor (clearnet is slower, and needs ~40s until Tor is up)");
     }
 
-    // Write the managed profile, then inject the CA so https://*.epix is trusted.
-    let profile = data_root.join("firefox-profile");
-    let secure = {
-        if let Err(e) =
-            write_profile(&profile, proxy_addr, socks_addr, &display, true, tor_clearnet, ext_capable)
-        {
-            eprintln!("could not write the Firefox profile: {e}");
-            std::process::exit(1);
-        }
-        match install_ca(&profile, &ca) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("· note: could not install the local CA ({e}); falling back to http");
-                let _ = write_profile(
-                    &profile, proxy_addr, socks_addr, &display, false, tor_clearnet, ext_capable,
-                );
-                false
-            }
-        }
-    };
-
-    // Install the starter chrome theme (userChrome.css) - works on any edition,
-    // and is left alone once written so edits persist.
-    if let Err(e) = ext::install_theme(&profile) {
-        eprintln!("· note: could not install the theme: {e}");
-    }
-
-    // Install the Epix Wallet extension (wallet + clearnet-block + Tor/I2P
-    // panel) and its native host.
-    if ext_capable {
-        // Existing profiles: drop the retired browser-ext and give the wallet
-        // its toolbar slot.
-        ext::migrate_legacy_extension(&profile);
-        if let Err(e) = ext::install_extension(&profile) {
-            eprintln!("· note: could not install the wallet extension: {e}");
-        }
-        if let Err(e) = ext::install_native_host() {
-            eprintln!("· note: could not install the native host: {e}");
-        }
-        println!("· wallet extension + native host installed");
-    } else {
-        println!(
-            "· note: {} enforces extension signing, so the clearnet-block extension \
-             won't load. Use Firefox ESR or Developer Edition (the shipping bundle \
-             uses ESR).",
-            firefox.display()
-        );
-    }
+    // Write the managed profile (CA injected so https://*.epix is trusted), then
+    // install the theme + wallet extension into it.
+    let (profile, secure) =
+        setup_profile(&data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &ca);
+    install_addons(&profile, &firefox, ext_capable);
 
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
-    println!("· launching Firefox at {start_url}");
-    // Spawn (not wait): the node now outlives the browser window, anchored by
-    // the tray. If Firefox fails to launch we still return - the tray keeps the
-    // node running and offers "Open EpixNet" to try again.
-    let child = match Command::new(&firefox)
-        .arg("--profile")
-        .arg(&profile)
-        .arg("--no-remote")
-        .arg("--new-instance")
-        .arg(&start_url)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("could not launch Firefox at {}: {e}", firefox.display());
-            std::process::exit(1);
-        }
-    };
+    let child = launch_browser(background, &firefox, &profile, &start_url);
 
     // I2P on/off comes from the node config (the boot above defaults it to
     // "embedded" unless the user disabled it on the Config page).
@@ -301,6 +269,97 @@ async fn boot(raw_arg: &str) -> (Ready, std::process::Child) {
         i2p_on,
     };
     (ready, child)
+}
+
+/// Write the managed Firefox profile and install the local CA. Returns the
+/// profile path and whether `https://*.epix` is trusted; a CA-install failure
+/// falls back to http (re-writing the profile without secure origins). A failure
+/// to write the profile at all is fatal.
+fn setup_profile(
+    data_root: &Path,
+    proxy_addr: SocketAddr,
+    socks_addr: SocketAddr,
+    display: &str,
+    tor_clearnet: bool,
+    ext_capable: bool,
+    ca: &LocalCa,
+) -> (PathBuf, bool) {
+    let profile = data_root.join("firefox-profile");
+    if let Err(e) =
+        write_profile(&profile, proxy_addr, socks_addr, display, true, tor_clearnet, ext_capable)
+    {
+        eprintln!("could not write the Firefox profile: {e}");
+        std::process::exit(1);
+    }
+    let secure = match install_ca(&profile, ca) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("· note: could not install the local CA ({e}); falling back to http");
+            let _ =
+                write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
+            false
+        }
+    };
+    (profile, secure)
+}
+
+/// Install the starter chrome theme and, when the edition allows unsigned
+/// add-ons, the Epix Wallet extension + its native host. All best-effort:
+/// failures are logged, never fatal (the theme persists once written).
+fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
+    if let Err(e) = ext::install_theme(profile) {
+        eprintln!("· note: could not install the theme: {e}");
+    }
+    if !ext_capable {
+        println!(
+            "· note: {} enforces extension signing, so the clearnet-block extension \
+             won't load. Use Firefox ESR or Developer Edition (the shipping bundle \
+             uses ESR).",
+            firefox.display()
+        );
+        return;
+    }
+    // Existing profiles: drop the retired browser-ext and give the wallet its
+    // toolbar slot.
+    ext::migrate_legacy_extension(profile);
+    if let Err(e) = ext::install_extension(profile) {
+        eprintln!("· note: could not install the wallet extension: {e}");
+    }
+    if let Err(e) = ext::install_native_host() {
+        eprintln!("· note: could not install the native host: {e}");
+    }
+    println!("· wallet extension + native host installed");
+}
+
+/// Launch Firefox on the managed profile (spawn, not wait - the node outlives
+/// the window, anchored by the tray). Returns `None` in background mode (the
+/// tray opens the browser on demand) or if the launch fails; neither is fatal,
+/// the tray keeps the node up and "Open EpixNet" retries.
+fn launch_browser(
+    background: bool,
+    firefox: &Path,
+    profile: &Path,
+    start_url: &str,
+) -> Option<std::process::Child> {
+    if background {
+        println!("· background mode: node + tray up, no browser window");
+        return None;
+    }
+    println!("· launching Firefox at {start_url}");
+    match Command::new(firefox)
+        .arg("--profile")
+        .arg(profile)
+        .arg("--no-remote")
+        .arg("--new-instance")
+        .arg(start_url)
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(e) => {
+            eprintln!("could not launch Firefox at {}: {e}", firefox.display());
+            None
+        }
+    }
 }
 
 /// Locate a Firefox executable: `EPIX_FIREFOX`, a Firefox bundled inside our own
@@ -485,7 +544,7 @@ fn write_profile(
          }}\n"
     );
     std::fs::write(&pac_path, pac)?;
-    let pac_url = format!("file://{}", pac_path.display());
+    let pac_url = file_url(&pac_path);
 
     let proxy_prefs = format!(
         "user_pref(\"network.proxy.type\", 2);\n\
@@ -537,6 +596,22 @@ user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
     let mut f = std::fs::File::create(profile.join("user.js"))?;
     f.write_all(prefs.as_bytes())?;
     Ok(())
+}
+
+/// A `file://` URL Firefox will load for a local path. On Unix a path already
+/// starts with `/`, so `file://` + `/x` is the well-formed `file:///x`. On
+/// Windows the path is `C:\dir\f`, which must become `file:///C:/dir/f`
+/// (forward slashes, the extra slash before the drive) - the naive
+/// `file://C:\dir\f` is not a valid URL and Firefox silently ignores the PAC,
+/// so `.epix` routing and clearnet-through-Tor both break. Spaces (common under
+/// `C:\Users\First Last\`) are percent-encoded.
+fn file_url(path: &Path) -> String {
+    let p = path.display().to_string().replace('\\', "/").replace(' ', "%20");
+    if p.starts_with('/') {
+        format!("file://{p}")
+    } else {
+        format!("file:///{p}")
+    }
 }
 
 /// Poll `addr` until a TCP connection succeeds or `timeout` elapses.

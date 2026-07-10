@@ -19,11 +19,11 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tray_icon::{Icon, TrayIconBuilder};
 
-use crate::Ready;
+use crate::{autostart, Ready};
 
 /// The tray icon, decoded from the same PNG the Linux packaging ships.
 const TRAY_PNG: &[u8] = include_bytes!("../../../packaging/linux/icons/epix-64.png");
@@ -32,7 +32,9 @@ const TRAY_PNG: &[u8] = include_bytes!("../../../packaging/linux/icons/epix-64.p
 /// stats) plus what it takes to reopen the browser.
 pub struct TrayContext {
     pub ready: Ready,
-    pub child: Child,
+    /// The browser process, or `None` in background mode (no window yet - the
+    /// tray opens one on demand).
+    pub child: Option<Child>,
     pub rt: tokio::runtime::Handle,
     /// Open-requests from later launches (single-instance): each is the raw
     /// launch argument to open in the running browser.
@@ -83,8 +85,8 @@ async fn snapshot(state: &epix_ui::AppState) -> Snapshot {
 /// thread and only returns by exiting the process from the Quit item. When no
 /// tray can be shown it logs why and hands the browser process back in `Err`,
 /// so the caller can fall back to waiting on it.
-pub fn run(ctx: TrayContext) -> Result<(), Child> {
-    let unavailable = |reason: &str, child: Child| {
+pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
+    let unavailable = |reason: &str, child: Option<Child>| {
         eprintln!("· system tray unavailable ({reason}); running until the browser closes");
         Err(child)
     };
@@ -111,18 +113,7 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
 
     // Refresh the stats snapshot on the node's runtime every second.
     let snap = Arc::new(Mutex::new(Snapshot::default()));
-    {
-        let (snap, state) = (snap.clone(), ctx.ready.state.clone());
-        ctx.rt.spawn(async move {
-            loop {
-                let s = snapshot(&state).await;
-                if let Ok(mut g) = snap.lock() {
-                    *g = s;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
+    spawn_stats_refresh(&ctx.rt, ctx.ready.state.clone(), snap.clone());
 
     let menu_rx = MenuEvent::receiver();
     let open_rx = ctx.open_rx;
@@ -139,33 +130,7 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
     event_loop.run(move |_event, _target, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1000));
 
-        if let Ok(s) = snap.lock() {
-            let reach = if s.port_opened { "active" } else { "passive" };
-            handles.ip.set_text(match &s.ip {
-                Some(ip) => format!("IP: {ip} ({reach})"),
-                None => format!("IP: - ({reach})"),
-            });
-            if let Some(tor) = &handles.tor {
-                tor.set_text(match &s.onion {
-                    Some(onion) => format!("Tor: {}", short_host(onion, ".onion")),
-                    None => format!("Tor: {}", s.tor_status),
-                });
-            }
-            if let Some(i2p) = &handles.i2p {
-                i2p.set_text(match &s.i2p {
-                    Some(addr) => format!("I2P: {}", short_host(addr, ".i2p")),
-                    None => "I2P: starting…".to_string(),
-                });
-            }
-            handles.peers.set_text(format!(
-                "Peers: {} connected / {} known",
-                s.peers_connected, s.peers_total
-            ));
-            handles.conns.set_text(format!("Connections: {}", s.connections));
-            handles
-                .transfer
-                .set_text(format!("Received {} · Sent {}", human(s.wire_recv), human(s.wire_sent)));
-        }
+        refresh_menu_stats(&handles, &snap);
 
         // A later launch of EpixNet hands its target here instead of starting
         // a second node; open it in the running browser.
@@ -175,22 +140,96 @@ pub fn run(ctx: TrayContext) -> Result<(), Child> {
         }
 
         while let Ok(ev) = menu_rx.try_recv() {
-            if ev.id == handles.quit {
-                // Take the managed browser down with the node - without the
-                // node every .epix page in it is dead anyway.
-                close_browser(&mut child);
+            if on_menu_event(&ev, &handles, &mut child, &firefox, &profile, &start_url) {
                 *control_flow = ControlFlow::Exit;
-            } else if ev.id == handles.open {
-                reopen_browser(&mut child, &firefox, &profile, &start_url);
-            } else if ev.id == handles.github {
-                open_external("https://github.com/EpixZone/EpixNet");
-            } else if ev.id == handles.issues {
-                open_external("https://github.com/EpixZone/EpixNet/issues");
-            } else if ev.id == handles.x {
-                open_external("https://x.com/zone_epix");
             }
         }
     });
+}
+
+/// Spawn the once-a-second stats refresh onto the node runtime, writing each
+/// reading into the shared snapshot the menu reads back.
+fn spawn_stats_refresh(
+    rt: &tokio::runtime::Handle,
+    state: Arc<epix_ui::AppState>,
+    snap: Arc<Mutex<Snapshot>>,
+) {
+    rt.spawn(async move {
+        loop {
+            let s = snapshot(&state).await;
+            if let Ok(mut g) = snap.lock() {
+                *g = s;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// Refresh the dynamic menu lines (IP / Tor / I2P / peers / connections /
+/// transfer) from the latest stats snapshot. Does nothing if the snapshot lock
+/// is poisoned.
+fn refresh_menu_stats(handles: &Handles, snap: &Mutex<Snapshot>) {
+    let Ok(s) = snap.lock() else { return };
+    let reach = if s.port_opened { "active" } else { "passive" };
+    handles.ip.set_text(match &s.ip {
+        Some(ip) => format!("IP: {ip} ({reach})"),
+        None => format!("IP: - ({reach})"),
+    });
+    if let Some(tor) = &handles.tor {
+        tor.set_text(match &s.onion {
+            Some(onion) => format!("Tor: {}", short_host(onion, ".onion")),
+            None => format!("Tor: {}", s.tor_status),
+        });
+    }
+    if let Some(i2p) = &handles.i2p {
+        i2p.set_text(match &s.i2p {
+            Some(addr) => format!("I2P: {}", short_host(addr, ".i2p")),
+            None => "I2P: starting…".to_string(),
+        });
+    }
+    handles
+        .peers
+        .set_text(format!("Peers: {} connected / {} known", s.peers_connected, s.peers_total));
+    handles.conns.set_text(format!("Connections: {}", s.connections));
+    handles
+        .transfer
+        .set_text(format!("Received {} · Sent {}", human(s.wire_recv), human(s.wire_sent)));
+}
+
+/// Handle one tray menu click. Returns `true` only for Quit, so the caller
+/// exits the event loop (after the browser has been taken down here).
+fn on_menu_event(
+    ev: &MenuEvent,
+    handles: &Handles,
+    child: &mut Option<Child>,
+    firefox: &Path,
+    profile: &Path,
+    start_url: &str,
+) -> bool {
+    if ev.id == handles.quit {
+        // Take the managed browser down with the node - without the node every
+        // .epix page in it is dead anyway.
+        close_browser(child);
+        return true;
+    }
+    if ev.id == handles.open {
+        reopen_browser(child, firefox, profile, start_url);
+    } else if ev.id == handles.autostart {
+        // Toggle "open at login", then reflect the real state back onto the
+        // checkbox (a failed write leaves it where it was).
+        let want = handles.autostart_item.is_checked();
+        if let Err(e) = autostart::set_enabled(want) {
+            eprintln!("· could not change open-at-login: {e}");
+        }
+        handles.autostart_item.set_checked(autostart::is_enabled());
+    } else if ev.id == handles.github {
+        open_external("https://github.com/EpixZone/EpixNet");
+    } else if ev.id == handles.issues {
+        open_external("https://github.com/EpixZone/EpixNet/issues");
+    } else if ev.id == handles.x {
+        open_external("https://x.com/zone_epix");
+    }
+    false
 }
 
 /// The dynamic menu items whose text updates, plus the ids of the actionable
@@ -204,6 +243,10 @@ struct Handles {
     conns: MenuItem,
     transfer: MenuItem,
     open: muda::MenuId,
+    /// The "Open at Login" checkbox: its id (for click matching) and the item
+    /// itself (to read/reflect the checked state).
+    autostart: muda::MenuId,
+    autostart_item: CheckMenuItem,
     github: muda::MenuId,
     issues: muda::MenuId,
     x: muda::MenuId,
@@ -237,6 +280,8 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
     let peers = MenuItem::new("Peers: …", false, None);
     let conns = MenuItem::new("Connections: …", false, None);
     let transfer = MenuItem::new("Transfer: …", false, None);
+    let autostart_item =
+        CheckMenuItem::new("Open at Login", true, autostart::is_enabled(), None);
     let github = MenuItem::new("GitHub", true, None);
     let issues = MenuItem::new("Report a bug", true, None);
     let x = MenuItem::new("EpixNet on X", true, None);
@@ -246,6 +291,7 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
     let s1 = sep();
     let s2 = sep();
     let s3 = sep();
+    let s4 = sep();
     let mut items: Vec<&dyn muda::IsMenuItem> = vec![&open, &s1, &header, &ip];
     if let Some(t) = &tor {
         items.push(t);
@@ -258,16 +304,19 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
         &conns,
         &transfer,
         &s2,
+        &autostart_item,
+        &s3,
         &github,
         &issues,
         &x,
-        &s3,
+        &s4,
         &quit,
     ]);
     menu.append_items(&items).map_err(|e| format!("build menu: {e}"))?;
 
     let handles = Handles {
         open: open.id().clone(),
+        autostart: autostart_item.id().clone(),
         github: github.id().clone(),
         issues: issues.id().clone(),
         x: x.id().clone(),
@@ -278,6 +327,7 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
         peers,
         conns,
         transfer,
+        autostart_item,
     };
 
     let tray = TrayIconBuilder::new()
@@ -318,34 +368,41 @@ fn target_url(scheme: &str, arg: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
-/// Reopen the browser from the tray. If the previous window was closed, start a
-/// fresh managed instance; if it is still running, ask Firefox (remote) to
-/// raise it - best-effort, errors ignored.
-fn reopen_browser(child: &mut Child, firefox: &Path, profile: &Path, url: &str) {
-    match child.try_wait() {
-        Ok(Some(_)) => {
-            if let Ok(c) = Command::new(firefox)
-                .arg("--profile")
-                .arg(profile)
-                .arg("--no-remote")
-                .arg("--new-instance")
-                .arg(url)
-                .spawn()
-            {
-                *child = c;
+/// Reopen the browser from the tray. Starts a fresh managed instance when there
+/// is no window (background mode, or the previous one was closed); if one is
+/// still running, asks Firefox (remote) to raise it - best-effort.
+fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str) {
+    let spawn_fresh = |child: &mut Option<Child>| {
+        if let Ok(c) = Command::new(firefox)
+            .arg("--profile")
+            .arg(profile)
+            .arg("--no-remote")
+            .arg("--new-instance")
+            .arg(url)
+            .spawn()
+        {
+            *child = Some(c);
+        }
+    };
+    match child {
+        // No window yet (background mode) or it exited: start one.
+        None => spawn_fresh(child),
+        Some(c) => match c.try_wait() {
+            Ok(Some(_)) => spawn_fresh(child),
+            // Still running: best-effort remote open to raise it.
+            Ok(None) => {
+                let _ = Command::new(firefox).arg("--profile").arg(profile).arg(url).spawn();
             }
-        }
-        Ok(None) => {
-            let _ = Command::new(firefox).arg("--profile").arg(profile).arg(url).spawn();
-        }
-        Err(_) => {}
+            Err(_) => {}
+        },
     }
 }
 
 /// Close the managed browser on quit: a graceful TERM first (unix - lets
 /// Firefox flush session state), then a hard kill if it lingers. No-op when
-/// the window is already closed.
-fn close_browser(child: &mut Child) {
+/// there is no window or it already closed.
+fn close_browser(child: &mut Option<Child>) {
+    let Some(child) = child.as_mut() else { return };
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
@@ -361,6 +418,15 @@ fn close_browser(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Park the current thread forever, keeping the process (and the node) alive.
+/// Used in background mode when no tray host is available: there is no window
+/// to wait on, and the node should keep serving until the process is killed.
+pub fn park() {
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 /// Open a clearnet URL in the user's default browser (fast; these links are
