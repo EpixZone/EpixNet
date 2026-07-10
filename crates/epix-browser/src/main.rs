@@ -238,81 +238,15 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
         println!("· routing clearnet through Tor (clearnet is slower, and needs ~40s until Tor is up)");
     }
 
-    // Write the managed profile, then inject the CA so https://*.epix is trusted.
-    let profile = data_root.join("firefox-profile");
-    let secure = {
-        if let Err(e) =
-            write_profile(&profile, proxy_addr, socks_addr, &display, true, tor_clearnet, ext_capable)
-        {
-            eprintln!("could not write the Firefox profile: {e}");
-            std::process::exit(1);
-        }
-        match install_ca(&profile, &ca) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("· note: could not install the local CA ({e}); falling back to http");
-                let _ = write_profile(
-                    &profile, proxy_addr, socks_addr, &display, false, tor_clearnet, ext_capable,
-                );
-                false
-            }
-        }
-    };
-
-    // Install the starter chrome theme (userChrome.css) - works on any edition,
-    // and is left alone once written so edits persist.
-    if let Err(e) = ext::install_theme(&profile) {
-        eprintln!("· note: could not install the theme: {e}");
-    }
-
-    // Install the Epix Wallet extension (wallet + clearnet-block + Tor/I2P
-    // panel) and its native host.
-    if ext_capable {
-        // Existing profiles: drop the retired browser-ext and give the wallet
-        // its toolbar slot.
-        ext::migrate_legacy_extension(&profile);
-        if let Err(e) = ext::install_extension(&profile) {
-            eprintln!("· note: could not install the wallet extension: {e}");
-        }
-        if let Err(e) = ext::install_native_host() {
-            eprintln!("· note: could not install the native host: {e}");
-        }
-        println!("· wallet extension + native host installed");
-    } else {
-        println!(
-            "· note: {} enforces extension signing, so the clearnet-block extension \
-             won't load. Use Firefox ESR or Developer Edition (the shipping bundle \
-             uses ESR).",
-            firefox.display()
-        );
-    }
+    // Write the managed profile (CA injected so https://*.epix is trusted), then
+    // install the theme + wallet extension into it.
+    let (profile, secure) =
+        setup_profile(&data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &ca);
+    install_addons(&profile, &firefox, ext_capable);
 
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
-    // Background mode brings up the node + tray only; the user opens the browser
-    // from the tray. Otherwise launch Firefox now (spawn, not wait): the node
-    // outlives the window, anchored by the tray. A launch failure is not fatal -
-    // the tray keeps the node running and "Open EpixNet" retries.
-    let child = if background {
-        println!("· background mode: node + tray up, no browser window");
-        None
-    } else {
-        println!("· launching Firefox at {start_url}");
-        match Command::new(&firefox)
-            .arg("--profile")
-            .arg(&profile)
-            .arg("--no-remote")
-            .arg("--new-instance")
-            .arg(&start_url)
-            .spawn()
-        {
-            Ok(child) => Some(child),
-            Err(e) => {
-                eprintln!("could not launch Firefox at {}: {e}", firefox.display());
-                None
-            }
-        }
-    };
+    let child = launch_browser(background, &firefox, &profile, &start_url);
 
     // I2P on/off comes from the node config (the boot above defaults it to
     // "embedded" unless the user disabled it on the Config page).
@@ -335,6 +269,97 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
         i2p_on,
     };
     (ready, child)
+}
+
+/// Write the managed Firefox profile and install the local CA. Returns the
+/// profile path and whether `https://*.epix` is trusted; a CA-install failure
+/// falls back to http (re-writing the profile without secure origins). A failure
+/// to write the profile at all is fatal.
+fn setup_profile(
+    data_root: &Path,
+    proxy_addr: SocketAddr,
+    socks_addr: SocketAddr,
+    display: &str,
+    tor_clearnet: bool,
+    ext_capable: bool,
+    ca: &LocalCa,
+) -> (PathBuf, bool) {
+    let profile = data_root.join("firefox-profile");
+    if let Err(e) =
+        write_profile(&profile, proxy_addr, socks_addr, display, true, tor_clearnet, ext_capable)
+    {
+        eprintln!("could not write the Firefox profile: {e}");
+        std::process::exit(1);
+    }
+    let secure = match install_ca(&profile, ca) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("· note: could not install the local CA ({e}); falling back to http");
+            let _ =
+                write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
+            false
+        }
+    };
+    (profile, secure)
+}
+
+/// Install the starter chrome theme and, when the edition allows unsigned
+/// add-ons, the Epix Wallet extension + its native host. All best-effort:
+/// failures are logged, never fatal (the theme persists once written).
+fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
+    if let Err(e) = ext::install_theme(profile) {
+        eprintln!("· note: could not install the theme: {e}");
+    }
+    if !ext_capable {
+        println!(
+            "· note: {} enforces extension signing, so the clearnet-block extension \
+             won't load. Use Firefox ESR or Developer Edition (the shipping bundle \
+             uses ESR).",
+            firefox.display()
+        );
+        return;
+    }
+    // Existing profiles: drop the retired browser-ext and give the wallet its
+    // toolbar slot.
+    ext::migrate_legacy_extension(profile);
+    if let Err(e) = ext::install_extension(profile) {
+        eprintln!("· note: could not install the wallet extension: {e}");
+    }
+    if let Err(e) = ext::install_native_host() {
+        eprintln!("· note: could not install the native host: {e}");
+    }
+    println!("· wallet extension + native host installed");
+}
+
+/// Launch Firefox on the managed profile (spawn, not wait - the node outlives
+/// the window, anchored by the tray). Returns `None` in background mode (the
+/// tray opens the browser on demand) or if the launch fails; neither is fatal,
+/// the tray keeps the node up and "Open EpixNet" retries.
+fn launch_browser(
+    background: bool,
+    firefox: &Path,
+    profile: &Path,
+    start_url: &str,
+) -> Option<std::process::Child> {
+    if background {
+        println!("· background mode: node + tray up, no browser window");
+        return None;
+    }
+    println!("· launching Firefox at {start_url}");
+    match Command::new(firefox)
+        .arg("--profile")
+        .arg(profile)
+        .arg("--no-remote")
+        .arg("--new-instance")
+        .arg(start_url)
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(e) => {
+            eprintln!("could not launch Firefox at {}: {e}", firefox.display());
+            None
+        }
+    }
 }
 
 /// Locate a Firefox executable: `EPIX_FIREFOX`, a Firefox bundled inside our own

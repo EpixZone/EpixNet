@@ -113,18 +113,7 @@ pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
 
     // Refresh the stats snapshot on the node's runtime every second.
     let snap = Arc::new(Mutex::new(Snapshot::default()));
-    {
-        let (snap, state) = (snap.clone(), ctx.ready.state.clone());
-        ctx.rt.spawn(async move {
-            loop {
-                let s = snapshot(&state).await;
-                if let Ok(mut g) = snap.lock() {
-                    *g = s;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
+    spawn_stats_refresh(&ctx.rt, ctx.ready.state.clone(), snap.clone());
 
     let menu_rx = MenuEvent::receiver();
     let open_rx = ctx.open_rx;
@@ -141,33 +130,7 @@ pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
     event_loop.run(move |_event, _target, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1000));
 
-        if let Ok(s) = snap.lock() {
-            let reach = if s.port_opened { "active" } else { "passive" };
-            handles.ip.set_text(match &s.ip {
-                Some(ip) => format!("IP: {ip} ({reach})"),
-                None => format!("IP: - ({reach})"),
-            });
-            if let Some(tor) = &handles.tor {
-                tor.set_text(match &s.onion {
-                    Some(onion) => format!("Tor: {}", short_host(onion, ".onion")),
-                    None => format!("Tor: {}", s.tor_status),
-                });
-            }
-            if let Some(i2p) = &handles.i2p {
-                i2p.set_text(match &s.i2p {
-                    Some(addr) => format!("I2P: {}", short_host(addr, ".i2p")),
-                    None => "I2P: starting…".to_string(),
-                });
-            }
-            handles.peers.set_text(format!(
-                "Peers: {} connected / {} known",
-                s.peers_connected, s.peers_total
-            ));
-            handles.conns.set_text(format!("Connections: {}", s.connections));
-            handles
-                .transfer
-                .set_text(format!("Received {} · Sent {}", human(s.wire_recv), human(s.wire_sent)));
-        }
+        refresh_menu_stats(&handles, &snap);
 
         // A later launch of EpixNet hands its target here instead of starting
         // a second node; open it in the running browser.
@@ -177,30 +140,96 @@ pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
         }
 
         while let Ok(ev) = menu_rx.try_recv() {
-            if ev.id == handles.quit {
-                // Take the managed browser down with the node - without the
-                // node every .epix page in it is dead anyway.
-                close_browser(&mut child);
+            if on_menu_event(&ev, &handles, &mut child, &firefox, &profile, &start_url) {
                 *control_flow = ControlFlow::Exit;
-            } else if ev.id == handles.open {
-                reopen_browser(&mut child, &firefox, &profile, &start_url);
-            } else if ev.id == handles.autostart {
-                // Toggle "open at login", then reflect the real state back onto
-                // the checkbox (a failed write leaves it where it was).
-                let want = handles.autostart_item.is_checked();
-                if let Err(e) = autostart::set_enabled(want) {
-                    eprintln!("· could not change open-at-login: {e}");
-                }
-                handles.autostart_item.set_checked(autostart::is_enabled());
-            } else if ev.id == handles.github {
-                open_external("https://github.com/EpixZone/EpixNet");
-            } else if ev.id == handles.issues {
-                open_external("https://github.com/EpixZone/EpixNet/issues");
-            } else if ev.id == handles.x {
-                open_external("https://x.com/zone_epix");
             }
         }
     });
+}
+
+/// Spawn the once-a-second stats refresh onto the node runtime, writing each
+/// reading into the shared snapshot the menu reads back.
+fn spawn_stats_refresh(
+    rt: &tokio::runtime::Handle,
+    state: Arc<epix_ui::AppState>,
+    snap: Arc<Mutex<Snapshot>>,
+) {
+    rt.spawn(async move {
+        loop {
+            let s = snapshot(&state).await;
+            if let Ok(mut g) = snap.lock() {
+                *g = s;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// Refresh the dynamic menu lines (IP / Tor / I2P / peers / connections /
+/// transfer) from the latest stats snapshot. Does nothing if the snapshot lock
+/// is poisoned.
+fn refresh_menu_stats(handles: &Handles, snap: &Mutex<Snapshot>) {
+    let Ok(s) = snap.lock() else { return };
+    let reach = if s.port_opened { "active" } else { "passive" };
+    handles.ip.set_text(match &s.ip {
+        Some(ip) => format!("IP: {ip} ({reach})"),
+        None => format!("IP: - ({reach})"),
+    });
+    if let Some(tor) = &handles.tor {
+        tor.set_text(match &s.onion {
+            Some(onion) => format!("Tor: {}", short_host(onion, ".onion")),
+            None => format!("Tor: {}", s.tor_status),
+        });
+    }
+    if let Some(i2p) = &handles.i2p {
+        i2p.set_text(match &s.i2p {
+            Some(addr) => format!("I2P: {}", short_host(addr, ".i2p")),
+            None => "I2P: starting…".to_string(),
+        });
+    }
+    handles
+        .peers
+        .set_text(format!("Peers: {} connected / {} known", s.peers_connected, s.peers_total));
+    handles.conns.set_text(format!("Connections: {}", s.connections));
+    handles
+        .transfer
+        .set_text(format!("Received {} · Sent {}", human(s.wire_recv), human(s.wire_sent)));
+}
+
+/// Handle one tray menu click. Returns `true` only for Quit, so the caller
+/// exits the event loop (after the browser has been taken down here).
+fn on_menu_event(
+    ev: &MenuEvent,
+    handles: &Handles,
+    child: &mut Option<Child>,
+    firefox: &Path,
+    profile: &Path,
+    start_url: &str,
+) -> bool {
+    if ev.id == handles.quit {
+        // Take the managed browser down with the node - without the node every
+        // .epix page in it is dead anyway.
+        close_browser(child);
+        return true;
+    }
+    if ev.id == handles.open {
+        reopen_browser(child, firefox, profile, start_url);
+    } else if ev.id == handles.autostart {
+        // Toggle "open at login", then reflect the real state back onto the
+        // checkbox (a failed write leaves it where it was).
+        let want = handles.autostart_item.is_checked();
+        if let Err(e) = autostart::set_enabled(want) {
+            eprintln!("· could not change open-at-login: {e}");
+        }
+        handles.autostart_item.set_checked(autostart::is_enabled());
+    } else if ev.id == handles.github {
+        open_external("https://github.com/EpixZone/EpixNet");
+    } else if ev.id == handles.issues {
+        open_external("https://github.com/EpixZone/EpixNet/issues");
+    } else if ev.id == handles.x {
+        open_external("https://x.com/zone_epix");
+    }
+    false
 }
 
 /// The dynamic menu items whose text updates, plus the ids of the actionable
