@@ -13,3 +13,55 @@ reason = "bincode unmaintained; migration tracked separately."
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "paste unmaintained (proc-macro, low risk)."
+
+# Desktop system-tray stack (Linux, epix-browser only): tao/tray-icon need the
+# gtk-rs GTK3 bindings, which upstream deprecated (GTK3 is EOL). Unavoidable for
+# a cross-platform tray; the Rust desktop ecosystem (Tauri included) ignores the
+# same set. All "unmaintained" except glib (see its note).
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0411"
+reason = "gdkwayland-sys unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0412"
+reason = "gdk unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0413"
+reason = "atk unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0414"
+reason = "gdkx11-sys unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0415"
+reason = "gtk unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0416"
+reason = "atk-sys unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0418"
+reason = "gdk-sys unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0419"
+reason = "gtk3-macros unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0420"
+reason = "gtk-sys unmaintained (GTK3 bindings); desktop tray only."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0429"
+reason = "glib 0.18 VariantStrIter unsoundness; fixed in 0.20 but GTK3 pins 0.18. glib is used only internally by GTK for the tray; our code never iterates untrusted GVariants, so the unsound path is unreachable."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+reason = "proc-macro-error unmaintained; build-time helper pulled by the GTK3 tray stack."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0384"
+reason = "instant unmaintained; time shim pulled by the GTK3 tray stack."

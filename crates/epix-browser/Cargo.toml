@@ -43,6 +43,7 @@ winreg = "0.52"
 # build.rs downloads the prebuilt wallet extension (the epix-wallet repo's
 # wallet-dist release) into shells/wallet-ext when it is not staged locally.
 [build-dependencies]
+epix-build = { path = "../epix-build" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 

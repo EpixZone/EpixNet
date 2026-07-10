@@ -63,6 +63,22 @@ cp -R "$FIREFOX_APP" "$APP/Contents/Resources/firefox/"
 # Icon: generate an .icns from a rendered PNG.
 "$REPO_ROOT/packaging/macos/make-icon.sh" "$APP/Contents/Resources/AppIcon.icns"
 
+# Rebrand the bundled Firefox so the Dock shows EpixNet while browsing: our
+# icon over firefox.icns, and the display name. The .app folder name and the
+# firefox binary stay as-is (the launcher's edition detection and Mozilla's
+# internal paths depend on them). Re-signed below, so the edits don't leave a
+# broken signature. Best-effort: a Firefox layout change must not fail the build.
+BUNDLED_FF="$(find "$APP/Contents/Resources/firefox" -maxdepth 1 -name "*.app" | head -1)"
+if [ -n "$BUNDLED_FF" ]; then
+  echo "· rebranding the bundled Firefox as EpixNet"
+  FF_ICNS="$BUNDLED_FF/Contents/Resources/firefox.icns"
+  [ -f "$FF_ICNS" ] && cp "$APP/Contents/Resources/AppIcon.icns" "$FF_ICNS"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName EpixNet" \
+    "$BUNDLED_FF/Contents/Info.plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName EpixNet" \
+    "$BUNDLED_FF/Contents/Info.plist" 2>/dev/null || true
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

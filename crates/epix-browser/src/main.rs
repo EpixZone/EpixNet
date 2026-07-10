@@ -14,6 +14,7 @@
 
 mod ca;
 mod ext;
+mod ipc;
 mod proxy;
 mod tray;
 
@@ -52,10 +53,31 @@ pub struct Ready {
     pub firefox: PathBuf,
     pub profile: PathBuf,
     pub start_url: String,
+    /// The scheme the managed browser uses (`https` with a trusted CA, else
+    /// `http`); used to build URLs for reopen requests from later launches.
+    pub scheme: String,
     pub version: String,
+    /// Whether Tor / I2P are on for this run - decided at boot; the tray
+    /// omits the corresponding stat line entirely when a transport is off.
+    pub tor_on: bool,
+    pub i2p_on: bool,
 }
 
 fn main() {
+    // Single instance: the node stays running in the background, so if EpixNet
+    // is already up, hand this launch's target to it and exit instead of
+    // booting a second node against the same data directory.
+    // nosemgrep: rust.lang.security.args.args - this is the launch target (a
+    // xite name / epix:// URL), not used for any security decision.
+    let raw_arg = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
+    let open_rx = match ipc::init(&raw_arg) {
+        ipc::Role::Secondary => {
+            println!("· EpixNet is already running - opened {raw_arg} in it");
+            return;
+        }
+        ipc::Role::Primary(rx) => rx,
+    };
+
     // The tray needs the main thread for its native event loop (macOS menu bar,
     // Windows message pump), so tokio runs on its own worker threads and the
     // main thread stays free. The node's spawned tasks keep running as long as
@@ -69,14 +91,19 @@ fn main() {
         }
     };
 
-    let (ready, firefox_child) = rt.block_on(boot());
+    let (ready, firefox_child) = rt.block_on(boot(&raw_arg));
 
     // Hand the main thread to the tray. It keeps the node alive after the
     // browser closes and quits it on demand. When no tray host is available
     // (headless Linux, GTK failure, EPIX_NO_TRAY), `run` logs why and hands the
     // browser process back so we fall back to the old behaviour: run until the
     // window closes, then shut down.
-    let ctx = tray::TrayContext { ready, child: firefox_child, rt: rt.handle().clone() };
+    let ctx = tray::TrayContext {
+        ready,
+        child: firefox_child,
+        rt: rt.handle().clone(),
+        open_rx,
+    };
     if let Err(child) = tray::run(ctx) {
         tray::wait_for_browser(child);
         println!("· browser closed - shutting down the node");
@@ -86,11 +113,8 @@ fn main() {
 /// Boot the node, write the managed profile, install the extension, and launch
 /// Firefox (non-blocking). Returns the running state the tray watches plus the
 /// browser process. Fatal setup errors exit the process directly.
-async fn boot() -> (Ready, std::process::Child) {
-    let target = std::env::args()
-        .nth(1)
-        .map(|a| epix_node::parse_target(&a))
-        .unwrap_or_else(|| "dashboard.epix".to_string());
+async fn boot(raw_arg: &str) -> (Ready, std::process::Child) {
+    let target = epix_node::parse_target(raw_arg);
 
     let data_root = epix_node::data_root();
     if let Err(e) = std::fs::create_dir_all(&data_root) {
@@ -256,13 +280,25 @@ async fn boot() -> (Ready, std::process::Child) {
         }
     };
 
+    // I2P on/off comes from the node config (the boot above defaults it to
+    // "embedded" unless the user disabled it on the Config page).
+    let i2p_on = running
+        .state
+        .config_get("i2p")
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))
+        .is_some_and(|mode| mode != "disable");
+
     let ready = Ready {
         state: running.state.clone(),
         display,
         firefox,
         profile,
         start_url,
+        scheme: scheme.to_string(),
         version: env!("EPIX_VERSION").to_string(),
+        tor_on,
+        i2p_on,
     };
     (ready, child)
 }

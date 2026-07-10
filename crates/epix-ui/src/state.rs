@@ -4140,6 +4140,10 @@ impl AppState {
         let sites = xites.len();
         drop(xites);
         let (port_opened, _) = self.port_status().await;
+        // Wire totals cover ALL protocol traffic (handshakes, announces,
+        // content checks), not just file payloads - so they move even when an
+        // update finds nothing new to download. The tray shows these.
+        let (wire_recv, wire_sent) = epix_protocol::wire_totals();
         json!({
             "version": self.version,
             "sites": sites,
@@ -4148,6 +4152,8 @@ impl AppState {
             "connections": self.connection_stats().await.total,
             "bytes_recv": bytes_recv,
             "bytes_sent": bytes_sent,
+            "wire_recv": wire_recv,
+            "wire_sent": wire_sent,
             "port_opened": port_opened,
         })
     }
@@ -6484,9 +6490,23 @@ impl AppState {
             peers += 1;
         }
 
+        // Newsfeed: `null` = the user never followed this site, else the
+        // follow count. Xites key their one-time auto-follow off the null
+        // (EpixNet's Newsfeed plugin injected this): without the key present
+        // they never register their feed queries and the dashboard feed
+        // stays empty for them.
+        let feed_follow_num = {
+            let user = self.user.read().await;
+            user.follows
+                .get(address)
+                .map(|f| json!(f.as_object().map(|o| o.len()).unwrap_or(0)))
+                .unwrap_or(Value::Null)
+        };
+
         json!({
             "auth_address": auth_address,
             "cert_user_id": cert_user_id,
+            "feed_follow_num": feed_follow_num,
             "xid_directory": xid_directory,
             "address": address,
             "display": entry.display,

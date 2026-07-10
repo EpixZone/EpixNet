@@ -9,5 +9,5 @@ pub mod msg;
 pub mod server;
 
 pub use connection::{Connection, FindHashIdsReply, HandshakeInfo, PexReply};
-pub use msg::{vget, vmap};
+pub use msg::{vget, vmap, wire_totals};
 pub use server::{serve_stream, PeerServer, RequestHandler};

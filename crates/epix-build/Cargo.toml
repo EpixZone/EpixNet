@@ -1,0 +1,9 @@
+[package]
+name = "epix-build"
+version = "0.1.0"
+edition = "2021"
+description = "Shared build-script helpers (version + git rev) for the Epix binaries."
+publish = false
+
+[lib]
+path = "src/lib.rs"
