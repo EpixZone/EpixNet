@@ -110,7 +110,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
         let field = UITextField()
         field.attributedPlaceholder = NSAttributedString(
-            string: "Type a .epix name or address",
+            string: "Search or type a .epix name",
             attributes: [.foregroundColor: Self.torOff]
         )
         field.textColor = Self.fieldText
@@ -217,26 +217,42 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         let t = input.trimmingCharacters(in: .whitespaces)
         if t.isEmpty { return }
         let url: String
-        if t.hasPrefix("http://") || t.hasPrefix("https://") {
+        if t.hasPrefix("?") {
+            // A leading "?" always searches (the Firefox convention), even
+            // for something that would otherwise parse as an address.
+            url = searchUrl(String(t.dropFirst()))
+        } else if t.hasPrefix("http://") || t.hasPrefix("https://") {
             url = t
         } else if t.hasPrefix("epix://") {
             let host = String(t.dropFirst("epix://".count)).components(separatedBy: "/")[0]
             currentDisplay = host
             url = nodeUrl(host)
         } else if t.hasPrefix("epix1") || t.hasSuffix(".epix") {
+            // Only explicit xite addresses go to the resolver: epix1... or
+            // something.epix. A bare word is a search, not an implied .epix.
             currentDisplay = t
             url = nodeUrl(t)
         } else if t.contains("."), !t.contains(" ") {
             // Looks like a clearnet domain: browse it over https.
             url = "https://\(t)"
         } else {
-            // A bare word is a .epix name.
-            currentDisplay = "\(t).epix"
-            url = nodeUrl("\(t).epix")
+            // Everything else - bare words, phrases - searches DuckDuckGo.
+            url = searchUrl(t)
         }
         if let u = URL(string: url) {
             webView?.load(URLRequest(url: u))
         }
+    }
+
+    /// A DuckDuckGo search for typed input that is not an address. Clearnet,
+    /// so it follows the clearnet-through-Tor routing like any other
+    /// non-.epix page.
+    private func searchUrl(_ query: String) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: allowed) ?? trimmed
+        return "https://duckduckgo.com/?q=\(encoded)"
     }
 
     private func friendlyUrl(_ url: String) -> String {
