@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
 async-trait = "0.1"
 tracing = "0.1"
 # For the .b32.i2p short address: sha256(destination) then base32.
-sha2 = "0.10"
+sha2 = "0.11"
 data-encoding = "2"
 
 [features]
