@@ -42,12 +42,18 @@ fn icons() -> Option<&'static Icons> {
     static ICONS: OnceLock<Option<Icons>> = OnceLock::new();
     ICONS
         .get_or_init(|| {
+            // Purely cosmetic: this only picks which icon to DISPLAY on the
+            // browser window. No trust or security decision flows from it.
+            // nosemgrep: rust.lang.security.current-exe.current-exe
             let exe = std::env::current_exe().ok()?;
             let mut wide: Vec<u16> = exe.as_os_str().encode_wide().collect();
             wide.push(0);
             let mut big = std::ptr::null_mut();
             let mut small = std::ptr::null_mut();
             // Index 0 = the exe's first icon group (our app icon).
+            // SAFETY: `wide` is NUL-terminated and outlives the call; the two
+            // out-pointers are valid for one HICON each, as `nicons` = 1 says.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let got = unsafe { ExtractIconExW(wide.as_ptr(), 0, &mut big, &mut small, 1) };
             (got > 0 && !big.is_null()).then(|| Icons {
                 big: big as isize,
@@ -79,6 +85,9 @@ pub fn stamp_firefox_windows(firefox: &Path) {
         path = stripped.to_string();
     }
     let mut ctx = StampCtx { firefox: path, big: ic.big, small: ic.small };
+    // SAFETY: `ctx` outlives the EnumWindows call (it is synchronous) and the
+    // callback only reads it through the LPARAM for the call's duration.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         EnumWindows(Some(enum_cb), &mut ctx as *mut StampCtx as LPARAM);
     }
@@ -86,6 +95,10 @@ pub fn stamp_firefox_windows(firefox: &Path) {
 
 /// The full image path of a pid's executable, lowercased ("" when denied).
 fn process_image_lower(pid: u32) -> String {
+    // SAFETY: the handle is checked for null before use and closed on every
+    // path; `len` starts as the buffer capacity and the OS writes back the
+    // actual length, so the slice below stays in bounds.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {

@@ -161,6 +161,8 @@ fn attach_console_or_log(data_root: &Path) {
     };
     // Launched from a terminal: adopt its console. AttachConsole also wires up
     // the std handles unless they were explicitly redirected (`> file` wins).
+    // SAFETY: plain FFI call with a constant argument; no pointers involved.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
         return;
     }
@@ -182,6 +184,9 @@ fn attach_console_or_log(data_root: &Path) {
     // The file handle becomes the process's stdout/stderr for its lifetime
     // (children inherit it too). Deliberately leaked - it must outlive us.
     let raw = f.into_raw_handle();
+    // SAFETY: `raw` is a valid handle we own and intentionally leak, so it
+    // stays live for every later write through the std handles.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         SetStdHandle(STD_OUTPUT_HANDLE, raw as _);
         SetStdHandle(STD_ERROR_HANDLE, raw as _);
