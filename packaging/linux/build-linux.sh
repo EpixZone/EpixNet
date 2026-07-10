@@ -4,6 +4,11 @@
 # a tarball. (Untested in CI here - Linux scaffold; the Rust cores are the same
 # ones built and tested on the host.)
 #
+# Build deps: protobuf-compiler libudev-dev pkg-config, plus GTK/AppIndicator
+# for the system tray: libgtk-3-dev libayatana-appindicator3-dev libxdo-dev.
+# Runtime: GTK3 (on every desktop); the AppIndicator lib is dlopened, so if it
+# is missing the launcher just runs without a tray instead of failing to start.
+#
 # Usage: packaging/linux/build-linux.sh [output-dir]
 #   EPIX_BUNDLE_FIREFOX=/path/to/firefox   dir containing the firefox binary
 set -euo pipefail

@@ -15,6 +15,7 @@
 mod ca;
 mod ext;
 mod proxy;
+mod tray;
 
 use ca::LocalCa;
 use std::io::Write;
@@ -43,8 +44,49 @@ fn tor_clearnet_setting(data_root: &Path) -> Option<bool> {
         .and_then(|v| v.get("tor_clearnet").and_then(|t| t.as_bool()))
 }
 
-#[tokio::main]
-async fn main() {
+/// Everything the tray needs once the node is up and the browser has launched.
+pub struct Ready {
+    pub state: Arc<epix_ui::AppState>,
+    /// The `.epix` display name (or raw address) the node serves.
+    pub display: String,
+    pub firefox: PathBuf,
+    pub profile: PathBuf,
+    pub start_url: String,
+    pub version: String,
+}
+
+fn main() {
+    // The tray needs the main thread for its native event loop (macOS menu bar,
+    // Windows message pump), so tokio runs on its own worker threads and the
+    // main thread stays free. The node's spawned tasks keep running as long as
+    // this runtime is alive - the whole process lifetime, including after the
+    // browser window closes.
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("could not start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let (ready, firefox_child) = rt.block_on(boot());
+
+    // Hand the main thread to the tray. It keeps the node alive after the
+    // browser closes and quits it on demand. When no tray host is available
+    // (headless Linux, GTK failure, EPIX_NO_TRAY), `run` logs why and hands the
+    // browser process back so we fall back to the old behaviour: run until the
+    // window closes, then shut down.
+    let ctx = tray::TrayContext { ready, child: firefox_child, rt: rt.handle().clone() };
+    if let Err(child) = tray::run(ctx) {
+        tray::wait_for_browser(child);
+        println!("· browser closed - shutting down the node");
+    }
+}
+
+/// Boot the node, write the managed profile, install the extension, and launch
+/// Firefox (non-blocking). Returns the running state the tray watches plus the
+/// browser process. Fatal setup errors exit the process directly.
+async fn boot() -> (Ready, std::process::Child) {
     let target = std::env::args()
         .nth(1)
         .map(|a| epix_node::parse_target(&a))
@@ -196,18 +238,33 @@ async fn main() {
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
     println!("· launching Firefox at {start_url}");
-    let status = Command::new(&firefox)
+    // Spawn (not wait): the node now outlives the browser window, anchored by
+    // the tray. If Firefox fails to launch we still return - the tray keeps the
+    // node running and offers "Open EpixNet" to try again.
+    let child = match Command::new(&firefox)
         .arg("--profile")
         .arg(&profile)
         .arg("--no-remote")
         .arg("--new-instance")
         .arg(&start_url)
-        .status();
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("could not launch Firefox at {}: {e}", firefox.display());
+            std::process::exit(1);
+        }
+    };
 
-    match status {
-        Ok(_) => println!("· Firefox closed - shutting down the node"),
-        Err(e) => eprintln!("could not launch Firefox at {}: {e}", firefox.display()),
-    }
+    let ready = Ready {
+        state: running.state.clone(),
+        display,
+        firefox,
+        profile,
+        start_url,
+        version: env!("EPIX_VERSION").to_string(),
+    };
+    (ready, child)
 }
 
 /// Locate a Firefox executable: `EPIX_FIREFOX`, a Firefox bundled inside our own
