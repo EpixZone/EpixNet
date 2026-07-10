@@ -36,7 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 getrandom = { version = "0.2" }
-sha3 = { version = "0.10", optional = true }
+sha3 = { version = "0.11", optional = true }
 
 [features]
 # UiPassword: a cookie-session login gate over the whole UI. Off by default and
