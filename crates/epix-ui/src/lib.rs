@@ -20,7 +20,7 @@ pub mod tracker;
 pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
-pub use state::{AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry};
+pub use state::{AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry, DEFAULT_SIZE_LIMIT_MB};
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},

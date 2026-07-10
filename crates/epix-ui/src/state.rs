@@ -17,8 +17,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-/// Default per-xite size limit, in MB (matches EpixNet's `config.size_limit`).
-const DEFAULT_SIZE_LIMIT_MB: i64 = 10;
+/// Default per-xite size limit, in MB. The Epix python client raised its
+/// `--size-limit` default from ZeroNet's 10 to 1000; a growing xite stops
+/// syncing at this cap until the user raises it, so the old 10 broke any
+/// site past 10 MB out of the box.
+pub const DEFAULT_SIZE_LIMIT_MB: i64 = 1000;
 
 /// Resolves + clones a `.epix` host that isn't served yet, so the browser can
 /// open any name by typing it. Implemented by the node (which has the chain
@@ -4717,7 +4720,7 @@ impl AppState {
             "tasks": 0,
             "started_task_num": 0,
             "bad_files": 0,
-            "size_limit": 10,
+            "size_limit": DEFAULT_SIZE_LIMIT_MB,
             "settings": { "size": 0 },
             // Always an object - dashboard rows read `content.title` unchecked.
             "content": content,
@@ -7162,7 +7165,9 @@ mod tests {
         assert!(info["content"].get("sign").is_none());
         assert!(info["content"].get("signs").is_none());
 
-        assert_eq!(info["size_limit"], 10);
+        // The default limit matches the python client's --size-limit (1000 MB,
+        // not ZeroNet's old 10) - a growing xite must not stall at 10 MB.
+        assert_eq!(info["size_limit"], DEFAULT_SIZE_LIMIT_MB);
         assert_eq!(info["next_size_limit"], 10);
     }
 
