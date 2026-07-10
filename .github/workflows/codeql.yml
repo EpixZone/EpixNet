@@ -34,9 +34,17 @@ jobs:
       # reports "Low Rust analysis quality".
       - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      # Pinned to 1.94, not stable: the extractor's bundled rust-analyzer
+      # (ra_ap 0.0.301 in CodeQL 2.26.0) passes --lockfile-path to
+      # `cargo metadata`, and cargo 1.95+ removed that flag. cargo then exits
+      # with an error, rust-analyzer silently falls back to a workspace with
+      # no dependency or std resolution, and the scan reports "Low Rust
+      # analysis quality". 1.94 is the last toolchain that accepts the flag.
+      # Unpin to stable once the CodeQL bundle ships a rust-analyzer with the
+      # upper version bound fix (rust-lang/rust-analyzer#21783).
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # 1.94
         with:
-          toolchain: stable
+          toolchain: "1.94"
           components: rust-src
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Fetch dependencies
