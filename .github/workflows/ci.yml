@@ -2,7 +2,7 @@ name: CI
 
 # Compiles the whole workspace so a dependency bump that does not build is
 # caught here, not after it lands on main. The scanning workflows
-# (security.yml, codeql.yml) do not compile the code, so this fills that gap.
+# (security.yml, codeql.yml) do not gate on the build, so this fills that gap.
 
 on:
   push:
