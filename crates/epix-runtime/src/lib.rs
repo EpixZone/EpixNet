@@ -98,7 +98,7 @@ impl Default for RuntimeConfig {
 /// transport already set on the [`AppState`].
 pub struct NodeRuntime {
     state: Arc<AppState>,
-    trackers: Vec<PeerAddr>,
+    trackers: Vec<epix_xite::Tracker>,
     config: RuntimeConfig,
     shutdown: Arc<Notify>,
     handles: Vec<JoinHandle<()>>,
@@ -115,11 +115,15 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn new(state: Arc<AppState>, trackers: Vec<PeerAddr>) -> Self {
+    pub fn new(state: Arc<AppState>, trackers: Vec<epix_xite::Tracker>) -> Self {
         Self::with_config(state, trackers, RuntimeConfig::default())
     }
 
-    pub fn with_config(state: Arc<AppState>, trackers: Vec<PeerAddr>, config: RuntimeConfig) -> Self {
+    pub fn with_config(
+        state: Arc<AppState>,
+        trackers: Vec<epix_xite::Tracker>,
+        config: RuntimeConfig,
+    ) -> Self {
         // A per-process DHT node id (ties to this run; a stable identity-derived
         // id is a later Sybil-resistance refinement).
         let seed = format!(
@@ -311,7 +315,7 @@ impl NodeRuntime {
 /// blocking the server bind), then every `period`.
 async fn announce_loop(
     state: Arc<AppState>,
-    trackers: Vec<PeerAddr>,
+    trackers: Vec<epix_xite::Tracker>,
     shutdown: Arc<Notify>,
     period: Duration,
 ) {

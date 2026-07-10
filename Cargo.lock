@@ -2290,6 +2290,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "epix-core",
+ "epix-discovery",
  "epix-peer",
  "epix-plugin",
  "epix-protocol",
