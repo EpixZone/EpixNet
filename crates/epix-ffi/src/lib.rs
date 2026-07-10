@@ -128,12 +128,22 @@ impl EpixNode {
         };
         // Boot synchronously so the shell knows serving is ready (and can point
         // its web view at ui_url) before returning; then drive the server on a
-        // background task for the process lifetime.
+        // background task for the process lifetime. The listener is bound HERE,
+        // not inside the spawned task: on a first launch the runtime workers are
+        // busy with Tor bootstrap, so a spawned bind can lose the race against
+        // the shell's first page load - the web view got connection-refused and
+        // rendered a blank page (the Android "blank screen on fresh install").
         let booted: Result<RunningNode, String> = self.rt.block_on(async {
-            let (server, running) = boot(opts).await?;
-            let addr = running.ui_addr;
+            let (server, mut running) = boot(opts).await?;
+            let listener = tokio::net::TcpListener::bind(running.ui_addr)
+                .await
+                .map_err(|e| format!("bind UI on {}: {e}", running.ui_addr))?;
+            // The bound address is authoritative (a port-0 request resolves here).
+            running.ui_addr = listener
+                .local_addr()
+                .map_err(|e| format!("UI listener address: {e}"))?;
             tokio::spawn(async move {
-                let _ = server.serve(addr).await;
+                let _ = server.serve_on(listener).await;
             });
             Ok(running)
         });
