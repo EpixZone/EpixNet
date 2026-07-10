@@ -1,0 +1,43 @@
+name: CI
+
+# Compiles the whole workspace so a dependency bump that does not build is
+# caught here, not after it lands on main. The scanning workflows
+# (security.yml, codeql.yml) do not compile the code, so this fills that gap.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Only the Rust build matters here; skip fetching the prebuilt wallet
+      # extension (network access, unrelated to whether the workspace compiles).
+      EPIX_WALLET_SKIP: "1"
+      # Treat warnings as errors so the build stays warning-free. cargo caps
+      # dependency lints to `allow`, so this only gates our own crates.
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # --all-targets also compiles tests and examples, so a break in any of
+      # them (like the RustCrypto bump) fails here.
+      - name: Build (all targets)
+        run: cargo build --workspace --all-targets --locked
+      # Run the deterministic crypto vectors (sslcrypto + Python interop), so a
+      # change that compiles but breaks byte-compatibility is caught too.
+      - name: Test crypto byte-compatibility
+        run: cargo test -p epix-crypt --locked

@@ -16,7 +16,7 @@ async fn call(ws: &mut Ws, cmd: &str, id: i64) -> Value {
 
 async fn call_params(ws: &mut Ws, cmd: &str, params: Value, id: i64) -> Value {
     ws.send(Message::Text(
-        json!({ "cmd": cmd, "id": id, "params": params }).to_string(),
+        json!({ "cmd": cmd, "id": id, "params": params }).to_string().into(),
     ))
     .await
     .unwrap();

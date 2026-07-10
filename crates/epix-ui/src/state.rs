@@ -7695,7 +7695,6 @@ mod tests {
 
     #[tokio::test]
     async fn filepack_reads_from_tar_gz() {
-        use std::io::Write;
         // Build a small .tar.gz containing dir/hello.txt.
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
