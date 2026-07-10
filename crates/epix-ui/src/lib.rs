@@ -152,6 +152,15 @@ impl UiServer {
 
     pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        self.serve_on(listener).await
+    }
+
+    /// Serve on an already-bound listener. Callers that must guarantee the UI
+    /// is reachable before they proceed (the mobile shells point a web view at
+    /// it the moment boot returns) bind first and hand the listener over, so
+    /// there is no window where the port is not yet listening.
+    pub async fn serve_on(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        let addr = listener.local_addr()?;
         // EpixNet enables the cross-origin gate by default only on a loopback
         // bind (a LAN/public bind is a deliberate multi-client deployment);
         // the `ui_check_cors` config key overrides either way.
