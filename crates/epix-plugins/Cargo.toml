@@ -6,6 +6,7 @@ description = "The standard EpixNet plugins (Sidebar, …) as Rust structs over 
 
 [dependencies]
 epix-core = { path = "../epix-core" }
+epix-discovery = { path = "../epix-discovery" }
 epix-ui = { path = "../epix-ui" }
 epix-plugin = { path = "../epix-plugin" }
 epix-peer = { path = "../epix-peer" }

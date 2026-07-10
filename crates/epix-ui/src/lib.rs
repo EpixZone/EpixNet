@@ -879,7 +879,7 @@ fn plugin_description(name: &str) -> &'static str {
         "UiFileManager" => "Browse a xite's files from the dashboard.",
         "AnnounceLocal" => "Finds peers on the local network over UDP broadcast.",
         "AnnounceShare" => "Remembers working trackers and reuses them across restarts.",
-        "Beacon" => "Announcer discovery: learns working announcers from peers, shares yours back, and keeps the set healthy. Can also follow a list published on a xite (trackers_xite).",
+        "Beacon" => "Announcer discovery: starts from the built-in bootstrap list, learns working announcers from peers, shares yours back, and keeps the set healthy. Can also follow a list published on a xite (trackers_xite) - and maintains that list automatically when this node owns the xite.",
         "AnnounceBitTorrent" => "Announces to HTTP(S) and UDP BitTorrent trackers.",
         "NoNewSites" => "Locks the node's site set: blocks adding and deleting sites.",
         "ContentFilter" => "Mute authors and block sites (enforced on serve + db).",

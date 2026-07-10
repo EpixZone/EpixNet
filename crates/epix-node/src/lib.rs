@@ -18,8 +18,16 @@ use std::sync::Arc;
 /// direct `epix-ui` dependency.
 pub use epix_ui::AppState;
 
-/// The default Epix bootstrap tracker.
-pub const DEFAULT_TRACKER: &str = "145.223.69.23:26959";
+/// The default Epix bootstrap announcers (re-exported from epix-core; the
+/// Beacon plugin seeds its book from the same list).
+pub use epix_core::DEFAULT_TRACKERS;
+
+/// The default announcer list, parsed. Epix `host:port` entries and
+/// BitTorrent tracker URLs; unparseable entries are impossible (epix-core
+/// tests them).
+pub fn default_trackers() -> Vec<epix_xite::Tracker> {
+    DEFAULT_TRACKERS.iter().filter_map(|t| epix_xite::Tracker::parse(t)).collect()
+}
 /// Epix's default UI port.
 pub const DEFAULT_UI_PORT: u16 = 42222;
 /// Legacy EpixNet UI port, used as a fallback when the default is taken (so a
@@ -177,7 +185,7 @@ pub async fn boot(
     let data_dir = opts.data_root.join("data").join(&address);
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
-    let trackers = vec![PeerAddr::parse(DEFAULT_TRACKER).unwrap()];
+    let trackers = default_trackers();
     let (content, bytes_recv) =
         clone_xite(&address, &data_dir, transport.clone(), &trackers).await?;
 
@@ -226,7 +234,7 @@ async fn clone_xite(
     address: &str,
     data_dir: &std::path::Path,
     transport: Arc<dyn Transport>,
-    trackers: &[PeerAddr],
+    trackers: &[epix_xite::Tracker],
 ) -> Result<(Option<serde_json::Value>, u64), String> {
     clone_xite_with_progress(address, data_dir, transport, trackers, None)
         .await
@@ -247,7 +255,7 @@ async fn clone_xite_with_progress(
     address: &str,
     data_dir: &std::path::Path,
     transport: Arc<dyn Transport>,
-    trackers: &[PeerAddr],
+    trackers: &[epix_xite::Tracker],
     progress: Option<&Arc<AppState>>,
 ) -> Result<(Option<serde_json::Value>, u64, Vec<String>), String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
@@ -912,7 +920,7 @@ struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
     transport: Arc<dyn Transport>,
-    trackers: Vec<PeerAddr>,
+    trackers: Vec<epix_xite::Tracker>,
     /// Names currently being cloned, so concurrent requests coalesce.
     in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
 }
@@ -1179,16 +1187,18 @@ async fn serve(
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;
 
-    // Trackers: configured list, else the default.
-    let trackers: Vec<PeerAddr> = match state
+    // Trackers: configured list, else the built-in defaults. Either way this
+    // is only the bootstrap set - the Beacon plugin folds in everything it
+    // discovers from peers (and the optional trackers_xite list) each cycle.
+    let trackers: Vec<epix_xite::Tracker> = match state
         .config_get("trackers")
         .await
         .and_then(|v| v.as_str().map(str::to_string))
     {
         Some(list) if !list.trim().is_empty() => {
-            list.split([',', '\n']).filter_map(|t| PeerAddr::parse(t.trim()).ok()).collect()
+            list.split([',', '\n']).filter_map(epix_xite::Tracker::parse).collect()
         }
-        _ => vec![PeerAddr::parse(DEFAULT_TRACKER).unwrap()],
+        _ => default_trackers(),
     };
 
     // On-demand resolve + clone: typing any `talk.epix` in the browser clones

@@ -130,7 +130,7 @@ async fn live_clone_dashboard_from_network() {
     let peers = epix_xite::announce(
         transport.as_ref(),
         DASH,
-        &[PeerAddr::parse(LIVE_TRACKER).unwrap()],
+        &[epix_xite::Tracker::Epix(PeerAddr::parse(LIVE_TRACKER).unwrap())],
         &epix_xite::SelfAdvert::default(),
     )
     .await;

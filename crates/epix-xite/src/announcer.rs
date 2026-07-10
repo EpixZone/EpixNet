@@ -4,6 +4,8 @@ use epix_core::PeerAddr;
 use epix_discovery::{address_hash, discover_via_epix_tracker, AnnounceParams};
 use epix_transport::Transport;
 
+pub use epix_discovery::Tracker;
+
 /// How we advertise ourselves to trackers, so they hand our address to other
 /// nodes. Overlay addresses are the only way onion/i2p-only nodes get found.
 #[derive(Debug, Clone, Default)]
@@ -20,12 +22,14 @@ pub struct SelfAdvert {
     pub want_i2p: bool,
 }
 
-/// Announce `xite_address` to each Epix tracker and return the de-duplicated
-/// union of discovered peers. Trackers that error are skipped.
+/// Announce `xite_address` to each tracker - the Epix wire protocol for
+/// `epix://` announcers, the BitTorrent announce (UDP or HTTP, infohash =
+/// `sha1(address)`) for tracker URLs - and return the de-duplicated union of
+/// discovered peers. Trackers that error are skipped.
 pub async fn announce(
     transport: &dyn Transport,
     xite_address: &str,
-    trackers: &[PeerAddr],
+    trackers: &[Tracker],
     advert: &SelfAdvert,
 ) -> Vec<PeerAddr> {
     let hash = address_hash(xite_address);
@@ -56,12 +60,22 @@ pub async fn announce(
         i2p: &i2ps,
     };
     let mut peers: Vec<PeerAddr> = Vec::new();
+    let mut fold = |found: Vec<PeerAddr>| {
+        for p in found {
+            if !peers.contains(&p) {
+                peers.push(p);
+            }
+        }
+    };
     for tracker in trackers {
-        if let Ok(found) = discover_via_epix_tracker(transport, tracker, &params).await {
-            for p in found {
-                if !peers.contains(&p) {
-                    peers.push(p);
+        match tracker {
+            Tracker::Epix(addr) => {
+                if let Ok(found) = discover_via_epix_tracker(transport, addr, &params).await {
+                    fold(found);
                 }
+            }
+            Tracker::Bt(url) => {
+                fold(epix_discovery::announce_bittorrent(url, xite_address, advert.port).await);
             }
         }
     }

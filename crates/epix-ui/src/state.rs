@@ -417,7 +417,7 @@ pub struct AppState {
     /// Trackers contributed at runtime (the Beacon plugin's live list),
     /// folded into every announce alongside the configured ones. Replaced
     /// wholesale on each refresh - not persisted, the plugin's book is.
-    extra_trackers: RwLock<Vec<PeerAddr>>,
+    extra_trackers: RwLock<Vec<epix_xite::Tracker>>,
     /// Fired when the runtime-contributed tracker set changes, so the announce
     /// loop can run early instead of waiting out its period.
     trackers_changed: Arc<tokio::sync::Notify>,
@@ -487,6 +487,30 @@ fn empty_filters() -> Value {
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// The per-announcer stats key: the tracker's canonical form - Epix
+/// announcers by their real transport (`tcp://…`, `onion://…`, `i2p://…` -
+/// the dashboard pill shows the actual protocol), BitTorrent trackers by
+/// their announce URL. Identical to `Tracker`'s Display on purpose: the
+/// Beacon book uses the same form, so stats lookups can never drift from it.
+fn tracker_stat_key(tracker: &epix_xite::Tracker) -> String {
+    tracker.to_string()
+}
+
+/// Whether the Tor state makes `tracker` unusable this pass. Tor Always
+/// routes every peer dial through Tor - but BitTorrent announces do their own
+/// networking (UDP cannot ride Tor at all, and a direct HTTP announce would
+/// leak the real IP), so they are skipped outright in that mode; Epix
+/// announcers keep working over the (Tor-routed) transport. Symmetrically,
+/// onion announcers are unreachable without Tor, so they are skipped while it
+/// is off rather than piling up failures.
+fn tracker_tor_gated(tracker: &epix_xite::Tracker, tor_on: bool, tor_status: &str) -> bool {
+    match tracker {
+        epix_xite::Tracker::Bt(_) => tor_on && tor_status == "Always",
+        epix_xite::Tracker::Epix(PeerAddr::Onion { .. }) => !tor_on,
+        epix_xite::Tracker::Epix(_) => false,
+    }
 }
 
 /// Escape a string for safe interpolation into dialog HTML (cert names,
@@ -831,22 +855,23 @@ impl AppState {
 
     // --- AnnounceShare: persisted working trackers --------------------------
 
-    /// The trackers remembered from previous announces (`epix://…` addresses).
-    pub async fn shared_trackers(&self) -> Vec<PeerAddr> {
+    /// The trackers remembered from previous announces (`epix://…` addresses
+    /// and BitTorrent tracker URLs).
+    pub async fn shared_trackers(&self) -> Vec<epix_xite::Tracker> {
         self.config_get("shared_trackers")
             .await
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default()
             .iter()
             .filter_map(|v| v.as_str())
-            .filter_map(|s| PeerAddr::parse(s).ok())
+            .filter_map(epix_xite::Tracker::parse)
             .collect()
     }
 
     /// Replace the runtime-contributed tracker list (the Beacon plugin's
     /// refresh). Every announce pass folds these in; a change wakes the
     /// announce loop so new announcers are used right away.
-    pub async fn set_extra_trackers(&self, trackers: Vec<PeerAddr>) {
+    pub async fn set_extra_trackers(&self, trackers: Vec<epix_xite::Tracker>) {
         let changed = {
             let mut current = self.extra_trackers.write().await;
             let changed = *current != trackers;
@@ -862,7 +887,7 @@ impl AppState {
     }
 
     /// The runtime-contributed trackers (beyond the configured/static list).
-    pub async fn extra_trackers(&self) -> Vec<PeerAddr> {
+    pub async fn extra_trackers(&self) -> Vec<epix_xite::Tracker> {
         self.extra_trackers.read().await.clone()
     }
 
@@ -1809,8 +1834,13 @@ impl AppState {
 
     /// Announce a xite to each tracker in turn, recording per-tracker stats and
     /// folding the peers found into the xite's registry. Returns all peers.
-    pub async fn announce_to_trackers(&self, address: &str, trackers: &[PeerAddr]) -> Vec<PeerAddr> {
+    pub async fn announce_to_trackers(
+        &self,
+        address: &str,
+        trackers: &[epix_xite::Tracker],
+    ) -> Vec<PeerAddr> {
         let Some(transport) = self.transport.read().await.clone() else { return Vec::new() };
+        let (tor_on, tor_st) = self.tor_status().await;
         // Trackers key peers by the signed content address, so a `.epix` alias
         // must announce under that (not the display name) to find the same
         // peers as the raw address.
@@ -1837,6 +1867,9 @@ impl AppState {
         let mut set = tokio::task::JoinSet::new();
         let mut skipped = 0;
         for tracker in trackers.iter().cloned() {
+            if tracker_tor_gated(&tracker, tor_on, &tor_st) {
+                continue;
+            }
             if self.tracker_backed_off(&tracker).await {
                 skipped += 1;
                 continue;
@@ -1854,6 +1887,23 @@ impl AppState {
                 (tracker, peers)
             });
         }
+        let all = self.absorb_announce_results(set).await;
+        self.add_peers(address, all.clone()).await;
+        let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
+        self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
+        // Push the fresh peer count + tracker status to any connected UI.
+        self.push_site_info(address).await;
+        self.push_announcer_info(&key).await;
+        all
+    }
+
+    /// Drain the concurrent per-tracker announces: record each tracker's
+    /// stats, remember answering trackers for AnnounceShare, and return the
+    /// de-duplicated union of discovered peers.
+    async fn absorb_announce_results(
+        &self,
+        mut set: tokio::task::JoinSet<(epix_xite::Tracker, Vec<PeerAddr>)>,
+    ) -> Vec<PeerAddr> {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
             let Ok((tracker, peers)) = res else { continue };
@@ -1869,12 +1919,6 @@ impl AppState {
                 }
             }
         }
-        self.add_peers(address, all.clone()).await;
-        let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
-        self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
-        // Push the fresh peer count + tracker status to any connected UI.
-        self.push_site_info(address).await;
-        self.push_announcer_info(&key).await;
         all
     }
 
@@ -1883,11 +1927,12 @@ impl AppState {
     /// the dashboard's working-tracker count and Beacon's health check reflect
     /// which announcers actually answer (a dead onion/IPv6 entry shouldn't read
     /// as working just because it was tried).
-    async fn record_tracker(&self, tracker: &PeerAddr, num_added: usize) {
-        // Key (and show) trackers by their real transport, not a blanket
-        // `epix://` - `tcp://1.2.3.4:15441`, `onion://…`, `i2p://…` - so the
-        // dashboard's tracker pill reflects the actual protocol.
-        let key = format!("{}://{}", tracker.scheme(), tracker);
+    async fn record_tracker(&self, tracker: &epix_xite::Tracker, num_added: usize) {
+        // Key (and show) Epix announcers by their real transport, not a
+        // blanket `epix://` - `tcp://1.2.3.4:15441`, `onion://…`, `i2p://…` -
+        // so the dashboard's tracker pill reflects the actual protocol.
+        // BitTorrent trackers are keyed by their announce URL.
+        let key = tracker_stat_key(tracker);
         let mut stats = self.tracker_stats.write().await;
         let entry = stats.entry(key).or_insert_with(|| {
             json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0 })
@@ -1913,8 +1958,8 @@ impl AppState {
     /// that has failed more than 5 times and was tried within the last
     /// `60 * min(30, num_error)` seconds, so a reliably-dead tracker is not
     /// hammered every pass. `force` (a manual `siteAnnounce`) bypasses it.
-    async fn tracker_backed_off(&self, tracker: &PeerAddr) -> bool {
-        let key = format!("{}://{}", tracker.scheme(), tracker);
+    async fn tracker_backed_off(&self, tracker: &epix_xite::Tracker) -> bool {
+        let key = tracker_stat_key(tracker);
         let stats = self.tracker_stats.read().await;
         let Some(entry) = stats.get(&key) else { return false };
         let num_error = entry.get("num_error").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -6981,7 +7026,7 @@ mod tests {
     #[tokio::test]
     async fn tracker_back_off_after_repeated_errors() {
         let state = AppState::new("test");
-        let tracker = PeerAddr::parse("1.2.3.4:26959").unwrap();
+        let tracker = epix_xite::Tracker::Epix(PeerAddr::parse("1.2.3.4:26959").unwrap());
         // Fresh tracker: never backed off.
         assert!(!state.tracker_backed_off(&tracker).await);
         // Six failed announces (num_added == 0 records an error).
@@ -6997,7 +7042,7 @@ mod tests {
         // the window, not the count alone, gates it.
         {
             let mut stats = state.tracker_stats.write().await;
-            let key = format!("{}://{}", tracker.scheme(), tracker);
+            let key = tracker_stat_key(&tracker);
             let e = stats.get_mut(&key).unwrap().as_object_mut().unwrap();
             e.insert("time_request".into(), json!(0));
         }
