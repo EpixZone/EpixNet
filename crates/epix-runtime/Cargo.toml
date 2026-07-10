@@ -22,7 +22,7 @@ async-trait = "0.1"
 serde_json = "1"
 rmpv = "1"
 socket2 = "0.5"
-igd-next = { version = "0.16", features = ["aio_tokio"], optional = true }
+igd-next = { version = "0.17", features = ["aio_tokio"], optional = true }
 
 [features]
 default = ["local-discovery", "inbound-seeding"]

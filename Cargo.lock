@@ -1719,7 +1719,7 @@ dependencies = [
  "flate2",
  "futures",
  "home",
- "igd-next",
+ "igd-next 0.16.2",
  "natpmp",
  "netdev 0.36.0",
  "nom",
@@ -2092,7 +2092,7 @@ dependencies = [
  "epix-ui",
  "epix-xite",
  "hex",
- "igd-next",
+ "igd-next 0.17.1",
  "rmpv",
  "serde_json",
  "socket2 0.5.10",
@@ -3089,6 +3089,26 @@ dependencies = [
  "hyper-util",
  "log",
  "rand 0.9.4",
+ "tokio",
+ "url",
+ "xmltree",
+]
+
+[[package]]
+name = "igd-next"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de7238d487a9aff61f81b5ab41c0a841532a115a398b5fa92a2fadd0885e2581"
+dependencies = [
+ "attohttpc",
+ "bytes",
+ "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "log",
+ "rand 0.10.1",
  "tokio",
  "url",
  "xmltree",
