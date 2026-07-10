@@ -93,7 +93,9 @@ fn stage_wallet_ext() {
     println!("cargo:rerun-if-changed={}", dest.join("manifest.json").display());
 
     if std::env::var_os("EPIX_WALLET_SKIP").is_some_and(|v| v == "1") {
-        println!("cargo:warning=EPIX_WALLET_SKIP=1: building without the wallet extension");
+        // Informational, not a warning: skipping is an explicit opt-in (e.g. a
+        // Rust-only CI compile check). Shown under `cargo build -vv`.
+        println!("epix-browser: EPIX_WALLET_SKIP=1, building without the wallet extension");
         return;
     }
     if dest.join("manifest.json").exists() {
