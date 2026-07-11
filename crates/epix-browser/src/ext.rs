@@ -200,17 +200,31 @@ fn write_dir_to_zip(
     Ok(())
 }
 
-/// Install the starter chrome theme into `<profile>/chrome/`, but only files
-/// that don't exist yet - so a user's edits to userChrome.css survive relaunch.
+/// Install the chrome theme into `<profile>/chrome/`. The editable starter
+/// sheets (userChrome.css, userContent.css) are written only when absent so a
+/// user's edits survive; `epix-managed.css` (hide dead chrome, size the wallet
+/// button) is rewritten every launch and `@import`ed from userChrome.css, so
+/// those managed rules always land, including on pre-existing profiles.
 pub fn install_theme(profile: &Path) -> Result<(), String> {
     let chrome = profile.join("chrome");
     std::fs::create_dir_all(&chrome).map_err(|e| format!("chrome dir: {e}"))?;
+    const MANAGED: &str = "epix-managed.css";
     for file in THEME.files() {
         let name = file.path().file_name().unwrap();
         let dest = chrome.join(name);
-        if !dest.exists() {
+        // Always refresh the managed sheet; write the editable ones only once.
+        if name == std::ffi::OsStr::new(MANAGED) || !dest.exists() {
             std::fs::write(&dest, file.contents())
                 .map_err(|e| format!("write {}: {e}", dest.display()))?;
+        }
+    }
+    // Ensure userChrome.css pulls in the managed rules. A profile created before
+    // epix-managed.css existed has a userChrome.css without the import; prepend
+    // it (an `@import` is valid at the very top, ahead of the comment).
+    let uc = chrome.join("userChrome.css");
+    if let Ok(s) = std::fs::read_to_string(&uc) {
+        if !s.contains(MANAGED) {
+            let _ = std::fs::write(&uc, format!("@import \"{MANAGED}\";\n{s}"));
         }
     }
     Ok(())
@@ -247,11 +261,20 @@ fn set_windows_native_host_registry(manifest_path: &Path) -> Result<(), String> 
 }
 
 fn serde_json_manifest(nmh: &Path) -> String {
-    // Small hand-rolled JSON to avoid a serde_json dep here.
-    format!(
-        "{{\n  \"name\": \"{NMH_NAME}\",\n  \"description\": \"Epix native messaging host\",\n  \"path\": \"{}\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{EXT_ID}\"]\n}}\n",
-        nmh.display()
-    )
+    // Build with serde_json so the path is correctly escaped. On Windows
+    // `nmh.display()` is a backslash path (C:\Users\...), and interpolating it
+    // raw into a JSON string produces invalid escapes (\U, \A, \E) - or worse a
+    // real tab from \t in a name like \username. Firefox's native-messaging
+    // manifest parser rejects the file, so sendNativeMessage fails and the
+    // wallet's Tor/I2P shield, Ledger bridge, and clearnet toggle all go dead.
+    serde_json::json!({
+        "name": NMH_NAME,
+        "description": "Epix native messaging host",
+        "path": nmh.to_string_lossy(),
+        "type": "stdio",
+        "allowed_extensions": [EXT_ID],
+    })
+    .to_string()
 }
 
 /// Where the native-messaging host manifest is written.

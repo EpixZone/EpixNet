@@ -1,3 +1,7 @@
+/* Managed rules (hide dead chrome, size the wallet button). Kept in a separate
+ * file the launcher rewrites every launch; this @import must stay at the top. */
+@import "epix-managed.css";
+
 /* Epix browser chrome theme (starter).
  *
  * This restyles Firefox's chrome to look like Epix. It is written into the
