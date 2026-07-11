@@ -1,3 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/epix-ffi", "crates/epix-browser", "crates/epix-nmh", "crates/epix-build", "crates/wire-spike", "crates/xid-spike"]
+
+# saturating-time 0.4.0 hangs forever on Windows: its platform-limit search
+# assumes 1ns clock granularity, but Windows SystemTime is a 100ns FILETIME, so
+# the loop never terminates. That made arti (tor-netdoc, tor-cert) hang on every
+# Tor bootstrap on Windows. Point at our fork until the fix is released upstream.
+# Fork: https://github.com/EpixZone/saturating-time  Upstream: https://codeberg.org/cve/saturating-time
+[patch.crates-io]
+saturating-time = { git = "https://github.com/EpixZone/saturating-time", rev = "afd652ed569053f878c30f6b0ef44528cd900d46" }
