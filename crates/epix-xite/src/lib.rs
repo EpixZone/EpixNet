@@ -93,6 +93,38 @@ mod tests {
     }
 
     #[test]
+    fn sign_applies_ignore_and_skips_nested_content_units() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+        xite.storage.write("index.html", b"<h1>hi</h1>").unwrap();
+        xite.storage.write("css/all.css", b"body{}").unwrap();
+        xite.storage.write("css/extra.css", b"p{}").unwrap();
+        xite.storage.write("build.py", b"print(1)").unwrap();
+        // A nested content unit (like data/users/content.json): its files are
+        // separately signed user content, never the root's.
+        xite.storage.write("data/users/content.json", b"{}").unwrap();
+        xite.storage.write("data/users/alice/data.json", b"{}").unwrap();
+        // An EpixNet-style ignore with a lookahead: css/ except all.css, and
+        // anything .py.
+        let content = serde_json::to_vec(&json!({
+            "ignore": "(css/(?!all\\.css)|.*\\.py)",
+        }))
+        .unwrap();
+        xite.storage.write("content.json", &content).unwrap();
+        xite.content = Some(serde_json::from_slice(&content).unwrap());
+
+        xite.sign(priv_hex, 1777992698.0).unwrap();
+
+        let files = xite.content.as_ref().unwrap()["files"].as_object().unwrap();
+        let mut keys: Vec<&str> = files.keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["css/all.css", "index.html"]);
+    }
+
+    #[test]
     fn sign_rejects_non_owner_key() {
         let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();

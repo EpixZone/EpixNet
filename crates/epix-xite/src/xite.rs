@@ -54,6 +54,21 @@ fn skip_hashing(rel: &str) -> bool {
     base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
 }
 
+/// The content's `ignore` pattern compiled with EpixNet's `re.match`
+/// semantics (anchored at the start of the relative path). An invalid or
+/// missing pattern ignores nothing.
+fn ignore_regex(pat: Option<&Value>) -> Option<fancy_regex::Regex> {
+    let pat = pat?.as_str()?;
+    if pat.is_empty() {
+        return None;
+    }
+    fancy_regex::Regex::new(&format!("^(?:{pat})")).ok()
+}
+
+fn is_ignored(re: &Option<fancy_regex::Regex>, rel: &str) -> bool {
+    re.as_ref().is_some_and(|re| re.is_match(rel).unwrap_or(false))
+}
+
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -395,6 +410,50 @@ impl Xite {
             .collect()
     }
 
+    /// Build the `files` map for the content.json unit rooted at `dir` (empty
+    /// for the root): hash every file under `dir`, keyed by path relative to
+    /// `dir`. Skips the unit's own content.json and nested content.json subtrees
+    /// (their own signed units), entries already declared optional,
+    /// hidden/transient files, and paths matching the `ignore` pattern. Shared
+    /// by the root [`sign`](Self::sign) and [`sign_child`](Self::sign_child).
+    fn hash_unit_files(
+        &self,
+        dir: &str,
+        optional: &std::collections::HashSet<String>,
+        ignore: &Option<fancy_regex::Regex>,
+    ) -> Result<serde_json::Map<String, Value>> {
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        let listing = self.storage.list_files();
+        // Directories governed by their own content.json own their subtrees.
+        let nested_dirs: Vec<String> = listing
+            .iter()
+            .filter_map(|f| f.strip_prefix(prefix.as_str()))
+            .filter(|rel| rel.ends_with("/content.json"))
+            .map(|rel| rel[..rel.len() - "content.json".len()].to_string())
+            .collect();
+        let mut files = serde_json::Map::new();
+        for inner in listing {
+            let Some(rel) = inner.strip_prefix(prefix.as_str()).map(str::to_string) else {
+                continue;
+            };
+            if rel == "content.json" || rel.ends_with("/content.json") || optional.contains(&rel) {
+                continue;
+            }
+            if skip_hashing(&rel) || is_ignored(ignore, &rel) {
+                continue;
+            }
+            if nested_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
+                continue;
+            }
+            let bytes = self.storage.read(&inner)?;
+            files.insert(
+                rel,
+                json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) }),
+            );
+        }
+        Ok(files)
+    }
+
     /// Sign the root content.json with `privatekey`: rebuild the `files` map by
     /// hashing every file under the root (except content.json files, which are
     /// their own signed units), set `modified` (must exceed the previous value),
@@ -422,20 +481,8 @@ impl Xite {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
-        let mut files = serde_json::Map::new();
-        for inner in self.storage.list_files() {
-            if inner == "content.json" || inner.ends_with("/content.json") || optional.contains(&inner) {
-                continue;
-            }
-            if skip_hashing(&inner) {
-                continue;
-            }
-            let bytes = self.storage.read(&inner)?;
-            files.insert(
-                inner,
-                json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) }),
-            );
-        }
+        let ignore = ignore_regex(content.get("ignore"));
+        let files = self.hash_unit_files("", &optional, &ignore)?;
 
         let map = content.as_object_mut().ok_or_else(|| {
             Error::Protocol("content.json is not a JSON object".into())
@@ -524,22 +571,8 @@ impl Xite {
             .and_then(|v| v.as_object())
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
-        let prefix = format!("{dir}/");
-        let mut files = serde_json::Map::new();
-        for inner in self.storage.list_files() {
-            let Some(rel) = inner.strip_prefix(&prefix) else { continue };
-            if rel == "content.json" || rel.ends_with("/content.json") || optional.contains(rel) {
-                continue;
-            }
-            if skip_hashing(rel) {
-                continue;
-            }
-            let bytes = self.storage.read(&inner)?;
-            files.insert(
-                rel.to_string(),
-                json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) }),
-            );
-        }
+        let ignore = ignore_regex(map.get("ignore"));
+        let files = self.hash_unit_files(dir, &optional, &ignore)?;
         map.insert("files".into(), Value::Object(files));
         if modified.fract() == 0.0 {
             map.insert("modified".into(), json!(modified as i64));
