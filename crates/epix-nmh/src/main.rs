@@ -4,6 +4,10 @@
 //! Each message is handled by [`epix_nmh::handle`]. Settings live next to the
 //! node data so the launcher and the node see the same file.
 
+// GUI subsystem on Windows so no console window can ever flash when Firefox
+// spawns the host; stdio still works over the pipes Firefox provides.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use epix_nmh::{handle, read_frame, write_frame, Settings};
 use std::io::{stdin, stdout};
 

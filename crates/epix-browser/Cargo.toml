@@ -36,9 +36,19 @@ muda = "0.15"
 tao = "0.30"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# Windows: register the native-messaging host via the registry.
+# Windows: register the native-messaging host via the registry; console
+# handling for the GUI-subsystem build (attach to a parent console for dev
+# runs, else route std streams to a log file); WM_SETICON stamping so the
+# managed Firefox's windows show the Epix icon.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # build.rs downloads the prebuilt wallet extension (the epix-wallet repo's
 # wallet-dist release) into shells/wallet-ext when it is not staged locally.

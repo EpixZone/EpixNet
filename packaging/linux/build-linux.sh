@@ -32,6 +32,24 @@ else
   echo "warning: no Firefox to bundle (run packaging/fetch-firefox-esr.sh linux)"
 fi
 
+# Firefox enterprise policies: trust the launcher's local CA so https://*.epix
+# is a secure context on machines without NSS certutil (the launcher writes
+# the CA itself to ~/.mozilla/certificates/epix-ca.pem at each run), and
+# default urlbar search to DuckDuckGo (ESR-only policy; the bundle is ESR).
+mkdir -p "$STAGE/firefox/distribution"
+cat > "$STAGE/firefox/distribution/policies.json" <<'POLICIES'
+{
+  "policies": {
+    "Certificates": {
+      "Install": ["epix-ca.pem"]
+    },
+    "SearchEngines": {
+      "Default": "DuckDuckGo"
+    }
+  }
+}
+POLICIES
+
 # Hicolor icons for the .desktop entry, prebuilt from the assets repo
 # (images/icons/generated/linux) and checked in under packaging/linux/icons.
 for s in 48 64 128 256 512; do
@@ -41,6 +59,8 @@ for s in 48 64 128 256 512; do
 done
 
 # .desktop entry registering epix:// (installed to ~/.local/share/applications).
+# StartupWMClass matches the --class/--name the launcher passes to Firefox, so
+# the shell shows the Epix icon (not Firefox's) for the browser window.
 cat > "$STAGE/epix.desktop" <<DESKTOP
 [Desktop Entry]
 Name=EpixNet
@@ -50,6 +70,7 @@ Type=Application
 Terminal=false
 Categories=Network;WebBrowser;
 MimeType=x-scheme-handler/epix;
+StartupWMClass=EpixNet
 DESKTOP
 
 cat > "$STAGE/install.sh" <<'INSTALL'

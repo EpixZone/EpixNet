@@ -112,17 +112,6 @@ jobs:
       - name: Fetch Firefox ESR to bundle
         shell: bash
         run: packaging/fetch-firefox-esr.sh win64
-      - name: Build installer
-        shell: bash
-        env:
-          EPIX_VERSION: ${{ steps.v.outputs.version }}
-          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
-        run: |
-          # makensis comes from the NSIS install; put it on PATH for Git Bash.
-          export PATH="/c/Program Files (x86)/NSIS:$PATH"
-          packaging/windows/build-windows.sh
-      # Sign the installer + the two exes with Azure Trusted Signing, if the
-      # Azure secrets are configured (otherwise ship it unsigned).
       - name: Check signing config
         id: signcfg
         shell: bash
@@ -133,7 +122,18 @@ jobs:
             echo "sign=false; installer will be unsigned"
             echo "sign=false" >> "$GITHUB_OUTPUT"
           fi
-      - name: Sign with Azure Trusted Signing
+      - name: Build install tree
+        shell: bash
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+          EPIX_PHASE: stage
+        run: packaging/windows/build-windows.sh
+      # Sign our two exes BEFORE they are packed, so the binaries a user
+      # actually runs after install carry the signature (SmartScreen and
+      # Defender judge those too, not just the installer). Non-recursive: the
+      # bundled firefox/ subtree keeps Mozilla's own signatures.
+      - name: Sign binaries with Azure Trusted Signing
         if: steps.signcfg.outputs.sign == 'true'
         # Pin bumped as Microsoft releases the action; check the latest tag at
         # github.com/Azure/trusted-signing-action before a release.
@@ -145,9 +145,33 @@ jobs:
           endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ github.workspace }}/dist/epix-windows
+          files-folder-filter: exe
+          files-folder-recurse: false
+      - name: Pack installer
+        shell: bash
+        env:
+          EPIX_VERSION: ${{ steps.v.outputs.version }}
+          EPIX_PHASE: pack
+        run: |
+          # makensis comes from the NSIS install; put it on PATH for Git Bash.
+          export PATH="/c/Program Files (x86)/NSIS:$PATH"
+          packaging/windows/build-windows.sh
+      # Then sign the installer itself (top of dist/ only - the staged tree
+      # under dist/epix-windows/ is already signed).
+      - name: Sign installer with Azure Trusted Signing
+        if: steps.signcfg.outputs.sign == 'true'
+        uses: azure/trusted-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
           files-folder: ${{ github.workspace }}/dist
           files-folder-filter: exe
-          files-folder-recurse: true
+          files-folder-recurse: false
       - uses: actions/upload-artifact@v7
         with:
           name: epix-windows

@@ -110,9 +110,40 @@ without publishing a Release. (The **Build** workflow is intentionally unsigned,
 so use Release to test signing.) Once it's green, push a `v*` tag for the real
 thing.
 
-Note: a fresh certificate builds Microsoft SmartScreen reputation over time, so
-the first downloads may still show a warning until reputation accrues - this is
-normal and not something signing fixes immediately.
+### SmartScreen: getting from "unrecognized app" to no warning
+
+Signing alone does not remove the orange "Windows protected your PC" banner -
+SmartScreen is a *reputation* system layered on top of the signature. What it
+weighs, per Microsoft's [developer guidance](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation):
+
+- **Publisher reputation** (the signing identity) and **file-hash reputation**
+  (each released binary). A young certificate + a brand-new installer = the
+  warning, even with a valid Trusted Signing signature.
+- Reputation carries across releases only when every release is signed with the
+  **same identity** - keep using the same certificate profile forever; never
+  ship an unsigned build in between.
+- **EV certificates no longer bypass SmartScreen** (Microsoft removed that
+  behavior) - don't pay for one hoping to fix this.
+- It typically takes **several weeks and hundreds of clean installs** for the
+  warning to fade. There is no consumer-facing form to expedite it; the
+  [Security Intelligence submission portal](https://www.microsoft.com/en-us/wdsi/filesubmission)
+  exists for wrong *malware* detections and enterprise scenarios.
+
+Known 2026 wrinkle: Trusted Signing rotated its intermediate CAs on
+2026-03-26 ("Microsoft ID Verified CS EOC/AOC CA 0x"), and reputation did not
+propagate to chains under the new intermediates - every signed build showed the
+warning again. Microsoft fixed the propagation on 2026-06-18; builds signed
+after that date accrue (and inherit) reputation normally, with no account or
+workflow change needed. Releases signed inside that window (0.3.3 was) benefit
+from simply being re-released.
+
+Guaranteed no-warning channels, if/when wanted:
+
+- **Microsoft Store**: Store-distributed apps are re-signed by Microsoft and
+  never see SmartScreen.
+- **winget** (`winget install`): no browser download prompt and no orange
+  dialog UX; a manifest PR to microsoft/winget-pkgs pointing at the signed
+  GitHub-Release installer is enough.
 
 ## Linux
 
