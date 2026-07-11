@@ -1,0 +1,23 @@
+/* Managed Epix chrome rules. REWRITTEN ON EVERY LAUNCH by the launcher, so do
+ * not edit this file - put your own tweaks in userChrome.css, which is left
+ * alone. userChrome.css @imports this file.
+ */
+
+/* The managed browser has exactly one pinned extension (the wallet) and no
+ * Firefox account, so Firefox's account/sync button and the extensions-overflow
+ * (puzzle) button are just dead chrome. Hide both. The wallet stays reachable
+ * because the launcher pins it directly to the toolbar. */
+#fxa-toolbar-menu-button,
+#unified-extensions-button {
+  display: none !important;
+}
+
+/* The wallet's toolbar button reads a touch small next to Firefox's own 16px
+ * glyphs (its artwork has built-in padding). Nudge the icon up so it matches
+ * the neighbouring controls. Firefox scales from the wallet's 48px asset, so it
+ * stays crisp. */
+#wallet_epix_zone-browser-action .toolbarbutton-icon,
+#wallet_epix_zone-browser-action .toolbarbutton-badge-stack > .toolbarbutton-icon {
+  width: 20px !important;
+  height: 20px !important;
+}
