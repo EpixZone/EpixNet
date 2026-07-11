@@ -2487,6 +2487,13 @@ impl AppState {
     pub async fn has_cors_permission(&self, source: &str, target: &str) -> bool {
         let xites = self.xites.read().await;
         let Some(src) = self.resolve_xite(&xites, source) else { return false };
+        // An ADMIN site can already read any site's files over the WS API
+        // (fileGet et al.), so blocking its subresource loads adds no
+        // security; allowing them lets the dashboard show other xites'
+        // favicons without per-site Cors grants.
+        if src.settings.permissions.iter().any(|p| p == "ADMIN") {
+            return true;
+        }
         let target_canonical = self
             .resolve_xite(&xites, target)
             .map(|x| canonical_address(x.content.as_ref(), target));
