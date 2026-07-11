@@ -20,7 +20,9 @@ pub mod tracker;
 pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
-pub use state::{AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry, DEFAULT_SIZE_LIMIT_MB};
+pub use state::{
+    self_exe, AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry, DEFAULT_SIZE_LIMIT_MB,
+};
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -1055,9 +1057,13 @@ async fn serve_config_page(
         params.get("error").map(|msg| (false, msg.clone()))
     };
     let pending = ctx.state.restart_pending_keys().await;
+    let can_restart = ctx.state.can_restart();
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     let theme = ctx.state.theme_class().await;
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, &pending, flash, &homepage, &theme))
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        render_config_page(&values, &pending, can_restart, flash, &homepage, &theme),
+    )
         .into_response()
 }
 
@@ -1164,6 +1170,7 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 fn render_config_page(
     values: &[(&str, &str, &str, String, String, &str)],
     pending: &[String],
+    can_restart: bool,
     flash: Option<(bool, String)>,
     homepage: &str,
     theme: &str,
@@ -1321,11 +1328,22 @@ fn render_config_page(
     // The restart bar renders server-side when a saved change waits for a
     // restart; the page script hides it while unsaved edits exist (the save
     // bar takes its place) and brings it back once they are saved or undone.
+    // Without a registered relauncher (the mobile apps, where the node is a
+    // library in the app process) there is no button - the bar just says the
+    // change applies on the next start.
+    let (restart_title, restart_button) = if can_restart {
+        (
+            "Some changed settings need a restart to apply",
+            "<a class='button button-submit' id='restart-btn' href='/Config?action=restart'>Restart EpixNet</a>",
+        )
+    } else {
+        ("Some changed settings apply after EpixNet restarts - close and reopen the app", "")
+    };
     let restart_bar = format!(
         "<div class='bottom bottom-restart{visible}' id='bottom-restart'{data}>\
            <div class='bottom-content'>\
-             <div class='title'>Some changed settings need a restart to apply</div>\
-             <a class='button button-submit' id='restart-btn' href='/Config?action=restart'>Restart EpixNet</a>\
+             <div class='title'>{restart_title}</div>\
+             {restart_button}\
            </div>\
          </div>",
         visible = if pending.is_empty() { "" } else { " visible" },

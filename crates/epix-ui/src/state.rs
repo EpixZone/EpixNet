@@ -616,15 +616,26 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The running executable's canonical path, for building a self-relaunch
+/// argv. This is exec plumbing, not an authorization decision: the value
+/// comes from the kernel (/proc/self/exe, _NSGetExecutablePath,
+/// GetModuleFileNameW - not argv[0]), is resolved to a real path right away,
+/// and must name an existing file. Anyone who could swap it already runs
+/// code as this user.
+pub fn self_exe() -> Option<String> {
+    let exe = std::env::current_exe().ok()?; // nosemgrep: rust.lang.security.current-exe.current-exe
+    let exe = exe.canonicalize().ok()?;
+    exe.is_file().then(|| exe.display().to_string())
+}
+
 /// Launch a detached helper that waits for this process to die, then starts
-/// the node again. The wait matters: the single-instance guard and the bound
-/// ports are only free once the old process is gone. `None` relaunches the
-/// current executable with this process's own arguments.
-fn spawn_relauncher(argv: Option<Vec<String>>) {
-    let argv = argv.unwrap_or_else(|| {
-        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-        std::iter::once(exe).chain(std::env::args().skip(1)).collect()
-    });
+/// the node again with `argv`. The wait matters: the single-instance guard
+/// and the bound ports are only free once the old process is gone. Only ever
+/// called with an argv the embedding shell registered explicitly
+/// ([`AppState::set_restart_argv`]) - there is no environment-derived
+/// fallback, so a node whose shell cannot relaunch (the mobile apps) plainly
+/// shuts down instead.
+fn spawn_relauncher(argv: &[String]) {
     if argv.first().map(|s| s.is_empty()).unwrap_or(true) {
         return;
     }
@@ -1293,10 +1304,18 @@ impl AppState {
         pending
     }
 
-    /// The argv a requested restart relaunches with (embedding shells override
-    /// the default self-relaunch; the desktop browser passes `--background`).
+    /// Register the argv a requested restart relaunches with. Only shells that
+    /// really can respawn the process set one (the desktop browser passes
+    /// `--background`); without it a restart request is a plain shutdown and
+    /// the Config page words its restart bar accordingly.
     pub fn set_restart_argv(&self, argv: Vec<String>) {
         *self.restart_argv.lock().unwrap() = Some(argv);
+    }
+
+    /// Whether a restart can actually relaunch the node (a shell registered
+    /// a relaunch argv).
+    pub fn can_restart(&self) -> bool {
+        self.restart_argv.lock().unwrap().is_some()
     }
 
     /// Stop the node process; with `restart` a detached helper waits for this
@@ -1311,11 +1330,11 @@ impl AppState {
         .await;
         self.persist_peers().await;
         self.persist_sites().await;
-        let argv = if restart { Some(self.restart_argv.lock().unwrap().clone()) } else { None };
+        let argv = if restart { self.restart_argv.lock().unwrap().clone() } else { None };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             if let Some(argv) = argv {
-                spawn_relauncher(argv);
+                spawn_relauncher(&argv);
             }
             std::process::exit(0);
         });
