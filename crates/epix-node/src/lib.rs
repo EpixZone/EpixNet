@@ -1400,6 +1400,11 @@ async fn serve(
         open_in_browser(&format!("http://{bind}/{display}/"));
     }
 
+    // Boot has applied (and possibly written) every restart-only config key by
+    // now; snapshot them so the Config page can tell a saved-but-not-yet-live
+    // change apart and offer a restart.
+    state.snapshot_boot_config().await;
+
     let server =
         UiServer::with_registry_and_media(state.clone(), plugins.command_registry(), plugins.media_bundle());
     Ok((server, RunningNode { state, display, address, ui_addr: bind }))

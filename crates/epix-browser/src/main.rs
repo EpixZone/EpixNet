@@ -322,6 +322,13 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     let start_url = format!("{scheme}://{display}/");
     let child = launch_browser(background, &firefox, &profile, &start_url);
 
+    // A Config-page restart relaunches this executable in background mode:
+    // the node comes back up without popping a second browser window, and the
+    // already-open window reconnects on its own.
+    if let Ok(exe) = std::env::current_exe() {
+        running.state.set_restart_argv(vec![exe.display().to_string(), "--background".to_string()]);
+    }
+
     // I2P on/off comes from the node config (the boot above defaults it to
     // "embedded" unless the user disabled it on the Config page).
     let i2p_on = running
