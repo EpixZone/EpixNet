@@ -93,29 +93,47 @@ android {
 }
 
 // Stage the Epix Wallet WebExtension (the forked Keplr's Firefox build) into
-// assets so MainActivity can installBuiltIn it. Prefers the repo staging dir
-// shells/wallet-ext (populated by epix-browser's build.rs or a local wallet
-// build); otherwise downloads the prebuilt artifact from the epix-wallet
-// repo's rolling wallet-dist release. GeckoView additionally needs the
-// geckoViewAddons permission for native messaging, which the desktop manifest
-// does not carry, so it is patched in here. Delete the assets dir to re-stage.
-val walletDistUrl =
-    "https://github.com/EpixZone/epix-wallet/releases/download/wallet-dist/epix-wallet-firefox.zip"
+// assets so MainActivity can installBuiltIn it. The wallet build is pinned by
+// shells/wallet-ext.rev (an epix-wallet commit); this stages that build's
+// immutable wallet-<rev> release, matching the desktop build (build.rs). It
+// prefers the repo staging dir shells/wallet-ext when that already holds the
+// pinned rev (populated by build.rs or a local wallet build), else downloads
+// the release. A pin bump re-stages; an unchanged pin reuses the staged copy.
+// GeckoView additionally needs the geckoViewAddons permission for native
+// messaging, which the desktop manifest does not carry, so it is patched in.
+val walletRev =
+    layout.projectDirectory.file("../../wallet-ext.rev").asFile
+        .takeIf { it.exists() }?.readText()?.trim().orEmpty()
+
+fun walletDistUrl(rev: String) =
+    "https://github.com/EpixZone/epix-wallet/releases/download/wallet-$rev/epix-wallet-firefox.zip"
 
 val stageWalletExt by tasks.registering {
     val dest = layout.projectDirectory.dir("src/main/assets/extensions/wallet").asFile
     val staged = layout.projectDirectory.dir("../../wallet-ext").asFile
+    val stagedStamp = layout.projectDirectory.file("../../wallet-ext.rev-stamp").asFile
+    // The rev this assets copy was staged from (assets/extensions is gitignored).
+    val destStamp = File(dest.parentFile, "wallet.rev-stamp")
     outputs.dir(dest)
+    inputs.property("walletRev", walletRev)
     doLast {
+        if (walletRev.isEmpty())
+            throw GradleException("wallet pin ../../wallet-ext.rev is missing or empty")
         val manifest = File(dest, "manifest.json")
-        if (manifest.exists()) return@doLast
+        val current = destStamp.takeIf { it.exists() }?.readText()?.trim()
+        if (manifest.exists() && current == walletRev) return@doLast
+
+        dest.deleteRecursively()
         dest.mkdirs()
-        if (File(staged, "manifest.json").exists()) {
+        // Reuse shells/wallet-ext only when it already holds the pinned rev.
+        val stagedOk = File(staged, "manifest.json").exists() &&
+            stagedStamp.takeIf { it.exists() }?.readText()?.trim() == walletRev
+        if (stagedOk) {
             staged.copyRecursively(dest, overwrite = true)
             File(dest, "README.md").delete()
         } else {
             val zip = File.createTempFile("epix-wallet", ".zip")
-            uri(walletDistUrl).toURL().openStream().use { input ->
+            uri(walletDistUrl(walletRev)).toURL().openStream().use { input ->
                 zip.outputStream().use { input.copyTo(it) }
             }
             copy {
@@ -132,6 +150,7 @@ val stageWalletExt by tasks.registering {
             perms.add("geckoViewAddons")
             manifest.writeText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(json)))
         }
+        destStamp.writeText(walletRev)
     }
 }
 tasks.named("preBuild") { dependsOn(stageWalletExt) }
