@@ -46,7 +46,9 @@ pub struct NodeOptions {
     pub target: String,
     /// The UI HTTP/WebSocket bind, e.g. `127.0.0.1:43110`.
     pub ui_addr: String,
-    /// Tor routing mode: `disable` / `enable` / `always`.
+    /// Tor routing mode: `disable` / `enable` / `always`. Empty means "no
+    /// explicit choice": boot uses the Config page's persisted `tor` value,
+    /// defaulting to `enable`.
     pub tor_mode: String,
     /// Open the served xite in the OS browser once serving (desktop only;
     /// shells that own their own webview pass `false`).
@@ -69,7 +71,7 @@ impl NodeOptions {
             data_root: data_root.into(),
             target: target.into(),
             ui_addr: DEFAULT_UI_ADDR.to_string(),
-            tor_mode: "enable".to_string(),
+            tor_mode: String::new(),
             open_browser: false,
             geoip_gz: None,
             log_file: None,
@@ -1234,11 +1236,22 @@ async fn serve(
         state.set_fileserver_port(port).await;
     }
 
+    // Tor mode: an explicit option (EPIX_TOR / a shell's own setting) wins;
+    // otherwise the Config page's persisted choice; otherwise enable. Without
+    // the config fallback the Config page's Tor select would be dead UI - the
+    // desktop launcher always passes a value, so the stored choice was ignored.
     #[cfg(feature = "tor")]
     let tor_mode = if offline {
         epix_runtime::TorMode::Disable
-    } else {
+    } else if !opts.tor_mode.is_empty() {
         epix_runtime::TorMode::parse(&opts.tor_mode)
+    } else {
+        let configured = state
+            .config_get("tor")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "enable".to_string());
+        epix_runtime::TorMode::parse(&configured)
     };
 
     // Privacy by default: turn the embedded I2P router on the first time a node

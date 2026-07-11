@@ -127,7 +127,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ),
     ("Network", "fileserver_port", "File server port (0 to disable seeding)", "26552", "text"),
     ("Network", "ip_external", "File server external ip (blank = auto-detect via UPnP)", "", "textarea"),
-    ("Network", "tor", "Tor", "enable", "select:Disable=disable|Enable=enable|Always=always"),
+    (
+        "Network",
+        "tor",
+        "Tor (Always routes all peer traffic through Tor; restart EpixNet to apply)",
+        "enable",
+        "select:Disable=disable|Enable=enable|Always=always",
+    ),
     ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
     (
         "Network",
