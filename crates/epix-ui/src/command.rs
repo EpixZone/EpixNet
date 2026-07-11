@@ -1363,6 +1363,16 @@ impl WsCommand for XidResolve {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = xid_param(p, "address").ok_or("xidResolve: address required")?;
+        // Dotted values are xID directory names (e.g. "mud.epix"), not linked
+        // addresses: xites pass the per-user data directory here. Forward-
+        // resolve them, like xidResolveBatch does; the reverse lookup below
+        // would just negative-cache a name.
+        if address.contains('.') {
+            return Ok(epix_chain::xid_identity::resolve_name(address)
+                .await
+                .map(|i| xid_info_value(&i))
+                .unwrap_or(Value::Null));
+        }
         if let Some(info) = epix_chain::xid_identity::resolve_identity(address).await {
             return Ok(xid_info_value(&info));
         }
@@ -1666,10 +1676,20 @@ impl WsCommand for SitePublish {
         let sign = p.get("sign").and_then(|v| v.as_bool()).unwrap_or(true);
         let inner_path = s.state.content_inner_path(&address, &inner_path).await;
         if sign {
+            // `"stored"` = use the site key saved in users.json (see sign_for).
+            let privatekey = match sign_privatekey(p) {
+                Some(pk) if pk == "stored" => Some(
+                    s.state
+                        .site_privatekey(&address)
+                        .await
+                        .ok_or("Site sign failed: Private key not found in users.json")?,
+                ),
+                other => other,
+            };
             if inner_path == "content.json" {
                 // Root: sign with the given key or the saved site key; with
                 // neither, the file is assumed already signed.
-                let key = match sign_privatekey(p) {
+                let key = match privatekey {
                     Some(pk) => Some(pk),
                     None => s.state.site_privatekey(&address).await,
                 };
@@ -1678,7 +1698,7 @@ impl WsCommand for SitePublish {
                 }
             } else {
                 s.state
-                    .sign_user_content(&address, &inner_path, sign_privatekey(p), Some(s.id))
+                    .sign_user_content(&address, &inner_path, privatekey, Some(s.id))
                     .await?;
             }
         }
@@ -1714,6 +1734,18 @@ async fn sign_for(
     inner_path: &str,
     privatekey: Option<String>,
 ) -> Result<String, String> {
+    // `"stored"` is EpixNet's sentinel for "use the site key saved in
+    // users.json" (the sidebar and wrapper infopanel send it when
+    // site_info.privatekey is true) - never a literal key.
+    let privatekey = match privatekey {
+        Some(pk) if pk == "stored" => Some(
+            s.state
+                .site_privatekey(address)
+                .await
+                .ok_or("Site sign failed: Private key not found in users.json")?,
+        ),
+        other => other,
+    };
     let content_path = s.state.content_inner_path(address, inner_path).await;
     if content_path == "content.json" {
         let key = match privatekey {

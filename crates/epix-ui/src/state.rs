@@ -5448,6 +5448,7 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.own = owned;
         }
+        self.persist_sites().await;
     }
 
     /// Try to recover a xite's private key from the user's master seed via its
@@ -6527,6 +6528,11 @@ impl AppState {
             .unwrap_or_default();
         let cert_user_id = self.user.read().await.cert_user_id(address);
         let xid_directory = self.user_directory(address, &auth_address).await;
+        // Whether users.json holds this site's own private key (a bool, never
+        // the key itself) - EpixNet's formatSiteInfo parity. The wrapper
+        // infopanel and the sidebar sign/publish buttons key off this: true ->
+        // sign with `privatekey: "stored"`, false -> prompt for the key.
+        let has_privatekey = self.user.read().await.site_privatekey(address).is_some();
 
         let address_hash = hex::encode(Sha256::digest(address.as_bytes()));
         let short = if address.len() > 6 { &address[..6] } else { address };
@@ -6561,6 +6567,7 @@ impl AppState {
         json!({
             "auth_address": auth_address,
             "cert_user_id": cert_user_id,
+            "privatekey": has_privatekey,
             "feed_follow_num": feed_follow_num,
             "xid_directory": xid_directory,
             "address": address,

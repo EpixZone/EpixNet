@@ -54,6 +54,21 @@ fn skip_hashing(rel: &str) -> bool {
     base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
 }
 
+/// The content's `ignore` pattern compiled with EpixNet's `re.match`
+/// semantics (anchored at the start of the relative path). An invalid or
+/// missing pattern ignores nothing.
+fn ignore_regex(pat: Option<&Value>) -> Option<fancy_regex::Regex> {
+    let pat = pat?.as_str()?;
+    if pat.is_empty() {
+        return None;
+    }
+    fancy_regex::Regex::new(&format!("^(?:{pat})")).ok()
+}
+
+fn is_ignored(re: &Option<fancy_regex::Regex>, rel: &str) -> bool {
+    re.as_ref().is_some_and(|re| re.is_match(rel).unwrap_or(false))
+}
+
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -422,12 +437,28 @@ impl Xite {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
+        let listing = self.storage.list_files();
+        // Directories governed by their own content.json (includes, per-user
+        // dirs): their files are separate signed units, never the root's.
+        let nested_dirs: Vec<String> = listing
+            .iter()
+            .filter(|f| f.ends_with("/content.json"))
+            .map(|f| f[..f.len() - "content.json".len()].to_string())
+            .collect();
+        let ignore = ignore_regex(content.get("ignore"));
+
         let mut files = serde_json::Map::new();
-        for inner in self.storage.list_files() {
+        for inner in listing {
             if inner == "content.json" || inner.ends_with("/content.json") || optional.contains(&inner) {
                 continue;
             }
             if skip_hashing(&inner) {
+                continue;
+            }
+            if nested_dirs.iter().any(|d| inner.starts_with(d.as_str())) {
+                continue;
+            }
+            if is_ignored(&ignore, &inner) {
                 continue;
             }
             let bytes = self.storage.read(&inner)?;
@@ -525,13 +556,28 @@ impl Xite {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
         let prefix = format!("{dir}/");
+        let listing = self.storage.list_files();
+        // Nested content.json units inside this directory own their subtrees.
+        let nested_dirs: Vec<String> = listing
+            .iter()
+            .filter_map(|f| f.strip_prefix(&prefix))
+            .filter(|rel| rel.ends_with("/content.json"))
+            .map(|rel| rel[..rel.len() - "content.json".len()].to_string())
+            .collect();
+        let ignore = ignore_regex(map.get("ignore"));
         let mut files = serde_json::Map::new();
-        for inner in self.storage.list_files() {
+        for inner in listing {
             let Some(rel) = inner.strip_prefix(&prefix) else { continue };
             if rel == "content.json" || rel.ends_with("/content.json") || optional.contains(rel) {
                 continue;
             }
             if skip_hashing(rel) {
+                continue;
+            }
+            if nested_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
+                continue;
+            }
+            if is_ignored(&ignore, rel) {
                 continue;
             }
             let bytes = self.storage.read(&inner)?;
