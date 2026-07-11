@@ -22,12 +22,15 @@ separate `EpixZone/epix-wallet` repo (branch `epix`); the shells consume a
 prebuilt artifact, so you do not need a wallet checkout to build them.
 
 - The wallet's CI builds the Firefox WebExtension on every push to `epix` and
-  publishes it to a rolling `wallet-dist` GitHub release
-  (`epix-wallet-firefox.zip`).
+  publishes it to an immutable `wallet-<rev>` GitHub release
+  (`epix-wallet-firefox.zip`), one per commit.
+- `shells/wallet-ext.rev` pins which wallet commit to embed. Bumping it (a
+  one-line PR) is how EpixNet adopts a new wallet, keeping builds reproducible.
 - `shells/wallet-ext/` is the staging directory (gitignored except its
-  README). When empty, `epix-browser`'s `build.rs` downloads the release into
-  it before compiling; the Android build stages it into assets and the iOS
-  build references it as a bundle resource.
+  README). `epix-browser`'s `build.rs` downloads the pinned release into it
+  before compiling (skipped when the staged copy already matches the pin); the
+  Android build stages it into assets and the iOS build references it as a
+  bundle resource.
 - Overrides for wallet development: `EPIX_WALLET_DIST=/path/to/epix-wallet/apps/extension/build/firefox`
   copies a local build instead of downloading; `EPIX_WALLET_SKIP=1` builds
   without the wallet (desktop only). See `shells/wallet-ext/README.md`.

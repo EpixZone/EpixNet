@@ -11,10 +11,11 @@
 //! Prefs to allow the unsigned extension (Developer Edition / ESR) are set by
 //! the profile writer.
 //!
-//! `shells/wallet-ext` is a build artifact (gitignored): when it is empty,
-//! this crate's `build.rs` downloads the prebuilt wallet from the epix-wallet
-//! repo's rolling `wallet-dist` release before `include_dir!` embeds it (see
-//! `shells/wallet-ext/README.md` for local-build overrides).
+//! `shells/wallet-ext` is a build artifact (gitignored): when it is missing or
+//! stale, this crate's `build.rs` downloads the wallet build pinned by
+//! `shells/wallet-ext.rev` (its immutable `wallet-<rev>` release) before
+//! `include_dir!` embeds it (see `shells/wallet-ext/README.md` for local-build
+//! overrides and how to bump the pin).
 
 use include_dir::{include_dir, Dir};
 use std::io::Write;

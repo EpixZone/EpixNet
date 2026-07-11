@@ -52,6 +52,11 @@ ios/**/project.xcworkspace/
 # are committed so a fresh checkout still compiles; run the build to populate.
 /shells/wallet-ext/*
 !/shells/wallet-ext/README.md
+# The rev of the staged wallet copy (compared to the shells/wallet-ext.rev pin
+# to detect a stale copy), and the transient extract dir a fetch uses before
+# moving files into place. The pin file itself (wallet-ext.rev) IS tracked.
+/shells/wallet-ext.rev-stamp
+/shells/wallet-ext.tmp/
 
 # Android copy of the wallet build artifact (staged by gradle stageWalletExt)
 /shells/android/app/src/main/assets/extensions/
