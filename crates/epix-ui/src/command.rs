@@ -1045,23 +1045,24 @@ impl WsCommand for ServerUpdate {
 }
 
 /// `serverShutdown` - ADMIN: stop the node process. The shells supervise the
-/// process, so exit is the shutdown; state persists continuously.
+/// process, so exit is the shutdown; state persists continuously. With
+/// `{restart: true}` (the Config page after a restart-only setting changed) a
+/// detached helper starts the node again once this process is gone.
 struct ServerShutdown;
 #[async_trait]
 impl WsCommand for ServerShutdown {
     fn name(&self) -> &'static str {
         "serverShutdown"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        s.state.push_notification("info", "Shutting down...", 5000);
-        s.state.log("INFO", "Shutdown requested over the WS API".to_string()).await;
-        s.state.persist_peers().await;
-        s.state.persist_sites().await;
-        tokio::spawn(async {
-            // Give the response + notification a moment to flush.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            std::process::exit(0);
-        });
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let restart = p
+            .get("restart")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let msg = if restart { "Restarting..." } else { "Shutting down..." };
+        s.state.push_notification("info", msg, 5000);
+        s.state.shutdown(restart).await;
         Ok(Value::from("ok"))
     }
 }

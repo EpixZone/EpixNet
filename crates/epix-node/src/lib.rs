@@ -225,6 +225,13 @@ fn resolve_ui_bind_with(
 /// server binary and the FFI background thread.
 pub async fn run(opts: NodeOptions) -> Result<(), String> {
     let (server, running) = boot(opts).await?;
+    // A standalone binary can relaunch itself for the Config page's restart.
+    // Shells that call `boot` directly register their own argv (the desktop
+    // browser) or none at all (the mobile apps, where the node is a library
+    // and a restart request is a plain shutdown).
+    if let Some(exe) = epix_ui::self_exe() {
+        running.state.set_restart_argv(vec![exe]);
+    }
     server.serve(running.ui_addr).await.map_err(|e| format!("server: {e}"))
 }
 
@@ -1399,6 +1406,11 @@ async fn serve(
     if opts.open_browser {
         open_in_browser(&format!("http://{bind}/{display}/"));
     }
+
+    // Boot has applied (and possibly written) every restart-only config key by
+    // now; snapshot them so the Config page can tell a saved-but-not-yet-live
+    // change apart and offer a restart.
+    state.snapshot_boot_config().await;
 
     let server =
         UiServer::with_registry_and_media(state.clone(), plugins.command_registry(), plugins.media_bundle());

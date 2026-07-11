@@ -224,6 +224,32 @@ pub fn is_config_action(kind: &str) -> bool {
     kind.starts_with("button:")
 }
 
+/// Config keys the node only reads while booting - changing one takes effect
+/// on the next start. The Config page offers a restart when one of these has
+/// changed since boot (`data_dir` is tracked separately off epixnet.conf).
+pub const CONFIG_RESTART_KEYS: &[&str] = &[
+    "offline",
+    "fileserver_ip_type",
+    "fileserver_port",
+    "tor",
+    "i2p",
+    "i2p_sam_port",
+    "mesh",
+    "mesh_peers",
+    "mesh_listen",
+    "trackers",
+];
+
+/// A config value normalized for change comparison: strings trimmed, bools and
+/// numbers in their canonical text form (config.json written by the Python
+/// client holds real numbers/bools where the Config page saves strings).
+fn config_value_str(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.trim().to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// The input to [`AppState::add_xite`]: a xite's storage and (if loaded) its
 /// verified content.json. Settings/stats are derived from these.
 pub struct XiteEntry {
@@ -334,6 +360,15 @@ pub struct AppState {
     /// survives restarts.
     config: RwLock<serde_json::Map<String, Value>>,
     config_path: Option<PathBuf>,
+    /// Effective values of [`CONFIG_RESTART_KEYS`] captured when boot finished
+    /// applying them ([`Self::snapshot_boot_config`]). The Config page marks a
+    /// key "pending restart" when its saved value has drifted from this. None
+    /// until snapshotted (test/in-memory nodes never are, so nothing pends).
+    boot_config: std::sync::Mutex<Option<HashMap<String, String>>>,
+    /// The argv a requested restart relaunches with. Set by the embedding
+    /// shell - the desktop browser relaunches itself with `--background` so no
+    /// second window pops. None relaunches the current exe with its own args.
+    restart_argv: std::sync::Mutex<Option<Vec<String>>>,
     /// Names of loaded plugins/features, reported in `serverInfo` (the dashboard
     /// menu shows plugin-gated items like Stats from this).
     plugins: RwLock<Vec<String>>,
@@ -581,6 +616,62 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The running executable's canonical path, for building a self-relaunch
+/// argv. This is exec plumbing, not an authorization decision: the value
+/// comes from the kernel (/proc/self/exe, _NSGetExecutablePath,
+/// GetModuleFileNameW - not argv[0]), is resolved to a real path right away,
+/// and must name an existing file. Anyone who could swap it already runs
+/// code as this user.
+pub fn self_exe() -> Option<String> {
+    let exe = std::env::current_exe().ok()?; // nosemgrep: rust.lang.security.current-exe.current-exe
+    let exe = exe.canonicalize().ok()?;
+    exe.is_file().then(|| exe.display().to_string())
+}
+
+/// Launch a detached helper that waits for this process to die, then starts
+/// the node again with `argv`. The wait matters: the single-instance guard
+/// and the bound ports are only free once the old process is gone. Only ever
+/// called with an argv the embedding shell registered explicitly
+/// ([`AppState::set_restart_argv`]) - there is no environment-derived
+/// fallback, so a node whose shell cannot relaunch (the mobile apps) plainly
+/// shuts down instead.
+fn spawn_relauncher(argv: &[String]) {
+    if argv.first().map(|s| s.is_empty()).unwrap_or(true) {
+        return;
+    }
+    let pid = std::process::id();
+    #[cfg(unix)]
+    {
+        let sq = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let cmd = format!(
+            "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; exec {}",
+            argv.iter().map(|a| sq(a)).collect::<Vec<_>>().join(" ")
+        );
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(windows)]
+    {
+        let pq = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut cmd = format!(
+            "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Process -FilePath {}",
+            pq(&argv[0])
+        );
+        let args = argv[1..].iter().map(|a| pq(a)).collect::<Vec<_>>().join(",");
+        if !args.is_empty() {
+            cmd.push_str(&format!(" -ArgumentList {args}"));
+        }
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &cmd])
+            .spawn();
+    }
+}
+
 impl AppState {
     /// In-memory node with a freshly generated user identity.
     pub fn new(version: impl Into<String>) -> Arc<Self> {
@@ -613,6 +704,8 @@ impl AppState {
             events: tokio::sync::broadcast::channel(4096).0,
             config: RwLock::new(serde_json::Map::new()),
             config_path: None,
+            boot_config: std::sync::Mutex::new(None),
+            restart_argv: std::sync::Mutex::new(None),
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
@@ -726,6 +819,8 @@ impl AppState {
             events: tokio::sync::broadcast::channel(4096).0,
             config: RwLock::new(config),
             config_path: Some(config_path),
+            boot_config: std::sync::Mutex::new(None),
+            restart_argv: std::sync::Mutex::new(None),
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
@@ -1135,7 +1230,10 @@ impl AppState {
     }
 
     /// `configList` - the editable config keys with current value + default.
+    /// `pending` marks a restart-only key whose saved value this run did not
+    /// boot with, so the change waits for the next start.
     pub async fn config_list(&self) -> Value {
+        let pending = self.restart_pending_keys().await;
         let mut back = serde_json::Map::new();
         for (_section, key, _label, default, kind) in CONFIG_SCHEMA {
             if is_config_action(kind) {
@@ -1146,9 +1244,100 @@ impl AppState {
             } else {
                 (self.config_get(key).await.unwrap_or_else(|| json!(default)), json!(default))
             };
-            back.insert(key.to_string(), json!({ "value": value, "default": default, "pending": false }));
+            back.insert(
+                key.to_string(),
+                json!({ "value": value, "default": default, "pending": pending.iter().any(|p| p == key) }),
+            );
         }
         Value::Object(back)
+    }
+
+    /// A key's effective value for change comparison: the saved config value,
+    /// else the schema default, normalized to canonical text.
+    async fn config_effective(&self, key: &str, default: &str) -> String {
+        match self.config_get(key).await {
+            Some(v) => config_value_str(&v),
+            None => default.trim().to_string(),
+        }
+    }
+
+    /// Capture the restart-only keys' effective values once boot has applied
+    /// them (epix-node calls this at the end of boot, after boot's own
+    /// config writes like the I2P autostart). [`Self::restart_pending_keys`]
+    /// diffs against this snapshot.
+    pub async fn snapshot_boot_config(&self) {
+        let mut snap = HashMap::new();
+        for (_section, key, _label, default, _kind) in CONFIG_SCHEMA {
+            if CONFIG_RESTART_KEYS.contains(key) {
+                snap.insert(key.to_string(), self.config_effective(key, default).await);
+            }
+        }
+        *self.boot_config.lock().unwrap() = Some(snap);
+    }
+
+    /// Config keys whose saved value differs from what this run booted with -
+    /// the changes only a restart applies. Includes `data_dir` when a move is
+    /// staged in epixnet.conf.
+    pub async fn restart_pending_keys(&self) -> Vec<String> {
+        let snap = self.boot_config.lock().unwrap().clone();
+        let mut pending = Vec::new();
+        if let Some(snap) = snap {
+            for (_section, key, _label, default, _kind) in CONFIG_SCHEMA {
+                if let Some(boot) = snap.get(*key) {
+                    if *boot != self.config_effective(key, default).await {
+                        pending.push(key.to_string());
+                    }
+                }
+            }
+        }
+        // data_dir applies from epixnet.conf on the next start: pending when
+        // the staged root (or the default, when the entry was removed) is not
+        // the one this run opened.
+        let conf = self.data_dir_conf.lock().unwrap().clone();
+        if let (Some(conf), Some(root)) = (conf, &self.data_root) {
+            let staged = crate::paths::read_conf_data_dir(&conf)
+                .unwrap_or_else(crate::paths::default_data_root);
+            if &staged != root {
+                pending.push("data_dir".to_string());
+            }
+        }
+        pending
+    }
+
+    /// Register the argv a requested restart relaunches with. Only shells that
+    /// really can respawn the process set one (the desktop browser passes
+    /// `--background`); without it a restart request is a plain shutdown and
+    /// the Config page words its restart bar accordingly.
+    pub fn set_restart_argv(&self, argv: Vec<String>) {
+        *self.restart_argv.lock().unwrap() = Some(argv);
+    }
+
+    /// Whether a restart can actually relaunch the node (a shell registered
+    /// a relaunch argv).
+    pub fn can_restart(&self) -> bool {
+        self.restart_argv.lock().unwrap().is_some()
+    }
+
+    /// Stop the node process; with `restart` a detached helper waits for this
+    /// process to die and starts it again (the Config page's restart button
+    /// and `serverShutdown {restart: true}`). State is persisted first, then
+    /// exit is delayed a moment so the caller's response can flush.
+    pub async fn shutdown(&self, restart: bool) {
+        self.log(
+            "INFO",
+            format!("Shutdown requested ({})", if restart { "restart" } else { "quit" }),
+        )
+        .await;
+        self.persist_peers().await;
+        self.persist_sites().await;
+        let argv = if restart { self.restart_argv.lock().unwrap().clone() } else { None };
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            if let Some(argv) = argv {
+                spawn_relauncher(&argv);
+            }
+            std::process::exit(0);
+        });
     }
 
     // --- Data directory (the `data_dir` config key) --------------------------
@@ -7958,6 +8147,60 @@ mod tests {
         assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(target.clone()));
         // The old root stays in place as a backup.
         assert!(old.path().join("private/users.json").exists());
+    }
+
+    #[tokio::test]
+    async fn restart_pending_tracks_boot_snapshot() {
+        let dir = tempdir().unwrap();
+        let s = AppState::with_data_dir("test", dir.path());
+        // No snapshot yet (test nodes don't boot): nothing pends.
+        s.config_set("fileserver_port", json!("26000")).await;
+        assert!(s.restart_pending_keys().await.is_empty());
+
+        s.snapshot_boot_config().await;
+        assert!(s.restart_pending_keys().await.is_empty());
+
+        // A restart-only key drifting from the boot value pends...
+        s.config_set("fileserver_port", json!("26001")).await;
+        assert_eq!(s.restart_pending_keys().await, vec!["fileserver_port".to_string()]);
+        // ...a live key does not...
+        s.config_set("language", json!("de")).await;
+        assert_eq!(s.restart_pending_keys().await, vec!["fileserver_port".to_string()]);
+        // ...and changing it back clears the pending state.
+        s.config_set("fileserver_port", json!("26000")).await;
+        assert!(s.restart_pending_keys().await.is_empty());
+
+        // Bool/number forms normalize: the Python client wrote real JSON
+        // types where the Config page saves strings.
+        s.config_set("offline", json!(false)).await;
+        s.snapshot_boot_config().await;
+        s.config_set("offline", json!("false")).await;
+        assert!(s.restart_pending_keys().await.is_empty());
+        s.config_set("offline", json!("true")).await;
+        assert_eq!(s.restart_pending_keys().await, vec!["offline".to_string()]);
+
+        // configList reports the same key as pending.
+        let list = s.config_list().await;
+        assert_eq!(list["offline"]["pending"], true);
+        assert_eq!(list["language"]["pending"], false);
+    }
+
+    #[tokio::test]
+    async fn restart_pending_includes_staged_data_dir() {
+        let dir = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let conf = dir.path().join("epixnet.conf");
+        // The conf names the root this node runs on (as after a normal boot).
+        crate::paths::write_conf_data_dir(&conf, Some(dir.path())).unwrap();
+        let s = AppState::with_data_dir("test", dir.path());
+        s.set_data_dir_conf(&conf);
+        s.snapshot_boot_config().await;
+        assert!(s.restart_pending_keys().await.is_empty());
+
+        // Staging a move in epixnet.conf pends data_dir until the next start.
+        let target = target.path().join("new-root");
+        s.set_data_dir(target.to_str().unwrap()).await.unwrap();
+        assert_eq!(s.restart_pending_keys().await, vec!["data_dir".to_string()]);
     }
 
     #[tokio::test]

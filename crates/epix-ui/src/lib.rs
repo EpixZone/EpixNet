@@ -20,7 +20,9 @@ pub mod tracker;
 pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
-pub use state::{AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry, DEFAULT_SIZE_LIMIT_MB};
+pub use state::{
+    self_exe, AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry, DEFAULT_SIZE_LIMIT_MB,
+};
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -844,18 +846,26 @@ async fn render_wrapper(
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct PluginsQuery {
-    toggle: Option<String>,
-}
-
-/// `GET /Plugins` - the plugin manager page. `?toggle=<name>` flips a plugin's
-/// enabled state (persisted) and redirects back; the change takes effect on the
-/// next page load, no restart.
-async fn serve_plugins_page(State(ctx): State<Ctx>, Query(q): Query<PluginsQuery>) -> Response {
-    if let Some(name) = q.toggle {
-        let enabled = ctx.state.plugin_enabled(&name).await;
-        ctx.state.set_plugin_enabled(&name, !enabled).await;
+/// `GET /Plugins` - the plugin manager page. Toggles are staged on the page
+/// and applied together via `?save=1&<name>=on|off` (the floating save bar);
+/// `?toggle=<name>` still flips one directly as the no-JS fallback. Either
+/// way the change takes effect on the next page load, no restart.
+async fn serve_plugins_page(
+    State(ctx): State<Ctx>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Some(name) = q.get("toggle") {
+        let enabled = ctx.state.plugin_enabled(name).await;
+        ctx.state.set_plugin_enabled(name, !enabled).await;
+        return Redirect::to("/Plugins").into_response();
+    }
+    if q.contains_key("save") {
+        let known = ctx.state.plugin_states().await;
+        for (name, val) in &q {
+            if known.iter().any(|(n, _, _)| n == name) {
+                ctx.state.set_plugin_enabled(name, val == "on").await;
+            }
+        }
         return Redirect::to("/Plugins").into_response();
     }
     let states = ctx.state.plugin_states().await;
@@ -897,8 +907,9 @@ fn plugin_description(name: &str) -> &'static str {
 }
 
 /// Render the plugin manager page (sliding toggle switches, one row per
-/// plugin). The toggle is a link (`/Plugins?toggle=…`) so it works without
-/// JS/WebSocket.
+/// plugin). With JS a click only stages the change and a floating save bar
+/// applies them together; the link href (`/Plugins?toggle=…`) stays as the
+/// no-JS fallback where each click applies directly.
 fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str, theme: &str) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
@@ -906,22 +917,62 @@ fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str, theme: &
         let checked = if *enabled { "checked" } else { "" };
         let default_txt = if *default_enabled { "enabled" } else { "disabled" };
         rows.push_str(&format!(
-            "<div class='plugin'>\
+            "<div class='plugin' data-name='{name}' data-enabled='{on}'>\
                <div class='title'><h3>{name}</h3>\
                  <div class='description'>{descr} <span class='default'>(default: {default_txt})</span></div></div>\
                <a class='value value-right checkbox {checked}' href='/Plugins?toggle={name}' \
-                  title='{action} {name}'><div class='checkbox-skin'></div></a>\
+                  title='Toggle {name}'><div class='checkbox-skin'></div></a>\
              </div>",
             name = esc(name),
+            on = if *enabled { "1" } else { "0" },
             descr = esc(plugin_description(name)),
-            action = if *enabled { "Disable" } else { "Enable" },
         ));
     }
     if rows.is_empty() {
         rows.push_str("<div class='description'>No plugins loaded.</div>");
     }
-    page_shell("Plugins", "Plugins", "", &format!("<div class='plugins'>{rows}</div>"), homepage, theme)
+    let body = format!(
+        "<div class='plugins'>{rows}</div>\
+         <div class='bottom bottom-save' id='bottom-save'>\
+           <div class='bottom-content'>\
+             <div class='title'><span><span id='save-count'>0</span> <span id='save-what'>plugins</span> changed</span></div>\
+             <a class='button button-submit' id='save-btn' href='#save'>Save changes</a>\
+           </div>\
+         </div>{PLUGINS_PAGE_JS}"
+    );
+    page_shell("Plugins", "Plugins", "", &body, homepage, theme)
 }
+
+/// Client script for the plugin manager: stage toggle clicks, show the
+/// floating save bar with the changed count, apply staged changes together
+/// via `/Plugins?save=1`.
+const PLUGINS_PAGE_JS: &str = "<script>(function(){\
+var changed={};\
+var rows=Array.prototype.slice.call(document.querySelectorAll('.plugin[data-name]'));\
+function apply(){\
+var n=Object.keys(changed).length;\
+document.getElementById('save-count').textContent=n;\
+document.getElementById('save-what').textContent=n===1?'plugin':'plugins';\
+document.getElementById('bottom-save').classList.toggle('visible',n>0);\
+}\
+rows.forEach(function(row){\
+var a=row.querySelector('a.checkbox');if(!a)return;\
+a.addEventListener('click',function(e){\
+e.preventDefault();\
+a.classList.toggle('checked');\
+var name=row.getAttribute('data-name');\
+var initial=row.getAttribute('data-enabled')==='1';\
+var now=a.classList.contains('checked');\
+if(now===initial){delete changed[name];}else{changed[name]=now;}\
+apply();\
+});\
+});\
+document.getElementById('save-btn').addEventListener('click',function(e){\
+e.preventDefault();\
+var q=Object.keys(changed).map(function(k){return encodeURIComponent(k)+'='+(changed[k]?'on':'off');});\
+if(q.length){location.href='/Plugins?save=1&'+q.join('&');}\
+});\
+})();</script>";
 
 /// `GET /Config` - the node settings page. `?save=1&<key>=<value>` persists the
 /// changed keys (via configSet) and redirects back.
@@ -935,6 +986,16 @@ async fn serve_config_page(
             // The resolver cache is per-request at the chain layer, so there's
             // nothing persistent to drop; the call succeeds like EpixNet's.
             return Redirect::to("/Config?cleared=1").into_response();
+        }
+        if action == "restart" {
+            // The restart bar's button: stop the node and relaunch once the
+            // process is gone. The page returned keeps polling and comes back
+            // to /Config when the node answers again.
+            ctx.state.push_notification("info", "Restarting...", 5000);
+            ctx.state.shutdown(true).await;
+            let theme = ctx.state.theme_class().await;
+            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme))
+                .into_response();
         }
         return Redirect::to("/Config").into_response();
     }
@@ -995,10 +1056,37 @@ async fn serve_config_page(
     } else {
         params.get("error").map(|msg| (false, msg.clone()))
     };
+    let pending = ctx.state.restart_pending_keys().await;
+    let can_restart = ctx.state.can_restart();
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     let theme = ctx.state.theme_class().await;
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_config_page(&values, flash, &homepage, &theme))
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        render_config_page(&values, &pending, can_restart, flash, &homepage, &theme),
+    )
         .into_response()
+}
+
+/// The page shown after the restart button: the node is going down, so the
+/// page itself polls until /Config answers again and then returns there. The
+/// meta refresh is the no-JS fallback (its first hits may error while the
+/// node is down; the JS poll swallows those).
+fn render_restarting_page(theme: &str) -> String {
+    let body = "<meta http-equiv='refresh' content='6;url=/Config'>\
+        <p class='sub'>EpixNet is restarting. This page returns to the settings when the node is back - \
+        if it does not, reload it manually.</p>\
+        <script>(function(){\
+        var tries=0;\
+        var timer=setInterval(function(){\
+        tries++;\
+        if(tries<3){return;}\
+        if(tries>60){clearInterval(timer);return;}\
+        fetch('/Config',{cache:'no-store'}).then(function(r){\
+        if(r.ok){clearInterval(timer);location.replace('/Config');}\
+        }).catch(function(){});\
+        },1000);\
+        })();</script>";
+    page_shell("Restarting", "Restarting EpixNet", "", body, "", theme)
 }
 
 /// Percent-encode a string for use as a query-parameter value.
@@ -1073,14 +1161,26 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 /// grouped into sections (Web Interface / Network / Performance / Epix Chain
 /// Config) with a widget per config kind. Keys whose backend isn't built yet
 /// (Tor, tracker proxy) render disabled with a "coming soon" note.
+///
+/// Each row carries a gutter marker that shows when the value differs from
+/// its default (click resets it), turns green while an edit is unsaved, and
+/// orange when the saved change waits for a restart. Saving happens from a
+/// floating bottom bar that appears once something changed; a second bar
+/// offers the restart when a restart-only key is pending.
 fn render_config_page(
     values: &[(&str, &str, &str, String, String, &str)],
+    pending: &[String],
+    can_restart: bool,
     flash: Option<(bool, String)>,
     homepage: &str,
     theme: &str,
 ) -> String {
     let esc = |s: &str| {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
     };
     // Render a `select` from a `Label=value|...` option spec; `disabled` greys it out.
     let render_select = |key: &str, spec: &str, val: &str, disabled: bool| -> String {
@@ -1163,8 +1263,47 @@ fn render_config_page(
             } else {
                 ""
             };
+            // Normalized current value for change tracking: booleans in
+            // canonical "true"/"false" form, everything else trimmed - the
+            // same form the page script compares against.
+            let initial = if kind == "bool" {
+                if matches!(val.as_str(), "true" | "on" | "1") { "true" } else { "false" }.to_string()
+            } else {
+                val.trim().to_string()
+            };
+            let is_pending = pending.iter().any(|p| p == key);
+            // The gutter marker: shown when the saved value differs from the
+            // default or the change waits for a restart; the page script adds
+            // "changed" (green) while an unsaved edit differs from `initial`.
+            let marker = if coming_soon {
+                String::new()
+            } else {
+                let mut classes = String::from("marker");
+                if is_pending {
+                    classes.push_str(" pending visible");
+                } else if initial != *default {
+                    classes.push_str(" visible");
+                }
+                let title = if is_pending {
+                    "This change applies after a restart. Click to reset to the default."
+                } else {
+                    "Changed from the default. Click to reset."
+                };
+                format!("<a class='{classes}' href='#reset' title='{title}'>\u{2022}</a>")
+            };
+            let attrs = if coming_soon {
+                String::new()
+            } else {
+                format!(
+                    " data-key='{key}' data-label='{label}' data-initial='{initial}' data-default='{default}'",
+                    key = esc(key),
+                    label = esc(label),
+                    initial = esc(&initial),
+                    default = esc(default),
+                )
+            };
             sections.push_str(&format!(
-                "<div class='config-item'>\
+                "<div class='config-item'{attrs}>{marker}\
                    <div class='title'><h3>{label}</h3>\
                      <div class='description'><span class='default'>(default: {default})</span>{note}</div></div>\
                    <div class='value value-right'>{widget}</div>\
@@ -1186,15 +1325,97 @@ fn render_config_page(
         ),
         None => String::new(),
     };
+    // The restart bar renders server-side when a saved change waits for a
+    // restart; the page script hides it while unsaved edits exist (the save
+    // bar takes its place) and brings it back once they are saved or undone.
+    // Without a registered relauncher (the mobile apps, where the node is a
+    // library in the app process) there is no button - the bar just says the
+    // change applies on the next start.
+    let (restart_title, restart_button) = if can_restart {
+        (
+            "Some changed settings need a restart to apply",
+            "<a class='button button-submit' id='restart-btn' href='/Config?action=restart'>Restart EpixNet</a>",
+        )
+    } else {
+        ("Some changed settings apply after EpixNet restarts - close and reopen the app", "")
+    };
+    let restart_bar = format!(
+        "<div class='bottom bottom-restart{visible}' id='bottom-restart'{data}>\
+           <div class='bottom-content'>\
+             <div class='title'>{restart_title}</div>\
+             {restart_button}\
+           </div>\
+         </div>",
+        visible = if pending.is_empty() { "" } else { " visible" },
+        data = if pending.is_empty() { "" } else { " data-pending='1'" },
+    );
     let body = format!(
         "{flash}<form method='get' action='/Config'>\
            {sections}\
            <input type='hidden' name='save' value='1'>\
-           <button class='button button-submit' type='submit'>Save</button>\
-         </form>"
+           <noscript><button class='button button-submit' type='submit'>Save</button></noscript>\
+           <div class='bottom bottom-save' id='bottom-save'>\
+             <div class='bottom-content'>\
+               <div class='title'><span><span id='save-count'>0</span> <span id='save-what'>settings</span> changed</span></div>\
+               <button class='button button-submit' type='submit'>Save settings</button>\
+             </div>\
+           </div>\
+         </form>{restart_bar}{CONFIG_PAGE_JS}"
     );
     page_shell("Configuration", "Configuration", "", &body, homepage, theme)
 }
+
+/// Client script for the settings page: track edits against each row's saved
+/// value, drive the gutter markers (green while unsaved, reset-to-default on
+/// click) and the floating save/restart bars.
+const CONFIG_PAGE_JS: &str = "<script>(function(){\
+var items=Array.prototype.slice.call(document.querySelectorAll('.config-item[data-key]'));\
+function ctl(item){return item.querySelector(\"input[type=checkbox],select,textarea,input.input-text\");}\
+function current(item){\
+var c=ctl(item);if(!c)return null;\
+if(c.type==='checkbox')return c.checked?'true':'false';\
+return (c.value||'').trim();\
+}\
+function apply(){\
+var changed=0;\
+items.forEach(function(item){\
+var c=ctl(item);if(!c||c.disabled)return;\
+var cur=current(item);\
+var isChanged=cur!==item.getAttribute('data-initial');\
+var isDefault=cur===item.getAttribute('data-default');\
+if(isChanged)changed++;\
+var m=item.querySelector('.marker');\
+if(m){\
+m.classList.toggle('changed',isChanged);\
+m.classList.toggle('visible',isChanged||!isDefault||m.classList.contains('pending'));\
+}\
+});\
+var save=document.getElementById('bottom-save');\
+if(save){\
+document.getElementById('save-count').textContent=changed;\
+document.getElementById('save-what').textContent=changed===1?'setting':'settings';\
+save.classList.toggle('visible',changed>0);\
+}\
+var restart=document.getElementById('bottom-restart');\
+if(restart){restart.classList.toggle('visible',restart.hasAttribute('data-pending')&&changed===0);}\
+}\
+items.forEach(function(item){\
+var c=ctl(item);if(!c)return;\
+c.addEventListener('input',apply);\
+c.addEventListener('change',apply);\
+var m=item.querySelector('.marker');\
+if(m)m.addEventListener('click',function(e){\
+e.preventDefault();\
+if(c.disabled)return;\
+var label=item.getAttribute('data-label')||item.getAttribute('data-key');\
+var def=item.getAttribute('data-default');\
+if(!confirm('Reset \"'+label+'\" to its default value'+(def?' ('+def+')':'')+'?'))return;\
+if(c.type==='checkbox'){c.checked=def==='true';}else{c.value=def;}\
+apply();\
+});\
+});\
+apply();\
+})();</script>";
 
 /// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
 /// directory inside a xite with links to navigate and open files.
@@ -1310,6 +1531,7 @@ const PAGE_CSS: &str = "\
 --epix-purple:#8A4BDB;--epix-cyan:#69E9F5;\
 --epix-neutral-0:#FEFEFE;--epix-neutral-1:#F6F6F9;--epix-neutral-2:#F2F2F6;--epix-neutral-3:#DCDCE3;--epix-neutral-4:#ABABB5;--epix-neutral-5:#72747B;--epix-neutral-6:#404045;--epix-neutral-7:#2E2E32;--epix-neutral-8:#242428;--epix-neutral-9:#1D1D1F;--epix-neutral-11:#09090A;\
 --epix-success-soft:#E8F8F0;--epix-danger-soft:#FDEDEC;--epix-ink-soft:#1D1D1F;\
+--epix-success:#149A5D;--epix-warning:#B77E00;\
 --epix-bg:var(--epix-neutral-1);--epix-surface:var(--epix-neutral-0);--epix-surface-2:var(--epix-neutral-2);--epix-border:var(--epix-neutral-3);--epix-border-strong:var(--epix-neutral-4);\
 --epix-text:var(--epix-neutral-9);--epix-text-mid:var(--epix-neutral-6);--epix-text-low:var(--epix-neutral-5);\
 --epix-accent:var(--epix-purple);--epix-on-accent:#FEFEFE;--epix-focus:var(--epix-purple);--epix-link:var(--epix-purple);\
@@ -1318,17 +1540,19 @@ const PAGE_CSS: &str = "\
 @media (prefers-color-scheme:dark){:root:not(.theme-light){color-scheme:dark;\
 --epix-bg:var(--epix-neutral-11);--epix-surface:var(--epix-neutral-9);--epix-surface-2:var(--epix-neutral-8);--epix-border:var(--epix-neutral-7);--epix-border-strong:var(--epix-neutral-6);\
 --epix-text:var(--epix-neutral-1);--epix-text-mid:var(--epix-neutral-3);--epix-text-low:var(--epix-neutral-4);\
+--epix-success:#2DCE89;--epix-warning:#FFA200;\
 --epix-focus:var(--epix-cyan);--epix-link:var(--epix-cyan)}}\
 .theme-dark{color-scheme:dark;\
 --epix-bg:var(--epix-neutral-11);--epix-surface:var(--epix-neutral-9);--epix-surface-2:var(--epix-neutral-8);--epix-border:var(--epix-neutral-7);--epix-border-strong:var(--epix-neutral-6);\
 --epix-text:var(--epix-neutral-1);--epix-text-mid:var(--epix-neutral-3);--epix-text-low:var(--epix-neutral-4);\
+--epix-success:#2DCE89;--epix-warning:#FFA200;\
 --epix-focus:var(--epix-cyan);--epix-link:var(--epix-cyan)}\
 *{box-sizing:border-box}\
 body{margin:0;padding:0;background:var(--epix-bg);color:var(--epix-text);font-family:var(--epix-font-sans);font-size:14px;line-height:1.5}\
 h1{background:var(--epix-purple);color:#FEFEFE;margin:0;padding:20px max(16px,calc((100% - 800px)/2 + 32px));font-size:24px;font-weight:700;line-height:1.25;overflow-wrap:anywhere}\
 h1 a{color:#FEFEFE;text-decoration:none}\
 h1 a:hover{text-decoration:underline}\
-.content{max-width:min(800px,calc(100% - 32px));margin:24px auto 80px;background:var(--epix-surface);border:1px solid var(--epix-border);border-radius:12px;padding:28px 32px 48px}\
+.content{max-width:min(800px,calc(100% - 32px));margin:24px auto 130px;background:var(--epix-surface);border:1px solid var(--epix-border);border-radius:12px;padding:28px 32px 48px}\
 .sub{color:var(--epix-text-mid);font-size:14px;margin:0 0 24px}\
 a{color:var(--epix-link);text-decoration:none}\
 .plugin,.config-item{position:relative;padding:16px 0;border-bottom:1px solid var(--epix-border)}\
@@ -1357,6 +1581,18 @@ textarea.input-text{resize:vertical;line-height:1.5}\
 .input-text:disabled{background:var(--epix-surface-2);color:var(--epix-text-low);border-color:var(--epix-border);cursor:not-allowed}\
 .section-title{font-size:12px;font-weight:600;color:var(--epix-text-mid);text-transform:uppercase;letter-spacing:.08em;margin:32px 0 4px;padding-bottom:8px;border-bottom:1px solid var(--epix-border)}\
 .config{margin-bottom:8px}\
+.config-item .marker{position:absolute;left:-26px;top:14px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;line-height:1;text-decoration:none;color:var(--epix-accent);opacity:0;pointer-events:none;transform:scale(1.8);transition:opacity .4s,transform .4s}\
+.config-item .marker.visible{opacity:1;pointer-events:auto;transform:scale(1)}\
+.config-item .marker.changed{color:var(--epix-success)}\
+.config-item .marker.pending{color:var(--epix-warning)}\
+.config-item .marker:focus-visible{outline:2px solid var(--epix-focus);outline-offset:2px;border-radius:4px}\
+.bottom{position:fixed;left:0;right:0;bottom:0;z-index:900;padding:14px 16px calc(14px + env(safe-area-inset-bottom,0px));transform:translateY(110%);transition:transform .45s cubic-bezier(.86,0,.07,1);background:var(--epix-surface);background:color-mix(in srgb,var(--epix-surface) 88%,transparent);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);border-top:1px solid var(--epix-border);box-shadow:0 -6px 24px rgba(2,2,2,.12)}\
+.bottom.visible{transform:translateY(0)}\
+.bottom-content{max-width:800px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:16px}\
+.bottom .title{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--epix-text-mid);display:flex;align-items:center;gap:10px;min-width:0}\
+.bottom .title::before{content:'';width:9px;height:9px;border-radius:50%;background:var(--epix-success);flex:none}\
+.bottom-restart .title::before{background:var(--epix-warning)}\
+.bottom .button{margin-top:0;flex:none}\
 .notification{padding:12px 16px;border-radius:8px;margin:0 0 20px;font-size:14px;color:var(--epix-ink-soft)}\
 .notification-done{background:var(--epix-success-soft)}\
 .notification-error{background:var(--epix-danger-soft)}\
@@ -1368,12 +1604,15 @@ textarea.input-text{resize:vertical;line-height:1.5}\
 .fixbutton{-webkit-user-select:none;user-select:none;-webkit-user-drag:none}\
 .fixbutton:hover{box-shadow:var(--epix-shadow)}\
 @media (max-width:640px){\
-.content{max-width:100%;margin:0;border:none;border-radius:0;padding:20px 16px 64px}\
+.content{max-width:100%;margin:0;border:none;border-radius:0;padding:20px 16px 130px}\
 h1{padding:18px 84px 18px 16px;font-size:20px}\
 .config-item:has(.value .button){padding-right:0}\
 .config-item:has(.value .button) .value{position:static;transform:none;margin-top:10px}\
 .button,.config-item .value .button{height:44px;min-height:44px}\
 .checkbox{padding:10px 0 10px 10px}\
+.config-item .marker{left:-17px;width:16px;font-size:19px}\
+.bottom-content{gap:10px}\
+.bottom .title{font-size:11px;letter-spacing:.05em}\
 }";
 
 /// Shared page shell for the server-rendered admin pages, on the flat Epix
