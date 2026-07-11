@@ -228,7 +228,9 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
 
     // Boot the node and serve the plain UI on loopback.
     println!("· starting the Epix node …");
-    let tor_mode = std::env::var("EPIX_TOR").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "enable".into());
+    // Tor mode: EPIX_TOR is an explicit override; empty defers to the Config
+    // page's persisted choice (the node resolves it at boot, default enable).
+    let tor_mode = std::env::var("EPIX_TOR").ok().filter(|s| !s.is_empty()).unwrap_or_default();
     let opts = epix_node::NodeOptions {
         data_root: data_root.clone(),
         target: target.clone(),
@@ -285,6 +287,20 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     let ext_capable = firefox_allows_unsigned(&firefox);
 
     let socks_addr: SocketAddr = SOCKS_ADDR.parse().unwrap();
+    // The effective Tor mode the node booted with: the EPIX_TOR override when
+    // set, else the Config page's persisted choice (default enable). Must match
+    // the node's resolution, or the PAC would route clearnet at a SOCKS
+    // listener that never binds.
+    let tor_mode = if tor_mode.is_empty() {
+        running
+            .state
+            .config_get("tor")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "enable".to_string())
+    } else {
+        tor_mode
+    };
     // Route clearnet through Tor by default (opt-out), but only when Tor is on -
     // otherwise there is no SOCKS listener and clearnet would break. An explicit
     // saved setting overrides the default.

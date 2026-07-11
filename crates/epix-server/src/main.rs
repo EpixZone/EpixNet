@@ -61,10 +61,12 @@ async fn main() {
         }
     };
 
+    // EPIX_TOR is an explicit override; empty defers to the Config page's
+    // persisted choice (the node resolves it at boot, default enable).
     let tor_mode = std::env::var("EPIX_TOR")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "enable".to_string());
+        .unwrap_or_default();
 
     let opts = NodeOptions {
         data_root: root.clone(),
