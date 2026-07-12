@@ -109,25 +109,7 @@ async fn serve_stream_hooked(
         let params = vget(&req, "params").cloned().unwrap_or(Value::Nil);
 
         let body = if cmd == "handshake" {
-            // The connection arrives from an ephemeral port; the handshake
-            // advertises the peer's fileserver port, so rebind the address
-            // handlers see to one we can dial back (inbound `update` fetches
-            // body-less updates from the sender, and adds it as a peer).
-            let advertised = vget(&params, "fileserver_port").and_then(|v| v.as_i64());
-            if let (PeerAddr::Ip(addr), Some(port)) = (&peer, advertised) {
-                if port > 0 && port <= u16::MAX as i64 {
-                    let mut dialable = *addr;
-                    dialable.set_port(port as u16);
-                    peer = PeerAddr::Ip(dialable);
-                }
-            }
-            // A completed inbound handshake means a real peer reached us on
-            // this transport - the clearnet TCP server uses it to confirm the
-            // fileserver port is open.
-            if let Some(hook) = on_inbound {
-                hook(&peer);
-            }
-            handshake_response(version, rev, fileserver_port)
+            answer_handshake(&mut peer, &params, on_inbound, version, rev, fileserver_port)
         } else {
             handler.handle(&peer, &cmd, &params).await
         };
@@ -143,14 +125,56 @@ async fn serve_stream_hooked(
             break;
         }
         if let Some(bytes) = raw_tail {
-            use tokio::io::AsyncWriteExt;
-            if stream.write_all(&bytes).await.is_err() || stream.flush().await.is_err() {
+            if !send_stream_tail(&mut stream, &bytes).await {
                 break;
             }
-            crate::msg::WIRE_SENT
-                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// Answer a handshake: adopt the peer's advertised dial-back port, fire the
+/// inbound hook, and build the reply body.
+fn answer_handshake(
+    peer: &mut PeerAddr,
+    params: &Value,
+    on_inbound: Option<&InboundHook>,
+    version: &str,
+    rev: i64,
+    fileserver_port: u16,
+) -> Value {
+    adopt_dialback_port(peer, params);
+    // A completed inbound handshake means a real peer reached us on this
+    // transport - the clearnet TCP server uses it to confirm the port is open.
+    if let Some(hook) = on_inbound {
+        hook(peer);
+    }
+    handshake_response(version, rev, fileserver_port)
+}
+
+/// The connection arrives from an ephemeral port; the handshake advertises the
+/// peer's fileserver port, so rebind the address handlers see to one we can
+/// dial back (inbound `update` fetches body-less updates from the sender and
+/// adds it as a peer). Non-IP transports and port 0 keep the original address.
+fn adopt_dialback_port(peer: &mut PeerAddr, params: &Value) {
+    let advertised = vget(params, "fileserver_port").and_then(|v| v.as_i64());
+    if let (PeerAddr::Ip(addr), Some(port)) = (&*peer, advertised) {
+        if (1..=u16::MAX as i64).contains(&port) {
+            let mut dialable = *addr;
+            dialable.set_port(port as u16);
+            *peer = PeerAddr::Ip(dialable);
+        }
+    }
+}
+
+/// Write the raw file bytes that follow a `streamFile` reply. Returns false if
+/// the socket errored, so the caller drops the connection.
+async fn send_stream_tail(stream: &mut epix_transport::PeerStream, bytes: &[u8]) -> bool {
+    use tokio::io::AsyncWriteExt;
+    if stream.write_all(bytes).await.is_err() || stream.flush().await.is_err() {
+        return false;
+    }
+    crate::msg::WIRE_SENT.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Turn a `getFile`-shaped body (`{body, size, location}`) into the
