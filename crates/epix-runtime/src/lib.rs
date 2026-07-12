@@ -210,15 +210,24 @@ impl NodeRuntime {
         // open that port through the home router with UPnP so it's reachable.
         #[cfg(feature = "inbound-seeding")]
         if let Some(port) = self.config.fileserver_port {
+            // Tor-always binds the fileserver to loopback, so clearnet is
+            // deliberately closed - don't report a public port in that mode,
+            // whether from a public interface IP or an inbound peer.
+            #[cfg(feature = "tor")]
+            let clearnet_seeding = self.config.tor_mode != epix_tor::TorMode::Always;
+            #[cfg(not(feature = "tor"))]
+            let clearnet_seeding = true;
             self.handles.push(tokio::spawn(seed_loop(
                 self.state.clone(),
                 self.node_handler(),
                 port,
+                clearnet_seeding,
                 self.shutdown.clone(),
             )));
             self.handles.push(tokio::spawn(upnp_loop(
                 self.state.clone(),
                 port,
+                clearnet_seeding,
                 self.shutdown.clone(),
             )));
         }
@@ -686,6 +695,7 @@ async fn seed_loop(
     state: Arc<AppState>,
     handler: Arc<handler::NodeHandler>,
     port: u16,
+    clearnet: bool,
     shutdown: Arc<Notify>,
 ) {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
@@ -695,7 +705,40 @@ async fn seed_loop(
             return;
         }
     };
-    let server = epix_protocol::PeerServer::new(handler);
+    let mut server = epix_protocol::PeerServer::new(handler);
+    // A real peer reaching us over clearnet TCP proves the fileserver port is
+    // open from the internet - the privacy-preserving alternative to the Python
+    // client's third-party port-scan services (no phone-home). The first public
+    // inbound peer flips the status if nothing already has (a public interface
+    // IP or UPnP may have set it first). Onion/I2P inbound never runs this
+    // server, so it stays strictly clearnet.
+    if clearnet {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::SocketAddr>();
+        let listener_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(addr) = rx.recv().await {
+                if is_public_ipv4(&addr.ip()) {
+                    let (already, _) = listener_state.port_status().await;
+                    if !already {
+                        listener_state.set_port_status(true, Some(addr.ip().to_string())).await;
+                        listener_state
+                            .log(
+                                "INFO",
+                                format!("Fileserver port confirmed open by inbound peer {}", addr.ip()),
+                            )
+                            .await;
+                    }
+                    break; // one public confirmation is enough
+                }
+            }
+        });
+        let hook: epix_protocol::InboundHook = Arc::new(move |peer: &epix_core::PeerAddr| {
+            if let epix_core::PeerAddr::Ip(addr) = peer {
+                let _ = tx.send(*addr);
+            }
+        });
+        server = server.on_inbound(hook);
+    }
     state.log("INFO", format!("Seeding files (+ DHT + propagation) on port {port}")).await;
     tokio::select! {
         _ = shutdown.notified() => {}
@@ -932,10 +975,37 @@ async fn i2p_loop(
 /// gateway, in which case the node still serves on the LAN and to manually
 /// forwarded ports.
 #[cfg(feature = "inbound-seeding")]
-async fn upnp_loop(state: Arc<AppState>, port: u16, shutdown: Arc<Notify>) {
+async fn upnp_loop(state: Arc<AppState>, port: u16, clearnet: bool, shutdown: Arc<Notify>) {
     use igd_next::aio::tokio::search_gateway;
     use igd_next::{PortMappingProtocol, SearchOptions};
     use std::net::SocketAddr;
+
+    // A publicly-routable address peers can already reach directly, with no
+    // router to traverse: either the operator set `ip_external`, or this host
+    // has a public IP bound to its interface (a VPS/seedbox, no NAT). Either
+    // way the fileserver port is reachable without UPnP, so mark it opened and
+    // skip the gateway search entirely. This mirrors the Python client, which
+    // treated "we have an external IP" as port-opened (FileServer.portCheck);
+    // the Rust client previously only ever set port_opened via a successful
+    // UPnP mapping, so a VPS with no UPnP gateway always showed "port closed".
+    if clearnet {
+        let external = state
+            .config_get("ip_external")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| public_ipv4().map(|ip| ip.to_string()));
+        if let Some(ip) = external {
+            state.set_port_status(true, Some(ip.clone())).await;
+            state
+                .log("INFO", format!("Fileserver reachable at {ip}:{port} (public IP, no UPnP needed)"))
+                .await;
+            // Nothing to refresh; hold the task until shutdown, then clear.
+            shutdown.notified().await;
+            state.set_port_status(false, None).await;
+            return;
+        }
+    }
 
     let Some(local_ip) = local_ipv4() else {
         state.log("INFO", "UPnP: no local IPv4 address; skipping port mapping").await;
@@ -993,4 +1063,66 @@ fn local_ipv4() -> Option<std::net::IpAddr> {
     sock.connect("8.8.8.8:80").ok()?;
     let ip = sock.local_addr().ok()?.ip();
     ip.is_ipv4().then_some(ip)
+}
+
+/// This host's own IPv4 if it is a publicly-routable address (a VPS/seedbox
+/// where the public IP sits directly on the interface, not behind NAT). The
+/// outbound-source-IP probe returns that public IP directly in that case; a
+/// NAT'd home machine returns a private `192.168.x`/`10.x` address instead and
+/// this yields `None`, leaving UPnP to open the port.
+#[cfg(feature = "inbound-seeding")]
+fn public_ipv4() -> Option<std::net::IpAddr> {
+    let ip = local_ipv4()?;
+    is_public_ipv4(&ip).then_some(ip)
+}
+
+/// Whether an IPv4 is reachable from the public internet: excludes private,
+/// loopback, link-local, unspecified, broadcast, and the 100.64.0.0/10 CGNAT
+/// range (carrier NAT, not directly reachable).
+#[cfg(feature = "inbound-seeding")]
+fn is_public_ipv4(ip: &std::net::IpAddr) -> bool {
+    let std::net::IpAddr::V4(v4) = ip else { return false };
+    let o = v4.octets();
+    !v4.is_private()
+        && !v4.is_loopback()
+        && !v4.is_link_local()
+        && !v4.is_unspecified()
+        && !v4.is_broadcast()
+        && !(o[0] == 100 && (0x40..0x80).contains(&o[1])) // 100.64.0.0/10 CGNAT
+}
+
+#[cfg(all(test, feature = "inbound-seeding"))]
+mod tests {
+    use super::is_public_ipv4;
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn public_addresses_are_reachable() {
+        // A VPS public IP (this server) and other routable addresses.
+        assert!(is_public_ipv4(&ip("74.208.249.9")));
+        assert!(is_public_ipv4(&ip("8.8.8.8")));
+        assert!(is_public_ipv4(&ip("1.1.1.1")));
+    }
+
+    #[test]
+    fn nat_and_reserved_addresses_are_not() {
+        // Private ranges (home NAT) - UPnP should handle these, not us.
+        assert!(!is_public_ipv4(&ip("192.168.1.10")));
+        assert!(!is_public_ipv4(&ip("10.0.0.5")));
+        assert!(!is_public_ipv4(&ip("172.16.4.4")));
+        // Loopback, link-local, unspecified, CGNAT.
+        assert!(!is_public_ipv4(&ip("127.0.0.1")));
+        assert!(!is_public_ipv4(&ip("169.254.1.1")));
+        assert!(!is_public_ipv4(&ip("0.0.0.0")));
+        assert!(!is_public_ipv4(&ip("100.64.0.1")));
+        assert!(!is_public_ipv4(&ip("100.127.255.255")));
+        // 100.0.0.0/8 outside the CGNAT sub-range is still public.
+        assert!(is_public_ipv4(&ip("100.0.0.1")));
+        // IPv6 is out of scope for this clearnet check.
+        assert!(!is_public_ipv4(&ip("2001:4860:4860::8888")));
+    }
 }
