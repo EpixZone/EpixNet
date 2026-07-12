@@ -17,16 +17,29 @@ pub trait RequestHandler: Send + Sync {
     async fn handle(&self, peer: &PeerAddr, cmd: &str, params: &Value) -> Value;
 }
 
+/// Called once per inbound connection when it answers the handshake, with the
+/// peer's dial-back-corrected address. Only the clearnet TCP server wires this
+/// (a real inbound peer proves our fileserver port is reachable); onion/I2P/
+/// mesh inbound do not imply clearnet reachability, so they leave it unset.
+pub type InboundHook = Arc<dyn Fn(&PeerAddr) + Send + Sync>;
+
 /// A TCP peer server. (Tor/Reticulum listeners slot in the same way later.)
 pub struct PeerServer {
     handler: Arc<dyn RequestHandler>,
     version: String,
     rev: i64,
+    on_inbound: Option<InboundHook>,
 }
 
 impl PeerServer {
     pub fn new(handler: Arc<dyn RequestHandler>) -> Self {
-        Self { handler, version: "EpixRS".into(), rev: 8192 }
+        Self { handler, version: "EpixRS".into(), rev: 8192, on_inbound: None }
+    }
+
+    /// Register a hook fired when an inbound connection answers the handshake.
+    pub fn on_inbound(mut self, hook: InboundHook) -> Self {
+        self.on_inbound = Some(hook);
+        self
     }
 
     /// The server's advertised version and revision, for driving
@@ -46,9 +59,19 @@ impl PeerServer {
             let handler = self.handler.clone();
             let version = self.version.clone();
             let rev = self.rev;
+            let on_inbound = self.on_inbound.clone();
             tokio::spawn(async move {
                 let stream: epix_transport::PeerStream = Box::pin(sock);
-                serve_stream(handler, PeerAddr::Ip(addr), stream, &version, rev, port).await;
+                serve_stream_hooked(
+                    handler,
+                    PeerAddr::Ip(addr),
+                    stream,
+                    &version,
+                    rev,
+                    port,
+                    on_inbound.as_ref(),
+                )
+                .await;
             });
         }
     }
@@ -60,11 +83,24 @@ impl PeerServer {
 /// and returns when the peer disconnects.
 pub async fn serve_stream(
     handler: Arc<dyn RequestHandler>,
+    peer: PeerAddr,
+    stream: epix_transport::PeerStream,
+    version: &str,
+    rev: i64,
+    fileserver_port: u16,
+) {
+    serve_stream_hooked(handler, peer, stream, version, rev, fileserver_port, None).await
+}
+
+/// [`serve_stream`] plus an optional inbound-handshake hook (clearnet TCP only).
+async fn serve_stream_hooked(
+    handler: Arc<dyn RequestHandler>,
     mut peer: PeerAddr,
     mut stream: epix_transport::PeerStream,
     version: &str,
     rev: i64,
     fileserver_port: u16,
+    on_inbound: Option<&InboundHook>,
 ) {
     let mut buf = Vec::new();
     while let Ok(req) = read_msg(&mut stream, &mut buf).await {
@@ -84,6 +120,12 @@ pub async fn serve_stream(
                     dialable.set_port(port as u16);
                     peer = PeerAddr::Ip(dialable);
                 }
+            }
+            // A completed inbound handshake means a real peer reached us on
+            // this transport - the clearnet TCP server uses it to confirm the
+            // fileserver port is open.
+            if let Some(hook) = on_inbound {
+                hook(&peer);
             }
             handshake_response(version, rev, fileserver_port)
         } else {
@@ -160,4 +202,78 @@ fn response(req_id: i64, body: Value) -> Value {
         pairs.extend(fields);
     }
     Value::Map(pairs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::{read_msg, send_msg};
+    use std::sync::Mutex;
+    use tokio::net::{TcpListener, TcpStream};
+
+    struct NoopHandler;
+    #[async_trait]
+    impl RequestHandler for NoopHandler {
+        async fn handle(&self, _peer: &PeerAddr, _cmd: &str, _params: &Value) -> Value {
+            vmap(vec![("error", Value::from("noop"))])
+        }
+    }
+
+    /// The inbound hook fires on a handshake, and the address it reports has
+    /// been dial-back-corrected to the peer's advertised fileserver port (so a
+    /// caller can decide reachability by the peer's real IP, not its ephemeral
+    /// source port). The hook runs before the handshake reply is sent, so once
+    /// the client has read the reply the hook has already run.
+    #[tokio::test]
+    async fn inbound_hook_fires_with_dialback_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let seen: Arc<Mutex<Option<PeerAddr>>> = Arc::new(Mutex::new(None));
+        let seen_cb = seen.clone();
+        let hook: InboundHook = Arc::new(move |peer: &PeerAddr| {
+            *seen_cb.lock().unwrap() = Some(peer.clone());
+        });
+        tokio::spawn(PeerServer::new(Arc::new(NoopHandler)).on_inbound(hook).serve(listener));
+
+        // Raw client: connect and handshake, advertising fileserver_port 12345.
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let mut stream: epix_transport::PeerStream = Box::pin(sock);
+        let hs = vmap(vec![
+            ("cmd", Value::from("handshake")),
+            ("req_id", Value::from(1i64)),
+            ("params", vmap(vec![("fileserver_port", Value::from(12345i64))])),
+        ]);
+        send_msg(&mut stream, &hs).await.unwrap();
+        let mut buf = Vec::new();
+        let _resp = read_msg(&mut stream, &mut buf).await.unwrap();
+
+        let recorded = seen.lock().unwrap().clone().expect("peer recorded");
+        match recorded {
+            PeerAddr::Ip(a) => assert_eq!(a.port(), 12345, "adopted the advertised dial-back port"),
+            other => panic!("expected Ip peer, got {other:?}"),
+        }
+    }
+
+    /// The plain `serve_stream` entry point (used by the Tor/I2P inbound paths)
+    /// carries no hook, so those transports can never flip clearnet status.
+    #[tokio::test]
+    async fn plain_serve_stream_has_no_hook() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // A server with NO on_inbound set: a handshake must still succeed.
+        tokio::spawn(PeerServer::new(Arc::new(NoopHandler)).serve(listener));
+
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let mut stream: epix_transport::PeerStream = Box::pin(sock);
+        let hs = vmap(vec![
+            ("cmd", Value::from("handshake")),
+            ("req_id", Value::from(1i64)),
+            ("params", vmap(vec![("fileserver_port", Value::from(0i64))])),
+        ]);
+        send_msg(&mut stream, &hs).await.unwrap();
+        let mut buf = Vec::new();
+        let resp = read_msg(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(vget(&resp, "cmd").and_then(|v| v.as_str()), Some("response"));
+    }
 }
