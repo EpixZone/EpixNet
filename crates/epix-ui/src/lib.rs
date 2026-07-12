@@ -282,6 +282,16 @@ async fn is_cross_origin_request(
     if headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) == Some("navigate") {
         return false;
     }
+    // /StatsJson is the public gateway stats endpoint: aggregate counters
+    // only, never per-xite content. A gateway page fetches it cross-origin
+    // through a reverse proxy that adds the CORS headers (the route itself
+    // sends none, so the response stays unreadable to foreign pages hitting
+    // the node directly). The Python gateway got the same effect by running
+    // with the whole gate off (ui_ip_protect=off); exempting just this path
+    // keeps the gate on for everything else.
+    if path == "/StatsJson" {
+        return false;
+    }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
     // Untraceable requests are blocked for site paths (checked below for /).

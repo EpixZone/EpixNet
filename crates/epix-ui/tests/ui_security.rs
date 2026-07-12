@@ -131,4 +131,22 @@ async fn cross_origin_gate_and_cors_permission() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+
+    // /StatsJson is fetched cross-origin by the marketing site (through a
+    // reverse proxy that adds the CORS headers), so a foreign Origin passes
+    // the gate for this one path...
+    let resp = router
+        .clone()
+        .oneshot(get("/StatsJson", &[host, ("origin", "https://epixnet.io")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "/StatsJson is exempt from the gate");
+
+    // ...while the same foreign Origin stays blocked for xite content.
+    let resp = router
+        .clone()
+        .oneshot(get("/1Target/data.json", &[host, ("origin", "https://epixnet.io")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "xite content still gated");
 }
