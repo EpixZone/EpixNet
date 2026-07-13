@@ -5256,6 +5256,7 @@ impl AppState {
         let fileserver_ip = if tor_status == "Always" { "127.0.0.1" } else { "*" };
         let rev = self.rev().await;
         let ui_port = self.ui_port().await;
+        let (epix_browser, browser_tor_clearnet) = self.browser_settings().await;
         json!({
             "version": self.version,
             "rev": rev,
@@ -5269,6 +5270,9 @@ impl AppState {
             "tor_status": tor_status,
             "tor_has_meek_bridges": false,
             "tor_use_bridges": false,
+            "network_status": self.network_status().await,
+            "epix_browser": epix_browser,
+            "browser_tor_clearnet": browser_tor_clearnet,
             "ui_ip": "127.0.0.1",
             "ui_port": ui_port,
             "debug": false,
@@ -5284,6 +5288,83 @@ impl AppState {
             "user_settings": user_settings,
             "language": language,
         })
+    }
+
+    /// Per-network inbound reachability for the dashboard's Network pill. Each
+    /// entry says whether peers can reach this node over that network; the
+    /// top-level `reachable` is true when ANY of them works (a Tor-only or
+    /// I2P-only node still counts as reachable). Additive to `serverInfo` -
+    /// the older `port_opened`/`ip_external`/`tor_*` fields stay as they were.
+    pub async fn network_status(&self) -> Value {
+        let (port_opened, detected_ip) = self.port_status().await;
+        let fileserver_port = self.fileserver_port().await;
+        let configured_ip = self
+            .config_get("ip_external")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|x| !x.is_empty());
+        // Seeding disabled (port 0) means no clearnet inbound at all.
+        let clearnet_enabled = fileserver_port != 0;
+        let clearnet_reachable = clearnet_enabled && port_opened;
+        let clearnet_ip = configured_ip.or(detected_ip);
+
+        let (tor_enabled, tor_status) = self.tor_status().await;
+        let onion = self.onion_address().await;
+        let tor_ok = matches!(tor_status.as_str(), "OK" | "Always");
+        let tor_reachable = tor_enabled && tor_ok && onion.is_some();
+
+        let i2p = self.i2p_status().await;
+        let i2p_str = |k: &str| i2p.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let i2p_num = |k: &str| i2p.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        let i2p_mode = i2p_str("mode").unwrap_or_default();
+        let i2p_enabled = !i2p_mode.is_empty() && i2p_mode != "disable";
+        let i2p_b32 = i2p_str("b32");
+        let i2p_reachable = i2p_enabled && (i2p_num("tunnels_built") > 0 || i2p_b32.is_some());
+
+        let reachable = clearnet_reachable || tor_reachable || i2p_reachable;
+
+        json!({
+            "reachable": reachable,
+            "clearnet": {
+                "enabled": clearnet_enabled,
+                "reachable": clearnet_reachable,
+                "port": fileserver_port,
+                "ip": clearnet_ip,
+            },
+            "tor": {
+                "enabled": tor_enabled,
+                "reachable": tor_reachable,
+                "status": tor_status,
+                "always": tor_ok && tor_status == "Always",
+                "address": onion.map(|o| format!("{o}.onion")),
+            },
+            "i2p": {
+                "enabled": i2p_enabled,
+                "reachable": i2p_reachable,
+                "phase": i2p_str("phase"),
+                "address": i2p_b32.map(|b| format!("{b}.i2p")),
+            },
+        })
+    }
+
+    /// Whether the node runs under the Epix Browser (its native host writes
+    /// `browser-settings.json` next to the node data) and whether that browser
+    /// routes clearnet (non-`.epix`) traffic through Tor. Returns
+    /// `(epix_browser, tor_clearnet)`. `tor_clearnet` defaults on (opt-out),
+    /// matching epix-nmh's `Settings::tor_clearnet`. The dashboard uses this to
+    /// drop the "your browser is not safe" warning in Tor-always mode when the
+    /// browser already tunnels clearnet through Tor.
+    pub async fn browser_settings(&self) -> (bool, bool) {
+        let Some(root) = &self.data_root else { return (false, true) };
+        match std::fs::read(root.join("browser-settings.json")) {
+            Ok(bytes) => {
+                let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let tor_clearnet =
+                    v.get("tor_clearnet").and_then(|b| b.as_bool()).unwrap_or(true);
+                (true, tor_clearnet)
+            }
+            Err(_) => (false, true),
+        }
     }
 
     /// Push the latest `serverInfo` (`setServerInfo`) on the `serverChanged`
@@ -7660,6 +7741,24 @@ mod tests {
             "sign": "should-be-stripped",
             "signs": {"1abc": "x"},
         })
+    }
+
+    #[tokio::test]
+    async fn browser_settings_reads_epix_browser_and_tor_clearnet() {
+        let dir = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let path = dir.path().join("browser-settings.json");
+
+        // No file: not running under Epix Browser; tor_clearnet defaults on.
+        assert_eq!(state.browser_settings().await, (false, true));
+
+        // File present with the checkbox off: Epix Browser, clearnet NOT via Tor.
+        std::fs::write(&path, br#"{"tor_clearnet": false}"#).unwrap();
+        assert_eq!(state.browser_settings().await, (true, false));
+
+        // File present without the key: default on (opt-out).
+        std::fs::write(&path, br#"{"clearnet_allow": {}}"#).unwrap();
+        assert_eq!(state.browser_settings().await, (true, true));
     }
 
     #[tokio::test]

@@ -3662,6 +3662,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_info_network_status_per_network_reachability() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state.clone(), Some("1site".into()));
+
+        // Nothing set up: no network reachable, clearnet disabled (port 0).
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["reachable"], false);
+        assert_eq!(ns["clearnet"]["enabled"], false);
+        assert_eq!(ns["tor"]["reachable"], false);
+        assert_eq!(ns["i2p"]["reachable"], false);
+
+        // Clearnet port open -> clearnet reachable -> node reachable.
+        state.set_fileserver_port(26552).await;
+        state.set_port_status(true, Some("203.0.113.7".into())).await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["reachable"], true);
+        assert_eq!(ns["clearnet"]["reachable"], true);
+        assert_eq!(ns["clearnet"]["port"], 26552);
+        assert_eq!(ns["clearnet"]["ip"], "203.0.113.7");
+
+        // Clearnet closed, but Tor up with a published onion -> still reachable.
+        state.set_port_status(false, None).await;
+        state.set_tor_status(true, "OK").await;
+        state.set_onion_address("abcdef").await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["clearnet"]["reachable"], false);
+        assert_eq!(ns["tor"]["reachable"], true);
+        assert_eq!(ns["tor"]["address"], "abcdef.onion");
+        assert_eq!(ns["reachable"], true);
+
+        // I2P with a built tunnel and address -> reachable, address suffixed.
+        state.set_i2p_status(json!({ "mode": "both", "phase": "ready", "tunnels_built": 2, "b32": "xyz.b32" })).await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["i2p"]["reachable"], true);
+        assert_eq!(ns["i2p"]["address"], "xyz.b32.i2p");
+    }
+
+    #[tokio::test]
     async fn config_set_saves_and_notifies_on_language() {
         let state = AppState::new("test");
         let mut events = state.subscribe_events();
