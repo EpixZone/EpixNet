@@ -5899,6 +5899,14 @@ impl AppState {
         let mut xite = Xite::new(addr, storage);
         xite.content = content;
 
+        // Stamp the running node version onto the root content.json before
+        // signing (EpixNet's ContentManager.sign sets `epixnet_version =
+        // config.version`), so a re-signed xite advertises the version that
+        // signed it instead of carrying whatever stale value it shipped with.
+        if let Some(map) = xite.content.as_mut().and_then(|c| c.as_object_mut()) {
+            map.insert("epixnet_version".into(), json!(self.version));
+        }
+
         let prev = xite
             .content
             .as_ref()
