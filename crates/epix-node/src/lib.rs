@@ -998,8 +998,11 @@ impl epix_ui::ContentSyncer for OnDemand {
         let mut peers = self.state.connectable_peers(address, 20).await;
         if peers.is_empty() {
             // A rarely-visited site may have no warm peers yet: announce for
-            // some, then fall back to the DHT.
-            peers = self.state.announce_to_trackers(address, &self.trackers).await;
+            // some, then fall back to the DHT. Use the full tracker set (shared
+            // + Beacon-discovered), not just the bootstrap list, or a peer known
+            // only to a shared tracker is never found.
+            let trackers = self.state.all_trackers(&self.trackers).await;
+            peers = self.state.announce_to_trackers(address, &trackers).await;
             if peers.is_empty() {
                 peers = self.state.find_peers_dht(address).await;
             }
@@ -1067,11 +1070,15 @@ impl OnDemand {
             // Mark the download in flight: the html serving gate holds the
             // page document back until the core set is on disk.
             self.state.begin_clone(&address);
+            // Announce to the full tracker set (shared + Beacon-discovered), not
+            // just the bootstrap list, so a peer registered only on a shared
+            // tracker (e.g. an onion-only seeder) is discovered.
+            let trackers = self.state.all_trackers(&self.trackers).await;
             let cloned = clone_xite_with_progress(
                 &address,
                 &data_dir,
                 self.transport.clone(),
-                &self.trackers,
+                &trackers,
                 Some(&self.state),
             )
             .await;

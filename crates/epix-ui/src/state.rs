@@ -995,6 +995,26 @@ impl AppState {
         self.extra_trackers.read().await.clone()
     }
 
+    /// The full tracker set for an announce: the `bootstrap` list plus the
+    /// operator's `shared_trackers` and the Beacon-discovered `extra_trackers`,
+    /// deduped. The periodic announce loop and the on-demand resolver must use
+    /// the same set - a site whose only peers are registered on a
+    /// Beacon-discovered tracker is otherwise invisible to on-demand clones,
+    /// which is how an onion-only xite ends up "No peers found" even though a
+    /// shared tracker knows its peer.
+    pub async fn all_trackers(
+        &self,
+        bootstrap: &[epix_xite::Tracker],
+    ) -> Vec<epix_xite::Tracker> {
+        let mut all = bootstrap.to_vec();
+        for t in self.shared_trackers().await.into_iter().chain(self.extra_trackers().await) {
+            if !all.contains(&t) {
+                all.push(t);
+            }
+        }
+        all
+    }
+
     /// The signal fired when the runtime-contributed tracker set changes.
     pub fn trackers_changed(&self) -> Arc<tokio::sync::Notify> {
         self.trackers_changed.clone()
@@ -7307,6 +7327,30 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn all_trackers_merges_bootstrap_shared_and_extra_deduped() {
+        let state = AppState::new("test");
+        let mk = |s: &str| epix_xite::Tracker::Epix(PeerAddr::parse(s).unwrap());
+        let bootstrap = vec![mk("1.1.1.1:26959")];
+
+        // No shared/extra yet: just the bootstrap list.
+        assert_eq!(state.all_trackers(&bootstrap).await, bootstrap);
+
+        // A shared tracker (config) and a Beacon-discovered one both fold in.
+        state.config_set("shared_trackers", json!(["2.2.2.2:26959"])).await;
+        state.set_extra_trackers(vec![mk("3.3.3.3:26959")]).await;
+        let all = state.all_trackers(&bootstrap).await;
+        assert!(all.contains(&mk("1.1.1.1:26959")));
+        assert!(all.contains(&mk("2.2.2.2:26959")));
+        assert!(all.contains(&mk("3.3.3.3:26959")));
+
+        // A tracker present in more than one source appears once.
+        state.config_set("shared_trackers", json!(["1.1.1.1:26959", "2.2.2.2:26959"])).await;
+        let all = state.all_trackers(&bootstrap).await;
+        assert_eq!(all.iter().filter(|t| **t == mk("1.1.1.1:26959")).count(), 1);
+        assert_eq!(all.len(), 3);
+    }
 
     #[tokio::test]
     async fn tracker_back_off_after_repeated_errors() {
