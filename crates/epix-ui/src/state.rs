@@ -2973,11 +2973,18 @@ impl AppState {
             }
 
             // Verify + apply the newer content.json (full signer/rules check,
-            // size-limited), then sync its changed files.
+            // size-limited), then sync its changed files. Keep the previous
+            // content.json bytes so an incomplete sync can roll back: a resync
+            // must land atomically. If we persisted the new content.json but
+            // couldn't fetch every file it declares, the node would serve a
+            // content.json whose files are stale or missing - the mismatch that
+            // hangs the wrapper's html gate ("content.json updated but files
+            // stale"). So commit the new version only when all its files land.
             let mut xite = Xite::new(
                 Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
                 view.storage.clone(),
             );
+            let prev_content_bytes = xite.storage.read("content.json").ok();
             let limit = self.size_limit_bytes(address).await;
             xite.set_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
             self.update_content(address, xite.content.clone()).await;
@@ -2991,11 +2998,57 @@ impl AppState {
             self.set_worker_stats(address, 0, 0, 0).await;
             let report = report.map_err(|e| e.to_string())?;
             self.add_transfer(address, report.bytes, 0).await;
-            // Data files may have changed - rebuild the db view.
+
+            // Atomic landing: if any declared file is still missing, roll the
+            // content.json back to the version whose files we DO have, and put
+            // that back into the live state. The node keeps serving the prior,
+            // consistent version; the next resync tick retries. Without this a
+            // half-finished sync leaves the node stuck on the loading screen.
+            if !report.failed.is_empty() {
+                self.log(
+                    "INFO",
+                    format!(
+                        "Resync of {address} incomplete: {} file(s) unavailable; kept the previous version",
+                        report.failed.len()
+                    ),
+                )
+                .await;
+                self.rollback_content(address, &canonical, &view.storage, prev_content_bytes.as_deref())
+                    .await;
+                return Ok(false);
+            }
+
+            // Every file landed - the new content.json (already on disk) is now
+            // backed by all its files. Rebuild the db view from the new content.
             self.update_content(address, xite.content).await;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Restore a xite's content.json to `prev_bytes` (the version before an
+    /// incomplete resync) and reload it into the live state, so the node keeps
+    /// serving a consistent version instead of a content.json whose files are
+    /// missing. A no-op when there is nothing to restore. Falls back to the
+    /// local (unsigned) load like restore, since the prior content already
+    /// verified when it was first adopted.
+    async fn rollback_content(
+        &self,
+        address: &str,
+        canonical: &str,
+        storage: &XiteStorage,
+        prev_bytes: Option<&[u8]>,
+    ) {
+        let Some(prev) = prev_bytes else { return };
+        if storage.write("content.json", prev).is_err() {
+            return;
+        }
+        let Ok(addr) = Address::parse(canonical.to_string()) else { return };
+        let mut restored = Xite::new(addr, storage.clone());
+        let loaded = restored.load_content().unwrap_or(false) || restored.load_content_local();
+        if loaded {
+            self.update_content(address, restored.content).await;
+        }
     }
 
     /// Peer counts (connected/connectable/onion/local/total) for the sidebar.
@@ -7808,6 +7861,49 @@ mod tests {
 
         // Idempotent: a second call is a no-op that still reports present.
         assert!(state.load_content_from_disk(addr).await);
+    }
+
+    #[tokio::test]
+    async fn rollback_content_restores_previous_version_on_disk_and_in_state() {
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let storage = XiteStorage::new(dir.path());
+
+        // The version we started from (v1) is on disk and in the live state.
+        let v1 = serde_json::to_vec(&json!({
+            "address": addr, "modified": 100.0, "title": "V1", "files": {}
+        }))
+        .unwrap();
+        storage.write("content.json", &v1).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(serde_json::from_slice(&v1).unwrap()),
+                },
+            )
+            .await;
+
+        // A resync wrote the newer v2 content.json to disk and swapped it into
+        // the live state, then couldn't fetch one of its files.
+        let v2 = serde_json::to_vec(&json!({
+            "address": addr, "modified": 200.0, "title": "V2", "files": {}
+        }))
+        .unwrap();
+        storage.write("content.json", &v2).unwrap();
+        state.update_content(addr, Some(serde_json::from_slice(&v2).unwrap())).await;
+        assert_eq!(state.site_info(addr).await["content"]["title"], "V2");
+
+        // Rolling back restores v1 both on disk and in the live siteInfo.
+        state.rollback_content(addr, addr, &storage, Some(&v1)).await;
+        assert_eq!(state.site_info(addr).await["content"]["title"], "V1");
+        assert_eq!(storage.read("content.json").unwrap(), v1);
+
+        // No previous bytes: a no-op, current state untouched.
+        state.rollback_content(addr, addr, &storage, None).await;
+        assert_eq!(state.site_info(addr).await["content"]["title"], "V1");
     }
 
     #[tokio::test]
