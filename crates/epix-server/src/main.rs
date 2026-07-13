@@ -41,7 +41,7 @@ async fn main() {
 
     // Accept a raw `epix1…` address, a `.epix` name, or an `epix://…` deep link
     // (from the OS handing off a clicked link). Default to the dashboard xite.
-    let raw = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_DASHBOARD.to_string());
+    let raw = cli.first().cloned().unwrap_or_else(|| DEFAULT_DASHBOARD.to_string());
     let target = epix_node::parse_target(&raw);
 
     // Headless mode (`EPIX_HEADLESS=1`): serve the node but don't open a browser

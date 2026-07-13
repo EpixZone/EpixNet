@@ -4210,53 +4210,57 @@ impl AppState {
         self.peer_locations_impl(Some(address)).await
     }
 
+    /// The clearnet peer IPs of the selected xite(s), unpinged (`None`):
+    /// `only_site = None` pools every served xite, `Some(address)` just that
+    /// one. The first stage of the peer-location queries below.
+    async fn known_peer_ips(&self, only_site: Option<&str>) -> HashMap<std::net::IpAddr, Option<i64>> {
+        let xites = self.xites.read().await;
+        let selected: Vec<&ManagedXite> = match only_site {
+            Some(addr) => self.resolve_xite(&xites, addr).into_iter().collect(),
+            None => xites.values().collect(),
+        };
+        let mut pings = HashMap::new();
+        for x in selected {
+            for p in x.peers.peers() {
+                if let PeerAddr::Ip(sa) = &p.addr {
+                    pings.entry(sa.ip()).or_insert(None);
+                }
+            }
+        }
+        pings
+    }
+
     /// Shared body: `only_site = None` pools every xite's peers (the global
     /// world map); `Some(address)` restricts to that one xite (the sidebar
     /// globe), so an unconnected site doesn't borrow other sites' dots.
     async fn peer_locations_impl(&self, only_site: Option<&str>) -> Vec<Value> {
         let Some(geoip) = self.geoip.read().await.clone() else { return Vec::new() };
         // Best ping seen per IP (ms), across the selected xite(s).
-        let mut pings: HashMap<std::net::IpAddr, Option<i64>> = HashMap::new();
-        {
-            let xites = self.xites.read().await;
-            let selected: Vec<&ManagedXite> = match only_site {
-                Some(addr) => self.resolve_xite(&xites, addr).into_iter().collect(),
-                None => xites.values().collect(),
-            };
-            for x in selected {
-                for p in x.peers.peers() {
-                    if let PeerAddr::Ip(sa) = &p.addr {
-                        pings.entry(sa.ip()).or_insert(None);
-                    }
-                }
-            }
-        }
+        let mut pings = self.known_peer_ips(only_site).await;
         // Ping (ms) per connected clearnet peer, from the warm pool. For a single
         // site, only annotate IPs that are actually this site's peers - the warm
         // pool is node-wide, so folding all of it in would re-introduce other
         // sites' dots.
         for addr in self.conn_pool.connected_addrs().await {
-            if let PeerAddr::Ip(sa) = &addr {
-                let ip = sa.ip();
-                if only_site.is_some() && !pings.contains_key(&ip) {
-                    continue;
-                }
-                if let Some(ms) = self.conn_pool.ping_for(&addr).await {
-                    pings.insert(ip, Some(ms));
-                }
+            let PeerAddr::Ip(sa) = &addr else { continue };
+            let ip = sa.ip();
+            if only_site.is_some() && !pings.contains_key(&ip) {
+                continue;
+            }
+            if let Some(ms) = self.conn_pool.ping_for(&addr).await {
+                pings.insert(ip, Some(ms));
             }
         }
         let mut out = Vec::new();
         for (ip, ping) in pings {
-            if let Some(loc) = geoip.locate(ip) {
-                out.push(json!({
-                    "lat": loc.lat,
-                    "lon": loc.lon,
-                    "city": loc.city,
-                    "country": loc.country,
-                    "ping": ping,
-                }));
-            }
+            let Some(loc) = geoip.locate(ip) else { continue };
+            out.push(json!({
+                "lat": loc.lat,
+                "lon": loc.lon,
+                "city": loc.city,
+                "country": loc.country,
+                "ping": ping,
+            }));
         }
         out
     }
