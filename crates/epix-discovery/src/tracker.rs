@@ -6,6 +6,22 @@ use epix_transport::Transport;
 use rmpv::Value;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
+/// Signs a tracker's onion-ownership challenge with the onion identity key.
+///
+/// Bootstrapper-lineage trackers don't take an onion self-advert at face
+/// value: the first announce comes back with an `onion_sign_this` nonce, and
+/// the onion is only registered once a re-announce proves key ownership with
+/// `onion_signs` (`{identity pubkey: ed25519 signature over the nonce}`).
+/// Without that second step the tracker silently drops the onion - the
+/// announce "succeeds" but no other node can ever discover us.
+pub trait OnionSigner: Send + Sync {
+    /// The onion's 32-byte ed25519 identity public key (the key encoded in
+    /// the `.onion` address itself).
+    fn public_key(&self) -> [u8; 32];
+    /// A standard Ed25519 signature over `msg` by the identity key.
+    fn sign(&self, msg: &[u8]) -> [u8; 64];
+}
+
 /// Parameters for an `announce` request.
 pub struct AnnounceParams<'a> {
     /// Xite tracker hashes (`sha256(address)`) to query.
@@ -24,30 +40,66 @@ pub struct AnnounceParams<'a> {
     /// Our i2p self-addresses (b32 host, no `.i2p`, e.g. `<b32>.b32`), so i2p
     /// trackers advertise us.
     pub i2p: &'a [String],
+    /// Answers the tracker's `onion_sign_this` challenge, proving we own the
+    /// onions in `onions`. Without it the tracker never registers them.
+    pub onion_signer: Option<&'a dyn OnionSigner>,
 }
 
 /// Run an `announce` over an already-handshaked connection, returning the peers.
 pub async fn announce(conn: &mut Connection, params: &AnnounceParams<'_>) -> Result<Vec<PeerAddr>> {
-    let hashes = params
+    let hashes: Vec<Value> = params
         .hashes
         .iter()
         .map(|h| Value::Binary(h.to_vec()))
         .collect();
-    let need_types = params.need_types.iter().map(|t| Value::from(*t)).collect();
-    let add = params.add.iter().map(|t| Value::from(*t)).collect();
-    let onions = params.onions.iter().map(|o| Value::from(o.as_str())).collect();
-    let i2p = params.i2p.iter().map(|o| Value::from(o.as_str())).collect();
+    let need_types: Vec<Value> = params.need_types.iter().map(|t| Value::from(*t)).collect();
+    let add: Vec<Value> = params.add.iter().map(|t| Value::from(*t)).collect();
+    let onions: Vec<Value> = params.onions.iter().map(|o| Value::from(o.as_str())).collect();
+    let i2p: Vec<Value> = params.i2p.iter().map(|o| Value::from(o.as_str())).collect();
     let request = vmap(vec![
-        ("hashes", Value::Array(hashes)),
-        ("onions", Value::Array(onions)),
-        ("i2p", Value::Array(i2p)),
+        ("hashes", Value::Array(hashes.clone())),
+        ("onions", Value::Array(onions.clone())),
+        ("i2p", Value::Array(i2p.clone())),
         ("port", Value::from(params.port as i64)),
-        ("need_types", Value::Array(need_types)),
+        ("need_types", Value::Array(need_types.clone())),
         ("need_num", Value::from(params.need_num)),
-        ("add", Value::Array(add)),
+        ("add", Value::Array(add.clone())),
     ]);
 
     let res = conn.request("announce", request).await?;
+
+    // Bootstrapper trackers challenge onion self-adverts: prove key ownership
+    // by signing the nonce, or the onion is never registered (and this node
+    // stays undiscoverable by everyone announcing the same xite).
+    let challenge = vget(&res, "onion_sign_this").and_then(|v| v.as_str()).map(str::to_string);
+    if let (Some(challenge), Some(signer)) = (challenge, params.onion_signer) {
+        if !params.onions.is_empty() {
+            let sig = signer.sign(challenge.as_bytes());
+            let pubkey = signer.public_key();
+            let signed = vmap(vec![
+                ("hashes", Value::Array(hashes)),
+                ("onions", Value::Array(onions)),
+                ("i2p", Value::Array(i2p)),
+                ("port", Value::from(params.port as i64)),
+                ("need_types", Value::Array(need_types)),
+                // The peers came back on the first response already.
+                ("need_num", Value::from(0)),
+                ("add", Value::Array(add)),
+                ("onion_sign_this", Value::from(challenge.as_str())),
+                (
+                    "onion_signs",
+                    Value::Map(vec![(
+                        Value::Binary(pubkey.to_vec()),
+                        Value::Binary(sig.to_vec()),
+                    )]),
+                ),
+            ]);
+            // Registration only: a failure here shouldn't cost us the peers
+            // the first response handed back.
+            let _ = conn.request("announce", signed).await;
+        }
+    }
+
     let per_xite = vget(&res, "peers")
         .and_then(|v| v.as_array())
         .ok_or_else(|| Error::Protocol("announce response missing `peers`".into()))?;

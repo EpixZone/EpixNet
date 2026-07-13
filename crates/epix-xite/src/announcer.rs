@@ -8,7 +8,7 @@ pub use epix_discovery::Tracker;
 
 /// How we advertise ourselves to trackers, so they hand our address to other
 /// nodes. Overlay addresses are the only way onion/i2p-only nodes get found.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SelfAdvert {
     /// Our fileserver port (also the onion/i2p virtual port). 0 = passive.
     pub port: u16,
@@ -20,6 +20,22 @@ pub struct SelfAdvert {
     pub want_onion: bool,
     /// Whether we can dial i2p peers (I2P up) - request them from trackers.
     pub want_i2p: bool,
+    /// Signs the tracker's onion-ownership challenge; without it, trackers
+    /// that verify onion adverts never register ours.
+    pub onion_signer: Option<std::sync::Arc<dyn epix_discovery::OnionSigner>>,
+}
+
+impl std::fmt::Debug for SelfAdvert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfAdvert")
+            .field("port", &self.port)
+            .field("onion", &self.onion)
+            .field("i2p", &self.i2p)
+            .field("want_onion", &self.want_onion)
+            .field("want_i2p", &self.want_i2p)
+            .field("onion_signer", &self.onion_signer.is_some())
+            .finish()
+    }
 }
 
 /// Announce `xite_address` to each tracker - the Epix wire protocol for
@@ -58,6 +74,7 @@ pub async fn announce(
         add: &add,
         onions: &onions,
         i2p: &i2ps,
+        onion_signer: advert.onion_signer.as_deref(),
     };
     let mut peers: Vec<PeerAddr> = Vec::new();
     let mut fold = |found: Vec<PeerAddr>| {

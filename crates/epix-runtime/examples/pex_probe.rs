@@ -60,6 +60,7 @@ async fn main() {
         add: &[],
         onions: &[],
         i2p: &[],
+        onion_signer: None,
     };
     let mut conn = Connection::connect(&transport, &peer).await.expect("connect");
     conn.handshake().await.expect("handshake");
@@ -89,6 +90,7 @@ async fn main() {
         add: &add,
         onions: &[],
         i2p: std::slice::from_ref(&a),
+        onion_signer: None,
     };
     announce(&mut conn, &p1).await.expect("announce a");
     // Second announcer registers `b` and should discover `a`.
@@ -102,6 +104,7 @@ async fn main() {
         add: &add,
         onions: &[],
         i2p: std::slice::from_ref(&b),
+        onion_signer: None,
     };
     let found = announce(&mut conn, &p2).await.expect("announce b");
     println!("== tracker i2p record+serve selftest ==");

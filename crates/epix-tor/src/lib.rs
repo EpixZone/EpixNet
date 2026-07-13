@@ -58,6 +58,135 @@ pub struct Tor {
     client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
 }
 
+/// The onion service's ed25519 identity key, for proving onion ownership to
+/// trackers (Bootstrapper's `onion_sign_this` challenge). Loaded from the
+/// Arti keystore where [`Tor::launch_onion_service`] persists it.
+pub struct OnionKey {
+    /// Tor's expanded secret key: 32-byte scalar `a` + 32-byte hash prefix.
+    expanded: [u8; 64],
+    /// The identity public key - the same 32 bytes the `.onion` address encodes.
+    public: [u8; 32],
+}
+
+impl OnionKey {
+    /// Load the identity key of the onion service `nickname` from the Arti
+    /// keystore under `data_dir` (same layout [`Tor::bootstrap`] uses). The
+    /// key file is an OpenSSH envelope holding a 64-byte
+    /// `ed25519-expanded@spec.torproject.org` private key.
+    pub fn load(data_dir: &Path, nickname: &str) -> Result<Self> {
+        let path = data_dir
+            .join("tor")
+            .join("state")
+            .join("keystore")
+            .join("hss")
+            .join(nickname)
+            .join("ks_hs_id.ed25519_expanded_private");
+        let pem = std::fs::read_to_string(&path)
+            .map_err(|e| Error::Protocol(format!("onion key {}: {e}", path.display())))?;
+        let b64: String =
+            pem.lines().filter(|l| !l.starts_with("-----")).collect::<Vec<_>>().join("");
+        let blob = base64_decode(&b64)
+            .ok_or_else(|| Error::Protocol("onion key: bad base64".into()))?;
+        parse_openssh_ed25519_expanded(&blob)
+            .ok_or_else(|| Error::Protocol("onion key: unexpected OpenSSH structure".into()))
+    }
+
+    /// The 32-byte identity public key (what the `.onion` address encodes).
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public
+    }
+
+    /// Standard Ed25519 signature over `msg`, verifiable against
+    /// [`Self::public_key`]. Expanded-key path (Tor keys have no seed):
+    /// `r = H(prefix || msg)`, `S = r + H(R || A || msg) * a`.
+    ///
+    /// Built directly on curve25519 - `ed25519_dalek`'s hazmat
+    /// `ExpandedSecretKey` re-clamps the scalar half, but Arti stores hs
+    /// identity keys as uniform reduced scalars (low bits set, bit 254
+    /// clear), so clamping silently swaps in a different key and every
+    /// signature fails verification.
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        use curve25519_dalek::{EdwardsPoint, Scalar};
+        use sha2::{Digest, Sha512};
+        let scalar_bytes: [u8; 32] = self.expanded[..32].try_into().expect("split");
+        let a = Scalar::from_bytes_mod_order(scalar_bytes);
+        let prefix = &self.expanded[32..];
+        let r = Scalar::from_hash(Sha512::new().chain_update(prefix).chain_update(msg));
+        let big_r = EdwardsPoint::mul_base(&r).compress();
+        let k = Scalar::from_hash(
+            Sha512::new()
+                .chain_update(big_r.as_bytes())
+                .chain_update(self.public)
+                .chain_update(msg),
+        );
+        let s = k * a + r;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(big_r.as_bytes());
+        sig[32..].copy_from_slice(&s.to_bytes());
+        sig
+    }
+}
+
+/// Minimal base64 (standard alphabet) decoder - avoids a dependency for one
+/// keystore file read.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' {
+            continue;
+        }
+        let v = ALPHA.iter().position(|&a| a == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Pull the 64-byte expanded private key + 32-byte public key out of Arti's
+/// `openssh-key-v1` envelope (algorithm `ed25519-expanded@spec.torproject.org`).
+fn parse_openssh_ed25519_expanded(blob: &[u8]) -> Option<OnionKey> {
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    let rest = blob.strip_prefix(MAGIC)?;
+    let mut off = 0;
+    let rd = |off: &mut usize| -> Option<&[u8]> {
+        let n = u32::from_be_bytes(rest.get(*off..*off + 4)?.try_into().ok()?) as usize;
+        let s = rest.get(*off + 4..*off + 4 + n)?;
+        *off += 4 + n;
+        Some(s)
+    };
+    let cipher = rd(&mut off)?;
+    if cipher != b"none" {
+        return None; // encrypted keystores are not supported
+    }
+    rd(&mut off)?; // kdf name
+    rd(&mut off)?; // kdf options
+    off += 4; // number of keys (always 1)
+    rd(&mut off)?; // public key blob
+    let private = rd(&mut off)?;
+    // Private section: two check ints, then per-key algorithm/public/private.
+    let mut poff = 8;
+    let prd = |poff: &mut usize| -> Option<&[u8]> {
+        let n = u32::from_be_bytes(private.get(*poff..*poff + 4)?.try_into().ok()?) as usize;
+        let s = private.get(*poff + 4..*poff + 4 + n)?;
+        *poff += 4 + n;
+        Some(s)
+    };
+    let alg = prd(&mut poff)?;
+    if alg != b"ed25519-expanded@spec.torproject.org" {
+        return None;
+    }
+    let public: [u8; 32] = prd(&mut poff)?.try_into().ok()?;
+    let expanded: [u8; 64] = prd(&mut poff)?.try_into().ok()?;
+    Some(OnionKey { expanded, public })
+}
+
 /// Install the process-wide rustls crypto provider (`ring`) once. rustls 0.23
 /// refuses to pick a default when more than one provider is compiled in (both
 /// `ring` and `aws-lc-rs` end up in the tree via arti's deps), so arti's TLS
@@ -361,6 +490,88 @@ mod tests {
         assert_eq!(TorMode::parse("enable"), TorMode::Enable);
         assert_eq!(TorMode::parse("Always"), TorMode::Always);
         assert_eq!(TorMode::parse(""), TorMode::Enable);
+    }
+
+    /// Build an `openssh-key-v1` envelope holding an expanded ed25519 key the
+    /// way Arti's keystore writes them, load it through [`OnionKey::load`],
+    /// and check the produced signature verifies against the identity pubkey
+    /// with a stock Ed25519 verifier (what Bootstrapper trackers run).
+    ///
+    /// The scalar is a uniform reduced scalar that is deliberately NOT in
+    /// clamped form - exactly how Arti stores hs identity keys. A signer
+    /// that clamps (e.g. `ed25519_dalek`'s hazmat `ExpandedSecretKey`) would
+    /// change the key and fail this test.
+    #[test]
+    fn onion_key_loads_and_signs_tracker_challenge() {
+        use curve25519_dalek::{EdwardsPoint, Scalar};
+        use ed25519_dalek::Verifier;
+
+        // A deterministic "expanded" key with an Arti-style unclamped scalar.
+        let scalar = Scalar::from_bytes_mod_order([7u8; 32]);
+        let scalar_bytes = scalar.to_bytes();
+        assert_ne!(scalar_bytes[0] & 7, 0, "test scalar must not look clamped");
+        let mut expanded = [0u8; 64];
+        expanded[..32].copy_from_slice(&scalar_bytes);
+        expanded[32..].copy_from_slice(&[9u8; 32]); // hash prefix
+        let public = EdwardsPoint::mul_base(&scalar).compress().to_bytes();
+
+        let str32 = |b: &[u8]| {
+            let mut v = (b.len() as u32).to_be_bytes().to_vec();
+            v.extend_from_slice(b);
+            v
+        };
+        let alg = b"ed25519-expanded@spec.torproject.org";
+        // Private section: check ints, alg, public, private, no comment.
+        let mut private = vec![0x11, 0x22, 0x33, 0x44, 0x11, 0x22, 0x33, 0x44];
+        private.extend(str32(alg));
+        private.extend(str32(&public));
+        private.extend(str32(&expanded));
+        private.extend(str32(b""));
+        while private.len() % 8 != 0 {
+            private.push(0);
+        }
+        let mut blob = b"openssh-key-v1\0".to_vec();
+        blob.extend(str32(b"none")); // cipher
+        blob.extend(str32(b"none")); // kdf
+        blob.extend(str32(b"")); // kdf options
+        blob.extend(1u32.to_be_bytes()); // key count
+        let mut pub_blob = str32(alg);
+        pub_blob.extend(str32(&public));
+        blob.extend(str32(&pub_blob));
+        blob.extend(str32(&private));
+
+        // Base64-wrap into the PEM-style file Arti writes.
+        const ALPHA: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in blob.chunks(3) {
+            let mut buf = [0u8; 3];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            let n = u32::from_be_bytes([0, buf[0], buf[1], buf[2]]);
+            for i in 0..=chunk.len() {
+                b64.push(ALPHA[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+            for _ in chunk.len()..3 {
+                b64.push('=');
+            }
+        }
+        let pem = format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{b64}\n-----END OPENSSH PRIVATE KEY-----\n"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_dir = dir.path().join("tor/state/keystore/hss/epix");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(key_dir.join("ks_hs_id.ed25519_expanded_private"), pem).unwrap();
+
+        let key = OnionKey::load(dir.path(), "epix").expect("load onion key");
+        assert_eq!(key.public_key(), public);
+
+        let msg = b"1783961332"; // tracker challenges are epoch-second strings
+        let sig = key.sign(msg);
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&public).unwrap();
+        vk.verify(msg, &ed25519_dalek::Signature::from_bytes(&sig))
+            .expect("signature verifies against the identity pubkey");
     }
 
     /// Write a guards.json into `<state>/state/` shaped like arti's, with the

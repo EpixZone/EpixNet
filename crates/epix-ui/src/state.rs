@@ -398,6 +398,9 @@ pub struct AppState {
     tor_enabled: RwLock<bool>,
     tor_status: RwLock<String>,
     onion_address: RwLock<Option<String>>,
+    /// Signer for tracker onion-ownership challenges (`onion_sign_this`),
+    /// set once the onion service is up. Included in every self-advert.
+    onion_signer: RwLock<Option<std::sync::Arc<dyn epix_xite::OnionSigner>>>,
     /// Our own `.b32.i2p` short address (host without the `.i2p` suffix) once
     /// the I2P inbound session is ready. Advertised in PEX so peers can reach
     /// and gossip us over I2P. Set by the runtime's I2P loop.
@@ -716,6 +719,7 @@ impl AppState {
             tor_enabled: RwLock::new(false),
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
+            onion_signer: RwLock::new(None),
             i2p_address: RwLock::new(None),
             ui_loopback: RwLock::new(false),
             bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -832,6 +836,7 @@ impl AppState {
             tor_enabled: RwLock::new(false),
             tor_status: RwLock::new("Disabled".to_string()),
             onion_address: RwLock::new(None),
+            onion_signer: RwLock::new(None),
             i2p_address: RwLock::new(None),
             ui_loopback: RwLock::new(false),
             bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2078,6 +2083,7 @@ impl AppState {
             i2p: self.i2p_address().await,
             want_onion: self.tor_status().await.0,
             want_i2p: self.i2p_address().await.is_some(),
+            onion_signer: self.onion_signer.read().await.clone(),
         });
         // Announce to every tracker concurrently: with a Beacon-sized list
         // (dozens, some dead), serial announces would stretch one pass across
@@ -2273,6 +2279,13 @@ impl AppState {
     pub async fn set_onion_address(&self, host: &str) {
         *self.onion_address.write().await = Some(host.to_string());
         self.push_server_info().await;
+    }
+
+    /// Record the onion identity signer used to answer tracker
+    /// `onion_sign_this` challenges - without it, Bootstrapper trackers never
+    /// register our onion and other nodes cannot discover us over Tor.
+    pub async fn set_onion_signer(&self, signer: std::sync::Arc<dyn epix_xite::OnionSigner>) {
+        *self.onion_signer.write().await = Some(signer);
     }
 
     /// Tor state for `serverInfo`: `(enabled, status)`.
