@@ -987,6 +987,30 @@ impl epix_ui::OnDemandResolver for OnDemand {
         self.in_flight.lock().await.remove(host);
         result
     }
+
+    async fn resolve(&self, host: &str) -> Option<String> {
+        resolve_host(&self.data_root, host).await
+    }
+}
+
+/// Resolve `host` (a `.epix` name or an `epix1…` address) to a xite address,
+/// consulting the on-disk cache first and the chain only on a miss/expiry.
+/// A successful chain lookup is written back to the cache. Never clones.
+async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String> {
+    let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+    if name.starts_with("epix1") {
+        return Some(name.to_string());
+    }
+    match cached_resolution(data_root, host) {
+        Some((address, true)) => Some(address),
+        stale => match try_resolve_on_chain(name, tld).await {
+            Ok(address) => {
+                write_resolve_cache(data_root, host, &address);
+                Some(address)
+            }
+            Err(_) => stale.map(|(address, _)| address),
+        },
+    }
 }
 
 #[async_trait::async_trait]
@@ -1039,22 +1063,9 @@ impl OnDemand {
         // Resolve the name to a xite address (unless it's already one): the
         // on-disk cache first; the chain only on a miss or an expired entry.
         // An expired entry still serves if the chain is unreachable.
-        let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-        let address = if name.starts_with("epix1") {
-            name.to_string()
-        } else {
-            match cached_resolution(&self.data_root, host) {
-                Some((address, true)) => address,
-                stale => match try_resolve_on_chain(name, tld).await {
-                    Ok(address) => {
-                        // Persist so a restart serves it without re-resolving.
-                        write_resolve_cache(&self.data_root, host, &address);
-                        address
-                    }
-                    Err(e) => stale.map(|(address, _)| address).ok_or(e)?,
-                },
-            }
-        };
+        let address = resolve_host(&self.data_root, host)
+            .await
+            .ok_or_else(|| format!("could not resolve {host}"))?;
 
         let data_dir = self.data_root.join("data").join(&address);
         // Clone when the address isn't served yet, or resume when it is served
@@ -1438,6 +1449,10 @@ async fn serve(
 
     let server =
         UiServer::with_registry_and_media(state.clone(), plugins.command_registry(), plugins.media_bundle());
+    // Local operator channel: a filesystem-guarded admin socket so a locked-down
+    // (restricted / NoNewSites) node can still be administered server-side.
+    #[cfg(unix)]
+    server.spawn_admin_socket(opts.data_root.join("admin.sock"));
     Ok((server, RunningNode { state, display, address, ui_addr: bind }))
 }
 

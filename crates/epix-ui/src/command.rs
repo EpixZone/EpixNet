@@ -100,6 +100,34 @@ const NEW_SITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
 /// lock the node's site set (no adds and no deletes) with one switch.
 const DELETE_SITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 
+/// Commands that write or delete a xite's files/content. On a restricted
+/// (public gateway) node these need genuine ownership of the bound xite, never
+/// just the wrapper's elevated id - otherwise any visitor could rewrite or
+/// delete files on a site the gateway only serves.
+const WRITE_COMMANDS: &[&str] =
+    &["fileWrite", "fileDelete", "siteSign", "sitePublish", "certAdd"];
+
+/// ADMIN commands that are read-only and expose nothing sensitive, so a
+/// restricted (public gateway) node still answers them - the read-only
+/// dashboard a visitor sees needs the site list, network stats, peer info, and
+/// the news feed. Everything else in `ADMIN_COMMANDS` (mutations, node config,
+/// identities, logs, the master seed) stays server-side only. An allow-list, so
+/// a newly added admin command is refused on a gateway until it is vetted here.
+const GATEWAY_READ_COMMANDS: &[&str] = &[
+    "announcerStats",
+    "channelJoinAllsite",
+    "chartDbQuery",
+    "chartGetPeerLocations",
+    "feedQuery",
+    "feedSearch",
+    "notificationQuery",
+    "optionalLimitStats",
+    "serverPortcheck",
+    "sidebarGetHtmlTag",
+    "sidebarGetPeers",
+    "siteList",
+];
+
 /// Per-connection context handed to every command.
 pub struct WsSession {
     pub state: Arc<AppState>,
@@ -117,10 +145,25 @@ pub struct WsSession {
     /// receives events for *every* xite, not just its bound one (the dashboard
     /// uses this so its Sites panel updates for all sites).
     pub allsite_channels: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// A trusted local operator session (the admin Unix socket, reachable only
+    /// with filesystem access to the data dir). Trusted sessions bypass the
+    /// restricted-gateway gates and NoNewSites, since server-side admin is how
+    /// a locked-down node is meant to be changed.
+    pub trusted: bool,
 }
 
 impl WsSession {
     pub fn new(state: Arc<AppState>, xite: Option<String>) -> Self {
+        Self::build(state, xite, false)
+    }
+
+    /// A trusted session for the local admin socket: full admin, no gateway
+    /// restrictions. Only ever created for the filesystem-guarded Unix socket.
+    pub fn new_trusted(state: Arc<AppState>, xite: Option<String>) -> Self {
+        Self::build(state, xite, true)
+    }
+
+    fn build(state: Arc<AppState>, xite: Option<String>, trusted: bool) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             state,
@@ -128,6 +171,7 @@ impl WsSession {
             xite,
             channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
+            trusted,
         }
     }
 
@@ -277,29 +321,88 @@ impl CommandRegistry {
         params: &Value,
         req_id: i64,
     ) -> Result<Value, String> {
-        // Gate ADMIN-only commands. A command is allowed when it comes from the
-        // wrapper (elevated id) or the bound site actually holds ADMIN.
+        // A restricted (internet-facing) node has no trusted admin client. A
+        // normal node binds the UI to loopback, so only the local wrapper
+        // reaches the command API - it proves itself with an elevated request
+        // id, and the dashboard xite it drives holds ADMIN. Behind a reverse
+        // proxy (the public gateway) neither holds: any visitor can send the
+        // same elevated id, and any visitor can bind their socket to the
+        // dashboard address to inherit its ADMIN grant. So when restricted,
+        // admin is refused outright and only happens server-side.
+        // The local admin socket is a trusted operator channel: it bypasses the
+        // gateway restrictions entirely (that is the sanctioned way to change a
+        // locked-down node).
+        let restrict = session.state.ui_restrict().await && !session.trusted;
         if is_admin_command(cmd) {
-            let elevated = req_id >= WRAPPER_ID_BASE;
-            let has_admin = match &session.xite {
-                Some(addr) => session.state.site_has_admin(addr).await,
+            if restrict {
+                // A locked gateway still answers the safe read-only admin
+                // commands the public dashboard needs (site list, stats, peers,
+                // feed); every mutation and sensitive read is server-side only.
+                if !GATEWAY_READ_COMMANDS.contains(&cmd) {
+                    return Err(format!("{cmd} is disabled on this gateway"));
+                }
+            } else {
+                // Allowed from the trusted admin socket, the wrapper (elevated
+                // id), or when the bound site actually holds ADMIN.
+                let elevated = session.trusted || req_id >= WRAPPER_ID_BASE;
+                let has_admin = match &session.xite {
+                    Some(addr) => session.state.site_has_admin(addr).await,
+                    None => false,
+                };
+                if !elevated && !has_admin {
+                    return Err(format!("You don't have permission to run {cmd}"));
+                }
+            }
+        }
+        // Restricted node: writing or deleting a xite's files needs the node to
+        // genuinely own it (hold the signing key). Serving a site never confers
+        // write access, and the dashboard's ADMIN grant must not either - the
+        // client chooses which site to bind to.
+        if restrict && WRITE_COMMANDS.contains(&cmd) {
+            let owns = match &session.xite {
+                Some(addr) => session.state.xite_owned(addr).await,
                 None => false,
             };
-            if !elevated && !has_admin {
-                return Err(format!("You don't have permission to run {cmd}"));
+            if !owns {
+                let msg = "This node is a read-only gateway; changes are disabled here";
+                session.state.push_notification("error", msg, 0);
+                return Err(msg.into());
             }
+        }
+        // UiConfig / UiPluginManager: turning the plugin off removes the feature
+        // itself, not just its dashboard link - the pages stop loading (see the
+        // route handlers) and their commands are declined here, so the only way
+        // to change these is server-side (CLI/config file). Without this a
+        // client that navigates straight to the command still reaches it.
+        if !session.trusted
+            && matches!(cmd, "configSet" | "configList")
+            && !session.state.plugin_enabled("UiConfig").await
+        {
+            return Err("The configuration page is disabled on this node".into());
+        }
+        if !session.trusted
+            && matches!(cmd, "pluginConfigSet" | "pluginList")
+            && !session.state.plugin_enabled("UiPluginManager").await
+        {
+            return Err("The plugin manager is disabled on this node".into());
         }
         // NoNewSites: when the operator sets `no_new_sites`, lock the node's site
         // set - refuse commands that add/clone a new site or delete an existing
         // one.
-        if NEW_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
+        if !session.trusted
+            && NEW_SITE_COMMANDS.contains(&cmd)
+            && session.state.no_new_sites().await
+        {
             let msg = "Adding new sites is disabled on this node";
             // Also push a toast: the dashboard fires these without a callback,
             // so the plain error response alone is invisible to the user.
             session.state.push_notification("error", msg, 0);
             return Err(msg.into());
         }
-        if DELETE_SITE_COMMANDS.contains(&cmd) && session.state.no_new_sites().await {
+        if !session.trusted
+            && DELETE_SITE_COMMANDS.contains(&cmd)
+            && session.state.no_new_sites().await
+        {
             let msg = "Deleting sites is disabled on this node";
             session.state.push_notification("error", msg, 0);
             return Err(msg.into());
@@ -329,7 +432,7 @@ impl CommandRegistry {
             let allowed = session.xite.as_deref() == Some(target.as_str())
                 || match &session.xite {
                     Some(addr) => session.state.site_has_admin(addr).await,
-                    None => req_id >= WRAPPER_ID_BASE,
+                    None => !restrict && req_id >= WRAPPER_ID_BASE,
                 };
             if !allowed {
                 return Err(format!("No permission to run commands as {target}"));
@@ -963,7 +1066,14 @@ impl WsCommand for SiteAdd {
         if s.state.has_xite(&address).await {
             return Ok(json!({ "error": "Site already added" }));
         }
-        if s.state.ensure_xite(&address).await {
+        // A trusted operator (the admin socket) may add a site even when
+        // NoNewSites locks the set - that is the server-side `siteDownload`.
+        let added = if s.trusted {
+            s.state.ensure_xite_admin(&address).await
+        } else {
+            s.state.ensure_xite(&address).await
+        };
+        if added {
             Ok(Value::from("ok"))
         } else {
             Ok(json!({ "error": "Invalid address" }))

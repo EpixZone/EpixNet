@@ -17,6 +17,9 @@ pub fn is_action(name: &str) -> bool {
         "siteCreate"
             | "siteSign"
             | "siteVerify"
+            | "siteList"
+            | "siteDelete"
+            | "siteDownload"
             | "dbRebuild"
             | "dbQuery"
             | "importBundle"
@@ -145,6 +148,62 @@ async fn dispatch(
             Ok(())
         }
 
+        // --- site admin: one path, run live via the admin socket when the node
+        // is up, else the offline data-dir equivalent. `siteList` takes no arg;
+        // the others take an address.
+        "siteList" | "siteDelete" | "siteDownload" => {
+            let address = if action == "siteList" {
+                String::new()
+            } else {
+                let [a] = args else { return Err(format!("usage: {action} <address>")) };
+                a.clone()
+            };
+            // The live command name and its params (siteDownload maps to siteAdd).
+            let (live_cmd, params) = match action {
+                "siteList" => ("siteList", serde_json::json!({})),
+                "siteDelete" => ("siteDelete", serde_json::json!({ "address": address })),
+                _ => ("siteAdd", serde_json::json!({ "address": address })),
+            };
+            match admin_call(data_root, live_cmd, params).await? {
+                Some(reply) => match action {
+                    "siteList" => {
+                        let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
+                        for s in sites {
+                            let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("?");
+                            let peers = s.get("peers").and_then(|v| v.as_i64()).unwrap_or(0);
+                            println!("{addr}  ({peers} peers)");
+                        }
+                        println!("{} site(s) [live]", sites.len());
+                    }
+                    "siteDelete" => println!("Deleted {address} [live]"),
+                    _ => println!("Downloading {address} [live] - watch the node log"),
+                },
+                None => {
+                    let state = open_state(data_root, version).await;
+                    match action {
+                        "siteList" => {
+                            let sites = state.xite_addresses().await;
+                            for addr in &sites {
+                                println!("{addr}");
+                            }
+                            println!("{} site(s) [offline]", sites.len());
+                        }
+                        "siteDelete" if !state.remove_xite(&address).await => {
+                            return Err(format!("Unknown site: {address}"));
+                        }
+                        "siteDelete" => println!("Deleted {address} [offline]"),
+                        // No network stack offline: register it so the node
+                        // clones it on the next start.
+                        _ => {
+                            state.register_for_download(&address).await?;
+                            println!("Queued {address}; downloads on next start [offline]");
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
         // --- key operations (no node, no data dir) -------------------------
         "cryptSign" => {
             let [message, privatekey] = args else {
@@ -229,6 +288,43 @@ async fn dispatch(
         }
         _ => Err("unknown action".into()),
     }
+}
+
+/// Send one command to the running node's admin socket, if it is up.
+///
+/// `Ok(None)` means the node is not running (no socket to connect to), so the
+/// caller falls back to an offline data-dir operation. `Ok(Some(value))` is the
+/// command's result. A command-level failure comes back as `Err`.
+async fn admin_call(
+    data_root: &std::path::Path,
+    cmd: &str,
+    params: serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let path = data_root.join("admin.sock");
+    let mut stream = match tokio::net::UnixStream::connect(&path).await {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // node not running -> offline path
+    };
+    let req = serde_json::json!({ "cmd": cmd, "params": params }).to_string();
+    stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    let (r, _w) = stream.into_split();
+    let mut line = String::new();
+    BufReader::new(r).read_line(&mut line).await.map_err(|e| e.to_string())?;
+    let reply: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("bad admin reply: {e}"))?;
+    // A transport/protocol error, or the EpixNet convention where a command
+    // failure comes back as a result of `{"error": …}`.
+    if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    let result = reply.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(Some(result))
 }
 
 /// Open the node state offline: data dir + user + the served-site registry.
