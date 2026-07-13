@@ -335,6 +335,19 @@ async fn clone_xite_with_progress(
             }
         });
     }
+    // Seed the search with every peer the node already knows for this xite, not
+    // just the handful this call's one-shot announce returns. The background
+    // announce loop accumulates a working set across cycles (onion seeders that
+    // a single fresh announce may miss), so feeding them in up front is what
+    // lets a retry - or a clone that started while discovery was still warming -
+    // reach a live seeder instead of failing on four dead peers.
+    if let Some(state) = progress {
+        for p in state.connectable_peers(address, 50).await {
+            if found.lock().unwrap().insert(p.to_string()) {
+                let _ = tx.send(p);
+            }
+        }
+    }
     // PEX: the first few discovered peers are asked for their peers too,
     // feeding the same channel - EpixNet ran peer exchange during the
     // download, and it reaches peers the trackers/DHT don't know.
@@ -1151,7 +1164,15 @@ impl OnDemand {
             // just the bootstrap list, so a peer registered only on a shared
             // tracker (e.g. an onion-only seeder) is discovered.
             let trackers = self.state.all_trackers(&self.trackers).await;
-            let cloned = clone_xite_with_progress(
+            // content.json discovery is best-effort per attempt: a single
+            // announce round can return only dead/unreachable peers this second
+            // while the node's background announce loop keeps turning up live
+            // seeders. Retry a few times - each attempt re-announces and
+            // re-seeds from the node's grown peer set - so a thinly seeded site
+            // (the dashboard has few seeders) isn't doomed by one unlucky round.
+            // Cheap when it works: a live peer makes the first try land.
+            const CLONE_ATTEMPTS: usize = 4;
+            let mut cloned = clone_xite_with_progress(
                 &address,
                 &data_dir,
                 self.live_transport().await,
@@ -1159,6 +1180,30 @@ impl OnDemand {
                 Some(&self.state),
             )
             .await;
+            for attempt in 1..CLONE_ATTEMPTS {
+                if cloned.is_ok() {
+                    break;
+                }
+                self.state
+                    .log(
+                        "INFO",
+                        format!(
+                            "content.json fetch failed for {address}; \
+                             retry {attempt}/{} after finding more peers",
+                            CLONE_ATTEMPTS - 1
+                        ),
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                cloned = clone_xite_with_progress(
+                    &address,
+                    &data_dir,
+                    self.live_transport().await,
+                    &trackers,
+                    Some(&self.state),
+                )
+                .await;
+            }
             self.state.end_clone(&address);
             let (content, bytes, user_files) = match cloned {
                 Ok(r) => r,
