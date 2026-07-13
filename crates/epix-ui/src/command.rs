@@ -1663,6 +1663,10 @@ impl WsCommand for SiteSign {
         // Merger sites sign into their merged site (`merged-…/` paths).
         let (address, inner_path) = s.resolve_target(inner_path).await?;
         sign_for(s, &address, &inner_path, sign_privatekey(p)).await?;
+        // Push fresh siteInfo so the page re-renders with the new signed state -
+        // EpixNet's `updateWebsocket(file_done=…)` after actionSiteSign. Without
+        // it the sidebar keeps showing the pre-sign modified-files/sign panel.
+        s.state.push_site_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
@@ -1712,6 +1716,10 @@ impl WsCommand for SitePublish {
             }
         }
         let published = s.state.publish(&address, &inner_path, Some(s.id)).await?;
+        // Fresh siteInfo so the page re-renders post-publish (the sidebar's
+        // sign/publish panel and modified-files list reset) - EpixNet's
+        // `site.updateWebsocket()` at the end of cbSitePublish.
+        s.state.push_site_info(&address).await;
         // The page checks for the literal "ok" (EpixNet's actionSitePublish
         // responds "ok"; the peer count arrives as a notification - to the
         // publishing page only, like EpixNet's self.cmd).
