@@ -335,6 +335,19 @@ async fn clone_xite_with_progress(
             }
         });
     }
+    // Seed the search with every peer the node already knows for this xite, not
+    // just the handful this call's one-shot announce returns. The background
+    // announce loop accumulates a working set across cycles (onion seeders that
+    // a single fresh announce may miss), so feeding them in up front is what
+    // lets a retry - or a clone that started while discovery was still warming -
+    // reach a live seeder instead of failing on four dead peers.
+    if let Some(state) = progress {
+        for p in state.connectable_peers(address, 50).await {
+            if found.lock().unwrap().insert(p.to_string()) {
+                let _ = tx.send(p);
+            }
+        }
+    }
     // PEX: the first few discovered peers are asked for their peers too,
     // feeding the same channel - EpixNet ran peer exchange during the
     // download, and it reaches peers the trackers/DHT don't know.
@@ -940,6 +953,10 @@ struct OnDemand {
     trackers: Vec<epix_xite::Tracker>,
     /// Names currently being cloned, so concurrent requests coalesce.
     in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Whether Tor is expected to come up (mode != Disable). Gates the
+    /// cold-start wait in `await_tor_ready`. Set once, after the Tor mode is
+    /// resolved in `serve`.
+    tor_expected: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1059,6 +1076,49 @@ impl OnDemand {
         self.state.transport().await.unwrap_or_else(|| self.transport.clone())
     }
 
+    /// Block (bounded) until the in-process Tor transport is installed, so a
+    /// cold-start clone of an onion-seeded site dials through Tor instead of
+    /// the plain TCP transport the node holds until Arti finishes bootstrapping.
+    ///
+    /// Fresh installs hit this hard, Windows worst of all: opening the
+    /// dashboard right after setup fired the clone while Tor was still
+    /// bootstrapping, every onion peer dial failed on the TCP-only transport,
+    /// and the loading screen dead-ended at "index.html download failed"
+    /// ("Peers found: 4" but none reachable). Once Tor is up (the steady
+    /// state) this returns at once, so only the first cold-start open waits.
+    ///
+    /// Bounded: if Tor fails or drags past the cap, fall through and let the
+    /// clone try over clearnet rather than block the page forever. "Disabled"
+    /// is not treated as terminal here - on a cold start the Tor loop may not
+    /// have flipped the status to "Bootstrapping" yet, and `tor_expected`
+    /// already told us it is coming.
+    async fn await_tor_ready(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.tor_expected.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.state.tor_status().await.0 {
+            return; // already up: no wait
+        }
+        self.state
+            .log(
+                "INFO",
+                "Waiting for Tor to bootstrap before cloning (onion-seeded \
+                 sites are unreachable until it is up)"
+                    .to_string(),
+            )
+            .await;
+        // ~2 minutes. Arti's cold bootstrap is ~10-40s, but a slow link (or a
+        // Windows machine fetching a fresh consensus) can take longer.
+        for _ in 0..240 {
+            let (up, status) = self.state.tor_status().await;
+            if up || status == "Failed" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     async fn do_ensure(&self, host: &str) -> Result<(), String> {
         // Resolve the name to a xite address (unless it's already one): the
         // on-disk cache first; the chain only on a miss or an expired entry.
@@ -1091,6 +1151,12 @@ impl OnDemand {
                     self.state.set_display(&address, host).await;
                 }
             }
+            // Onion-seeded sites are only reachable once Tor is up. On a cold
+            // start the plain TCP transport is still installed, so wait for the
+            // onion-capable transport before dialing - otherwise a fresh
+            // install's first open fails every peer and shows "index.html
+            // download failed". No-op once Tor is up (the steady state).
+            self.await_tor_ready().await;
             // Mark the download in flight: the html serving gate holds the
             // page document back until the core set is on disk.
             self.state.begin_clone(&address);
@@ -1098,7 +1164,15 @@ impl OnDemand {
             // just the bootstrap list, so a peer registered only on a shared
             // tracker (e.g. an onion-only seeder) is discovered.
             let trackers = self.state.all_trackers(&self.trackers).await;
-            let cloned = clone_xite_with_progress(
+            // content.json discovery is best-effort per attempt: a single
+            // announce round can return only dead/unreachable peers this second
+            // while the node's background announce loop keeps turning up live
+            // seeders. Retry a few times - each attempt re-announces and
+            // re-seeds from the node's grown peer set - so a thinly seeded site
+            // (the dashboard has few seeders) isn't doomed by one unlucky round.
+            // Cheap when it works: a live peer makes the first try land.
+            const CLONE_ATTEMPTS: usize = 4;
+            let mut cloned = clone_xite_with_progress(
                 &address,
                 &data_dir,
                 self.live_transport().await,
@@ -1106,6 +1180,30 @@ impl OnDemand {
                 Some(&self.state),
             )
             .await;
+            for attempt in 1..CLONE_ATTEMPTS {
+                if cloned.is_ok() {
+                    break;
+                }
+                self.state
+                    .log(
+                        "INFO",
+                        format!(
+                            "content.json fetch failed for {address}; \
+                             retry {attempt}/{} after finding more peers",
+                            CLONE_ATTEMPTS - 1
+                        ),
+                    )
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                cloned = clone_xite_with_progress(
+                    &address,
+                    &data_dir,
+                    self.live_transport().await,
+                    &trackers,
+                    Some(&self.state),
+                )
+                .await;
+            }
             self.state.end_clone(&address);
             let (content, bytes, user_files) = match cloned {
                 Ok(r) => r,
@@ -1253,11 +1351,12 @@ async fn serve(
         transport: transport.clone(),
         trackers: trackers.clone(),
         in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        tor_expected: std::sync::atomic::AtomicBool::new(false),
     });
     state.set_on_demand(on_demand.clone()).await;
     // The same component syncs included/user content for existing sites
     // (called by the resync loop, so EpixTalk-style posts stay fresh).
-    state.set_content_syncer(on_demand).await;
+    state.set_content_syncer(on_demand.clone()).await;
 
     state.add_transfer(&address, bytes_recv, 0).await;
     state.rebuild_merger_dbs().await;
@@ -1295,6 +1394,15 @@ async fn serve(
             .unwrap_or_else(|| "enable".to_string());
         epix_runtime::TorMode::parse(&configured)
     };
+
+    // Let the on-demand resolver know Tor is coming, so a cold-start clone
+    // waits for the onion-capable transport instead of failing every onion
+    // dial on the plain TCP transport the node holds until Arti bootstraps.
+    #[cfg(feature = "tor")]
+    on_demand.tor_expected.store(
+        tor_mode != epix_runtime::TorMode::Disable,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Privacy by default: turn the embedded I2P router on the first time a node
     // runs with no explicit `i2p` choice (persisted so the Config page shows it
