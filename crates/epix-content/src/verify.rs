@@ -570,11 +570,20 @@ fn sum_file_sizes(content: &Value, node: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// EpixNet's `isValidRelativePath`: no `..`, no leading slash, no control/quote
-/// characters, not absolute, and no Windows-reserved device names (a xite
-/// carrying `CON/x.txt` would be undownloadable on Windows peers).
+/// EpixNet's `isValidRelativePath`: no `..` traversal, no leading slash, no
+/// control/quote characters, not absolute, and no Windows-reserved device names
+/// (a xite carrying `CON/x.txt` would be undownloadable on Windows peers).
 fn is_valid_relative_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') || path.contains("..") {
+    if path.is_empty() || path.starts_with('/') {
+        return false;
+    }
+    // Traversal is a whole path SEGMENT equal to `..` (or `.`), not any `..`
+    // substring. A dotted filename is fine and common - e.g. a Vite/Nuxt
+    // catch-all bundle `assets/_...all_-53e78351.js` from a `[...all]` route.
+    // The old `path.contains("..")` rejected those, so a validly-signed content
+    // .json failed verification: the clone never finalized and the xite was
+    // dropped on restart.
+    if path.split('/').any(|segment| segment == ".." || segment == ".") {
         return false;
     }
     // Reject characters EpixNet forbids in inner paths.
@@ -879,7 +888,14 @@ mod tests {
     fn relative_path_validation() {
         assert!(is_valid_relative_path("index.html"));
         assert!(is_valid_relative_path("js/app.js"));
+        // Only a `..`/`.` path SEGMENT is traversal, not a `..` substring: a
+        // Vite/Nuxt catch-all bundle for a `[...all]` route is legitimate.
+        assert!(is_valid_relative_path("assets/_...all_-53e78351.js"));
+        assert!(is_valid_relative_path("a..b/c...d.js"));
         assert!(!is_valid_relative_path("../secret"));
+        assert!(!is_valid_relative_path("a/../b"));
+        assert!(!is_valid_relative_path("a/.."));
+        assert!(!is_valid_relative_path("a/./b"));
         assert!(!is_valid_relative_path("/etc/passwd"));
         assert!(!is_valid_relative_path("a\\b"));
         // Windows-reserved device names, matching EpixNet's (uppercase-only)
