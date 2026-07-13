@@ -32,6 +32,11 @@ pub const DEFAULT_SIZE_LIMIT_MB: i64 = 1000;
 pub trait OnDemandResolver: Send + Sync {
     /// Resolve + clone `host` and add it as a served xite. `Ok(())` once served.
     async fn ensure(&self, host: &str) -> Result<(), String>;
+
+    /// Resolve `host` (a `.epix` name or an address) to a xite address WITHOUT
+    /// cloning: the on-disk cache first, the chain on a miss. Used so a
+    /// locked-down node can still follow an xID to a xite it already serves.
+    async fn resolve(&self, host: &str) -> Option<String>;
 }
 
 /// Extra peer discovery beyond the trackers - the runtime installs a DHT
@@ -953,6 +958,23 @@ impl AppState {
             || self.config_get("no_new_sites").await.and_then(|v| v.as_bool()).unwrap_or(false)
     }
 
+    /// Whether this node runs as a restricted, internet-facing gateway.
+    ///
+    /// A normal node binds the UI to loopback, so the only client that can
+    /// reach the command API is the local wrapper - and the wrapper proves
+    /// itself with an elevated request id that grants ADMIN. Behind a reverse
+    /// proxy (the public gateway) that assumption breaks: any internet client
+    /// can send the same elevated id. When this is set, the node never trusts
+    /// the client-supplied id for ADMIN, and content-mutating commands require
+    /// genuine ownership of the bound xite - so a public visitor gets a
+    /// read-only view and settings can only change server-side.
+    pub async fn ui_restrict(&self) -> bool {
+        self.config_get("ui_restrict")
+            .await
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false)
+    }
+
     /// The configured UI password, if any (UiPassword). Empty/unset means the
     /// login gate is off.
     pub async fn ui_password(&self) -> Option<String> {
@@ -1527,6 +1549,23 @@ impl AppState {
     }
 
     /// Register a served xite, deriving its settings + stats from content.json.
+    /// Register `address` as an empty served xite and persist it, so the node
+    /// downloads it on demand later. Used by the offline `siteDownload` CLI,
+    /// which has no network stack to clone right now.
+    pub async fn register_for_download(&self, address: &str) -> Result<(), String> {
+        if !address.starts_with("epix1") {
+            return Err(format!("Not a xite address: {address}"));
+        }
+        if self.has_xite(address).await {
+            return Ok(());
+        }
+        let root = self.data_root.as_ref().ok_or("no data dir")?;
+        let dir = root.join("data").join(address);
+        self.add_xite(address, XiteEntry { storage: XiteStorage::new(&dir), content: None }).await;
+        self.persist_sites().await;
+        Ok(())
+    }
+
     pub async fn add_xite(&self, address: impl Into<String>, entry: XiteEntry) {
         let address = address.into();
         let mut settings = XiteSettings::new(now_secs());
@@ -5718,20 +5757,39 @@ impl AppState {
     /// now served. Used by the browser proxy path so typing any `talk.epix`
     /// clones and opens it live.
     pub async fn ensure_xite(&self, host: &str) -> bool {
+        self.ensure_xite_inner(host, false).await
+    }
+
+    /// Operator variant (the trusted admin socket): clone `host` even when
+    /// NoNewSites locks the site set, so `siteDownload` works server-side.
+    pub async fn ensure_xite_admin(&self, host: &str) -> bool {
+        self.ensure_xite_inner(host, true).await
+    }
+
+    async fn ensure_xite_inner(&self, host: &str, force: bool) -> bool {
         // Served AND complete (or ours): done. A registered xite whose core
         // files are missing (an interrupted clone) still goes to the resolver
         // so its download resumes - the periodic resync only fetches files
         // when a newer content.json shows up, so it never heals one. Owned
         // sites never re-download: local edits stay.
-        if self.has_xite(host).await
-            && (self.xite_owned(host).await || self.xite_core_complete(host).await)
+        let key0 = self.canonical_key(host).await;
+        if self.has_xite(&key0).await
+            && (self.xite_owned(&key0).await || self.xite_core_complete(&key0).await)
         {
             return true;
         }
-        // NoNewSites: the node's site set is locked - nothing new gets cloned
-        // (an already-served xite still counts as served).
-        if self.no_new_sites().await {
-            return self.has_xite(host).await;
+        // NoNewSites (unless an operator forces it): the site set is locked, but
+        // an xID must still RESOLVE and a xite already on this node must still
+        // serve and resume/update. Only a brand-new xite (one we do not already
+        // have) is refused - the caller shows the "new xites disabled" page.
+        if !force && self.no_new_sites().await {
+            let key = self.resolve_for_serving(host).await;
+            if !self.has_xite(&key).await {
+                return false;
+            }
+            // Registered but maybe incomplete: fall through so the resolver
+            // resumes its download. This adds no new site, it heals an existing
+            // one.
         }
         let hook = self.on_demand.read().await.clone();
         match hook {
@@ -5739,10 +5797,29 @@ impl AppState {
                 if let Err(e) = hook.ensure(host).await {
                     self.log("INFO", format!("On-demand resolve of {host} failed: {e}")).await;
                 }
-                self.has_xite(host).await
+                self.has_xite(&self.canonical_key(host).await).await
             }
             None => false,
         }
+    }
+
+    /// Resolve `host` to a xite address for SERVING (no cloning): the in-memory
+    /// display metadata and on-disk cache first (via `canonical_key`), then the
+    /// chain through the on-demand resolver. Returns the address if resolved, or
+    /// `host` unchanged if it cannot be. Lets a locked-down node follow an xID
+    /// to a xite it already serves without adding anything new.
+    pub async fn resolve_for_serving(&self, host: &str) -> String {
+        let key = self.canonical_key(host).await;
+        // Resolved via cache/display, or `host` is already a bech32 address.
+        if key != host || !host.contains('.') {
+            return key;
+        }
+        if let Some(hook) = self.on_demand.read().await.clone() {
+            if let Some(address) = hook.resolve(host).await {
+                return address;
+            }
+        }
+        key
     }
 
     /// Mark a xite owned/not (`siteSetOwned`). Signing still requires the key.
@@ -7867,6 +7944,9 @@ mod tests {
             async fn ensure(&self, _host: &str) -> Result<(), String> {
                 Ok(())
             }
+            async fn resolve(&self, host: &str) -> Option<String> {
+                host.starts_with("epix1").then(|| host.to_string())
+            }
         }
         let state = AppState::new("test");
         state.set_on_demand(Arc::new(AlwaysClone)).await;
@@ -8786,6 +8866,9 @@ mod tests {
         impl OnDemandResolver for AlwaysClone {
             async fn ensure(&self, _host: &str) -> Result<(), String> {
                 Ok(())
+            }
+            async fn resolve(&self, host: &str) -> Option<String> {
+                host.starts_with("epix1").then(|| host.to_string())
             }
         }
         let dir = tempfile::tempdir().unwrap();

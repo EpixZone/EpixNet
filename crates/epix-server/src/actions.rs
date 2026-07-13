@@ -17,6 +17,9 @@ pub fn is_action(name: &str) -> bool {
         "siteCreate"
             | "siteSign"
             | "siteVerify"
+            | "siteList"
+            | "siteDelete"
+            | "siteDownload"
             | "dbRebuild"
             | "dbQuery"
             | "importBundle"
@@ -145,6 +148,63 @@ async fn dispatch(
             Ok(())
         }
 
+        // --- site admin (live via the admin socket, or offline on the data dir)
+        "siteList" => {
+            if let Some(reply) = admin_call(data_root, "siteList", serde_json::json!({})).await? {
+                let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
+                for s in sites {
+                    let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("?");
+                    let peers = s.get("peers").and_then(|v| v.as_i64()).unwrap_or(0);
+                    println!("{addr}  ({peers} peers)");
+                }
+                println!("{} site(s) [live]", sites.len());
+            } else {
+                let state = open_state(data_root, version).await;
+                let sites = state.xite_addresses().await;
+                for addr in &sites {
+                    println!("{addr}");
+                }
+                println!("{} site(s) [offline]", sites.len());
+            }
+            Ok(())
+        }
+        "siteDelete" => {
+            let [address] = args else { return Err("usage: siteDelete <address>".into()) };
+            if let Some(reply) =
+                admin_call(data_root, "siteDelete", serde_json::json!({ "address": address })).await?
+            {
+                if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
+                    return Err(err.to_string());
+                }
+                println!("Deleted {address} [live]");
+            } else {
+                let state = open_state(data_root, version).await;
+                if !state.remove_xite(address).await {
+                    return Err(format!("Unknown site: {address}"));
+                }
+                println!("Deleted {address} [offline]");
+            }
+            Ok(())
+        }
+        "siteDownload" => {
+            let [address] = args else { return Err("usage: siteDownload <address>".into()) };
+            if let Some(reply) =
+                admin_call(data_root, "siteAdd", serde_json::json!({ "address": address })).await?
+            {
+                if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
+                    return Err(err.to_string());
+                }
+                println!("Downloading {address} [live] - watch the node log for progress");
+            } else {
+                // Offline: no network stack here, so register it and let the
+                // node clone it on the next start.
+                let state = open_state(data_root, version).await;
+                state.register_for_download(address).await?;
+                println!("Queued {address}; it will download when the node next starts [offline]");
+            }
+            Ok(())
+        }
+
         // --- key operations (no node, no data dir) -------------------------
         "cryptSign" => {
             let [message, privatekey] = args else {
@@ -229,6 +289,37 @@ async fn dispatch(
         }
         _ => Err("unknown action".into()),
     }
+}
+
+/// Send one command to the running node's admin socket, if it is up.
+///
+/// `Ok(None)` means the node is not running (no socket to connect to), so the
+/// caller falls back to an offline data-dir operation. `Ok(Some(value))` is the
+/// command's result. A command-level failure comes back as `Err`.
+async fn admin_call(
+    data_root: &std::path::Path,
+    cmd: &str,
+    params: serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let path = data_root.join("admin.sock");
+    let mut stream = match tokio::net::UnixStream::connect(&path).await {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // node not running -> offline path
+    };
+    let req = serde_json::json!({ "cmd": cmd, "params": params }).to_string();
+    stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
+    stream.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    let (r, _w) = stream.into_split();
+    let mut line = String::new();
+    BufReader::new(r).read_line(&mut line).await.map_err(|e| e.to_string())?;
+    let reply: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("bad admin reply: {e}"))?;
+    if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(Some(reply.get("result").cloned().unwrap_or(serde_json::Value::Null)))
 }
 
 /// Open the node state offline: data dir + user + the served-site registry.

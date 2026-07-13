@@ -178,6 +178,79 @@ impl UiServer {
         );
         axum::serve(listener, tower::make::Shared::new(app)).await
     }
+
+    /// Spawn the local admin socket at `path` (a Unix domain socket). Each
+    /// connection is a trusted operator session: it takes one JSON
+    /// `{"cmd":…,"params":…,"xite":…}` request per line and returns one JSON
+    /// reply, dispatched through the full command registry with no gateway
+    /// restrictions. Reachable only with filesystem access to the data dir (the
+    /// socket is created mode 0600 and a reverse proxy never forwards it), so it
+    /// is the sanctioned way to administer a locked-down node from the server.
+    #[cfg(unix)]
+    pub fn spawn_admin_socket(&self, path: std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            let _ = std::fs::remove_file(&path); // a stale socket from a crash
+            let listener = match tokio::net::UnixListener::bind(&path) {
+                Ok(l) => l,
+                Err(e) => {
+                    ctx.state.log("WARNING", format!("admin socket {path:?}: {e}")).await;
+                    return;
+                }
+            };
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            ctx.state.log("INFO", format!("Admin socket at {}", path.display())).await;
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        tokio::spawn(handle_admin_conn(ctx.clone(), stream));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+}
+
+/// One admin-socket connection: newline-delimited JSON requests, one reply each.
+#[cfg(unix)]
+async fn handle_admin_conn(ctx: Ctx, stream: tokio::net::UnixStream) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (r, mut w) = stream.into_split();
+    let mut lines = BufReader::new(r).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let reply = handle_admin_text(&ctx, line).await;
+        if w.write_all(reply.as_bytes()).await.is_err() || w.write_all(b"\n").await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Dispatch one admin-socket request as a trusted session.
+#[cfg(unix)]
+async fn handle_admin_text(ctx: &Ctx, text: &str) -> String {
+    let req: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("bad json: {e}") }).to_string(),
+    };
+    let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or_default();
+    if cmd.is_empty() {
+        return json!({ "error": "missing cmd" }).to_string();
+    }
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let xite = req.get("xite").and_then(|v| v.as_str()).map(str::to_string);
+    let session = WsSession::new_trusted(ctx.state.clone(), xite);
+    // A high id keeps the wrapper-elevation path happy too; `trusted` already
+    // clears every gate.
+    match ctx.registry.dispatch(&session, cmd, &params, i64::MAX).await {
+        Ok(result) => json!({ "result": result }).to_string(),
+        Err(e) => json!({ "error": e }).to_string(),
+    }
 }
 
 /// The route-entry security checks, ported from EpixNet's `UiRequest.route`:
@@ -614,6 +687,22 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
     )
 }
 
+/// The page shown when a locked-down node (NoNewSites) is asked for a xite it
+/// does not already serve. Distinct from the block page: nothing is wrong with
+/// the xite, this node just does not add new ones.
+fn no_new_sites_html(requested: &str) -> String {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<!doctype html><html><head><meta charset='utf-8'><title>New xites disabled</title>\
+         <meta name='viewport' content='width=device-width, initial-scale=1'></head>\
+         <body style='font-family:Inter,-apple-system,Segoe UI,Roboto,sans-serif;background:#09090A;color:#F6F6F9;text-align:center;margin:0;padding:15vh 24px 0'>\
+         <h1 style='font-size:24px;font-weight:600'>New xites are disabled</h1>\
+         <p style='color:#ABABB5;overflow-wrap:anywhere'>This node does not add new xites. It only serves the ones it already has.</p>\
+         <p style='color:#6B6B76;overflow-wrap:anywhere;font-size:13px'>{}</p></body></html>",
+        esc(requested),
+    )
+}
+
 async fn serve_wrapper(
     State(ctx): State<Ctx>,
     Path(requested): Path<String>,
@@ -684,11 +773,21 @@ async fn render_wrapper(
         if !plausible_xite_ref(&requested) || !ctx.state.has_on_demand().await {
             return (StatusCode::NOT_FOUND, "unknown xite").into_response();
         }
-        // NoNewSites: a locked node serves what it has; browsing to a xite it
-        // doesn't serve won't clone it.
-        if !ctx.state.has_xite(&address).await && ctx.state.no_new_sites().await {
-            return (StatusCode::FORBIDDEN, "Adding new sites is disabled on this node")
-                .into_response();
+        // NoNewSites: a locked node still resolves an xID and serves (and
+        // resumes) a xite it already has, but a brand-new one gets a clear page
+        // instead of an endless loading screen. Resolve first (chain allowed),
+        // so following an xID to an already-served xite still works.
+        if ctx.state.no_new_sites().await {
+            let key = ctx.state.resolve_for_serving(&requested).await;
+            if !ctx.state.has_xite(&key).await {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    no_new_sites_html(&requested),
+                )
+                    .into_response();
+            }
+            address = key;
         }
         let ensure = {
             let state = ctx.state.clone();
@@ -869,6 +968,13 @@ async fn serve_plugins_page(
     State(ctx): State<Ctx>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    // Turning UiPluginManager off removes the page, not just its dashboard
+    // link: navigating straight to /Plugins (or its toggle/save query) is
+    // refused, so the only way back is server-side.
+    if !ctx.state.plugin_enabled("UiPluginManager").await {
+        return (StatusCode::FORBIDDEN, "The plugin manager is disabled on this node")
+            .into_response();
+    }
     if let Some(name) = q.get("toggle") {
         let enabled = ctx.state.plugin_enabled(name).await;
         ctx.state.set_plugin_enabled(name, !enabled).await;
@@ -995,6 +1101,13 @@ async fn serve_config_page(
     State(ctx): State<Ctx>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    // Turning UiConfig off removes the page, not just its dashboard link:
+    // navigating straight to /Config (or its action/save query) is refused, so
+    // node config can only be changed server-side.
+    if !ctx.state.plugin_enabled("UiConfig").await {
+        return (StatusCode::FORBIDDEN, "The configuration page is disabled on this node")
+            .into_response();
+    }
     // Action buttons (e.g. Clear xID Cache) come back as `?action=<name>`.
     if let Some(action) = params.get("action") {
         if action == "xidClearCache" {
