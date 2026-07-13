@@ -1739,12 +1739,19 @@ impl AppState {
             }
             let dir = root.join(&canonical);
             let storage = XiteStorage::new(&dir);
-            // Load + verify the on-disk content.json under the canonical address.
+            // Load the on-disk content.json under the canonical address. Prefer
+            // the verified copy; if it doesn't verify but parses, serve it as a
+            // local copy anyway (the same fallback boot() uses for the launch
+            // xite) - it's already-downloaded content in the operator's own data
+            // dir. Dropping it here used to make a registered xite vanish on
+            // restart, and under NoNewSites the wrapper then 403s before the
+            // on-demand heal can run. Only skip when there's no content.json at
+            // all (a bare registration whose clone never landed).
             let Ok(addr) = Address::parse(canonical.clone()) else { continue };
             let mut xite = Xite::new(addr, storage.clone());
-            match xite.load_content() {
-                Ok(true) => {}
-                _ => continue, // no content.json, or it failed signature verification
+            let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
+            if !loaded {
+                continue; // no content.json on disk yet
             }
             let content = xite.content.clone();
             // Settings live flat in the entry (EpixNet schema); accept the old
@@ -5129,6 +5136,40 @@ impl AppState {
         }
     }
 
+    /// Load a registered xite's on-disk content.json into its in-memory entry
+    /// when it isn't there yet. A clone that wrote every file but errored before
+    /// finalizing (a transient "could not fetch + verify content.json from any
+    /// peer" that later healed once more peers appeared), or an incomplete
+    /// resync, can leave the files complete on disk while `entry.content` stays
+    /// `None`. The wrapper then shows a perpetual download page and siteInfo has
+    /// no title. Returns true if content is present afterward (already loaded or
+    /// just loaded here).
+    pub async fn load_content_from_disk(&self, address: &str) -> bool {
+        let storage = {
+            let xites = self.xites.read().await;
+            let Some(x) = self.resolve_xite(&xites, address) else { return false };
+            // Already loaded: nothing to heal.
+            if x.content.is_some() {
+                return true;
+            }
+            x.storage.clone()
+        };
+        let Ok(addr) = Address::parse(address.to_string()) else { return false };
+        let mut xite = Xite::new(addr, storage);
+        // Verified load (a valid signature for this address); fall back to a
+        // local unsigned copy so an authored/edited site still populates.
+        let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
+        if !loaded {
+            return false;
+        }
+        // update_content also finalizes settings (size/modified via
+        // apply_content_stats) and rebuilds the db from the on-disk files.
+        self.update_content(address, xite.content.clone()).await;
+        self.persist_sites().await;
+        self.push_site_info(address).await;
+        true
+    }
+
     /// Progressive serve during an on-demand clone: the state of one file of a
     /// xite that is downloading but not yet registered.
     pub fn loading_file(&self, address: &str, inner_path: &str) -> LoadingFile {
@@ -5776,6 +5817,11 @@ impl AppState {
         if self.has_xite(&key0).await
             && (self.xite_owned(&key0).await || self.xite_core_complete(&key0).await)
         {
+            // Files are complete on disk. Heal an interrupted finalize where the
+            // in-memory content.json was never loaded (clone errored after
+            // writing files; an incomplete resync) - otherwise the wrapper shows
+            // a perpetual download page and siteInfo has no title.
+            self.load_content_from_disk(&key0).await;
             return true;
         }
         // NoNewSites (unless an operator forces it): the site set is locked, but
@@ -7614,6 +7660,43 @@ mod tests {
             "sign": "should-be-stripped",
             "signs": {"1abc": "x"},
         })
+    }
+
+    #[tokio::test]
+    async fn load_content_from_disk_heals_registered_but_empty_entry() {
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        // A clone that wrote content.json to disk but errored before finalizing:
+        // registered with content = None while the file sits on disk.
+        std::fs::write(
+            dir.path().join("content.json"),
+            serde_json::to_vec(&json!({
+                "address": addr,
+                "modified": 1777992697.0,
+                "title": "Epix Test",
+                "files": { "index.html": { "size": 100, "sha512": "a" } },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+
+        // Before: siteInfo has no title (the wrapper's perpetual download page).
+        assert!(state.site_info(addr).await["content"].get("title").is_none());
+
+        // Heal it from disk.
+        assert!(state.load_content_from_disk(addr).await);
+
+        // After: content is loaded and siteInfo carries the real title + stats.
+        let info = state.site_info(addr).await;
+        assert_eq!(info["content"]["title"], "Epix Test");
+        assert_eq!(info["settings"]["size"], 100);
+
+        // Idempotent: a second call is a no-op that still reports present.
+        assert!(state.load_content_from_disk(addr).await);
     }
 
     #[tokio::test]
