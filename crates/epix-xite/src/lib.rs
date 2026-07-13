@@ -62,6 +62,35 @@ mod tests {
     }
 
     #[test]
+    fn stage_content_adopts_in_memory_without_touching_disk() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let a = XiteStorage::hash_bytes(b"hello");
+        let (address, content_bytes) =
+            signed_content(priv_hex, json!({ "a.txt": { "size": 5, "sha512": a } }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite =
+            Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+
+        // Staging verifies + adopts in memory: the sync workers can read the
+        // declared files, but the stored content.json (the completeness
+        // marker) is untouched.
+        xite.stage_content(&content_bytes).unwrap();
+        assert!(xite.content.is_some());
+        assert_eq!(xite.files_needed().len(), 1);
+        assert!(!xite.storage.exists("content.json"), "staging must not write to disk");
+
+        // The commit lands the exact staged bytes.
+        xite.commit_content(&content_bytes).unwrap();
+        assert_eq!(xite.storage.read("content.json").unwrap(), content_bytes);
+
+        // A bad signature still fails at stage time.
+        let mut tampered: serde_json::Value = serde_json::from_slice(&content_bytes).unwrap();
+        tampered["title"] = json!("evil");
+        assert!(xite.stage_content(&serde_json::to_vec(&tampered).unwrap()).is_err());
+    }
+
+    #[test]
     fn sign_rebuilds_files_and_produces_a_valid_content_json() {
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();

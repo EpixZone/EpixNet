@@ -404,6 +404,10 @@ async fn clone_xite_with_progress(
     // download channel, so the file sync starts with them buffered.
     let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<PeerAddr>();
     let mut peer_count = 0usize;
+    // A freshly fetched content.json is STAGED (verified + adopted in memory
+    // only) while the files download; its exact signed bytes are kept here and
+    // committed to disk only once the core file set is complete.
+    let mut staged_bytes: Option<Vec<u8>> = None;
     if xite.content.is_none() {
         let mut fetchers: tokio::task::JoinSet<Option<Vec<u8>>> = tokio::task::JoinSet::new();
         let mut untried: std::collections::VecDeque<PeerAddr> = std::collections::VecDeque::new();
@@ -454,8 +458,9 @@ async fn clone_xite_with_progress(
                 }
                 Some(result) = fetchers.join_next(), if !fetchers.is_empty() => {
                     if let Ok(Some(bytes)) = result {
-                        if xite.set_content(&bytes).is_ok() {
+                        if xite.stage_content(&bytes).is_ok() {
                             got_content = true;
+                            staged_bytes = Some(bytes);
                         }
                     }
                     if !got_content {
@@ -563,6 +568,21 @@ async fn clone_xite_with_progress(
         epix_worker::sync_files_streaming(&xite, sync_rx, transport.clone(), 8, on_file).await
     {
         bytes_recv = report.bytes;
+    }
+    // Staged adopt: commit the fetched content.json to disk (atomic rename)
+    // only now that its core file set is complete, so neither a crash nor an
+    // unseeded file can leave a stored content.json ahead of its files. An
+    // incomplete core set fails the clone instead; the on-demand retry
+    // re-enters with the downloaded files still on disk, so a later attempt
+    // only fetches what is still missing.
+    if let Some(bytes) = &staged_bytes {
+        let missing = xite.files_needed().len();
+        if missing > 0 {
+            return Err(format!(
+                "clone incomplete: {missing} core file(s) unavailable from current peers"
+            ));
+        }
+        xite.commit_content(bytes).map_err(|e| format!("commit content.json: {e}"))?;
     }
     // Core set done: NOW dismiss the loading screen. The site opens fully
     // styled, and the user-content pass below streams topics/posts into the
