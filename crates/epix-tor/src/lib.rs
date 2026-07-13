@@ -71,6 +71,43 @@ fn install_crypto_provider() {
     });
 }
 
+/// Recover from a poisoned persisted guard sample.
+///
+/// Arti persists its guard sample in `<state>/state/guards.json` and marks
+/// guards disabled after too many "indeterminate" circuit failures - which a
+/// laptop accumulates by sleeping mid-circuit. Once EVERY guard in the sample
+/// is disabled, no circuit can ever be built again: each start "bootstraps"
+/// from the directory cache, then rejects the whole sample (`AllGuardsDown`,
+/// 0 accepted) and every dial fails, while nothing ever resamples. The node
+/// looks healthy (bootstrapped, onion service registered) but is mute.
+///
+/// Detect exactly that state - a non-empty sample with all guards disabled -
+/// and delete the file so bootstrap draws a fresh sample. It holds only
+/// resumable network state; onion-service keys live elsewhere (`hss/`,
+/// `keystore/`), so the node's onion address is unaffected. Any parse
+/// surprise (format change, missing fields) leaves the file alone.
+fn clear_poisoned_guard_state(state_dir: &Path) {
+    let path = state_dir.join("state").join("guards.json");
+    let Ok(bytes) = std::fs::read(&path) else { return };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
+    let Some(guards) = v.get("default").and_then(|s| s.get("guards")).and_then(|g| g.as_array())
+    else {
+        return;
+    };
+    if guards.is_empty() {
+        return;
+    }
+    let all_disabled =
+        guards.iter().all(|g| g.get("disabled").is_some_and(|d| !d.is_null()));
+    if all_disabled && std::fs::remove_file(&path).is_ok() {
+        tracing::warn!(
+            "tor: cleared poisoned guard state ({} sampled guards, all disabled); \
+             a fresh sample will be drawn",
+            guards.len()
+        );
+    }
+}
+
 impl Tor {
     /// Bootstrap a Tor client, keeping its state + directory cache under
     /// `data_dir` (`<data>/tor/state`, `<data>/tor/cache`) so later starts
@@ -79,6 +116,7 @@ impl Tor {
         install_crypto_provider();
         let state = data_dir.join("tor").join("state");
         let cache = data_dir.join("tor").join("cache");
+        clear_poisoned_guard_state(&state);
         let config = TorClientConfigBuilder::from_directories(state, cache)
             .build()
             .map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
@@ -323,6 +361,77 @@ mod tests {
         assert_eq!(TorMode::parse("enable"), TorMode::Enable);
         assert_eq!(TorMode::parse("Always"), TorMode::Always);
         assert_eq!(TorMode::parse(""), TorMode::Enable);
+    }
+
+    /// Write a guards.json into `<state>/state/` shaped like arti's, with the
+    /// given per-guard `disabled` values (JSON `null` = healthy).
+    fn write_guards(state_dir: &Path, disabled: &[serde_json::Value]) -> std::path::PathBuf {
+        let dir = state_dir.join("state");
+        std::fs::create_dir_all(&dir).unwrap();
+        let guards: Vec<serde_json::Value> = disabled
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "id": {"ed25519": "x", "rsa": "y"},
+                    "orports": ["192.0.2.1:443"],
+                    "disabled": d,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "default": {"guards": guards, "confirmed": []},
+            "restricted": {"guards": [], "confirmed": []},
+        });
+        let path = dir.join("guards.json");
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn poisoned_guard_state_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let poisoned = serde_json::json!({"type": "TooManyIndeterminateFailures"});
+        let path = write_guards(dir.path(), &[poisoned.clone(), poisoned]);
+        clear_poisoned_guard_state(dir.path());
+        assert!(!path.exists(), "an all-disabled sample must be removed");
+    }
+
+    #[test]
+    fn healthy_and_mixed_guard_state_is_kept() {
+        // All healthy.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards(dir.path(), &[serde_json::Value::Null, serde_json::Value::Null]);
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists(), "a healthy sample stays");
+
+        // One usable guard left: arti can still build circuits - keep it.
+        let dir = tempfile::tempdir().unwrap();
+        let poisoned = serde_json::json!({"type": "TooManyIndeterminateFailures"});
+        let path = write_guards(dir.path(), &[poisoned, serde_json::Value::Null]);
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists(), "a partly-usable sample stays");
+    }
+
+    #[test]
+    fn missing_empty_or_malformed_guard_state_is_left_alone() {
+        // Missing file: no panic.
+        let dir = tempfile::tempdir().unwrap();
+        clear_poisoned_guard_state(dir.path());
+
+        // Empty sample: nothing to judge.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards(dir.path(), &[]);
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists());
+
+        // Unparseable / unexpected format: leave it for arti.
+        let dir = tempfile::tempdir().unwrap();
+        let sd = dir.path().join("state");
+        std::fs::create_dir_all(&sd).unwrap();
+        let path = sd.join("guards.json");
+        std::fs::write(&path, b"not json").unwrap();
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists());
     }
 
     #[tokio::test]

@@ -2382,6 +2382,7 @@ dependencies = [
  "futures",
  "rustls",
  "safelog",
+ "serde_json",
  "tempfile",
  "tokio",
  "tor-cell",
