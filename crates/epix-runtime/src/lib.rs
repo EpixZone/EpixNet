@@ -439,8 +439,10 @@ async fn dht_loop(
                 if !probed.insert(peer.clone()) || probed.len() > 8 {
                     continue;
                 }
+                // Overlay-aware bound: probing an onion/i2p contact needs the
+                // longer dial deadline or it can never join the routing table.
                 let probe = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    peer.connect_timeout(),
                     rpc.probe(&peer, dht.id),
                 );
                 if let Ok(Ok((responder, contacts))) = probe.await {

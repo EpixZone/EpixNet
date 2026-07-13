@@ -3215,9 +3215,11 @@ impl AppState {
         let canonical = canonical_address(view.content.as_ref(), address);
 
         for peer in &peers {
-            // Bound each peer attempt so a slow/unresponsive peer doesn't stall
-            // the whole update.
-            let fetched = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            // Bound each peer attempt so a slow/unresponsive peer doesn't
+            // stall the whole update; overlay peers get the longer dial
+            // deadline (a flat clearnet bound meant resync could never fetch
+            // content.json from an onion/i2p peer).
+            let fetched = tokio::time::timeout(peer.connect_timeout(), async {
                 let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
                 conn.handshake().await.ok()?;
                 conn.get_file(&canonical, "content.json").await.ok()
@@ -4739,7 +4741,9 @@ impl AppState {
 
         let mut learned: Vec<PeerAddr> = Vec::new();
         for peer in ours.iter().take(max_peers) {
-            let got = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            // Overlay-aware bound: an onion/i2p peer can't finish a dial +
+            // PEX inside a clearnet-sized timeout.
+            let got = tokio::time::timeout(peer.connect_timeout(), async {
                 let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
                 conn.handshake().await.ok()?;
                 conn.pex(
@@ -6649,6 +6653,7 @@ impl AppState {
             let body = body.clone();
             let diffs = wire_diffs.clone();
             set.spawn(async move {
+                let deadline = peer.connect_timeout();
                 let push = async {
                     let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
                     conn.handshake().await.ok()?;
@@ -6659,9 +6664,12 @@ impl AppState {
                     let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
                     Some(peer)
                 };
-                // Bounds the whole sitePublish reply: reachable peers answer in
-                // ~1-3s, so 10s only ever pays for dead candidates.
-                tokio::time::timeout(std::time::Duration::from_secs(10), push).await.ok().flatten()
+                // Bounds the whole sitePublish reply: reachable clearnet
+                // peers answer in ~1-3s, so the deadline only ever pays for
+                // dead candidates. Overlay peers get the longer dial bound -
+                // a fresh onion circuit takes 20-40s, and cutting it off is
+                // what made publishing to Tor-only peers silently fail.
+                tokio::time::timeout(deadline, push).await.ok().flatten()
             });
         }
         let mut published = 0;
@@ -6761,7 +6769,9 @@ impl AppState {
             None => {
                 let fetched = match (&sender, self.transport.read().await.clone()) {
                     (Some(s), Some(transport)) => {
-                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        // The sender may be an onion/i2p peer: use its dial
+                        // deadline, not a flat clearnet one.
+                        tokio::time::timeout(s.connect_timeout(), async {
                             let mut conn =
                                 Connection::connect(transport.as_ref(), s).await.ok()?;
                             conn.handshake().await.ok()?;

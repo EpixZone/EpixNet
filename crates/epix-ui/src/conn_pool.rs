@@ -36,7 +36,6 @@ pub struct ConnectionPool {
     max: usize,
 }
 
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl ConnectionPool {
@@ -82,7 +81,9 @@ impl ConnectionPool {
             let transport = transport.clone();
             set.spawn(async move {
                 let onion = matches!(addr, PeerAddr::Onion { .. });
-                let conn = tokio::time::timeout(DIAL_TIMEOUT, async {
+                // Overlay-aware dial bound: a flat few-second deadline meant
+                // the warm pool could never hold an onion/i2p connection.
+                let conn = tokio::time::timeout(addr.connect_timeout(), async {
                     let mut conn = Connection::connect(transport.as_ref(), &addr).await.ok()?;
                     conn.handshake().await.ok()?;
                     Some(conn)

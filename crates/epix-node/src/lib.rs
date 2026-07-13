@@ -369,7 +369,9 @@ async fn clone_xite_with_progress(
             let address = address.clone();
             let transport = transport.clone();
             tokio::spawn(async move {
-                let reply = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                // Overlay-aware bound: an onion/i2p peer needs the longer
+                // dial deadline to answer the exchange at all.
+                let reply = tokio::time::timeout(peer.connect_timeout(), async {
                     let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
                     conn.handshake().await.ok()?;
                     conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 10)
@@ -922,7 +924,9 @@ async fn fetch_list_modified(
     peer: &PeerAddr,
     address: &str,
 ) -> Option<Vec<(String, f64)>> {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // Overlay-aware bound: user-content sync must be able to ask onion/i2p
+    // peers too, and a flat clearnet deadline cut them off mid-dial.
+    tokio::time::timeout(peer.connect_timeout(), async {
         let mut conn = Connection::connect(transport, peer).await.ok()?;
         conn.handshake().await.ok()?;
         let reply = conn.list_modified(address, 0.0).await.ok()?;

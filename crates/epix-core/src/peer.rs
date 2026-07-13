@@ -71,6 +71,33 @@ impl PeerAddr {
         )
     }
 
+    /// Deadline for dialing this peer and completing the handshake (plus a
+    /// small request, e.g. a PEX exchange or a content.json fetch): 15s for a
+    /// direct clearnet socket (an unreachable peer must not hang its caller;
+    /// the OS TCP timeout is ~75s), 45s for an overlay peer - building a Tor
+    /// circuit and finishing an onion rendezvous routinely takes 20-40s, so
+    /// clearnet-sized bounds cut off reachable overlay peers mid-handshake.
+    /// Every per-peer dial site shares this so no path is overlay-blind.
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        if self.is_overlay() {
+            std::time::Duration::from_secs(45)
+        } else {
+            std::time::Duration::from_secs(15)
+        }
+    }
+
+    /// Deadline for one file transfer from this peer: 60s clearnet (a peer
+    /// that stalls mid-transfer gets requeued quickly), 180s overlay -
+    /// multi-hop circuits move data at a fraction of clearnet bandwidth, so a
+    /// file that lands in seconds directly can take a minute-plus over Tor.
+    pub fn file_timeout(&self) -> std::time::Duration {
+        if self.is_overlay() {
+            std::time::Duration::from_secs(180)
+        } else {
+            std::time::Duration::from_secs(60)
+        }
+    }
+
     /// The I2P destination host (`<b32>.i2p`) yosemite's SAM connect expects,
     /// or None for non-I2P peers.
     pub fn i2p_dest(&self) -> Option<String> {
@@ -261,6 +288,27 @@ mod tests {
         assert!(PeerAddr::parse("nonsense").is_err());
         assert!(PeerAddr::parse("rns:xyz").is_err());
         assert!(PeerAddr::parse("1.2.3.4:99999").is_err());
+    }
+
+    #[test]
+    fn overlay_peers_get_the_longer_timeouts() {
+        // Every dial site shares these bounds; an overlay peer (Tor/I2P/mesh)
+        // must get the generous ones or it is cut off mid-handshake.
+        let clearnet = PeerAddr::parse("1.2.3.4:20790").unwrap();
+        assert!(!clearnet.is_overlay());
+        assert_eq!(clearnet.connect_timeout().as_secs(), 15);
+        assert_eq!(clearnet.file_timeout().as_secs(), 60);
+
+        for s in [
+            "abcdefghij234567.onion:43110",
+            "ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.i2p:15441",
+            "rns:0123456789abcdef0123456789abcdef",
+        ] {
+            let p = PeerAddr::parse(s).unwrap();
+            assert!(p.is_overlay(), "{s}");
+            assert_eq!(p.connect_timeout().as_secs(), 45, "{s}");
+            assert_eq!(p.file_timeout().as_secs(), 180, "{s}");
+        }
     }
 
     #[test]
