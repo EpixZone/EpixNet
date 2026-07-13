@@ -190,7 +190,7 @@ async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
         let Some((file, attempts)) = next else { break };
 
         let fetched = tokio::time::timeout(
-            file_timeout(&peer),
+            peer.file_timeout(),
             conn.get_file(&ctx.address, &file.inner_path),
         )
         .await
@@ -405,7 +405,7 @@ pub async fn fetch_files_raw(
                 };
                 let Some((path, attempts)) = next else { break };
                 let fetched =
-                    tokio::time::timeout(file_timeout(&peer), conn.get_file(&address, &path)).await;
+                    tokio::time::timeout(peer.file_timeout(), conn.get_file(&address, &path)).await;
                 match fetched {
                     Ok(Ok(bytes)) => {
                         got.lock().await.insert(path, bytes);
@@ -453,43 +453,8 @@ fn scale_workers(max_workers: usize, tasks: usize) -> usize {
     if tasks > 50 { max_workers * 3 } else { max_workers }
 }
 
-/// Dial + handshake deadline for a direct clearnet peer: an unreachable one
-/// must not hang its worker (the OS TCP timeout is ~75s) while the queue idles.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Per-file transfer deadline for a direct clearnet peer: one that stalls
-/// mid-transfer gets requeued quickly.
-const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Dial + handshake deadline for an overlay peer (Tor/I2P/mesh). Building a Tor
-/// circuit and finishing an onion rendezvous routinely takes 20-40s, so the
-/// clearnet 15s cut off reachable onion seeders mid-handshake.
-const OVERLAY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-/// Per-file transfer deadline for an overlay peer. Multi-hop circuits move data
-/// at a fraction of clearnet bandwidth, so a file that lands in seconds directly
-/// can take a minute-plus over Tor. Without the headroom the transfer timed out
-/// at 60s, requeued, and after a few rounds the file was marked failed and the
-/// site opened missing it (a clone "stuck" near the end over Tor).
-const OVERLAY_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// Dial + handshake deadline, generous for slow overlay peers.
-fn connect_timeout(peer: &PeerAddr) -> std::time::Duration {
-    if peer.is_overlay() {
-        OVERLAY_CONNECT_TIMEOUT
-    } else {
-        CONNECT_TIMEOUT
-    }
-}
-
-/// Per-file transfer deadline, generous for slow overlay peers.
-fn file_timeout(peer: &PeerAddr) -> std::time::Duration {
-    if peer.is_overlay() {
-        OVERLAY_FILE_TIMEOUT
-    } else {
-        FILE_TIMEOUT
-    }
-}
-
 async fn connect(transport: &dyn Transport, peer: &PeerAddr) -> Option<Connection> {
-    tokio::time::timeout(connect_timeout(peer), async {
+    tokio::time::timeout(peer.connect_timeout(), async {
         let mut conn = Connection::connect(transport, peer).await.ok()?;
         conn.handshake().await.ok()?;
         Some(conn)
