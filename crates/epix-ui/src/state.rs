@@ -5257,6 +5257,7 @@ impl AppState {
         let rev = self.rev().await;
         let ui_port = self.ui_port().await;
         let (epix_browser, browser_tor_clearnet) = self.browser_settings().await;
+        let ui_restrict = self.ui_restrict().await;
         json!({
             "version": self.version,
             "rev": rev,
@@ -5273,6 +5274,9 @@ impl AppState {
             "network_status": self.network_status().await,
             "epix_browser": epix_browser,
             "browser_tor_clearnet": browser_tor_clearnet,
+            // Read-only gateway mode: the dashboard hides node-lifecycle
+            // controls (shut down, restart) since the backend refuses them here.
+            "ui_restrict": ui_restrict,
             "ui_ip": "127.0.0.1",
             "ui_port": ui_port,
             "debug": false,

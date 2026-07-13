@@ -3708,6 +3708,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_info_exposes_ui_restrict() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state.clone(), Some("1site".into()));
+
+        // Off by default.
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["ui_restrict"], false);
+
+        // Reflects the config (accepts the string "true", like ui_restrict()).
+        state.config_set("ui_restrict", json!("true")).await;
+        let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(info["ui_restrict"], true);
+    }
+
+    #[tokio::test]
     async fn config_set_saves_and_notifies_on_language() {
         let state = AppState::new("test");
         let mut events = state.subscribe_events();
