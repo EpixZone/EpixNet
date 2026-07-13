@@ -96,7 +96,8 @@ impl Xite {
             return Ok(false);
         }
         let bytes = self.storage.read("content.json")?;
-        self.set_content(&bytes)?;
+        // Already on disk - verify + parse into memory, don't re-write it.
+        self.stage_content(&bytes)?;
         Ok(true)
     }
 
@@ -120,19 +121,44 @@ impl Xite {
         self.set_content_limited(bytes, i64::MAX)
     }
 
+    /// [`Self::stage_content_limited`] with no size limit.
+    pub fn stage_content(&mut self, bytes: &[u8]) -> Result<()> {
+        self.stage_content_limited(bytes, i64::MAX)
+    }
+
     /// Verify the root `content.json` - signatures against the valid signers
     /// (including a delegated `signers` list authorized by `signers_sign`),
     /// address/inner_path/relative-path rules, and the `size_limit` (bytes) -
-    /// then store + parse it. This is the full EpixNet `verifyFile` path, not
-    /// just a single-owner signature.
-    pub fn set_content_limited(&mut self, bytes: &[u8], size_limit: i64) -> Result<()> {
+    /// and adopt it IN MEMORY ONLY. Sync workers read `self.content`, so this
+    /// is enough to start fetching the files it declares; nothing touches the
+    /// stored content.json until [`Self::commit_content`], keeping the old
+    /// on-disk version authoritative (and the site serving) through the sync.
+    /// This is the full EpixNet `verifyFile` path, not just a single-owner
+    /// signature.
+    pub fn stage_content_limited(&mut self, bytes: &[u8], size_limit: i64) -> Result<()> {
         let json: Value = serde_json::from_slice(bytes)?;
         let ctx = RootCtx { address: self.address.as_str().to_string(), size_limit };
         epix_content::verify_content_file("content.json", &json, bytes.len() as i64, &ctx)
             .map_err(|e| Error::Crypt(e.to_string()))?;
-        self.storage.write("content.json", bytes)?;
         self.content = Some(json);
         Ok(())
+    }
+
+    /// Commit staged root content.json bytes to disk atomically. Call once the
+    /// files the staged content declares are present, so the on-disk
+    /// content.json (the completeness marker) never gets ahead of its files.
+    pub fn commit_content(&self, bytes: &[u8]) -> Result<()> {
+        self.storage.write_atomic("content.json", bytes)
+    }
+
+    /// Verify + adopt + commit the root `content.json` in one step: stage
+    /// ([`Self::stage_content_limited`]) then commit ([`Self::commit_content`]).
+    /// For paths where the declared files are already known-present (owner
+    /// signing, local edits); sync paths should stage first and commit after
+    /// the files arrive.
+    pub fn set_content_limited(&mut self, bytes: &[u8], size_limit: i64) -> Result<()> {
+        self.stage_content_limited(bytes, size_limit)?;
+        self.commit_content(bytes)
     }
 
     /// Files declared under a content.json node (`files` or `files_optional`).
@@ -520,7 +546,7 @@ impl Xite {
         // Python-EpixNet's on-disk format (helper.jsonDumps): human-readable
         // and diff-friendly; the signature covers the canonical form, not this.
         let bytes = epix_content::dumps_content(&content).into_bytes();
-        self.storage.write("content.json", &bytes)?;
+        self.storage.write_atomic("content.json", &bytes)?;
         self.content = Some(content);
         Ok(())
     }

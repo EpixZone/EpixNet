@@ -48,6 +48,36 @@ impl XiteStorage {
         std::fs::write(&p, bytes).map_err(Error::Io)
     }
 
+    /// Write `inner_path` atomically: write a sibling temp file, fsync it, then
+    /// rename it over the target (an atomic replace on a single filesystem), and
+    /// best-effort fsync the parent directory. Used for the `content.json` commit
+    /// so a crash mid-write never leaves a half-written commit marker. Data files
+    /// use plain [`Self::write`] - they are hash-verified, so a torn one just
+    /// fails `verify` and is re-downloaded.
+    pub fn write_atomic(&self, inner_path: &str, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let p = self.path(inner_path)?;
+        let parent =
+            p.parent().ok_or_else(|| Error::Other(format!("no parent dir: {inner_path}")))?;
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("content.json");
+        let tmp = parent.join(format!("{name}.epixtmp"));
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(Error::Io)?;
+            f.write_all(bytes).map_err(Error::Io)?;
+            f.sync_all().map_err(Error::Io)?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &p) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Io(e));
+        }
+        // Best-effort durability of the rename itself.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
     /// Delete a stored file, pruning any directories the removal left empty.
     pub fn delete(&self, inner_path: &str) -> Result<()> {
         let p = self.path(inner_path)?;
@@ -116,5 +146,27 @@ mod tests {
         let h = XiteStorage::hash_bytes(b"");
         assert_eq!(&h[..16], "cf83e1357eefb8bd");
         assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = XiteStorage::new(dir.path());
+
+        // Creates missing parent dirs like plain write.
+        s.write_atomic("sub/content.json", b"v1").unwrap();
+        assert_eq!(s.read("sub/content.json").unwrap(), b"v1");
+
+        // Replaces the previous version in place.
+        s.write_atomic("sub/content.json", b"v2-longer-content").unwrap();
+        assert_eq!(s.read("sub/content.json").unwrap(), b"v2-longer-content");
+
+        // No temp file survives the rename.
+        let leftovers: Vec<String> = s
+            .list_files()
+            .into_iter()
+            .filter(|f| f.ends_with(".epixtmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
     }
 }

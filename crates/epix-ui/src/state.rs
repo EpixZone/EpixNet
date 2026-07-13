@@ -296,6 +296,34 @@ struct ManagedXite {
     peer_hashfields: HashMap<String, epix_xite::Hashfield>,
 }
 
+/// A verified root content.json waiting for its files: the signature checked
+/// out but some declared files could not be fetched yet, so it was NOT
+/// committed to disk and the node keeps serving the previous version. Only the
+/// small signed JSON value + its exact bytes are held - file data is always
+/// verified per-file and written to disk as it arrives.
+struct PendingUpdate {
+    /// Every served key the commit applies to (raw address + `.epix` aliases).
+    keys: Vec<String>,
+    /// The verified content.json.
+    content: Value,
+    /// The exact signed bytes to commit (atomically) once the files land.
+    bytes: Vec<u8>,
+    /// Retry passes attempted so far, driving the decaying retry probability.
+    tries: i64,
+}
+
+/// EpixNet's bad-file backoff (`random.randint(0, min(40, tries)) < 4`): the
+/// first few passes always retry, then the chance decays to ~10% per tick so a
+/// file nobody serves doesn't burn bandwidth forever.
+fn retry_pending_allowed(tries: i64) -> bool {
+    let bound = tries.clamp(0, 40) as u8;
+    let mut b = [0u8; 1];
+    if getrandom::getrandom(&mut b).is_err() {
+        return true;
+    }
+    (b[0] % (bound + 1)) < 4
+}
+
 /// Server-wide state shared across all HTTP/WebSocket handlers.
 pub struct AppState {
     pub version: String,
@@ -425,6 +453,13 @@ pub struct AppState {
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
     updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Verified root content.json updates whose declared files have not all
+    /// landed yet, keyed by canonical address. The on-disk content.json (the
+    /// completeness marker) stays at the previous consistent version until the
+    /// file set completes; [`Self::retry_pending_updates`] re-fetches the
+    /// missing files each resync tick and commits when they land. Holds only
+    /// the small signed JSON + bytes, never file data.
+    pending_updates: std::sync::Mutex<HashMap<String, PendingUpdate>>,
     /// Xite addresses with an update pass (periodic resync or `siteUpdate`)
     /// currently running, bracketed by [`Self::begin_site_update`] /
     /// [`Self::end_site_update`]. A websocket whose event stream lagged
@@ -732,6 +767,7 @@ impl AppState {
             tracker: crate::tracker::TrackerDb::new(),
             pins_path: None,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
@@ -848,6 +884,7 @@ impl AppState {
             rns_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
@@ -1752,6 +1789,21 @@ impl AppState {
             let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
             if !loaded {
                 continue; // no content.json on disk yet
+            }
+            // Legacy persisted-ahead state: older builds wrote content.json to
+            // disk before its files, so a crash or failed sync could leave a
+            // stored content.json whose files are missing. New code commits
+            // content.json only after its files (staged adopt), so this only
+            // flags dirs written by older builds; the resync loop heals them.
+            let missing = xite.files_needed().len();
+            if missing > 0 {
+                self.log(
+                    "INFO",
+                    format!(
+                        "{canonical}: stored content.json declares {missing} file(s) not on disk; resync will fetch them"
+                    ),
+                )
+                .await;
             }
             let content = xite.content.clone();
             // Settings live flat in the entry (EpixNet schema); accept the old
@@ -2913,6 +2965,213 @@ impl AppState {
         }
     }
 
+    /// Every served key for the xite signed as `canonical` (the raw address
+    /// plus any `.epix` alias). Falls back to `fallback` alone if the registry
+    /// has no match.
+    async fn alias_keys(&self, canonical: &str, fallback: &str) -> Vec<String> {
+        let keys: Vec<String> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(k, x)| {
+                    k.as_str() == canonical
+                        || canonical_address(x.content.as_ref(), k) == canonical
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        if keys.is_empty() {
+            vec![fallback.to_string()]
+        } else {
+            keys
+        }
+    }
+
+    /// Land a verified root content.json: when every file it declares is
+    /// present (`failed` empty), commit it - atomic-rename the exact signed
+    /// bytes over the stored content.json and adopt it under every alias key.
+    /// Otherwise DEFER: keep the previous on-disk version authoritative (the
+    /// node keeps serving a consistent site instead of a loading screen),
+    /// record the missing paths in `settings.cache.bad_files`, and hold the
+    /// update as a [`PendingUpdate`] for [`Self::retry_pending_updates`].
+    /// Returns whether the update committed.
+    async fn finalize_root_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        storage: &XiteStorage,
+        content: Value,
+        bytes: &[u8],
+        failed: &[String],
+    ) -> bool {
+        if failed.is_empty() {
+            self.commit_root_update(keys, canonical, storage, content, bytes).await
+        } else {
+            self.defer_root_update(keys, canonical, content, bytes, failed).await;
+            false
+        }
+    }
+
+    /// The commit half of [`Self::finalize_root_update`]: atomic-rename the
+    /// exact signed bytes over the stored content.json, drop any pending
+    /// record, clear the bad-file counters, and adopt the new content under
+    /// every alias key.
+    async fn commit_root_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        storage: &XiteStorage,
+        content: Value,
+        bytes: &[u8],
+    ) -> bool {
+        if let Err(e) = storage.write_atomic("content.json", bytes) {
+            self.log("ERROR", format!("Committing content.json for {canonical} failed: {e}"))
+                .await;
+            return false;
+        }
+        self.pending_updates.lock().unwrap().remove(canonical);
+        {
+            let mut xites = self.xites.write().await;
+            for k in keys {
+                if let Some(x) = xites.get_mut(k) {
+                    x.settings.cache.bad_files.clear();
+                }
+            }
+        }
+        for k in keys {
+            self.update_content(k, Some(content.clone())).await;
+        }
+        true
+    }
+
+    /// The defer half of [`Self::finalize_root_update`]: record the missing
+    /// paths in `settings.cache.bad_files` (the dashboard's bad-file warning)
+    /// and hold the update as a [`PendingUpdate`] for
+    /// [`Self::retry_pending_updates`].
+    async fn defer_root_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        content: Value,
+        bytes: &[u8],
+        failed: &[String],
+    ) {
+        self.log(
+            "INFO",
+            format!(
+                "Update for {canonical} incomplete: {} file(s) not yet available; keeping the previous version and retrying",
+                failed.len()
+            ),
+        )
+        .await;
+        {
+            let mut xites = self.xites.write().await;
+            for k in keys {
+                if let Some(x) = xites.get_mut(k) {
+                    for f in failed {
+                        *x.settings.cache.bad_files.entry(f.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let new_modified = content.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let mut pending = self.pending_updates.lock().unwrap();
+        // Keep only the newest pending version per xite; a re-attempt of the
+        // same version keeps its retry counter (the backoff keeps decaying).
+        let (replace, tries) = match pending.get(canonical) {
+            Some(p) => {
+                let pm = p.content.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                (pm <= new_modified, if pm == new_modified { p.tries } else { 0 })
+            }
+            None => (true, 0),
+        };
+        if replace {
+            pending.insert(
+                canonical.to_string(),
+                PendingUpdate { keys: keys.to_vec(), content, bytes: bytes.to_vec(), tries },
+            );
+        }
+    }
+
+    /// Retry the pending (verified but uncommitted) root updates: re-fetch each
+    /// one's still-missing files from connectable peers and commit the ones
+    /// whose file set completed. Called from the periodic resync tick, with a
+    /// decaying per-update retry probability so files nobody serves don't cost
+    /// bandwidth every pass.
+    pub async fn retry_pending_updates(&self) {
+        let due: Vec<(Vec<String>, String, Value, Vec<u8>)> = {
+            let mut pending = self.pending_updates.lock().unwrap();
+            pending
+                .iter_mut()
+                .filter_map(|(canonical, p)| {
+                    p.tries += 1;
+                    retry_pending_allowed(p.tries).then(|| {
+                        (p.keys.clone(), canonical.clone(), p.content.clone(), p.bytes.clone())
+                    })
+                })
+                .collect()
+        };
+        for (keys, canonical, content, bytes) in due {
+            if self.retry_pending_update(&keys, &canonical, content, &bytes).await {
+                self.log("INFO", format!("Pending update for {} completed and committed", keys[0]))
+                    .await;
+                for k in &keys {
+                    self.push_site_info_event(k, "updated").await;
+                }
+            }
+        }
+    }
+
+    /// One retry pass for a single pending update: re-fetch its still-missing
+    /// files and try to commit. Returns whether the update committed.
+    async fn retry_pending_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        content: Value,
+        bytes: &[u8],
+    ) -> bool {
+        let key = &keys[0];
+        if !self.has_xite(key).await {
+            // The xite was deleted; drop its pending update.
+            self.pending_updates.lock().unwrap().remove(canonical);
+            return false;
+        }
+        if !self.is_serving(key).await {
+            return false;
+        }
+        let Ok(view) = self.xite_view(key).await else { return false };
+        let Ok(addr) = Address::parse(canonical.to_string()) else { return false };
+        // A view staged at the pending content, so files_needed() reflects
+        // the version we are trying to complete, not the served one.
+        let mut xite = Xite::new(addr, view.storage.clone());
+        xite.content = Some(content.clone());
+        let needed = xite.files_needed();
+        if !needed.is_empty() {
+            self.fetch_pending_files(key, &xite, needed).await;
+        }
+        let failed: Vec<String> =
+            xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
+        self.finalize_root_update(keys, canonical, &view.storage, content, bytes, &failed).await
+    }
+
+    /// Fetch a pending update's missing files from connectable peers, updating
+    /// the live worker stats. A no-op without a transport or peers - files
+    /// that arrive some other way still let the caller's commit land.
+    async fn fetch_pending_files(&self, key: &str, xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
+        let Some(transport) = self.transport.read().await.clone() else { return };
+        let peers = self.connectable_peers(key, 10).await;
+        if peers.is_empty() {
+            return;
+        }
+        self.set_worker_stats(key, needed.len(), peers.len().min(8), needed.len()).await;
+        let report = epix_worker::sync_files_list(needed, xite, &peers, transport, 8, None).await;
+        self.set_worker_stats(key, 0, 0, 0).await;
+        if let Ok(report) = report {
+            self.add_transfer(key, report.bytes, 0).await;
+        }
+    }
+
     /// Check a xite for a newer content.json among its peers and, if found,
     /// verify it and download the changed files (updating live worker stats).
     /// Returns true if an update was applied. This is the node's re-sync step.
@@ -2927,14 +3186,16 @@ impl AppState {
             return Ok(false);
         }
         let view = self.xite_view(address).await?;
-        // Never resync a local working copy: a content.json that does not verify
-        // for the address it is served under (authored here, edited, or signed
-        // for a different address and not re-signed yet) is authoritative
-        // locally. Its `address` field would point the fetch below at a foreign
-        // xite, and we'd overwrite the local files with that (older) content -
-        // exactly the "loads the old dashboard after a minute" symptom. A
-        // signature is only required for content we choose to pull from peers.
-        {
+        // Never resync a local working copy: a stored content.json that does
+        // not verify for the address it is served under (authored here,
+        // edited, or signed for a different address and not re-signed yet) is
+        // authoritative locally. Its `address` field would point the fetch
+        // below at a foreign xite, and we'd overwrite the local files with
+        // that (older) content - exactly the "loads the old dashboard after a
+        // minute" symptom. No stored content.json at all is fine: that's a
+        // registered xite whose sync never committed, and resync is exactly
+        // what heals it.
+        if view.storage.exists("content.json") {
             let mut probe = Xite::new(
                 Address::parse(address.to_string()).map_err(|e| e.to_string())?,
                 view.storage.clone(),
@@ -2972,22 +3233,19 @@ impl AppState {
                 return Ok(false); // already current
             }
 
-            // Verify + apply the newer content.json (full signer/rules check,
-            // size-limited), then sync its changed files. Keep the previous
-            // content.json bytes so an incomplete sync can roll back: a resync
-            // must land atomically. If we persisted the new content.json but
-            // couldn't fetch every file it declares, the node would serve a
-            // content.json whose files are stale or missing - the mismatch that
-            // hangs the wrapper's html gate ("content.json updated but files
-            // stale"). So commit the new version only when all its files land.
+            // Verify the newer content.json (full signer/rules check,
+            // size-limited) and STAGE it in memory only, then sync its changed
+            // files against the staged version. The stored content.json - the
+            // completeness marker the html gate keys on - is untouched until
+            // every declared file lands, so an incomplete sync leaves the node
+            // serving the previous consistent version instead of a loading
+            // screen (the "content.json updated but files stale" hang).
             let mut xite = Xite::new(
                 Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
                 view.storage.clone(),
             );
-            let prev_content_bytes = xite.storage.read("content.json").ok();
             let limit = self.size_limit_bytes(address).await;
-            xite.set_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
-            self.update_content(address, xite.content.clone()).await;
+            xite.stage_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
 
             let needed = xite.files_needed().len();
             let workers = peers.len().min(8);
@@ -2999,56 +3257,18 @@ impl AppState {
             let report = report.map_err(|e| e.to_string())?;
             self.add_transfer(address, report.bytes, 0).await;
 
-            // Atomic landing: if any declared file is still missing, roll the
-            // content.json back to the version whose files we DO have, and put
-            // that back into the live state. The node keeps serving the prior,
-            // consistent version; the next resync tick retries. Without this a
-            // half-finished sync leaves the node stuck on the loading screen.
-            if !report.failed.is_empty() {
-                self.log(
-                    "INFO",
-                    format!(
-                        "Resync of {address} incomplete: {} file(s) unavailable; kept the previous version",
-                        report.failed.len()
-                    ),
-                )
+            // Commit when complete, else defer (kept pending + retried by the
+            // resync tick); either way the node serves a consistent version.
+            let keys = self.alias_keys(&canonical, address).await;
+            let failed: Vec<String> =
+                xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
+            let Some(content) = xite.content else { return Ok(false) };
+            let committed = self
+                .finalize_root_update(&keys, &canonical, &view.storage, content, &bytes, &failed)
                 .await;
-                self.rollback_content(address, &canonical, &view.storage, prev_content_bytes.as_deref())
-                    .await;
-                return Ok(false);
-            }
-
-            // Every file landed - the new content.json (already on disk) is now
-            // backed by all its files. Rebuild the db view from the new content.
-            self.update_content(address, xite.content).await;
-            return Ok(true);
+            return Ok(committed);
         }
         Ok(false)
-    }
-
-    /// Restore a xite's content.json to `prev_bytes` (the version before an
-    /// incomplete resync) and reload it into the live state, so the node keeps
-    /// serving a consistent version instead of a content.json whose files are
-    /// missing. A no-op when there is nothing to restore. Falls back to the
-    /// local (unsigned) load like restore, since the prior content already
-    /// verified when it was first adopted.
-    async fn rollback_content(
-        &self,
-        address: &str,
-        canonical: &str,
-        storage: &XiteStorage,
-        prev_bytes: Option<&[u8]>,
-    ) {
-        let Some(prev) = prev_bytes else { return };
-        if storage.write("content.json", prev).is_err() {
-            return;
-        }
-        let Ok(addr) = Address::parse(canonical.to_string()) else { return };
-        let mut restored = Xite::new(addr, storage.clone());
-        let loaded = restored.load_content().unwrap_or(false) || restored.load_content_local();
-        if loaded {
-            self.update_content(address, restored.content).await;
-        }
     }
 
     /// Peer counts (connected/connectable/onion/local/total) for the sidebar.
@@ -6589,14 +6809,26 @@ impl AppState {
             }
         };
         let mut child_files: Option<Vec<epix_xite::FileEntry>> = None;
+        let mut committed_inline = false;
         if is_root {
+            // Verify + STAGE the pushed root in memory only. It is committed
+            // (written to disk + adopted for serving) by finish_inbound_update
+            // once every file it declares is present, so a push whose files
+            // can't all be fetched never regresses a working site.
             let limit = self.size_limit_bytes(&key).await;
-            if let Err(e) = xite.set_content_limited(&bytes, limit) {
+            if let Err(e) = xite.stage_content_limited(&bytes, limit) {
                 self.updates_in_flight.lock().unwrap().remove(&uri);
                 return Err(format!("File {inner_path} invalid: {e}"));
             }
-            for k in &keys {
-                self.update_content(k, xite.content.clone()).await;
+            // Fast path: every declared file is already present (a
+            // metadata-only re-sign, or files that landed earlier), so there
+            // is nothing to wait for - commit before answering the sender.
+            if xite.files_needed().is_empty() {
+                let canonical = canonical_address(xite.content.as_ref(), &key);
+                let content = xite.content.clone().unwrap_or(Value::Null);
+                committed_inline = self
+                    .finalize_root_update(&keys, &canonical, &xite.storage, content, &bytes, &[])
+                    .await;
             }
         } else {
             // An include / user content.json: verified against its on-disk
@@ -6630,9 +6862,12 @@ impl AppState {
         // EpixNet - the sender gets its "ok" response right away.
         let state = self.clone();
         let inner = inner_path.to_string();
+        // Already-committed roots (and child pushes) have nothing left to
+        // commit; finish only syncs/publishes for them.
+        let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
         tokio::spawn(async move {
             state
-                .finish_inbound_update(keys, xite, sender, inner, uri, diffs, child_files)
+                .finish_inbound_update(keys, xite, sender, inner, uri, diffs, child_files, root_bytes)
                 .await;
         });
         Ok(InboundUpdate::Applied)
@@ -6666,7 +6901,9 @@ impl AppState {
 
     /// The deferred half of [`Self::apply_inbound_update`]: apply any diffs the
     /// publisher sent (patching our old file copies to skip downloads), sync the
-    /// files still needed (preferring the sender), rebuild db views, then
+    /// files still needed (preferring the sender), then - for a root push -
+    /// commit the staged content.json only if every declared file is present
+    /// (else defer it for retry and keep serving the previous version), and
     /// re-publish to a few peers so the update spreads.
     async fn finish_inbound_update(
         &self,
@@ -6677,6 +6914,7 @@ impl AppState {
         uri: String,
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
         child_files: Option<Vec<epix_xite::FileEntry>>,
+        root_bytes: Option<Vec<u8>>,
     ) {
         let key = keys[0].clone();
         // Diff keys are relative to the pushed content.json's directory (the
@@ -6740,13 +6978,7 @@ impl AppState {
                     self.add_transfer(&key, report.bytes, 0).await;
                 }
                 self.set_worker_stats(&key, 0, 0, 0).await;
-                if child_files.is_none() {
-                    // Root data files changed - rebuild the db views under
-                    // every alias.
-                    for k in &keys {
-                        self.update_content(k, xite.content.clone()).await;
-                    }
-                } else {
+                if child_files.is_some() {
                     // Child data files (user posts) feed the db per file, so
                     // open pages see them without a full rebuild.
                     for path in needed_paths {
@@ -6756,14 +6988,38 @@ impl AppState {
                     }
                 }
             }
-            // EpixNet re-publishes an accepted update to up to 3 more peers,
-            // forwarding the diffs it received so they spread with the push.
+        }
+
+        // Root push: commit the staged content.json (write to disk + adopt for
+        // serving + rebuild db views) only when every file it declares is now
+        // present. Otherwise the update is deferred - the previous version
+        // keeps serving and the resync tick retries the missing files. This is
+        // what apply_inbound_update staged instead of writing.
+        let committed = match (&child_files, &root_bytes) {
+            (None, Some(bytes)) => {
+                let canonical = canonical_address(xite.content.as_ref(), &key);
+                let failed: Vec<String> =
+                    xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
+                let content = xite.content.clone().unwrap_or(Value::Null);
+                self.finalize_root_update(&keys, &canonical, &xite.storage, content, bytes, &failed)
+                    .await
+            }
+            // Child pushes were verified + stored by add_content already.
+            _ => true,
+        };
+
+        // EpixNet re-publishes an accepted update to up to 3 more peers,
+        // forwarding the diffs it received so they spread with the push - but
+        // never a version we couldn't complete ourselves.
+        if committed && self.transport.read().await.is_some() {
             let _ = self.publish_to(&key, &inner_path, 3, diffs, None).await;
         }
         self.updates_in_flight.lock().unwrap().remove(&uri);
         // Flash the dashboard row: a peer pushed a new version and it landed.
-        for k in &keys {
-            self.push_site_info_event(k, "updated").await;
+        if committed {
+            for k in &keys {
+                self.push_site_info_event(k, "updated").await;
+            }
         }
     }
 
@@ -7864,12 +8120,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_content_restores_previous_version_on_disk_and_in_state() {
+    async fn incomplete_update_keeps_previous_version_serving() {
+        // The gateway regression: an update whose files can't all be fetched
+        // must leave the previous version serving - on disk AND in the live
+        // state - instead of a content.json that is ahead of its files.
         let dir = tempdir().unwrap();
         let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
         let storage = XiteStorage::new(dir.path());
 
-        // The version we started from (v1) is on disk and in the live state.
         let v1 = serde_json::to_vec(&json!({
             "address": addr, "modified": 100.0, "title": "V1", "files": {}
         }))
@@ -7886,24 +8144,108 @@ mod tests {
             )
             .await;
 
-        // A resync wrote the newer v2 content.json to disk and swapped it into
-        // the live state, then couldn't fetch one of its files.
-        let v2 = serde_json::to_vec(&json!({
-            "address": addr, "modified": 200.0, "title": "V2", "files": {}
+        // Served under a `.epix` alias too: a commit must swap every key.
+        state
+            .add_xite(
+                "dash.epix",
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(serde_json::from_slice(&v1).unwrap()),
+                },
+            )
+            .await;
+
+        // A newer v2 arrives but one of its files couldn't be fetched: the
+        // update is deferred, nothing on disk or in the live state changes.
+        let v2_content = json!({
+            "address": addr, "modified": 200.0, "title": "V2",
+            "files": { "js/app.js": { "size": 5, "sha512": "aa" } },
+        });
+        let v2 = serde_json::to_vec(&v2_content).unwrap();
+        let keys = vec![addr.to_string(), "dash.epix".to_string()];
+        let committed = state
+            .finalize_root_update(
+                &keys,
+                addr,
+                &storage,
+                v2_content.clone(),
+                &v2,
+                &["js/app.js".to_string()],
+            )
+            .await;
+        assert!(!committed);
+        assert_eq!(storage.read("content.json").unwrap(), v1, "old version stays on disk");
+        assert_eq!(state.site_info(addr).await["content"]["title"], "V1", "old version serves");
+        assert_eq!(state.bad_files(addr).await, vec!["js/app.js"], "missing file recorded");
+
+        // The files land later (any path): the same finalize now commits the
+        // exact signed bytes and swaps the live state.
+        let committed =
+            state.finalize_root_update(&keys, addr, &storage, v2_content, &v2, &[]).await;
+        assert!(committed);
+        assert_eq!(storage.read("content.json").unwrap(), v2, "exact bytes committed");
+        assert_eq!(state.site_info(addr).await["content"]["title"], "V2");
+        assert_eq!(state.site_info("dash.epix").await["content"]["title"], "V2", "alias swapped");
+        assert!(state.bad_files(addr).await.is_empty(), "bad_files cleared on commit");
+    }
+
+    #[tokio::test]
+    async fn retry_pending_updates_commits_once_files_land() {
+        // A deferred update converges: once its missing file appears on disk,
+        // the retry tick commits it without needing peers or a transport.
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let storage = XiteStorage::new(dir.path());
+
+        let v1 = serde_json::to_vec(&json!({
+            "address": addr, "modified": 100.0, "title": "V1", "files": {}
         }))
         .unwrap();
-        storage.write("content.json", &v2).unwrap();
-        state.update_content(addr, Some(serde_json::from_slice(&v2).unwrap())).await;
-        assert_eq!(state.site_info(addr).await["content"]["title"], "V2");
+        storage.write("content.json", &v1).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(serde_json::from_slice(&v1).unwrap()),
+                },
+            )
+            .await;
 
-        // Rolling back restores v1 both on disk and in the live siteInfo.
-        state.rollback_content(addr, addr, &storage, Some(&v1)).await;
-        assert_eq!(state.site_info(addr).await["content"]["title"], "V1");
+        let body = b"hello";
+        let v2_content = json!({
+            "address": addr, "modified": 200.0, "title": "V2",
+            "files": { "a.txt": {
+                "size": body.len(),
+                "sha512": XiteStorage::hash_bytes(body),
+            } },
+        });
+        let v2 = serde_json::to_vec(&v2_content).unwrap();
+        let keys = vec![addr.to_string()];
+        assert!(
+            !state
+                .finalize_root_update(&keys, addr, &storage, v2_content, &v2, &["a.txt".into()])
+                .await
+        );
         assert_eq!(storage.read("content.json").unwrap(), v1);
 
-        // No previous bytes: a no-op, current state untouched.
-        state.rollback_content(addr, addr, &storage, None).await;
+        // Nothing on disk yet: the retry can't fetch (no transport) and the
+        // update stays pending, still serving v1.
+        state.retry_pending_updates().await;
+        assert_eq!(storage.read("content.json").unwrap(), v1);
         assert_eq!(state.site_info(addr).await["content"]["title"], "V1");
+
+        // The file lands (a later push, another peer, any path): the next
+        // retry pass verifies the set is complete and commits.
+        storage.write("a.txt", body).unwrap();
+        state.retry_pending_updates().await;
+        assert_eq!(storage.read("content.json").unwrap(), v2);
+        assert_eq!(state.site_info(addr).await["content"]["title"], "V2");
+
+        // Committed pending entries are gone: another pass is a no-op.
+        state.retry_pending_updates().await;
+        assert_eq!(storage.read("content.json").unwrap(), v2);
     }
 
     #[tokio::test]

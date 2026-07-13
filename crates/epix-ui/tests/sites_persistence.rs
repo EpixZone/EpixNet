@@ -133,7 +133,11 @@ async fn restores_a_python_written_sites_json_entry() {
 }
 
 #[tokio::test]
-async fn restore_skips_unverified_content() {
+async fn restore_falls_back_to_local_copy_for_unverified_content() {
+    // A content.json that no longer verifies (authored here, edited, or not
+    // re-signed yet) is still restored, served as a local working copy - it is
+    // already-downloaded content in the operator's own data dir. Dropping it
+    // used to make a registered xite vanish on restart.
     let root = tempfile::tempdir().unwrap();
     let privkey = epix_crypt::new_seed();
     let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
@@ -147,16 +151,18 @@ async fn restore_skips_unverified_content() {
         state.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
     }
 
-    // Corrupt the on-disk content.json so its signature no longer verifies.
-    let mut tampered: serde_json::Value =
+    // Edit the on-disk content.json so its signature no longer verifies.
+    let mut edited: serde_json::Value =
         serde_json::from_slice(&std::fs::read(xite_dir.join("content.json")).unwrap()).unwrap();
-    tampered["modified"] = json!(9999);
-    std::fs::write(xite_dir.join("content.json"), serde_json::to_vec(&tampered).unwrap()).unwrap();
+    edited["modified"] = json!(9999);
+    std::fs::write(xite_dir.join("content.json"), serde_json::to_vec(&edited).unwrap()).unwrap();
 
     let state = AppState::with_data_dir("run-2", root.path());
     let restored = state.restore_sites().await;
-    assert_eq!(restored, 0, "tampered content.json is not restored");
-    assert!(!state.has_any_alias(&address).await);
+    assert_eq!(restored, 1, "unverified content.json restores as a local copy");
+    assert!(state.has_any_alias(&address).await);
+    let info = state.site_info(&address).await;
+    assert_eq!(info["content"]["modified"], json!(9999), "the local copy is what serves");
 }
 
 #[tokio::test]

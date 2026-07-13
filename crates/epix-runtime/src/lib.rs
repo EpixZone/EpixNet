@@ -673,6 +673,10 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
                     };
                     state.push_update_result(&address, ok).await;
                 }
+                // Verified updates whose files couldn't all be fetched are
+                // held uncommitted (the previous version keeps serving);
+                // re-fetch their missing files and commit the completed ones.
+                state.retry_pending_updates().await;
                 // OptionalManager: keep optional files under the size cap.
                 let freed = state.enforce_optional_limit().await;
                 if freed > 0 {
