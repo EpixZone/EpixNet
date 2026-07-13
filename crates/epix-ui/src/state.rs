@@ -7397,6 +7397,22 @@ fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
 fn summarize_content(content: &Value) -> Value {
     let mut c = content.clone();
     if let Value::Object(map) = &mut c {
+        // If the xite doesn't declare a top-level `favicon`, fall back to a
+        // conventional favicon file it ships (EpixTalk carries
+        // `img/favicon.ico` with no `favicon` key). The dashboard site rail
+        // reads `content.favicon` to show the marker icon, so without this it
+        // shows the plain brand dot even though a favicon exists. Do this
+        // before `files` is replaced by a count below.
+        let has_favicon = map.get("favicon").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+        if !has_favicon {
+            let from_files = map
+                .get("files")
+                .and_then(Value::as_object)
+                .and_then(pick_favicon_file);
+            if let Some(path) = from_files {
+                map.insert("favicon".into(), json!(path));
+            }
+        }
         for key in ["files", "files_optional", "includes"] {
             let count = map.get(key).and_then(|v| v.as_object()).map(|o| o.len()).unwrap_or(0);
             map.insert(key.to_string(), json!(count));
@@ -7406,6 +7422,26 @@ fn summarize_content(content: &Value) -> Value {
         map.remove("signers_sign");
     }
     c
+}
+
+/// Pick a favicon out of a content.json `files` map for xites that ship one but
+/// don't declare a top-level `favicon`. Prefers well-known locations, then any
+/// file basename that starts with `favicon.`.
+fn pick_favicon_file(files: &serde_json::Map<String, Value>) -> Option<String> {
+    const KNOWN: [&str; 4] =
+        ["favicon.ico", "favicon.png", "img/favicon.ico", "img/favicon.png"];
+    for cand in KNOWN {
+        if files.contains_key(cand) {
+            return Some(cand.to_string());
+        }
+    }
+    files
+        .keys()
+        .find(|k| {
+            let base = k.rsplit('/').next().unwrap_or(k);
+            base.starts_with("favicon.")
+        })
+        .cloned()
 }
 
 /// `getNextSizeLimit`: the smallest tier (MB) that fits `size * 1.2`.
@@ -7425,6 +7461,34 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn summarize_content_falls_back_to_favicon_file() {
+        // Declares a `favicon` key: kept as-is.
+        let declared = summarize_content(&json!({
+            "favicon": "custom.png",
+            "files": { "custom.png": {}, "index.html": {} },
+        }));
+        assert_eq!(declared["favicon"], "custom.png");
+
+        // No key but ships img/favicon.ico (EpixTalk's case): backfilled.
+        let from_file = summarize_content(&json!({
+            "files": { "img/favicon.ico": {}, "index.html": {} },
+        }));
+        assert_eq!(from_file["favicon"], "img/favicon.ico");
+        // files is still collapsed to a count.
+        assert_eq!(from_file["files"], 2);
+
+        // Root favicon.ico wins over an img/ one.
+        let root = summarize_content(&json!({
+            "files": { "img/favicon.png": {}, "favicon.ico": {} },
+        }));
+        assert_eq!(root["favicon"], "favicon.ico");
+
+        // No favicon anywhere: key stays absent.
+        let none = summarize_content(&json!({ "files": { "index.html": {} } }));
+        assert!(none.get("favicon").is_none());
+    }
 
     #[tokio::test]
     async fn all_trackers_merges_bootstrap_shared_and_extra_deduped() {
