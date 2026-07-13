@@ -107,6 +107,27 @@ const DELETE_SITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 const WRITE_COMMANDS: &[&str] =
     &["fileWrite", "fileDelete", "siteSign", "sitePublish", "certAdd"];
 
+/// ADMIN commands that are read-only and expose nothing sensitive, so a
+/// restricted (public gateway) node still answers them - the read-only
+/// dashboard a visitor sees needs the site list, network stats, peer info, and
+/// the news feed. Everything else in `ADMIN_COMMANDS` (mutations, node config,
+/// identities, logs, the master seed) stays server-side only. An allow-list, so
+/// a newly added admin command is refused on a gateway until it is vetted here.
+const GATEWAY_READ_COMMANDS: &[&str] = &[
+    "announcerStats",
+    "channelJoinAllsite",
+    "chartDbQuery",
+    "chartGetPeerLocations",
+    "feedQuery",
+    "feedSearch",
+    "notificationQuery",
+    "optionalLimitStats",
+    "serverPortcheck",
+    "sidebarGetHtmlTag",
+    "sidebarGetPeers",
+    "siteList",
+];
+
 /// Per-connection context handed to every command.
 pub struct WsSession {
     pub state: Arc<AppState>,
@@ -314,17 +335,23 @@ impl CommandRegistry {
         let restrict = session.state.ui_restrict().await && !session.trusted;
         if is_admin_command(cmd) {
             if restrict {
-                return Err(format!("{cmd} is disabled on this gateway"));
-            }
-            // Allowed from the trusted admin socket, the wrapper (elevated id),
-            // or when the bound site actually holds ADMIN.
-            let elevated = session.trusted || req_id >= WRAPPER_ID_BASE;
-            let has_admin = match &session.xite {
-                Some(addr) => session.state.site_has_admin(addr).await,
-                None => false,
-            };
-            if !elevated && !has_admin {
-                return Err(format!("You don't have permission to run {cmd}"));
+                // A locked gateway still answers the safe read-only admin
+                // commands the public dashboard needs (site list, stats, peers,
+                // feed); every mutation and sensitive read is server-side only.
+                if !GATEWAY_READ_COMMANDS.contains(&cmd) {
+                    return Err(format!("{cmd} is disabled on this gateway"));
+                }
+            } else {
+                // Allowed from the trusted admin socket, the wrapper (elevated
+                // id), or when the bound site actually holds ADMIN.
+                let elevated = session.trusted || req_id >= WRAPPER_ID_BASE;
+                let has_admin = match &session.xite {
+                    Some(addr) => session.state.site_has_admin(addr).await,
+                    None => false,
+                };
+                if !elevated && !has_admin {
+                    return Err(format!("You don't have permission to run {cmd}"));
+                }
             }
         }
         // Restricted node: writing or deleting a xite's files needs the node to
