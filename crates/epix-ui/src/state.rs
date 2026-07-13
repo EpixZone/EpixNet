@@ -5228,6 +5228,7 @@ impl AppState {
             "tor_status": tor_status,
             "tor_has_meek_bridges": false,
             "tor_use_bridges": false,
+            "network_status": self.network_status().await,
             "ui_ip": "127.0.0.1",
             "ui_port": ui_port,
             "debug": false,
@@ -5242,6 +5243,63 @@ impl AppState {
             "plugins_rev": {},
             "user_settings": user_settings,
             "language": language,
+        })
+    }
+
+    /// Per-network inbound reachability for the dashboard's Network pill. Each
+    /// entry says whether peers can reach this node over that network; the
+    /// top-level `reachable` is true when ANY of them works (a Tor-only or
+    /// I2P-only node still counts as reachable). Additive to `serverInfo` -
+    /// the older `port_opened`/`ip_external`/`tor_*` fields stay as they were.
+    pub async fn network_status(&self) -> Value {
+        let (port_opened, detected_ip) = self.port_status().await;
+        let fileserver_port = self.fileserver_port().await;
+        let configured_ip = self
+            .config_get("ip_external")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|x| !x.is_empty());
+        // Seeding disabled (port 0) means no clearnet inbound at all.
+        let clearnet_enabled = fileserver_port != 0;
+        let clearnet_reachable = clearnet_enabled && port_opened;
+        let clearnet_ip = configured_ip.or(detected_ip);
+
+        let (tor_enabled, tor_status) = self.tor_status().await;
+        let onion = self.onion_address().await;
+        let tor_ok = matches!(tor_status.as_str(), "OK" | "Always");
+        let tor_reachable = tor_enabled && tor_ok && onion.is_some();
+
+        let i2p = self.i2p_status().await;
+        let i2p_str = |k: &str| i2p.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let i2p_num = |k: &str| i2p.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        let i2p_mode = i2p_str("mode").unwrap_or_default();
+        let i2p_enabled = !i2p_mode.is_empty() && i2p_mode != "disable";
+        let i2p_b32 = i2p_str("b32");
+        let i2p_reachable = i2p_enabled && (i2p_num("tunnels_built") > 0 || i2p_b32.is_some());
+
+        let reachable = clearnet_reachable || tor_reachable || i2p_reachable;
+
+        json!({
+            "reachable": reachable,
+            "clearnet": {
+                "enabled": clearnet_enabled,
+                "reachable": clearnet_reachable,
+                "port": fileserver_port,
+                "ip": clearnet_ip,
+            },
+            "tor": {
+                "enabled": tor_enabled,
+                "reachable": tor_reachable,
+                "status": tor_status,
+                "always": tor_ok && tor_status == "Always",
+                "address": onion.map(|o| format!("{o}.onion")),
+            },
+            "i2p": {
+                "enabled": i2p_enabled,
+                "reachable": i2p_reachable,
+                "phase": i2p_str("phase"),
+                "address": i2p_b32.map(|b| format!("{b}.i2p")),
+            },
         })
     }
 
