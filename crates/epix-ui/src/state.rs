@@ -5315,11 +5315,13 @@ impl AppState {
 
         let i2p = self.i2p_status().await;
         let i2p_str = |k: &str| i2p.get(k).and_then(|v| v.as_str()).map(str::to_string);
-        let i2p_num = |k: &str| i2p.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let i2p_mode = i2p_str("mode").unwrap_or_default();
         let i2p_enabled = !i2p_mode.is_empty() && i2p_mode != "disable";
-        let i2p_b32 = i2p_str("b32");
-        let i2p_reachable = i2p_enabled && (i2p_num("tunnels_built") > 0 || i2p_b32.is_some());
+        // Peers can only dial us over I2P once our inbound destination is
+        // published, i.e. we have a non-empty b32. While the session is still
+        // "Starting…" the status carries an empty b32, which is not reachable.
+        let i2p_b32 = i2p_str("b32").filter(|s| !s.is_empty());
+        let i2p_reachable = i2p_enabled && i2p_b32.is_some();
 
         let reachable = clearnet_reachable || tor_reachable || i2p_reachable;
 

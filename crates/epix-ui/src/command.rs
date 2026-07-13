@@ -3693,6 +3693,14 @@ mod tests {
         assert_eq!(ns["reachable"], true);
 
         // I2P with a built tunnel and address -> reachable, address suffixed.
+        // Enabled but still starting (empty b32): not reachable, no address.
+        state.set_i2p_status(json!({ "mode": "both", "phase": "Starting\u{2026}", "tunnels_built": 2, "b32": "" })).await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["i2p"]["enabled"], true);
+        assert_eq!(ns["i2p"]["reachable"], false);
+        assert_eq!(ns["i2p"]["address"], Value::Null);
+
+        // Inbound destination published (non-empty b32): reachable, suffixed.
         state.set_i2p_status(json!({ "mode": "both", "phase": "ready", "tunnels_built": 2, "b32": "xyz.b32" })).await;
         let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
         assert_eq!(ns["i2p"]["reachable"], true);
