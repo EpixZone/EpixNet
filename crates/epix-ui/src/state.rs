@@ -3005,26 +3005,57 @@ impl AppState {
         failed: &[String],
     ) -> bool {
         if failed.is_empty() {
-            if let Err(e) = storage.write_atomic("content.json", bytes) {
-                self.log("ERROR", format!("Committing content.json for {canonical} failed: {e}"))
-                    .await;
-                return false;
-            }
-            self.pending_updates.lock().unwrap().remove(canonical);
-            {
-                let mut xites = self.xites.write().await;
-                for k in keys {
-                    if let Some(x) = xites.get_mut(k) {
-                        x.settings.cache.bad_files.clear();
-                    }
+            self.commit_root_update(keys, canonical, storage, content, bytes).await
+        } else {
+            self.defer_root_update(keys, canonical, content, bytes, failed).await;
+            false
+        }
+    }
+
+    /// The commit half of [`Self::finalize_root_update`]: atomic-rename the
+    /// exact signed bytes over the stored content.json, drop any pending
+    /// record, clear the bad-file counters, and adopt the new content under
+    /// every alias key.
+    async fn commit_root_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        storage: &XiteStorage,
+        content: Value,
+        bytes: &[u8],
+    ) -> bool {
+        if let Err(e) = storage.write_atomic("content.json", bytes) {
+            self.log("ERROR", format!("Committing content.json for {canonical} failed: {e}"))
+                .await;
+            return false;
+        }
+        self.pending_updates.lock().unwrap().remove(canonical);
+        {
+            let mut xites = self.xites.write().await;
+            for k in keys {
+                if let Some(x) = xites.get_mut(k) {
+                    x.settings.cache.bad_files.clear();
                 }
             }
-            for k in keys {
-                self.update_content(k, Some(content.clone())).await;
-            }
-            return true;
         }
+        for k in keys {
+            self.update_content(k, Some(content.clone())).await;
+        }
+        true
+    }
 
+    /// The defer half of [`Self::finalize_root_update`]: record the missing
+    /// paths in `settings.cache.bad_files` (the dashboard's bad-file warning)
+    /// and hold the update as a [`PendingUpdate`] for
+    /// [`Self::retry_pending_updates`].
+    async fn defer_root_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        content: Value,
+        bytes: &[u8],
+        failed: &[String],
+    ) {
         self.log(
             "INFO",
             format!(
@@ -3060,7 +3091,6 @@ impl AppState {
                 PendingUpdate { keys: keys.to_vec(), content, bytes: bytes.to_vec(), tries },
             );
         }
-        false
     }
 
     /// Retry the pending (verified but uncommitted) root updates: re-fetch each
@@ -3082,52 +3112,63 @@ impl AppState {
                 .collect()
         };
         for (keys, canonical, content, bytes) in due {
-            let key = keys[0].clone();
-            if !self.has_xite(&key).await {
-                // The xite was deleted; drop its pending update.
-                self.pending_updates.lock().unwrap().remove(&canonical);
-                continue;
-            }
-            if !self.is_serving(&key).await {
-                continue;
-            }
-            let Ok(view) = self.xite_view(&key).await else { continue };
-            let Ok(addr) = Address::parse(canonical.clone()) else { continue };
-            // A view staged at the pending content, so files_needed() reflects
-            // the version we are trying to complete, not the served one.
-            let mut xite = Xite::new(addr, view.storage.clone());
-            xite.content = Some(content.clone());
-            let needed = xite.files_needed();
-            if !needed.is_empty() {
-                // Only the fetch needs a transport; files that arrived some
-                // other way still let the commit below land.
-                let Some(transport) = self.transport.read().await.clone() else { continue };
-                let peers = self.connectable_peers(&key, 10).await;
-                if peers.is_empty() {
-                    continue;
-                }
-                self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
-                    .await;
-                let report =
-                    epix_worker::sync_files_list(needed, &xite, &peers, transport.clone(), 8, None)
-                        .await;
-                self.set_worker_stats(&key, 0, 0, 0).await;
-                if let Ok(report) = report {
-                    self.add_transfer(&key, report.bytes, 0).await;
-                }
-            }
-            let failed: Vec<String> =
-                xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
-            let committed = self
-                .finalize_root_update(&keys, &canonical, &view.storage, content, &bytes, &failed)
-                .await;
-            if committed {
-                self.log("INFO", format!("Pending update for {key} completed and committed"))
+            if self.retry_pending_update(&keys, &canonical, content, &bytes).await {
+                self.log("INFO", format!("Pending update for {} completed and committed", keys[0]))
                     .await;
                 for k in &keys {
                     self.push_site_info_event(k, "updated").await;
                 }
             }
+        }
+    }
+
+    /// One retry pass for a single pending update: re-fetch its still-missing
+    /// files and try to commit. Returns whether the update committed.
+    async fn retry_pending_update(
+        &self,
+        keys: &[String],
+        canonical: &str,
+        content: Value,
+        bytes: &[u8],
+    ) -> bool {
+        let key = &keys[0];
+        if !self.has_xite(key).await {
+            // The xite was deleted; drop its pending update.
+            self.pending_updates.lock().unwrap().remove(canonical);
+            return false;
+        }
+        if !self.is_serving(key).await {
+            return false;
+        }
+        let Ok(view) = self.xite_view(key).await else { return false };
+        let Ok(addr) = Address::parse(canonical.to_string()) else { return false };
+        // A view staged at the pending content, so files_needed() reflects
+        // the version we are trying to complete, not the served one.
+        let mut xite = Xite::new(addr, view.storage.clone());
+        xite.content = Some(content.clone());
+        let needed = xite.files_needed();
+        if !needed.is_empty() {
+            self.fetch_pending_files(key, &xite, needed).await;
+        }
+        let failed: Vec<String> =
+            xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
+        self.finalize_root_update(keys, canonical, &view.storage, content, bytes, &failed).await
+    }
+
+    /// Fetch a pending update's missing files from connectable peers, updating
+    /// the live worker stats. A no-op without a transport or peers - files
+    /// that arrive some other way still let the caller's commit land.
+    async fn fetch_pending_files(&self, key: &str, xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
+        let Some(transport) = self.transport.read().await.clone() else { return };
+        let peers = self.connectable_peers(key, 10).await;
+        if peers.is_empty() {
+            return;
+        }
+        self.set_worker_stats(key, needed.len(), peers.len().min(8), needed.len()).await;
+        let report = epix_worker::sync_files_list(needed, xite, &peers, transport, 8, None).await;
+        self.set_worker_stats(key, 0, 0, 0).await;
+        if let Ok(report) = report {
+            self.add_transfer(key, report.bytes, 0).await;
         }
     }
 
