@@ -89,7 +89,7 @@ async fn run() {
     // Download the declared files with the regular worker, peers = the mesh
     // destination only.
     let report =
-        epix_worker::sync_files(&xite_b, &[a_addr], transport_b, 2).await.expect("sync");
+        epix_worker::sync_files(&xite_b, &[a_addr], transport_b, 2, None).await.expect("sync");
     assert!(report.failed.is_empty(), "failed: {:?}", report.failed);
     assert_eq!(xite_b.storage().read("index.html").unwrap(), index);
     assert!(xite_b.files_needed().is_empty(), "everything verified on disk");

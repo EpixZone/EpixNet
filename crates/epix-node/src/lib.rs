@@ -264,6 +264,37 @@ pub async fn run(opts: NodeOptions) -> Result<(), String> {
 /// against the first peers to respond, and the file download starts the
 /// moment content.json verifies - while discovery keeps feeding fresh peers
 /// (and replacement workers) into the running download.
+/// Applies worker peer outcomes to the live registry as they happen. A clone
+/// can run for minutes, so batching feedback to the end of the pass (like the
+/// short resync/push passes do) would let a dead peer keep being redialed for
+/// the whole download.
+struct LiveFeedback {
+    state: Arc<AppState>,
+    address: String,
+}
+
+impl epix_worker::PeerFeedback for LiveFeedback {
+    fn note(&self, peer: &PeerAddr, outcome: epix_worker::PeerOutcome) {
+        let state = self.state.clone();
+        let address = self.address.clone();
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            state.apply_peer_outcomes(&address, vec![(peer, outcome)]).await;
+        });
+    }
+}
+
+/// The [`LiveFeedback`] sink for a clone/sync pass, when a state is present.
+fn live_feedback(
+    progress: Option<&Arc<AppState>>,
+    address: &str,
+) -> Option<Arc<dyn epix_worker::PeerFeedback>> {
+    progress.map(|state| {
+        Arc::new(LiveFeedback { state: state.clone(), address: address.to_string() })
+            as Arc<dyn epix_worker::PeerFeedback>
+    })
+}
+
 async fn clone_xite_with_progress(
     address: &str,
     data_dir: &std::path::Path,
@@ -566,8 +597,15 @@ async fn clone_xite_with_progress(
         }) as epix_worker::FileProgress
     });
     let mut bytes_recv = 0;
-    if let Ok(report) =
-        epix_worker::sync_files_streaming(&xite, sync_rx, transport.clone(), 8, on_file).await
+    if let Ok(report) = epix_worker::sync_files_streaming(
+        &xite,
+        sync_rx,
+        transport.clone(),
+        8,
+        on_file,
+        live_feedback(progress, address),
+    )
+    .await
     {
         bytes_recv = report.bytes;
     }
@@ -841,7 +879,8 @@ async fn sync_included_content(
             });
         }) as epix_worker::FileProgress
     });
-    match epix_worker::sync_files_list(needed, xite, peers, transport, 8, on_file).await {
+    let feedback = live_feedback(progress, address);
+    match epix_worker::sync_files_list(needed, xite, peers, transport, 8, on_file, feedback).await {
         Ok(report) => {
             // Report only the files that actually landed - a partial sync
             // (dead peers) must not fire file_done for missing files.

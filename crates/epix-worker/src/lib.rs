@@ -59,6 +59,51 @@ pub fn download_priority(inner_path: &str) -> i32 {
 /// as each file finishes downloading. Drives the wrapper's loading screen.
 pub type FileProgress = Arc<dyn Fn(&str, usize, usize) + Send + Sync>;
 
+/// What happened with one peer during a sync pass, so the host can adjust its
+/// reputation and backoff. Reported through [`PeerFeedback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerOutcome {
+    /// Dial + handshake succeeded.
+    ConnectOk,
+    /// Dial or handshake failed or timed out.
+    ConnectFail,
+    /// A file downloaded from the peer and passed its hash check.
+    FileOk,
+    /// A file fetch failed: refused, timed out, or hash mismatch.
+    FileFail,
+}
+
+/// Sink for per-peer outcomes. The worker stays generic (no peer-registry
+/// dependency); the host decides what reputation/backoff each outcome earns.
+pub trait PeerFeedback: Send + Sync {
+    fn note(&self, peer: &PeerAddr, outcome: PeerOutcome);
+}
+
+/// A [`PeerFeedback`] that buffers outcomes for the caller to drain and apply
+/// after the pass - for hosts whose peer registry needs async/mutable access
+/// the worker's sync callback can't take.
+#[derive(Default)]
+pub struct CollectFeedback {
+    events: std::sync::Mutex<Vec<(PeerAddr, PeerOutcome)>>,
+}
+
+impl CollectFeedback {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Take everything recorded so far.
+    pub fn drain(&self) -> Vec<(PeerAddr, PeerOutcome)> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
+}
+
+impl PeerFeedback for CollectFeedback {
+    fn note(&self, peer: &PeerAddr, outcome: PeerOutcome) {
+        self.events.lock().unwrap().push((peer.clone(), outcome));
+    }
+}
+
 /// Download all files in `xite.files_needed()` from `peers` concurrently.
 ///
 /// Spawns up to `max_workers` workers (capped by the peer count); each connects
@@ -69,8 +114,9 @@ pub async fn sync_files(
     peers: &[PeerAddr],
     transport: Arc<dyn Transport>,
     max_workers: usize,
+    feedback: Option<Arc<dyn PeerFeedback>>,
 ) -> Result<SyncReport> {
-    sync_files_with_progress(xite, peers, transport, max_workers, None).await
+    sync_files_with_progress(xite, peers, transport, max_workers, None, feedback).await
 }
 
 /// Shared state for one sync pass, cloned into each worker.
@@ -82,6 +128,7 @@ struct SyncCtx {
     root: Arc<std::path::PathBuf>,
     transport: Arc<dyn Transport>,
     on_file: Option<FileProgress>,
+    feedback: Option<Arc<dyn PeerFeedback>>,
     done: Arc<std::sync::atomic::AtomicUsize>,
     total: usize,
 }
@@ -92,6 +139,7 @@ impl SyncCtx {
         xite: &Xite,
         transport: Arc<dyn Transport>,
         on_file: Option<FileProgress>,
+        feedback: Option<Arc<dyn PeerFeedback>>,
     ) -> Self {
         // Highest priority first: the visible page downloads before the bulk.
         needed.sort_by_key(|f| std::cmp::Reverse(download_priority(&f.inner_path)));
@@ -103,8 +151,16 @@ impl SyncCtx {
             root: Arc::new(xite.storage.root().to_path_buf()),
             transport,
             on_file,
+            feedback,
             done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             total,
+        }
+    }
+
+    /// Report a per-peer outcome to the host's feedback sink, if any.
+    fn note(&self, peer: &PeerAddr, outcome: PeerOutcome) {
+        if let Some(f) = &self.feedback {
+            f.note(peer, outcome);
         }
     }
 
@@ -161,9 +217,13 @@ async fn drain_workers(mut join: tokio::task::JoinSet<()>, ctx: &SyncCtx) {
 async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
     let storage = XiteStorage::new((*ctx.root).clone());
     let mut conn = match connect(ctx.transport.as_ref(), &peer).await {
-        Some(c) => c,
+        Some(c) => {
+            ctx.note(&peer, PeerOutcome::ConnectOk);
+            c
+        }
         None => {
             // Couldn't use this peer - leave the queue for other workers.
+            ctx.note(&peer, PeerOutcome::ConnectFail);
             return;
         }
     };
@@ -198,6 +258,7 @@ async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
         match fetched {
             Ok(bytes) if XiteStorage::hash_bytes(&bytes) == file.sha512 => {
                 if storage.write(&file.inner_path, &bytes).is_ok() {
+                    ctx.note(&peer, PeerOutcome::FileOk);
                     {
                         let mut r = ctx.report.lock().await;
                         r.downloaded += 1;
@@ -212,12 +273,16 @@ async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
                 }
             }
             _ => {
+                ctx.note(&peer, PeerOutcome::FileFail);
                 refused.insert(file.inner_path.clone());
                 requeue_or_fail(&ctx.queue, &ctx.report, file, attempts).await;
                 // The connection may be unhealthy; reconnect for the next item.
                 match connect(ctx.transport.as_ref(), &peer).await {
                     Some(c) => conn = c,
-                    None => break,
+                    None => {
+                        ctx.note(&peer, PeerOutcome::ConnectFail);
+                        break;
+                    }
                 }
             }
         }
@@ -234,6 +299,7 @@ pub async fn sync_files_list(
     transport: Arc<dyn Transport>,
     max_workers: usize,
     on_file: Option<FileProgress>,
+    feedback: Option<Arc<dyn PeerFeedback>>,
 ) -> Result<SyncReport> {
     if needed.is_empty() || peers.is_empty() {
         let mut report = SyncReport::default();
@@ -241,7 +307,7 @@ pub async fn sync_files_list(
         return Ok(report);
     }
     let max_workers = scale_workers(max_workers, needed.len());
-    let ctx = SyncCtx::new(needed, xite, transport, on_file);
+    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback);
     let worker_count = peers.len().min(max_workers.max(1));
     let mut join = tokio::task::JoinSet::new();
     for i in 0..worker_count {
@@ -259,6 +325,7 @@ pub async fn sync_files_with_progress(
     transport: Arc<dyn Transport>,
     max_workers: usize,
     on_file: Option<FileProgress>,
+    feedback: Option<Arc<dyn PeerFeedback>>,
 ) -> Result<SyncReport> {
     let needed = xite.files_needed();
     if needed.is_empty() || peers.is_empty() {
@@ -267,7 +334,7 @@ pub async fn sync_files_with_progress(
         return Ok(report);
     }
     let max_workers = scale_workers(max_workers, needed.len());
-    let ctx = SyncCtx::new(needed, xite, transport, on_file);
+    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback);
     let worker_count = peers.len().min(max_workers.max(1));
     let mut join = tokio::task::JoinSet::new();
     for i in 0..worker_count {
@@ -288,13 +355,14 @@ pub async fn sync_files_streaming(
     transport: Arc<dyn Transport>,
     max_workers: usize,
     on_file: Option<FileProgress>,
+    feedback: Option<Arc<dyn PeerFeedback>>,
 ) -> Result<SyncReport> {
     let needed = xite.files_needed();
     if needed.is_empty() {
         return Ok(SyncReport::default());
     }
     let max_workers = scale_workers(max_workers, needed.len()).max(1);
-    let ctx = SyncCtx::new(needed, xite, transport, on_file);
+    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut spares: VecDeque<PeerAddr> = VecDeque::new();
     let mut join = tokio::task::JoinSet::new();
