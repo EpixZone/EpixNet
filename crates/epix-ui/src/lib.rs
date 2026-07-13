@@ -670,20 +670,19 @@ async fn serve_wallet(State(ctx): State<Ctx>, Path(path): Path<String>) -> Respo
 /// Serve the wrapper page for a xite (`GET /{address}/`).
 /// The page shown in place of a blocked site (ContentFilter).
 fn blocklisted_html(address: &str, reason: &str) -> String {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let reason_html = if reason.is_empty() {
         String::new()
     } else {
-        format!("<p>Reason: {}</p>", esc(reason))
+        format!("<p>Reason: {}</p>", html_escape(reason))
     };
-    format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>Site blocked</title>\
-         <meta name='viewport' content='width=device-width, initial-scale=1'></head>\
-         <body style='font-family:Inter,-apple-system,Segoe UI,Roboto,sans-serif;background:#09090A;color:#F6F6F9;text-align:center;margin:0;padding:15vh 24px 0'>\
-         <h1 style='font-size:24px;font-weight:600'>This site is blocked</h1>\
-         <p style='color:#ABABB5;overflow-wrap:anywhere'>{}</p>{}</body></html>",
-        esc(address),
-        reason_html,
+    status_page_html(
+        "Site blocked",
+        "This site is blocked",
+        &format!(
+            "<p style='color:#ABABB5;overflow-wrap:anywhere'>{}</p>{}",
+            html_escape(address),
+            reason_html,
+        ),
     )
 }
 
@@ -691,15 +690,27 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
 /// does not already serve. Distinct from the block page: nothing is wrong with
 /// the xite, this node just does not add new ones.
 fn no_new_sites_html(requested: &str) -> String {
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    status_page_html(
+        "New xites disabled",
+        "New xites are disabled",
+        &format!(
+            "<p style='color:#ABABB5;overflow-wrap:anywhere'>This node does not add new xites. \
+             It only serves the ones it already has.</p>\
+             <p style='color:#6B6B76;overflow-wrap:anywhere;font-size:13px'>{}</p>",
+            html_escape(requested),
+        ),
+    )
+}
+
+/// The dark full-page shell shared by the standalone status pages (blocked /
+/// new-xites-disabled): a centered heading with `body_html` (already-escaped
+/// markup) beneath it.
+fn status_page_html(title: &str, heading: &str, body_html: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset='utf-8'><title>New xites disabled</title>\
+        "<!doctype html><html><head><meta charset='utf-8'><title>{title}</title>\
          <meta name='viewport' content='width=device-width, initial-scale=1'></head>\
          <body style='font-family:Inter,-apple-system,Segoe UI,Roboto,sans-serif;background:#09090A;color:#F6F6F9;text-align:center;margin:0;padding:15vh 24px 0'>\
-         <h1 style='font-size:24px;font-weight:600'>New xites are disabled</h1>\
-         <p style='color:#ABABB5;overflow-wrap:anywhere'>This node does not add new xites. It only serves the ones it already has.</p>\
-         <p style='color:#6B6B76;overflow-wrap:anywhere;font-size:13px'>{}</p></body></html>",
-        esc(requested),
+         <h1 style='font-size:24px;font-weight:600'>{heading}</h1>{body_html}</body></html>"
     )
 }
 
