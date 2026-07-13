@@ -59,6 +59,18 @@ impl PeerAddr {
         }
     }
 
+    /// Whether this peer rides a slow overlay network (Tor onion, I2P, or the
+    /// Reticulum mesh) rather than a direct clearnet TCP socket. Overlay dials
+    /// and transfers need far more generous timeouts: a Tor circuit + onion
+    /// rendezvous alone can take tens of seconds, and multi-hop bandwidth is a
+    /// fraction of clearnet.
+    pub fn is_overlay(&self) -> bool {
+        matches!(
+            self,
+            PeerAddr::Onion { .. } | PeerAddr::I2p { .. } | PeerAddr::Rns(_)
+        )
+    }
+
     /// The I2P destination host (`<b32>.i2p`) yosemite's SAM connect expects,
     /// or None for non-I2P peers.
     pub fn i2p_dest(&self) -> Option<String> {
