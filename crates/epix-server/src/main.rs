@@ -13,6 +13,11 @@ use epix_node::{NodeOptions, DEFAULT_UI_ADDR};
 /// Lite (CC-BY-4.0), shipped gzipped and expanded into the data dir at runtime.
 const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
 
+/// The xite opened when no target is given on the command line: the dashboard.
+/// A bech32 address (not the `dashboard.epix` name) so boot never depends on
+/// chain name resolution being reachable.
+const DEFAULT_DASHBOARD: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+
 /// The UI bind address: `EPIX_UI_ADDR` if set, else the default loopback bind.
 fn ui_bind() -> String {
     std::env::var("EPIX_UI_ADDR")
@@ -35,8 +40,8 @@ async fn main() {
     }
 
     // Accept a raw `epix1…` address, a `.epix` name, or an `epix://…` deep link
-    // (from the OS handing off a clicked link). Default to the dashboard.
-    let raw = std::env::args().nth(1).unwrap_or_else(|| "dashboard.epix".to_string());
+    // (from the OS handing off a clicked link). Default to the dashboard xite.
+    let raw = cli.first().cloned().unwrap_or_else(|| DEFAULT_DASHBOARD.to_string());
     let target = epix_node::parse_target(&raw);
 
     // Headless mode (`EPIX_HEADLESS=1`): serve the node but don't open a browser

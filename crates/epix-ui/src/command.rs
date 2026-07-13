@@ -1002,13 +1002,21 @@ impl WsCommand for SiteClone {
             .or_else(|| p.as_array().and_then(|a| a.get(2)))
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // A `target_address` is a source-code upgrade of an existing site, not a
+        // brand-new one; only the new-site path navigates the browser (matching
+        // EpixNet's `cbSiteClone`, which redirects only when target is unset).
+        let is_new = target.is_none();
         let address = s.state.clone_xite(&source, &root, target).await?;
-        // The wrapper follows this to the new site, like EpixNet's redirect.
-        s.state.push_notification(
-            "done",
-            &format!("Site cloned: <a href=\"/{address}/\">open it</a>"),
-            8000,
-        );
+        if is_new {
+            // Forward the wrapper to the freshly created site, like EpixNet's
+            // `self.cmd("redirect", "/<new_address>")`. The redirect is routed to
+            // the source site so it reaches that site's wrapper connection (the
+            // one that handles wrapper commands), not just the app WS that issued
+            // this command.
+            s.state.push_redirect(&source, &format!("/{address}/"));
+        } else {
+            s.state.push_notification("done", "Site source code upgraded!", 8000);
+        }
         Ok(json!({ "address": address }))
     }
 }

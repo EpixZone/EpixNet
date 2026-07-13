@@ -92,8 +92,8 @@ impl WsCommand for SidebarGetPeers {
     }
 
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        s.address()?; // globe is per-site; require a bound xite
-        let globe_data = s.state.peer_globe_data().await;
+        let address = s.address()?; // globe is per-site; require a bound xite
+        let globe_data = s.state.peer_globe_data(address).await;
         Ok(Value::Array(globe_data.into_iter().map(|f| json!(f)).collect()))
     }
 }

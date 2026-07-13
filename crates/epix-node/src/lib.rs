@@ -181,17 +181,33 @@ pub async fn boot(
     opts: NodeOptions,
 ) -> Result<(UiServer, RunningNode), String> {
     let (address, display, _from_cache) = resolve_target(&opts.data_root, &opts.target).await;
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
     let data_dir = opts.data_root.join("data").join(&address);
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
 
-    let trackers = default_trackers();
-    let (content, bytes_recv) =
-        clone_xite(&address, &data_dir, transport.clone(), &trackers).await?;
+    // Load the launch xite from disk only - the UI server must always come up,
+    // never blocking startup on a download (EpixNet's model). Three cases:
+    //   - a verified content.json loads normally;
+    //   - a content.json on disk that does not verify (authored, edited, or not
+    //     yet signed for this address) is parsed and served as-is - a signature
+    //     is only required when fetching from peers, not for local content;
+    //   - nothing on disk leaves `content` None, so the xite registers empty and
+    //     downloads on demand when first opened, showing the wrapper's
+    //     "Searching for peers" screen.
+    let content = match Address::parse(address.clone()) {
+        Ok(addr) => {
+            let mut xite = Xite::new(addr, XiteStorage::new(&data_dir));
+            let _ = xite.load_content(); // verified path: sets content when valid
+            if xite.content.is_none() {
+                xite.load_content_local(); // local unsigned/edited copy: serve as-is
+            }
+            xite.content.clone()
+        }
+        Err(_) => None,
+    };
 
-    let running = serve(opts, address, display, data_dir, content, bytes_recv).await?;
+    let running = serve(opts, address, display, data_dir, content, 0).await?;
     Ok(running)
 }
 
@@ -237,23 +253,11 @@ pub async fn run(opts: NodeOptions) -> Result<(), String> {
 
 /// Clone a xite into `data_dir` from the network (skipping the fetch if it is
 /// already complete on disk): discover peers, fetch + verify content.json, and
-/// sync every file. Returns the verified content and the bytes downloaded.
-/// Shared by initial boot and the on-demand resolver.
-async fn clone_xite(
-    address: &str,
-    data_dir: &std::path::Path,
-    transport: Arc<dyn Transport>,
-    trackers: &[epix_xite::Tracker],
-) -> Result<(Option<serde_json::Value>, u64), String> {
-    clone_xite_with_progress(address, data_dir, transport, trackers, None)
-        .await
-        .map(|(content, bytes, _)| (content, bytes))
-}
-
-/// [`clone_xite`], pushing wrapper loading-screen events (`peers_added`,
+/// sync every file. Pushes wrapper loading-screen events (`peers_added`,
 /// `file_done` for content.json with the pending-file counts) to `progress`
 /// as the clone advances - the on-demand path, where a browser is watching
-/// the loading screen.
+/// the loading screen. Used by the on-demand resolver (initial boot no longer
+/// blocks on a download; it serves from disk and lets this run on first open).
 ///
 /// Discovery and download run concurrently: every tracker announce and the
 /// DHT lookup stream discovered peers into a channel, content.json is raced
