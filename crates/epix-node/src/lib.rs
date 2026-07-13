@@ -915,7 +915,11 @@ async fn fetch_content(
     peer: PeerAddr,
     address: String,
 ) -> Option<Vec<u8>> {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let budget = std::time::Duration::from_secs(match peer {
+        PeerAddr::Onion { .. } | PeerAddr::I2p { .. } => 45,
+        _ => 10,
+    });
+    tokio::time::timeout(budget, async {
         let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
         conn.handshake().await.ok()?;
         conn.get_file(&address, "content.json").await.ok()
@@ -1013,7 +1017,7 @@ impl epix_ui::ContentSyncer for OnDemand {
         sync_included_content(
             &xite,
             &peers,
-            self.transport.clone(),
+            self.live_transport().await,
             Some(&self.state),
             address,
         )
@@ -1022,6 +1026,15 @@ impl epix_ui::ContentSyncer for OnDemand {
 }
 
 impl OnDemand {
+    /// The node's live peer transport - the Tor/I2P/mesh-upgraded one the
+    /// runtime installs on the state once those overlays come up, not the plain
+    /// TCP transport captured at boot. Onion/I2P peers fail instantly through
+    /// the captured one, so on-demand clones must dial through the live
+    /// transport or an onion-only seeder is never reachable.
+    async fn live_transport(&self) -> Arc<dyn Transport> {
+        self.state.transport().await.unwrap_or_else(|| self.transport.clone())
+    }
+
     async fn do_ensure(&self, host: &str) -> Result<(), String> {
         // Resolve the name to a xite address (unless it's already one): the
         // on-disk cache first; the chain only on a miss or an expired entry.
@@ -1077,7 +1090,7 @@ impl OnDemand {
             let cloned = clone_xite_with_progress(
                 &address,
                 &data_dir,
-                self.transport.clone(),
+                self.live_transport().await,
                 &trackers,
                 Some(&self.state),
             )
