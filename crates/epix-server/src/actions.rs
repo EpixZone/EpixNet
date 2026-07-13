@@ -148,59 +148,58 @@ async fn dispatch(
             Ok(())
         }
 
-        // --- site admin (live via the admin socket, or offline on the data dir)
-        "siteList" => {
-            if let Some(reply) = admin_call(data_root, "siteList", serde_json::json!({})).await? {
-                let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
-                for s in sites {
-                    let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("?");
-                    let peers = s.get("peers").and_then(|v| v.as_i64()).unwrap_or(0);
-                    println!("{addr}  ({peers} peers)");
-                }
-                println!("{} site(s) [live]", sites.len());
+        // --- site admin: one path, run live via the admin socket when the node
+        // is up, else the offline data-dir equivalent. `siteList` takes no arg;
+        // the others take an address.
+        "siteList" | "siteDelete" | "siteDownload" => {
+            let address = if action == "siteList" {
+                String::new()
             } else {
-                let state = open_state(data_root, version).await;
-                let sites = state.xite_addresses().await;
-                for addr in &sites {
-                    println!("{addr}");
+                let [a] = args else { return Err(format!("usage: {action} <address>")) };
+                a.clone()
+            };
+            // The live command name and its params (siteDownload maps to siteAdd).
+            let (live_cmd, params) = match action {
+                "siteList" => ("siteList", serde_json::json!({})),
+                "siteDelete" => ("siteDelete", serde_json::json!({ "address": address })),
+                _ => ("siteAdd", serde_json::json!({ "address": address })),
+            };
+            match admin_call(data_root, live_cmd, params).await? {
+                Some(reply) => match action {
+                    "siteList" => {
+                        let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
+                        for s in sites {
+                            let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("?");
+                            let peers = s.get("peers").and_then(|v| v.as_i64()).unwrap_or(0);
+                            println!("{addr}  ({peers} peers)");
+                        }
+                        println!("{} site(s) [live]", sites.len());
+                    }
+                    "siteDelete" => println!("Deleted {address} [live]"),
+                    _ => println!("Downloading {address} [live] - watch the node log"),
+                },
+                None => {
+                    let state = open_state(data_root, version).await;
+                    match action {
+                        "siteList" => {
+                            let sites = state.xite_addresses().await;
+                            for addr in &sites {
+                                println!("{addr}");
+                            }
+                            println!("{} site(s) [offline]", sites.len());
+                        }
+                        "siteDelete" if !state.remove_xite(&address).await => {
+                            return Err(format!("Unknown site: {address}"));
+                        }
+                        "siteDelete" => println!("Deleted {address} [offline]"),
+                        // No network stack offline: register it so the node
+                        // clones it on the next start.
+                        _ => {
+                            state.register_for_download(&address).await?;
+                            println!("Queued {address}; downloads on next start [offline]");
+                        }
+                    }
                 }
-                println!("{} site(s) [offline]", sites.len());
-            }
-            Ok(())
-        }
-        "siteDelete" => {
-            let [address] = args else { return Err("usage: siteDelete <address>".into()) };
-            if let Some(reply) =
-                admin_call(data_root, "siteDelete", serde_json::json!({ "address": address })).await?
-            {
-                if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
-                    return Err(err.to_string());
-                }
-                println!("Deleted {address} [live]");
-            } else {
-                let state = open_state(data_root, version).await;
-                if !state.remove_xite(address).await {
-                    return Err(format!("Unknown site: {address}"));
-                }
-                println!("Deleted {address} [offline]");
-            }
-            Ok(())
-        }
-        "siteDownload" => {
-            let [address] = args else { return Err("usage: siteDownload <address>".into()) };
-            if let Some(reply) =
-                admin_call(data_root, "siteAdd", serde_json::json!({ "address": address })).await?
-            {
-                if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
-                    return Err(err.to_string());
-                }
-                println!("Downloading {address} [live] - watch the node log for progress");
-            } else {
-                // Offline: no network stack here, so register it and let the
-                // node clone it on the next start.
-                let state = open_state(data_root, version).await;
-                state.register_for_download(address).await?;
-                println!("Queued {address}; it will download when the node next starts [offline]");
             }
             Ok(())
         }
@@ -316,10 +315,16 @@ async fn admin_call(
     BufReader::new(r).read_line(&mut line).await.map_err(|e| e.to_string())?;
     let reply: serde_json::Value =
         serde_json::from_str(line.trim()).map_err(|e| format!("bad admin reply: {e}"))?;
+    // A transport/protocol error, or the EpixNet convention where a command
+    // failure comes back as a result of `{"error": …}`.
     if let Some(err) = reply.get("error").and_then(|v| v.as_str()) {
         return Err(err.to_string());
     }
-    Ok(Some(reply.get("result").cloned().unwrap_or(serde_json::Value::Null)))
+    let result = reply.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(Some(result))
 }
 
 /// Open the node state offline: data dir + user + the served-site registry.
