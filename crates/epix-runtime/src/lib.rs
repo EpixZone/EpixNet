@@ -788,7 +788,7 @@ async fn tor_loop(
     // feed its streams to the same handler the TCP listener uses.
     if let Some(port) = fileserver_port {
         match tor.launch_onion_service("epix", port) {
-            Ok((_svc, onion_host, mut inbound)) => {
+            Ok((svc, onion_host, mut inbound)) => {
                 state
                     .log("INFO", format!("Tor: onion service up at {onion_host}.onion:{port}"))
                     .await;
@@ -796,6 +796,14 @@ async fn tor_loop(
                 let handler = handler.clone();
                 let (version, rev) = epix_protocol::PeerServer::new(handler.clone()).banner();
                 tokio::spawn(async move {
+                    // The RunningOnionService handle keeps the service alive:
+                    // dropping it decommissions the service, so its descriptor
+                    // is never published and no peer can ever reach us. Hold it
+                    // for as long as we accept inbound streams (the process
+                    // lifetime) - previously it was dropped right here at the
+                    // end of the match arm, silently killing the service
+                    // milliseconds after the "onion service up" log line.
+                    let _svc = svc;
                     while let Some(stream) = inbound.recv().await {
                         let handler = handler.clone() as Arc<dyn RequestHandler>;
                         let version = version.clone();
