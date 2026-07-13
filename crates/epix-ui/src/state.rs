@@ -5215,6 +5215,7 @@ impl AppState {
         let fileserver_ip = if tor_status == "Always" { "127.0.0.1" } else { "*" };
         let rev = self.rev().await;
         let ui_port = self.ui_port().await;
+        let (epix_browser, browser_tor_clearnet) = self.browser_settings().await;
         json!({
             "version": self.version,
             "rev": rev,
@@ -5229,6 +5230,8 @@ impl AppState {
             "tor_has_meek_bridges": false,
             "tor_use_bridges": false,
             "network_status": self.network_status().await,
+            "epix_browser": epix_browser,
+            "browser_tor_clearnet": browser_tor_clearnet,
             "ui_ip": "127.0.0.1",
             "ui_port": ui_port,
             "debug": false,
@@ -5301,6 +5304,26 @@ impl AppState {
                 "address": i2p_b32.map(|b| format!("{b}.i2p")),
             },
         })
+    }
+
+    /// Whether the node runs under the Epix Browser (its native host writes
+    /// `browser-settings.json` next to the node data) and whether that browser
+    /// routes clearnet (non-`.epix`) traffic through Tor. Returns
+    /// `(epix_browser, tor_clearnet)`. `tor_clearnet` defaults on (opt-out),
+    /// matching epix-nmh's `Settings::tor_clearnet`. The dashboard uses this to
+    /// drop the "your browser is not safe" warning in Tor-always mode when the
+    /// browser already tunnels clearnet through Tor.
+    pub async fn browser_settings(&self) -> (bool, bool) {
+        let Some(root) = &self.data_root else { return (false, true) };
+        match std::fs::read(root.join("browser-settings.json")) {
+            Ok(bytes) => {
+                let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let tor_clearnet =
+                    v.get("tor_clearnet").and_then(|b| b.as_bool()).unwrap_or(true);
+                (true, tor_clearnet)
+            }
+            Err(_) => (false, true),
+        }
     }
 
     /// Push the latest `serverInfo` (`setServerInfo`) on the `serverChanged`
@@ -7672,6 +7695,24 @@ mod tests {
             "sign": "should-be-stripped",
             "signs": {"1abc": "x"},
         })
+    }
+
+    #[tokio::test]
+    async fn browser_settings_reads_epix_browser_and_tor_clearnet() {
+        let dir = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let path = dir.path().join("browser-settings.json");
+
+        // No file: not running under Epix Browser; tor_clearnet defaults on.
+        assert_eq!(state.browser_settings().await, (false, true));
+
+        // File present with the checkbox off: Epix Browser, clearnet NOT via Tor.
+        std::fs::write(&path, br#"{"tor_clearnet": false}"#).unwrap();
+        assert_eq!(state.browser_settings().await, (true, false));
+
+        // File present without the key: default on (opt-out).
+        std::fs::write(&path, br#"{"clearnet_allow": {}}"#).unwrap();
+        assert_eq!(state.browser_settings().await, (true, true));
     }
 
     #[tokio::test]
