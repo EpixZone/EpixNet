@@ -5117,14 +5117,20 @@ impl AppState {
         let mut xite = Xite::new(addr, storage.clone());
         match xite.load_content() {
             // Authoritative content (a valid signature for this address): the
-            // core is complete only when every declared file is present at its
-            // signed size, so an interrupted peer download still resumes.
+            // core is complete when every declared file is PRESENT on disk.
+            // Presence is enough: workers only write verified bytes, so a file
+            // that exists but differs from its signed size can only be a local
+            // edit made after the last sign - and local changes serve as-is
+            // (the signature only gates content downloaded from peers).
+            // Requiring the signed size here turned an edited-but-servable
+            // xite into a page that hangs behind the html gate, waiting on a
+            // "download" no peer can ever satisfy.
             Ok(true) => xite.files().iter().all(|f| {
                 storage
                     .path(&f.inner_path)
                     .ok()
                     .and_then(|p| std::fs::metadata(p).ok())
-                    .is_some_and(|m| m.len() as i64 == f.size)
+                    .is_some()
             }),
             // A content.json is on disk but does not verify for this address, or
             // none is stored yet. `load_content_local` is true only in the first
