@@ -156,4 +156,29 @@ mod tests {
         );
         assert!(xite.set_content(&content_bytes).is_err());
     }
+
+    #[test]
+    fn load_content_local_serves_unverified_on_disk() {
+        // A content.json signed for one address, stored under a DIFFERENT one
+        // (e.g. files copied into a new site's dir but not re-signed yet). The
+        // verifying load rejects it; the local load parses it so the on-disk
+        // copy still serves - a signature is only required from peers.
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let (signed_for, content_bytes) = signed_content(priv_hex, json!({}));
+        let other = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        assert_ne!(signed_for, other);
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("content.json", &content_bytes).unwrap();
+
+        let mut xite = Xite::new(Address::parse(other.to_string()).unwrap(), storage);
+        // Verifying load fails against the wrong address, leaving content unset.
+        assert!(xite.load_content().is_err());
+        assert!(xite.content.is_none());
+        // Lenient local load parses it so the files can be served (and signed).
+        assert!(xite.load_content_local());
+        assert!(xite.content.is_some());
+        assert_eq!(xite.content.as_ref().unwrap()["address"], signed_for);
+    }
 }

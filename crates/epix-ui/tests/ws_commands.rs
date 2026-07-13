@@ -184,12 +184,28 @@ async fn site_clone_copies_template_not_live_data() {
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address.clone()));
 
+    // Watch for the wrapper `redirect` the dashboard's "Create new, empty site"
+    // relies on to forward the browser to the freshly cloned site.
+    let mut events = state.subscribe_events();
+
     let res = registry
         .dispatch(&session, "siteClone", &json!({ "address": address }), WRAPPER_ID)
         .await
         .unwrap();
     let new_address = res["address"].as_str().expect("new address").to_string();
     assert_ne!(new_address, address);
+
+    // A `redirect` to `/<new_address>/`, routed to the source site so it reaches
+    // that site's wrapper connection (EpixNet's `self.cmd("redirect", ...)`).
+    let redirect = std::iter::from_fn(|| events.try_recv().ok())
+        .find(|ev| ev.payload.contains("\"redirect\""))
+        .expect("siteClone emits a redirect event");
+    assert_eq!(redirect.target.as_deref(), Some(address.as_str()));
+    assert!(
+        redirect.payload.contains(&format!("/{new_address}/")),
+        "redirect targets the new site: {}",
+        redirect.payload
+    );
 
     let dir = root.path().join("data").join(&new_address);
     // The -default tree replaced the live one: the clone starts clean.
@@ -209,4 +225,48 @@ async fn site_clone_copies_template_not_live_data() {
     // The clone is served and owned; its own privatekey is saved.
     assert!(state.has_xite(&new_address).await);
     assert!(state.site_privatekey(&new_address).await.is_some());
+}
+
+/// The dashboard's "Create new, empty site" clones with a `template-new` root.
+/// That directory holds only page files (an index.html), never its own
+/// content.json, so the clone must fall back to the source's ROOT content.json
+/// as the template - otherwise it fails with "Source has no content.json".
+#[tokio::test]
+async fn site_clone_from_template_root_uses_root_content() {
+    let (state, root, address, _key) = state_with_site().await;
+    // A blank starter page under a `template-new/` root, with NO content.json
+    // in that directory (mirrors the real dashboard xite).
+    let src_dir = root.path().join("data").join(&address);
+    XiteStorage::new(&src_dir)
+        .write("template-new/index.html", b"<h1>blank starter</h1>")
+        .unwrap();
+    assert!(!src_dir.join("template-new/content.json").exists());
+
+    let registry = CommandRegistry::with_defaults();
+    let session = WsSession::new(state.clone(), Some(address.clone()));
+
+    let res = registry
+        .dispatch(
+            &session,
+            "siteClone",
+            &json!([address, "template-new"]),
+            WRAPPER_ID,
+        )
+        .await
+        .expect("clone from template-new root succeeds");
+    let new_address = res["address"].as_str().expect("new address").to_string();
+    assert_ne!(new_address, address);
+
+    let dir = root.path().join("data").join(&new_address);
+    // The template-new page landed de-prefixed as the new site's index.html.
+    let index = std::fs::read_to_string(dir.join("index.html")).unwrap();
+    assert_eq!(index, "<h1>blank starter</h1>");
+
+    let content: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("content.json")).unwrap()).unwrap();
+    assert_eq!(content["address"], new_address);
+    assert_eq!(content["clone_root"], "template-new");
+    // A `template-*` root gets the generic title, not "My <source title>".
+    assert_eq!(content["title"], "My New Epix Site");
+    assert!(epix_content::verify_signer(&content, &new_address), "signature verifies");
 }

@@ -8,7 +8,7 @@ pub mod canonical;
 pub mod diff;
 pub mod verify;
 
-pub use canonical::dumps_sorted;
+pub use canonical::{dumps_content, dumps_sorted};
 pub use diff::{patch, DiffAction};
 pub use verify::{verify_content_file, VerifyContext, VerifyError};
 use epix_core::{Error, Result};
@@ -83,6 +83,36 @@ mod tests {
         assert_eq!(dumps_sorted(&json!({"b": 1, "a": 2})), r#"{"a": 2, "b": 1}"#);
         assert_eq!(dumps_sorted(&json!([1, 2, 3])), "[1, 2, 3]");
         assert_eq!(dumps_sorted(&json!({})), "{}");
+    }
+
+    /// The on-disk format matches Python EpixNet's `helper.jsonDumps` exactly.
+    /// The expected string below is that function's verbatim output for this
+    /// value (`json.dumps(indent=1, sort_keys=True)` + its compaction passes):
+    /// multi-line file entries, the one-entry `signs` dict on a single line, a
+    /// flat signers list on a single line.
+    #[test]
+    fn dumps_content_matches_python_json_dumps() {
+        let content = json!({
+            "address": "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g",
+            "title": "Dashboard",
+            "modified": 1783901827,
+            "inner_path": "content.json",
+            "postmessage_nonce_security": true,
+            "signs_required": 1,
+            "ignore": "(js/all\\.js|\\.git)",
+            "files": {
+                "index.html": {"sha512": "5b6a2c352af0e4a85a55fffa42fa1e2463", "size": 3919},
+                "css/all.css": {"sha512": "aabbccddee0011223344556677889900aa", "size": 83622},
+            },
+            "includes": {
+                "data/users/content.json": {"signers": ["epix1abc", "epix1def"], "signers_required": 1}
+            },
+            "optional": "(data/.*|.*\\.zip)",
+            "signers_sign": "GzDAK33cGtqcui0MibSu9pX",
+            "signs": {"epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g": "HMPzO44Ztew"},
+        });
+        let expected = "{\n \"address\": \"epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g\",\n \"files\": {\n  \"css/all.css\": {\n   \"sha512\": \"aabbccddee0011223344556677889900aa\",\n   \"size\": 83622\n  },\n  \"index.html\": {\n   \"sha512\": \"5b6a2c352af0e4a85a55fffa42fa1e2463\",\n   \"size\": 3919\n  }\n },\n \"ignore\": \"(js/all\\\\.js|\\\\.git)\",\n \"includes\": {\n  \"data/users/content.json\": {\n   \"signers\": [\"epix1abc\",\"epix1def\"],\n   \"signers_required\": 1\n  }\n },\n \"inner_path\": \"content.json\",\n \"modified\": 1783901827,\n \"optional\": \"(data/.*|.*\\\\.zip)\",\n \"postmessage_nonce_security\": true,\n \"signers_sign\": \"GzDAK33cGtqcui0MibSu9pX\",\n \"signs\": {\"epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g\": \"HMPzO44Ztew\"},\n \"signs_required\": 1,\n \"title\": \"Dashboard\"\n}";
+        assert_eq!(dumps_content(&content), expected);
     }
 
     #[test]

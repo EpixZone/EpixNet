@@ -479,8 +479,13 @@ pub fn builtin_plugins() -> Vec<&'static str> {
     plugins
 }
 
-async fn health() -> &'static str {
-    "Epix UI server"
+/// Falls back to the liveness string only if no xite is served yet. A temporary
+/// redirect (never cached) so it always tracks the current homepage.
+async fn health(State(ctx): State<Ctx>) -> Response {
+    if let Some(home) = ctx.state.homepage().await {
+        return Redirect::temporary(&format!("/{home}/")).into_response();
+    }
+    "Epix UI server".into_response()
 }
 
 /// `GET /EpixNet-Internal/Status` - a small JSON status the browser's native

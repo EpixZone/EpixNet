@@ -100,6 +100,20 @@ impl Xite {
         Ok(true)
     }
 
+    /// Parse a stored `content.json` for serving the LOCAL copy, WITHOUT
+    /// signature verification. Returns `false` if none is stored or it is not
+    /// valid JSON. A signature is only required when fetching content from peers
+    /// (see [`Self::set_content`]); content already on disk - a site the
+    /// operator authored, edited, or has not signed yet - is served as-is, so
+    /// its files can be opened and then signed. Never call this on bytes
+    /// received from a peer.
+    pub fn load_content_local(&mut self) -> bool {
+        let Ok(bytes) = self.storage.read("content.json") else { return false };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { return false };
+        self.content = Some(json);
+        true
+    }
+
     /// Verify + store the root `content.json` with no size limit. See
     /// [`Self::set_content_limited`].
     pub fn set_content(&mut self, bytes: &[u8]) -> Result<()> {
@@ -503,7 +517,9 @@ impl Xite {
         }
 
         epix_content::sign(&mut content, privatekey)?;
-        let bytes = serde_json::to_vec(&content).map_err(Error::from)?;
+        // Python-EpixNet's on-disk format (helper.jsonDumps): human-readable
+        // and diff-friendly; the signature covers the canonical form, not this.
+        let bytes = epix_content::dumps_content(&content).into_bytes();
         self.storage.write("content.json", &bytes)?;
         self.content = Some(content);
         Ok(())
@@ -583,7 +599,8 @@ impl Xite {
         map.insert("inner_path".into(), json!(inner_path));
 
         epix_content::sign(&mut content, privatekey)?;
-        let bytes = serde_json::to_vec(&content).map_err(Error::from)?;
+        // Python-EpixNet's on-disk format (helper.jsonDumps), like the root.
+        let bytes = epix_content::dumps_content(&content).into_bytes();
         // add_content verifies (signer allowed, cert valid, sizes) and stores.
         self.add_content(inner_path, &bytes, xid_map)?;
         Ok(content)

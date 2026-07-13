@@ -2333,11 +2333,15 @@ impl AppState {
             }
         };
 
-        // The template content.json: `content.json-default` wins over the live
-        // one (template sites ship their clean copy there).
+        // The template content.json: `<root>/content.json-default` wins (template
+        // sites ship their clean copy there); otherwise fall back to the ROOT
+        // content.json, NOT `<root>/content.json`. EpixNet's `Site.clone` does the
+        // same - a clone root like `template-new/` holds only page files
+        // (index.html), never its own content.json, so keying off the sub-path
+        // there fails with "Source has no content.json".
         let template = src_storage
             .read(&format!("{prefix}content.json-default"))
-            .or_else(|_| src_storage.read(&format!("{prefix}content.json")))
+            .or_else(|_| src_storage.read("content.json"))
             .map_err(|_| "Source has no content.json".to_string())?;
         let mut content: Value =
             serde_json::from_slice(&template).map_err(|_| "Invalid template content.json")?;
@@ -2345,8 +2349,15 @@ impl AppState {
         for key in ["domain", "xid_name", "signs", "signers_sign", "address_index", "inner_path"] {
             map.remove(key);
         }
-        let title = map.get("title").and_then(|v| v.as_str()).unwrap_or("New Epix Site");
-        map.insert("title".into(), json!(format!("My {title}")));
+        // A `template-*` clone root is a blank starter, so it gets a generic
+        // title rather than "My <source title>" (EpixNet's `Site.clone`).
+        let new_title = if root.starts_with("template-") {
+            "My New Epix Site".to_string()
+        } else {
+            let title = map.get("title").and_then(|v| v.as_str()).unwrap_or("New Epix Site");
+            format!("My {title}")
+        };
+        map.insert("title".into(), json!(new_title));
         map.insert("cloned_from".into(), json!(source));
         if !root.is_empty() {
             map.insert("clone_root".into(), json!(root));
@@ -2394,7 +2405,7 @@ impl AppState {
             let _ = dst_storage.write("index.html", b"<h1>My new site</h1>");
         }
         dst_storage
-            .write("content.json", &serde_json::to_vec(&content).map_err(|e| e.to_string())?)
+            .write("content.json", epix_content::dumps_content(&content).as_bytes())
             .map_err(|e| e.to_string())?;
 
         // Serve it, sign it as the new owner, and mark it ours.
@@ -2427,7 +2438,7 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         let content = json!({ "address": address, "title": "My new xite", "files": {} });
         storage
-            .write("content.json", &serde_json::to_vec(&content).map_err(|e| e.to_string())?)
+            .write("content.json", epix_content::dumps_content(&content).as_bytes())
             .map_err(|e| e.to_string())?;
         self.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
         self.sign_xite(&address, &privatekey).await?;
@@ -2837,6 +2848,22 @@ impl AppState {
             return Ok(false);
         }
         let view = self.xite_view(address).await?;
+        // Never resync a local working copy: a content.json that does not verify
+        // for the address it is served under (authored here, edited, or signed
+        // for a different address and not re-signed yet) is authoritative
+        // locally. Its `address` field would point the fetch below at a foreign
+        // xite, and we'd overwrite the local files with that (older) content -
+        // exactly the "loads the old dashboard after a minute" symptom. A
+        // signature is only required for content we choose to pull from peers.
+        {
+            let mut probe = Xite::new(
+                Address::parse(address.to_string()).map_err(|e| e.to_string())?,
+                view.storage.clone(),
+            );
+            if !probe.load_content().unwrap_or(false) {
+                return Ok(false);
+            }
+        }
         let local_modified = view
             .content
             .as_ref()
@@ -3869,7 +3896,7 @@ impl AppState {
                 fo.insert(upload.inner_path.clone(), entry);
             }
         }
-        let bytes = serde_json::to_vec_pretty(&content).map_err(|e| e.to_string())?;
+        let bytes = epix_content::dumps_content(&content).into_bytes();
         storage.write("content.json", &bytes).map_err(|e| e.to_string())?;
         // Refresh our in-memory view + advertise the file.
         self.update_content(&upload.address, Some(content)).await;
@@ -4170,22 +4197,52 @@ impl AppState {
     /// `chartGetPeerLocations` - geolocate every distinct clearnet peer IP we
     /// know across all served xites, for the dashboard's world map. Returns
     /// `[{lat, lon, city, country, ping}]`. Empty if no geolocation db is loaded.
+    /// Every geolocated peer the node knows, across all xites - the dashboard's
+    /// world map (`chartGetPeerLocations`).
     pub async fn peer_locations(&self) -> Vec<Value> {
+        self.peer_locations_impl(None).await
+    }
+
+    /// The geolocated peers of a single xite - the sidebar's per-site globe.
+    /// EpixNet's `getPeerLocations(self.site.peers)`: a xite with no peers gets
+    /// an empty globe rather than the whole node's peer set.
+    pub async fn site_peer_locations(&self, address: &str) -> Vec<Value> {
+        self.peer_locations_impl(Some(address)).await
+    }
+
+    /// Shared body: `only_site = None` pools every xite's peers (the global
+    /// world map); `Some(address)` restricts to that one xite (the sidebar
+    /// globe), so an unconnected site doesn't borrow other sites' dots.
+    async fn peer_locations_impl(&self, only_site: Option<&str>) -> Vec<Value> {
         let Some(geoip) = self.geoip.read().await.clone() else { return Vec::new() };
-        // Best ping seen per IP (ms), across xites.
+        // Best ping seen per IP (ms), across the selected xite(s).
         let mut pings: HashMap<std::net::IpAddr, Option<i64>> = HashMap::new();
-        for x in self.xites.read().await.values() {
-            for p in x.peers.peers() {
-                if let PeerAddr::Ip(sa) = &p.addr {
-                    pings.entry(sa.ip()).or_insert(None);
+        {
+            let xites = self.xites.read().await;
+            let selected: Vec<&ManagedXite> = match only_site {
+                Some(addr) => self.resolve_xite(&xites, addr).into_iter().collect(),
+                None => xites.values().collect(),
+            };
+            for x in selected {
+                for p in x.peers.peers() {
+                    if let PeerAddr::Ip(sa) = &p.addr {
+                        pings.entry(sa.ip()).or_insert(None);
+                    }
                 }
             }
         }
-        // Ping (ms) per connected clearnet peer, from the warm pool.
+        // Ping (ms) per connected clearnet peer, from the warm pool. For a single
+        // site, only annotate IPs that are actually this site's peers - the warm
+        // pool is node-wide, so folding all of it in would re-introduce other
+        // sites' dots.
         for addr in self.conn_pool.connected_addrs().await {
             if let PeerAddr::Ip(sa) = &addr {
+                let ip = sa.ip();
+                if only_site.is_some() && !pings.contains_key(&ip) {
+                    continue;
+                }
                 if let Some(ms) = self.conn_pool.ping_for(&addr).await {
-                    pings.insert(sa.ip(), Some(ms));
+                    pings.insert(ip, Some(ms));
                 }
             }
         }
@@ -4209,8 +4266,8 @@ impl AppState {
     /// Height is derived from ping (log-scaled around the average), matching
     /// EpixNet: connected peers rise with latency, unpinged peers sit slightly
     /// below the surface.
-    pub async fn peer_globe_data(&self) -> Vec<f64> {
-        let locs = self.peer_locations().await;
+    pub async fn peer_globe_data(&self, address: &str) -> Vec<f64> {
+        let locs = self.site_peer_locations(address).await;
         let pings: Vec<f64> =
             locs.iter().filter_map(|l| l["ping"].as_f64()).filter(|p| *p > 0.0).collect();
         let ping_avg =
@@ -4964,23 +5021,36 @@ impl AppState {
     /// (the file_status probe) - reading and SHA512ing a whole site per page
     /// load would make big sites expensive to open.
     pub async fn xite_core_complete(&self, address: &str) -> bool {
-        let (storage, canonical) = {
+        let storage = {
             let xites = self.xites.read().await;
             let Some(x) = self.resolve_xite(&xites, address) else { return false };
-            (x.storage.clone(), canonical_address(x.content.as_ref(), address))
+            x.storage.clone()
         };
-        let Ok(addr) = Address::parse(canonical) else { return false };
+        // Verify the on-disk content.json against the address the xite is SERVED
+        // under - not the address the content claims. A content.json that does
+        // not verify for this address (authored here, edited, or signed for a
+        // different address and not re-signed yet) is a LOCAL working copy.
+        let Ok(addr) = Address::parse(address.to_string()) else { return false };
         let mut xite = Xite::new(addr, storage.clone());
-        if !xite.load_content().unwrap_or(false) {
-            return false;
+        match xite.load_content() {
+            // Authoritative content (a valid signature for this address): the
+            // core is complete only when every declared file is present at its
+            // signed size, so an interrupted peer download still resumes.
+            Ok(true) => xite.files().iter().all(|f| {
+                storage
+                    .path(&f.inner_path)
+                    .ok()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .is_some_and(|m| m.len() as i64 == f.size)
+            }),
+            // A content.json is on disk but does not verify for this address, or
+            // none is stored yet. `load_content_local` is true only in the first
+            // case: a local copy, served as-is and never gated or auto-downloaded
+            // over (its files may differ from the stale content.json until it is
+            // re-signed - a signature is only required for content from peers).
+            // No content.json at all -> not complete -> download on demand.
+            _ => xite.load_content_local(),
         }
-        xite.files().iter().all(|f| {
-            storage
-                .path(&f.inner_path)
-                .ok()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .is_some_and(|m| m.len() as i64 == f.size)
-        })
     }
 
     /// Progressive serve during an on-demand clone: the state of one file of a
@@ -5773,9 +5843,8 @@ impl AppState {
                         json.get_mut("files_optional").and_then(|f| f.as_object_mut())
                     {
                         if map.remove(inner_path).is_some() {
-                            if let Ok(out) = serde_json::to_vec(&json) {
-                                let _ = storage.write("content.json", &out);
-                            }
+                            let out = epix_content::dumps_content(&json);
+                            let _ = storage.write("content.json", out.as_bytes());
                         }
                     }
                 }
