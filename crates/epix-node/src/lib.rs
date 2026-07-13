@@ -940,6 +940,10 @@ struct OnDemand {
     trackers: Vec<epix_xite::Tracker>,
     /// Names currently being cloned, so concurrent requests coalesce.
     in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Whether Tor is expected to come up (mode != Disable). Gates the
+    /// cold-start wait in `await_tor_ready`. Set once, after the Tor mode is
+    /// resolved in `serve`.
+    tor_expected: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1059,6 +1063,49 @@ impl OnDemand {
         self.state.transport().await.unwrap_or_else(|| self.transport.clone())
     }
 
+    /// Block (bounded) until the in-process Tor transport is installed, so a
+    /// cold-start clone of an onion-seeded site dials through Tor instead of
+    /// the plain TCP transport the node holds until Arti finishes bootstrapping.
+    ///
+    /// Fresh installs hit this hard, Windows worst of all: opening the
+    /// dashboard right after setup fired the clone while Tor was still
+    /// bootstrapping, every onion peer dial failed on the TCP-only transport,
+    /// and the loading screen dead-ended at "index.html download failed"
+    /// ("Peers found: 4" but none reachable). Once Tor is up (the steady
+    /// state) this returns at once, so only the first cold-start open waits.
+    ///
+    /// Bounded: if Tor fails or drags past the cap, fall through and let the
+    /// clone try over clearnet rather than block the page forever. "Disabled"
+    /// is not treated as terminal here - on a cold start the Tor loop may not
+    /// have flipped the status to "Bootstrapping" yet, and `tor_expected`
+    /// already told us it is coming.
+    async fn await_tor_ready(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.tor_expected.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.state.tor_status().await.0 {
+            return; // already up: no wait
+        }
+        self.state
+            .log(
+                "INFO",
+                "Waiting for Tor to bootstrap before cloning (onion-seeded \
+                 sites are unreachable until it is up)"
+                    .to_string(),
+            )
+            .await;
+        // ~2 minutes. Arti's cold bootstrap is ~10-40s, but a slow link (or a
+        // Windows machine fetching a fresh consensus) can take longer.
+        for _ in 0..240 {
+            let (up, status) = self.state.tor_status().await;
+            if up || status == "Failed" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     async fn do_ensure(&self, host: &str) -> Result<(), String> {
         // Resolve the name to a xite address (unless it's already one): the
         // on-disk cache first; the chain only on a miss or an expired entry.
@@ -1091,6 +1138,12 @@ impl OnDemand {
                     self.state.set_display(&address, host).await;
                 }
             }
+            // Onion-seeded sites are only reachable once Tor is up. On a cold
+            // start the plain TCP transport is still installed, so wait for the
+            // onion-capable transport before dialing - otherwise a fresh
+            // install's first open fails every peer and shows "index.html
+            // download failed". No-op once Tor is up (the steady state).
+            self.await_tor_ready().await;
             // Mark the download in flight: the html serving gate holds the
             // page document back until the core set is on disk.
             self.state.begin_clone(&address);
@@ -1253,11 +1306,12 @@ async fn serve(
         transport: transport.clone(),
         trackers: trackers.clone(),
         in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        tor_expected: std::sync::atomic::AtomicBool::new(false),
     });
     state.set_on_demand(on_demand.clone()).await;
     // The same component syncs included/user content for existing sites
     // (called by the resync loop, so EpixTalk-style posts stay fresh).
-    state.set_content_syncer(on_demand).await;
+    state.set_content_syncer(on_demand.clone()).await;
 
     state.add_transfer(&address, bytes_recv, 0).await;
     state.rebuild_merger_dbs().await;
@@ -1295,6 +1349,15 @@ async fn serve(
             .unwrap_or_else(|| "enable".to_string());
         epix_runtime::TorMode::parse(&configured)
     };
+
+    // Let the on-demand resolver know Tor is coming, so a cold-start clone
+    // waits for the onion-capable transport instead of failing every onion
+    // dial on the plain TCP transport the node holds until Arti bootstraps.
+    #[cfg(feature = "tor")]
+    on_demand.tor_expected.store(
+        tor_mode != epix_runtime::TorMode::Disable,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Privacy by default: turn the embedded I2P router on the first time a node
     // runs with no explicit `i2p` choice (persisted so the Config page shows it
