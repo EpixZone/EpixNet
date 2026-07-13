@@ -333,12 +333,7 @@ async fn announce_loop(
         // from previous runs, plus the runtime-contributed list (Syncronite's
         // live bootstrap) - re-read every pass, like EpixNet's loadTrackersFile
         // in its announce loop.
-        let mut all = trackers.clone();
-        for t in state.shared_trackers().await.into_iter().chain(state.extra_trackers().await) {
-            if !all.contains(&t) {
-                all.push(t);
-            }
-        }
+        let all = state.all_trackers(&trackers).await;
         if all.is_empty() {
             return;
         }
