@@ -25,6 +25,12 @@ tor-proto = "0.44"
 # we install `ring` explicitly before bootstrap (see `install_crypto_provider`).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 async-trait = "0.1"
+# Expanded-key signing for the tracker onion-ownership challenge. Built on
+# curve25519 directly: Arti stores hs identity keys as uniform reduced
+# scalars, which ed25519-dalek's hazmat ExpandedSecretKey would re-clamp
+# (silently swapping in a different key).
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "digest", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
 futures = "0.3"
 # Only for reading arti's guards.json in the poisoned-guard-state check.
 serde_json = "1"
@@ -32,5 +38,7 @@ tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros", "
 tracing = "0.1"
 
 [dev-dependencies]
+# Independent Ed25519 verifier for the OnionKey signing test.
+ed25519-dalek = { version = "2", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

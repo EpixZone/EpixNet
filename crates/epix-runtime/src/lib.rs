@@ -741,6 +741,22 @@ async fn seed_loop(
     }
 }
 
+/// Bridges the Arti-persisted onion identity key to the announcer's
+/// challenge-signing hook (`epix-tor` doesn't depend on `epix-discovery`).
+#[cfg(feature = "tor")]
+struct TorOnionSigner(epix_tor::OnionKey);
+
+#[cfg(feature = "tor")]
+impl epix_xite::OnionSigner for TorOnionSigner {
+    fn public_key(&self) -> [u8; 32] {
+        self.0.public_key()
+    }
+
+    fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        self.0.sign(msg)
+    }
+}
+
 /// Bootstrap in-process Tor and run its three surfaces until shutdown: the peer
 /// transport (set on the app state so onion peers are dialable, or all traffic
 /// is Tor-routed in Always mode), an onion service whose inbound streams feed
@@ -788,6 +804,22 @@ async fn tor_loop(
                     .log("INFO", format!("Tor: onion service up at {onion_host}.onion:{port}"))
                     .await;
                 state.set_onion_address(&onion_host).await;
+                // Load the identity key so announces can answer the tracker's
+                // onion-ownership challenge; without it the onion is never
+                // registered and Tor-only peers can't discover us.
+                match epix_tor::OnionKey::load(&data_dir, "epix") {
+                    Ok(key) => {
+                        state.set_onion_signer(std::sync::Arc::new(TorOnionSigner(key))).await
+                    }
+                    Err(e) => {
+                        state
+                            .log(
+                                "WARNING",
+                                format!("Tor: onion identity key unavailable ({e}); tracker onion announces will not register"),
+                            )
+                            .await
+                    }
+                }
                 let handler = handler.clone();
                 let (version, rev) = epix_protocol::PeerServer::new(handler.clone()).banner();
                 tokio::spawn(async move {

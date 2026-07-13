@@ -20,7 +20,7 @@ pub fn address_hash(address: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-pub use tracker::{announce, discover_via_epix_tracker, AnnounceParams};
+pub use tracker::{announce, discover_via_epix_tracker, AnnounceParams, OnionSigner};
 
 /// One announcer, whichever protocol it speaks. The announce set mixes both
 /// kinds: Epix trackers (nodes speaking the wire protocol's `announce`) and
