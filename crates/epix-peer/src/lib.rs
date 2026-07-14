@@ -246,9 +246,15 @@ impl Peers {
     /// never reach (which crowded reachable peers out of the `limit`), and
     /// dead peers stop being redialed every pass.
     ///
-    /// Ordering: dialable clearnet before overlay (a direct socket is faster
-    /// than a circuit), then reputation, then fewer connection errors, then
-    /// most recent response.
+    /// Ordering: REPUTATION first, then dialable clearnet before overlay (a
+    /// direct socket is faster than a circuit) as the tiebreak, then fewer
+    /// connection errors, then most recent response. Reputation must outrank
+    /// the network preference: on a xite with more clearnet peers than the
+    /// limit, a network-first sort returns an all-clearnet list forever, and
+    /// an overlay-only publisher (the one peer that HAS a pending update's
+    /// files) is never dialed no matter how often the clearnet peers fail.
+    /// Reputation-first converges: one failed pass sinks the useless peers
+    /// below the untried ones.
     ///
     /// Fallback: if the filters leave nothing but connectable peers exist,
     /// degrade gracefully - first drop the backoff filter (all candidates
@@ -272,9 +278,9 @@ impl Peers {
         }
         let net_rank = |p: &Peer| if p.addr.is_overlay() { 1 } else { 0 };
         peers.sort_by(|a, b| {
-            net_rank(a)
-                .cmp(&net_rank(b))
-                .then(b.reputation.cmp(&a.reputation))
+            b.reputation
+                .cmp(&a.reputation)
+                .then(net_rank(a).cmp(&net_rank(b)))
                 .then(a.connection_errors.cmp(&b.connection_errors))
                 .then(b.time_response.cmp(&a.time_response))
         });
@@ -409,6 +415,42 @@ mod tests {
         all_down.get_mut(&ip("3.3.3.3:15441")).unwrap().note_connect_fail(100);
         let got = all_down.connectable_dialable(10, DialableNets::all(), 101);
         assert_eq!(got, vec![ip("3.3.3.3:15441")], "never starve the caller");
+    }
+
+    #[test]
+    fn overlay_publisher_gets_selected_despite_a_clearnet_majority() {
+        // The gateway stall: ~19 connectable clearnet peers serving the OLD
+        // site version and one onion publisher holding a pending update's
+        // files, selection limit 10. Every pass the clearnet peers connect
+        // fine but fail the file hashes (reputation drops, no backoff). The
+        // publisher must be selected after the first failed pass - with the
+        // old network-first ordering it never was, and the update stalled
+        // forever.
+        let mut peers = Peers::new();
+        for i in 1..=19 {
+            peers.add(ip(&format!("10.0.0.{i}:26552")), 0);
+        }
+        let publisher = ip("6m4j2es4wom2xyhlvj4vjmsdsabqascped5d7t7knz3w2ku5hqlywwid.onion:26552");
+        peers.add(publisher.clone(), 0);
+
+        let mut committed = false;
+        for pass in 0..3 {
+            let selected = peers.connectable_dialable(10, DialableNets::all(), 100 + pass);
+            assert_eq!(selected.len(), 10);
+            if selected.contains(&publisher) {
+                committed = true;
+                break;
+            }
+            // Each selected clearnet peer connects but serves stale files:
+            // ConnectOk then two FileFails, like the real retry pass.
+            for addr in selected {
+                let p = peers.get_mut(&addr).unwrap();
+                p.note_connect_ok(100 + pass);
+                p.note_file_fail();
+                p.note_file_fail();
+            }
+        }
+        assert!(committed, "the onion publisher was never selected");
     }
 
     #[test]

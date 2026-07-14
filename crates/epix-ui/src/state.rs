@@ -1860,14 +1860,59 @@ impl AppState {
         restored
     }
 
+    /// Whether `addr` is one of this node's OWN addresses (external ip:port,
+    /// onion service, i2p destination, or mesh hash). Trackers, PEX, and the
+    /// DHT all echo our own announces back at us; registering them makes the
+    /// node dial itself - the dial "succeeds" and it serves itself its own
+    /// stale files, wasting a selection slot on every sync pass.
+    async fn is_own_peer(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Ip(sa) => {
+                let port = self.fileserver_port().await;
+                if port == 0 || sa.port() != port {
+                    return false;
+                }
+                let (_, detected) = self.port_status().await;
+                let configured = self
+                    .config_get("ip_external")
+                    .await
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .filter(|s| !s.is_empty());
+                [configured, detected]
+                    .iter()
+                    .flatten()
+                    .any(|ip| ip.parse().ok() == Some(sa.ip()))
+            }
+            // Overlay ports are historic/vestigial: any entry with our host
+            // is us.
+            PeerAddr::Onion { host, .. } => {
+                self.onion_address().await.as_deref() == Some(host.as_str())
+            }
+            PeerAddr::I2p { dest, .. } => {
+                self.i2p_address().await.as_deref() == Some(dest.as_str())
+            }
+            PeerAddr::Rns(_) => match self.rns_address().await {
+                Some(r) => addr.to_string() == format!("rns:{}", r.to_lowercase()),
+                None => false,
+            },
+        }
+    }
+
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
+    /// Silently drops this node's own addresses (see [`Self::is_own_peer`]).
     pub async fn add_peers(&self, address: &str, addrs: impl IntoIterator<Item = PeerAddr>) {
+        let mut filtered = Vec::new();
+        for a in addrs {
+            if !self.is_own_peer(&a).await {
+                filtered.push(a);
+            }
+        }
         let grew = {
             let mut xites = self.xites.write().await;
             match xites.get_mut(address) {
                 Some(x) => {
                     let before = x.peers.len();
-                    x.peers.add_many(addrs, now_secs());
+                    x.peers.add_many(filtered, now_secs());
                     x.settings.peers = x.peers.len() as i64;
                     x.peers.len() > before
                 }
@@ -7033,8 +7078,11 @@ impl AppState {
         }
         if let Some(transport) = self.transport.read().await.clone() {
             let mut peers = self.connectable_peers(&key, 10).await;
+            // Prefer fetching from the sender - it definitely has the files
+            // it just announced - but only if its address is dialable (an
+            // inbound-only peer, e.g. `ip:0`, would just waste a worker).
             if let Some(s) = sender {
-                if !peers.contains(&s) {
+                if epix_peer::Peer::new(s.clone(), 0).is_connectable() && !peers.contains(&s) {
                     peers.insert(0, s);
                 }
             }
@@ -8234,6 +8282,47 @@ mod tests {
             .await;
         state.add_peers(addr2, [onion.clone()]).await;
         assert_eq!(state.connectable_peers(addr2, 10).await, vec![onion]);
+    }
+
+    #[tokio::test]
+    async fn add_peers_drops_the_nodes_own_addresses() {
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        state.set_fileserver_port(26552).await;
+        state.set_port_status(true, Some("74.208.249.9".into())).await;
+        state.set_onion_address("jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd").await;
+
+        let own_ip = PeerAddr::parse("74.208.249.9:26552").unwrap();
+        let own_onion = PeerAddr::parse(
+            "jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd.onion:26552",
+        )
+        .unwrap();
+        // Same onion under an old port is still us.
+        let own_onion_old_port = PeerAddr::parse(
+            "jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd.onion:48333",
+        )
+        .unwrap();
+        let other = PeerAddr::parse("8.8.8.8:26552").unwrap();
+        // Same IP but a different port is NOT filtered (a NAT neighbor).
+        let same_ip_other_port = PeerAddr::parse("74.208.249.9:11111").unwrap();
+
+        state
+            .add_peers(addr, [own_ip, own_onion, own_onion_old_port, other, same_ip_other_port])
+            .await;
+        let mut got = state.connectable_peers(addr, 10).await;
+        got.sort_by_key(|p| p.to_string());
+        assert_eq!(
+            got,
+            vec![
+                PeerAddr::parse("74.208.249.9:11111").unwrap(),
+                PeerAddr::parse("8.8.8.8:26552").unwrap(),
+            ],
+            "own addresses dropped, real peers kept"
+        );
     }
 
     #[tokio::test]
