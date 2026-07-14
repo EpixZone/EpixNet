@@ -1424,9 +1424,15 @@ async fn serve(
     state.add_transfer(&address, bytes_recv, 0).await;
     state.rebuild_merger_dbs().await;
 
-    // Seeding + offline policy.
+    // Seeding + offline policy. The Config page persists values as STRINGS
+    // (like i2p_sam_port below), so accept both forms - reading only the
+    // number form made a configured port silently fall back to the default.
     const DEFAULT_FILESERVER_PORT: u16 = 26552;
-    let fileserver_port = match state.config_get("fileserver_port").await.and_then(|v| v.as_u64()) {
+    let configured_port = state
+        .config_get("fileserver_port")
+        .await
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+    let fileserver_port = match configured_port {
         Some(0) => None,
         Some(p) => Some(p as u16),
         None => Some(DEFAULT_FILESERVER_PORT),
