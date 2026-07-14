@@ -187,6 +187,20 @@ impl Xite {
         &self.storage
     }
 
+    pub fn content_rules(
+        &self,
+        inner_path: &str,
+        content: &Value,
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Option<Value> {
+        let ctx = ChildCtx {
+            address: self.address.as_str().to_string(),
+            storage: &self.storage,
+            xid_map,
+        };
+        epix_content::verify::get_rules(inner_path, content, &ctx)
+    }
+
     /// The `includes` inner_paths declared in a content.json value.
     pub fn includes_in(content: &Value) -> Vec<String> {
         content
