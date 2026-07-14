@@ -72,14 +72,39 @@ async fn check_canyouseeme(client: &reqwest::Client, port: u16) -> Option<PortCh
     let body = client
         .post("https://www.canyouseeme.org/")
         .header(reqwest::header::REFERER, "https://www.canyouseeme.org/")
-        .body(format!("ip=1.1.1.1&port={port}"))
+        .form(&[("ip", "1.1.1.1"), ("port", &port.to_string())])
         .send()
         .await
         .ok()?
         .text()
         .await
         .ok()?;
-    parse_canyouseeme(&body)
+    sane(parse_canyouseeme(&body))
+}
+
+/// Reject a verdict whose reported IP isn't a real public address. A service
+/// that hands back a private/reserved/loopback IP (a proxy artifact, or a
+/// pre-filled form default) is confused - and it may then "successfully scan"
+/// that private host and report a bogus open, which is worse than no answer.
+/// Treat such a result as unknown so the next service is tried.
+fn sane(res: Option<PortCheck>) -> Option<PortCheck> {
+    let res = res?;
+    match res.ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4))
+            if !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_unspecified()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && v4.octets()[0] != 0
+                && !(v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])) =>
+        {
+            Some(res)
+        }
+        Ok(std::net::IpAddr::V6(v6)) if !v6.is_loopback() && !v6.is_unspecified() => Some(res),
+        _ => None,
+    }
 }
 
 /// Extract the visitor IP ipfingerprints.com pre-fills into its scan form.
@@ -130,7 +155,7 @@ async fn check_ipfingerprints(client: &reqwest::Client, port: u16) -> Option<Por
         .text()
         .await
         .ok()?;
-    parse_ipfingerprints_verdict(&message, ip)
+    sane(parse_ipfingerprints_verdict(&message, ip))
 }
 
 /// Ask the check services, in order, whether `port` is reachable from the
@@ -188,5 +213,21 @@ mod tests {
             Some(PortCheck { ip: ip(), opened: false })
         );
         assert_eq!(parse_ipfingerprints_verdict("scan failed", ip()), None);
+    }
+
+    #[test]
+    fn private_or_reserved_ips_are_rejected() {
+        // The gateway hit this: a service handed back a private IP with a
+        // false "open". A verdict is only trusted if its IP is really public.
+        let open = |ip: &str| Some(PortCheck { ip: ip.into(), opened: true });
+        assert_eq!(sane(open("10.88.0.135")), None, "private 10/8");
+        assert_eq!(sane(open("192.168.1.9")), None, "private 192.168/16");
+        assert_eq!(sane(open("172.16.5.5")), None, "private 172.16/12");
+        assert_eq!(sane(open("127.0.0.1")), None, "loopback");
+        assert_eq!(sane(open("100.64.1.1")), None, "CGNAT 100.64/10");
+        assert_eq!(sane(open("0.0.0.0")), None, "unspecified");
+        assert_eq!(sane(open("not-an-ip")), None, "garbage");
+        // A real public address passes through unchanged.
+        assert_eq!(sane(open("74.208.249.9")), open("74.208.249.9"));
     }
 }
