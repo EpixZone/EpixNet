@@ -114,17 +114,28 @@ impl PeerAddr {
             let arr: [u8; 16] = bytes.try_into().map_err(|_| Error::InvalidPeer(s.into()))?;
             return Ok(PeerAddr::Rns(arr));
         }
-        // I2P: a `.b32.i2p` (or bare `.i2p`) host, port optional.
+        // I2P: a `.b32.i2p` (or bare `.i2p`) host, port optional. An empty
+        // host (".i2p", ".onion:0") is junk - a node whose overlay address
+        // wasn't up yet advertised a blank - and must not become a peer.
         if let Some(host) = s.strip_suffix(".i2p") {
+            if host.is_empty() {
+                return Err(Error::InvalidPeer(s.into()));
+            }
             return Ok(PeerAddr::I2p { dest: host.to_string(), port: 0 });
         }
         if let Some((host, port)) = s.rsplit_once(':') {
             if let Some(onion_host) = host.strip_suffix(".onion") {
                 let port: u16 = port.parse().map_err(|_| Error::InvalidPeer(s.into()))?;
+                if onion_host.is_empty() {
+                    return Err(Error::InvalidPeer(s.into()));
+                }
                 return Ok(PeerAddr::Onion { host: onion_host.to_string(), port });
             }
             if let Some(dest) = host.strip_suffix(".i2p") {
                 let port: u16 = port.parse().map_err(|_| Error::InvalidPeer(s.into()))?;
+                if dest.is_empty() {
+                    return Err(Error::InvalidPeer(s.into()));
+                }
                 return Ok(PeerAddr::I2p { dest: dest.to_string(), port });
             }
         }
@@ -288,6 +299,12 @@ mod tests {
         assert!(PeerAddr::parse("nonsense").is_err());
         assert!(PeerAddr::parse("rns:xyz").is_err());
         assert!(PeerAddr::parse("1.2.3.4:99999").is_err());
+        // Empty overlay hosts (a node advertising before its address was up)
+        // must not become peers.
+        assert!(PeerAddr::parse(".onion:0").is_err());
+        assert!(PeerAddr::parse(".onion:26552").is_err());
+        assert!(PeerAddr::parse(".i2p").is_err());
+        assert!(PeerAddr::parse(".i2p:26552").is_err());
     }
 
     #[test]
