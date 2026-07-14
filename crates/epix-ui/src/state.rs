@@ -6455,7 +6455,7 @@ impl AppState {
             Some(bytes) => serde_json::from_slice(bytes).ok()?,
             None => {
                 let mut c = serde_json::Map::new();
-                let mut user = self.user.write().await;
+                let user = self.user.read().await;
                 if let (Some(id), Some(cert)) = (user.cert_user_id(address), user.get_cert(address))
                 {
                     c.insert("cert_user_id".into(), json!(id));
