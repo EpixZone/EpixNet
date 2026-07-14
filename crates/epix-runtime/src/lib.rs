@@ -1026,95 +1026,13 @@ async fn upnp_loop(state: Arc<AppState>, port: u16, clearnet: bool, shutdown: Ar
     use igd_next::{PortMappingProtocol, SearchOptions};
     use std::net::SocketAddr;
 
-    // Hold the task until shutdown, then clear the status.
-    async fn hold(state: &Arc<AppState>, shutdown: &Arc<Notify>) {
+    // A clearnet node with a directly-routable path (configured IP, or a
+    // dial-back-confirmed public IP) needs no UPnP: the status is settled and
+    // the task just holds until shutdown. Only a NAT'd host falls through.
+    if clearnet && resolve_direct_port_status(&state, port).await {
         shutdown.notified().await;
         state.set_port_status(false, None).await;
-    }
-
-    if clearnet {
-        // Operator-configured external IP: trusted as-is, port assumed open
-        // (Python parity: "Server port opened based on configuration").
-        let configured = state
-            .config_get("ip_external")
-            .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|s| !s.trim().is_empty());
-        if let Some(ip) = configured {
-            state.set_port_status(true, Some(ip.clone())).await;
-            state
-                .log("INFO", format!("Fileserver port {port} open (ip_external configured: {ip})"))
-                .await;
-            hold(&state, &shutdown).await;
-            return;
-        }
-
-        // The Python client's proven check (unchanged there for six years):
-        // an external service dials our port back, and its response is both
-        // the verdict and our external IP as the internet sees it. Having a
-        // public interface IP is NOT proof - provider panel firewalls (VPS
-        // hosts allow 22/80/443 by default) silently drop other ports, and
-        // assuming "public IP = open" hid exactly that on the gateway.
-        match crate::portcheck::port_check(port).await {
-            Some(check) => {
-                // Never regress a confirmation that raced in from the seed
-                // listener (an inbound handshake is proof too).
-                let (already_open, _) = state.port_status().await;
-                state.set_port_status(check.opened || already_open, Some(check.ip.clone())).await;
-                if check.opened {
-                    state
-                        .log(
-                            "INFO",
-                            format!("Port check: {}:{port} is reachable from the internet", check.ip),
-                        )
-                        .await;
-                    hold(&state, &shutdown).await;
-                    return;
-                }
-                state
-                    .log(
-                        "WARNING",
-                        format!("Port check: {}:{port} is NOT reachable from the internet", check.ip),
-                    )
-                    .await;
-                if public_ipv4().is_some() {
-                    // Public IP and still unreachable: there is no NAT router
-                    // to map, so something upstream drops the port. An
-                    // inbound handshake still flips the status if the path
-                    // opens later (see seed_loop).
-                    state
-                        .log(
-                            "WARNING",
-                            format!(
-                                "The OS is listening on port {port} but probes never arrive; check the provider/network firewall for TCP {port}"
-                            ),
-                        )
-                        .await;
-                    hold(&state, &shutdown).await;
-                    return;
-                }
-                // NAT'd: fall through to UPnP mapping (re-checked below).
-            }
-            None => {
-                // No check service reachable: reachability is UNKNOWN. On a
-                // public-IP host record the address and let the first inbound
-                // handshake confirm; a NAT'd host falls through to UPnP.
-                if let Some(ip) = public_ipv4() {
-                    let (already_open, _) = state.port_status().await;
-                    state.set_port_status(already_open, Some(ip.to_string())).await;
-                    state
-                        .log(
-                            "INFO",
-                            format!(
-                                "Port check services unreachable; {ip}:{port} reported open once an inbound connection confirms it"
-                            ),
-                        )
-                        .await;
-                    hold(&state, &shutdown).await;
-                    return;
-                }
-            }
-        }
+        return;
     }
 
     let Some(local_ip) = local_ipv4() else {
@@ -1145,33 +1063,7 @@ async fn upnp_loop(state: Arc<AppState>, port: u16, clearnet: bool, shutdown: Ar
         {
             Ok(()) => {
                 if verified.is_none() {
-                    // A mapping "succeeding" is not proof the port is open
-                    // (double NAT, upstream filtering): re-run the dial-back
-                    // check, like Python's portOpen -> portCheck. With no
-                    // check service reachable, stay optimistic (old behavior).
-                    let v = if clearnet { crate::portcheck::port_check(port).await } else { None };
-                    verified = Some(match v {
-                        Some(check) => {
-                            state
-                                .log(
-                                    "INFO",
-                                    format!(
-                                        "UPnP: mapped port {port}; dial-back check: {} (external {})",
-                                        if check.opened { "reachable" } else { "still not reachable" },
-                                        check.ip
-                                    ),
-                                )
-                                .await;
-                            (check.opened, Some(check.ip))
-                        }
-                        None => {
-                            let ip = ext_ip.clone().unwrap_or_else(|| "?".into());
-                            state
-                                .log("INFO", format!("UPnP: opened port {port} (external {ip}:{port})"))
-                                .await;
-                            (true, ext_ip.clone())
-                        }
-                    });
+                    verified = Some(verify_mapped_port(&state, port, clearnet, &ext_ip).await);
                 }
                 let (opened, ip) = verified.clone().unwrap_or((true, ext_ip.clone()));
                 state.set_port_status(opened, ip).await;
@@ -1189,6 +1081,120 @@ async fn upnp_loop(state: Arc<AppState>, port: u16, clearnet: bool, shutdown: Ar
     // Remove the mapping on shutdown (best effort).
     let _ = gateway.remove_port(PortMappingProtocol::TCP, port).await;
     state.set_port_status(false, None).await;
+}
+
+/// Try to settle the fileserver port status for a clearnet node WITHOUT UPnP:
+/// an operator-configured `ip_external`, or the Python client's dial-back
+/// check (an external service connects to our port and reports both the
+/// verdict and our external IP). Returns true if the status is settled (the
+/// caller holds until shutdown); false means a NAT'd host that should try
+/// UPnP mapping instead.
+///
+/// A public interface IP is NOT proof of reachability: provider panel
+/// firewalls (VPS hosts allow 22/80/443 by default) silently drop other
+/// ports, and assuming "public IP = open" hid exactly that on the gateway.
+#[cfg(feature = "inbound-seeding")]
+async fn resolve_direct_port_status(state: &Arc<AppState>, port: u16) -> bool {
+    // Operator-configured external IP: trusted as-is (Python parity:
+    // "Server port opened based on configuration").
+    let configured = state
+        .config_get("ip_external")
+        .await
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.trim().is_empty());
+    if let Some(ip) = configured {
+        state.set_port_status(true, Some(ip.clone())).await;
+        state
+            .log("INFO", format!("Fileserver port {port} open (ip_external configured: {ip})"))
+            .await;
+        return true;
+    }
+
+    let Some(check) = crate::portcheck::port_check(port).await else {
+        // No check service reachable: reachability is UNKNOWN. A public-IP
+        // host records the address and lets the first inbound handshake
+        // confirm; a NAT'd host falls through to UPnP.
+        let Some(ip) = public_ipv4() else { return false };
+        let (already_open, _) = state.port_status().await;
+        state.set_port_status(already_open, Some(ip.to_string())).await;
+        state
+            .log(
+                "INFO",
+                format!(
+                    "Port check services unreachable; {ip}:{port} reported open once an inbound connection confirms it"
+                ),
+            )
+            .await;
+        return true;
+    };
+
+    // Never regress a confirmation that raced in from the seed listener (an
+    // inbound handshake is proof too).
+    let (already_open, _) = state.port_status().await;
+    state.set_port_status(check.opened || already_open, Some(check.ip.clone())).await;
+    if check.opened {
+        state
+            .log("INFO", format!("Port check: {}:{port} is reachable from the internet", check.ip))
+            .await;
+        return true;
+    }
+    state
+        .log(
+            "WARNING",
+            format!("Port check: {}:{port} is NOT reachable from the internet", check.ip),
+        )
+        .await;
+    // Public IP and still unreachable: there is no NAT router to map, so
+    // something upstream drops the port. An inbound handshake still flips the
+    // status if the path opens later (see seed_loop). A NAT'd host (no public
+    // IP) returns false to try UPnP.
+    if public_ipv4().is_some() {
+        state
+            .log(
+                "WARNING",
+                format!(
+                    "The OS is listening on port {port} but probes never arrive; check the provider/network firewall for TCP {port}"
+                ),
+            )
+            .await;
+        return true;
+    }
+    false
+}
+
+/// After a UPnP mapping succeeds, confirm it actually opened the port with a
+/// dial-back check (a mapping can "succeed" behind double-NAT or upstream
+/// filtering, like Python's portOpen -> portCheck). Returns the `(opened, ip)`
+/// to record; with no check service reachable, stays optimistic (the old
+/// behavior) and reports the router's external IP.
+#[cfg(feature = "inbound-seeding")]
+async fn verify_mapped_port(
+    state: &Arc<AppState>,
+    port: u16,
+    clearnet: bool,
+    ext_ip: &Option<String>,
+) -> (bool, Option<String>) {
+    let check = if clearnet { crate::portcheck::port_check(port).await } else { None };
+    match check {
+        Some(check) => {
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "UPnP: mapped port {port}; dial-back check: {} (external {})",
+                        if check.opened { "reachable" } else { "still not reachable" },
+                        check.ip
+                    ),
+                )
+                .await;
+            (check.opened, Some(check.ip))
+        }
+        None => {
+            let ip = ext_ip.clone().unwrap_or_else(|| "?".into());
+            state.log("INFO", format!("UPnP: opened port {port} (external {ip}:{port})")).await;
+            (true, ext_ip.clone())
+        }
+    }
 }
 
 /// The node's primary local IPv4 address (the source IP for outbound traffic),
