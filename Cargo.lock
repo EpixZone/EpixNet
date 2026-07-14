@@ -2346,6 +2346,7 @@ dependencies = [
  "epix-xite",
  "hex",
  "igd-next 0.17.1",
+ "reqwest",
  "rmpv",
  "serde_json",
  "socket2 0.5.10",

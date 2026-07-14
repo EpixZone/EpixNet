@@ -23,6 +23,8 @@ serde_json = "1"
 rmpv = "1"
 socket2 = "0.5"
 igd-next = { version = "0.17", features = ["aio_tokio"], optional = true }
+# Dial-back port checking (the Python client's PeerPortchecker services).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 [features]
 default = ["local-discovery", "inbound-seeding"]
@@ -31,7 +33,7 @@ local-discovery = []
 # Inbound file server so peers can pull our files (seeding), plus UPnP port
 # mapping so the fileserver port is reachable through a home router. Off on
 # mobile, which should not accept inbound connections or poke router ports.
-inbound-seeding = ["dep:igd-next"]
+inbound-seeding = ["dep:igd-next", "dep:reqwest"]
 # In-process Tor (Arti): dial .onion peers, host an onion service for inbound,
 # and a local SOCKS listener for the browser shells. On all platforms.
 tor = ["dep:epix-tor"]
