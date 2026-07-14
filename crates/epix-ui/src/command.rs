@@ -429,16 +429,19 @@ impl CommandRegistry {
                 .or_else(|| params.as_array().and_then(|a| a.get(2)))
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new()));
-            let allowed = session.xite.as_deref() == Some(target.as_str())
+            let caller_elevated = session.trusted
+                || req_id >= WRAPPER_ID_BASE
                 || match &session.xite {
                     Some(addr) => session.state.site_has_admin(addr).await,
-                    None => !restrict && req_id >= WRAPPER_ID_BASE,
+                    None => false,
                 };
+            let allowed = caller_elevated || session.xite.as_deref() == Some(target.as_str());
             if !allowed {
                 return Err(format!("No permission to run commands as {target}"));
             }
             let rebound = WsSession::new(session.state.clone(), Some(target));
-            return Box::pin(self.dispatch(&rebound, &inner_cmd, &inner_params, req_id)).await;
+            let inner_id = if caller_elevated { req_id.max(WRAPPER_ID_BASE) } else { req_id };
+            return Box::pin(self.dispatch(&rebound, &inner_cmd, &inner_params, inner_id)).await;
         }
         // A command from a disabled plugin behaves as if unregistered.
         if let Some(plugin) = self.command_plugin.get(cmd) {

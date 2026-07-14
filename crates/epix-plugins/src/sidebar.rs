@@ -351,6 +351,11 @@ fn render_sidebar(
     ));
 
     b.push_str("</ul></div>");
+    b.push_str(
+        "<div class='menu template'>\
+           <a href='#' class='menu-item template'>Template</a>\
+         </div>",
+    );
     b
 }
 
@@ -407,6 +412,8 @@ mod tests {
             "<a href='data/users/content.json' class='contents-content'>data/users/content.json</a>"
         ));
         assert!(html.contains("id='menu-sign-publish'"), "sign-or-publish menu");
+        assert!(html.contains("class='menu template'"), "menu popup template");
+        assert!(html.contains("class='menu-item template'"), "menu item template");
 
         // Not owned: the owner panel is still in the DOM (CSS hides it), but the
         // checkbox is unchecked.

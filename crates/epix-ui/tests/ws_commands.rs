@@ -149,6 +149,16 @@ async fn as_runs_commands_for_other_sites_with_admin_only() {
     state.add_permission(&address, "ADMIN").await;
     let res = registry.dispatch(&session, "as", &as_params, 1).await.unwrap();
     assert_eq!(res["address"], "1Other", "{res}");
+
+    let fav = json!({ "address": "1Other", "cmd": "siteFavourite", "params": [true] });
+    let res = registry.dispatch(&session, "as", &fav, 1).await.unwrap();
+    assert_eq!(res, Value::from("ok"), "admin dashboard runs an admin command on another site");
+    assert_eq!(state.site_info("1Other").await["settings"]["favorite"], true);
+
+    // Without ADMIN, the same as-command is refused at the outer gate.
+    state.remove_permission(&address, "ADMIN").await;
+    let err = registry.dispatch(&session, "as", &fav, 1).await.unwrap_err();
+    assert!(err.contains("permission"), "{err}");
 }
 
 #[tokio::test]

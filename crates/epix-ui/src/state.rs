@@ -6410,9 +6410,13 @@ impl AppState {
     /// root content.json that's the xite's own address (or its declared
     /// `signers`); for a user content, the user's auth address. `fileRules`.
     pub async fn file_rules(&self, address: &str, inner_path: &str) -> Value {
+        if inner_path.starts_with("data/users/") && inner_path.ends_with("content.json") {
+            if let Some(rules) = self.user_content_rules(address, inner_path).await {
+                return rules;
+            }
+        }
         let content = self.content(address).await;
         let signers = if inner_path.starts_with("data/users/") {
-            // User content: signed by the user's own auth key for this xite.
             let auth = self.user.write().await.auth_address(address).unwrap_or_default();
             vec![Value::from(auth)]
         } else {
@@ -6438,6 +6442,57 @@ impl AppState {
         })
     }
 
+    /// Resolve the governing rules for a user content.json and stamp on its
+    /// `current_size`. Returns `None` if no parent `user_contents` governs it
+    /// (the caller falls back to the generic rules).
+    async fn user_content_rules(&self, address: &str, inner_path: &str) -> Option<Value> {
+        let storage = self.xites.read().await.get(address)?.storage.clone();
+        // The content being rule-checked: the user's stored content.json, or -
+        // when they haven't posted yet - a synthetic one carrying the current
+        // cert so the per-user permission_rules still match.
+        let stored = storage.read(inner_path).ok();
+        let content: Value = match &stored {
+            Some(bytes) => serde_json::from_slice(bytes).ok()?,
+            None => {
+                let mut c = serde_json::Map::new();
+                let user = self.user.read().await;
+                if let (Some(id), Some(cert)) = (user.cert_user_id(address), user.get_cert(address))
+                {
+                    c.insert("cert_user_id".into(), json!(id));
+                    c.insert("cert_auth_type".into(), json!(cert.auth_type));
+                    c.insert("cert_sign".into(), json!(cert.cert_sign));
+                }
+                Value::Object(c)
+            }
+        };
+        let xid_map = Self::resolve_xid_map(&storage, inner_path).await;
+        let addr = Address::parse(address.to_string()).ok()?;
+        let xite = Xite::new(addr, storage);
+        let mut rules = xite.content_rules(inner_path, &content, &xid_map)?;
+        // current_size = the raw content.json bytes + its declared files, the
+        // same measure verification limits with `max_size` (EpixNet uses
+        // len(dumps(content)) + sum(file sizes); an empty synthetic is 0).
+        let current_size = match &stored {
+            Some(bytes) => {
+                let files: i64 = content
+                    .get("files")
+                    .and_then(|f| f.as_object())
+                    .map(|m| {
+                        m.values()
+                            .filter_map(|f| f.get("size").and_then(|s| s.as_i64()))
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                bytes.len() as i64 + files
+            }
+            None => 0,
+        };
+        if let Some(obj) = rules.as_object_mut() {
+            obj.insert("current_size".into(), json!(current_size));
+        }
+        Some(rules)
+    }
+
     /// Write a file into a xite's storage (`fileWrite`).
     pub async fn write_file(&self, address: &str, inner_path: &str, bytes: &[u8]) -> Result<(), String> {
         let storage = self
@@ -6460,7 +6515,13 @@ impl AppState {
                 let _ = storage.write(&format!("{inner_path}-old"), &old);
             }
         }
-        storage.write(inner_path, bytes).map_err(|e| e.to_string())
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
+        if inner_path == "content.json" {
+            if let Ok(content) = serde_json::from_slice::<Value>(bytes) {
+                self.update_content(address, Some(content)).await;
+            }
+        }
+        Ok(())
     }
 
     /// Delete a file from a xite's storage (`fileDelete`). If the file is an
@@ -6521,7 +6582,12 @@ impl AppState {
         };
         let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
         let mut xite = Xite::new(addr, storage);
-        xite.content = content;
+        xite.content = xite
+            .storage
+            .read("content.json")
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .or(content);
 
         // Stamp the running node version onto the root content.json before
         // signing (EpixNet's ContentManager.sign sets `epixnet_version =
@@ -7283,8 +7349,18 @@ impl AppState {
 
     /// Override the per-xite size limit (MB).
     pub async fn set_size_limit(&self, address: &str, size_limit_mb: i64) {
-        if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.size_limit = Some(size_limit_mb);
+        let changed = {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) => {
+                    x.settings.size_limit = Some(size_limit_mb);
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            self.persist_sites().await;
         }
     }
 
@@ -9055,6 +9131,115 @@ mod tests {
         // A non-owner key is refused.
         let other = "22c824485fe256587c3809b5f7c99864d7339e9fba061a016834cecc454e01f8";
         assert!(state.sign_xite(&owner_addr, other).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn editing_title_via_content_json_survives_signing() {
+        // The sidebar "Save site settings" flow: fileWrite content.json with a
+        // new title, then siteSign. The title must survive - signing used to
+        // re-sign the stale in-memory content and revert the edit on disk.
+        let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &owner_addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "title": "Old title", "files": {} })),
+                },
+            )
+            .await;
+
+        // Edit the title + description via a content.json write (unsigned).
+        let edited = json!({
+            "title": "New title", "description": "New description", "files": {}
+        });
+        state
+            .write_file(&owner_addr, "content.json", serde_json::to_vec(&edited).unwrap().as_slice())
+            .await
+            .unwrap();
+
+        // The edit is visible immediately (siteInfo renders from memory, which
+        // the write now refreshes) - not just on disk.
+        let info = state.site_info(&owner_addr).await;
+        assert_eq!(info["content"]["title"], "New title", "edit visible before signing");
+        assert_eq!(info["content"]["description"], "New description");
+
+        // Signing preserves the edit rather than reverting to the old title.
+        let bytes = state.sign_xite(&owner_addr, owner).await.unwrap();
+        let signed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(signed["title"], "New title", "title survives signing");
+        assert_eq!(signed["description"], "New description");
+        assert!(signed["signs"].get(&owner_addr).is_some(), "signed by owner");
+
+        // And it's what serves + persists on disk.
+        assert_eq!(state.site_info(&owner_addr).await["content"]["title"], "New title");
+        let on_disk: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("content.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk["title"], "New title");
+    }
+
+    #[tokio::test]
+    async fn file_rules_reports_user_max_size_and_current_size() {
+        // The forum's used/total gauge: fileRules on a user content.json must
+        // return the per-user max_size (from user_contents.permission_rules)
+        // and the current_size (content.json bytes + declared files), or the
+        // bar stays empty (setCurrentSize(undefined)).
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+
+        // Root delegates data/users/content.json.
+        storage
+            .write(
+                "content.json",
+                serde_json::to_vec(&json!({
+                    "address": addr, "modified": 1, "files": {},
+                    "includes": { "data/users/content.json": {} },
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        // The user_contents parent with EpixTalk's per-user rule.
+        storage
+            .write(
+                "data/users/content.json",
+                serde_json::to_vec(&json!({
+                    "address": addr, "inner_path": "data/users/content.json", "modified": 1,
+                    "files": {},
+                    "user_contents": {
+                        "cert_signers": {}, "permissions": {},
+                        "permission_rules": { ".*": { "files_allowed": "data.json", "max_size": 200000 } },
+                    },
+                }))
+                .unwrap()
+                .as_slice(),
+            )
+            .unwrap();
+        // A user with a data.json of 500 bytes declared in their content.json.
+        let user_content = json!({
+            "address": addr, "inner_path": "data/users/1USER/content.json", "modified": 1,
+            "files": { "data.json": { "size": 500, "sha512": "aa" } },
+        });
+        let user_bytes = serde_json::to_vec(&user_content).unwrap();
+        storage.write("data/users/1USER/content.json", &user_bytes).unwrap();
+
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: None }).await;
+
+        let rules = state.file_rules(addr, "data/users/1USER/content.json").await;
+        assert_eq!(rules["max_size"], 200000, "real per-user max_size, not the 10MB stub");
+        assert_eq!(
+            rules["current_size"],
+            user_bytes.len() as i64 + 500,
+            "content.json bytes + declared file sizes"
+        );
+        // The gauge would now render used/total instead of staying empty.
+        assert!(rules["current_size"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]
