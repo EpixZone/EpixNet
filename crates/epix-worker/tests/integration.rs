@@ -103,14 +103,28 @@ async fn clones_a_xite_from_a_peer() {
     xite.set_content(&content_bytes).unwrap();
     assert_eq!(xite.files_needed().len(), 2);
 
+    let feedback = epix_worker::CollectFeedback::new();
     let report = epix_worker::sync_files(
         &xite,
         &[PeerAddr::Ip(peer)],
         Arc::new(TcpTransport),
         4,
+        Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
     )
     .await
     .unwrap();
+
+    // The pass reported per-peer outcomes: a successful connect plus one
+    // FileOk per downloaded file, and no failures against a healthy seeder.
+    let outcomes = feedback.drain();
+    use epix_worker::PeerOutcome::*;
+    assert!(outcomes.iter().all(|(p, _)| *p == PeerAddr::Ip(peer)));
+    assert_eq!(outcomes.iter().filter(|(_, o)| *o == ConnectOk).count(), 1);
+    assert_eq!(outcomes.iter().filter(|(_, o)| *o == FileOk).count(), 2);
+    assert_eq!(
+        outcomes.iter().filter(|(_, o)| matches!(o, ConnectFail | FileFail)).count(),
+        0
+    );
 
     assert_eq!(report.downloaded, 2);
     assert!(report.failed.is_empty(), "failed: {:?}", report.failed);
@@ -158,7 +172,7 @@ async fn live_clone_dashboard_from_network() {
     println!("content.json verified; syncing {to_sync} files…");
 
     // 3. Download every file in parallel, verifying each hash.
-    let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8)
+    let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8, None)
         .await
         .unwrap();
     println!(
@@ -209,7 +223,7 @@ async fn streaming_sync_starts_before_discovery_finishes() {
     });
 
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-    let report = epix_worker::sync_files_streaming(&xite, rx, transport, 4, None)
+    let report = epix_worker::sync_files_streaming(&xite, rx, transport, 4, None, None)
         .await
         .unwrap();
     assert_eq!(report.downloaded, 2, "failed: {:?}", report.failed);

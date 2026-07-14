@@ -3,7 +3,7 @@
 
 use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
-use epix_peer::{PeerCounts, Peers};
+use epix_peer::{DialableNets, PeerCounts, Peers};
 use epix_protocol::Connection;
 use epix_transport::Transport;
 use epix_user::User;
@@ -3165,8 +3165,19 @@ impl AppState {
             return;
         }
         self.set_worker_stats(key, needed.len(), peers.len().min(8), needed.len()).await;
-        let report = epix_worker::sync_files_list(needed, xite, &peers, transport, 8, None).await;
+        let feedback = epix_worker::CollectFeedback::new();
+        let report = epix_worker::sync_files_list(
+            needed,
+            xite,
+            &peers,
+            transport,
+            8,
+            None,
+            Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
+        )
+        .await;
         self.set_worker_stats(key, 0, 0, 0).await;
+        self.apply_peer_outcomes(key, feedback.drain()).await;
         if let Ok(report) = report {
             self.add_transfer(key, report.bytes, 0).await;
         }
@@ -3252,10 +3263,19 @@ impl AppState {
             let needed = xite.files_needed().len();
             let workers = peers.len().min(8);
             self.set_worker_stats(address, needed, workers, needed).await;
-            let report = epix_worker::sync_files(&xite, &peers, transport.clone(), 8).await;
+            let feedback = epix_worker::CollectFeedback::new();
+            let report = epix_worker::sync_files(
+                &xite,
+                &peers,
+                transport.clone(),
+                8,
+                Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
+            )
+            .await;
             // Always clear the live task counters - a leftover tasks>0 keeps
             // the dashboard row's "Updating" spinner stuck.
             self.set_worker_stats(address, 0, 0, 0).await;
+            self.apply_peer_outcomes(address, feedback.drain()).await;
             let report = report.map_err(|e| e.to_string())?;
             self.add_transfer(address, report.bytes, 0).await;
 
@@ -3278,14 +3298,67 @@ impl AppState {
         self.xites.read().await.get(address).map(|x| x.peers.counts()).unwrap_or_default()
     }
 
-    /// Connectable peer addresses for a xite (best reputation first).
+    /// Connectable peer addresses for a xite that this node can actually dial
+    /// right now: filtered to the dialable networks, skipping peers in
+    /// failure backoff, best first. Every sync/publish/PEX caller inherits
+    /// the filter, so a clearnet-only node stops handing workers onion/i2p
+    /// peers it can never reach.
     pub async fn connectable_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
+        let nets = self.dialable_networks().await;
         self.xites
             .read()
             .await
             .get(address)
-            .map(|x| x.peers.connectable(limit))
+            .map(|x| x.peers.connectable_dialable(limit, nets, now_secs()))
             .unwrap_or_default()
+    }
+
+    /// Which peer networks this node can DIAL right now. Clearnet always (the
+    /// base transport is TCP); onion when the Tor client is up - dialing
+    /// needs no published onion service of our own; i2p when the I2P
+    /// transport is composed in and the session reports Ready; rns when the
+    /// mesh transport is up.
+    pub async fn dialable_networks(&self) -> DialableNets {
+        let (tor_enabled, tor_status) = self.tor_status().await;
+        let onion = tor_enabled && matches!(tor_status.as_str(), "OK" | "Always");
+        let i2p_ready = self
+            .i2p_status()
+            .await
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .map(|p| p == "Ready")
+            .unwrap_or(false);
+        let i2p = i2p_ready && self.i2p_transport.read().await.is_some();
+        let rns = self.rns_transport.read().await.is_some();
+        DialableNets { clearnet: true, onion, i2p, rns }
+    }
+
+    /// Apply a sync pass's per-peer outcomes (drained from an
+    /// [`epix_worker::CollectFeedback`]) to a xite's peer registry: a
+    /// success clears the backoff and rewards the peer, a failure docks its
+    /// reputation and backs it off exponentially. This is what feeds
+    /// [`Self::connectable_peers`]' ordering - without it reputation never
+    /// moved and selection was effectively random.
+    pub async fn apply_peer_outcomes(
+        &self,
+        address: &str,
+        outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)>,
+    ) {
+        if outcomes.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            for (addr, outcome) in outcomes {
+                let Some(p) = x.peers.get_mut(&addr) else { continue };
+                match outcome {
+                    epix_worker::PeerOutcome::ConnectOk => p.note_connect_ok(now),
+                    epix_worker::PeerOutcome::ConnectFail => p.note_connect_fail(now),
+                    epix_worker::PeerOutcome::FileOk => p.note_file_ok(now),
+                    epix_worker::PeerOutcome::FileFail => p.note_file_fail(),
+                }
+            }
+        }
     }
 
     /// Bytes transferred for a xite this run (recv, sent).
@@ -6981,13 +7054,22 @@ impl AppState {
                     needed.iter().map(|f| f.inner_path.clone()).collect();
                 self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
                     .await;
-                if let Ok(report) =
-                    epix_worker::sync_files_list(needed, &xite, &peers, transport.clone(), 8, None)
-                        .await
+                let feedback = epix_worker::CollectFeedback::new();
+                if let Ok(report) = epix_worker::sync_files_list(
+                    needed,
+                    &xite,
+                    &peers,
+                    transport.clone(),
+                    8,
+                    None,
+                    Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
+                )
+                .await
                 {
                     self.add_transfer(&key, report.bytes, 0).await;
                 }
                 self.set_worker_stats(&key, 0, 0, 0).await;
+                self.apply_peer_outcomes(&key, feedback.drain()).await;
                 if child_files.is_some() {
                     // Child data files (user posts) feed the db per file, so
                     // open pages see them without a full rebuild.
@@ -8090,6 +8172,98 @@ mod tests {
         // File present without the key: default on (opt-out).
         std::fs::write(&path, br#"{"clearnet_allow": {}}"#).unwrap();
         assert_eq!(state.browser_settings().await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn dialable_networks_follows_transport_state() {
+        let state = AppState::new("test");
+
+        // Fresh node: only clearnet is dialable.
+        let nets = state.dialable_networks().await;
+        assert!(nets.clearnet && !nets.onion && !nets.i2p && !nets.rns);
+
+        // Tor client up: onion dialable, regardless of our own onion service.
+        state.set_tor_status(true, "OK").await;
+        assert!(state.dialable_networks().await.onion);
+        state.set_tor_status(true, "Always").await;
+        assert!(state.dialable_networks().await.onion);
+        state.set_tor_status(false, "Disabled").await;
+        assert!(!state.dialable_networks().await.onion);
+
+        // I2P needs BOTH the transport composed in and the session Ready.
+        state.set_i2p_transport(Arc::new(epix_transport::TcpTransport)).await;
+        state.set_i2p_status(json!({ "phase": "Starting…" })).await;
+        assert!(!state.dialable_networks().await.i2p, "starting is not dialable");
+        state.set_i2p_status(json!({ "phase": "Ready" })).await;
+        assert!(state.dialable_networks().await.i2p);
+
+        // Mesh transport up: rns dialable.
+        state.set_rns_transport(Arc::new(epix_transport::TcpTransport)).await;
+        assert!(state.dialable_networks().await.rns);
+    }
+
+    #[tokio::test]
+    async fn connectable_peers_filters_networks_the_node_cannot_dial() {
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let state = AppState::new("test"); // no Tor: clearnet-only node
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+
+        let clearnet = PeerAddr::parse("8.8.8.8:15441").unwrap();
+        let onion = PeerAddr::parse("expyuzz4wqqyqhjn.onion:15441").unwrap();
+        state.add_peers(addr, [clearnet.clone(), onion.clone()]).await;
+
+        // A clearnet peer exists: the undialable onion peer is excluded, so
+        // it can't crowd reachable peers out of the worker's list.
+        assert_eq!(state.connectable_peers(addr, 10).await, vec![clearnet.clone()]);
+
+        // Tor comes up: both are candidates, clearnet preferred.
+        state.set_tor_status(true, "OK").await;
+        let got = state.connectable_peers(addr, 10).await;
+        assert_eq!(got, vec![clearnet, onion.clone()]);
+        state.set_tor_status(false, "Disabled").await;
+
+        // An onion-only xite on the same clearnet-only node still gets its
+        // peer (fallback) - selection never starves an overlay-only xite.
+        let dir2 = tempdir().unwrap();
+        let addr2 = "epix1readmehqfdxy4pzx7u72wwaerc4psx0gt6fety";
+        state
+            .add_xite(addr2, XiteEntry { storage: XiteStorage::new(dir2.path()), content: None })
+            .await;
+        state.add_peers(addr2, [onion.clone()]).await;
+        assert_eq!(state.connectable_peers(addr2, 10).await, vec![onion]);
+    }
+
+    #[tokio::test]
+    async fn peer_outcomes_move_reputation_and_backoff() {
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let good = PeerAddr::parse("1.1.1.1:15441").unwrap();
+        let dead = PeerAddr::parse("2.2.2.2:15441").unwrap();
+        state.add_peers(addr, [good.clone(), dead.clone()]).await;
+
+        // A sync pass's outcomes: `good` served a file, `dead` failed a dial.
+        state
+            .apply_peer_outcomes(
+                addr,
+                vec![
+                    (good.clone(), epix_worker::PeerOutcome::ConnectOk),
+                    (good.clone(), epix_worker::PeerOutcome::FileOk),
+                    (dead.clone(), epix_worker::PeerOutcome::ConnectFail),
+                ],
+            )
+            .await;
+
+        // The dead peer is now in backoff: selection returns only `good`,
+        // and the worker marked it connected (it never did before).
+        assert_eq!(state.connectable_peers(addr, 10).await, vec![good]);
+        assert_eq!(state.peer_counts(addr).await.connected, 1);
     }
 
     #[tokio::test]

@@ -14,6 +14,40 @@ use epix_core::PeerAddr;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 
+/// Which peer networks this node can currently DIAL. Computed by the host
+/// (which knows the transport/Tor/I2P state) and passed into
+/// [`Peers::connectable_dialable`], so this crate needs no transport
+/// dependency. Distinct from inbound reachability: a node with no published
+/// onion service can still dial onion peers if its Tor client is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DialableNets {
+    /// Direct TCP (the base transport) - true on every real node.
+    pub clearnet: bool,
+    /// Tor onion dialing (the Tor client is up).
+    pub onion: bool,
+    /// I2P dialing (transport composed in and the session is Ready).
+    pub i2p: bool,
+    /// Reticulum mesh dialing (transport up).
+    pub rns: bool,
+}
+
+impl DialableNets {
+    /// Every network dialable - the permissive default for tests/tools.
+    pub fn all() -> Self {
+        Self { clearnet: true, onion: true, i2p: true, rns: true }
+    }
+
+    /// Can this node currently dial `addr`?
+    pub fn can_dial(&self, addr: &PeerAddr) -> bool {
+        match addr {
+            PeerAddr::Ip(_) => self.clearnet,
+            PeerAddr::Onion { .. } => self.onion,
+            PeerAddr::I2p { .. } => self.i2p,
+            PeerAddr::Rns(_) => self.rns,
+        }
+    }
+}
+
 /// One known peer of a xite.
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -26,6 +60,10 @@ pub struct Peer {
     pub time_response: i64,
     /// Consecutive connection failures.
     pub connection_errors: u32,
+    /// Unix time before which selection skips the peer (exponential backoff
+    /// after failures). In-memory only - never serialized or sent to peers,
+    /// so it is wire-safe.
+    pub retry_after: i64,
     /// Whether we currently hold a live connection to the peer.
     pub connected: bool,
     pub bytes_recv: u64,
@@ -40,6 +78,7 @@ impl Peer {
             time_found: now,
             time_response: 0,
             connection_errors: 0,
+            retry_after: 0,
             connected: false,
             bytes_recv: 0,
             bytes_sent: 0,
@@ -49,6 +88,41 @@ impl Peer {
     /// Stable registry key (the address string).
     pub fn key(&self) -> String {
         self.addr.to_string()
+    }
+
+    /// A dial + handshake succeeded: clear the failure state and backoff,
+    /// stamp the response time, and reward the peer.
+    pub fn note_connect_ok(&mut self, now: i64) {
+        self.connected = true;
+        self.time_response = now;
+        self.connection_errors = 0;
+        self.retry_after = 0;
+        self.reputation += 1;
+    }
+
+    /// A dial or handshake failed/timed out: back the peer off exponentially
+    /// (EpixNet-style `min(3600, 15 << errors)` seconds) so selection stops
+    /// burning time on it every pass, and dock its reputation.
+    pub fn note_connect_fail(&mut self, now: i64) {
+        self.connected = false;
+        self.connection_errors += 1;
+        self.reputation -= 1;
+        let shift = self.connection_errors.min(8);
+        self.retry_after = now + (15i64 << shift).min(3600);
+    }
+
+    /// A file downloaded from the peer and verified: the strongest positive
+    /// signal a peer can give.
+    pub fn note_file_ok(&mut self, now: i64) {
+        self.time_response = now;
+        self.reputation += 1;
+    }
+
+    /// A file fetch failed (refused, timed out, or hash mismatch). Reputation
+    /// only - the dial itself worked, and the peer may serve other files, so
+    /// it is deprioritized rather than backed off.
+    pub fn note_file_fail(&mut self) {
+        self.reputation -= 1;
     }
 
     /// A Tor onion peer.
@@ -158,9 +232,52 @@ impl Peers {
     }
 
     /// The connectable peer addresses (for the worker), best reputation first.
+    /// Network-blind and backoff-blind; prefer [`Self::connectable_dialable`]
+    /// when the caller knows which networks it can dial.
     pub fn connectable(&self, limit: usize) -> Vec<PeerAddr> {
         let mut peers: Vec<&Peer> = self.map.values().filter(|p| p.is_connectable()).collect();
         peers.sort_by(|a, b| b.reputation.cmp(&a.reputation));
+        peers.into_iter().take(limit).map(|p| p.addr.clone()).collect()
+    }
+
+    /// The peers a sync pass should actually try: connectable, on a network
+    /// this node can dial right now, and not in failure backoff - so a
+    /// clearnet-only node stops handing the worker onion/i2p peers it can
+    /// never reach (which crowded reachable peers out of the `limit`), and
+    /// dead peers stop being redialed every pass.
+    ///
+    /// Ordering: dialable clearnet before overlay (a direct socket is faster
+    /// than a circuit), then reputation, then fewer connection errors, then
+    /// most recent response.
+    ///
+    /// Fallback: if the filters leave nothing but connectable peers exist,
+    /// degrade gracefully - first drop the backoff filter (all candidates
+    /// backed off: retrying early beats idling), then the network filter (an
+    /// overlay-only xite on a node whose overlay is still warming up must
+    /// still get candidates rather than starve). A node with any reachable
+    /// peer can therefore never regress to an empty list.
+    pub fn connectable_dialable(&self, limit: usize, nets: DialableNets, now: i64) -> Vec<PeerAddr> {
+        let connectable: Vec<&Peer> =
+            self.map.values().filter(|p| p.is_connectable()).collect();
+        let mut peers: Vec<&Peer> = connectable
+            .iter()
+            .copied()
+            .filter(|p| nets.can_dial(&p.addr) && p.retry_after <= now)
+            .collect();
+        if peers.is_empty() {
+            peers = connectable.iter().copied().filter(|p| nets.can_dial(&p.addr)).collect();
+        }
+        if peers.is_empty() {
+            peers = connectable;
+        }
+        let net_rank = |p: &Peer| if p.addr.is_overlay() { 1 } else { 0 };
+        peers.sort_by(|a, b| {
+            net_rank(a)
+                .cmp(&net_rank(b))
+                .then(b.reputation.cmp(&a.reputation))
+                .then(a.connection_errors.cmp(&b.connection_errors))
+                .then(b.time_response.cmp(&a.time_response))
+        });
         peers.into_iter().take(limit).map(|p| p.addr.clone()).collect()
     }
 
@@ -226,5 +343,94 @@ mod tests {
 
         assert_eq!(peers.get(&ip("8.8.8.8:15441")).unwrap().bytes_recv, 1000);
         assert_eq!(peers.connectable(10).len(), 3);
+    }
+
+    /// Networks: clearnet only (the common cold-start node).
+    fn clearnet_only() -> DialableNets {
+        DialableNets { clearnet: true, onion: false, i2p: false, rns: false }
+    }
+
+    #[test]
+    fn dialable_filter_excludes_unreachable_networks() {
+        let mut peers = Peers::new();
+        peers.add(ip("8.8.8.8:15441"), 0);
+        peers.add(ip("expyuzz4wqqyqhjn.onion:15441"), 0);
+
+        // A clearnet-only node gets only the clearnet peer...
+        let got = peers.connectable_dialable(10, clearnet_only(), 100);
+        assert_eq!(got, vec![ip("8.8.8.8:15441")]);
+
+        // ...but an onion-only xite still gets its onion peer (fallback)
+        // instead of an empty list.
+        let mut onion_only = Peers::new();
+        onion_only.add(ip("expyuzz4wqqyqhjn.onion:15441"), 0);
+        let got = onion_only.connectable_dialable(10, clearnet_only(), 100);
+        assert_eq!(got, vec![ip("expyuzz4wqqyqhjn.onion:15441")]);
+
+        // With Tor dialable, both come back, clearnet preferred.
+        let got = peers.connectable_dialable(10, DialableNets::all(), 100);
+        assert_eq!(got[0], ip("8.8.8.8:15441"));
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn backoff_excludes_then_readmits_failed_peers() {
+        let mut peers = Peers::new();
+        peers.add(ip("1.1.1.1:15441"), 0);
+        peers.add(ip("2.2.2.2:15441"), 0);
+
+        // 1.1.1.1 failed a dial at t=100: backed off 30s (15 << 1).
+        peers.get_mut(&ip("1.1.1.1:15441")).unwrap().note_connect_fail(100);
+        let got = peers.connectable_dialable(10, DialableNets::all(), 101);
+        assert_eq!(got, vec![ip("2.2.2.2:15441")], "backed-off peer skipped");
+
+        // After the window it comes back (ranked last: reputation dropped).
+        let got = peers.connectable_dialable(10, DialableNets::all(), 200);
+        assert_eq!(got, vec![ip("2.2.2.2:15441"), ip("1.1.1.1:15441")]);
+
+        // Repeated failures grow the window exponentially, capped at 3600.
+        let p = peers.get_mut(&ip("1.1.1.1:15441")).unwrap();
+        for _ in 0..10 {
+            p.note_connect_fail(1000);
+        }
+        assert_eq!(p.retry_after, 1000 + 3600, "cap");
+        assert_eq!(p.connection_errors, 11);
+
+        // A success clears everything.
+        p.note_connect_ok(2000);
+        assert_eq!(p.connection_errors, 0);
+        assert_eq!(p.retry_after, 0);
+        assert!(p.connected);
+
+        // If EVERY candidate is backed off, selection degrades to retrying
+        // them rather than returning nothing.
+        let mut all_down = Peers::new();
+        all_down.add(ip("3.3.3.3:15441"), 0);
+        all_down.get_mut(&ip("3.3.3.3:15441")).unwrap().note_connect_fail(100);
+        let got = all_down.connectable_dialable(10, DialableNets::all(), 101);
+        assert_eq!(got, vec![ip("3.3.3.3:15441")], "never starve the caller");
+    }
+
+    #[test]
+    fn selection_orders_by_reputation_then_errors_then_recency() {
+        let mut peers = Peers::new();
+        for (a, rep, errs, resp) in [
+            ("1.1.1.1:1", 5, 0, 50),
+            ("2.2.2.2:1", 5, 2, 90),
+            ("3.3.3.3:1", 9, 0, 10),
+            ("4.4.4.4:1", 5, 0, 90),
+        ] {
+            peers.add(ip(a), 0);
+            let p = peers.get_mut(&ip(a)).unwrap();
+            p.reputation = rep;
+            p.connection_errors = errs;
+            p.time_response = resp;
+        }
+        let got = peers.connectable_dialable(10, DialableNets::all(), 100);
+        assert_eq!(
+            got,
+            vec![ip("3.3.3.3:1"), ip("4.4.4.4:1"), ip("1.1.1.1:1"), ip("2.2.2.2:1")],
+            "reputation first, then fewer errors, then most recent response"
+        );
     }
 }
