@@ -6460,7 +6460,13 @@ impl AppState {
                 let _ = storage.write(&format!("{inner_path}-old"), &old);
             }
         }
-        storage.write(inner_path, bytes).map_err(|e| e.to_string())
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
+        if inner_path == "content.json" {
+            if let Ok(content) = serde_json::from_slice::<Value>(bytes) {
+                self.update_content(address, Some(content)).await;
+            }
+        }
+        Ok(())
     }
 
     /// Delete a file from a xite's storage (`fileDelete`). If the file is an
@@ -6521,7 +6527,12 @@ impl AppState {
         };
         let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
         let mut xite = Xite::new(addr, storage);
-        xite.content = content;
+        xite.content = xite
+            .storage
+            .read("content.json")
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .or(content);
 
         // Stamp the running node version onto the root content.json before
         // signing (EpixNet's ContentManager.sign sets `epixnet_version =
@@ -7283,8 +7294,18 @@ impl AppState {
 
     /// Override the per-xite size limit (MB).
     pub async fn set_size_limit(&self, address: &str, size_limit_mb: i64) {
-        if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.size_limit = Some(size_limit_mb);
+        let changed = {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) => {
+                    x.settings.size_limit = Some(size_limit_mb);
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            self.persist_sites().await;
         }
     }
 
@@ -9055,6 +9076,55 @@ mod tests {
         // A non-owner key is refused.
         let other = "22c824485fe256587c3809b5f7c99864d7339e9fba061a016834cecc454e01f8";
         assert!(state.sign_xite(&owner_addr, other).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn editing_title_via_content_json_survives_signing() {
+        // The sidebar "Save site settings" flow: fileWrite content.json with a
+        // new title, then siteSign. The title must survive - signing used to
+        // re-sign the stale in-memory content and revert the edit on disk.
+        let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &owner_addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "title": "Old title", "files": {} })),
+                },
+            )
+            .await;
+
+        // Edit the title + description via a content.json write (unsigned).
+        let edited = json!({
+            "title": "New title", "description": "New description", "files": {}
+        });
+        state
+            .write_file(&owner_addr, "content.json", serde_json::to_vec(&edited).unwrap().as_slice())
+            .await
+            .unwrap();
+
+        // The edit is visible immediately (siteInfo renders from memory, which
+        // the write now refreshes) - not just on disk.
+        let info = state.site_info(&owner_addr).await;
+        assert_eq!(info["content"]["title"], "New title", "edit visible before signing");
+        assert_eq!(info["content"]["description"], "New description");
+
+        // Signing preserves the edit rather than reverting to the old title.
+        let bytes = state.sign_xite(&owner_addr, owner).await.unwrap();
+        let signed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(signed["title"], "New title", "title survives signing");
+        assert_eq!(signed["description"], "New description");
+        assert!(signed["signs"].get(&owner_addr).is_some(), "signed by owner");
+
+        // And it's what serves + persists on disk.
+        assert_eq!(state.site_info(&owner_addr).await["content"]["title"], "New title");
+        let on_disk: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("content.json")).unwrap())
+                .unwrap();
+        assert_eq!(on_disk["title"], "New title");
     }
 
     #[tokio::test]
