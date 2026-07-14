@@ -408,9 +408,10 @@ pub struct AppState {
     /// Recent log lines for the dashboard console (`serverErrors`): each is
     /// `[date_added, level, message]`, newest last, capped.
     logs: RwLock<std::collections::VecDeque<Value>>,
-    /// Open sidebar-console log streams (`consoleLogStream`); new log lines are
-    /// pushed to each as `logLineAdd` events.
-    log_streams: RwLock<Vec<i64>>,
+    /// Open sidebar-console log streams (`consoleLogStream`) as `(stream_id,
+    /// level_filter)`; new log lines are pushed to each as `logLineAdd` events,
+    /// but only when the line passes that stream's filter.
+    log_streams: RwLock<Vec<(i64, String)>>,
     /// Path to the persisted peer database (`peers.json`), so known peers survive
     /// restarts (the PeerDb plugin). None for in-memory nodes.
     peers_path: Option<PathBuf>,
@@ -5138,11 +5139,14 @@ impl AppState {
                 logs.pop_front();
             }
         }
-        // Stream to any open sidebar console(s).
+        // Stream to any open sidebar console(s) whose filter matches this line.
         let streams = self.log_streams.read().await;
         if !streams.is_empty() {
             let formatted = format_log_line(&line);
-            for id in streams.iter() {
+            for (id, filter) in streams.iter() {
+                if !log_line_matches(&line, filter) {
+                    continue;
+                }
                 self.push_event(
                     "logLineAdd",
                     json!({ "stream_id": id, "lines": [formatted] }),
@@ -5169,25 +5173,33 @@ impl AppState {
     }
 
     /// `consoleLogRead` - recent lines for the sidebar console as formatted
-    /// strings, plus the byte-position metadata the panel displays.
-    pub async fn console_log_read(&self) -> Value {
-        let lines: Vec<Value> =
-            self.logs.read().await.iter().map(|l| json!(format_log_line(l))).collect();
+    /// strings, plus the byte-position metadata the panel displays. `filter`
+    /// is the active tab's level (`INFO`/`WARNING`/`ERROR`, or empty for All).
+    pub async fn console_log_read(&self, filter: &str) -> Value {
+        let lines: Vec<Value> = self
+            .logs
+            .read()
+            .await
+            .iter()
+            .filter(|l| log_line_matches(l, filter))
+            .map(|l| json!(format_log_line(l)))
+            .collect();
         let n = lines.len();
         json!({ "lines": lines, "pos_start": 0, "pos_end": n * 80, "num_found": n })
     }
 
     /// `consoleLogStream` - open a live log stream; returns its id. New lines
-    /// arrive as `logLineAdd` events tagged with this id.
-    pub async fn console_log_stream_open(&self) -> i64 {
+    /// arrive as `logLineAdd` events tagged with this id, filtered to `filter`
+    /// (the active tab's level, or empty for All).
+    pub async fn console_log_stream_open(&self, filter: &str) -> i64 {
         let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
-        self.log_streams.write().await.push(id);
+        self.log_streams.write().await.push((id, filter.to_string()));
         id
     }
 
     /// `consoleLogStreamRemove` - stop a live log stream.
     pub async fn console_log_stream_remove(&self, id: i64) {
-        self.log_streams.write().await.retain(|s| *s != id);
+        self.log_streams.write().await.retain(|s| s.0 != id);
     }
 
     /// Subscribe to server-pushed UI events (one receiver per WS connection).
@@ -8030,6 +8042,19 @@ fn format_log_line(line: &Value) -> String {
     format!("[{:02}:{:02}:{:02}] {} Node {}", tod / 3600, (tod % 3600) / 60, tod % 60, level, msg)
 }
 
+/// Whether a stored console log line (`[ts, level, message]`) passes a console
+/// tab filter. An empty filter (the "All" tab) shows everything; otherwise the
+/// line's level must match. The Error tab also covers CRITICAL, mirroring
+/// `server_errors`.
+fn log_line_matches(line: &Value, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let level = line.get(1).and_then(Value::as_str).unwrap_or("");
+    level.eq_ignore_ascii_case(filter)
+        || (filter.eq_ignore_ascii_case("ERROR") && level.eq_ignore_ascii_case("CRITICAL"))
+}
+
 /// The address a permission grant is keyed by: the xite's signed content
 /// address when known (so a site served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
@@ -8886,12 +8911,52 @@ mod tests {
         state.log("INFO", "an info line").await; // below ERROR -> dropped
         state.log("DEBUG", "a debug line").await; // dropped
         state.log("ERROR", "a real error").await; // kept
-        assert_eq!(state.console_log_read().await["num_found"], 1);
+        assert_eq!(state.console_log_read("").await["num_found"], 1);
 
         // Lowering the threshold lets INFO through again.
         state.config_set("log_level", json!("INFO")).await;
         state.log("INFO", "now visible").await;
-        assert_eq!(state.console_log_read().await["num_found"], 2);
+        assert_eq!(state.console_log_read("").await["num_found"], 2);
+    }
+
+    #[tokio::test]
+    async fn console_log_read_filters_by_tab_level() {
+        let state = AppState::new("test");
+        state.log("INFO", "started").await;
+        state.log("INFO", "still going").await;
+        state.log("WARNING", "slow peer").await;
+        state.log("ERROR", "sync failed").await;
+
+        // Empty filter (the "All" tab) returns every level.
+        assert_eq!(state.console_log_read("").await["num_found"], 4);
+        // Each tab returns only its own level, not everything.
+        assert_eq!(state.console_log_read("INFO").await["num_found"], 2);
+        assert_eq!(state.console_log_read("WARNING").await["num_found"], 1);
+        assert_eq!(state.console_log_read("ERROR").await["num_found"], 1);
+
+        // The Error tab also surfaces CRITICAL lines.
+        state.log("CRITICAL", "disk full").await;
+        assert_eq!(state.console_log_read("ERROR").await["num_found"], 2);
+    }
+
+    #[tokio::test]
+    async fn console_stream_only_pushes_matching_levels() {
+        let state = AppState::new("test");
+        // Open a WARNING-filtered stream.
+        let sid = state.console_log_stream_open("WARNING").await;
+        let mut events = state.subscribe_events();
+
+        // An INFO line must not be streamed to a WARNING tab.
+        state.log("INFO", "routine").await;
+        assert!(events.try_recv().is_err());
+
+        // A WARNING line is streamed with the matching id.
+        state.log("WARNING", "slow peer").await;
+        let ev = events.try_recv().unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "logLineAdd");
+        assert_eq!(payload["params"]["stream_id"], sid);
+        assert!(payload["params"]["lines"][0].as_str().unwrap().contains("slow peer"));
     }
 
     #[tokio::test]
@@ -9294,14 +9359,14 @@ mod tests {
         assert_eq!(errors[0][2], "sync failed");
         assert!(errors[0][0].as_f64().unwrap() > 0.0);
         // The sidebar console still sees all three levels.
-        assert_eq!(state.console_log_read().await["num_found"], 3);
+        assert_eq!(state.console_log_read("").await["num_found"], 3);
     }
 
     #[tokio::test]
     async fn console_stream_returns_id_and_pushes_loglineadd() {
         let state = AppState::new("test");
         // Opening a stream returns a real id (was null before -> UI crash).
-        let sid = state.console_log_stream_open().await;
+        let sid = state.console_log_stream_open("").await;
         let mut events = state.subscribe_events();
 
         // A new log line streams as logLineAdd with the matching stream_id.
@@ -9315,7 +9380,7 @@ mod tests {
         assert!(line.starts_with('['));
 
         // consoleLogRead returns the formatted line too.
-        let read = state.console_log_read().await;
+        let read = state.console_log_read("").await;
         assert_eq!(read["num_found"], 1);
         assert!(read["lines"][0].as_str().unwrap().contains("hello world"));
 

@@ -940,6 +940,16 @@ impl WsCommand for ServerErrors {
     }
 }
 
+/// Extract the console tab's level filter from a request. The sidebar sends
+/// `{filter, read_size}`; accept the positional array form too. Empty (the
+/// "All" tab) means no filtering.
+fn console_log_filter(p: &Value) -> &str {
+    p.get("filter")
+        .or_else(|| p.as_array().and_then(|a| a.first()))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
 /// `consoleLogRead` - recent log lines for the sidebar console (formatted
 /// strings + byte-position metadata).
 struct ConsoleLogRead;
@@ -948,8 +958,9 @@ impl WsCommand for ConsoleLogRead {
     fn name(&self) -> &'static str {
         "consoleLogRead"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(s.state.console_log_read().await)
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let filter = console_log_filter(p);
+        Ok(s.state.console_log_read(filter).await)
     }
 }
 
@@ -961,8 +972,9 @@ impl WsCommand for ConsoleLogStream {
     fn name(&self) -> &'static str {
         "consoleLogStream"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(json!({ "stream_id": s.state.console_log_stream_open().await }))
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let filter = console_log_filter(p);
+        Ok(json!({ "stream_id": s.state.console_log_stream_open(filter).await }))
     }
 }
 
