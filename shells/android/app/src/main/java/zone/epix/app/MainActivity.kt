@@ -89,13 +89,29 @@ class MainActivity : AppCompatActivity() {
     private var pendingGeckoPermission: GeckoSession.PermissionDelegate.Callback? = null
     /// Retries left for a failed load of the node's own UI (see onLoadError).
     private var nodeLoadRetries = 0
+    /// Full-screen loading splash (spinning white Epix mark) shown over the
+    /// chrome while the node boots and the first page paints; removed on the
+    /// first page stop. Mirrors the desktop toolbar spin (EpixNet PR #231).
+    private var splashOverlay: View? = null
+    /// Set once we ask the session to load the actual node page. The session
+    /// opens at about:blank and fires an immediate page-stop for it; without
+    /// this guard the splash would vanish before the real page even loads.
+    private var nodePageRequested = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         torClearnet = getPreferences(Context.MODE_PRIVATE).getBoolean(PREF_TOR_CLEARNET, true)
 
-        setContentView(buildBrowserChrome())
+        val container = FrameLayout(this)
+        container.addView(
+            buildBrowserChrome(),
+            FrameLayout.LayoutParams(-1, -1),
+        )
+        splashOverlay = buildSplash().also {
+            container.addView(it, FrameLayout.LayoutParams(-1, -1))
+        }
+        setContentView(container)
 
         runtime = GeckoRuntime.getDefault(this)
         installWallet()
@@ -143,6 +159,10 @@ class MainActivity : AppCompatActivity() {
                 // A page made it through: later transient errors get a fresh
                 // retry budget.
                 if (success) nodeLoadRetries = 0
+                // The first real page (dashboard or the error page) is up, so
+                // the boot/connect wait is over - drop the loading splash. Skip
+                // the session's initial about:blank stop (nodePageRequested).
+                if (nodePageRequested) hideSplash()
             }
         }
         geckoView.setSession(session)
@@ -169,6 +189,9 @@ class MainActivity : AppCompatActivity() {
             // connection renders as a silent blank page. The node now binds
             // before start() returns, so this passes immediately - it guards
             // the boot-failed path and anything else that delays the bind.
+            // From here the next page-stop is a real page, so let it drop the
+            // splash (about:blank already came and went).
+            nodePageRequested = true
             if (awaitUiPort()) {
                 session.loadUri(nodeUrl(currentDisplay))
             } else {
@@ -246,7 +269,10 @@ class MainActivity : AppCompatActivity() {
             setStroke(dp(2), COLOR_CHROME_BG)
         }
         val icon = android.widget.ImageView(this).apply {
-            setImageResource(R.drawable.epix_icon)
+            // The white Epix mark on a dark disc (the disc is the chrome color,
+            // so it reads as a clean white mark) - matches the desktop browser's
+            // reskinned toolbar icon (EpixNet PR #231).
+            setImageResource(R.drawable.epix_badge_white)
             scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
         }
@@ -280,6 +306,58 @@ class MainActivity : AppCompatActivity() {
         geckoView.coverUntilFirstPaint(COLOR_CHROME_BG)
         root.addView(geckoView, LinearLayout.LayoutParams(-1, 0, 1f))
         return root
+    }
+
+    /**
+     * The loading splash: the white Epix mark spinning on the dark chrome
+     * background, shown from launch until the first page paints. Mirrors the
+     * desktop browser's spinning toolbar icon (EpixNet PR #231) - on a cold
+     * start the node bootstraps Tor for tens of seconds, so this covers that
+     * wait instead of a blank dark screen.
+     */
+    private fun buildSplash(): View {
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(COLOR_CHROME_BG)
+            // Swallow taps so the chrome behind the splash stays inert while it
+            // shows (e.g. the address bar can't be focused mid-boot).
+            isClickable = true
+        }
+        val mark = android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.epix_mark_white)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            // A steady continuous spin (compositor-driven), one turn every
+            // 1.2s, for as long as the node is coming up.
+            startAnimation(
+                android.view.animation.RotateAnimation(
+                    0f,
+                    360f,
+                    android.view.animation.Animation.RELATIVE_TO_SELF,
+                    0.5f,
+                    android.view.animation.Animation.RELATIVE_TO_SELF,
+                    0.5f,
+                ).apply {
+                    duration = 1200
+                    repeatCount = android.view.animation.Animation.INFINITE
+                    interpolator = android.view.animation.LinearInterpolator()
+                },
+            )
+        }
+        overlay.addView(mark, FrameLayout.LayoutParams(dp(96), dp(96), Gravity.CENTER))
+        return overlay
+    }
+
+    /** Fade the loading splash out and remove it. Idempotent. */
+    private fun hideSplash() {
+        val overlay = splashOverlay ?: return
+        splashOverlay = null
+        overlay.animate()
+            .alpha(0f)
+            .setDuration(250)
+            .withEndAction {
+                overlay.clearAnimation()
+                (overlay.parent as? android.view.ViewGroup)?.removeView(overlay)
+            }
+            .start()
     }
 
     /** Turn what the user typed into somewhere to go. */

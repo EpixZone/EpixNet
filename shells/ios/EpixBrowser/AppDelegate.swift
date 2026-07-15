@@ -35,6 +35,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     var torTimer: Timer?
     var urlObservation: NSKeyValueObservation?
     var currentDisplay = ""
+    /// Full-screen loading splash (spinning white Epix mark) shown over the
+    /// chrome while the node boots and the first page paints; removed on the
+    /// first navigation finish. Mirrors the desktop toolbar spin (PR #231).
+    var splashView: UIView?
     /// Route clearnet browsing through the node's Tor SOCKS listener. Default
     /// on (opt-out), like the desktop extension. Persisted across launches.
     var torClearnet = true
@@ -75,6 +79,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         window.rootViewController = controller
         window.makeKeyAndVisible()
         self.window = window
+        presentSplash(over: controller.view)
 
         // The launch URL, if opened via an epix:// link.
         let target = (launchOptions?[.url] as? URL).flatMap(targetFrom) ?? "dashboard.epix"
@@ -129,11 +134,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         self.addressBar = field
 
         // The Epix button (Brave-style): the logo with the Tor state as a
-        // badge; tapping opens the Epix panel. The logo ships as epix-icon.png
-        // in the bundle (the same asset the Android shell uses), with the
-        // system diamond as a fallback if the resource wasn't packaged.
+        // badge; tapping opens the Epix panel. The logo is the white Epix mark
+        // on a dark disc (the disc matches the chrome, so it reads as a clean
+        // white mark) - the same reskin as the desktop toolbar (PR #231), and
+        // ships as epix-badge-white.png in the bundle, with the system diamond
+        // as a fallback if the resource wasn't packaged.
         let button = UIButton(type: .custom)
-        if let path = Bundle.main.path(forResource: "epix-icon", ofType: "png"),
+        if let path = Bundle.main.path(forResource: "epix-badge-white", ofType: "png"),
             let logo = UIImage(contentsOfFile: path) {
             let size = CGSize(width: 36, height: 36)
             let scaled = UIGraphicsImageRenderer(size: size).image { _ in
@@ -163,6 +170,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         self.torBadge = badge
 
         let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
         // Dark behind the page: WKWebView paints white before content arrives
         // (the node may still be booting on a cold start).
@@ -803,6 +811,54 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         "\(nodeBase)/\(name)/"
     }
 
+    /// Show the loading splash: the white Epix mark spinning on the dark chrome
+    /// background, over `host`, until the first page paints. On a cold start the
+    /// node bootstraps Tor for tens of seconds; this covers that wait (the
+    /// desktop browser spins its toolbar icon, PR #231) instead of a blank
+    /// dark screen.
+    private func presentSplash(over host: UIView) {
+        let overlay = UIView(frame: host.bounds)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.backgroundColor = Self.chromeBg
+
+        let mark = UIImageView()
+        if let path = Bundle.main.path(forResource: "epix-mark-white", ofType: "png") {
+            mark.image = UIImage(contentsOfFile: path)
+        }
+        mark.contentMode = .scaleAspectFit
+        mark.translatesAutoresizingMaskIntoConstraints = false
+        overlay.addSubview(mark)
+        NSLayoutConstraint.activate([
+            mark.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            mark.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            mark.widthAnchor.constraint(equalToConstant: 96),
+            mark.heightAnchor.constraint(equalToConstant: 96),
+        ])
+
+        // A steady continuous spin, one turn every 1.2s, for as long as the
+        // node is coming up.
+        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+        spin.fromValue = 0
+        spin.toValue = 2 * Double.pi
+        spin.duration = 1.2
+        spin.repeatCount = .infinity
+        mark.layer.add(spin, forKey: "spin")
+
+        host.addSubview(overlay)
+        splashView = overlay
+    }
+
+    /// Fade the loading splash out and remove it. Idempotent.
+    func hideSplash() {
+        guard let overlay = splashView else { return }
+        splashView = nil
+        UIView.animate(
+            withDuration: 0.25,
+            animations: { overlay.alpha = 0 },
+            completion: { _ in overlay.removeFromSuperview() }
+        )
+    }
+
     private func showError(_ message: String) {
         let html = "<body style='font:16px system-ui;padding:2rem;color:#f87171'>Could not start Epix: \(message)</body>"
         webView?.loadHTMLString(html, baseURL: nil)
@@ -814,6 +870,28 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         return url.host ?? url.absoluteString
             .replacingOccurrences(of: "epix://", with: "")
             .components(separatedBy: "/").first
+    }
+}
+
+/// Drops the loading splash once the first page settles - whether it painted
+/// (didFinish) or errored out (the node's own error page still shows). The
+/// splash is idempotent, so extra navigations are harmless.
+extension AppDelegate: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        hideSplash()
+    }
+
+    func webView(
+        _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
+    ) {
+        hideSplash()
+    }
+
+    func webView(
+        _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        hideSplash()
     }
 }
 
