@@ -2219,9 +2219,16 @@ fn header_map(pairs: Vec<(header::HeaderName, String)>) -> axum::http::HeaderMap
 }
 
 /// The wrapper's script-nonce CSP header value (EpixNet's `script_nonce` path).
+///
+/// `wasm-unsafe-eval` permits WebAssembly COMPILATION only (scripts still need
+/// the nonce; JS eval stays blocked). The Epix wallet injects its provider
+/// into every page, wrapper included, and its crypto is wasm - without this
+/// the wrapper console reports "blocked WebAssembly (script-src)" on every
+/// page view.
 fn wrapper_csp(script_nonce: &str) -> String {
     format!(
-        "default-src 'none'; script-src 'nonce-{script_nonce}'; img-src 'self' blob: data:; \
+        "default-src 'none'; script-src 'nonce-{script_nonce}' 'wasm-unsafe-eval'; \
+         img-src 'self' blob: data:; \
          style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *"
     )
 }
