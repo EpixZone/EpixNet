@@ -47,7 +47,7 @@ static WALLET_TOOLBAR_48: &[u8] = include_bytes!("../assets/wallet-toolbar-48.pn
 
 /// Bump when the wallet REPACKING logic changes (icon substitution, manifest
 /// transform, JS patches) but the wallet build itself does not. Folded into the
-/// version salt so an otherwise-unchanged wallet still repacks and reloads once,
+/// version stamp so an otherwise-unchanged wallet still repacks and reloads once,
 /// picking up the new packing.
 const WALLET_PACK_VERSION: u32 = 8;
 
@@ -248,7 +248,7 @@ fn find_area(s: &str, area: &str) -> Option<usize> {
 /// even rewritten, keeps serving cached bytecode) - stamping guarantees a fresh
 /// build is actually picked up, without reinstalling on every unchanged launch.
 pub fn install_extension(profile: &Path) -> Result<(), String> {
-    // Fold the substitute toolbar icons into the version salt, so changing them
+    // Fold the substitute toolbar icons into the version stamp, so changing them
     // (or the wallet build) bumps the add-on version and forces Firefox to
     // reload - otherwise a same-version XPI keeps serving the cached old icon.
     let extra = bytes_hash(WALLET_TOOLBAR_16)
@@ -276,31 +276,31 @@ pub fn install_theme_addon(profile: &Path) -> Result<(), String> {
 
 /// Zip an embedded add-on dir into `<profile>/extensions/<id>.xpi`, stamping its
 /// `manifest.json` version with a content hash so Firefox reloads it only when
-/// the embedded files change (see [`stamp_manifest_version`]). `extra_salt` folds
+/// the embedded files change (see [`stamp_manifest_version`]). `extra_stamp` folds
 /// in bytes not part of `dir` (e.g. the wallet's substitute icons) so those also
 /// bump the version; `extra_files` are added to the archive after the dir.
 fn install_addon_xpi(
     profile: &Path,
     dir: &Dir,
     ext_id: &str,
-    extra_salt: u32,
+    extra_stamp: u32,
     extra_files: &[(&str, &[u8])],
 ) -> Result<(), String> {
     let ext_dir = profile.join("extensions");
     std::fs::create_dir_all(&ext_dir).map_err(|e| format!("extensions dir: {e}"))?;
     let xpi_path = ext_dir.join(format!("{ext_id}.xpi"));
 
-    let salt = (ext_content_hash(dir).wrapping_add(extra_salt)) % 1_000_000;
+    let stamp = (ext_content_hash(dir).wrapping_add(extra_stamp)) % 1_000_000;
     // Only (re)write the XPI when its content actually changed. Rewriting an
     // identical XPI still changes the file's timestamp, and Firefox reinstalls a
     // sideloaded add-on whose file it sees as new on every launch - which tears
     // down and recreates the toolbar button, flickering the wallet icon through
-    // its reload on each start. A sidecar records the salt the on-disk XPI was
+    // its reload on each start. A sidecar records the stamp the on-disk XPI was
     // built from; if it still matches, leave the file (and its mtime) untouched.
     let marker = profile.join(format!(".{ext_id}.xpi.salt"));
-    let salt_str = salt.to_string();
+    let stamp_str = stamp.to_string();
     if xpi_path.exists()
-        && std::fs::read_to_string(&marker).map_or(false, |m| m.trim() == salt_str)
+        && std::fs::read_to_string(&marker).map_or(false, |m| m.trim() == stamp_str)
     {
         return Ok(());
     }
@@ -309,18 +309,18 @@ fn install_addon_xpi(
     let mut zip = zip::ZipWriter::new(file);
     let opts: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    write_dir_to_zip(&mut zip, dir, "", &opts, salt)?;
+    write_dir_to_zip(&mut zip, dir, "", &opts, stamp)?;
     for (name, bytes) in extra_files {
         zip.start_file(*name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
         zip.write_all(bytes).map_err(|e| format!("zip write {name}: {e}"))?;
     }
     zip.finish().map_err(|e| format!("finish xpi: {e}"))?;
-    let _ = std::fs::write(&marker, &salt_str);
+    let _ = std::fs::write(&marker, &stamp_str);
     Ok(())
 }
 
 /// A stable short hash of every embedded extension file (path + contents), used
-/// as a build-identifying version salt.
+/// as a build-identifying version stamp.
 fn ext_content_hash(dir: &Dir) -> u32 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -452,18 +452,18 @@ fn bytes_hash(bytes: &[u8]) -> u32 {
 }
 
 /// Transform a bundled `manifest.json` for packing: stamp its version with the
-/// build salt, and (for the wallet) trim the `browser_action`/`action`
+/// build stamp, and (for the wallet) trim the `browser_action`/`action`
 /// `default_icon` to only the 48px source. Firefox picks a `default_icon` by
 /// nearest size, so with a 16 and a 48 it would upscale the 16px one to the 24px
 /// button (fuzzy) for the brief moment before the wallet's script sets its own
 /// icon; leaving only 48 makes that pre-script icon a crisp downscale instead.
 /// Falls back to the plain version stamp if the manifest can't be parsed.
-fn transform_manifest(contents: &[u8], salt: u32) -> Vec<u8> {
+fn transform_manifest(contents: &[u8], stamp: u32) -> Vec<u8> {
     let Ok(mut m) = serde_json::from_slice::<serde_json::Value>(contents) else {
-        return stamp_manifest_version(contents, salt);
+        return stamp_manifest_version(contents, stamp);
     };
     if let Some(v) = m.get("version").and_then(|x| x.as_str()) {
-        m["version"] = serde_json::Value::String(format!("{v}.{salt}"));
+        m["version"] = serde_json::Value::String(format!("{v}.{stamp}"));
     }
     for key in ["browser_action", "action"] {
         if let Some(ba) = m.get_mut(key).and_then(|b| b.as_object_mut()) {
@@ -476,12 +476,12 @@ fn transform_manifest(contents: &[u8], salt: u32) -> Vec<u8> {
             }
         }
     }
-    serde_json::to_vec(&m).unwrap_or_else(|_| stamp_manifest_version(contents, salt))
+    serde_json::to_vec(&m).unwrap_or_else(|_| stamp_manifest_version(contents, stamp))
 }
 
-/// Rewrite `manifest.json`'s `"version": "X.Y.Z"` to `"X.Y.Z.<salt>"` so the
+/// Rewrite `manifest.json`'s `"version": "X.Y.Z"` to `"X.Y.Z.<stamp>"` so the
 /// add-on version tracks the build.
-fn stamp_manifest_version(contents: &[u8], salt: u32) -> Vec<u8> {
+fn stamp_manifest_version(contents: &[u8], stamp: u32) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else { return contents.to_vec() };
     let needle = "\"version\":";
     let Some(vpos) = text.find(needle) else { return contents.to_vec() };
@@ -491,7 +491,7 @@ fn stamp_manifest_version(contents: &[u8], salt: u32) -> Vec<u8> {
     let rest = &after[q1 + 1..];
     let Some(q2) = rest.find('"') else { return contents.to_vec() };
     let version = &rest[..q2];
-    let stamped = format!("{version}.{salt}");
+    let stamped = format!("{version}.{stamp}");
     let start = vpos + needle.len() + q1 + 1;
     let end = start + q2;
     let mut out = String::with_capacity(text.len() + 8);
@@ -506,7 +506,7 @@ fn write_dir_to_zip(
     dir: &Dir,
     prefix: &str,
     opts: &zip::write::FileOptions<'_, ()>,
-    salt: u32,
+    stamp: u32,
 ) -> Result<(), String> {
     for file in dir.files() {
         let name = file.path().file_name().unwrap().to_string_lossy();
@@ -520,7 +520,7 @@ fn write_dir_to_zip(
         let patched;
         let bytes: &[u8] = match entry.as_str() {
             "manifest.json" => {
-                stamped = transform_manifest(file.contents(), salt);
+                stamped = transform_manifest(file.contents(), stamp);
                 &stamped
             }
             "assets/toolbar-16.png" => WALLET_TOOLBAR_16,
@@ -536,7 +536,7 @@ fn write_dir_to_zip(
     for sub in dir.dirs() {
         let name = sub.path().file_name().unwrap().to_string_lossy();
         let p = if prefix.is_empty() { name.to_string() } else { format!("{prefix}/{name}") };
-        write_dir_to_zip(zip, sub, &p, opts, salt)?;
+        write_dir_to_zip(zip, sub, &p, opts, stamp)?;
     }
     Ok(())
 }
@@ -1066,7 +1066,7 @@ mod tests {
         install_extension(&p.0).unwrap();
         let xpi = p.0.join("extensions").join(format!("{EXT_ID}.xpi"));
         let marker = p.0.join(format!(".{EXT_ID}.xpi.salt"));
-        assert!(marker.exists(), "salt sidecar written");
+        assert!(marker.exists(), "stamp sidecar written");
         let mtime1 = std::fs::metadata(&xpi).unwrap().modified().unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(40));
@@ -1076,7 +1076,7 @@ mod tests {
 
         std::fs::write(&marker, "different").unwrap(); // simulate a content change
         std::thread::sleep(std::time::Duration::from_millis(40));
-        install_extension(&p.0).unwrap(); // salt mismatch -> rewritten
+        install_extension(&p.0).unwrap(); // stamp mismatch -> rewritten
         let mtime3 = std::fs::metadata(&xpi).unwrap().modified().unwrap();
         assert_ne!(mtime2, mtime3, "changed content must rewrite the XPI");
     }
