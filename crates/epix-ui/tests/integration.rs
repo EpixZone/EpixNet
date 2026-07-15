@@ -79,6 +79,11 @@ async fn serves_xite_files_over_http() {
     let wrapper = reqwest::get(format!("http://{addr}/epix1xite/")).await.unwrap();
     let wcsp = wrapper.headers()["content-security-policy"].to_str().unwrap();
     assert!(wcsp.contains("script-src 'nonce-"), "wrapper CSP has a script nonce: {wcsp}");
+    // WebAssembly compilation is allowed (the wallet's injected provider is
+    // wasm crypto); scripts themselves still need the nonce.
+    assert!(wcsp.contains("'wasm-unsafe-eval'"), "wasm compilation allowed: {wcsp}");
+    assert!(!wcsp.contains("unsafe-eval'") || wcsp.contains("wasm-unsafe-eval'"), "no plain unsafe-eval");
+    assert!(!wcsp.contains(" 'unsafe-eval'"), "JS eval stays blocked: {wcsp}");
     assert!(!wcsp.contains("sandbox"));
 
     let missing = reqwest::get(format!("http://{addr}/epix1xite/nope.txt"))
