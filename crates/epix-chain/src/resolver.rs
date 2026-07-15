@@ -13,7 +13,10 @@ pub const DEFAULT_RPC_URL: &str = "https://api.epix.zone";
 /// Resolves `.epix` names against the Epix chain, verifying every answer with a
 /// Merkle proof against a finalized state digest.
 pub struct XidResolver {
-    client: reqwest::Client,
+    /// The HTTP client plus the SOCKS generation it was built for. Rebuilt when
+    /// the proxy setting changes, so a client built direct before Tor came up
+    /// (Always mode) does not keep sending over clearnet afterwards.
+    client: RwLock<(u64, reqwest::Client)>,
     rpc_url: String,
     cache: RwLock<HashMap<String, (DomainSnapshot, Instant)>>,
     ttl: Duration,
@@ -32,14 +35,30 @@ const DIGEST_TTL: Duration = Duration::from_secs(3);
 
 impl XidResolver {
     pub fn new(rpc_url: impl Into<String>) -> Self {
+        let gen = crate::socks_generation();
         let client = crate::http_client(Duration::from_secs(15));
         Self {
-            client,
+            client: RwLock::new((gen, client)),
             rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
             cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(30 * 60),
             digest: RwLock::new(None),
         }
+    }
+
+    /// The HTTP client for the current SOCKS setting, rebuilding it if the proxy
+    /// changed since it was last built.
+    async fn client(&self) -> reqwest::Client {
+        let gen = crate::socks_generation();
+        {
+            let cur = self.client.read().await;
+            if cur.0 == gen {
+                return cur.1.clone();
+            }
+        }
+        let client = crate::http_client(Duration::from_secs(15));
+        *self.client.write().await = (gen, client.clone());
+        client
     }
 
     /// Override the positive-cache TTL (default 30 minutes).
@@ -145,7 +164,10 @@ impl XidResolver {
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
-        self.client
+        // Refuse to egress over clearnet before Tor is ready in Always mode.
+        crate::chain_egress_ok()?;
+        self.client()
+            .await
             .get(url)
             .send()
             .await

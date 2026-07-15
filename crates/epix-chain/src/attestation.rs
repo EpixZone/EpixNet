@@ -30,7 +30,9 @@ pub struct StateDigest {
 
 /// Verifies chain-attested content against the Epix chain's finalized state.
 pub struct ChainAttestation {
-    client: reqwest::Client,
+    /// HTTP client + the SOCKS generation it was built for (rebuilt on change,
+    /// so a direct client from before Tor came up doesn't keep sending direct).
+    client: RwLock<(u64, reqwest::Client)>,
     rpc_url: String,
     digest: RwLock<Option<(StateDigest, Instant)>>,
     finalized: RwLock<HashMap<String, (bool, Instant)>>,
@@ -39,14 +41,29 @@ pub struct ChainAttestation {
 
 impl ChainAttestation {
     pub fn new(rpc_url: impl Into<String>) -> Self {
+        let gen = crate::socks_generation();
         let client = crate::http_client(Duration::from_secs(15));
         Self {
-            client,
+            client: RwLock::new((gen, client)),
             rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
             digest: RwLock::new(None),
             finalized: RwLock::new(HashMap::new()),
             names: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// The HTTP client for the current SOCKS setting, rebuilding on change.
+    async fn client(&self) -> reqwest::Client {
+        let gen = crate::socks_generation();
+        {
+            let cur = self.client.read().await;
+            if cur.0 == gen {
+                return cur.1.clone();
+            }
+        }
+        let client = crate::http_client(Duration::from_secs(15));
+        *self.client.write().await = (gen, client.clone());
+        client
     }
 
     /// The chain's current state digest (cached for [`DIGEST_TTL`]).
@@ -130,7 +147,10 @@ impl ChainAttestation {
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
-        self.client
+        // Refuse to egress over clearnet before Tor is ready in Always mode.
+        crate::chain_egress_ok()?;
+        self.client()
+            .await
             .get(url)
             .send()
             .await

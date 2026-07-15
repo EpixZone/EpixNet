@@ -47,20 +47,58 @@ use thiserror::Error;
 /// resolvers created anywhere pick it up. `None` = direct (enable/disable modes).
 static CHAIN_SOCKS: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
+/// Whether chain RPC MUST route through Tor (set in Tor-always mode). While set
+/// and no SOCKS proxy is configured yet, a chain call is refused rather than
+/// sent direct - so the chain server never sees the node's real IP or which
+/// `.epix` name it resolves during the ~10-40s Tor bootstrap window.
+static CHAIN_REQUIRE_TOR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Bumped whenever [`set_chain_socks`] changes the proxy, so a cached HTTP
+/// client built for the old setting is rebuilt instead of sending over the
+/// wrong route (a client built direct before the proxy was set would otherwise
+/// stay direct forever).
+static SOCKS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Route all chain RPC through `socks` (e.g. `socks5h://127.0.0.1:43111`), or
 /// `None` for direct. Set by the node in Tor-always mode so the chain server
 /// never sees the node's real IP or which `.epix` names it resolves (`socks5h`
-/// resolves the hostname through Tor too, so DNS doesn't leak). Clients built
-/// after this call use the new setting.
+/// resolves the hostname through Tor too, so DNS doesn't leak). Clients rebuild
+/// to pick up the new setting.
 pub fn set_chain_socks(socks: Option<String>) {
     if let Ok(mut w) = CHAIN_SOCKS.write() {
         *w = socks.filter(|s| !s.is_empty());
     }
+    SOCKS_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether chain RPC is currently routed through a proxy.
 pub fn chain_socks() -> Option<String> {
     CHAIN_SOCKS.read().ok().and_then(|r| r.clone())
+}
+
+/// Require chain RPC to route through Tor (Tor-always mode). Set once at
+/// startup; until the SOCKS proxy is wired, [`chain_egress_ok`] refuses calls.
+pub fn set_chain_require_tor(required: bool) {
+    CHAIN_REQUIRE_TOR.store(required, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current SOCKS generation - cached HTTP clients rebuild when it changes.
+pub(crate) fn socks_generation() -> u64 {
+    SOCKS_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a chain request may egress right now. In Tor-always mode a request
+/// before the SOCKS proxy is set would go direct over clearnet, leaking the
+/// real IP and the queried name, so it is refused; the caller retries once Tor
+/// is up. A no-op in enable/disable modes.
+pub(crate) fn chain_egress_ok() -> Result<()> {
+    if CHAIN_REQUIRE_TOR.load(std::sync::atomic::Ordering::Relaxed) && chain_socks().is_none() {
+        return Err(ChainError::Rpc(
+            "Tor-always mode: chain RPC blocked until Tor is ready".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Build the HTTP client every chain RPC uses, honoring [`set_chain_socks`].
@@ -214,6 +252,11 @@ pub mod xid_identity {
         if let Some(hit) = cached(address) {
             return hit;
         }
+        // Refuse to egress over clearnet before Tor is ready in Always mode
+        // (returns without caching, so the next call retries once Tor is up).
+        if super::chain_egress_ok().is_err() {
+            return None;
+        }
         // Step 1: unverified reverse lookup - names the candidate domain.
         let client = super::http_client(Duration::from_secs(15));
         let url = format!("{DEFAULT_RPC_URL}/xid/v1/reverse_identity/{address}");
@@ -284,5 +327,38 @@ pub mod xid_identity {
         };
         store(fqdn.to_string(), Some(info.clone()));
         Some(info)
+    }
+}
+
+#[cfg(test)]
+mod egress_gate_tests {
+    use super::*;
+
+    /// The Tor-always egress gate blocks chain RPC until the SOCKS proxy is
+    /// wired, and advancing the proxy setting bumps the client-rebuild
+    /// generation. Global state is reset at the end so it doesn't leak to other
+    /// tests (no other test touches these globals).
+    #[test]
+    fn egress_gate_blocks_until_socks_then_allows() {
+        // Not required (enable/disable modes): always allowed.
+        set_chain_require_tor(false);
+        set_chain_socks(None);
+        assert!(chain_egress_ok().is_ok());
+
+        // Always mode, proxy not wired yet: refused (a direct call would leak).
+        set_chain_require_tor(true);
+        set_chain_socks(None);
+        assert!(chain_egress_ok().is_err());
+
+        // Proxy wired: allowed, and the generation advanced so a cached direct
+        // client rebuilds to route through Tor.
+        let before = socks_generation();
+        set_chain_socks(Some("socks5h://127.0.0.1:43111".into()));
+        assert!(chain_egress_ok().is_ok());
+        assert!(socks_generation() > before);
+
+        // Reset to defaults for any other test in this binary.
+        set_chain_require_tor(false);
+        set_chain_socks(None);
     }
 }

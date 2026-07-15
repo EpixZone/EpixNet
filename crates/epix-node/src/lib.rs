@@ -1506,6 +1506,11 @@ async fn serve(
             tor_mode == epix_runtime::TorMode::Always,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // In Always mode, block chain RPC from egressing over clearnet until the
+        // SOCKS proxy is wired (below), so name resolution never leaks the real
+        // IP or the queried name to api.epix.zone during the Tor bootstrap
+        // window. Set before the runtime starts, so its first resolves are gated.
+        epix_chain::set_chain_require_tor(tor_mode == epix_runtime::TorMode::Always);
     }
 
     // Privacy by default: turn the embedded I2P router on the first time a node
