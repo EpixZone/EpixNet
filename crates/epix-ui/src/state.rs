@@ -1707,6 +1707,31 @@ impl AppState {
             .map(str::to_string)
     }
 
+    /// Clear every xID resolution cache, so the next visit to any `.epix` name
+    /// does a fresh chain lookup instead of reusing a remembered address:
+    ///   - the on-disk resolve cache (`resolve-cache.json`),
+    ///   - the served xites' display-name bindings ([`Self::resolve_name`]
+    ///     checks those FIRST, so a still-registered xite that was resolved
+    ///     from a name would otherwise keep claiming it even after the name
+    ///     moves to a new address on chain),
+    ///   - the chain layer's in-memory caches (resolver snapshots, signers,
+    ///     identities).
+    /// The xites themselves stay registered and serving under their bech32
+    /// addresses; a name rebinds to whatever address the next resolve returns.
+    pub async fn xid_clear_cache(&self) {
+        if let Some(root) = &self.data_root {
+            let _ = std::fs::remove_file(root.join("resolve-cache.json"));
+        }
+        {
+            let mut xites = self.xites.write().await;
+            for x in xites.values_mut() {
+                x.display = None;
+            }
+        }
+        self.persist_sites().await;
+        epix_chain::clear_xid_caches().await;
+    }
+
     /// Normalize a serving reference to the bech32 address: an address passes
     /// through; a `.epix` name resolves via [`Self::resolve_name`]. Returns the
     /// input unchanged if the name is unknown (lookups then miss cleanly).
@@ -9137,6 +9162,54 @@ mod tests {
         assert!(state.remove_xite("deleteme.epix").await);
         assert!(!state.has_xite(addr).await);
         assert!(!state.has_xite("deleteme.epix").await);
+    }
+
+    #[tokio::test]
+    async fn xid_clear_cache_forces_fresh_resolution() {
+        // "Clear xID cache" must drop everything that can answer a name with a
+        // remembered address: the display binding on a served xite (checked
+        // first by resolve_name) and the on-disk resolve cache. Otherwise a
+        // name moved to a new address on chain keeps loading the old xite.
+        let root = tempdir().unwrap();
+        let old_addr = "epix1oldaddress";
+        let state = AppState::with_data_dir("test", root.path());
+        let site_dir = root.path().join("data").join(old_addr);
+        std::fs::create_dir_all(&site_dir).unwrap();
+        state
+            .add_xite(old_addr, XiteEntry {
+                storage: XiteStorage::new(&site_dir),
+                content: Some(json!({ "address": old_addr, "files": {} })),
+            })
+            .await;
+        state.set_display(old_addr, "dashboard.epix").await;
+        std::fs::write(
+            root.path().join("resolve-cache.json"),
+            serde_json::to_vec(&json!({
+                "dashboard.epix": { "address": old_addr, "resolved_at": 4102444800u64 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Both stale sources answer before the clear.
+        assert_eq!(state.resolve_name("dashboard.epix").await.as_deref(), Some(old_addr));
+        assert_eq!(state.canonical_key("dashboard.epix").await, old_addr);
+
+        state.xid_clear_cache().await;
+
+        // The name no longer maps anywhere: the next visit must resolve on
+        // chain. The xite itself stays registered under its address.
+        assert_eq!(state.resolve_name("dashboard.epix").await, None);
+        assert_eq!(state.canonical_key("dashboard.epix").await, "dashboard.epix");
+        assert!(state.has_xite(old_addr).await);
+        assert!(!root.path().join("resolve-cache.json").exists());
+        // The cleared binding is persisted, so it stays gone after a restart.
+        let sites: serde_json::Map<String, Value> =
+            std::fs::read(root.path().join("private/sites.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+        let entry = sites.get(old_addr).expect("xite still recorded");
+        assert!(entry.get("display").is_none(), "display binding must not persist");
     }
 
     #[tokio::test]

@@ -1122,8 +1122,11 @@ async fn serve_config_page(
     // Action buttons (e.g. Clear xID Cache) come back as `?action=<name>`.
     if let Some(action) = params.get("action") {
         if action == "xidClearCache" {
-            // The resolver cache is per-request at the chain layer, so there's
-            // nothing persistent to drop; the call succeeds like EpixNet's.
+            // Drop the on-disk resolve cache, the display-name bindings, and
+            // the chain layer's in-memory caches, so the next visit to any
+            // `.epix` name re-resolves on chain (e.g. after a name is moved
+            // to a new address).
+            ctx.state.xid_clear_cache().await;
             return Redirect::to("/Config?cleared=1").into_response();
         }
         if action == "restart" {

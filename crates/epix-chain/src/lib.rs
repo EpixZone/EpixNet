@@ -29,6 +29,17 @@ pub fn shared_resolver() -> Arc<XidResolver> {
     SHARED.get_or_init(|| Arc::new(XidResolver::new(DEFAULT_RPC_URL))).clone()
 }
 
+/// Drop every in-memory xID cache in this process - the shared resolver's
+/// verified snapshots, the signer cache, and the identity cache - so the next
+/// resolve of any name is a fresh, chain-verified lookup. Backs the node's
+/// "Clear xID cache" action; the node clears its own on-disk resolve cache and
+/// display-name bindings alongside this.
+pub async fn clear_xid_caches() {
+    shared_resolver().clear().await;
+    xid_signers::clear();
+    xid_identity::clear();
+}
+
 use thiserror::Error;
 
 /// The SOCKS proxy every chain RPC routes through, if set - the node's Arti
@@ -114,6 +125,13 @@ pub mod xid_signers {
         }
     }
 
+    /// Drop every cached signer resolution (see [`super::clear_xid_caches`]).
+    pub fn clear() {
+        if let Ok(mut guard) = CACHE.write() {
+            *guard = None;
+        }
+    }
+
     /// The addresses that may sign for `name.tld`'s user content: its linked
     /// identity addresses (all of them - a signature matching any is valid,
     /// EpixNet's `resolveUserSigners`). Empty if the name doesn't resolve.
@@ -180,6 +198,13 @@ pub mod xid_identity {
             guard
                 .get_or_insert_with(HashMap::new)
                 .insert(key, (info, Instant::now()));
+        }
+    }
+
+    /// Drop every cached identity lookup (see [`super::clear_xid_caches`]).
+    pub fn clear() {
+        if let Ok(mut guard) = CACHE.write() {
+            *guard = None;
         }
     }
 

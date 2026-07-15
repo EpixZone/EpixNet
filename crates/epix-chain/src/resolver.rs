@@ -48,6 +48,13 @@ impl XidResolver {
         self
     }
 
+    /// Drop every cached snapshot (and the finalized-digest memo), so the next
+    /// resolve of any name fetches and re-verifies from the chain.
+    pub async fn clear(&self) {
+        self.cache.write().await.clear();
+        *self.digest.write().await = None;
+    }
+
     /// Resolve `name.tld`, returning a **chain-verified** snapshot.
     ///
     /// Pipeline: fetch the record + Merkle proof, recompute the root, require it
