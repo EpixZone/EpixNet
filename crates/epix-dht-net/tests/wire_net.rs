@@ -57,6 +57,58 @@ async fn dht_announce_and_lookup_over_real_tcp() {
     assert!(found.contains(&host), "lookup over TCP returned {found:?}");
 }
 
+/// Phase 4: overlay self-addresses (onion/i2p/rns) announced over a clearnet
+/// TCP connection pass through the serving side's rewrite untouched and come
+/// back from a wire lookup - the path that makes a Tor-only or I2P-only
+/// publisher discoverable by everyone else. A clearnet `0.0.0.0` claim on the
+/// same announce is rewritten to the connection's source IP, keeping the
+/// claimed port.
+#[tokio::test]
+async fn overlay_self_addresses_round_trip_over_the_wire() {
+    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+    let mut nodes = Vec::new();
+    for i in 200..206 {
+        nodes.push(spawn_node(i, transport.clone()).await);
+    }
+    let contacts: Vec<Contact> = nodes.iter().map(|n| n.contact.clone()).collect();
+    for n in &nodes {
+        for c in &contacts {
+            n.node.add_contact(c.clone());
+        }
+    }
+
+    let key = site_key("epix1onionpublisher77777777777777777777");
+    let claims = vec![
+        PeerAddr::parse("0.0.0.0:48333").unwrap(),
+        PeerAddr::parse("expyuzz4wqqyqhjn.onion:48333").unwrap(),
+        PeerAddr::parse("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:48333").unwrap(),
+        PeerAddr::parse("rns:00112233445566778899aabbccddeeff").unwrap(),
+    ];
+    nodes[4].node.announce_all(key, &claims, &nodes[4].client).await;
+
+    let found = nodes[0].node.get_peers(key, &nodes[0].client).await;
+    // Overlay claims arrive verbatim.
+    for claim in &claims[1..] {
+        assert!(found.contains(claim), "missing {claim} in {found:?}");
+    }
+    // The clearnet 0.0.0.0 claim was rewritten to the announcer's source IP
+    // (loopback here) with the claimed listening port kept, when it reaches a
+    // remote node's store via Announce.
+    assert!(
+        found.contains(&PeerAddr::parse("127.0.0.1:48333").unwrap()),
+        "rewritten clearnet claim missing in {found:?}"
+    );
+    // Wire contract: the announcer ALSO stores its own raw 0.0.0.0 claim
+    // locally (GetPeers returns store contents verbatim, only Announce claims
+    // get the source-IP rewrite), and the lookup queries the announcer too, so
+    // the raw claim leaks back. The runtime drops it via `dialable_dht_peer`
+    // before dialing; this asserts the leak is real so that filter stays.
+    assert!(
+        found.contains(&PeerAddr::parse("0.0.0.0:48333").unwrap()),
+        "raw 0.0.0.0 claim expected in lookup (downstream must filter it): {found:?}"
+    );
+}
+
 #[tokio::test]
 async fn cold_start_probe_bootstraps_and_finds_a_site_with_no_tracker() {
     // The rare-site scenario: A serves a xite, B knows A only by ADDRESS

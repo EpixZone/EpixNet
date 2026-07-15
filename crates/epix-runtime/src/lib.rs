@@ -201,10 +201,23 @@ impl NodeRuntime {
         // site, and look up extra peers - a tracker-independent discovery path
         // (works for rare sites and if the trackers go down). Also installs the
         // PeerFinder hook so on-demand clones can query the DHT.
+        //
+        // The DHT runs over the plain clearnet transport captured at startup,
+        // so every probe, lookup, AND announce leaves from our real IP. In
+        // Tor-Always mode clearnet is deliberately closed for anonymity, so the
+        // DHT is disabled entirely there - running it would leak the real IP
+        // (and tie it to the site keys we query, or correlate it to our onion
+        // self-claim). Discovery in that mode falls back to trackers-over-Tor
+        // and PEX. Routing the DHT itself over Tor is a larger, separate change.
+        #[cfg(feature = "tor")]
+        let clearnet_dht = self.config.tor_mode != epix_tor::TorMode::Always;
+        #[cfg(not(feature = "tor"))]
+        let clearnet_dht = true;
         self.handles.push(tokio::spawn(dht_loop(
             self.state.clone(),
             self.dht.clone(),
             self.config.fileserver_port,
+            clearnet_dht,
             self.shutdown.clone(),
             self.config.announce_interval,
         )));
@@ -389,23 +402,73 @@ struct DhtPeerFinder {
 impl epix_ui::PeerFinder for DhtPeerFinder {
     async fn find(&self, address: &str) -> Vec<PeerAddr> {
         let mut peers = self.dht.get_peers(epix_dht::site_key(address), self.rpc.as_ref()).await;
-        peers.retain(|p| !matches!(p, PeerAddr::Ip(s) if s.ip().is_unspecified()));
+        peers.retain(dialable_dht_peer);
         peers
     }
 }
 
-/// Drive the DHT: seed the routing table by probing peers we already know
-/// (learning real node contacts from their responses), announce every served
-/// site under its key, and fold looked-up peers into each site's registry.
+/// Whether a DHT lookup result is a usable dial target. A NAT'd announcer
+/// stores its own `0.0.0.0:port` claim locally, and `GetPeers` returns store
+/// contents verbatim (only `Announce` claims get the source-IP rewrite), so an
+/// unspecified-IP claim leaks back through lookups and must be dropped before
+/// anyone tries to dial it. The wire test `overlay_..._round_trip` pins that
+/// this raw claim really is present in responses, so this filter stays load
+/// bearing.
+fn dialable_dht_peer(p: &PeerAddr) -> bool {
+    !matches!(p, PeerAddr::Ip(s) if s.ip().is_unspecified())
+}
+
+/// The addresses this node claims to host sites at when announcing to the
+/// DHT. Clearnet is claimed as `0.0.0.0:port` (a NAT'd node doesn't know its
+/// public IP; the serving side substitutes the connection's source IP - see
+/// `DhtService`). Overlay self-addresses pass through `rewrite_claimed_addr`
+/// verbatim, which is what makes a Tor-only or I2P-only publisher
+/// discoverable through the DHT at all. `onion` comes without its `.onion`
+/// suffix, `i2p` without `.i2p` (as AppState stores them), `rns` as the hex
+/// destination hash. Everything is gated on a real fileserver port: the port
+/// doubles as the onion/i2p virtual port, so a portless node has no inbound
+/// service to claim on any network.
+fn dht_self_claims(
+    port: u16,
+    onion: Option<String>,
+    i2p: Option<String>,
+    rns: Option<String>,
+) -> Vec<PeerAddr> {
+    let mut claims = Vec::new();
+    if port == 0 {
+        return claims;
+    }
+    claims.push(PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr"));
+    if let Some(host) = onion.filter(|h| !h.is_empty()) {
+        claims.extend(PeerAddr::parse(&format!("{host}.onion:{port}")));
+    }
+    if let Some(dest) = i2p.filter(|d| !d.is_empty()) {
+        claims.extend(PeerAddr::parse(&format!("{dest}.i2p:{port}")));
+    }
+    if let Some(hash) = rns.filter(|h| !h.is_empty()) {
+        claims.extend(PeerAddr::parse(&format!("rns:{hash}")));
+    }
+    claims
+}
+
 /// Tracker-independent discovery: a rare site findable from any peer that
 /// serves it, even with every tracker down. Runs on the announce cadence.
 async fn dht_loop(
     state: Arc<AppState>,
     dht: Arc<epix_dht::Node>,
     fileserver_port: Option<u16>,
+    clearnet_dht: bool,
     shutdown: Arc<Notify>,
     period: Duration,
 ) {
+    // Tor-Always mode: the DHT can only run over the leaky clearnet transport,
+    // so stay off it entirely. No peer finder is installed, so find_peers_dht
+    // is a no-op and the clone / user-content paths don't leak over clearnet
+    // either.
+    if !clearnet_dht {
+        state.log("INFO", "DHT: disabled in Tor-Always mode (clearnet closed)").await;
+        return;
+    }
     // Wait for the transport (set by the node just before the runtime starts).
     let transport = loop {
         if let Some(t) = state.transport().await {
@@ -421,7 +484,7 @@ async fn dht_loop(
     // (see DhtService). The port is our real listening port.
     let port = fileserver_port.unwrap_or(0);
     let me_addr = PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr");
-    let me = epix_dht::Contact::new(dht.id, me_addr.clone());
+    let me = epix_dht::Contact::new(dht.id, me_addr);
     let rpc = Arc::new(epix_dht_net::WireRpcClient::new(me, transport));
 
     // Expose DHT lookups to the on-demand clone path.
@@ -459,15 +522,27 @@ async fn dht_loop(
             }
         }
         // 2. Announce every served site and fold in any peers the DHT knows.
+        // Self-claims are rebuilt every round: the onion service, I2P session,
+        // and mesh come up minutes after start, and this is where they become
+        // discoverable (Phase 4 - a Tor/I2P-only publisher is invisible to
+        // clearnet-NAT'd nodes otherwise). This only runs outside Tor-Always
+        // mode (dht_loop returns early there), so announcing our overlay
+        // self-claims here does not correlate them to our real IP.
+        let claims = dht_self_claims(
+            port,
+            state.onion_address().await,
+            state.i2p_address().await,
+            state.rns_address().await,
+        );
         let mut found_total = 0;
         for address in &addresses {
             let key = epix_dht::site_key(address);
-            if port != 0 {
-                dht.announce(key, me_addr.clone(), rpc.as_ref()).await;
+            if !claims.is_empty() {
+                dht.announce_all(key, &claims, rpc.as_ref()).await;
             }
             let mut peers = dht.get_peers(key, rpc.as_ref()).await;
             // Drop unusable claims (a NAT'd announcer's own 0.0.0.0 entry).
-            peers.retain(|p| !matches!(p, PeerAddr::Ip(s) if s.ip().is_unspecified()));
+            peers.retain(dialable_dht_peer);
             if !peers.is_empty() {
                 found_total += peers.len();
                 state.add_peers(address, peers).await;
@@ -1236,11 +1311,47 @@ fn is_public_ipv4(ip: &std::net::IpAddr) -> bool {
 
 #[cfg(all(test, feature = "inbound-seeding"))]
 mod tests {
-    use super::is_public_ipv4;
+    use super::{dht_self_claims, is_public_ipv4};
+    use epix_core::PeerAddr;
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn dht_self_claims_cover_every_configured_network() {
+        // Clearnet only: the 0.0.0.0 claim the serving side rewrites.
+        let claims = dht_self_claims(48333, None, None, None);
+        assert_eq!(claims, vec![PeerAddr::parse("0.0.0.0:48333").unwrap()]);
+
+        // All networks up: one claim per network, fileserver port throughout
+        // (it doubles as the onion/i2p virtual port).
+        let claims = dht_self_claims(
+            48333,
+            Some("expyuzz4wqqyqhjn".into()),
+            Some("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32".into()),
+            Some("00112233445566778899aabbccddeeff".into()),
+        );
+        let strings: Vec<String> = claims.iter().map(|c| c.to_string()).collect();
+        assert_eq!(
+            strings,
+            vec![
+                "0.0.0.0:48333",
+                "expyuzz4wqqyqhjn.onion:48333",
+                "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:48333",
+                "rns:00112233445566778899aabbccddeeff",
+            ]
+        );
+
+        // No fileserver port = no inbound service on any network: claim
+        // nothing (an onion claim with port 0 is not connectable either).
+        assert!(dht_self_claims(0, Some("expyuzz4wqqyqhjn".into()), None, None).is_empty());
+
+        // Empty overlay hosts (address not yet learned) are skipped, not
+        // announced as junk like ".onion:48333".
+        let claims = dht_self_claims(48333, Some(String::new()), Some(String::new()), None);
+        assert_eq!(claims.len(), 1);
     }
 
     #[test]

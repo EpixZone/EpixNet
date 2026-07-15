@@ -133,13 +133,31 @@ impl Node {
 
     /// Announce that `self_peer` hosts `key` to the K nodes closest to `key`.
     pub async fn announce(&self, key: NodeId, self_peer: PeerAddr, rpc: &dyn RpcClient) {
-        self.store.lock().unwrap().add(key, self_peer.clone());
-        let closest = self.find_node(key, rpc).await;
-        let sends = closest.into_iter().map(|c| {
-            let peer = self_peer.clone();
-            async move {
-                let _ = rpc.send(&c, Request::Announce(key, peer)).await;
+        self.announce_all(key, std::slice::from_ref(&self_peer), rpc).await;
+    }
+
+    /// Announce several self-addresses (clearnet + onion + i2p + rns) for
+    /// `key` with a single lookup: one `find_node`, then one Announce RPC per
+    /// (node, address) pair - the wire carries one peer per message, so this
+    /// stays compatible with older nodes.
+    pub async fn announce_all(&self, key: NodeId, self_peers: &[PeerAddr], rpc: &dyn RpcClient) {
+        if self_peers.is_empty() {
+            return;
+        }
+        {
+            let mut store = self.store.lock().unwrap();
+            for peer in self_peers {
+                store.add(key, peer.clone());
             }
+        }
+        let closest = self.find_node(key, rpc).await;
+        let sends = closest.iter().flat_map(|c| {
+            self_peers.iter().map(move |p| {
+                let peer = p.clone();
+                async move {
+                    let _ = rpc.send(c, Request::Announce(key, peer)).await;
+                }
+            })
         });
         join_all(sends).await;
     }

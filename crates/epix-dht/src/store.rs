@@ -5,6 +5,14 @@ use epix_core::PeerAddr;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Cap on peers kept per key. Announce is unauthenticated (any node can claim
+/// any address for any key), so an attacker could otherwise loop distinct
+/// fabricated onion/i2p addresses and grow one key's list without bound. When
+/// full, the oldest entry is evicted - a genuine host re-announces every round,
+/// so real peers churn back in while a one-shot flood ages out. K-per-key is
+/// far above the K closest honest announcers a real site attracts.
+const MAX_PEERS_PER_KEY: usize = 128;
+
 pub struct PeerStore {
     entries: HashMap<NodeId, Vec<(PeerAddr, Instant)>>,
     ttl: Duration,
@@ -20,7 +28,20 @@ impl PeerStore {
         let list = self.entries.entry(key).or_default();
         match list.iter_mut().find(|(p, _)| *p == peer) {
             Some(entry) => entry.1 = Instant::now(),
-            None => list.push((peer, Instant::now())),
+            None => {
+                if list.len() >= MAX_PEERS_PER_KEY {
+                    // Drop expired first; only evict the oldest if still full.
+                    list.retain(|(_, t)| t.elapsed() < self.ttl);
+                    if list.len() >= MAX_PEERS_PER_KEY {
+                        if let Some(oldest) =
+                            (0..list.len()).min_by_key(|&i| list[i].1)
+                        {
+                            list.remove(oldest);
+                        }
+                    }
+                }
+                list.push((peer, Instant::now()));
+            }
         }
     }
 
@@ -63,5 +84,27 @@ mod tests {
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&a) && peers.contains(&b));
         assert!(store.get(&NodeId::hash(b"other")).is_empty());
+    }
+
+    #[test]
+    fn per_key_peer_count_is_capped() {
+        let mut store = PeerStore::new(Duration::from_secs(3600));
+        let key = NodeId::hash(b"site");
+        // A flood of distinct fabricated addresses for one key.
+        for i in 0..(MAX_PEERS_PER_KEY + 50) {
+            store.add(key, PeerAddr::parse(&format!("10.0.{}.{}:1", i / 250, i % 250)).unwrap());
+        }
+        assert_eq!(store.get(&key).len(), MAX_PEERS_PER_KEY, "list stays capped");
+
+        // A genuine host that keeps announcing is retained (re-announce
+        // refreshes its timestamp, so it is never the oldest evicted).
+        let host = PeerAddr::parse("203.0.113.9:26552").unwrap();
+        for _ in 0..10 {
+            store.add(key, host.clone());
+            for i in 0..20 {
+                store.add(key, PeerAddr::parse(&format!("11.0.{}.{}:1", i / 250, i % 250)).unwrap());
+            }
+        }
+        assert!(store.get(&key).contains(&host), "re-announcing host survives the cap");
     }
 }
