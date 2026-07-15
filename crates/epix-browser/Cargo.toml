@@ -52,6 +52,11 @@ windows-sys = { version = "0.59", features = [
 
 # build.rs downloads the prebuilt wallet extension (the epix-wallet repo's
 # wallet-dist release) into shells/wallet-ext when it is not staged locally.
+# Tests write into a securely-created unique temp dir (not a predictable name
+# under the shared temp dir).
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 epix-build = { path = "../epix-build" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

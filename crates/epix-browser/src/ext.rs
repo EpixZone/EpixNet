@@ -756,28 +756,18 @@ fn nmh_binary() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A unique scratch profile dir, removed on drop.
-    struct TmpProfile(PathBuf);
+    /// A scratch profile dir with a securely-created unique name (via `tempfile`,
+    /// not a predictable name under the shared temp dir). Field `.0` is the path;
+    /// the `TempDir` guard removes the directory when the profile is dropped.
+    struct TmpProfile(PathBuf, #[allow(dead_code)] tempfile::TempDir);
     impl TmpProfile {
         fn new() -> Self {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "epix-theme-test-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            TmpProfile(dir)
+            let td = tempfile::tempdir().unwrap();
+            TmpProfile(td.path().to_path_buf(), td)
         }
         fn chrome(&self, name: &str) -> String {
             std::fs::read_to_string(self.0.join("chrome").join(name)).unwrap()
-        }
-    }
-    impl Drop for TmpProfile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 

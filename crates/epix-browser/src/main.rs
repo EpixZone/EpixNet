@@ -510,28 +510,7 @@ fn find_firefox() -> Option<PathBuf> {
         .map(PathBuf::from)
         .collect()
     } else if cfg!(target_os = "windows") {
-        let mut v = Vec::new();
-        // Per-user installs land under %LOCALAPPDATA% (Firefox installs there
-        // without admin). Check those first, unsigned-capable editions ahead of
-        // release, then the machine-wide Program Files locations.
-        let local = std::env::var("LOCALAPPDATA").ok();
-        if let Some(local) = &local {
-            for sub in ["Firefox ESR", "Firefox Developer Edition", "Firefox Nightly"] {
-                v.push(PathBuf::from(local).join(sub).join("firefox.exe"));
-            }
-        }
-        for p in [
-            "C:\\Program Files\\Firefox ESR\\firefox.exe",
-            "C:\\Program Files\\Firefox Developer Edition\\firefox.exe",
-            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
-            "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
-        ] {
-            v.push(PathBuf::from(p));
-        }
-        if let Some(local) = &local {
-            v.push(PathBuf::from(local).join("Mozilla Firefox").join("firefox.exe"));
-        }
-        v
+        windows_firefox_candidates()
     } else {
         ["/usr/bin/firefox-esr", "/usr/bin/firefox", "/usr/local/bin/firefox", "/snap/bin/firefox"]
             .iter()
@@ -539,6 +518,31 @@ fn find_firefox() -> Option<PathBuf> {
             .collect()
     };
     candidates.into_iter().find(|p| p.exists())
+}
+
+/// Windows Firefox candidate paths: per-user `%LOCALAPPDATA%` installs (which
+/// need no admin) first, unsigned-capable editions ahead of release, then the
+/// machine-wide Program Files locations.
+fn windows_firefox_candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    let local = std::env::var("LOCALAPPDATA").ok();
+    if let Some(local) = &local {
+        for sub in ["Firefox ESR", "Firefox Developer Edition", "Firefox Nightly"] {
+            v.push(PathBuf::from(local).join(sub).join("firefox.exe"));
+        }
+    }
+    for p in [
+        "C:\\Program Files\\Firefox ESR\\firefox.exe",
+        "C:\\Program Files\\Firefox Developer Edition\\firefox.exe",
+        "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+        "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
+    ] {
+        v.push(PathBuf::from(p));
+    }
+    if let Some(local) = &local {
+        v.push(PathBuf::from(local).join("Mozilla Firefox").join("firefox.exe"));
+    }
+    v
 }
 
 /// A Firefox bundled next to this launcher inside our `.app` / install dir.
