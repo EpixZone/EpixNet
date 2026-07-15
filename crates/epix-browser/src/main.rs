@@ -408,9 +408,20 @@ fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
     if let Err(e) = ext::install_extension(profile) {
         eprintln!("· note: could not install the wallet extension: {e}");
     }
+    // The Epix theme add-on (light + dark chrome colours).
+    if let Err(e) = ext::install_theme_addon(profile) {
+        eprintln!("· note: could not install the theme add-on: {e}");
+    }
+    // Make the Epix theme the active one the first time it is available (Firefox
+    // installs a sideloaded theme disabled). Runs before Firefox launches and
+    // only acts once, so switching themes later sticks.
+    ext::activate_theme_once(profile);
     // Profiles that installed the wallet before the manifest pinned it to the
     // toolbar: move it out of the puzzle-piece menu.
     ext::ensure_wallet_pinned(profile);
+    // Ensure a flexible spacer the chrome CSS can grow into the gap that sets the
+    // Epix button apart from the right-aligned extensions cluster.
+    ext::ensure_epix_spacer(profile);
     if let Err(e) = ext::install_native_host() {
         eprintln!("· note: could not install the native host: {e}");
     }
@@ -488,24 +499,50 @@ fn find_firefox() -> Option<PathBuf> {
     // Prefer editions that allow our unsigned extension (ESR / Developer /
     // Nightly) over release Firefox, since the extension is core to the
     // security contract.
-    let candidates: &[&str] = if cfg!(target_os = "macos") {
-        &[
+    let candidates: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        [
             "/Applications/Firefox ESR.app/Contents/MacOS/firefox",
             "/Applications/Firefox Developer Edition.app/Contents/MacOS/firefox",
             "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
             "/Applications/Firefox.app/Contents/MacOS/firefox",
         ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
     } else if cfg!(target_os = "windows") {
-        &[
-            "C:\\Program Files\\Firefox ESR\\firefox.exe",
-            "C:\\Program Files\\Firefox Developer Edition\\firefox.exe",
-            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
-            "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
-        ]
+        windows_firefox_candidates()
     } else {
-        &["/usr/bin/firefox-esr", "/usr/bin/firefox", "/usr/local/bin/firefox", "/snap/bin/firefox"]
+        ["/usr/bin/firefox-esr", "/usr/bin/firefox", "/usr/local/bin/firefox", "/snap/bin/firefox"]
+            .iter()
+            .map(PathBuf::from)
+            .collect()
     };
-    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Windows Firefox candidate paths: per-user `%LOCALAPPDATA%` installs (which
+/// need no admin) first, unsigned-capable editions ahead of release, then the
+/// machine-wide Program Files locations.
+fn windows_firefox_candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    let local = std::env::var("LOCALAPPDATA").ok();
+    if let Some(local) = &local {
+        for sub in ["Firefox ESR", "Firefox Developer Edition", "Firefox Nightly"] {
+            v.push(PathBuf::from(local).join(sub).join("firefox.exe"));
+        }
+    }
+    for p in [
+        "C:\\Program Files\\Firefox ESR\\firefox.exe",
+        "C:\\Program Files\\Firefox Developer Edition\\firefox.exe",
+        "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+        "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
+    ] {
+        v.push(PathBuf::from(p));
+    }
+    if let Some(local) = &local {
+        v.push(PathBuf::from(local).join("Mozilla Firefox").join("firefox.exe"));
+    }
+    v
 }
 
 /// A Firefox bundled next to this launcher inside our `.app` / install dir.
@@ -901,6 +938,10 @@ fn write_profile(
     // Load and auto-enable the bundled (unsigned) extension from the profile.
     // Only on editions that allow it; harmless prefs otherwise.
     let ext_prefs = if ext_capable {
+        // Note: the Epix theme is *not* forced here via extensions.activeThemeID.
+        // A sideloaded theme installs disabled and that pref alone won't switch
+        // to it; ext::activate_theme_once handles activation in the add-on DB,
+        // once, so a user who later picks another theme keeps it.
         "user_pref(\"xpinstall.signatures.required\", false);\n\
          user_pref(\"extensions.autoDisableScopes\", 0);\n\
          user_pref(\"extensions.enabledScopes\", 5);\n\

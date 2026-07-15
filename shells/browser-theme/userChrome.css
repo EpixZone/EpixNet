@@ -1,60 +1,19 @@
-/* Managed rules (hide dead chrome, size the wallet button). Kept in a separate
- * file the launcher rewrites every launch; this @import must stay at the top. */
+/* Managed rules (hide dead chrome, round the address bar, reskin the Epix
+ * icon). Kept in a separate file the launcher rewrites every launch; this
+ * @import must stay at the top. */
 @import "epix-managed.css";
 
-/* Epix browser chrome theme (starter).
+/* epix-userchrome v2
  *
- * This restyles Firefox's chrome to look like Epix. It is written into the
- * profile's chrome/ dir on first launch and NOT overwritten afterwards, so you
- * can edit it live: change a value, restart the browser, see it. This is the
- * CSS-only styling surface (full native rebrand is fork/unbranded-build work).
+ * Epix browser chrome overrides (starter).
  *
- * Requires toolkit.legacyUserProfileCustomizations.stylesheets=true (the
- * launcher sets it).
+ * The Epix look now comes from a proper Firefox theme add-on with light and
+ * dark variants, so colours live there and follow your system light/dark
+ * automatically. You can also switch to any other theme in about:addons and it
+ * will apply - this file no longer hardcodes colours that would override it.
+ *
+ * This file is for your own tweaks. It is written once and never overwritten,
+ * so you can edit it live: change a rule, restart the browser, see it. Requires
+ * toolkit.legacyUserProfileCustomizations.stylesheets=true (the launcher sets
+ * it). Put custom rules below.
  */
-
-:root {
-  --epix-bg: #0b0e14;
-  --epix-bg2: #111725;
-  --epix-fg: #cbd5e1;
-  --epix-accent: #8a4bdb;
-  --epix-border: #1e293b;
-}
-
-/* Toolbar + tab strip background. */
-#navigator-toolbox {
-  background-color: var(--epix-bg) !important;
-  border-bottom: 1px solid var(--epix-border) !important;
-}
-#nav-bar,
-#TabsToolbar,
-#PersonalToolbar {
-  background-color: var(--epix-bg) !important;
-  color: var(--epix-fg) !important;
-}
-
-/* Address bar. */
-#urlbar,
-#searchbar {
-  background-color: var(--epix-bg2) !important;
-  color: var(--epix-fg) !important;
-  border: 1px solid var(--epix-border) !important;
-  border-radius: 8px !important;
-}
-#urlbar[focused="true"] {
-  border-color: var(--epix-accent) !important;
-}
-
-/* Tabs. */
-.tabbrowser-tab {
-  color: var(--epix-fg) !important;
-}
-.tab-background[selected] {
-  background-color: var(--epix-bg2) !important;
-  border-top: 2px solid var(--epix-accent) !important;
-}
-
-/* Toolbar buttons inherit the accent on hover. */
-toolbarbutton:hover {
-  fill: var(--epix-accent) !important;
-}

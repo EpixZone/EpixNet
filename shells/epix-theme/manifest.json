@@ -1,0 +1,74 @@
+{
+  "manifest_version": 2,
+  "name": "Epix",
+  "version": "1.0.0",
+  "description": "Epix browser theme. Follows your system light/dark automatically.",
+  "applications": {
+    "gecko": {
+      "id": "theme@epix.zone",
+      "strict_min_version": "89.0"
+    }
+  },
+  "theme": {
+    "colors": {
+      "frame": "#FEFEFE",
+      "frame_inactive": "#F2F2F6",
+      "toolbar": "#F6F6F9",
+      "toolbar_text": "#1D1D1F",
+      "toolbar_field": "#FEFEFE",
+      "toolbar_field_text": "#1D1D1F",
+      "toolbar_field_border": "#DCDCE3",
+      "toolbar_field_focus": "#FEFEFE",
+      "toolbar_field_text_focus": "#1D1D1F",
+      "toolbar_field_border_focus": "#8A4BDB",
+      "toolbar_top_separator": "#DCDCE3",
+      "toolbar_bottom_separator": "#DCDCE3",
+      "tab_selected": "#FEFEFE",
+      "tab_line": "#8A4BDB",
+      "tab_text": "#1D1D1F",
+      "tab_background_text": "#404045",
+      "icons": "#404045",
+      "icons_attention": "#8A4BDB",
+      "popup": "#FEFEFE",
+      "popup_text": "#1D1D1F",
+      "popup_border": "#DCDCE3",
+      "popup_highlight": "#8A4BDB",
+      "popup_highlight_text": "#FEFEFE",
+      "ntp_background": "#FEFEFE",
+      "ntp_text": "#1D1D1F",
+      "button_background_hover": "rgba(138,75,219,0.12)",
+      "button_background_active": "rgba(138,75,219,0.20)"
+    }
+  },
+  "dark_theme": {
+    "colors": {
+      "frame": "#151517",
+      "frame_inactive": "#1D1D1F",
+      "toolbar": "#1D1D1F",
+      "toolbar_text": "#F6F6F9",
+      "toolbar_field": "#242428",
+      "toolbar_field_text": "#F6F6F9",
+      "toolbar_field_border": "#2E2E32",
+      "toolbar_field_focus": "#242428",
+      "toolbar_field_text_focus": "#F6F6F9",
+      "toolbar_field_border_focus": "#8A4BDB",
+      "toolbar_top_separator": "#2E2E32",
+      "toolbar_bottom_separator": "#2E2E32",
+      "tab_selected": "#1D1D1F",
+      "tab_line": "#8A4BDB",
+      "tab_text": "#F6F6F9",
+      "tab_background_text": "#DCDCE3",
+      "icons": "#DCDCE3",
+      "icons_attention": "#8A4BDB",
+      "popup": "#1D1D1F",
+      "popup_text": "#F6F6F9",
+      "popup_border": "#2E2E32",
+      "popup_highlight": "#8A4BDB",
+      "popup_highlight_text": "#FEFEFE",
+      "ntp_background": "#151517",
+      "ntp_text": "#F6F6F9",
+      "button_background_hover": "rgba(138,75,219,0.20)",
+      "button_background_active": "rgba(138,75,219,0.30)"
+    }
+  }
+}
