@@ -2171,7 +2171,18 @@ impl AppState {
 
     /// Persist every served xite's peers to `peers.json` (keyed by signed content
     /// address, so aliases share one list). Called periodically by the runtime.
+    /// Evicts dead peers first, so addresses that stopped answering (a node's
+    /// old port after a config change, adopted ephemeral ports) age out of the
+    /// table instead of being persisted and PEX-shared forever.
     pub async fn persist_peers(&self) {
+        let dropped: usize = {
+            let mut xites = self.xites.write().await;
+            let now = now_secs();
+            xites.values_mut().map(|x| x.peers.evict_dead(now)).sum()
+        };
+        if dropped > 0 {
+            self.log("INFO", format!("Evicted {dropped} dead peer(s)")).await;
+        }
         if !self.plugin_enabled("PeerDb").await {
             return;
         }

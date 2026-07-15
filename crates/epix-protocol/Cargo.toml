@@ -8,7 +8,7 @@ description = "EpixNet wire protocol: msgpack framing, handshake, and the FileRe
 epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
 rmpv = "1"
-tokio = { version = "1", features = ["io-util", "net", "rt"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "time", "sync"] }
 getrandom = "0.2"
 hex = "0.4"
 async-trait = "0.1"
@@ -17,4 +17,4 @@ async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
 epix-content = { path = "../epix-content" }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time", "test-util"] }
