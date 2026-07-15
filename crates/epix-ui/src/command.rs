@@ -3171,15 +3171,17 @@ fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new(program).arg(path).spawn();
 }
 
-/// `xidClearCache` - clear the xID resolver cache. The node's resolver cache is
-/// per-process at the chain layer; clearing it here is a successful no-op.
+/// `xidClearCache` - clear every xID resolution cache (the on-disk resolve
+/// cache, the display-name bindings, and the chain layer's in-memory caches),
+/// so the next visit to any `.epix` name re-resolves on chain.
 struct XidClearCache;
 #[async_trait]
 impl WsCommand for XidClearCache {
     fn name(&self) -> &'static str {
         "xidClearCache"
     }
-    async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        s.state.xid_clear_cache().await;
         Ok(Value::from("ok"))
     }
 }
