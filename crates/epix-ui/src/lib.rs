@@ -2011,7 +2011,7 @@ async fn serve_file(
                     crate::state::LoadingFile::Ready(_) if gated => {} // wait for the core set
                     crate::state::LoadingFile::Ready(bytes) => {
                         let bytes = substitute_html_vars(&ctx.state, &k, &ct, bytes).await;
-                        return (file_headers(&ct, StatusCode::OK), bytes).into_response();
+                        return serve_file_conditional(&ct, &headers, bytes);
                     }
                     crate::state::LoadingFile::NotInSite => {
                         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -2050,7 +2050,7 @@ async fn serve_file(
     match ctx.state.read_file(&address, &path).await {
         Some(bytes) => {
             let bytes = substitute_html_vars(&ctx.state, &address, &ct, bytes).await;
-            (file_headers(&ct, StatusCode::OK), bytes).into_response()
+            serve_file_conditional(&ct, &headers, bytes)
         }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
@@ -2198,13 +2198,49 @@ fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap
     let cacheable = matches!(base, "image" | "video" | "font")
         || content_type.starts_with("application/javascript")
         || content_type.starts_with("text/css");
+    // `no-cache` = store, but revalidate before every use (the ETag the file
+    // handler adds makes that a 304 while unchanged). EpixNet served these
+    // with max-age=600, but the wrapper navigates its iframe from SCRIPT, so
+    // a user's hard reload never bypass-caches the inner site's assets: a
+    // freshly published script kept running stale for up to 10 minutes with
+    // no recourse. Revalidation makes a publish visible on the next reload.
     let cache = if matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) && cacheable {
-        "public, max-age=600"
+        "public, no-cache"
     } else {
         "no-cache, no-store, private, must-revalidate, max-age=0"
     };
     pairs.push((header::CACHE_CONTROL, cache.to_string()));
     header_map(pairs)
+}
+
+/// Serve site-file bytes with an ETag, answering a matching `If-None-Match`
+/// with `304 Not Modified` so the `no-cache` policy above stays cheap: an
+/// unchanged file revalidates with an empty response instead of a re-download.
+/// The tag is a content hash, so it changes exactly when a publish (or a local
+/// edit) changes the file.
+fn serve_file_conditional(
+    ct: &str,
+    req_headers: &axum::http::HeaderMap,
+    bytes: Vec<u8>,
+) -> Response {
+    let etag = format!("\"{:016x}\"", {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    });
+    let mut headers = file_headers(ct, StatusCode::OK);
+    if let Ok(v) = header::HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, v);
+    }
+    let matches = req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| inm.split(',').any(|t| t.trim() == etag));
+    if matches {
+        return (StatusCode::NOT_MODIFIED, headers).into_response();
+    }
+    (headers, bytes).into_response()
 }
 
 /// Build a `HeaderMap` from name/value pairs (bad values are skipped).
