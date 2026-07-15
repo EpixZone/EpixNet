@@ -53,7 +53,7 @@ impl From<Address> for String {
 mod tests {
     use super::*;
 
-    const DASH: &str = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+    const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
     #[test]
     fn parse_valid_and_invalid() {

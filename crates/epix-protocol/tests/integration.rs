@@ -104,7 +104,7 @@ async fn download_and_verify_signed_content_over_loopback() {
 #[tokio::test]
 #[ignore]
 async fn live_node_handshake_and_getfile() {
-    let xite = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+    let xite = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
     let addr: std::net::SocketAddr = "127.0.0.1:20790".parse().unwrap();
     let mut conn = Connection::connect(&TcpTransport, &PeerAddr::Ip(addr)).await.unwrap();
     let hs = conn.handshake().await.unwrap();

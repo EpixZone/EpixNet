@@ -188,9 +188,9 @@ mod tests {
     #[test]
     fn content_db_tracks_xite_files() {
         let cdb = ContentDb::open(Database::open_in_memory().unwrap()).unwrap();
-        let xite = cdb.add_xite("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t").unwrap();
+        let xite = cdb.add_xite("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g").unwrap();
         // add_xite is idempotent.
-        assert_eq!(xite, cdb.add_xite("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t").unwrap());
+        assert_eq!(xite, cdb.add_xite("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g").unwrap());
 
         cdb.set_content(xite, "content.json", 1777, 9120).unwrap();
         cdb.set_content(xite, "data/users/content.json", 1700, 50).unwrap();
