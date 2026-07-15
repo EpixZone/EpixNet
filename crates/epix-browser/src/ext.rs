@@ -253,6 +253,7 @@ pub fn install_extension(profile: &Path) -> Result<(), String> {
     // reload - otherwise a same-version XPI keeps serving the cached old icon.
     let extra = bytes_hash(WALLET_TOOLBAR_16)
         .wrapping_add(bytes_hash(WALLET_TOOLBAR_48))
+        .wrapping_add(bytes_hash(EPIX_URLBAR_JS))
         .wrapping_add(WALLET_PACK_VERSION);
     // The wallet renders its (status-overlaid) toolbar icon only at the sizes in
     // its `M=[16,48]` list, and its own small canvas render is softer than
@@ -261,7 +262,7 @@ pub fn install_extension(profile: &Path) -> Result<(), String> {
     // down to the ~24px button; `transform_manifest` likewise trims the
     // `default_icon` to only 48px so the icon Firefox shows BEFORE the script
     // runs is a crisp downscale too, not a fuzzy 16px upscale.
-    install_addon_xpi(profile, &EXT, EXT_ID, extra, &[])
+    install_addon_xpi(profile, &EXT, EXT_ID, extra, &[("epix-urlbar.js", EPIX_URLBAR_JS)])
 }
 
 /// Install the Epix chrome theme add-on as an XPI. It is enabled by the same
@@ -443,6 +444,47 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
     patch_wallet_boot_spin(base).unwrap_or_else(|| base.to_vec())
 }
 
+/// URL-bar navigation for bare xite addresses. A bech32 `epix1…` address has no
+/// dot, so Firefox's fixup sends it to the default search engine instead of
+/// navigating (a dotted `name.epix` navigates natively). This background script
+/// catches exactly that search - a main-frame query that IS a bech32 address -
+/// before it leaves, and goes to the xite instead, like the mobile shells'
+/// address bars. Scoped to DuckDuckGo, the managed profile's default engine.
+const EPIX_URLBAR_JS: &[u8] = concat!(
+    "// Managed by epix-browser (added at pack time).\n",
+    "(() => {\n",
+    "  const api = globalThis.browser || globalThis.chrome;\n",
+    "  if (!api || !api.webRequest) return;\n",
+    "  const ADDR = /^epix1[a-z0-9]{20,80}$/;\n",
+    "  api.webRequest.onBeforeRequest.addListener(\n",
+    "    (details) => {\n",
+    "      try {\n",
+    "        const q = (new URL(details.url).searchParams.get(\"q\") || \"\").trim();\n",
+    "        if (ADDR.test(q)) return { redirectUrl: \"https://\" + q + \"/\" };\n",
+    "      } catch (_) {}\n",
+    "      return {};\n",
+    "    },\n",
+    "    { urls: [\"*://duckduckgo.com/*\", \"*://*.duckduckgo.com/*\"], types: [\"main_frame\"] },\n",
+    "    [\"blocking\"]\n",
+    "  );\n",
+    "})();\n",
+)
+.as_bytes();
+
+/// Add the URL-bar script to the wallet's background page, right after the
+/// polyfill so it registers before the wallet's own bundles. A no-op when the
+/// anchor isn't present exactly once (a changed wallet build) - the search
+/// then simply keeps its default behaviour, never breaks.
+fn patch_background_html(contents: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(contents).ok()?;
+    let anchor = "<script src=\"browser-polyfill.js\"></script>";
+    if text.matches(anchor).count() != 1 {
+        return None;
+    }
+    let replacement = format!("{anchor}<script src=\"epix-urlbar.js\"></script>");
+    Some(text.replacen(anchor, &replacement, 1).into_bytes())
+}
+
 /// A stable short hash of a byte slice (same family as [`ext_content_hash`]).
 fn bytes_hash(bytes: &[u8]) -> u32 {
     use std::hash::{Hash, Hasher};
@@ -525,6 +567,13 @@ fn write_dir_to_zip(
             }
             "assets/toolbar-16.png" => WALLET_TOOLBAR_16,
             "assets/toolbar-48.png" => WALLET_TOOLBAR_48,
+            // The wallet's background page gains the URL-bar address script
+            // (packed alongside via `extra_files`).
+            "background.html" => {
+                patched = patch_background_html(file.contents())
+                    .unwrap_or_else(|| file.contents().to_vec());
+                &patched
+            }
             _ if entry.ends_with(".js") => {
                 patched = patch_wallet_js(file.contents());
                 &patched
@@ -1129,5 +1178,47 @@ mod tests {
         // A file matching neither pattern passes through byte-for-byte.
         let plain = b"function unrelated(){return 1}";
         assert_eq!(patch_wallet_js(plain), plain);
+    }
+
+    // The background page gains the URL-bar address script, after the polyfill
+    // and before the wallet's own bundles; a changed page is left untouched.
+    #[test]
+    fn patch_background_html_inserts_urlbar_script() {
+        let src = b"<html><head><script src=\"browser-polyfill.js\"></script><script defer=\"defer\" src=\"background.bundle.js\"></script></head></html>";
+        let out = patch_background_html(src).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        let poly = s.find("browser-polyfill.js").unwrap();
+        let urlbar = s.find("epix-urlbar.js").unwrap();
+        let bundle = s.find("background.bundle.js").unwrap();
+        assert!(poly < urlbar && urlbar < bundle, "script order polyfill < urlbar < bundles: {s}");
+        // No anchor -> untouched.
+        assert!(patch_background_html(b"<html>changed build</html>").is_none());
+        // The injected script only rewrites bech32-address searches.
+        let js = std::str::from_utf8(EPIX_URLBAR_JS).unwrap();
+        assert!(js.contains("duckduckgo.com"), "scoped to the managed default engine");
+        assert!(js.contains("main_frame"), "only top-level navigations");
+        assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 query match");
+    }
+
+    // The packed wallet XPI carries the URL-bar script and loads it from the
+    // background page.
+    #[test]
+    fn install_extension_packs_urlbar_script() {
+        let p = TmpProfile::new();
+        std::fs::create_dir_all(&p.0).unwrap();
+        install_extension(&p.0).unwrap();
+        let xpi = p.0.join("extensions").join(format!("{EXT_ID}.xpi"));
+        let file = std::fs::File::open(&xpi).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        {
+            let mut entry = zip.by_name("epix-urlbar.js").expect("epix-urlbar.js packed");
+            let mut js = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut js).unwrap();
+            assert!(js.contains("onBeforeRequest"), "intercept registered: {js}");
+        }
+        let mut entry = zip.by_name("background.html").expect("background page present");
+        let mut html = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut html).unwrap();
+        assert!(html.contains("epix-urlbar.js"), "background page loads the script: {html}");
     }
 }

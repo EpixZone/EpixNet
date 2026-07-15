@@ -323,8 +323,8 @@ async fn host_allowed(ctx: &Ctx, host: &str) -> bool {
     if bare == "localhost" || bare.parse::<std::net::IpAddr>().is_ok() {
         return true; // IPs are not affected by DNS rebinding
     }
-    if bare.ends_with(".epix") {
-        return true;
+    if is_proxy_host(bare) {
+        return true; // *.epix names and bare epix1… addresses (proxy origins)
     }
     // Operator-listed extra hosts (reverse proxies etc.), one per line.
     ctx.state
@@ -432,7 +432,7 @@ fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
     if plausible_xite_ref(first_seg) {
         return Some(first_seg.to_string());
     }
-    if ref_host.ends_with(".epix") {
+    if is_proxy_host(ref_host) {
         return Some(ref_host.to_string());
     }
     ref_path.split('/').next().filter(|s| !s.is_empty()).map(str::to_string)
@@ -459,9 +459,11 @@ fn is_global_path(path: &str) -> bool {
 }
 
 /// True if `host` (no port) is a transparent-proxy xite host - a `.epix` name
-/// Firefox routed to us - rather than the loopback UI bind.
+/// or a bare bech32 `epix1…` address Firefox routed to us - rather than the
+/// loopback UI bind.
 fn is_proxy_host(host: &str) -> bool {
-    host.ends_with(".epix") && !host.is_empty()
+    (host.ends_with(".epix") && !host.is_empty())
+        || (host.starts_with("epix1") && host.len() > 20 && !host.contains('.'))
 }
 
 /// True if a path segment plausibly references a xite we could fetch on
@@ -471,6 +473,14 @@ fn plausible_xite_ref(s: &str) -> bool {
 }
 
 /// Rewrite a transparent-proxy request into the path form the router uses.
+/// Marks a request whose path was prefixed by [`rewrite_proxy_host`]. Lets the
+/// wrapper tell a rewritten `GET /` (serve it) apart from a URL that LITERALLY
+/// carried its own host as a path segment (`dashboard.epix/dashboard.epix/`,
+/// e.g. the Config page's path-form home link) - the latter redirects to the
+/// clean origin. Stripped from incoming requests, so a client can't forge it
+/// (forging would only suppress that cosmetic redirect anyway).
+const PROXY_REWRITE_MARKER: &str = "x-epix-host-rewrite";
+
 /// `Host: dashboard.epix` + `GET /index.html` (or absolute-form
 /// `GET http://dashboard.epix/index.html`) becomes `GET /dashboard.epix/index.html`,
 /// so the existing `/:address/*path` handlers serve it. The Host header is left
@@ -480,6 +490,7 @@ fn plausible_xite_ref(s: &str) -> bool {
 /// Public so the desktop browser proxy (which serves the same router over TLS)
 /// can apply the identical rewrite.
 pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Request {
+    req.headers_mut().remove(PROXY_REWRITE_MARKER);
     let host = req
         .headers()
         .get(header::HOST)
@@ -498,7 +509,8 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
     }
     // A path that already targets a xite (`/epix1…/` or `/name.epix/`, as the
     // dashboard's site links do) routes as-is instead of being nested under
-    // this host's path.
+    // this host's path; the wrapper redirects such a document to the xite's
+    // own origin.
     let first_seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
     if (first_seg.starts_with("epix1") && first_seg.len() > 20) || first_seg.ends_with(".epix") {
         return req;
@@ -512,6 +524,10 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
         parts.path_and_query = Some(paq);
         if let Ok(uri) = axum::http::Uri::from_parts(parts) {
             *req.uri_mut() = uri;
+            req.headers_mut().insert(
+                PROXY_REWRITE_MARKER,
+                axum::http::HeaderValue::from_static("1"),
+            );
         }
     }
     req
@@ -753,6 +769,24 @@ async fn render_wrapper(
         .and_then(|v| v.to_str().ok())
         .map(|h| h.split(':').next().unwrap_or(h).to_string())
         .unwrap_or_default();
+    // In transparent-proxy (host) mode, a document whose URL literally carries
+    // a xite path segment (the rewrite marker is absent - see
+    // [`PROXY_REWRITE_MARKER`]) is sent to that xite's own origin instead of
+    // serving nested under this host. Clicking a site on the dashboard links
+    // `/epix1talk…/`, which used to land on `https://dashboard.epix/epix1talk…/`:
+    // a page whose wrapper was in path mode, so its home button resolved to
+    // `dashboard.epix/dashboard.epix/`, and whose origin was the dashboard's.
+    // The same rule collapses a literal self path - the Config page's path-form
+    // home link lands on `dashboard.epix/dashboard.epix/` - to the clean origin.
+    // Loopback (path) serving is untouched - the mobile shells and the node's
+    // own UI address xites by path on one origin.
+    if is_proxy_host(&host) && !headers.contains_key(PROXY_REWRITE_MARKER) {
+        // Keep the directory the document was asked for, not the implied
+        // index.html; keep the query. Scheme-relative, so http/https carries.
+        let dir = inner_path.strip_suffix("index.html").unwrap_or(&inner_path);
+        let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
+        return Redirect::temporary(&format!("//{requested}/{dir}{query}")).into_response();
+    }
     let proxy_mode = host == requested;
 
     // The path segment may be a `.epix` name (xID) or the bech32 address; the
