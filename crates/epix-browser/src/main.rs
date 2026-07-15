@@ -895,6 +895,10 @@ fn write_profile(
     let pac = format!(
         "function FindProxyForURL(url, host) {{\n\
          \x20 if (shExpMatch(host, \"*.epix\")) {{ return \"PROXY {proxy_addr}\"; }}\n\
+         \x20 // A bare bech32 xite address (epix1..., dot-less) is a xite origin too:\n\
+         \x20 // the dashboard's site links and the URL-bar address navigation land on\n\
+         \x20 // https://epix1.../, which must reach the node, not DNS.\n\
+         \x20 if (shExpMatch(host, \"epix1*\") && dnsDomainLevels(host) === 0) {{ return \"PROXY {proxy_addr}\"; }}\n\
          \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
          \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
          \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\

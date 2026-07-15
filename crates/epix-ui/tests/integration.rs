@@ -159,6 +159,152 @@ async fn transparent_proxy_serves_epix_host() {
 }
 
 #[tokio::test]
+async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
+    // In host (transparent-proxy) mode a document that targets a DIFFERENT
+    // xite by path must land on that xite's own origin, not serve nested.
+    // Clicking a site on the dashboard links `/epix1talk…/`; without the
+    // redirect that page rendered under `https://dashboard.epix/epix1talk…/`
+    // with path-mode links, so its home button then went to
+    // `dashboard.epix/dashboard.epix/`.
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("index.html", b"<h1>dash</h1>").unwrap();
+    let state = AppState::new("0.1.0");
+    state
+        .add_xite(
+            "dashboard.epix",
+            XiteEntry {
+                storage,
+                content: Some(json!({ "title": "Dash", "files": { "index.html": {} } })),
+            },
+        )
+        .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let server = UiServer::new(state);
+    tokio::spawn(async move {
+        let _ = server.serve(addr).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+    // A dashboard-style site link: another xite's address as the path.
+    let talk = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+    let r = client
+        .get(format!("http://{addr}/{talk}/"))
+        .header("host", "dashboard.epix")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_redirection(), "cross-xite path redirects: {}", r.status());
+    assert_eq!(r.headers()["location"].to_str().unwrap(), format!("//{talk}/"));
+
+    // Directory and query survive the redirect.
+    let r = client
+        .get(format!("http://{addr}/{talk}/docs/?Topic:9"))
+        .header("host", "dashboard.epix")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_redirection());
+    assert_eq!(r.headers()["location"].to_str().unwrap(), format!("//{talk}/docs/?Topic:9"));
+
+    // A named cross-xite path redirects to the name's origin.
+    let r = client
+        .get(format!("http://{addr}/talk.epix/"))
+        .header("host", "dashboard.epix")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_redirection());
+    assert_eq!(r.headers()["location"].to_str().unwrap(), "//talk.epix/");
+
+    // A literal SELF path (the Config page's path-form home link lands on
+    // `dashboard.epix/dashboard.epix/`) collapses to the clean origin...
+    let r = client
+        .get(format!("http://{addr}/dashboard.epix/"))
+        .header("host", "dashboard.epix")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_redirection(), "literal self path redirects: {}", r.status());
+    assert_eq!(r.headers()["location"].to_str().unwrap(), "//dashboard.epix/");
+
+    // ...while the host-mode root (what that redirect lands on) serves, and a
+    // client cannot suppress-or-forge its way into the nested serve by sending
+    // the internal rewrite marker itself.
+    let r = client
+        .get(format!("http://{addr}/"))
+        .header("host", "dashboard.epix")
+        .header("sec-fetch-mode", "navigate")
+        .header("x-epix-host-rewrite", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "host-mode root serves (no redirect loop)");
+
+    // A bech32-address HOST is a proxy origin too (the redirect target): it
+    // serves in host mode, not nested and not redirected again.
+    let dir2 = tempfile::tempdir().unwrap();
+    let storage2 = XiteStorage::new(dir2.path());
+    storage2.write("index.html", b"<h1>talk</h1>").unwrap();
+    // (A second server keeps the test simple: fresh state with the address key.)
+    let state2 = AppState::new("0.1.0");
+    state2
+        .add_xite(
+            talk,
+            XiteEntry {
+                storage: storage2,
+                content: Some(json!({ "title": "Talk", "files": { "index.html": {} } })),
+            },
+        )
+        .await;
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    drop(listener2);
+    let server2 = UiServer::new(state2);
+    tokio::spawn(async move {
+        let _ = server2.serve(addr2).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr2).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let r = client
+        .get(format!("http://{addr2}/"))
+        .header("host", talk)
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "address host serves at its own origin");
+    let html = r.text().await.unwrap();
+    assert!(html.contains(r#"iframe_src = "/index.html?"#), "host-relative iframe: {html}");
+
+    // Loopback path mode is untouched: no redirect for 127.0.0.1 hosts.
+    let r = client
+        .get(format!("http://{addr2}/{talk}/"))
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "loopback path serving unchanged");
+}
+
+#[tokio::test]
 async fn rejects_cross_origin_websocket() {
     let (addr, _dir) = start_server().await;
     // A WebSocket from a foreign Origin is refused (can't drive the local API).
