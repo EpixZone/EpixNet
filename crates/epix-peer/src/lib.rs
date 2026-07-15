@@ -223,6 +223,28 @@ impl Peers {
         }
     }
 
+    /// Drop peers that keep failing and haven't answered recently (or ever).
+    /// Without eviction a dead address - a node's old port after a config
+    /// change, or an adopted ephemeral port - stays in the table forever,
+    /// gets persisted to peers.json, and keeps spreading to other nodes via
+    /// PEX. Six consecutive failures is past the backoff ceiling, so the
+    /// peer got a fair retry window before it is dropped; a currently
+    /// connected peer is never evicted. Returns how many were removed.
+    pub fn evict_dead(&mut self, now: i64) -> usize {
+        const MAX_ERRORS: u32 = 6;
+        const RESPONSE_GRACE_SECS: i64 = 4 * 3600;
+        let before = self.map.len();
+        self.map.retain(|_, p| {
+            if p.connected || p.connection_errors < MAX_ERRORS {
+                return true;
+            }
+            let responded_recently =
+                p.time_response != 0 && now - p.time_response < RESPONSE_GRACE_SECS;
+            responded_recently
+        });
+        before - self.map.len()
+    }
+
     /// Record transferred bytes against a peer.
     pub fn record_transfer(&mut self, addr: &PeerAddr, recv: u64, sent: u64) {
         if let Some(peer) = self.map.get_mut(&addr.to_string()) {
@@ -415,6 +437,59 @@ mod tests {
         all_down.get_mut(&ip("3.3.3.3:15441")).unwrap().note_connect_fail(100);
         let got = all_down.connectable_dialable(10, DialableNets::all(), 101);
         assert_eq!(got, vec![ip("3.3.3.3:15441")], "never starve the caller");
+    }
+
+    #[test]
+    fn evict_dead_drops_never_working_peers_after_repeated_failures() {
+        let mut peers = Peers::new();
+        peers.add(ip("9.9.9.9:4833"), 0); // a stale port that never answers
+        peers.add(ip("8.8.8.8:15441"), 0); // untouched, healthy candidate
+
+        // Five failures: still kept (inside the retry window).
+        for _ in 0..5 {
+            peers.get_mut(&ip("9.9.9.9:4833")).unwrap().note_connect_fail(100);
+        }
+        assert_eq!(peers.evict_dead(200), 0);
+        assert_eq!(peers.len(), 2);
+
+        // The sixth failure crosses the threshold: evicted, so it stops being
+        // persisted and PEX-shared. The untried peer stays.
+        peers.get_mut(&ip("9.9.9.9:4833")).unwrap().note_connect_fail(100);
+        assert_eq!(peers.evict_dead(200), 1);
+        assert_eq!(peers.len(), 1);
+        assert!(peers.get(&ip("8.8.8.8:15441")).is_some());
+    }
+
+    #[test]
+    fn evict_dead_spares_recently_working_and_connected_peers() {
+        let now = 10_000;
+        let mut peers = Peers::new();
+
+        // Worked an hour ago, now failing: kept (grace window).
+        peers.add(ip("1.1.1.1:15441"), 0);
+        let p = peers.get_mut(&ip("1.1.1.1:15441")).unwrap();
+        p.time_response = now - 3600;
+        for _ in 0..8 {
+            p.note_connect_fail(now);
+        }
+        p.time_response = now - 3600; // note_connect_fail doesn't touch it, be explicit
+
+        // Currently connected: never evicted regardless of error count.
+        peers.add(ip("2.2.2.2:15441"), 0);
+        let p = peers.get_mut(&ip("2.2.2.2:15441")).unwrap();
+        p.connection_errors = 20;
+        p.connected = true;
+
+        // Last answered days ago and keeps failing: evicted.
+        peers.add(ip("3.3.3.3:15441"), 0);
+        let p = peers.get_mut(&ip("3.3.3.3:15441")).unwrap();
+        p.time_response = now - 7 * 86_400;
+        p.connection_errors = 20;
+
+        assert_eq!(peers.evict_dead(now), 1);
+        assert!(peers.get(&ip("1.1.1.1:15441")).is_some(), "recent responder kept");
+        assert!(peers.get(&ip("2.2.2.2:15441")).is_some(), "connected peer kept");
+        assert!(peers.get(&ip("3.3.3.3:15441")).is_none(), "long-dead peer dropped");
     }
 
     #[test]

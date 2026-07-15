@@ -8,7 +8,24 @@ use async_trait::async_trait;
 use epix_core::PeerAddr;
 use rmpv::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
+
+/// How long an inbound connection may sit before its first request. The
+/// fileserver address gets announced to public BitTorrent trackers, so random
+/// BT clients and scanners connect and never speak our protocol - without this
+/// bound each one holds a socket (and an fd) forever.
+const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Idle bound between requests after the first. EpixNet closes idle peer
+/// connections after ~2 minutes; 5 keeps slow overlay peers safe while still
+/// reclaiming dead sockets. A healthy peer just reconnects when it needs us.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Maximum concurrent inbound connections. A guard against fd exhaustion: on
+/// the public gateway, leaked BT-crawler connections once ate the process fd
+/// limit, which killed the accept loop AND all outbound dials.
+const MAX_INBOUND: usize = 400;
 
 /// Handles an inbound request and returns the response **body** (a msgpack map);
 /// the server wraps it as `{cmd:"response", to:req_id, …body}`.
@@ -48,19 +65,37 @@ impl PeerServer {
         (self.version.clone(), self.rev)
     }
 
-    /// Serve inbound TCP connections until the listener errors. The listener's
-    /// own port is advertised as `fileserver_port` in handshake replies (a
-    /// Python peer requires the field and adopts it as our dial-back port).
+    /// Serve inbound TCP connections until shutdown. The listener's own port
+    /// is advertised as `fileserver_port` in handshake replies (a Python peer
+    /// requires the field and adopts it as our dial-back port).
+    ///
+    /// Accept errors (EMFILE under fd pressure, ECONNABORTED, …) are transient:
+    /// retry after a short pause instead of returning, or one error would kill
+    /// the accept loop and leave the node running but permanently deaf.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let inbound = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND));
         loop {
-            let (sock, addr) = listener.accept().await?;
+            let (sock, addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            };
+            // At capacity: shed the new connection instead of leaking toward
+            // the process fd limit (which would also break outbound dials).
+            let Ok(permit) = inbound.clone().try_acquire_owned() else {
+                drop(sock);
+                continue;
+            };
             let _ = sock.set_nodelay(true);
             let handler = self.handler.clone();
             let version = self.version.clone();
             let rev = self.rev;
             let on_inbound = self.on_inbound.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let stream: epix_transport::PeerStream = Box::pin(sock);
                 serve_stream_hooked(
                     handler,
@@ -103,7 +138,9 @@ async fn serve_stream_hooked(
     on_inbound: Option<&InboundHook>,
 ) {
     let mut buf = Vec::new();
-    while let Ok(req) = read_msg(&mut stream, &mut buf).await {
+    let mut deadline = FIRST_MSG_TIMEOUT;
+    while let Ok(Ok(req)) = tokio::time::timeout(deadline, read_msg(&mut stream, &mut buf)).await {
+        deadline = IDLE_TIMEOUT;
         let cmd = vget(&req, "cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let req_id = vget(&req, "req_id").and_then(|v| v.as_i64()).unwrap_or(0);
         let params = vget(&req, "params").cloned().unwrap_or(Value::Nil);
@@ -299,5 +336,28 @@ mod tests {
         let mut buf = Vec::new();
         let resp = read_msg(&mut stream, &mut buf).await.unwrap();
         assert_eq!(vget(&resp, "cmd").and_then(|v| v.as_str()), Some("response"));
+    }
+
+    /// A client that connects and never speaks the protocol (BT crawlers,
+    /// port scanners) must be dropped after FIRST_MSG_TIMEOUT instead of
+    /// holding a socket forever - the leak that exhausted the gateway's fd
+    /// limit and killed its accept loop.
+    #[tokio::test(start_paused = true)]
+    async fn silent_inbound_connection_is_dropped() {
+        let (server_side, _client_side) = tokio::io::duplex(1024);
+        let served = serve_stream(
+            Arc::new(NoopHandler),
+            PeerAddr::parse("127.0.0.1:1234").unwrap(),
+            Box::pin(server_side),
+            "EpixRS",
+            1,
+            0,
+        );
+        // The client never sends a byte. Paused time auto-advances past
+        // FIRST_MSG_TIMEOUT; the serve loop must give up rather than wait on
+        // read_msg forever. The outer bound only trips if it doesn't.
+        tokio::time::timeout(FIRST_MSG_TIMEOUT * 3, served)
+            .await
+            .expect("server should have dropped the silent connection");
     }
 }
