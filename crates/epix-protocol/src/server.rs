@@ -324,8 +324,9 @@ fn split_stream_body(body: Value) -> (Value, Option<Vec<u8>>) {
 fn handshake_response(version: &str, rev: i64, fileserver_port: u16) -> Value {
     // Report the node's real release version to peers that dial us (so they
     // can stat our build), falling back to the server's default banner when
-    // the advert is unseeded (tests, wire-spike).
-    let advertised = crate::advert::self_advert().version;
+    // the advert is unseeded (tests, wire-spike). Clone only the version, not
+    // the whole advert.
+    let advertised = crate::advert::with_self_advert(|a| a.version.clone());
     let version = if advertised.is_empty() { version } else { &advertised };
     vmap(vec![
         ("version", Value::from(version)),

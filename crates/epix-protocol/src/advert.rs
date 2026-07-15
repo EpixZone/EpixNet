@@ -76,8 +76,18 @@ pub fn update_self_advert(f: impl FnOnce(&mut SelfAdvert)) {
     }
 }
 
-/// The current advert (default/empty when never set - handshakes then carry
-/// no self-address, exactly the pre-Phase-6 wire shape).
-pub(crate) fn self_advert() -> SelfAdvert {
-    SELF_ADVERT.read().ok().and_then(|r| r.clone()).unwrap_or_default()
+/// Run `f` against the current advert under the read lock, without cloning it.
+/// A handshake only serializes the version plus one address, so borrowing and
+/// cloning just those (inside `f`) avoids a full-struct clone per handshake -
+/// on a phone that dials many peers, per-connection allocation adds up. When
+/// the advert was never set (or the lock is poisoned) `f` sees the default
+/// (empty) advert - the pre-Phase-6 wire shape.
+pub(crate) fn with_self_advert<R>(f: impl FnOnce(&SelfAdvert) -> R) -> R {
+    match SELF_ADVERT.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(advert) => f(advert),
+            None => f(&SelfAdvert::default()),
+        },
+        Err(_) => f(&SelfAdvert::default()),
+    }
 }

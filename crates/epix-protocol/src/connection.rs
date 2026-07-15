@@ -177,7 +177,7 @@ impl Connection {
     /// Advertises the self-address matching this connection's transport class
     /// (see [`crate::advert`]) so the peer can dial us back.
     pub async fn handshake(&mut self) -> Result<HandshakeInfo> {
-        let params = handshake_params(&crate::advert::self_advert(), &self.addr);
+        let params = crate::advert::with_self_advert(|a| handshake_params(a, &self.addr));
         let resp = self.request("handshake", params).await?;
         let hs = parse_handshake(&resp);
         self.peer = Some(hs.clone());
