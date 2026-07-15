@@ -62,11 +62,79 @@ fn random_peer_id() -> String {
     format!("-EpixRS-{}", hex::encode(b))
 }
 
+/// Build the handshake request params: the base fields every peer expects,
+/// plus the dial-back self-advertisement matching the connection's transport
+/// class. The overlay key names mirror the address kinds (`onion` is the
+/// Python client's own handshake key; `i2p`/`rns` are EpixNet extensions old
+/// nodes ignore - both sides look keys up by name, so extras are wire-safe).
+///
+/// The advertised `fileserver_port` doubles as the overlay dial-back port (the
+/// onion service maps it 1:1), so it is sent whenever we advertise anything -
+/// but `port_opened` stays strictly clearnet-truthful: only true when a public
+/// inbound peer confirmed the port, and never in Always mode (clearnet is
+/// closed there, whatever the OS listener does).
+fn handshake_params(advert: &crate::advert::SelfAdvert, target: &PeerAddr) -> Value {
+    // The real release version (from EPIX_VERSION / the git tag) rides in via
+    // the advert; epix-protocol's own crate version is only the fallback for
+    // an unseeded advert (tests, wire-spike).
+    let version = if advert.version.is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        advert.version.clone()
+    };
+    let mut params = vec![
+        ("version", Value::from(version)),
+        ("rev", Value::from(8192i64)),
+        ("peer_id", Value::from(random_peer_id())),
+        ("protocol", Value::from("v2")),
+        ("use_bin_type", Value::from(true)),
+        ("fileserver_port", Value::from(advert.fileserver_port as i64)),
+        ("crypt_supported", Value::Array(vec![])),
+        ("port_opened", Value::from(advert.port_opened && !advert.tor_always)),
+    ];
+    if advert.fileserver_port != 0 {
+        // One self-address per connection, matching its transport class: our
+        // onion on Tor-bound wires, i2p on i2p, rns on mesh. A DIRECT clearnet
+        // dial advertises no overlay address (the peer sees our real IP;
+        // claiming the onion there would link the two) - unless Always mode
+        // routes the dial through Tor, where the visible source is an exit
+        // node and the onion is our only dialable identity.
+        match target {
+            PeerAddr::Onion { .. } => {
+                if let Some(host) = &advert.onion {
+                    params.push(("onion", Value::from(host.as_str())));
+                }
+            }
+            PeerAddr::I2p { .. } => {
+                if let Some(dest) = &advert.i2p {
+                    params.push(("i2p", Value::from(dest.as_str())));
+                }
+            }
+            PeerAddr::Rns(_) => {
+                if let Some(hex) = &advert.rns {
+                    params.push(("rns", Value::from(hex.as_str())));
+                }
+            }
+            PeerAddr::Ip(_) => {
+                if advert.tor_always {
+                    if let Some(host) = &advert.onion {
+                        params.push(("onion", Value::from(host.as_str())));
+                    }
+                }
+            }
+        }
+    }
+    vmap(params)
+}
+
 /// A live connection to one peer. Request/response is matched by `req_id`.
 pub struct Connection {
     stream: PeerStream,
     buf: Vec<u8>,
     next_req_id: i64,
+    /// The address this connection was dialed to - picks which of our own
+    /// self-addresses the handshake advertises (see [`crate::advert`]).
+    addr: PeerAddr,
     pub peer: Option<HandshakeInfo>,
 }
 
@@ -74,7 +142,7 @@ impl Connection {
     /// Dial `addr` over `transport` and wrap the resulting stream.
     pub async fn connect(transport: &dyn Transport, addr: &PeerAddr) -> Result<Self> {
         let stream = transport.dial(addr).await?;
-        Ok(Self { stream, buf: Vec::new(), next_req_id: 0, peer: None })
+        Ok(Self { stream, buf: Vec::new(), next_req_id: 0, addr: addr.clone(), peer: None })
     }
 
     fn next_id(&mut self) -> i64 {
@@ -109,17 +177,10 @@ impl Connection {
     }
 
     /// Perform the protocol handshake (plaintext, no crypt negotiation yet).
+    /// Advertises the self-address matching this connection's transport class
+    /// (see [`crate::advert`]) so the peer can dial us back.
     pub async fn handshake(&mut self) -> Result<HandshakeInfo> {
-        let params = vmap(vec![
-            ("version", Value::from(env!("CARGO_PKG_VERSION"))),
-            ("rev", Value::from(8192i64)),
-            ("peer_id", Value::from(random_peer_id())),
-            ("protocol", Value::from("v2")),
-            ("use_bin_type", Value::from(true)),
-            ("fileserver_port", Value::from(0i64)),
-            ("crypt_supported", Value::Array(vec![])),
-            ("port_opened", Value::from(false)),
-        ]);
+        let params = handshake_params(&crate::advert::self_advert(), &self.addr);
         let resp = self.request("handshake", params).await?;
         let hs = parse_handshake(&resp);
         self.peer = Some(hs.clone());
@@ -408,5 +469,107 @@ impl Connection {
             location = next;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::advert::SelfAdvert;
+
+    fn key<'a>(params: &'a Value, k: &str) -> Option<&'a Value> {
+        vget(params, k)
+    }
+
+    #[test]
+    fn handshake_params_default_advert_is_the_legacy_shape() {
+        // A node that never set an advert (or a test harness) sends exactly
+        // the pre-Phase-6 fields: port 0, port_opened false, no self-address.
+        let p = handshake_params(&SelfAdvert::default(), &PeerAddr::parse("1.2.3.4:1").unwrap());
+        assert_eq!(key(&p, "fileserver_port").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(key(&p, "port_opened").and_then(|v| v.as_bool()), Some(false));
+        assert!(key(&p, "onion").is_none());
+        assert!(key(&p, "i2p").is_none());
+        assert!(key(&p, "rns").is_none());
+        assert_eq!(key(&p, "protocol").and_then(|v| v.as_str()), Some("v2"));
+    }
+
+    #[test]
+    fn handshake_params_advertise_by_transport_class() {
+        let advert = SelfAdvert {
+            version: "0.3.9".into(),
+            fileserver_port: 26552,
+            port_opened: true,
+            tor_always: false,
+            onion: Some("abcdefghij234567".into()),
+            i2p: Some("ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq".into()),
+            rns: Some("0123456789abcdef0123456789abcdef".into()),
+        };
+
+        // Onion target: onion advertised, nothing else.
+        let p = handshake_params(&advert, &PeerAddr::parse("2gzyxa5ihm7nsggfxnu5.onion:1").unwrap());
+        assert_eq!(key(&p, "onion").and_then(|v| v.as_str()), Some("abcdefghij234567"));
+        assert!(key(&p, "i2p").is_none() && key(&p, "rns").is_none());
+
+        // I2p target: i2p only.
+        let p = handshake_params(
+            &advert,
+            &PeerAddr::parse("ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.i2p:1").unwrap(),
+        );
+        assert!(key(&p, "i2p").is_some());
+        assert!(key(&p, "onion").is_none() && key(&p, "rns").is_none());
+
+        // Rns target: rns only.
+        let p = handshake_params(&advert, &PeerAddr::parse("rns:00112233445566778899aabbccddeeff").unwrap());
+        assert!(key(&p, "rns").is_some());
+        assert!(key(&p, "onion").is_none() && key(&p, "i2p").is_none());
+
+        // DIRECT clearnet target: the real port, port_opened as confirmed, and
+        // NO overlay address - a clearnet handshake must not link IP and onion.
+        let p = handshake_params(&advert, &PeerAddr::parse("1.2.3.4:26552").unwrap());
+        assert_eq!(key(&p, "fileserver_port").and_then(|v| v.as_i64()), Some(26552));
+        assert_eq!(key(&p, "port_opened").and_then(|v| v.as_bool()), Some(true));
+        assert!(key(&p, "onion").is_none() && key(&p, "i2p").is_none() && key(&p, "rns").is_none());
+
+        // Every target carries the node's real release version, not the
+        // epix-protocol crate version.
+        assert_eq!(key(&p, "version").and_then(|v| v.as_str()), Some("0.3.9"));
+    }
+
+    #[test]
+    fn handshake_params_version_falls_back_to_the_crate_version() {
+        // An unseeded advert (tests, wire-spike) reports epix-protocol's own
+        // crate version rather than an empty string.
+        let p = handshake_params(&SelfAdvert::default(), &PeerAddr::parse("1.2.3.4:1").unwrap());
+        assert_eq!(
+            key(&p, "version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn handshake_params_always_mode_advertises_onion_to_clearnet() {
+        // In Always mode a clearnet dial rides Tor: the peer sees an exit IP,
+        // so the onion is our only dialable identity - advertise it. The port
+        // rides along (the receiver builds onion:port from it), but
+        // port_opened stays false: clearnet is closed.
+        let advert = SelfAdvert {
+            version: "0.3.9".into(),
+            fileserver_port: 26552,
+            port_opened: true, // even if something confirmed it, Always overrides
+            tor_always: true,
+            onion: Some("abcdefghij234567".into()),
+            i2p: None,
+            rns: None,
+        };
+        let p = handshake_params(&advert, &PeerAddr::parse("1.2.3.4:26552").unwrap());
+        assert_eq!(key(&p, "onion").and_then(|v| v.as_str()), Some("abcdefghij234567"));
+        assert_eq!(key(&p, "fileserver_port").and_then(|v| v.as_i64()), Some(26552));
+        assert_eq!(key(&p, "port_opened").and_then(|v| v.as_bool()), Some(false));
+
+        // Not seeding (port 0): nothing to dial back - no self-address at all.
+        let advert = SelfAdvert { fileserver_port: 0, ..advert };
+        let p = handshake_params(&advert, &PeerAddr::parse("1.2.3.4:26552").unwrap());
+        assert!(key(&p, "onion").is_none());
     }
 }

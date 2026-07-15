@@ -1925,11 +1925,14 @@ impl AppState {
     }
 
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
-    /// Silently drops this node's own addresses (see [`Self::is_own_peer`]).
+    /// Silently drops this node's own addresses (see [`Self::is_own_peer`]) and
+    /// placeholder shapes (an inbound overlay sender whose handshake never
+    /// advertised a dial-back address arrives as an empty onion/i2p addr -
+    /// recording it wastes a selection slot on an undialable entry).
     pub async fn add_peers(&self, address: &str, addrs: impl IntoIterator<Item = PeerAddr>) {
         let mut filtered = Vec::new();
         for a in addrs {
-            if !self.is_own_peer(&a).await {
+            if a.is_wellformed() && !self.is_own_peer(&a).await {
                 filtered.push(a);
             }
         }
@@ -2005,8 +2008,19 @@ impl AppState {
     }
 
     /// Record a peer's advertised hashfield (`setHashfield`). Also registers the
-    /// peer if new.
+    /// peer if new - but never a placeholder shape (an inbound overlay sender
+    /// that advertised no dial-back address) nor this node's OWN address (an
+    /// inbound peer can now advertise an adopted overlay self-address, so the
+    /// same `is_own_peer` guard every other recording path applies is required
+    /// here too - otherwise a peer could plant our own onion/i2p/rns as a
+    /// dialable peer and make us sync from ourselves). The hashfield is only
+    /// stored for an addressable, non-self peer, so `findHashIds` never
+    /// attributes an attacker-supplied hashfield to our own address or to an
+    /// undialable placeholder.
     pub async fn set_peer_hashfield(&self, address: &str, peer: &PeerAddr, raw: &[u8]) -> bool {
+        // is_own_peer reads only onion/i2p/rns/port state, never self.xites, so
+        // computing it before the write lock cannot deadlock.
+        let registerable = peer.is_wellformed() && !self.is_own_peer(peer).await;
         let mut xites = self.xites.write().await;
         let key = xites
             .iter()
@@ -2016,10 +2030,12 @@ impl AppState {
             .map(|(k, _)| k.clone());
         let Some(key) = key else { return false };
         let x = xites.get_mut(&key).unwrap();
-        x.peers.add(peer.clone(), now_secs());
-        x.settings.peers = x.peers.len() as i64;
-        x.peer_hashfields
-            .insert(peer.to_string(), epix_xite::Hashfield::from_bytes(raw));
+        if registerable {
+            x.peers.add(peer.clone(), now_secs());
+            x.settings.peers = x.peers.len() as i64;
+            x.peer_hashfields
+                .insert(peer.to_string(), epix_xite::Hashfield::from_bytes(raw));
+        }
         true
     }
 
@@ -2438,6 +2454,10 @@ impl AppState {
             was != opened
         };
         *self.ip_external.write().await = ip_external;
+        // Outbound handshakes advertise clearnet reachability (Phase 6); keep
+        // the advert in sync with every confirmation path (inbound peer,
+        // port check, UPnP, ip_external config) - and with regressions.
+        epix_protocol::update_self_advert(|a| a.port_opened = opened);
         // The dashboard shows port reachability live (serverChanged).
         if changed {
             self.push_server_info().await;
