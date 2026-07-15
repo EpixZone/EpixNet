@@ -42,8 +42,6 @@ impl ReticulumServer {
                 continue;
             };
 
-            let mut addr = [0u8; 16];
-            addr.copy_from_slice(ev.id.as_slice());
             let stream = Box::pin(ReticulumStream::wrap(
                 transport.clone(),
                 link,
@@ -55,8 +53,14 @@ impl ReticulumServer {
             let version = self.version.clone();
             let rev = self.rev;
             tokio::spawn(async move {
-                // Mesh destinations aren't port-addressed; advertise 0.
-                serve_stream(handler, PeerAddr::Rns(addr), stream, &version, rev, 0).await;
+                // The inbound link id (`ev.id`) is NOT the peer's dialable
+                // destination hash - it's an ephemeral per-link identifier the
+                // stream uses for I/O, not an address we could dial back. Serve
+                // under the all-zero sentinel (which `is_wellformed` rejects, so
+                // it never enters a peer table) and let the handshake replace it
+                // with the peer's advertised `rns` self-address. Mesh
+                // destinations aren't port-addressed; advertise 0.
+                serve_stream(handler, PeerAddr::Rns([0u8; 16]), stream, &version, rev, 0).await;
             });
         }
     }

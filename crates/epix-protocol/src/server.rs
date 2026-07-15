@@ -169,7 +169,7 @@ async fn serve_stream_hooked(
     }
 }
 
-/// Answer a handshake: adopt the peer's advertised dial-back port, fire the
+/// Answer a handshake: adopt the peer's advertised dial-back address, fire the
 /// inbound hook, and build the reply body.
 fn answer_handshake(
     peer: &mut PeerAddr,
@@ -179,28 +179,112 @@ fn answer_handshake(
     rev: i64,
     fileserver_port: u16,
 ) -> Value {
-    adopt_dialback_port(peer, params);
-    // A completed inbound handshake means a real peer reached us on this
-    // transport - the clearnet TCP server uses it to confirm the port is open.
+    // The hook sees the SOURCE address, not the adopted one: a completed
+    // inbound handshake means a real peer reached us on this transport (the
+    // clearnet TCP server uses it to confirm the port is open), and that is a
+    // property of where the connection came from - an advertised onion must
+    // not hide that a public IP just proved our port reachable.
+    let source = peer.clone();
+    adopt_dialback_addr(peer, params);
     if let Some(hook) = on_inbound {
-        hook(peer);
+        hook(&source);
     }
     handshake_response(version, rev, fileserver_port)
 }
 
-/// The connection arrives from an ephemeral port; the handshake advertises the
-/// peer's fileserver port, so rebind the address handlers see to one we can
-/// dial back (inbound `update` fetches body-less updates from the sender and
-/// adds it as a peer). Non-IP transports and port 0 keep the original address.
-fn adopt_dialback_port(peer: &mut PeerAddr, params: &Value) {
-    let advertised = vget(params, "fileserver_port").and_then(|v| v.as_i64());
-    if let (PeerAddr::Ip(addr), Some(port)) = (&*peer, advertised) {
-        if (1..=u16::MAX as i64).contains(&port) {
-            let mut dialable = *addr;
-            dialable.set_port(port as u16);
-            *peer = PeerAddr::Ip(dialable);
+/// The connection arrives from an ephemeral port (clearnet) or a blank
+/// placeholder address (onion/i2p inbound, rns link id), so rebind the address
+/// handlers see to the dial-back address the handshake advertises - inbound
+/// `update`/`setHashfield`/`pex` record it per site, which is how an
+/// overlay-only publisher that pushes to us becomes a peer we can dial back.
+///
+/// The advertised self-address must match the connection's transport class:
+/// an onion claim rebinds onion (and Tor-exit-sourced Ip) connections, an i2p
+/// claim i2p connections, an rns claim mesh links. The claim is trusted the
+/// way PEX gossip is (unauthenticated), but only when it is complete and
+/// wire-packable - `pack()` base32/length-validates onion and i2p hosts, so
+/// junk that could never round-trip peer exchange is never adopted.
+fn adopt_dialback_addr(peer: &mut PeerAddr, params: &Value) {
+    let port = advertised_port(params);
+    match &*peer {
+        PeerAddr::Ip(addr) => *peer = adopt_ip(*addr, params, port),
+        // An overlay placeholder is replaced by its advertised self-address of
+        // the matching class, or left as-is (the well-formedness filter drops
+        // an un-rebound placeholder before it can enter a peer table).
+        PeerAddr::Onion { .. } => {
+            if let Some(p) = onion_claim(params, port) {
+                *peer = p;
+            }
+        }
+        PeerAddr::I2p { .. } => {
+            if let Some(p) = i2p_claim(params, port) {
+                *peer = p;
+            }
+        }
+        PeerAddr::Rns(_) => {
+            if let Some(p) = rns_claim(params) {
+                *peer = p;
+            }
         }
     }
+}
+
+/// Rebind an inbound clearnet peer. An advertised onion wins over the source IP
+/// (a Tor-Always dialer reaches clearnet through an exit node, so its source IP
+/// is the exit's, not a dialable identity - the Python client rebinds the same
+/// way). Otherwise honor `port_opened` like the Python client: a public peer
+/// that says its port is closed (behind NAT) is recorded non-connectable (port
+/// 0) so we never dial it or gossip it as reachable - it can still reach us. A
+/// LAN/loopback source is directly reachable, so it keeps the advertised port.
+fn adopt_ip(addr: std::net::SocketAddr, params: &Value, port: Option<u16>) -> PeerAddr {
+    if let Some(p) = onion_claim(params, port) {
+        return p;
+    }
+    let Some(port) = port else { return PeerAddr::Ip(addr) };
+    let port_opened = vget(params, "port_opened").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut dialable = addr;
+    let keep = port_opened || PeerAddr::Ip(dialable).is_private();
+    dialable.set_port(if keep { port } else { 0 });
+    PeerAddr::Ip(dialable)
+}
+
+/// The peer's advertised fileserver port (1..=65535), or None.
+fn advertised_port(params: &Value) -> Option<u16> {
+    vget(params, "fileserver_port")
+        .and_then(|v| v.as_i64())
+        .filter(|p| (1..=u16::MAX as i64).contains(p))
+        .map(|p| p as u16)
+}
+
+/// A non-empty string self-address claim from the handshake.
+fn overlay_claim(params: &Value, key: &str) -> Option<String> {
+    vget(params, key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Parse an advertised self-address, keeping it only when complete and
+/// wire-packable - `pack()` base32/length-validates onion and i2p hosts, so
+/// junk that could never round-trip peer exchange is never adopted.
+fn parse_dialback(s: String) -> Option<PeerAddr> {
+    PeerAddr::parse(&s).ok().filter(|p| p.is_wellformed() && p.pack().is_some())
+}
+
+fn onion_claim(params: &Value, port: Option<u16>) -> Option<PeerAddr> {
+    let host = overlay_claim(params, "onion")?;
+    parse_dialback(format!("{host}.onion:{}", port?))
+}
+
+fn i2p_claim(params: &Value, port: Option<u16>) -> Option<PeerAddr> {
+    // I2P streams are destination-addressed; the port rides along for
+    // wire-shape compatibility (0 when the peer isn't seeding).
+    let dest = overlay_claim(params, "i2p")?;
+    parse_dialback(format!("{dest}.i2p:{}", port.unwrap_or(0)))
+}
+
+fn rns_claim(params: &Value) -> Option<PeerAddr> {
+    // The inbound address is the LINK id, not the peer's dialable destination
+    // hash - the claim replaces it outright.
+    let hex = overlay_claim(params, "rns")?;
+    parse_dialback(format!("rns:{hex}"))
 }
 
 /// Write the raw file bytes that follow a `streamFile` reply. Returns false if
@@ -238,6 +322,12 @@ fn split_stream_body(body: Value) -> (Value, Option<Vec<u8>>) {
 }
 
 fn handshake_response(version: &str, rev: i64, fileserver_port: u16) -> Value {
+    // Report the node's real release version to peers that dial us (so they
+    // can stat our build), falling back to the server's default banner when
+    // the advert is unseeded (tests, wire-spike). Clone only the version, not
+    // the whole advert.
+    let advertised = crate::advert::with_self_advert(|a| a.version.clone());
+    let version = if advertised.is_empty() { version } else { &advertised };
     vmap(vec![
         ("version", Value::from(version)),
         ("rev", Value::from(rev)),
@@ -280,13 +370,12 @@ mod tests {
         }
     }
 
-    /// The inbound hook fires on a handshake, and the address it reports has
-    /// been dial-back-corrected to the peer's advertised fileserver port (so a
-    /// caller can decide reachability by the peer's real IP, not its ephemeral
-    /// source port). The hook runs before the handshake reply is sent, so once
-    /// the client has read the reply the hook has already run.
+    /// The inbound hook fires on a handshake with the connection's SOURCE
+    /// address - a real public IP reaching us proves the port is open, and an
+    /// advertised onion must not hide that. The hook runs before the handshake
+    /// reply is sent, so once the client has read the reply it has run.
     #[tokio::test]
-    async fn inbound_hook_fires_with_dialback_port() {
+    async fn inbound_hook_sees_the_source_address() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -297,13 +386,21 @@ mod tests {
         });
         tokio::spawn(PeerServer::new(Arc::new(NoopHandler)).on_inbound(hook).serve(listener));
 
-        // Raw client: connect and handshake, advertising fileserver_port 12345.
+        // Raw client: handshake advertising a dial-back port AND an onion (a
+        // Tor-Always dialer's shape). The adopted address becomes the onion,
+        // but the hook must still see the Ip source that proved reachability.
         let sock = TcpStream::connect(addr).await.unwrap();
         let mut stream: epix_transport::PeerStream = Box::pin(sock);
         let hs = vmap(vec![
             ("cmd", Value::from("handshake")),
             ("req_id", Value::from(1i64)),
-            ("params", vmap(vec![("fileserver_port", Value::from(12345i64))])),
+            (
+                "params",
+                vmap(vec![
+                    ("fileserver_port", Value::from(12345i64)),
+                    ("onion", Value::from("abcdefghij234567")),
+                ]),
+            ),
         ]);
         send_msg(&mut stream, &hs).await.unwrap();
         let mut buf = Vec::new();
@@ -311,9 +408,187 @@ mod tests {
 
         let recorded = seen.lock().unwrap().clone().expect("peer recorded");
         match recorded {
-            PeerAddr::Ip(a) => assert_eq!(a.port(), 12345, "adopted the advertised dial-back port"),
-            other => panic!("expected Ip peer, got {other:?}"),
+            PeerAddr::Ip(a) => {
+                assert!(a.ip().is_loopback(), "hook sees the source IP, got {a}")
+            }
+            other => panic!("expected the Ip source, got {other:?}"),
         }
+    }
+
+    /// After the handshake adopts an advertised self-address, every subsequent
+    /// request's handler sees the dialable address instead of the placeholder -
+    /// the seam that lets `update`/`pex` record an overlay caller as a peer.
+    #[tokio::test]
+    async fn requests_after_handshake_carry_the_adopted_address() {
+        struct Recording(Arc<Mutex<Option<PeerAddr>>>);
+        #[async_trait]
+        impl RequestHandler for Recording {
+            async fn handle(&self, peer: &PeerAddr, _cmd: &str, _params: &Value) -> Value {
+                *self.0.lock().unwrap() = Some(peer.clone());
+                vmap(vec![("ok", Value::from("1"))])
+            }
+        }
+        let seen: Arc<Mutex<Option<PeerAddr>>> = Arc::new(Mutex::new(None));
+        let (server_side, client_side) = tokio::io::duplex(4096);
+        // An inbound onion connection: blank placeholder, like the Tor accept
+        // loop passes.
+        tokio::spawn(serve_stream(
+            Arc::new(Recording(seen.clone())),
+            PeerAddr::Onion { host: String::new(), port: 0 },
+            Box::pin(server_side),
+            "EpixRS",
+            1,
+            0,
+        ));
+
+        let mut stream: epix_transport::PeerStream = Box::pin(client_side);
+        let mut buf = Vec::new();
+        let hs = vmap(vec![
+            ("cmd", Value::from("handshake")),
+            ("req_id", Value::from(1i64)),
+            (
+                "params",
+                vmap(vec![
+                    ("fileserver_port", Value::from(26552i64)),
+                    ("onion", Value::from("abcdefghij234567")),
+                ]),
+            ),
+        ]);
+        send_msg(&mut stream, &hs).await.unwrap();
+        let _ = read_msg(&mut stream, &mut buf).await.unwrap();
+        let ping = vmap(vec![
+            ("cmd", Value::from("ping")),
+            ("req_id", Value::from(2i64)),
+            ("params", vmap(vec![])),
+        ]);
+        send_msg(&mut stream, &ping).await.unwrap();
+        let _ = read_msg(&mut stream, &mut buf).await.unwrap();
+
+        let recorded = seen.lock().unwrap().clone().expect("handler saw the request");
+        assert_eq!(
+            recorded,
+            PeerAddr::parse("abcdefghij234567.onion:26552").unwrap(),
+            "the placeholder was rebound to the advertised self-address"
+        );
+    }
+
+    #[test]
+    fn adopt_dialback_addr_rebinds_each_transport_class() {
+        let params = |pairs: Vec<(&str, Value)>| vmap(pairs);
+
+        // Clearnet + port + port_opened: rebind to the advertised port.
+        let mut peer = PeerAddr::parse("1.2.3.4:55555").unwrap();
+        adopt_dialback_addr(
+            &mut peer,
+            &params(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("port_opened", Value::from(true)),
+            ]),
+        );
+        assert_eq!(peer, PeerAddr::parse("1.2.3.4:26552").unwrap());
+
+        // Clearnet + port but port_opened false (NAT'd): recorded
+        // non-connectable (port 0) so it is never dialed or re-gossiped.
+        let mut peer = PeerAddr::parse("1.2.3.4:55555").unwrap();
+        adopt_dialback_addr(&mut peer, &params(vec![("fileserver_port", Value::from(26552i64))]));
+        assert_eq!(peer, PeerAddr::parse("1.2.3.4:0").unwrap());
+
+        // A LAN/loopback source keeps the advertised port regardless of
+        // port_opened - it is directly reachable.
+        let mut peer = PeerAddr::parse("192.168.1.5:55555").unwrap();
+        adopt_dialback_addr(&mut peer, &params(vec![("fileserver_port", Value::from(26552i64))]));
+        assert_eq!(peer, PeerAddr::parse("192.168.1.5:26552").unwrap());
+
+        // Clearnet + onion claim: the onion wins (Tor-exit-sourced dialer).
+        let mut peer = PeerAddr::parse("1.2.3.4:55555").unwrap();
+        adopt_dialback_addr(
+            &mut peer,
+            &params(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("onion", Value::from("abcdefghij234567")),
+            ]),
+        );
+        assert_eq!(peer, PeerAddr::parse("abcdefghij234567.onion:26552").unwrap());
+
+        // Onion placeholder + onion claim.
+        let mut peer = PeerAddr::Onion { host: String::new(), port: 0 };
+        adopt_dialback_addr(
+            &mut peer,
+            &params(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("onion", Value::from("abcdefghij234567")),
+            ]),
+        );
+        assert_eq!(peer, PeerAddr::parse("abcdefghij234567.onion:26552").unwrap());
+
+        // I2p placeholder + i2p claim (a 52-char b32 short address).
+        let mut peer = PeerAddr::I2p { dest: String::new(), port: 0 };
+        let b32 = "ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq";
+        adopt_dialback_addr(
+            &mut peer,
+            &params(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("i2p", Value::from(b32)),
+            ]),
+        );
+        assert_eq!(peer, PeerAddr::parse(&format!("{b32}.i2p:26552")).unwrap());
+
+        // Rns link id + rns claim: the claim replaces the link id.
+        let mut peer = PeerAddr::Rns([9u8; 16]);
+        adopt_dialback_addr(
+            &mut peer,
+            &params(vec![("rns", Value::from("0123456789abcdef0123456789abcdef"))]),
+        );
+        assert_eq!(peer, PeerAddr::parse("rns:0123456789abcdef0123456789abcdef").unwrap());
+    }
+
+    #[test]
+    fn adopt_dialback_addr_rejects_junk_claims() {
+        let placeholder = PeerAddr::Onion { host: String::new(), port: 0 };
+
+        // No fileserver_port: an onion without a port is not dialable.
+        let mut peer = placeholder.clone();
+        adopt_dialback_addr(&mut peer, &vmap(vec![("onion", Value::from("abcdefghij234567"))]));
+        assert_eq!(peer, placeholder);
+
+        // Invalid base32 host: never adopted (couldn't round-trip PEX).
+        let mut peer = placeholder.clone();
+        adopt_dialback_addr(
+            &mut peer,
+            &vmap(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("onion", Value::from("not/base32!!")),
+            ]),
+        );
+        assert_eq!(peer, placeholder);
+
+        // Empty claim: ignored.
+        let mut peer = placeholder.clone();
+        adopt_dialback_addr(
+            &mut peer,
+            &vmap(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("onion", Value::from("")),
+            ]),
+        );
+        assert_eq!(peer, placeholder);
+
+        // A cross-class claim never rebinds: an i2p claim on an onion
+        // connection is ignored.
+        let mut peer = placeholder.clone();
+        adopt_dialback_addr(
+            &mut peer,
+            &vmap(vec![
+                ("fileserver_port", Value::from(26552i64)),
+                ("i2p", Value::from("ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq")),
+            ]),
+        );
+        assert_eq!(peer, placeholder);
+
+        // Bad rns hex keeps the link id.
+        let mut peer = PeerAddr::Rns([9u8; 16]);
+        adopt_dialback_addr(&mut peer, &vmap(vec![("rns", Value::from("nothex"))]));
+        assert_eq!(peer, PeerAddr::Rns([9u8; 16]));
     }
 
     /// The plain `serve_stream` entry point (used by the Tor/I2P inbound paths)

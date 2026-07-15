@@ -191,6 +191,20 @@ impl NodeRuntime {
         let tor_always = self.config.tor_mode == epix_tor::TorMode::Always;
         #[cfg(not(feature = "tor"))]
         let tor_always = false;
+        // Seed the handshake self-advertisement (Phase 6): outbound handshakes
+        // offer our dial-back address so an inbound overlay peer becomes
+        // dialable at first contact instead of waiting on PEX/trackers. The
+        // overlay loops fill in each address below as it comes up; port_opened
+        // flips when an inbound public peer confirms the port (seed_loop).
+        epix_protocol::set_self_advert(epix_protocol::SelfAdvert {
+            version: self.state.version.clone(),
+            fileserver_port: self.config.fileserver_port.unwrap_or(0),
+            port_opened: false,
+            tor_always,
+            onion: None,
+            i2p: None,
+            rns: None,
+        });
         self.handles.push(tokio::spawn(announce_loop(
             self.state.clone(),
             self.trackers.clone(),
@@ -1055,6 +1069,10 @@ async fn tor_loop(
                     .log("INFO", format!("Tor: onion service up at {onion_host}.onion:{port}"))
                     .await;
                 state.set_onion_address(&onion_host).await;
+                // Handshakes on Tor-bound connections now offer this onion as
+                // our dial-back address (Phase 6).
+                let advert_host = onion_host.clone();
+                epix_protocol::update_self_advert(move |a| a.onion = Some(advert_host));
                 // Load the identity key so announces can answer the tracker's
                 // onion-ownership challenge; without it the onion is never
                 // registered and Tor-only peers can't discover us.
@@ -1085,8 +1103,11 @@ async fn tor_loop(
                     while let Some(stream) = inbound.recv().await {
                         let handler = handler.clone() as Arc<dyn RequestHandler>;
                         let version = version.clone();
-                        // Inbound onion peers have no dial-back IP; the handshake
-                        // rebind is a no-op for them (they PEX their onion host).
+                        // Inbound onion peers arrive with no dial-back address;
+                        // the handshake rebinds this placeholder to the peer's
+                        // advertised `onion` self-address (Phase 6) so it
+                        // becomes directly dialable. Until then it is an empty
+                        // placeholder that never enters a peer table.
                         let peer = epix_core::PeerAddr::Onion {
                             host: String::new(),
                             port: 0,
@@ -1169,6 +1190,10 @@ async fn mesh_loop(
     // Layer `rns:` dialing onto the transport (composed with TCP/Tor/I2P).
     state.set_rns_transport(Arc::new(node.transport())).await;
     state.set_rns_address(&node.dest_hash_hex()).await;
+    // Handshakes over mesh links now offer this destination hash as our
+    // dial-back address (Phase 6) - the inbound link id a peer sees is not it.
+    let advert_hash = node.dest_hash_hex();
+    epix_protocol::update_self_advert(move |a| a.rns = Some(advert_hash));
 
     // Announce our destination and serve inbound links until shutdown.
     let announce = node.spawn_announce(Duration::from_secs(60));
@@ -1210,8 +1235,10 @@ async fn i2p_loop(
             while let Some(stream) = inbound.recv().await {
                 let handler = handler.clone() as Arc<dyn RequestHandler>;
                 let version = version.clone();
-                // Inbound I2P peers have no dial-back IP (they're reached by
-                // destination); use an empty i2p addr like the onion path does.
+                // Inbound I2P peers arrive with no dial-back address; the
+                // handshake rebinds this placeholder to the peer's advertised
+                // `i2p` destination (Phase 6). Until then it is an empty
+                // placeholder that never enters a peer table.
                 let peer = epix_core::PeerAddr::I2p { dest: String::new(), port: 0 };
                 let port = fileserver_port.unwrap_or(0);
                 tokio::spawn(async move {
@@ -1231,6 +1258,10 @@ async fn i2p_loop(
         if !announced_b32 {
             if let Some(host) = s.b32.strip_suffix(".i2p") {
                 state.set_i2p_address(host).await;
+                // Handshakes on i2p connections now offer this destination as
+                // our dial-back address (Phase 6).
+                let advert_dest = host.to_string();
+                epix_protocol::update_self_advert(move |a| a.i2p = Some(advert_dest));
                 state.log("INFO", format!("I2P: inbound address {}", s.b32)).await;
                 announced_b32 = true;
             }

@@ -71,6 +71,23 @@ impl PeerAddr {
         )
     }
 
+    /// Whether this address is a complete, dialable shape - not one of the
+    /// placeholder forms an inbound connection carries before the handshake
+    /// fills it in (empty onion host, empty i2p destination, port-0 onion, or
+    /// the all-zero rns sentinel an inbound mesh link is served under - its
+    /// link id is not a dialable destination hash). Placeholders must never
+    /// enter a peer registry: they can't be dialed, they don't round-trip
+    /// `to_string()`/`parse()`, and they waste selection slots. Ip addresses
+    /// count even at port 0 (`is_connectable` handles selection).
+    pub fn is_wellformed(&self) -> bool {
+        match self {
+            PeerAddr::Ip(_) => true,
+            PeerAddr::Onion { host, port } => !host.is_empty() && *port != 0,
+            PeerAddr::I2p { dest, .. } => !dest.is_empty(),
+            PeerAddr::Rns(hash) => *hash != [0u8; 16],
+        }
+    }
+
     /// Deadline for dialing this peer and completing the handshake (plus a
     /// small request, e.g. a PEX exchange or a content.json fetch): 15s for a
     /// direct clearnet socket (an unreachable peer must not hang its caller;
@@ -305,6 +322,28 @@ mod tests {
         assert!(PeerAddr::parse(".onion:26552").is_err());
         assert!(PeerAddr::parse(".i2p").is_err());
         assert!(PeerAddr::parse(".i2p:26552").is_err());
+    }
+
+    #[test]
+    fn wellformed_rejects_inbound_placeholders() {
+        // The placeholder shapes inbound overlay connections carry before the
+        // handshake fills them in must never enter a peer registry.
+        assert!(!PeerAddr::Onion { host: String::new(), port: 0 }.is_wellformed());
+        assert!(!PeerAddr::Onion { host: "abcdefghij234567".into(), port: 0 }.is_wellformed());
+        assert!(!PeerAddr::I2p { dest: String::new(), port: 0 }.is_wellformed());
+        // The all-zero rns sentinel an inbound mesh link is served under (its
+        // link id is not a dialable destination hash) is rejected.
+        assert!(!PeerAddr::Rns([0u8; 16]).is_wellformed());
+        // Complete addresses pass, including port-0 Ip (selection filters it)
+        // and portless-by-design rns.
+        assert!(PeerAddr::parse("1.2.3.4:0").unwrap().is_wellformed());
+        assert!(PeerAddr::parse("abcdefghij234567.onion:43110").unwrap().is_wellformed());
+        assert!(PeerAddr::parse(
+            "ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.i2p:15441"
+        )
+        .unwrap()
+        .is_wellformed());
+        assert!(PeerAddr::parse("rns:0123456789abcdef0123456789abcdef").unwrap().is_wellformed());
     }
 
     #[test]

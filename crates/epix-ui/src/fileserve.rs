@@ -141,10 +141,18 @@ impl FileService {
             }
         }
         let mut exclude: HashSet<String> = got.iter().map(|p| p.to_string()).collect();
-        // The requester connected from an ephemeral port; only add it back as a
-        // dialable peer if the handshake gave us its real fileserver port.
-        if peer.ip_type() != epix_core::IpType::Rns {
-            exclude.insert(peer.to_string());
+        exclude.insert(peer.to_string());
+        // Record the requester itself when it arrived over an overlay: the
+        // handshake rebinds an inbound onion/i2p/rns placeholder to the peer's
+        // advertised self-address, so an overlay publisher that
+        // PEXes us becomes a peer we can dial back at first contact instead of
+        // waiting for gossip to name it. A placeholder (no self-address
+        // advertised) is dropped by add_peers' well-formedness filter. A
+        // clearnet requester still arrives from an ephemeral port unless its
+        // handshake advertised a fileserver port; trackers cover clearnet
+        // self-advertising, so those are not recorded here.
+        if peer.is_overlay() {
+            got.push(peer.clone());
         }
         self.state.add_peers(&site, got).await;
 
@@ -281,11 +289,17 @@ impl FileService {
 
     /// `listModified {site, since}` - report our content.json files modified
     /// after `since`, so a peer can pull only what changed instead of polling
-    /// each file.
-    async fn list_modified(&self, params: &Value) -> Value {
+    /// each file. A dialable overlay requester is recorded as a peer of the
+    /// site: a syncing node calls this every resync pass, so this is where an
+    /// overlay peer that pulls from us becomes one we can dial back (the
+    /// handshake rebound its placeholder address; see the pex handler).
+    async fn list_modified(&self, peer: &PeerAddr, params: &Value) -> Value {
         let site = vget_str(params, "site").unwrap_or_default();
         if !self.state.has_any_alias(&site).await {
             return vmap(vec![("error", Value::from("Unknown site"))]);
+        }
+        if peer.is_overlay() {
+            self.state.add_peers(&site, [peer.clone()]).await;
         }
         let since = vget(params, "since")
             .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
@@ -421,7 +435,7 @@ impl RequestHandler for FileService {
             "update" => self.update(peer, params).await,
             "pex" => self.pex(peer, params).await,
             "announce" => self.announce(peer, params).await,
-            "listModified" => self.list_modified(params).await,
+            "listModified" => self.list_modified(peer, params).await,
             "checkport" => self.checkport(peer, params).await,
             // AnnounceShare/Beacon: peers exchange their working announcer
             // lists (`epix://host:port` strings), so the tracker set spreads
