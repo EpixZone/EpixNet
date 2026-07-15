@@ -422,6 +422,16 @@ fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
     let after_scheme = referer
         .trim_start_matches("https://")
         .trim_start_matches("http://");
+    // Drop the query/fragment before splitting on '/': a client-routed xite's
+    // referer carries its route in the query (`?Topic:…_user.epix/Some+Title`),
+    // and that query can hold both a `.epix` and a `/`. Splitting the raw string
+    // would read `index.html?Topic:…_user.epix` as the first path segment, treat
+    // it as a `.epix` source xite, and 403 the xite's own stylesheet in proxy
+    // (host) mode where the path is just `index.html?…`.
+    let after_scheme = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
     let (ref_host, ref_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
     let ref_host = strip_port(ref_host);
     // A xite can be served nested under another xite's proxy host: clicking a

@@ -192,3 +192,49 @@ async fn cross_origin_gate_and_cors_permission() {
         .unwrap();
     assert_eq!(resp.status(), 403, "xite content still gated");
 }
+
+#[tokio::test]
+async fn proxy_mode_subresource_with_epix_in_query_referer_passes() {
+    // Regression: in transparent-proxy (host) mode a client-routed xite's own
+    // referer carries its route in the query, and that route can hold both a
+    // `.epix` and a `/` (e.g. `?Topic:1780270617_user.epix/Epix+Topic+…`). The
+    // request path there is just `index.html?<query>`, so the cross-origin
+    // gate used to split the query into the referer's "first path segment",
+    // read `index.html?Topic:…_user.epix` as a foreign `.epix` source xite, and
+    // 403 the xite's own stylesheet - loading it unstyled. It must pass as a
+    // same-xite read. `rewrite_proxy_host` runs before routing in production.
+    let talk = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+    let state = AppState::new("sec-test");
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("data.json", b"{}").unwrap();
+    storage.write("css/all.css", b"body{}").unwrap();
+    state
+        .add_xite(talk, XiteEntry { storage, content: Some(json!({ "address": talk })) })
+        .await;
+    std::mem::forget(dir);
+    state.config_set("ui_check_cors", json!(true)).await;
+    let router = UiServer::new(state.clone()).router();
+
+    let referer = format!(
+        "http://{talk}/index.html?Topic:1780270617_user.epix/Epix+Topic"
+    );
+    let req = epix_ui::rewrite_proxy_host(get(
+        "/css/all.css",
+        &[("host", talk), ("referer", &referer), ("sec-fetch-mode", "no-cors")],
+    ));
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), 403, "xite's own stylesheet must not be 403'd in proxy mode");
+
+    // A genuinely foreign proxy-mode referer is still blocked.
+    let cross = epix_ui::rewrite_proxy_host(get(
+        "/css/all.css",
+        &[
+            ("host", talk),
+            ("referer", "http://epix1p0stmcza0xjkvv0vnjlk0ypr7xsunt4lxkhgcm/index.html"),
+            ("sec-fetch-mode", "no-cors"),
+        ],
+    ));
+    let resp = router.clone().oneshot(cross).await.unwrap();
+    assert_eq!(resp.status(), 403, "cross-xite proxy-mode read still blocked");
+}
