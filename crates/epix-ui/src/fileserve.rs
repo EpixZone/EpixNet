@@ -599,7 +599,7 @@ fn string_list(params: &Value, key: &str) -> Vec<String> {
 }
 
 /// Pack peers into an announce reply's per-hash bucket map (`ipv4`/`ip4`/
-/// `ipv6`/`onion`/`i2p`). `ip4` mirrors `ipv4` for old ZeroNet clients.
+/// `ipv6`/`onion`/`i2p`). `ip4` mirrors `ipv4` for old EpixNet clients.
 fn pack_peer_buckets(peers: &[PeerAddr]) -> Value {
     let (mut ipv4, mut ipv6, mut onion, mut i2p) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for p in peers {

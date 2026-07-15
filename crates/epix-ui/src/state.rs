@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 /// Default per-xite size limit, in MB. The Epix python client raised its
-/// `--size-limit` default from ZeroNet's 10 to 1000; a growing xite stops
+/// `--size-limit` default from EpixNet's 10 to 1000; a growing xite stops
 /// syncing at this cap until the user raises it, so the old 10 broke any
 /// site past 10 MB out of the box.
 pub const DEFAULT_SIZE_LIMIT_MB: i64 = 1000;
@@ -2235,6 +2235,26 @@ impl AppState {
         }
     }
 
+    /// How we advertise ourselves to trackers so they hand our address out:
+    /// our fileserver port plus any onion/i2p addresses we host (overlay
+    /// addresses are the only route by which onion/i2p-only nodes get found).
+    /// The `want_*` flags ask the tracker for peers of that type, so they key
+    /// on whether we can DIAL the network - not on whether we publish an
+    /// inbound address there. A dial-only i2p node (transport Ready, no
+    /// inbound b32) wants i2p peers; a node with a stale published b32 whose
+    /// session died does not.
+    pub async fn self_advert(&self) -> epix_xite::SelfAdvert {
+        let nets = self.dialable_networks().await;
+        epix_xite::SelfAdvert {
+            port: self.fileserver_port().await,
+            onion: self.onion_address().await,
+            i2p: self.i2p_address().await,
+            want_onion: self.tor_status().await.0,
+            want_i2p: nets.i2p,
+            onion_signer: self.onion_signer.read().await.clone(),
+        }
+    }
+
     /// Announce a xite to each tracker in turn, recording per-tracker stats and
     /// folding the peers found into the xite's registry. Returns all peers.
     pub async fn announce_to_trackers(
@@ -2254,17 +2274,7 @@ impl AppState {
                 .map(|x| canonical_address(x.content.as_ref(), address))
                 .unwrap_or_else(|| address.to_string())
         };
-        // How we advertise ourselves to trackers so they hand our address out:
-        // our fileserver port plus any onion/i2p addresses we host. Overlay
-        // addresses are the only route by which onion/i2p-only nodes get found.
-        let advert = std::sync::Arc::new(epix_xite::SelfAdvert {
-            port: self.fileserver_port().await,
-            onion: self.onion_address().await,
-            i2p: self.i2p_address().await,
-            want_onion: self.tor_status().await.0,
-            want_i2p: self.i2p_address().await.is_some(),
-            onion_signer: self.onion_signer.read().await.clone(),
-        });
+        let advert = std::sync::Arc::new(self.self_advert().await);
         // Announce to every tracker concurrently: with a Beacon-sized list
         // (dozens, some dead), serial announces would stretch one pass across
         // many timeouts and the dashboard's per-tracker stats would trickle in.
@@ -6174,13 +6184,23 @@ impl AppState {
     }
 
     /// Look up peers for `address` via the installed [`PeerFinder`] (the DHT),
-    /// or an empty list when none is installed.
+    /// or an empty list when none is installed. Drops this node's own addresses:
+    /// we announce our onion/i2p/rns self-claims to the DHT, and a lookup for a
+    /// site we serve echoes them straight back. The clone/user-content dial
+    /// paths call this directly (bypassing [`Self::add_peers`]' own-peer
+    /// filter), so without this a sole seeder would dial its own onion service
+    /// and "sync" from itself, masking the no-peers condition.
     pub async fn find_peers_dht(&self, address: &str) -> Vec<PeerAddr> {
         let hook = self.peer_finder.read().await.clone();
-        match hook {
-            Some(hook) => hook.find(address).await,
-            None => Vec::new(),
+        let Some(hook) = hook else { return Vec::new() };
+        let mut peers = hook.find(address).await;
+        let mut kept = Vec::with_capacity(peers.len());
+        for peer in peers.drain(..) {
+            if !self.is_own_peer(&peer).await {
+                kept.push(peer);
+            }
         }
+        kept
     }
 
     /// Install the included/user-content syncer (set by the node).
@@ -8387,6 +8407,35 @@ mod tests {
         assert!(state.dialable_networks().await.rns);
     }
 
+    /// Phase 4: `want_i2p` asks trackers for i2p peers, so it must key on
+    /// whether we can DIAL i2p - not on whether we publish an inbound b32.
+    #[tokio::test]
+    async fn want_i2p_follows_dialability_not_inbound_address() {
+        let state = AppState::new("test");
+
+        // A published inbound b32 alone must NOT request i2p peers: with no
+        // dialable i2p transport we could never reach any peer we're handed.
+        state.set_i2p_address("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32").await;
+        assert!(!state.self_advert().await.want_i2p, "inbound b32 alone is not dialability");
+
+        // Transport composed in but session not Ready yet: still no.
+        state.set_i2p_transport(Arc::new(epix_transport::TcpTransport)).await;
+        state.set_i2p_status(json!({ "phase": "Starting…" })).await;
+        assert!(!state.self_advert().await.want_i2p);
+
+        // Dialable (transport + Ready): want i2p peers - even a dial-only
+        // node with no inbound b32 of its own benefits.
+        state.set_i2p_status(json!({ "phase": "Ready" })).await;
+        assert!(state.self_advert().await.want_i2p);
+
+        // The advert still carries our inbound b32 independently of want_i2p.
+        let advert = state.self_advert().await;
+        assert_eq!(
+            advert.i2p.as_deref(),
+            Some("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32")
+        );
+    }
+
     #[tokio::test]
     async fn connectable_peers_filters_networks_the_node_cannot_dial() {
         let dir = tempdir().unwrap();
@@ -8460,6 +8509,85 @@ mod tests {
             ],
             "own addresses dropped, real peers kept"
         );
+    }
+
+    /// The i2p and rns arms of `is_own_peer` are exercised directly (not via
+    /// connectable_peers, which would also drop them for dialability and mask a
+    /// broken arm). Phase 4 announces i2p/rns self-claims to the DHT that echo
+    /// straight back, so these arms are the only guard against self-dialing.
+    #[tokio::test]
+    async fn is_own_peer_matches_i2p_and_rns_self_addresses() {
+        let state = AppState::new("test");
+        state.set_fileserver_port(26552).await;
+        state
+            .set_i2p_address("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32")
+            .await;
+        // rns_address is stored as given; is_own_peer lowercases for the compare,
+        // so an uppercase stored hash must still match its `rns:<lower>` form.
+        state.set_rns_address("00112233445566778899AABBCCDDEEFF").await;
+
+        // Our own i2p destination (any virtual port) is us.
+        assert!(
+            state
+                .is_own_peer(
+                    &PeerAddr::parse(
+                        "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:26552"
+                    )
+                    .unwrap()
+                )
+                .await
+        );
+        // Our own rns destination is us, case-insensitively.
+        assert!(
+            state
+                .is_own_peer(&PeerAddr::parse("rns:00112233445566778899aabbccddeeff").unwrap())
+                .await
+        );
+        // A different i2p dest / rns hash is NOT us.
+        assert!(
+            !state
+                .is_own_peer(
+                    &PeerAddr::parse(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.b32.i2p:26552"
+                    )
+                    .unwrap()
+                )
+                .await
+        );
+        assert!(
+            !state
+                .is_own_peer(&PeerAddr::parse("rns:ffffffffffffffffffffffffffffffff").unwrap())
+                .await
+        );
+    }
+
+    /// find_peers_dht must drop the node's own echoed claims before the clone /
+    /// user-content paths dial them (they bypass add_peers' own-peer filter).
+    #[tokio::test]
+    async fn find_peers_dht_drops_own_echoed_claims() {
+        struct StubFinder(Vec<PeerAddr>);
+        #[async_trait::async_trait]
+        impl PeerFinder for StubFinder {
+            async fn find(&self, _address: &str) -> Vec<PeerAddr> {
+                self.0.clone()
+            }
+        }
+
+        let state = AppState::new("test");
+        state.set_fileserver_port(26552).await;
+        state.set_onion_address("jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd").await;
+
+        let own_onion = PeerAddr::parse(
+            "jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd.onion:26552",
+        )
+        .unwrap();
+        let real_peer = PeerAddr::parse("expyuzz4wqqyqhjn.onion:26552").unwrap();
+        state
+            .set_peer_finder(Arc::new(StubFinder(vec![own_onion, real_peer.clone()])))
+            .await;
+
+        let got = state.find_peers_dht("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g").await;
+        assert_eq!(got, vec![real_peer], "own onion echo dropped, real peer kept");
     }
 
     #[tokio::test]
@@ -8696,7 +8824,7 @@ mod tests {
         assert!(info["content"].get("signs").is_none());
 
         // The default limit matches the python client's --size-limit (1000 MB,
-        // not ZeroNet's old 10) - a growing xite must not stall at 10 MB.
+        // not EpixNet's old 10) - a growing xite must not stall at 10 MB.
         assert_eq!(info["size_limit"], DEFAULT_SIZE_LIMIT_MB);
         assert_eq!(info["next_size_limit"], 10);
     }
