@@ -1020,6 +1020,10 @@ struct OnDemand {
     /// cold-start wait in `await_tor_ready`. Set once, after the Tor mode is
     /// resolved in `serve`.
     tor_expected: std::sync::atomic::AtomicBool,
+    /// Whether Tor-Always mode is active (clearnet is closed). When Tor is not
+    /// up, `await_tor_ready` refuses to fall through to a clearnet clone in this
+    /// mode, so a cold-start or Tor-down clone never leaks the real IP.
+    tor_always: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1150,18 +1154,23 @@ impl OnDemand {
     /// ("Peers found: 4" but none reachable). Once Tor is up (the steady
     /// state) this returns at once, so only the first cold-start open waits.
     ///
-    /// Bounded: if Tor fails or drags past the cap, fall through and let the
-    /// clone try over clearnet rather than block the page forever. "Disabled"
-    /// is not treated as terminal here - on a cold start the Tor loop may not
-    /// have flipped the status to "Bootstrapping" yet, and `tor_expected`
+    /// Returns whether it is safe to proceed to dial. Non-Always modes get the
+    /// old behaviour (true): a dual-homed Enable node may dial clearnet peers
+    /// directly, and a Disable node has no Tor to wait for. In Tor-Always mode
+    /// clearnet is closed, so this returns true ONLY once Tor actually comes up;
+    /// if Tor fails or drags past the cap it returns false and the caller aborts
+    /// the clone instead of dialing over clearnet and leaking the real IP.
+    /// "Disabled" is not treated as terminal here - on a cold start the Tor loop
+    /// may not have flipped the status to "Bootstrapping" yet, and `tor_expected`
     /// already told us it is coming.
-    async fn await_tor_ready(&self) {
+    async fn await_tor_ready(&self) -> bool {
         use std::sync::atomic::Ordering;
         if !self.tor_expected.load(Ordering::Relaxed) {
-            return;
+            return true;
         }
+        let always = self.tor_always.load(Ordering::Relaxed);
         if self.state.tor_status().await.0 {
-            return; // already up: no wait
+            return true; // already up: no wait
         }
         self.state
             .log(
@@ -1175,11 +1184,18 @@ impl OnDemand {
         // Windows machine fetching a fresh consensus) can take longer.
         for _ in 0..240 {
             let (up, status) = self.state.tor_status().await;
-            if up || status == "Failed" {
-                return;
+            if up {
+                return true;
+            }
+            if status == "Failed" {
+                // Fall through to clearnet only when clearnet is allowed.
+                return !always;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+        // Timed out: proceed over clearnet only when Always mode isn't forcing
+        // Tor. In Always mode, refuse rather than leak.
+        !always
     }
 
     async fn do_ensure(&self, host: &str) -> Result<(), String> {
@@ -1221,8 +1237,16 @@ impl OnDemand {
             // start the plain TCP transport is still installed, so wait for the
             // onion-capable transport before dialing - otherwise a fresh
             // install's first open fails every peer and shows "index.html
-            // download failed". No-op once Tor is up (the steady state).
-            self.await_tor_ready().await;
+            // download failed". No-op once Tor is up (the steady state). In
+            // Always mode, if Tor never comes up, abort rather than clone over
+            // clearnet and leak the real IP.
+            if !self.await_tor_ready().await {
+                return Err(
+                    "Tor is not available and Always mode forbids clearnet, so this site \
+                     cannot be fetched right now"
+                        .to_string(),
+                );
+            }
             // Mark the download in flight: the html serving gate holds the
             // page document back until the core set is on disk.
             self.state.begin_clone(&address);
@@ -1418,6 +1442,7 @@ async fn serve(
         trackers: trackers.clone(),
         in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
+        tor_always: std::sync::atomic::AtomicBool::new(false),
     });
     state.set_on_demand(on_demand.clone()).await;
     // The same component syncs included/user content for existing sites
@@ -1470,11 +1495,18 @@ async fn serve(
     // Let the on-demand resolver know Tor is coming, so a cold-start clone
     // waits for the onion-capable transport instead of failing every onion
     // dial on the plain TCP transport the node holds until Arti bootstraps.
+    // In Always mode it must also never fall through to a clearnet clone.
     #[cfg(feature = "tor")]
-    on_demand.tor_expected.store(
-        tor_mode != epix_runtime::TorMode::Disable,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    {
+        on_demand.tor_expected.store(
+            tor_mode != epix_runtime::TorMode::Disable,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        on_demand.tor_always.store(
+            tor_mode == epix_runtime::TorMode::Always,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 
     // Privacy by default: turn the embedded I2P router on the first time a node
     // runs with no explicit `i2p` choice (persisted so the Config page shows it
