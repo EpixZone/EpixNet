@@ -28,7 +28,7 @@ tempfile = "3"
 # Desktop bundles the auth/login plugins that a mobile build leaves off (the
 # phone UI is already local to the device). Build a mobile node with
 # `--no-default-features`.
-default = ["desktop", "tor", "i2p-embedded", "mesh"]
+default = ["desktop", "tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]
 desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
 # In-process Tor (Arti): onion dialing + hosting + SOCKS listener for the shell.
 tor = ["epix-node/tor"]
@@ -36,3 +36,8 @@ i2p = ["epix-node/i2p"]
 mesh = ["epix-node/mesh"]
 # Desktop: compile the embedded router in AND auto-enable it on first run.
 i2p-embedded = ["epix-node/i2p-embedded", "epix-node/i2p-autostart"]
+# The always-on server seeds and maps its port and discovers LAN peers; the
+# node no longer pulls these by default, so re-add them here (the mobile FFI
+# leaves them off). `--no-default-features` drops them for a server-side mobile build.
+inbound-seeding = ["epix-node/inbound-seeding"]
+local-discovery = ["epix-node/local-discovery"]

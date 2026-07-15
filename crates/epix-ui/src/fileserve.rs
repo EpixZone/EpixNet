@@ -5,8 +5,11 @@
 //! minimal `pex`. Without this the node could download from peers but never
 //! serve, so it could not seed content, Bigfile pieces, or optional files.
 //!
-//! Feature-gated behind `inbound-seeding` (off for mobile, which should not
-//! accept inbound connections).
+//! This handler is always compiled - it is what every inbound transport serves.
+//! The `inbound-seeding` feature only gates the CLEARNET TCP listener + UPnP
+//! (off on mobile); the onion (`tor`) and I2P (`i2p`) services mount this same
+//! handler, so a phone with no clearnet listener still serves its published
+//! files (e.g. a new EpixTalk topic) to peers over its onion/I2P address.
 
 use crate::state::InboundUpdate;
 use crate::AppState;
