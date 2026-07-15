@@ -181,19 +181,32 @@ impl NodeRuntime {
         if self.config.offline {
             return;
         }
+        // Tor-Always mode closes clearnet: every outbound dial must go through
+        // Tor. But the node installs a plain TCP transport at startup and
+        // tor_loop only swaps in the Tor-routed transport once Arti finishes
+        // bootstrapping (~10-40s). Each peer-dialing loop below waits for that
+        // (await_tor_routed) in Always mode, so none of them dials over clearnet
+        // during the bootstrap window and leaks the real IP. A no-op otherwise.
+        #[cfg(feature = "tor")]
+        let tor_always = self.config.tor_mode == epix_tor::TorMode::Always;
+        #[cfg(not(feature = "tor"))]
+        let tor_always = false;
         self.handles.push(tokio::spawn(announce_loop(
             self.state.clone(),
             self.trackers.clone(),
+            tor_always,
             self.shutdown.clone(),
             self.config.announce_interval,
         )));
         self.handles.push(tokio::spawn(resync_loop(
             self.state.clone(),
+            tor_always,
             self.shutdown.clone(),
             self.config.resync_interval,
         )));
         self.handles.push(tokio::spawn(connection_loop(
             self.state.clone(),
+            tor_always,
             self.shutdown.clone(),
             self.config.connection_interval,
         )));
@@ -206,11 +219,7 @@ impl NodeRuntime {
         // service, dials every contact through the Tor transport, and claims
         // only its onion address - so it never leaves from (or claims) the real
         // IP. Outside Always mode the DHT runs over clearnet as before. See
-        // dht_loop.
-        #[cfg(feature = "tor")]
-        let tor_always = self.config.tor_mode == epix_tor::TorMode::Always;
-        #[cfg(not(feature = "tor"))]
-        let tor_always = false;
+        // dht_loop. (`tor_always` is computed above, shared with the peer loops.)
         self.handles.push(tokio::spawn(dht_loop(
             self.state.clone(),
             self.dht.clone(),
@@ -310,6 +319,7 @@ impl NodeRuntime {
         // FileServer.wakeupWatcher. Cheap: a 30s self-check.
         self.handles.push(tokio::spawn(wakeup_loop(
             self.state.clone(),
+            tor_always,
             self.shutdown.clone(),
         )));
         // AnnounceLocal: discover peers on the LAN over UDP broadcast. When the
@@ -335,9 +345,35 @@ impl NodeRuntime {
 /// Re-announce every xite to the trackers (recording per-tracker stats).
 /// Announces once immediately (so peers populate right after startup without
 /// blocking the server bind), then every `period`.
+/// In Tor-Always mode, park until the Tor-routed transport is live before a
+/// peer-dialing loop does any outbound dial. `tor_status().0` flips true only
+/// AFTER tor_loop swaps in the Tor transport (set_transport precedes
+/// set_tor_status), so it is an exact "Tor routing is live" signal - waiting on
+/// it keeps a loop off the plain clearnet transport installed at startup, which
+/// would otherwise leak the real IP during the ~10-40s Tor bootstrap window.
+/// A no-op in every other mode. Returns false if shutdown fired while waiting
+/// (the caller should stop). It never falls through to clearnet: if Tor never
+/// comes up the caller simply never dials - the correct consequence of Always
+/// mode closing clearnet.
+async fn await_tor_routed(state: &AppState, tor_always: bool, shutdown: &Notify) -> bool {
+    if !tor_always {
+        return true;
+    }
+    loop {
+        if state.tor_status().await.0 {
+            return true;
+        }
+        tokio::select! {
+            _ = shutdown.notified() => return false,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
 async fn announce_loop(
     state: Arc<AppState>,
     trackers: Vec<epix_xite::Tracker>,
+    tor_always: bool,
     shutdown: Arc<Notify>,
     period: Duration,
 ) {
@@ -372,6 +408,11 @@ async fn announce_loop(
         // Drop tracker peers other nodes announced that have gone stale.
         state.tracker_expire().await;
     };
+    // In Always mode, don't announce (which dials trackers) until Tor routes
+    // our traffic - otherwise the immediate boot announce leaks our real IP.
+    if !await_tor_routed(&state, tor_always, &shutdown).await {
+        return;
+    }
     announce().await;
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -677,7 +718,17 @@ async fn dht_loop(
 /// Keep a small pool of warm peer connections open + pinged, so the dashboard's
 /// connection stats reflect real live links. Warms up quickly (peers arrive from
 /// the announce loop shortly after startup), then settles into `period`.
-async fn connection_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
+async fn connection_loop(
+    state: Arc<AppState>,
+    tor_always: bool,
+    shutdown: Arc<Notify>,
+    period: Duration,
+) {
+    // In Always mode, don't warm peer connections until Tor routes our traffic;
+    // manage_connections dials candidate peers, which over clearnet leaks our IP.
+    if !await_tor_routed(&state, tor_always, &shutdown).await {
+        return;
+    }
     // Retry every few seconds until the pool has a connection, so the count
     // shows soon after the background announce populates peers - rather than
     // waiting a full period after the empty first attempt.
@@ -753,7 +804,7 @@ async fn chart_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duratio
 /// jump, kick a fresh announce (via the trackers-changed notify the announce
 /// loop already waits on) and a connection sweep, so a laptop that closes and
 /// reopens rejoins the network at once instead of on the next 20-minute pass.
-async fn wakeup_loop(state: Arc<AppState>, shutdown: Arc<Notify>) {
+async fn wakeup_loop(state: Arc<AppState>, tor_always: bool, shutdown: Arc<Notify>) {
     let check = Duration::from_secs(30);
     // A jump longer than a few checks means real suspended time, not scheduler
     // jitter (EpixNet uses 3 minutes).
@@ -778,13 +829,24 @@ async fn wakeup_loop(state: Arc<AppState>, shutdown: Arc<Notify>) {
                 .await;
             // Kick the announce loop (it selects on this) and refresh peers.
             state.trackers_changed().notify_waiters();
+            // manage_connections dials peers; in Always mode wait for Tor first
+            // so a resume during the Tor bootstrap window can't dial clearnet
+            // and leak our IP.
+            if !await_tor_routed(&state, tor_always, &shutdown).await {
+                break;
+            }
             state.manage_connections().await;
         }
     }
 }
 
 /// Re-sync every xite (fetch a newer content.json + changed files).
-async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Duration) {
+async fn resync_loop(
+    state: Arc<AppState>,
+    tor_always: bool,
+    shutdown: Arc<Notify>,
+    period: Duration,
+) {
     // Initial user-content pass shortly after start (own task, so the resync
     // ticker isn't delayed): sites cloned before the recursive-content
     // feature (or while this node was offline) backfill their included and
@@ -797,10 +859,20 @@ async fn resync_loop(state: Arc<AppState>, shutdown: Arc<Notify>, period: Durati
                 _ = shutdown.notified() => return,
                 _ = tokio::time::sleep(Duration::from_secs(20)) => {}
             }
+            // sync_user_content dials peers; in Always mode wait for Tor first
+            // so the 20s pass can't race the Tor bootstrap and leak our IP.
+            if !await_tor_routed(&state, tor_always, &shutdown).await {
+                return;
+            }
             for address in state.xite_addresses().await {
                 state.sync_user_content(&address).await;
             }
         });
+    }
+    // The resync tick itself dials peers to fetch updates; hold it until Tor
+    // routes our traffic in Always mode.
+    if !await_tor_routed(&state, tor_always, &shutdown).await {
+        return;
     }
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1480,6 +1552,38 @@ mod tests {
         // Tor-Always: every dial rides Tor, so a clearnet peer also gets 45s.
         assert_eq!(dht_dial_timeout(&clearnet, true), std::time::Duration::from_secs(45));
         assert_eq!(dht_dial_timeout(&onion, true), std::time::Duration::from_secs(45));
+    }
+
+    #[tokio::test]
+    async fn await_tor_routed_is_noop_outside_always_mode() {
+        let state = crate::AppState::new("test");
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        // Not Always mode: proceed immediately even though Tor is not up (an
+        // Enable/Disable node may dial clearnet).
+        assert!(super::await_tor_routed(&state, false, &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn await_tor_routed_proceeds_once_tor_is_up() {
+        let state = crate::AppState::new("test");
+        state.set_tor_status(true, "Always").await;
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        // Always mode with Tor up: the Tor-routed transport is live, so proceed.
+        assert!(super::await_tor_routed(&state, true, &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn await_tor_routed_returns_false_on_shutdown_in_always_mode() {
+        let state = crate::AppState::new("test");
+        // Tor never comes up. The gate blocks (never dials clearnet); a shutdown
+        // releases it with false so the loop stops instead of leaking.
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            sd.notify_waiters();
+        });
+        assert!(!super::await_tor_routed(&state, true, &shutdown).await);
     }
 
     #[test]
