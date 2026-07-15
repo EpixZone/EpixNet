@@ -205,68 +205,86 @@ fn answer_handshake(
 /// wire-packable - `pack()` base32/length-validates onion and i2p hosts, so
 /// junk that could never round-trip peer exchange is never adopted.
 fn adopt_dialback_addr(peer: &mut PeerAddr, params: &Value) {
-    let port = vget(params, "fileserver_port")
-        .and_then(|v| v.as_i64())
-        .filter(|p| (1..=u16::MAX as i64).contains(p))
-        .map(|p| p as u16);
-    let claim = |key: &str| {
-        vget(params, key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
-    };
-    let adopt =
-        |s: String| PeerAddr::parse(&s).ok().filter(|p| p.is_wellformed() && p.pack().is_some());
+    let port = advertised_port(params);
     match &*peer {
-        PeerAddr::Ip(addr) => {
-            // An advertised onion wins over the source IP: a Tor-Always
-            // dialer reaches clearnet through an exit node, so its source IP
-            // is the exit's, not a dialable identity (the Python client
-            // rebinds inbound connections carrying an onion the same way).
-            if let (Some(host), Some(port)) = (claim("onion"), port) {
-                if let Some(p) = adopt(format!("{host}.onion:{port}")) {
-                    *peer = p;
-                    return;
-                }
-            }
-            if let Some(port) = port {
-                // Honor `port_opened` like the Python client: a public peer
-                // that says its fileserver port is closed (behind NAT) is
-                // recorded non-connectable (port 0) so we never dial it or
-                // gossip it to others as reachable - it can still reach us. A
-                // LAN/loopback source is directly reachable regardless, so it
-                // keeps the advertised port.
-                let port_opened =
-                    vget(params, "port_opened").and_then(|v| v.as_bool()).unwrap_or(false);
-                let mut dialable = *addr;
-                let keep = port_opened || PeerAddr::Ip(dialable).is_private();
-                dialable.set_port(if keep { port } else { 0 });
-                *peer = PeerAddr::Ip(dialable);
-            }
-        }
+        PeerAddr::Ip(addr) => *peer = adopt_ip(*addr, params, port),
+        // An overlay placeholder is replaced by its advertised self-address of
+        // the matching class, or left as-is (the well-formedness filter drops
+        // an un-rebound placeholder before it can enter a peer table).
         PeerAddr::Onion { .. } => {
-            if let (Some(host), Some(port)) = (claim("onion"), port) {
-                if let Some(p) = adopt(format!("{host}.onion:{port}")) {
-                    *peer = p;
-                }
+            if let Some(p) = onion_claim(params, port) {
+                *peer = p;
             }
         }
         PeerAddr::I2p { .. } => {
-            // I2P streams are destination-addressed; the port rides along for
-            // wire-shape compatibility (0 when the peer isn't seeding).
-            if let Some(dest) = claim("i2p") {
-                if let Some(p) = adopt(format!("{dest}.i2p:{}", port.unwrap_or(0))) {
-                    *peer = p;
-                }
+            if let Some(p) = i2p_claim(params, port) {
+                *peer = p;
             }
         }
         PeerAddr::Rns(_) => {
-            // The inbound address is the LINK id, not the peer's dialable
-            // destination hash - the claim replaces it outright.
-            if let Some(hex) = claim("rns") {
-                if let Some(p) = adopt(format!("rns:{hex}")) {
-                    *peer = p;
-                }
+            if let Some(p) = rns_claim(params) {
+                *peer = p;
             }
         }
     }
+}
+
+/// Rebind an inbound clearnet peer. An advertised onion wins over the source IP
+/// (a Tor-Always dialer reaches clearnet through an exit node, so its source IP
+/// is the exit's, not a dialable identity - the Python client rebinds the same
+/// way). Otherwise honor `port_opened` like the Python client: a public peer
+/// that says its port is closed (behind NAT) is recorded non-connectable (port
+/// 0) so we never dial it or gossip it as reachable - it can still reach us. A
+/// LAN/loopback source is directly reachable, so it keeps the advertised port.
+fn adopt_ip(addr: std::net::SocketAddr, params: &Value, port: Option<u16>) -> PeerAddr {
+    if let Some(p) = onion_claim(params, port) {
+        return p;
+    }
+    let Some(port) = port else { return PeerAddr::Ip(addr) };
+    let port_opened = vget(params, "port_opened").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut dialable = addr;
+    let keep = port_opened || PeerAddr::Ip(dialable).is_private();
+    dialable.set_port(if keep { port } else { 0 });
+    PeerAddr::Ip(dialable)
+}
+
+/// The peer's advertised fileserver port (1..=65535), or None.
+fn advertised_port(params: &Value) -> Option<u16> {
+    vget(params, "fileserver_port")
+        .and_then(|v| v.as_i64())
+        .filter(|p| (1..=u16::MAX as i64).contains(p))
+        .map(|p| p as u16)
+}
+
+/// A non-empty string self-address claim from the handshake.
+fn overlay_claim(params: &Value, key: &str) -> Option<String> {
+    vget(params, key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// Parse an advertised self-address, keeping it only when complete and
+/// wire-packable - `pack()` base32/length-validates onion and i2p hosts, so
+/// junk that could never round-trip peer exchange is never adopted.
+fn parse_dialback(s: String) -> Option<PeerAddr> {
+    PeerAddr::parse(&s).ok().filter(|p| p.is_wellformed() && p.pack().is_some())
+}
+
+fn onion_claim(params: &Value, port: Option<u16>) -> Option<PeerAddr> {
+    let host = overlay_claim(params, "onion")?;
+    parse_dialback(format!("{host}.onion:{}", port?))
+}
+
+fn i2p_claim(params: &Value, port: Option<u16>) -> Option<PeerAddr> {
+    // I2P streams are destination-addressed; the port rides along for
+    // wire-shape compatibility (0 when the peer isn't seeding).
+    let dest = overlay_claim(params, "i2p")?;
+    parse_dialback(format!("{dest}.i2p:{}", port.unwrap_or(0)))
+}
+
+fn rns_claim(params: &Value) -> Option<PeerAddr> {
+    // The inbound address is the LINK id, not the peer's dialable destination
+    // hash - the claim replaces it outright.
+    let hex = overlay_claim(params, "rns")?;
+    parse_dialback(format!("rns:{hex}"))
 }
 
 /// Write the raw file bytes that follow a `streamFile` reply. Returns false if

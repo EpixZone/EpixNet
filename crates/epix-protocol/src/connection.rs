@@ -92,39 +92,36 @@ fn handshake_params(advert: &crate::advert::SelfAdvert, target: &PeerAddr) -> Va
         ("crypt_supported", Value::Array(vec![])),
         ("port_opened", Value::from(advert.port_opened && !advert.tor_always)),
     ];
-    if advert.fileserver_port != 0 {
-        // One self-address per connection, matching its transport class: our
-        // onion on Tor-bound wires, i2p on i2p, rns on mesh. A DIRECT clearnet
-        // dial advertises no overlay address (the peer sees our real IP;
-        // claiming the onion there would link the two) - unless Always mode
-        // routes the dial through Tor, where the visible source is an exit
-        // node and the onion is our only dialable identity.
-        match target {
-            PeerAddr::Onion { .. } => {
-                if let Some(host) = &advert.onion {
-                    params.push(("onion", Value::from(host.as_str())));
-                }
-            }
-            PeerAddr::I2p { .. } => {
-                if let Some(dest) = &advert.i2p {
-                    params.push(("i2p", Value::from(dest.as_str())));
-                }
-            }
-            PeerAddr::Rns(_) => {
-                if let Some(hex) = &advert.rns {
-                    params.push(("rns", Value::from(hex.as_str())));
-                }
-            }
-            PeerAddr::Ip(_) => {
-                if advert.tor_always {
-                    if let Some(host) = &advert.onion {
-                        params.push(("onion", Value::from(host.as_str())));
-                    }
-                }
-            }
-        }
+    if let Some((key, host)) = self_address_claim(advert, target) {
+        params.push((key, Value::from(host)));
     }
     vmap(params)
+}
+
+/// The single dial-back self-address to advertise on a connection to `target`,
+/// as `(handshake key, host)`, or `None` when we have nothing to offer (not
+/// seeding, or the address for that transport isn't up).
+///
+/// One self-address per connection, matching its transport class: our onion on
+/// Tor-bound wires, i2p on i2p, rns on mesh. A DIRECT clearnet dial advertises
+/// no overlay address (the peer sees our real IP; claiming the onion there
+/// would link the two) - unless Always mode routes the dial through Tor, where
+/// the visible source is an exit node and the onion is our only dialable
+/// identity.
+fn self_address_claim(
+    advert: &crate::advert::SelfAdvert,
+    target: &PeerAddr,
+) -> Option<(&'static str, String)> {
+    if advert.fileserver_port == 0 {
+        return None;
+    }
+    match target {
+        PeerAddr::Onion { .. } => advert.onion.clone().map(|h| ("onion", h)),
+        PeerAddr::I2p { .. } => advert.i2p.clone().map(|d| ("i2p", d)),
+        PeerAddr::Rns(_) => advert.rns.clone().map(|r| ("rns", r)),
+        PeerAddr::Ip(_) if advert.tor_always => advert.onion.clone().map(|h| ("onion", h)),
+        PeerAddr::Ip(_) => None,
+    }
 }
 
 /// A live connection to one peer. Request/response is matched by `req_id`.
