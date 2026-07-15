@@ -15,16 +15,29 @@ epix-ui = { path = "../epix-ui" }
 epix-chain = { path = "../epix-chain" }
 epix-plugin = { path = "../epix-plugin" }
 epix-plugins = { path = "../epix-plugins" }
-epix-runtime = { path = "../epix-runtime" }
+# default-features = false so a download-only embedder (the mobile FFI) does
+# NOT pull the runtime's inbound-seeding / local-discovery loops just by
+# depending on the node. Each is re-exposed as a node feature below and put in
+# the node default, so desktop/server (which take the node default, or opt in
+# explicitly) keep them.
+epix-runtime = { path = "../epix-runtime", default-features = false }
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 serde_json = "1"
 async-trait = "0.1"
 
 [features]
-default = ["tor", "i2p-embedded", "mesh"]
+default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]
 tor = ["epix-runtime/tor"]
 i2p = ["epix-runtime/i2p"]
 mesh = ["epix-runtime/mesh"]
+# Inbound file server + UPnP port mapping. A phone should not accept inbound
+# clearnet connections or poke the router, so the mobile FFI leaves this off
+# (it stays reachable over its onion/i2p service, which the `tor`/`i2p`
+# features host independently).
+inbound-seeding = ["epix-runtime/inbound-seeding"]
+# LAN peer discovery over UDP broadcast. Off on mobile (no LAN-broadcast on a
+# phone; it is battery/radio + a presence-leak with no benefit).
+local-discovery = ["epix-runtime/local-discovery"]
 # i2p-embedded implies i2p, so the node's own #[cfg(feature = "i2p")] code
 # (config read, RuntimeConfig field) is compiled, not just the runtime's.
 i2p-embedded = ["i2p", "epix-runtime/i2p-embedded"]
