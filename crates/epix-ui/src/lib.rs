@@ -390,7 +390,11 @@ async fn is_cross_origin_request(
     let source = referer.and_then(|r| referer_site(ctx, r, host));
     match source {
         Some(source) if source == target => false,
-        Some(source) => !ctx.state.has_cors_permission(&source, target).await,
+        Some(source) => {
+            let source = ctx.state.canonical_key(&source).await;
+            let target = ctx.state.canonical_key(target).await;
+            source != target && !ctx.state.has_cors_permission(&source, &target).await
+        }
         None => true,
     }
 }

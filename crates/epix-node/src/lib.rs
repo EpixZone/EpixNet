@@ -1195,6 +1195,9 @@ impl OnDemand {
         // but its core files are incomplete (an interrupted earlier clone).
         // Owned sites never re-clone: local edits stay.
         let was_registered = self.state.has_xite(&address).await;
+        if was_registered && host != address {
+            self.state.set_display(&address, host).await;
+        }
         let resume = was_registered
             && !self.state.xite_owned(&address).await
             && !self.state.xite_core_complete(&address).await;
