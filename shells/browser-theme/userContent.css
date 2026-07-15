@@ -1,13 +1,7 @@
-/* Epix content-area theme (starter).
+/* Epix content-area overrides (starter).
  *
- * Styles Firefox's built-in pages (new tab, about:blank) to match Epix, so the
- * browser feels like one product rather than stock Firefox. Written into the
- * profile's chrome/ dir on first launch and not overwritten afterwards - edit
- * it live.
+ * The new-tab / home background now comes from the Epix theme add-on
+ * (ntp_background / ntp_text), which follows your system light/dark, so nothing
+ * is hardcoded here. Written once and not overwritten - add your own rules for
+ * Firefox's built-in pages below.
  */
-
-@-moz-document url("about:blank"), url("about:newtab"), url("about:home") {
-  body {
-    background: #0b0e14 !important;
-  }
-}

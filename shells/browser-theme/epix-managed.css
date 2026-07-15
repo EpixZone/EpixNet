@@ -1,23 +1,85 @@
 /* Managed Epix chrome rules. REWRITTEN ON EVERY LAUNCH by the launcher, so do
  * not edit this file - put your own tweaks in userChrome.css, which is left
  * alone. userChrome.css @imports this file.
+ *
+ * Colours come from the Epix theme add-on (a real Firefox theme with light and
+ * dark variants) and the toolbar Epix icon comes from the wallet extension
+ * (the launcher swaps the wallet's icon for the Epix badge), so this sheet only
+ * does structure: hide dead chrome, round the address bar, order the Epix button
+ * just left of the puzzle button, and size the button. Keeping colour out of
+ * here is what lets other Firefox themes actually apply.
  */
 
-/* The managed browser has exactly one pinned extension (the wallet) and no
- * Firefox account, so Firefox's account/sync button and the extensions-overflow
- * (puzzle) button are just dead chrome. Hide both. The wallet stays reachable
- * because the launcher pins it directly to the toolbar. */
-#fxa-toolbar-menu-button,
-#unified-extensions-button {
+/* The managed browser has no Firefox account, so its account/sync button is
+ * dead chrome - hide it. The extensions "puzzle" (unified-extensions) button is
+ * intentionally kept visible; it sits just to the right of the Epix button. */
+#fxa-toolbar-menu-button {
   display: none !important;
 }
 
-/* The wallet's toolbar button reads a touch small next to Firefox's own 16px
- * glyphs (its artwork has built-in padding). Nudge the icon up so it matches
- * the neighbouring controls. Firefox scales from the wallet's 48px asset, so it
- * stays crisp. */
+/* Give the address bar Epix's rounded corners. A theme add-on can set field
+ * colours but not radius, so this stays in CSS. */
+#urlbar,
+#searchbar {
+  border-radius: 8px !important;
+}
+
+/* Lay out the extensions area: the Epix (wallet) button sits just right of the
+ * address bar, and the puzzle button plus any pinned extensions are pushed to
+ * the far right (right-aligned near the menu). All are flex items in the nav-bar
+ * customization target, ordered by CSS `order` (`-moz-box-ordinal-group` covers
+ * older XUL box layout too). The launcher pins the wallet to the toolbar; this
+ * only orders it. */
+#wallet_epix_zone-browser-action {
+  order: 1 !important;
+  -moz-box-ordinal-group: 1 !important;
+}
+/* A flexible spring right after Epix opens the gap and right-aligns everything
+ * after it, so the Epix button stands alone next to the address bar. */
+#customizableui-special-spring2 {
+  order: 2 !important;
+  -moz-box-ordinal-group: 2 !important;
+}
+/* Pinned extensions (and pocket/downloads) are right-aligned, to the LEFT of the
+ * puzzle. Match extension buttons by their `*-browser-action` id regardless of
+ * element type (Firefox wraps them differently across versions) - not the Epix
+ * one, which is pinned left above. */
+#save-to-pocket-button,
+#downloads-button,
+[id$="-browser-action"]:not(#wallet_epix_zone-browser-action) {
+  order: 3 !important;
+  -moz-box-ordinal-group: 3 !important;
+}
+/* The puzzle button is the rightmost item of the extensions cluster. */
+#unified-extensions-button {
+  order: 4 !important;
+  -moz-box-ordinal-group: 4 !important;
+}
+
+/* Enlarge the Epix icon so its mark reads clearly. 24px matches the 24px render
+ * size the launcher adds to the wallet, and the wallet draws the icon at full
+ * size, so it is pixel-for-pixel 1:1 with the status dot - crisp, not upscaled
+ * from the 16px icon. */
 #wallet_epix_zone-browser-action .toolbarbutton-icon,
 #wallet_epix_zone-browser-action .toolbarbutton-badge-stack > .toolbarbutton-icon {
-  width: 20px !important;
-  height: 20px !important;
+  width: 24px !important;
+  height: 24px !important;
+}
+
+/* Loading animation, part 1 of 2: a short spin flourish that fires when the
+ * toolbar renders, i.e. exactly when a browser window appears. This is what makes
+ * a reopen spin: closing the browser leaves the node running, so on reopen it is
+ * already connected before the window is even painted - a status-driven spin would
+ * have nothing to wait for and finishes unseen during startup. A CSS animation is
+ * tied to the window appearing, not to the node, so it always plays and is smooth
+ * (compositor-driven, not a background timer Firefox throttles during startup).
+ * Part 2 is in the wallet (patch_wallet_boot_spin): a dot-less spin that covers a
+ * genuine cold connect, where the node bootstraps for tens of seconds. */
+@keyframes epix-flourish {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(720deg); }
+}
+#wallet_epix_zone-browser-action .toolbarbutton-icon {
+  animation: epix-flourish 1.6s linear 1 !important;
+  transform-origin: center center !important;
 }
