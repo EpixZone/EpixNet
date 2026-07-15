@@ -202,22 +202,20 @@ impl NodeRuntime {
         // (works for rare sites and if the trackers go down). Also installs the
         // PeerFinder hook so on-demand clones can query the DHT.
         //
-        // The DHT runs over the plain clearnet transport captured at startup,
-        // so every probe, lookup, AND announce leaves from our real IP. In
-        // Tor-Always mode clearnet is deliberately closed for anonymity, so the
-        // DHT is disabled entirely there - running it would leak the real IP
-        // (and tie it to the site keys we query, or correlate it to our onion
-        // self-claim). Discovery in that mode falls back to trackers-over-Tor
-        // and PEX. Routing the DHT itself over Tor is a larger, separate change.
+        // In Tor-Always mode the DHT runs OVER Tor: it waits for the onion
+        // service, dials every contact through the Tor transport, and claims
+        // only its onion address - so it never leaves from (or claims) the real
+        // IP. Outside Always mode the DHT runs over clearnet as before. See
+        // dht_loop.
         #[cfg(feature = "tor")]
-        let clearnet_dht = self.config.tor_mode != epix_tor::TorMode::Always;
+        let tor_always = self.config.tor_mode == epix_tor::TorMode::Always;
         #[cfg(not(feature = "tor"))]
-        let clearnet_dht = true;
+        let tor_always = false;
         self.handles.push(tokio::spawn(dht_loop(
             self.state.clone(),
             self.dht.clone(),
             self.config.fileserver_port,
-            clearnet_dht,
+            tor_always,
             self.shutdown.clone(),
             self.config.announce_interval,
         )));
@@ -428,8 +426,13 @@ fn dialable_dht_peer(p: &PeerAddr) -> bool {
 /// destination hash. Everything is gated on a real fileserver port: the port
 /// doubles as the onion/i2p virtual port, so a portless node has no inbound
 /// service to claim on any network.
+///
+/// `include_clearnet` is false in Tor-Always mode: our announce reaches peers
+/// from a Tor exit, so a `0.0.0.0` claim would be rewritten to the exit IP
+/// (useless, and it re-introduces a correlation). There we claim overlays only.
 fn dht_self_claims(
     port: u16,
+    include_clearnet: bool,
     onion: Option<String>,
     i2p: Option<String>,
     rns: Option<String>,
@@ -438,7 +441,9 @@ fn dht_self_claims(
     if port == 0 {
         return claims;
     }
-    claims.push(PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr"));
+    if include_clearnet {
+        claims.push(PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr"));
+    }
     if let Some(host) = onion.filter(|h| !h.is_empty()) {
         claims.extend(PeerAddr::parse(&format!("{host}.onion:{port}")));
     }
@@ -451,39 +456,98 @@ fn dht_self_claims(
     claims
 }
 
+/// Dial deadline for a DHT contact. In Tor-Always mode every dial rides Tor -
+/// even a clearnet peer - so it gets the overlay bound, since a cold Tor
+/// circuit build can exceed the 15s clearnet timeout and cut off a reachable
+/// peer mid-handshake. Otherwise the peer's own per-network bound applies.
+fn dht_dial_timeout(peer: &PeerAddr, tor_always: bool) -> Duration {
+    if tor_always {
+        Duration::from_secs(45)
+    } else {
+        peer.connect_timeout()
+    }
+}
+
+/// Announce our self-claims for one site to the DHT and fold any peers the DHT
+/// returns into the site's registry. Returns how many usable peers it found.
+/// dht_loop spawns this per site (bounded concurrency) so a pass stays roughly
+/// one lookup deep instead of summing every site's round trips serially.
+async fn dht_announce_site(
+    state: Arc<AppState>,
+    dht: Arc<epix_dht::Node>,
+    rpc: Arc<epix_dht_net::WireRpcClient>,
+    claims: Arc<Vec<PeerAddr>>,
+    address: String,
+) -> usize {
+    let key = epix_dht::site_key(&address);
+    if !claims.is_empty() {
+        dht.announce_all(key, claims.as_slice(), rpc.as_ref()).await;
+    }
+    let mut peers = dht.get_peers(key, rpc.as_ref()).await;
+    // Drop unusable claims (a NAT'd announcer's own 0.0.0.0 entry).
+    peers.retain(dialable_dht_peer);
+    let found = peers.len();
+    if found > 0 {
+        state.add_peers(&address, peers).await;
+    }
+    found
+}
+
 /// Tracker-independent discovery: a rare site findable from any peer that
 /// serves it, even with every tracker down. Runs on the announce cadence.
 async fn dht_loop(
     state: Arc<AppState>,
     dht: Arc<epix_dht::Node>,
     fileserver_port: Option<u16>,
-    clearnet_dht: bool,
+    tor_always: bool,
     shutdown: Arc<Notify>,
     period: Duration,
 ) {
-    // Tor-Always mode: the DHT can only run over the leaky clearnet transport,
-    // so stay off it entirely. No peer finder is installed, so find_peers_dht
-    // is a no-op and the clone / user-content paths don't leak over clearnet
-    // either.
-    if !clearnet_dht {
-        state.log("INFO", "DHT: disabled in Tor-Always mode (clearnet closed)").await;
-        return;
-    }
-    // Wait for the transport (set by the node just before the runtime starts).
-    let transport = loop {
-        if let Some(t) = state.transport().await {
-            break t;
-        }
-        tokio::select! {
-            _ = shutdown.notified() => return,
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-        }
-    };
-    // Our claimed contact. A NAT'd node doesn't know its public IP; it claims
-    // 0.0.0.0 and the serving side substitutes the connection's source IP
-    // (see DhtService). The port is our real listening port.
     let port = fileserver_port.unwrap_or(0);
-    let me_addr = PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr");
+
+    // Resolve the transport the DHT runs over and the address we claim as our
+    // own contact.
+    let (transport, me_addr) = if tor_always {
+        // Tor-Always: the DHT must ride Tor, and we claim only our onion. Wait
+        // for the onion service - its address appears strictly AFTER tor_loop
+        // installs the MixedTransport (set_transport precedes set_onion_address),
+        // so its presence is both the readiness gate and the self-claim source.
+        // With no fileserver port there is no onion virtual port to claim, so
+        // there is nothing to announce.
+        if port == 0 {
+            state.log("INFO", "DHT: idle in Tor-Always mode (no fileserver port)").await;
+            return;
+        }
+        let onion = loop {
+            if let Some(o) = state.onion_address().await {
+                break o;
+            }
+            tokio::select! {
+                _ = shutdown.notified() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        };
+        let Some(transport) = state.transport().await else { return };
+        let Ok(me_addr) = PeerAddr::parse(&format!("{onion}.onion:{port}")) else { return };
+        state.log("INFO", "DHT: running over Tor (Always mode)").await;
+        (transport, me_addr)
+    } else {
+        // Wait for the transport (set by the node just before the runtime
+        // starts). A NAT'd node doesn't know its public IP; it claims 0.0.0.0
+        // and the serving side substitutes the connection's source IP (see
+        // DhtService). The port is our real listening port.
+        let transport = loop {
+            if let Some(t) = state.transport().await {
+                break t;
+            }
+            tokio::select! {
+                _ = shutdown.notified() => return,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        };
+        (transport, PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr"))
+    };
+
     let me = epix_dht::Contact::new(dht.id, me_addr);
     let rpc = Arc::new(epix_dht_net::WireRpcClient::new(me, transport));
 
@@ -494,68 +558,97 @@ async fn dht_loop(
 
     let round = || async {
         // 1. Probe a handful of known peers: send FindNode(self) so they learn
-        //    our real contact and we learn real contacts from their tables.
-        //    The probed peer itself is NOT inserted (we don't know its node id;
-        //    only contacts carried in responses have authentic ids).
+        //    our contact and we learn real contacts from their tables. The
+        //    probed peer itself is NOT inserted (we don't know its node id; only
+        //    contacts carried in responses have authentic ids). Probes run
+        //    CONCURRENTLY: over Tor a dial takes tens of seconds and dead peers
+        //    hit the full 45s bound, so a serial probe phase (up to 8 x 45s)
+        //    would blow the 120s per-pass budget and starve the announce phase
+        //    below - the actual point of the pass.
         let addresses = state.xite_addresses().await;
-        let mut probed = std::collections::HashSet::new();
-        for address in &addresses {
+        let mut targets = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        'gather: for address in &addresses {
             for peer in state.connectable_peers(address, 3).await {
-                if !probed.insert(peer.clone()) || probed.len() > 8 {
-                    continue;
+                if seen.insert(peer.clone()) {
+                    targets.push(peer);
+                    if targets.len() >= 8 {
+                        break 'gather;
+                    }
                 }
-                // Overlay-aware bound: probing an onion/i2p contact needs the
-                // longer dial deadline or it can never join the routing table.
-                let probe = tokio::time::timeout(
-                    peer.connect_timeout(),
-                    rpc.probe(&peer, dht.id),
-                );
-                if let Ok(Ok((responder, contacts))) = probe.await {
-                    // The responder's authentic contact (id stamped into the
-                    // reply, address we dialed) plus whatever it shared.
+            }
+        }
+        let probed = targets.len();
+        let mut probe_set = tokio::task::JoinSet::new();
+        for peer in targets {
+            let rpc = rpc.clone();
+            let dht = dht.clone();
+            // Overlay-aware bound: an onion/i2p contact (or any contact over Tor
+            // in Always mode) needs the longer dial deadline to join the table.
+            let timeout = dht_dial_timeout(&peer, tor_always);
+            probe_set.spawn(async move {
+                if let Ok(Ok((responder, contacts))) =
+                    tokio::time::timeout(timeout, rpc.probe(&peer, dht.id)).await
+                {
                     for contact in responder.into_iter().chain(contacts) {
                         if contact.id != dht.id {
                             dht.add_contact(contact);
                         }
                     }
                 }
-            }
+            });
         }
+        while probe_set.join_next().await.is_some() {}
         // 2. Announce every served site and fold in any peers the DHT knows.
         // Self-claims are rebuilt every round: the onion service, I2P session,
         // and mesh come up minutes after start, and this is where they become
         // discoverable (Phase 4 - a Tor/I2P-only publisher is invisible to
-        // clearnet-NAT'd nodes otherwise). This only runs outside Tor-Always
-        // mode (dht_loop returns early there), so announcing our overlay
-        // self-claims here does not correlate them to our real IP.
-        let claims = dht_self_claims(
+        // clearnet-NAT'd nodes otherwise). Clearnet is excluded in Tor-Always
+        // mode, where we claim overlays only (see dht_self_claims).
+        let claims = Arc::new(dht_self_claims(
             port,
+            !tor_always,
             state.onion_address().await,
             state.i2p_address().await,
             state.rns_address().await,
-        );
-        let mut found_total = 0;
-        for address in &addresses {
-            let key = epix_dht::site_key(address);
-            if !claims.is_empty() {
-                dht.announce_all(key, &claims, rpc.as_ref()).await;
-            }
-            let mut peers = dht.get_peers(key, rpc.as_ref()).await;
-            // Drop unusable claims (a NAT'd announcer's own 0.0.0.0 entry).
-            peers.retain(dialable_dht_peer);
-            if !peers.is_empty() {
-                found_total += peers.len();
-                state.add_peers(address, peers).await;
+        ));
+        // Announce + look up each site concurrently, bounded. A lookup is
+        // several sequential round trips; over Tor each is far slower than
+        // clearnet, so a serial pass across ~dozens of sites would not fit the
+        // per-pass budget. A small cap keeps the pass roughly one lookup deep
+        // without opening too many Tor streams at once.
+        const SITE_CONCURRENCY: usize = 4;
+        let mut found_total = 0usize;
+        let mut set = tokio::task::JoinSet::new();
+        let mut pending = addresses.iter().cloned();
+        for address in pending.by_ref().take(SITE_CONCURRENCY) {
+            set.spawn(dht_announce_site(
+                state.clone(),
+                dht.clone(),
+                rpc.clone(),
+                claims.clone(),
+                address,
+            ));
+        }
+        while let Some(res) = set.join_next().await {
+            found_total += res.unwrap_or(0);
+            if let Some(address) = pending.next() {
+                set.spawn(dht_announce_site(
+                    state.clone(),
+                    dht.clone(),
+                    rpc.clone(),
+                    claims.clone(),
+                    address,
+                ));
             }
         }
         let routing = dht.routing_len();
-        if !probed.is_empty() || routing > 0 || found_total > 0 {
+        if probed > 0 || routing > 0 || found_total > 0 {
             state
                 .log(
                     "INFO",
                     format!(
-                        "DHT: probed {} peer(s), {routing} node(s) in the routing table, {found_total} peer(s) found for {} site(s)",
-                        probed.len(),
+                        "DHT: probed {probed} peer(s), {routing} node(s) in the routing table, {found_total} peer(s) found for {} site(s)",
                         addresses.len()
                     ),
                 )
@@ -1311,7 +1404,7 @@ fn is_public_ipv4(ip: &std::net::IpAddr) -> bool {
 
 #[cfg(all(test, feature = "inbound-seeding"))]
 mod tests {
-    use super::{dht_self_claims, is_public_ipv4};
+    use super::{dht_dial_timeout, dht_self_claims, is_public_ipv4};
     use epix_core::PeerAddr;
     use std::net::IpAddr;
 
@@ -1322,13 +1415,14 @@ mod tests {
     #[test]
     fn dht_self_claims_cover_every_configured_network() {
         // Clearnet only: the 0.0.0.0 claim the serving side rewrites.
-        let claims = dht_self_claims(48333, None, None, None);
+        let claims = dht_self_claims(48333, true, None, None, None);
         assert_eq!(claims, vec![PeerAddr::parse("0.0.0.0:48333").unwrap()]);
 
         // All networks up: one claim per network, fileserver port throughout
         // (it doubles as the onion/i2p virtual port).
         let claims = dht_self_claims(
             48333,
+            true,
             Some("expyuzz4wqqyqhjn".into()),
             Some("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32".into()),
             Some("00112233445566778899aabbccddeeff".into()),
@@ -1344,14 +1438,48 @@ mod tests {
             ]
         );
 
+        // Tor-Always mode (include_clearnet=false): overlays only, no 0.0.0.0
+        // (which would be rewritten to a useless, correlating Tor exit IP).
+        let claims = dht_self_claims(
+            48333,
+            false,
+            Some("expyuzz4wqqyqhjn".into()),
+            Some("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32".into()),
+            None,
+        );
+        let strings: Vec<String> = claims.iter().map(|c| c.to_string()).collect();
+        assert_eq!(
+            strings,
+            vec![
+                "expyuzz4wqqyqhjn.onion:48333",
+                "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:48333",
+            ],
+            "no 0.0.0.0 claim in Always mode"
+        );
+        // An Always-mode node with no overlay address yet claims nothing.
+        assert!(dht_self_claims(48333, false, None, None, None).is_empty());
+
         // No fileserver port = no inbound service on any network: claim
         // nothing (an onion claim with port 0 is not connectable either).
-        assert!(dht_self_claims(0, Some("expyuzz4wqqyqhjn".into()), None, None).is_empty());
+        assert!(dht_self_claims(0, true, Some("expyuzz4wqqyqhjn".into()), None, None).is_empty());
 
         // Empty overlay hosts (address not yet learned) are skipped, not
         // announced as junk like ".onion:48333".
-        let claims = dht_self_claims(48333, Some(String::new()), Some(String::new()), None);
+        let claims = dht_self_claims(48333, true, Some(String::new()), Some(String::new()), None);
         assert_eq!(claims.len(), 1);
+    }
+
+    #[test]
+    fn dht_dial_timeout_uses_overlay_bound_over_tor() {
+        let clearnet = PeerAddr::parse("8.8.8.8:26552").unwrap();
+        let onion = PeerAddr::parse("expyuzz4wqqyqhjn.onion:26552").unwrap();
+        // Normal mode: a clearnet peer gets the 15s direct-socket bound, an
+        // onion peer the 45s overlay bound.
+        assert_eq!(dht_dial_timeout(&clearnet, false), std::time::Duration::from_secs(15));
+        assert_eq!(dht_dial_timeout(&onion, false), std::time::Duration::from_secs(45));
+        // Tor-Always: every dial rides Tor, so a clearnet peer also gets 45s.
+        assert_eq!(dht_dial_timeout(&clearnet, true), std::time::Duration::from_secs(45));
+        assert_eq!(dht_dial_timeout(&onion, true), std::time::Duration::from_secs(45));
     }
 
     #[test]
