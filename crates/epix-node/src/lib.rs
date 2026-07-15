@@ -37,6 +37,7 @@ pub const LEGACY_UI_PORT: u16 = 43110;
 pub const DEFAULT_UI_ADDR: &str = "127.0.0.1:42222";
 
 /// How the embedded node should boot and serve.
+#[derive(Default)]
 pub struct NodeOptions {
     /// The shared data root, laid out like Python EpixNet: node files
     /// (users.json, sites.json) under `<root>/private/`, each xite under
@@ -173,6 +174,23 @@ pub async fn resolve_on_chain(name: &str, tld: &str) -> String {
         .unwrap_or_else(|e| panic!("{e}"))
 }
 
+/// What [`serve`] should bring up as the node's launch xite (its homepage).
+enum LaunchTarget {
+    /// Resolved to a xite address (from cache or the chain): register it and
+    /// serve whatever is already on disk.
+    Resolved {
+        address: String,
+        display: String,
+        data_dir: PathBuf,
+        content: Option<serde_json::Value>,
+    },
+    /// Deferred: in Tor-Always mode the launch name had no cache entry, and
+    /// resolving it on the chain before Tor is up would leak it over clearnet.
+    /// Only the homepage name is set; the on-demand resolver clones it on first
+    /// open, once Tor has bootstrapped.
+    Deferred { display: String },
+}
+
 /// Boot the node: resolve, clone + verify (unless already on disk), set up the
 /// UI server and the background runtime, and return the [`UiServer`] future to
 /// await plus the [`RunningNode`] handle. Cloning uses the network only when
@@ -180,21 +198,80 @@ pub async fn resolve_on_chain(name: &str, tld: &str) -> String {
 pub async fn boot(
     opts: NodeOptions,
 ) -> Result<(UiServer, RunningNode), String> {
-    let (address, display, _from_cache) = resolve_target(&opts.data_root, &opts.target).await;
-
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
+
+    // Arm the chain-egress gate BEFORE resolving the launch name. In Tor-Always
+    // mode the runtime only routes chain RPC through Tor once Arti has
+    // bootstrapped (~10-40s); a resolve that runs before then sends the .epix
+    // name and this node's IP to api.epix.zone in the clear. `serve` arms the
+    // same gate, but not until after this resolve would have run - so arm it
+    // here first.
+    #[cfg(feature = "tor")]
+    let tor_always = configured_tor_always(&opts.data_root, &opts);
+    #[cfg(not(feature = "tor"))]
+    let tor_always = false;
+    #[cfg(feature = "tor")]
+    epix_chain::set_chain_require_tor(tor_always);
+
+    // Resolve the launch target. In Always mode use only the on-disk cache
+    // (never the chain): a name with no cache entry is deferred to the on-demand
+    // resolver, which resolves and clones it once Tor is up instead of leaking
+    // it over clearnet during the bootstrap window.
+    let launch = if tor_always {
+        match cached_launch(&opts.data_root, &opts.target) {
+            Some((address, display)) => resolved_launch(&opts, address, display)?,
+            None => LaunchTarget::Deferred { display: launch_display(&opts.target) },
+        }
+    } else {
+        let (address, display, _from_cache) =
+            resolve_target(&opts.data_root, &opts.target).await;
+        resolved_launch(&opts, address, display)?
+    };
+
+    serve(opts, launch).await
+}
+
+/// The display form of a launch target: a raw `epix1…` address passes through;
+/// a `.epix` name (or bare label defaulting to the `epix` TLD) is normalized to
+/// `name.tld` - the same string the on-demand resolver keys on.
+fn launch_display(target: &str) -> String {
+    if target.starts_with("epix1") && !target.contains('.') {
+        return target.to_string();
+    }
+    let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
+    format!("{name}.{tld}")
+}
+
+/// Resolve a launch target from the on-disk cache only (no chain query), for
+/// Always mode where an uncached name must not be resolved over clearnet at
+/// boot. Returns `(address, display)` on any cache hit (fresh or stale, since a
+/// stale mapping keeps serving); `None` when the name has never been resolved,
+/// so it defers to the on-demand resolver.
+fn cached_launch(data_root: &std::path::Path, target: &str) -> Option<(String, String)> {
+    if target.starts_with("epix1") && !target.contains('.') {
+        return Some((target.to_string(), target.to_string()));
+    }
+    let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
+    let full = format!("{name}.{tld}");
+    cached_resolution(data_root, &full).map(|(address, _fresh)| (address, full))
+}
+
+/// Build a [`LaunchTarget::Resolved`] for an address we can serve now: create
+/// its data dir and load any content.json already on disk. The UI server must
+/// come up immediately and never block startup on a download (EpixNet's model):
+///   - a verified content.json loads normally;
+///   - a content.json that does not verify (authored, edited, or not yet signed
+///     for this address) is parsed and served as-is - a signature is only
+///     required when fetching from peers, not for local content;
+///   - nothing on disk leaves `content` None, so the xite registers empty and
+///     downloads on demand when first opened.
+fn resolved_launch(
+    opts: &NodeOptions,
+    address: String,
+    display: String,
+) -> Result<LaunchTarget, String> {
     let data_dir = opts.data_root.join("data").join(&address);
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
-
-    // Load the launch xite from disk only - the UI server must always come up,
-    // never blocking startup on a download (EpixNet's model). Three cases:
-    //   - a verified content.json loads normally;
-    //   - a content.json on disk that does not verify (authored, edited, or not
-    //     yet signed for this address) is parsed and served as-is - a signature
-    //     is only required when fetching from peers, not for local content;
-    //   - nothing on disk leaves `content` None, so the xite registers empty and
-    //     downloads on demand when first opened, showing the wrapper's
-    //     "Searching for peers" screen.
     let content = match Address::parse(address.clone()) {
         Ok(addr) => {
             let mut xite = Xite::new(addr, XiteStorage::new(&data_dir));
@@ -206,9 +283,33 @@ pub async fn boot(
         }
         Err(_) => None,
     };
+    Ok(LaunchTarget::Resolved { address, display, data_dir, content })
+}
 
-    let running = serve(opts, address, display, data_dir, content, 0).await?;
-    Ok(running)
+/// Whether the effective Tor mode is Always, read from the raw node config plus
+/// launch options - the same precedence [`serve`] applies, but computed before
+/// the [`AppState`] exists so [`boot`] can arm the chain-egress gate ahead of
+/// the launch-name resolve.
+#[cfg(feature = "tor")]
+fn configured_tor_always(data_root: &std::path::Path, opts: &NodeOptions) -> bool {
+    let config: serde_json::Value =
+        std::fs::read(data_root.join("private").join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+    let offline = config
+        .get("offline")
+        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+        .unwrap_or(false);
+    let mode = if offline {
+        epix_runtime::TorMode::Disable
+    } else if !opts.tor_mode.is_empty() {
+        epix_runtime::TorMode::parse(&opts.tor_mode)
+    } else {
+        let configured = config.get("tor").and_then(|v| v.as_str()).unwrap_or("enable");
+        epix_runtime::TorMode::parse(configured)
+    };
+    mode == epix_runtime::TorMode::Always
 }
 
 /// Pick the UI bind address: the requested one if its port is free, otherwise -
@@ -1097,6 +1198,20 @@ async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String>
     }
 }
 
+/// Whether resolving `host` will hit the chain and cannot fall back: a `.epix`
+/// name (not a raw `epix1…` address) with no cache entry at all. A fresh entry
+/// resolves from cache; a stale one still serves its stale mapping if the chain
+/// is unreachable - only a total miss forces a chain query with nothing to fall
+/// back to. Used to decide whether to wait for Tor before resolving in Always
+/// mode (mirrors [`resolve_host`]'s cache key).
+fn needs_chain_resolve(data_root: &std::path::Path, host: &str) -> bool {
+    let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+    if name.starts_with("epix1") {
+        return false;
+    }
+    cached_resolution(data_root, host).is_none()
+}
+
 #[async_trait::async_trait]
 impl epix_ui::ContentSyncer for OnDemand {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>) {
@@ -1199,6 +1314,21 @@ impl OnDemand {
     }
 
     async fn do_ensure(&self, host: &str) -> Result<(), String> {
+        // In Always mode, resolving a name that has no cache entry hits the
+        // chain, which is gated until Tor is up. Wait for Tor first so the
+        // resolve rides it (and never falls back to clearnet) - this is the path
+        // a deferred launch name takes on first open. Cached names and raw
+        // addresses need no chain query, so they skip the wait.
+        if self.tor_always.load(std::sync::atomic::Ordering::Relaxed)
+            && needs_chain_resolve(&self.data_root, host)
+            && !self.await_tor_ready().await
+        {
+            return Err(
+                "Tor is not available and Always mode forbids clearnet, so this site \
+                 cannot be resolved right now"
+                    .to_string(),
+            );
+        }
         // Resolve the name to a xite address (unless it's already one): the
         // on-disk cache first; the chain only on a miss or an expired entry.
         // An expired entry still serves if the chain is unreachable.
@@ -1351,15 +1481,11 @@ impl OnDemand {
     }
 }
 
-/// Wire up the [`AppState`], plugins, background runtime, and UI server for an
-/// already-resolved (and cloned) xite. Returns the server future + handle.
+/// Wire up the [`AppState`], plugins, background runtime, and UI server for a
+/// launch target. Returns the server future + handle.
 async fn serve(
     opts: NodeOptions,
-    address: String,
-    display: String,
-    data_dir: PathBuf,
-    content: Option<serde_json::Value>,
-    bytes_recv: u64,
+    launch: LaunchTarget,
 ) -> Result<(UiServer, RunningNode), String> {
     let state = AppState::with_data_dir(&opts.version, &opts.data_root);
     state.set_rev(&opts.rev).await;
@@ -1398,14 +1524,24 @@ async fn serve(
         state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
     }
 
-    // Serve keyed by the bech32 address; the resolved `.epix` name is display
-    // metadata (names translate to addresses at the HTTP/WS edges).
-    state
-        .add_xite(&address, XiteEntry { storage: XiteStorage::new(&data_dir), content })
-        .await;
-    if display != address {
-        state.set_display(&address, &display).await;
-    }
+    // Register the launch xite (keyed by the bech32 address; the `.epix` name is
+    // display metadata) and mark it the homepage. A deferred launch (Always
+    // mode, name not yet resolvable without leaking over clearnet) registers
+    // nothing - the on-demand resolver clones it on first open once Tor is up -
+    // but still records the homepage so the wrapper knows where to send the
+    // browser. `address` is empty in that case.
+    let (address, display) = match launch {
+        LaunchTarget::Resolved { address, display, data_dir, content } => {
+            state
+                .add_xite(&address, XiteEntry { storage: XiteStorage::new(&data_dir), content })
+                .await;
+            if display != address {
+                state.set_display(&address, &display).await;
+            }
+            (address, display)
+        }
+        LaunchTarget::Deferred { display } => (String::new(), display),
+    };
     // The launch xite is the homepage: the wrapper's corner home button and
     // the admin pages' back link return here from any other xite.
     state.set_homepage(&display);
@@ -1449,7 +1585,11 @@ async fn serve(
     // (called by the resync loop, so EpixTalk-style posts stay fresh).
     state.set_content_syncer(on_demand.clone()).await;
 
-    state.add_transfer(&address, bytes_recv, 0).await;
+    // A deferred launch has no address yet; the on-demand clone adds its
+    // transfer row when it registers the xite.
+    if !address.is_empty() {
+        state.add_transfer(&address, 0, 0).await;
+    }
     state.rebuild_merger_dbs().await;
 
     // Seeding + offline policy. The Config page persists values as STRINGS
@@ -1653,7 +1793,7 @@ async fn serve(
     // of guessing a fixed port - the bind may be the default, the legacy
     // fallback, or a user-chosen one.
     let _ = std::fs::write(opts.data_root.join("ui_port"), bind.port().to_string());
-    state.log("INFO", format!("Serving {display} ({bytes_recv} bytes received)")).await;
+    state.log("INFO", format!("Serving {display}")).await;
 
     if opts.open_browser {
         open_in_browser(&format!("http://{bind}/{display}/"));
@@ -1803,6 +1943,90 @@ mod tests {
         // Re-writing upgrades a legacy entry to the timestamped form.
         write_resolve_cache(root, "legacy.epix", "epix1legacy");
         assert_eq!(cached_resolution(root, "legacy.epix"), Some(("epix1legacy".into(), true)));
+    }
+
+    #[test]
+    fn cached_launch_uses_cache_only_and_defers_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A raw address passes straight through (no cache, no chain).
+        assert_eq!(
+            cached_launch(root, "epix1abcdef"),
+            Some(("epix1abcdef".into(), "epix1abcdef".into()))
+        );
+
+        // An uncached name has no cache hit -> None (boot defers it).
+        assert_eq!(cached_launch(root, "talk.epix"), None);
+
+        // Once cached it resolves from disk without touching the chain, keyed by
+        // the full name (matching how resolve_target writes it).
+        write_resolve_cache(root, "talk.epix", "epix1talk");
+        assert_eq!(cached_launch(root, "talk.epix"), Some(("epix1talk".into(), "talk.epix".into())));
+
+        // A bare label defaults to the epix TLD for both lookup and display.
+        write_resolve_cache(root, "blog.epix", "epix1blog");
+        assert_eq!(cached_launch(root, "blog"), Some(("epix1blog".into(), "blog.epix".into())));
+    }
+
+    #[test]
+    fn needs_chain_resolve_only_on_a_total_cache_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A raw address never queries the chain.
+        assert!(!needs_chain_resolve(root, "epix1abcdef"));
+
+        // A name with no cache entry must hit the chain (and can't fall back),
+        // so Always mode waits for Tor first.
+        assert!(needs_chain_resolve(root, "talk.epix"));
+
+        // A fresh entry resolves from cache - no wait.
+        write_resolve_cache(root, "talk.epix", "epix1talk");
+        assert!(!needs_chain_resolve(root, "talk.epix"));
+
+        // A stale entry still serves its stale mapping if the chain is
+        // unreachable, so it needs no Tor wait either.
+        let old = now_secs() - RESOLVE_CACHE_TTL_SECS - 1;
+        let cache = serde_json::json!({ "old.epix": { "address": "epix1old", "resolved_at": old } });
+        std::fs::write(resolve_cache_path(root), serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert!(!needs_chain_resolve(root, "old.epix"));
+    }
+
+    #[test]
+    fn launch_display_normalizes_names_and_addresses() {
+        assert_eq!(launch_display("talk.epix"), "talk.epix");
+        assert_eq!(launch_display("blog"), "blog.epix");
+        assert_eq!(launch_display("epix1abcdef"), "epix1abcdef");
+    }
+
+    #[cfg(feature = "tor")]
+    #[test]
+    fn configured_tor_always_follows_config_and_options() {
+        use epix_runtime::TorMode;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        let opts = |tor: &str| NodeOptions { tor_mode: tor.to_string(), ..Default::default() };
+        let write_config = |v: serde_json::Value| {
+            std::fs::write(root.join("private").join("config.json"), serde_json::to_vec(&v).unwrap())
+                .unwrap();
+        };
+
+        // No config, no option -> defaults to enable (not Always).
+        assert!(!configured_tor_always(root, &opts("")));
+
+        // An explicit option wins over config.
+        assert!(configured_tor_always(root, &opts("always")));
+        assert_eq!(TorMode::parse("always"), TorMode::Always);
+
+        // Config chooses Always when no option is given.
+        write_config(serde_json::json!({ "tor": "always" }));
+        assert!(configured_tor_always(root, &opts("")));
+
+        // Offline forces Disable regardless of the tor choice.
+        write_config(serde_json::json!({ "tor": "always", "offline": true }));
+        assert!(!configured_tor_always(root, &opts("")));
     }
 }
 

@@ -857,9 +857,7 @@ async fn render_wrapper(
         };
         // A name resolves quickly (cache or one chain query) while the clone
         // continues in the background; wait briefly so the wrapper can embed
-        // the bech32 identity (the WS session + events key off it). If the
-        // background ensure already finished without a resolution, the name
-        // doesn't exist - fail fast instead of waiting out the window.
+        // the bech32 identity (the WS session + events key off it).
         if !requested.starts_with("epix1") {
             for _ in 0..60 {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -872,9 +870,21 @@ async fn render_wrapper(
                     break;
                 }
             }
-            if address == requested {
-                return (StatusCode::NOT_FOUND, format!("could not resolve {requested}"))
-                    .into_response();
+            // Still unresolved after the window. Only 404 when the resolve is
+            // actually done (finished without producing an address = the name
+            // doesn't exist). If it is still in flight - e.g. an Always-mode
+            // name whose resolve is parked until Tor bootstraps - fall through
+            // and serve the loading screen; the inner html request waits it out
+            // and the background ensure resolves + clones once Tor is up.
+            if address == requested && ensure.is_finished() {
+                // Re-check once: the resolve may have landed just as the loop
+                // exited. Only 404 if it truly produced no address.
+                let key = ctx.state.canonical_key(&requested).await;
+                if key == requested {
+                    return (StatusCode::NOT_FOUND, format!("could not resolve {requested}"))
+                        .into_response();
+                }
+                address = key;
             }
         }
         loading = !ready(&ctx.state, address.clone()).await;
