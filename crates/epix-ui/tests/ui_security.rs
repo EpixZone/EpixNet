@@ -54,6 +54,48 @@ async fn host_allowlist_blocks_dns_rebinding() {
 }
 
 #[tokio::test]
+async fn cross_origin_gate_canonicalizes_name_origins() {
+    // A page on its clean name origin (https://dashboard.epix/) identifies
+    // itself by NAME in the referer, while xites and their permissions are
+    // keyed by ADDRESS. The gate must canonicalize both sides, or the
+    // name-origin dashboard's ADMIN never resolves and every cross-xite
+    // favicon load 403s (the address origin worked, the name origin didn't).
+    let dash = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+    let talk = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+    let state = AppState::new("sec-test");
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("data.json", b"{}").unwrap();
+    for addr in [dash, talk] {
+        let storage = storage.clone();
+        state
+            .add_xite(addr, XiteEntry { storage, content: Some(json!({ "address": addr })) })
+            .await;
+    }
+    std::mem::forget(dir);
+    state.set_display(dash, "dashboard.epix").await;
+    state.set_display(talk, "talk.epix").await;
+    state.config_set("ui_check_cors", json!(true)).await;
+    let router = UiServer::new(state.clone()).router();
+
+    // Without a permission the name-origin cross-xite read is still blocked.
+    let name_referer = ("referer", "https://dashboard.epix/index.html");
+    let cross = |uri: &str| get(uri, &[("host", "dashboard.epix"), name_referer]);
+    let resp = router.clone().oneshot(cross(&format!("/{talk}/data.json"))).await.unwrap();
+    assert_eq!(resp.status(), 403, "no permission, still blocked");
+
+    // ADMIN on the dashboard (looked up via the NAME) unlocks any target...
+    state.add_permission(dash, "ADMIN").await;
+    let resp = router.clone().oneshot(cross(&format!("/{talk}/data.json"))).await.unwrap();
+    assert_ne!(resp.status(), 403, "ADMIN resolves through the display name");
+
+    // ...including a target referenced by NAME (canonicalized before the
+    // Cors grant comparison too).
+    let resp = router.clone().oneshot(cross("/talk.epix/data.json")).await.unwrap();
+    assert_ne!(resp.status(), 403, "name-form target canonicalizes");
+}
+
+#[tokio::test]
 async fn options_preflight_is_answered_directly() {
     let (_state, router) = test_server().await;
     let req = axum::extract::Request::builder()
