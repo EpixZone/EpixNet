@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn address_validation() {
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         assert!(is_valid_address(addr));
         assert_eq!(address_to_hash160(addr).unwrap().len(), 20);
         assert!(!is_valid_address("epix1notavalidaddress"));

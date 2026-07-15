@@ -10,7 +10,7 @@ use rmpv::Value;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-const DASH: &str = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 const LIVE_TRACKER: &str = "145.223.69.23:26959";
 
 /// Mock Epix tracker: handshakes, then answers `announce` with one ipv4 peer.
@@ -60,7 +60,7 @@ async fn spawn_mock_tracker(peer_ip: [u8; 4], peer_port: u16) -> std::net::Socke
 #[tokio::test]
 async fn discovers_peers_via_epix_tracker() {
     let tracker = spawn_mock_tracker([203, 0, 113, 7], 26959).await;
-    let hash = address_hash("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t");
+    let hash = address_hash("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g");
     let params = AnnounceParams {
         hashes: &[hash],
         port: 0,
@@ -83,7 +83,7 @@ async fn discovers_peers_via_epix_tracker() {
 #[ignore]
 async fn live_tracker_discovers_real_peers() {
     let tracker = PeerAddr::parse("145.223.69.23:26959").unwrap();
-    let hash = address_hash("epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t");
+    let hash = address_hash("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g");
     let params = AnnounceParams {
         hashes: &[hash],
         port: 0,

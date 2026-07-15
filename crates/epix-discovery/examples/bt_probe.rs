@@ -4,7 +4,7 @@
 //!     cargo run -p epix-discovery --example bt_probe
 //!     cargo run -p epix-discovery --example bt_probe -- udp://host:port/announce ...
 
-const DASHBOARD: &str = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+const DASHBOARD: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
 /// Well-known public trackers (hostname form, stable across IP churn) plus
 /// whatever is passed on the command line.

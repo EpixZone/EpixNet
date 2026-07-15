@@ -45,7 +45,7 @@ fn main() {
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:20790".to_string());
     let site = args
         .next()
-        .unwrap_or_else(|| "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t".to_string());
+        .unwrap_or_else(|| "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g".to_string());
 
     println!("→ dialing {addr} ...");
     let mut stream = TcpStream::connect(&addr).expect("tcp connect");

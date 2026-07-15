@@ -8379,7 +8379,7 @@ mod tests {
     #[tokio::test]
     async fn connectable_peers_filters_networks_the_node_cannot_dial() {
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let state = AppState::new("test"); // no Tor: clearnet-only node
         state
             .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
@@ -8413,7 +8413,7 @@ mod tests {
     #[tokio::test]
     async fn add_peers_drops_the_nodes_own_addresses() {
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let state = AppState::new("test");
         state
             .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
@@ -8454,7 +8454,7 @@ mod tests {
     #[tokio::test]
     async fn peer_outcomes_move_reputation_and_backoff() {
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let state = AppState::new("test");
         state
             .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
@@ -8484,7 +8484,7 @@ mod tests {
     #[tokio::test]
     async fn load_content_from_disk_heals_registered_but_empty_entry() {
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         // A clone that wrote content.json to disk but errored before finalizing:
         // registered with content = None while the file sits on disk.
         std::fs::write(
@@ -8524,7 +8524,7 @@ mod tests {
         // must leave the previous version serving - on disk AND in the live
         // state - instead of a content.json that is ahead of its files.
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let storage = XiteStorage::new(dir.path());
 
         let v1 = serde_json::to_vec(&json!({
@@ -8593,7 +8593,7 @@ mod tests {
         // A deferred update converges: once its missing file appears on disk,
         // the retry tick commits it without needing peers or a transport.
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let storage = XiteStorage::new(dir.path());
 
         let v1 = serde_json::to_vec(&json!({
@@ -8849,7 +8849,7 @@ mod tests {
         for name in ["a.bin", "b.bin", "c.bin"] {
             storage.write(name, &vec![0u8; 1000]).unwrap();
         }
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let content = json!({
             "address": addr,
             "files": {},
@@ -9735,7 +9735,7 @@ mod tests {
     #[tokio::test]
     async fn optional_pins_persist_across_restart() {
         let dir = tempdir().unwrap();
-        let addr = "epix1dashuu6pvsut7aw9dx44f543mv7xt9zlydsj9t";
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let content = json!({
             "address": addr,
             "files_optional": { "big.bin": { "size": 10, "sha512": "ab" } },
