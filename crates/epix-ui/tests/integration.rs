@@ -88,6 +88,68 @@ async fn serves_xite_files_over_http() {
 }
 
 #[tokio::test]
+async fn site_scripts_revalidate_with_etag() {
+    // Site js/css is cached with `public, no-cache` + an ETag: stored, but
+    // revalidated on every use. The wrapper navigates its iframe from script,
+    // so a hard reload never bypass-caches the inner assets - with the old
+    // max-age=600 a freshly published script stayed stale for 10 minutes with
+    // no recourse. Unchanged files answer 304; a change serves new bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("app.js", b"var v = 1;").unwrap();
+    let state = AppState::new("0.1.0");
+    state
+        .add_xite(
+            "epix1cache",
+            XiteEntry {
+                storage: storage.clone(),
+                content: Some(json!({ "title": "C", "files": { "app.js": {} } })),
+            },
+        )
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = UiServer::new(state).router();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/epix1cache/app.js?wrapper_nonce=x");
+    let referer = ("referer", format!("http://{addr}/epix1cache/"));
+    let r = client.get(&url).header(referer.0, &referer.1).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["cache-control"], "public, no-cache");
+    let etag = r.headers()["etag"].to_str().unwrap().to_string();
+    assert!(etag.starts_with('"'), "quoted etag: {etag}");
+
+    // Unchanged: revalidation answers 304 with no body.
+    let r = client
+        .get(&url)
+        .header(referer.0, &referer.1)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 304);
+    assert!(r.bytes().await.unwrap().is_empty());
+
+    // Changed on disk (a publish / local edit): same request serves the new
+    // bytes under a new tag.
+    storage.write("app.js", b"var v = 2;").unwrap();
+    let r = client
+        .get(&url)
+        .header(referer.0, &referer.1)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_ne!(r.headers()["etag"].to_str().unwrap(), etag);
+    assert_eq!(r.text().await.unwrap(), "var v = 2;");
+}
+
+#[tokio::test]
 async fn transparent_proxy_serves_epix_host() {
     // A xite served under a `.epix` name, reachable via the transparent-proxy
     // host rewrite (what Firefox's PAC sends: Host: talk.epix, path /).
