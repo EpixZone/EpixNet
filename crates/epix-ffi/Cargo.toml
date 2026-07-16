@@ -22,7 +22,7 @@ epix-node = { path = "../epix-node", default-features = false }
 epix-chain = { path = "../epix-chain" }
 uniffi = { version = "0.28", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-thiserror = "1"
+thiserror = "2"
 
 [features]
 # The embedded I2P router is compiled in AND auto-enabled on first run, same as
