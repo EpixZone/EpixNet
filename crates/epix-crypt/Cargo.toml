@@ -7,7 +7,7 @@ description = "EpixNet cryptography: epix1 addresses (Keccak256+bech32), recover
 [dependencies]
 k256 = { version = "0.14", features = ["ecdsa", "arithmetic"] }
 sha2 = "0.11"
-sha3 = "0.11"
+sha3 = "0.12"
 hmac = "0.13"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
