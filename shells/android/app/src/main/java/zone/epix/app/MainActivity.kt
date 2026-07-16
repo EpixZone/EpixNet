@@ -165,6 +165,12 @@ class MainActivity : AppCompatActivity() {
                 if (nodePageRequested) hideSplash()
             }
         }
+        // GeckoView draws no UI of its own for content prompts: without a
+        // PromptDelegate, <select> dropdowns and JS alert/confirm/prompt taps
+        // silently do nothing (the Config page's dropdowns and reset
+        // confirms). WKWebView handles these natively on iOS; this is the
+        // Android equivalent, backed by plain AlertDialogs.
+        session.promptDelegate = buildPromptDelegate()
         geckoView.setSession(session)
         // The page, not the address bar, starts focused - otherwise the
         // keyboard pops over the app on every launch.
@@ -205,6 +211,115 @@ class MainActivity : AppCompatActivity() {
                 torStatus()?.let { torBadge.setColor(colorFor(it)) }
                 delay(5_000)
             }
+        }
+    }
+
+    /** Content prompt UI (selects, alert/confirm/prompt) over AlertDialogs. */
+    private fun buildPromptDelegate() = object : GeckoSession.PromptDelegate {
+        /// A prompt must be answered exactly once, but a dialog's dismiss
+        /// listener also runs after a button click - swallow the second
+        /// completion instead of crashing.
+        fun done(
+            res: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
+            response: GeckoSession.PromptDelegate.PromptResponse,
+        ) {
+            runCatching { res.complete(response) }
+        }
+
+        override fun onAlertPrompt(
+            session: GeckoSession,
+            prompt: GeckoSession.PromptDelegate.AlertPrompt,
+        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+            val dialog = AlertDialog.Builder(this@MainActivity)
+                .setTitle(prompt.title)
+                .setMessage(prompt.message)
+                .setPositiveButton(android.R.string.ok, null)
+                .create()
+            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.show()
+            return res
+        }
+
+        override fun onButtonPrompt(
+            session: GeckoSession,
+            prompt: GeckoSession.PromptDelegate.ButtonPrompt,
+        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+            val dialog = AlertDialog.Builder(this@MainActivity)
+                .setTitle(prompt.title)
+                .setMessage(prompt.message)
+                .setPositiveButton(android.R.string.ok) { _, _ ->
+                    done(res, prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE))
+                }
+                .setNegativeButton(android.R.string.cancel) { _, _ ->
+                    done(res, prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE))
+                }
+                .create()
+            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.show()
+            return res
+        }
+
+        override fun onTextPrompt(
+            session: GeckoSession,
+            prompt: GeckoSession.PromptDelegate.TextPrompt,
+        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+            val input = EditText(this@MainActivity).apply { setText(prompt.defaultValue ?: "") }
+            val pad = (16 * resources.displayMetrics.density).toInt()
+            val wrap = FrameLayout(this@MainActivity).apply {
+                setPadding(pad, 0, pad, 0)
+                addView(input)
+            }
+            val dialog = AlertDialog.Builder(this@MainActivity)
+                .setTitle(prompt.title)
+                .setMessage(prompt.message)
+                .setView(wrap)
+                .setPositiveButton(android.R.string.ok) { _, _ ->
+                    done(res, prompt.confirm(input.text.toString()))
+                }
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.show()
+            return res
+        }
+
+        override fun onChoicePrompt(
+            session: GeckoSession,
+            prompt: GeckoSession.PromptDelegate.ChoicePrompt,
+        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+            // Flatten one optgroup level; our pages only use flat selects.
+            val flat = mutableListOf<GeckoSession.PromptDelegate.ChoicePrompt.Choice>()
+            for (c in prompt.choices) {
+                val subs = c.items
+                if (subs.isNullOrEmpty()) flat.add(c) else flat.addAll(subs)
+            }
+            val labels = flat.map { it.label }.toTypedArray()
+            val builder = AlertDialog.Builder(this@MainActivity).setTitle(prompt.title)
+            if (prompt.type == GeckoSession.PromptDelegate.ChoicePrompt.Type.MULTIPLE) {
+                val checked = BooleanArray(flat.size) { flat[it].selected }
+                builder.setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                    checked[which] = isChecked
+                }
+                builder.setPositiveButton(android.R.string.ok) { _, _ ->
+                    val ids = flat.filterIndexed { i, _ -> checked[i] }.map { it.id }.toTypedArray()
+                    done(res, prompt.confirm(ids))
+                }
+                builder.setNegativeButton(android.R.string.cancel, null)
+            } else {
+                val selected = flat.indexOfFirst { it.selected }
+                builder.setSingleChoiceItems(labels, selected) { dialog, which ->
+                    done(res, prompt.confirm(flat[which]))
+                    dialog.dismiss()
+                }
+            }
+            val dialog = builder.create()
+            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.show()
+            return res
         }
     }
 
