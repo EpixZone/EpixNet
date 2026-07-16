@@ -25,7 +25,7 @@ const NID_SECP256K1: u16 = 714;
 
 fn random<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
-    getrandom::getrandom(&mut b).expect("os rng");
+    getrandom::fill(&mut b).expect("os rng");
     b
 }
 

@@ -98,7 +98,7 @@ impl UiServer {
             .route("/EpixNet-Internal/Status", get(serve_status))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
-            .route("/uimedia/*path", get(serve_uimedia))
+            .route("/uimedia/{*path}", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page))
             .route("/Config", get(serve_config_page))
             .route("/Stats", get(serve_stats_page))
@@ -112,8 +112,8 @@ impl UiServer {
             // AppState::wallet_ui_dir); 404s when nothing is staged.
             .route("/EpixWallet", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
             .route("/EpixWallet/", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
-            .route("/EpixWallet/*path", get(serve_wallet))
-            .route("/list/*path", get(serve_file_manager))
+            .route("/EpixWallet/{*path}", get(serve_wallet))
+            .route("/list/{*path}", get(serve_file_manager))
             // Browsers ask for /favicon.ico at the origin root.
             .route(
                 "/favicon.ico",
@@ -121,15 +121,15 @@ impl UiServer {
             )
             // EpixNet's /raw/<site>/<path>: the file without the wrapper,
             // under the restrictive noscript CSP.
-            .route("/raw/:address/*path", get(serve_raw))
+            .route("/raw/{address}/{*path}", get(serve_raw))
             // EpixNet's /add/<site> confirmation flow maps onto this node's
             // on-demand design: navigating to a xite already resolves +
             // clones it (gated by NoNewSites), so /add is a redirect.
-            .route("/add/:address", get(redirect_add))
-            .route("/add/:address/", get(redirect_add))
-            .route("/:address", get(redirect_to_slash))
-            .route("/:address/", get(serve_wrapper))
-            .route("/:address/*path", get(serve_file));
+            .route("/add/{address}", get(redirect_add))
+            .route("/add/{address}/", get(redirect_add))
+            .route("/{address}", get(redirect_to_slash))
+            .route("/{address}/", get(serve_wrapper))
+            .route("/{address}/{*path}", get(serve_file));
         // Benchmark: a diagnostics page timing the node's hot paths.
         #[cfg(feature = "benchmark")]
         let router = router.route("/Benchmark", get(serve_benchmark));
@@ -2480,7 +2480,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             }
             // A finished command's response.
             Some(reply) = replies.recv() => {
-                if sink.send(Message::Text(reply)).await.is_err() {
+                if sink.send(Message::Text(reply.into())).await.is_err() {
                     break;
                 }
             }
@@ -2499,7 +2499,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                         }
                         if let Some(only) = ev.only {
                             if only == session.id
-                                && sink.send(Message::Text(ev.payload)).await.is_err()
+                                && sink.send(Message::Text(ev.payload.into())).await.is_err()
                             {
                                 break;
                             }
@@ -2526,7 +2526,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                                     || merger_receives(&ctx.state, session.xite.as_deref(), addr).await
                             }
                         };
-                        if channel_ok && target_ok && sink.send(Message::Text(ev.payload)).await.is_err() {
+                        if channel_ok && target_ok && sink.send(Message::Text(ev.payload.into())).await.is_err() {
                             break;
                         }
                     }
