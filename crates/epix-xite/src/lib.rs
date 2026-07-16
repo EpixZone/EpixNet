@@ -155,6 +155,88 @@ mod tests {
     }
 
     #[test]
+    fn sign_splits_files_by_the_optional_pattern() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+        xite.storage.write("avatar.jpg", b"AV").unwrap();
+        xite.storage.write("1775.jpg", b"PHOTO").unwrap();
+        xite.storage.write("data.json", b"{}").unwrap();
+        // An EpixPost-style optional lookahead: every jpg except the avatar.
+        let content = serde_json::to_vec(&json!({ "optional": "(?!avatar).*jpg" })).unwrap();
+        xite.storage.write("content.json", &content).unwrap();
+        xite.content = Some(serde_json::from_slice(&content).unwrap());
+
+        xite.sign(priv_hex, 1777992698.0).unwrap();
+
+        // Matches hash into files_optional (size + sha512, they don't count
+        // against the required size limit); everything else stays required.
+        let content = xite.content.clone().unwrap();
+        let mut required: Vec<&str> =
+            content["files"].as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        required.sort();
+        assert_eq!(required, ["avatar.jpg", "data.json"]);
+        assert_eq!(content["files_optional"]["1775.jpg"]["size"], 5);
+        assert_eq!(
+            content["files_optional"]["1775.jpg"]["sha512"],
+            XiteStorage::hash_bytes(b"PHOTO")
+        );
+        assert_eq!(content["files_optional"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sign_without_an_optional_pattern_declares_no_optional_files() {
+        // EpixTalk regression guard: a content.json with no `optional` key
+        // signs everything as required and gains no files_optional node, even
+        // for names another site's pattern would match.
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+        xite.storage.write("index.html", b"<h1>hi</h1>").unwrap();
+        xite.storage.write("1775.jpg", b"PHOTO").unwrap();
+
+        xite.sign(priv_hex, 1777992698.0).unwrap();
+
+        let content = xite.content.clone().unwrap();
+        let mut keys: Vec<&str> =
+            content["files"].as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["1775.jpg", "index.html"]);
+        assert!(content.get("files_optional").is_none());
+    }
+
+    #[test]
+    fn sign_keeps_declared_optional_entries_for_absent_files() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+        // gone.jpg is declared optional but was never downloaded; new.jpg is a
+        // fresh match on disk.
+        xite.storage.write("new.jpg", b"NEW").unwrap();
+        let content = serde_json::to_vec(&json!({
+            "optional": ".*jpg",
+            "files_optional": { "gone.jpg": { "size": 3, "sha512": "aa" } },
+        }))
+        .unwrap();
+        xite.storage.write("content.json", &content).unwrap();
+        xite.content = Some(serde_json::from_slice(&content).unwrap());
+
+        xite.sign(priv_hex, 1777992698.0).unwrap();
+
+        let content = xite.content.clone().unwrap();
+        let optional = content["files_optional"].as_object().unwrap();
+        assert_eq!(optional["gone.jpg"], json!({ "size": 3, "sha512": "aa" }));
+        assert_eq!(optional["new.jpg"]["sha512"], XiteStorage::hash_bytes(b"NEW"));
+        assert!(content["files"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
     fn sign_rejects_non_owner_key() {
         let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();

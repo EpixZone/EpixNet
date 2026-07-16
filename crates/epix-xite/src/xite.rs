@@ -54,10 +54,11 @@ fn skip_hashing(rel: &str) -> bool {
     base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
 }
 
-/// The content's `ignore` pattern compiled with EpixNet's `re.match`
-/// semantics (anchored at the start of the relative path). An invalid or
-/// missing pattern ignores nothing.
-fn ignore_regex(pat: Option<&Value>) -> Option<fancy_regex::Regex> {
+/// A content path pattern (`ignore` or `optional`) compiled with EpixNet's
+/// `re.match` semantics (anchored at the start of the relative path). An
+/// invalid or missing pattern matches nothing - `hashFiles` never fails a
+/// sign over a bad regex.
+fn path_pattern(pat: Option<&Value>) -> Option<fancy_regex::Regex> {
     let pat = pat?.as_str()?;
     if pat.is_empty() {
         return None;
@@ -65,7 +66,7 @@ fn ignore_regex(pat: Option<&Value>) -> Option<fancy_regex::Regex> {
     fancy_regex::Regex::new(&format!("^(?:{pat})")).ok()
 }
 
-fn is_ignored(re: &Option<fancy_regex::Regex>, rel: &str) -> bool {
+fn pattern_matches(re: &Option<fancy_regex::Regex>, rel: &str) -> bool {
     re.as_ref().is_some_and(|re| re.is_match(rel).unwrap_or(false))
 }
 
@@ -464,18 +465,23 @@ impl Xite {
             .collect()
     }
 
-    /// Build the `files` map for the content.json unit rooted at `dir` (empty
-    /// for the root): hash every file under `dir`, keyed by path relative to
-    /// `dir`. Skips the unit's own content.json and nested content.json subtrees
-    /// (their own signed units), entries already declared optional,
-    /// hidden/transient files, and paths matching the `ignore` pattern. Shared
-    /// by the root [`sign`](Self::sign) and [`sign_child`](Self::sign_child).
+    /// Build the `files` and `files_optional` maps for the content.json unit
+    /// rooted at `dir` (empty for the root): hash every file under `dir`,
+    /// keyed by path relative to `dir`. Skips the unit's own content.json and
+    /// nested content.json subtrees (their own signed units), hidden/transient
+    /// files, and paths matching the `ignore` pattern. A file matching the
+    /// unit's `optional` pattern hashes into the second map (EpixNet's
+    /// `hashFiles` matches it against the same dir-relative path as `ignore`);
+    /// a file only in `declared_optional` is skipped so its stored entry
+    /// survives (it may not be on disk). Shared by the root
+    /// [`sign`](Self::sign) and [`sign_child`](Self::sign_child).
     fn hash_unit_files(
         &self,
         dir: &str,
-        optional: &std::collections::HashSet<String>,
+        declared_optional: &serde_json::Map<String, Value>,
         ignore: &Option<fancy_regex::Regex>,
-    ) -> Result<serde_json::Map<String, Value>> {
+        optional: &Option<fancy_regex::Regex>,
+    ) -> Result<(serde_json::Map<String, Value>, serde_json::Map<String, Value>)> {
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         let listing = self.storage.list_files();
         // Directories governed by their own content.json own their subtrees.
@@ -486,26 +492,52 @@ impl Xite {
             .map(|rel| rel[..rel.len() - "content.json".len()].to_string())
             .collect();
         let mut files = serde_json::Map::new();
+        let mut files_optional = serde_json::Map::new();
         for inner in listing {
             let Some(rel) = inner.strip_prefix(prefix.as_str()).map(str::to_string) else {
                 continue;
             };
-            if rel == "content.json" || rel.ends_with("/content.json") || optional.contains(&rel) {
+            if rel == "content.json" || rel.ends_with("/content.json") {
                 continue;
             }
-            if skip_hashing(&rel) || is_ignored(ignore, &rel) {
+            if skip_hashing(&rel) || pattern_matches(ignore, &rel) {
                 continue;
             }
             if nested_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
                 continue;
             }
+            let is_optional = pattern_matches(optional, &rel);
+            if !is_optional && declared_optional.contains_key(&rel) {
+                continue;
+            }
             let bytes = self.storage.read(&inner)?;
-            files.insert(
-                rel,
-                json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) }),
-            );
+            let entry = json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) });
+            if is_optional {
+                files_optional.insert(rel, entry);
+            } else {
+                files.insert(rel, entry);
+            }
         }
-        Ok(files)
+        Ok((files, files_optional))
+    }
+
+    /// Merge `files_optional` rebuilt by [`hash_unit_files`](Self::hash_unit_files)
+    /// with the entries already declared in the unit and store the result on
+    /// `map`: declared entries whose file was not re-hashed keep their metadata
+    /// (EpixNet's sign with `remove_missing_optional=False`). The key is only
+    /// written when there is something to declare, so a unit that never had
+    /// optional files signs byte-identically to before.
+    fn merge_files_optional(
+        map: &mut serde_json::Map<String, Value>,
+        mut files_optional: serde_json::Map<String, Value>,
+        declared_optional: serde_json::Map<String, Value>,
+    ) {
+        for (rel, entry) in declared_optional {
+            files_optional.entry(rel).or_insert(entry);
+        }
+        if !files_optional.is_empty() {
+            map.insert("files_optional".into(), Value::Object(files_optional));
+        }
     }
 
     /// Sign the root content.json with `privatekey`: rebuild the `files` map by
@@ -527,21 +559,24 @@ impl Xite {
 
         let mut content = self.content.clone().unwrap_or_else(|| json!({}));
 
-        // Files already declared optional stay optional; everything else on disk
-        // (minus content.json units) becomes a required file with size + hash.
-        let optional: std::collections::HashSet<String> = content
+        // Files already declared optional stay optional; new files matching the
+        // content's `optional` pattern sign as optional; everything else on
+        // disk (minus content.json units) becomes a required file.
+        let declared_optional: serde_json::Map<String, Value> = content
             .get("files_optional")
             .and_then(|v| v.as_object())
-            .map(|m| m.keys().cloned().collect())
+            .cloned()
             .unwrap_or_default();
 
-        let ignore = ignore_regex(content.get("ignore"));
-        let files = self.hash_unit_files("", &optional, &ignore)?;
+        let ignore = path_pattern(content.get("ignore"));
+        let optional = path_pattern(content.get("optional"));
+        let (files, files_optional) = self.hash_unit_files("", &declared_optional, &ignore, &optional)?;
 
         let map = content.as_object_mut().ok_or_else(|| {
             Error::Protocol("content.json is not a JSON object".into())
         })?;
         map.insert("files".into(), Value::Object(files));
+        Self::merge_files_optional(map, files_optional, declared_optional);
         // EpixNet signs an integer `modified` (int(time.time())); keep whole
         // seconds as an integer so our output matches, but allow a fractional
         // bump (prev + 1.0 collisions never produce one in practice).
@@ -621,15 +656,19 @@ impl Xite {
 
         // Hash this directory's files. Nested content.json files are their own
         // signed units; entries already declared optional keep their metadata
-        // (they may not be on disk).
-        let optional: std::collections::HashSet<String> = map
+        // (they may not be on disk); new files matching this content's
+        // `optional` pattern sign as optional.
+        let declared_optional: serde_json::Map<String, Value> = map
             .get("files_optional")
             .and_then(|v| v.as_object())
-            .map(|m| m.keys().cloned().collect())
+            .cloned()
             .unwrap_or_default();
-        let ignore = ignore_regex(map.get("ignore"));
-        let files = self.hash_unit_files(dir, &optional, &ignore)?;
+        let ignore = path_pattern(map.get("ignore"));
+        let optional = path_pattern(map.get("optional"));
+        let (files, files_optional) =
+            self.hash_unit_files(dir, &declared_optional, &ignore, &optional)?;
         map.insert("files".into(), Value::Object(files));
+        Self::merge_files_optional(map, files_optional, declared_optional);
         if modified.fract() == 0.0 {
             map.insert("modified".into(), json!(modified as i64));
         } else {
@@ -735,5 +774,73 @@ mod tests {
         // And the revoked user can no longer push old content back.
         let err = xite.add_content(&user_inner, &child, &none).unwrap_err();
         assert!(err.to_string().contains("archived"), "{err}");
+    }
+
+    #[test]
+    fn sign_child_splits_files_by_the_optional_pattern() {
+        // The EpixPost flow: a user content.json declares an `optional`
+        // pattern, so a newly written photo signs as optional instead of
+        // counting against the user's required size limit.
+        let site_pk = epix_crypt::new_seed();
+        let site = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let user_pk = epix_crypt::new_seed();
+        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let xite = Xite::new(Address::parse(site.clone()).unwrap(), storage.clone());
+        let none = std::collections::HashMap::new();
+
+        storage
+            .write(
+                "content.json",
+                &signed(
+                    serde_json::json!({
+                        "address": site, "modified": 1, "files": {},
+                        "includes": { "data/users/content.json": {} },
+                    }),
+                    &site_pk,
+                ),
+            )
+            .unwrap();
+        let parent = signed(
+            serde_json::json!({
+                "address": site, "inner_path": "data/users/content.json",
+                "modified": 10, "files": {},
+                "user_contents": { "permissions": {}, "cert_signers": {} },
+            }),
+            &site_pk,
+        );
+        xite.add_content("data/users/content.json", &parent, &none).unwrap();
+
+        // The user's unsigned content.json (as the app fileWrites it) plus
+        // their files: an avatar, a photo, and a data.json.
+        let user_dir = format!("data/users/{user}");
+        let user_inner = format!("{user_dir}/content.json");
+        storage
+            .write(&user_inner, br#"{ "optional": "(?!avatar).*jpg" }"#)
+            .unwrap();
+        storage.write(&format!("{user_dir}/avatar.jpg"), b"AV").unwrap();
+        storage.write(&format!("{user_dir}/1775.jpg"), b"PHOTO").unwrap();
+        storage.write(&format!("{user_dir}/data.json"), b"{}").unwrap();
+
+        let content = xite
+            .sign_child(&user_inner, &user_pk, 100.0, &serde_json::Map::new(), &none)
+            .unwrap();
+
+        let mut required: Vec<&str> =
+            content["files"].as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        required.sort();
+        assert_eq!(required, ["avatar.jpg", "data.json"]);
+        assert_eq!(content["files_optional"]["1775.jpg"]["size"], 5);
+        assert_eq!(
+            content["files_optional"]["1775.jpg"]["sha512"],
+            XiteStorage::hash_bytes(b"PHOTO")
+        );
+        assert_eq!(content["files_optional"].as_object().unwrap().len(), 1);
+        // add_content verified and stored the signed result.
+        let stored: Value =
+            serde_json::from_slice(&storage.read(&user_inner).unwrap()).unwrap();
+        assert!(stored["files_optional"]["1775.jpg"].is_object());
     }
 }

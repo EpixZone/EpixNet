@@ -57,3 +57,89 @@ async fn help_remove_and_help_all() {
         .unwrap();
     assert_eq!(val, Value::from(true));
 }
+
+/// The apps call the family with a capital O and positional args:
+/// `OptionalHelp([directory, title, hub_addr])` (EpixPost js/PostMeta.js),
+/// `OptionalHelpRemove([directory, hub_addr])`, and
+/// `OptionalHelpList([hub_addr])` (js/User.js). Both casings must dispatch.
+#[tokio::test]
+async fn capital_o_aliases_match_the_app_call_shapes() {
+    let (s, reg, addr) = session().await;
+    let res = reg
+        .dispatch(&s, "OptionalHelp", &json!(["big/", "Big set", addr]), 1)
+        .await
+        .unwrap();
+    assert_eq!(res["num"], 2, "{res}");
+
+    // The list round-trips what OptionalHelp recorded, then empties again.
+    let list = reg.dispatch(&s, "OptionalHelpList", &json!([addr]), 1).await.unwrap();
+    assert_eq!(list, json!({ "big/": "Big set" }));
+    let ok = reg.dispatch(&s, "OptionalHelpRemove", &json!(["big/", addr]), 1).await.unwrap();
+    assert_eq!(ok, Value::from("ok"));
+    let list = reg.dispatch(&s, "optionalHelpList", &json!([]), 1).await.unwrap();
+    assert_eq!(list, json!({}));
+}
+
+#[tokio::test]
+async fn optional_help_family_is_forbidden_for_unrelated_sites() {
+    let (s, reg, _addr) = session().await;
+    let dir = tempfile::tempdir().unwrap();
+    s.state
+        .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+        .await;
+    std::mem::forget(dir);
+
+    let err = reg.dispatch(&s, "OptionalHelpList", &json!(["1Other"]), 1).await.unwrap_err();
+    assert_eq!(err, "Forbidden");
+    let err = reg
+        .dispatch(&s, "OptionalHelp", &json!(["big/", "T", "1Other"]), 1)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "Forbidden");
+    let err = reg
+        .dispatch(&s, "optionalHelpRemove", &json!(["big/", "1Other"]), 1)
+        .await
+        .unwrap_err();
+    assert_eq!(err, "Forbidden");
+}
+
+/// A merger reaches the sites merged into it (MergerSite's hasSitePermission):
+/// holding `Merger:Test` opens a `merged_type: Test` hub to the family.
+#[tokio::test]
+async fn merger_can_use_optional_help_on_its_merged_sites() {
+    let (s, reg, addr) = session().await;
+    let dir = tempfile::tempdir().unwrap();
+    s.state
+        .add_xite(
+            "1Hub",
+            XiteEntry {
+                storage: XiteStorage::new(dir.path()),
+                content: Some(json!({ "merged_type": "Test" })),
+            },
+        )
+        .await;
+    std::mem::forget(dir);
+
+    // Not a merger yet: refused.
+    let err = reg.dispatch(&s, "OptionalHelpList", &json!(["1Hub"]), 1).await.unwrap_err();
+    assert_eq!(err, "Forbidden");
+
+    s.state.add_permission(&addr, "Merger:Test").await;
+    let res = reg
+        .dispatch(&s, "OptionalHelp", &json!(["data/", "Hub files", "1Hub"]), 1)
+        .await
+        .unwrap();
+    assert_eq!(res["num"], 0, "hub declares no optional files: {res}");
+    let list = reg.dispatch(&s, "OptionalHelpList", &json!(["1Hub"]), 1).await.unwrap();
+    assert_eq!(list, json!({ "data/": "Hub files" }));
+}
+
+#[tokio::test]
+async fn xid_resolve_identity_is_registered_as_an_alias() {
+    let (s, reg, _addr) = session().await;
+    // A missing address makes the handler error; an unregistered name would
+    // return Null instead. This proves the alias dispatches without touching
+    // the chain resolver.
+    let err = reg.dispatch(&s, "xidResolveIdentity", &json!([]), 1).await.unwrap_err();
+    assert!(err.contains("address required"), "{err}");
+}

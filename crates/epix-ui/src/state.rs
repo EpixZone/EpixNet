@@ -7,7 +7,7 @@ use epix_peer::{DialableNets, PeerCounts, Peers};
 use epix_protocol::Connection;
 use epix_transport::Transport;
 use epix_user::User;
-use epix_xite::{content_stats, Xite, XiteSettings, XiteStorage};
+use epix_xite::{content_stats, FileEntry, Xite, XiteSettings, XiteStorage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -473,6 +473,11 @@ pub struct AppState {
     /// serving gate reads this: while a clone runs, the page document waits
     /// for the whole core set instead of booting half-downloaded.
     clones_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per-file locks keyed by `(address, inner_path)` so concurrent
+    /// `file_need`s for the same file download it once: later callers wait on
+    /// the first, then hit the verified-on-disk early return. Entries are
+    /// removed when the fetch finishes.
+    file_need_locks: std::sync::Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
     /// Pending wrapper callbacks (`confirm`/`prompt`): a pushed event's `to` id
     /// maps to the oneshot awaiting the wrapper's `{cmd:"response", to}` reply.
     callbacks: std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<Value>>>,
@@ -771,6 +776,7 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
@@ -888,6 +894,7 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
@@ -4112,37 +4119,136 @@ impl AppState {
         Ok(xite)
     }
 
+    /// The raw content.json entry declaring `inner_path`: the root content.json
+    /// first, then the child content.json governing the path (user content
+    /// declares its files in `data/users/<auth>/content.json`, which a
+    /// root-only lookup misses). Returns `(entry, dir, optional)` where `dir`
+    /// is the declaring content.json's directory (`""` for the root) - paths
+    /// inside the entry (e.g. a bigfile's `piecemap`) are relative to it.
+    async fn declared_entry(&self, address: &str, inner_path: &str) -> Option<(Value, String, bool)> {
+        let content = self.content(address).await;
+        for (section, optional) in [("files", false), ("files_optional", true)] {
+            let entry =
+                content.as_ref().and_then(|c| c.get(section)).and_then(|f| f.get(inner_path));
+            if let Some(entry) = entry {
+                return Some((entry.clone(), String::new(), optional));
+            }
+        }
+        let governing = self.content_inner_path(address, inner_path).await;
+        let (dir, _) = governing.rsplit_once('/')?; // the root was searched above
+        let storage = self.xites.read().await.get(address).map(|x| x.storage.clone())?;
+        let child: Value = serde_json::from_slice(&storage.read(governing.as_str()).ok()?).ok()?;
+        let rel = inner_path.strip_prefix(&format!("{dir}/"))?;
+        for (section, optional) in [("files", false), ("files_optional", true)] {
+            if let Some(entry) = child.get(section).and_then(|f| f.get(rel)) {
+                return Some((entry.clone(), dir.to_string(), optional));
+            }
+        }
+        None
+    }
+
+    /// Info for one declared file - required or optional, found through the
+    /// root or its governing child content.json - as a site-relative
+    /// [`FileEntry`], plus whether it is optional.
+    pub async fn file_info_any(&self, address: &str, inner_path: &str) -> Option<(FileEntry, bool)> {
+        let (entry, _, optional) = self.declared_entry(address, inner_path).await?;
+        Some((
+            FileEntry {
+                inner_path: inner_path.to_string(),
+                size: entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+                sha512: entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            },
+            optional,
+        ))
+    }
+
     /// Download a file (required or optional) on demand from peers, verifying
     /// its hash before writing. `fileNeed`. Returns true if present after.
     pub async fn file_need(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        let xite = self.xite_view(address).await?;
-        let info = xite.file_info(inner_path).ok_or("file not declared in content.json")?;
-        if xite.storage.verify(inner_path, &info.sha512) {
+        let (entry, _, optional) = self
+            .declared_entry(address, inner_path)
+            .await
+            .ok_or("file not declared in content.json")?;
+        let info = FileEntry {
+            inner_path: inner_path.to_string(),
+            size: entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+            sha512: entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        };
+        // A multi-piece big file's declared sha512 is a merkle root over its
+        // pieces - a whole-file flat hash never matches it, neither for the
+        // on-disk check nor for a fetched blob.
+        let is_bigfile = entry.get("piecemap").is_some();
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        if !is_bigfile && storage.verify(inner_path, &info.sha512) {
             return Ok(true); // already have it
         }
-        let transport = self.transport.read().await.clone().ok_or("no transport")?;
-        let peers = self.connectable_peers(address, 20).await;
-        for peer in peers {
-            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else { continue };
-            if conn.handshake().await.is_err() {
-                continue;
-            }
-            let Ok(bytes) = conn.get_file(address, inner_path).await else { continue };
-            if XiteStorage::hash_bytes(&bytes) == info.sha512 {
-                xite.storage.write(inner_path, &bytes).map_err(|e| e.to_string())?;
-                self.set_peer_connected(address, &peer, true).await;
-                // Count optional bytes downloaded and advertise it in our
-                // hashfield so peers can discover we now hold it.
-                if xite.optional_files().iter().any(|f| f.inner_path == inner_path) {
-                    if let Some(x) = self.xites.write().await.get_mut(address) {
-                        x.settings.optional_downloaded += info.size;
-                        x.hashfield.add_hash(&info.sha512);
-                    }
-                }
-                return Ok(true);
+        // Coalesce concurrent requests for the same file (a page asks for the
+        // same avatar once per post): later callers wait on the first fetch,
+        // then the verify re-check below makes them a no-op.
+        let key = (address.to_string(), inner_path.to_string());
+        let lock = {
+            let mut locks = self.file_need_locks.lock().unwrap();
+            locks.entry(key.clone()).or_default().clone()
+        };
+        // Remove the map entry from a Drop guard, not a statement after the
+        // fetch: serve_file wraps this future in a timeout, and a cancelled
+        // fetch would otherwise leak its entry.
+        struct Cleanup<'a> {
+            locks: &'a std::sync::Mutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>,
+            key: (String, String),
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                self.locks.lock().unwrap().remove(&self.key);
             }
         }
-        Err("could not fetch the file from any peer".into())
+        let _cleanup = Cleanup { locks: &self.file_need_locks, key };
+        let _guard = lock.lock().await;
+        async {
+            if is_bigfile {
+                // Fetch the missing pieces, each verified against the
+                // piecemap (EpixNet needFile's Bigfile path). Boxed: the
+                // piecemap itself downloads through file_need.
+                Box::pin(self.bigfile_fetch_range(address, inner_path, 0, info.size.max(0) as u64))
+                    .await?;
+                return Ok(true);
+            }
+            if storage.verify(inner_path, &info.sha512) {
+                return Ok(true); // fetched by the caller we waited on
+            }
+            let transport = self.transport.read().await.clone().ok_or("no transport")?;
+            let peers = self.connectable_peers(address, 20).await;
+            for peer in peers {
+                let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else {
+                    continue;
+                };
+                if conn.handshake().await.is_err() {
+                    continue;
+                }
+                let Ok(bytes) = conn.get_file(address, inner_path).await else { continue };
+                if XiteStorage::hash_bytes(&bytes) == info.sha512 {
+                    storage.write(inner_path, &bytes).map_err(|e| e.to_string())?;
+                    self.set_peer_connected(address, &peer, true).await;
+                    // Count optional bytes downloaded and advertise it in our
+                    // hashfield so peers can discover we now hold it.
+                    if optional {
+                        if let Some(x) = self.xites.write().await.get_mut(address) {
+                            x.settings.optional_downloaded += info.size;
+                            x.hashfield.add_hash(&info.sha512);
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+            Err("could not fetch the file from any peer".into())
+        }
+        .await
     }
 
     /// List optional files with their state. `filter` = "downloaded" (default)
@@ -4180,19 +4286,43 @@ impl AppState {
             .find(|f| f["inner_path"] == inner_path)
             .unwrap_or(Value::Null);
 
+        // Root miss: user content declares its optional files in a child
+        // content.json (data/users/<auth>/content.json), which the root scan
+        // above never sees.
+        if info.is_null() {
+            if let Some((f, true)) = self.file_info_any(address, inner_path).await {
+                let (storage, is_pinned) = {
+                    let xites = self.xites.read().await;
+                    let x = xites.get(address).ok_or("unknown xite")?;
+                    (x.storage.clone(), x.pinned.contains(inner_path))
+                };
+                info = json!({
+                    "inner_path": f.inner_path,
+                    "size": f.size,
+                    "sha512": f.sha512,
+                    "is_downloaded": storage.verify(inner_path, &f.sha512),
+                    "is_pinned": is_pinned,
+                });
+            }
+        }
+
         if let Value::Object(map) = &mut info {
+            // Cosmetic parity with EpixNet's file_optional db row: count
+            // ourselves as the one known peer once the file is downloaded.
+            let downloaded = map.get("is_downloaded").and_then(|v| v.as_bool()).unwrap_or(false);
+            map.insert("peer".into(), json!(u8::from(downloaded)));
             let size = map["size"].as_i64().unwrap_or(0);
             if size > 1024 * 1024 {
-                let content = self.content(address).await;
-                let entry =
-                    content.as_ref().and_then(|c| c.get("files_optional")).and_then(|o| o.get(inner_path));
-                if let Some(entry) = entry {
+                if let Some((entry, dir, _)) = self.declared_entry(address, inner_path).await {
                     let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024);
                     let piece_num = (size + piece_size - 1) / piece_size.max(1);
                     map.insert("is_bigfile".into(), json!(true));
                     map.insert("piece_size".into(), json!(piece_size));
                     map.insert("piece_num".into(), json!(piece_num));
+                    // A child content.json's piecemap path is relative to its
+                    // own dir - return it site-relative like everything else.
                     if let Some(pm) = entry.get("piecemap").and_then(|v| v.as_str()) {
+                        let pm = if dir.is_empty() { pm.to_string() } else { format!("{dir}/{pm}") };
                         map.insert("piecemap".into(), json!(pm));
                     }
                 }
@@ -4208,6 +4338,15 @@ impl AppState {
         std::fs::metadata(path).ok().map(|m| m.len())
     }
 
+    /// The declared size of a big file (an entry carrying a `piecemap`), or
+    /// `None` when `inner_path` isn't one. Lets the HTTP Range path serve a
+    /// big file that has no sparse file on disk yet.
+    pub async fn bigfile_total(&self, address: &str, inner_path: &str) -> Option<u64> {
+        let (entry, _, _) = self.declared_entry(address, inner_path).await?;
+        entry.get("piecemap")?;
+        Some(entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64)
+    }
+
     /// Ensure the pieces covering `[offset, offset+size)` of a big file are
     /// present, downloading only the missing ones from peers and verifying each
     /// against the piecemap before writing it into the sparse file. A no-op for
@@ -4219,16 +4358,15 @@ impl AppState {
         offset: u64,
         size: u64,
     ) -> Result<(), String> {
-        let content = self.content(address).await;
-        let entry = content
-            .as_ref()
-            .and_then(|c| c.get("files_optional"))
-            .and_then(|o| o.get(inner_path));
-        let Some(entry) = entry else { return Ok(()) }; // not optional -> nothing to do
-        let Some(piecemap_path) = entry.get("piecemap").and_then(|v| v.as_str()).map(String::from)
-        else {
+        let Some((entry, dir, optional)) = self.declared_entry(address, inner_path).await else {
+            return Ok(()); // not declared -> nothing to do
+        };
+        let Some(piecemap_path) = entry.get("piecemap").and_then(|v| v.as_str()) else {
             return Ok(()); // not a big file
         };
+        // A child content.json's piecemap path is relative to its own dir.
+        let piecemap_path =
+            if dir.is_empty() { piecemap_path.to_string() } else { format!("{dir}/{piecemap_path}") };
         let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024) as u64;
         let total = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
         if piece_size == 0 || total == 0 || size == 0 {
@@ -4306,8 +4444,10 @@ impl AppState {
                 if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
                     write_at(&storage, inner_path, poff, &data)?;
                     self.set_peer_connected(address, peer, true).await;
-                    if let Some(x) = self.xites.write().await.get_mut(address) {
-                        x.settings.optional_downloaded += plen as i64;
+                    if optional {
+                        if let Some(x) = self.xites.write().await.get_mut(address) {
+                            x.settings.optional_downloaded += plen as i64;
+                        }
                     }
                     got = true;
                     break;
@@ -4515,14 +4655,23 @@ impl AppState {
 
     /// Delete a downloaded optional file. `optionalFileDelete`.
     pub async fn optional_file_delete(&self, address: &str, inner_path: &str) -> Result<Value, String> {
-        let xite = self.xite_view(address).await?;
-        let info = xite.file_info(inner_path).ok_or("file not declared")?;
-        if let Ok(path) = xite.storage.path(inner_path) {
+        let (info, optional) =
+            self.file_info_any(address, inner_path).await.ok_or("file not declared")?;
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        if let Ok(path) = storage.path(inner_path) {
             let _ = std::fs::remove_file(path);
         }
         let mut changed_pin = false;
         if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.optional_downloaded = (x.settings.optional_downloaded - info.size).max(0);
+            if optional {
+                x.settings.optional_downloaded = (x.settings.optional_downloaded - info.size).max(0);
+            }
             changed_pin = x.pinned.remove(inner_path);
         }
         if changed_pin {
@@ -6134,13 +6283,57 @@ impl AppState {
     /// The merged site + inner path for a `merged-<type>/<address>/<path>` path,
     /// if it is one (else `None`).
     pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
+        Self::split_merged_path_typed(inner_path).map(|(_, address, inner)| (address, inner))
+    }
+
+    /// [`Self::split_merged_path`], keeping the type:
+    /// `(merged_type, address, inner_path)`.
+    pub fn split_merged_path_typed(inner_path: &str) -> Option<(String, String, String)> {
         let rest = inner_path.strip_prefix("merged-")?;
         // merged-<type>/<address>/<inner_path>
         let mut parts = rest.splitn(3, '/');
-        let _type = parts.next()?;
+        let merged_type = parts.next()?.to_string();
         let address = parts.next()?.to_string();
         let inner = parts.next().unwrap_or("").to_string();
-        Some((address, inner))
+        Some((merged_type, address, inner))
+    }
+
+    /// Resolve a merger site's `merged-<type>/<address>/<path>` reference to
+    /// the real `(address, inner_path)`, enforcing MergerSite's access rules
+    /// (EpixNet's `checkMergerPath`): the merger must hold the
+    /// `Merger:<type>` permission and the target must be a served site whose
+    /// content.json declares that `merged_type`. `Ok(None)` when the path is
+    /// not a merged path at all.
+    pub async fn resolve_merged(
+        &self,
+        merger: &str,
+        inner_path: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        let Some((merged_type, address, inner)) = Self::split_merged_path_typed(inner_path) else {
+            return Ok(None);
+        };
+        if !self.merger_types(merger).await.contains(&merged_type) {
+            return Err(format!(
+                "No merger permission to load: {merger} holds no Merger:{merged_type}"
+            ));
+        }
+        let key = self.canonical_key(&address).await;
+        if !self.has_xite(&key).await {
+            return Err(format!("Merged site not found: {address}"));
+        }
+        if self.site_merged_type(&key).await.as_deref() != Some(merged_type.as_str()) {
+            // A site mid-clone has no verified content.json yet, so it cannot
+            // declare its merged_type. Let it through so its files serve
+            // progressively during the initial hub clone (the html wait loop
+            // gates on this same signal) instead of erroring until it lands.
+            let still_cloning = self.is_cloning(&key) && self.content(&key).await.is_none();
+            if !still_cloning {
+                return Err(format!(
+                    "Merger site ({merged_type}) does not have permission for merged site: {address}"
+                ));
+            }
+        }
+        Ok(Some((key, inner)))
     }
 
     // --- publish / sign ------------------------------------------------------
@@ -7503,24 +7696,50 @@ impl AppState {
     /// (`optionalHelp`): record `{directory: title}` and report the file
     /// count + total size under it. Returns (num, size).
     pub async fn optional_help_add(&self, address: &str, directory: &str, title: &str) -> Option<(i64, i64)> {
-        let mut xites = self.xites.write().await;
-        let x = xites.get_mut(address)?;
-        x.settings.optional_help.insert(directory.to_string(), json!(title));
-        // Tally the optional files under this directory prefix.
+        let (storage, content) = {
+            let mut xites = self.xites.write().await;
+            let x = xites.get_mut(address)?;
+            x.settings.optional_help.insert(directory.to_string(), json!(title));
+            (x.storage.clone(), x.content.clone())
+        };
+        // Tally the optional files under this directory prefix - the root
+        // content.json's plus those declared by stored child content.jsons
+        // (per-user optional files), which EpixNet counts through its
+        // file_optional table.
         let (mut num, mut size) = (0i64, 0i64);
-        if let Some(content) = &x.content {
-            if let Some(files) = content.get("files_optional").and_then(|f| f.as_object()) {
-                for (path, info) in files {
-                    if path.starts_with(directory) {
-                        num += 1;
-                        size += info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-                    }
+        let mut tally = |files: Option<&Value>, dir: &str| {
+            let Some(files) = files.and_then(|f| f.as_object()) else { return };
+            for (rel, info) in files {
+                let path = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+                if path.starts_with(directory) {
+                    num += 1;
+                    size += info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
                 }
             }
+        };
+        tally(content.as_ref().and_then(|c| c.get("files_optional")), "");
+        for child in storage.list_files() {
+            if !child.ends_with("/content.json") {
+                continue; // the root's was tallied from memory above
+            }
+            let Ok(bytes) = storage.read(&child) else { continue };
+            let Ok(child_json) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            tally(child_json.get("files_optional"), dir);
         }
-        drop(xites);
         self.persist_sites().await;
         Some((num, size))
+    }
+
+    /// The `{directory: title}` map recorded by optionalHelp
+    /// (`optionalHelpList`). `None` if the xite isn't served.
+    pub async fn optional_help_list(
+        &self,
+        address: &str,
+    ) -> Option<serde_json::Map<String, Value>> {
+        self.xites.read().await.get(address).map(|x| x.settings.optional_help.clone())
     }
 
     /// Stop helping distribute a directory (`optionalHelpRemove`). Returns
@@ -9739,6 +9958,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merged_site_signing_uses_the_globally_selected_cert() {
+        // Python MergerSite copied the merger site's cert onto the merged site
+        // on every write because python certs were per-site. Rust certs are
+        // global: a site entry derived after certSelect auto-attaches the
+        // active cert, so a merged site first touched through a merger path
+        // signs as the cert identity with no copy step. This pins that down
+        // against a hub whose user_contents actually demands the cert.
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+
+        // A provider issues a cert for the identity the user derived on the
+        // provider's own site, and the user selects it globally.
+        let issuer_key = epix_crypt::new_seed();
+        let issuer = epix_crypt::privatekey_to_address(&issuer_key).unwrap();
+        let cert_auth = {
+            let mut user = state.user.write().await;
+            let cert_auth = user.site_data("epix1certprovider").unwrap().auth_address.clone();
+            let cert_sign =
+                epix_crypt::sign(&format!("{cert_auth}#web/tester"), &issuer_key).unwrap();
+            user.add_cert(&cert_auth, "certs.epix", "web", "tester", &cert_sign).unwrap();
+            user.set_cert_global(Some("certs.epix"));
+            // A brand-new entry derived after the selection carries the cert.
+            assert_eq!(user.site_data("epix1fresh").unwrap().cert.as_deref(), Some("certs.epix"));
+            cert_auth
+        };
+
+        // A merger site and a hub whose user dirs require a certs.epix cert.
+        let hub = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let storage = XiteStorage::new(root.path().join("data").join(&hub));
+        storage
+            .write(
+                "data/users/content.json",
+                &serde_json::to_vec(&json!({
+                    "address": hub,
+                    "inner_path": "data/users/content.json",
+                    "user_contents": {
+                        "permissions": {},
+                        "cert_signers": { "certs.epix": [issuer] },
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        state
+            .add_xite(&hub, XiteEntry {
+                storage: storage.clone(),
+                content: Some(json!({ "address": hub, "merged_type": "PostHub", "files": {} })),
+            })
+            .await;
+        state
+            .add_xite("epix1merger", XiteEntry {
+                storage: XiteStorage::new(root.path().join("data/epix1merger")),
+                content: Some(json!({ "address": "epix1merger", "files": {} })),
+            })
+            .await;
+        state.add_permission("epix1merger", "Merger:PostHub").await;
+
+        // First touch of the merged site: it reports the cert's auth address,
+        // so the user dir the merger's xite writes into is the cert identity's.
+        let auth = state.user.write().await.auth_address(&hub).unwrap();
+        assert_eq!(auth, cert_auth, "the global cert reached the merged site");
+
+        let merged_path = format!("merged-PostHub/{hub}/data/users/{auth}/data.json");
+        let (target, inner) =
+            state.resolve_merged("epix1merger", &merged_path).await.unwrap().unwrap();
+        assert_eq!(target, hub);
+        state.write_file(&target, &inner, br#"{"post":[{"post_id":1}]}"#).await.unwrap();
+        let content_path = state.content_inner_path(&target, &inner).await;
+        assert_eq!(content_path, format!("data/users/{auth}/content.json"));
+
+        // The rule really bites: signing with the bare key (no cert fields
+        // attached) is refused by the hub's cert_signers.
+        let bare_key = state.user.read().await.get_cert(&hub).unwrap().auth_privatekey.clone();
+        let err = state
+            .sign_user_content(&target, &content_path, Some(bare_key), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cert"), "refused for the missing cert: {err}");
+
+        // Signing as the user attaches and verifies the cert.
+        state.sign_user_content(&target, &content_path, None, None).await.unwrap();
+        let signed: Value =
+            serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
+        assert_eq!(signed["cert_user_id"], json!("tester@certs.epix"));
+        assert_eq!(signed["cert_auth_type"], json!("web"));
+        assert!(signed["signs"][&cert_auth].is_string(), "signed as the cert identity: {signed}");
+        assert!(signed["files"]["data.json"]["sha512"].is_string(), "data.json hashed");
+    }
+
+    #[tokio::test]
     async fn publish_diffs_come_from_old_snapshots() {
         // fileWrite keeps a `-old` snapshot of a data file; take_diffs turns it
         // into the patch an update push carries (so peers that can't connect
@@ -10389,5 +10698,245 @@ mod tests {
         let payload: Value = serde_json::from_str(&ev.payload).unwrap();
         assert_eq!(payload["cmd"], "setServerInfo");
         assert!(payload["params"]["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn file_info_any_finds_user_content_optional_files() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "data/users/u1/content.json",
+                &serde_json::to_vec(&json!({
+                    "files": { "data.json": { "size": 2, "sha512": "dd" } },
+                    "files_optional": { "1.jpg": { "size": 7, "sha512": "aa" } },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                "epix1hub",
+                XiteEntry {
+                    storage,
+                    content: Some(json!({
+                        "address": "epix1hub",
+                        "files": { "index.html": { "size": 1, "sha512": "ff" } },
+                    })),
+                },
+            )
+            .await;
+
+        // The root content.json does not declare the user's image, so the
+        // root-only lookup misses...
+        let root = state.content("epix1hub").await.unwrap();
+        assert!(root["files"].get("data/users/u1/1.jpg").is_none());
+        assert!(root.get("files_optional").is_none());
+        // ...but its governing child content.json does, as optional, with the
+        // site-relative inner path kept.
+        let (info, optional) =
+            state.file_info_any("epix1hub", "data/users/u1/1.jpg").await.unwrap();
+        assert!(optional);
+        assert_eq!(info.inner_path, "data/users/u1/1.jpg");
+        assert_eq!(info.size, 7);
+        assert_eq!(info.sha512, "aa");
+        // Required child files come back optional=false; root files still hit.
+        let (_, optional) =
+            state.file_info_any("epix1hub", "data/users/u1/data.json").await.unwrap();
+        assert!(!optional);
+        let (info, optional) = state.file_info_any("epix1hub", "index.html").await.unwrap();
+        assert!(!optional);
+        assert_eq!(info.size, 1);
+        // Undeclared paths miss.
+        assert!(state.file_info_any("epix1hub", "data/users/u1/2.jpg").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_merged_enforces_the_permission_matrix() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                "epix1merger",
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path().join("merger")),
+                    content: Some(json!({ "address": "epix1merger", "files": {} })),
+                },
+            )
+            .await;
+        state
+            .add_xite(
+                "epix1hub",
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path().join("hub")),
+                    content: Some(json!({
+                        "address": "epix1hub",
+                        "merged_type": "EpixTalk",
+                        "files": {},
+                    })),
+                },
+            )
+            .await;
+
+        // Not a merged path at all.
+        assert_eq!(state.resolve_merged("epix1merger", "index.html").await, Ok(None));
+
+        // The merger holds no Merger:EpixTalk permission yet.
+        assert!(state
+            .resolve_merged("epix1merger", "merged-EpixTalk/epix1hub/avatar.jpg")
+            .await
+            .is_err());
+
+        state.add_permission("epix1merger", "Merger:EpixTalk").await;
+
+        // Happy path.
+        assert_eq!(
+            state.resolve_merged("epix1merger", "merged-EpixTalk/epix1hub/avatar.jpg").await,
+            Ok(Some(("epix1hub".to_string(), "avatar.jpg".to_string())))
+        );
+
+        // The target must be a registered site.
+        assert!(state
+            .resolve_merged("epix1merger", "merged-EpixTalk/epix1nowhere/avatar.jpg")
+            .await
+            .is_err());
+
+        // The target must declare the requested merged_type.
+        state.add_permission("epix1merger", "Merger:GitCenter").await;
+        assert!(state
+            .resolve_merged("epix1merger", "merged-GitCenter/epix1hub/x")
+            .await
+            .is_err());
+
+        // Exception: a target still cloning has no content.json to declare its
+        // merged_type yet - it resolves so its files serve during the clone.
+        state
+            .add_xite(
+                "epix1cloning",
+                XiteEntry { storage: XiteStorage::new(dir.path().join("cloning")), content: None },
+            )
+            .await;
+        state.begin_clone("epix1cloning");
+        assert_eq!(
+            state.resolve_merged("epix1merger", "merged-EpixTalk/epix1cloning/avatar.jpg").await,
+            Ok(Some(("epix1cloning".to_string(), "avatar.jpg".to_string())))
+        );
+        // Once the clone ends without declaring the type, it is refused again.
+        state.end_clone("epix1cloning");
+        assert!(state
+            .resolve_merged("epix1merger", "merged-EpixTalk/epix1cloning/avatar.jpg")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn file_need_fetches_bigfile_pieces_not_the_whole_blob() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        // A 3-piece big file, declared by a child content.json (a per-user
+        // dir) whose piecemap path is relative to that child's own dir.
+        let data = vec![7u8; 2500];
+        let hash = epix_xite::hash_bigfile(&data, 1024);
+        storage.write("data/users/A/big.bin", &data).unwrap();
+        storage
+            .write(
+                "data/users/A/big.bin.piecemap.msgpack",
+                &epix_xite::build_piecemap("big.bin", &hash),
+            )
+            .unwrap();
+        storage
+            .write(
+                "data/users/A/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": {
+                        "big.bin": {
+                            "sha512": hash.merkle_root,
+                            "size": 2500,
+                            "piecemap": "big.bin.piecemap.msgpack",
+                            "piece_size": 1024,
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1big", XiteEntry {
+                storage,
+                content: Some(json!({ "address": "epix1big", "files": {} })),
+            })
+            .await;
+        std::mem::forget(dir);
+
+        // The declared sha512 is a merkle root: a whole-file flat hash never
+        // matches it, so the old blob fetch path could only fail. The
+        // piecewise path verifies the on-disk pieces and succeeds without any
+        // transport.
+        assert_eq!(state.file_need("epix1big", "data/users/A/big.bin").await, Ok(true));
+        assert_eq!(state.bigfile_total("epix1big", "data/users/A/big.bin").await, Some(2500));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_file_need_removes_its_lock_map_entry() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1need", XiteEntry {
+                storage,
+                content: Some(json!({
+                    "address": "epix1need",
+                    "files_optional": { "a.bin": { "size": 3, "sha512": "aa" } },
+                })),
+            })
+            .await;
+        std::mem::forget(dir);
+
+        // Hold the per-file lock so the fetch blocks at an await point, then
+        // cancel it - serve_file's 45s timeout does exactly this - and the
+        // dropped future's map entry must still be removed.
+        let key = ("epix1need".to_string(), "a.bin".to_string());
+        let lock = state.file_need_locks.lock().unwrap().entry(key.clone()).or_default().clone();
+        let _guard = lock.lock().await;
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state.file_need("epix1need", "a.bin"),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the fetch must still be blocked when the timeout fires");
+        assert!(!state.file_need_locks.lock().unwrap().contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn optional_help_counts_child_declared_optional_files() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "data/users/A/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": { "img.jpg": { "size": 700, "sha512": "aa" } }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1help", XiteEntry {
+                storage,
+                content: Some(json!({
+                    "address": "epix1help",
+                    "files_optional": { "data/users/A/root.bin": { "size": 40, "sha512": "bb" } },
+                })),
+            })
+            .await;
+        std::mem::forget(dir);
+
+        // One optional file from the root content.json, one from the child's
+        // (python tallies both via its file_optional table).
+        let (num, size) = state.optional_help_add("epix1help", "data/users/A", "T").await.unwrap();
+        assert_eq!((num, size), (2, 740));
     }
 }

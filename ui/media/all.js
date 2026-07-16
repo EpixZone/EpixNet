@@ -2151,7 +2151,7 @@ if (window.getComputedStyle(document.body).transform) {
       if (indexOf.call(site_info.settings.permissions, "ADMIN") >= 0) {
         epixframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please reload site to use it."]);
       } else {
-        epixframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please open ZeroHello to use it."]);
+        epixframe.cmd("wrapperNotification", ["info", "Your system's theme has been changed.<br>Please open the Dashboard to use it."]);
       }
     });
   };

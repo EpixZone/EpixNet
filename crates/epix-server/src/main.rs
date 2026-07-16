@@ -32,6 +32,28 @@ async fn main() {
     // action name is the first argument, Python-CLI style. Anything else is
     // a xite target and starts the node.
     let cli: Vec<String> = std::env::args().skip(1).collect();
+    // Guard the conventional flags: without this, `--help` would be taken for
+    // a xite target and boot a full node against the real data dir.
+    match cli.first().map(String::as_str) {
+        Some("-h") | Some("--help") | Some("help") => {
+            println!("epix-server {}", env!("EPIX_VERSION"));
+            println!("Usage: epix-server [xite address | name.epix | epix://link]");
+            println!("       epix-server <action> [args...]");
+            println!();
+            println!("Actions: siteCreate, siteSign, siteVerify, siteList, siteDelete,");
+            println!("         siteDownload, dbRebuild, dbQuery, importBundle, cryptSign,");
+            println!("         cryptVerify, cryptGetPrivatekey, cryptPrivatekeyToAddress,");
+            println!("         peerPing, peerGetFile, peerCmd");
+            println!();
+            println!("Env: EPIX_DATA_DIR, EPIX_UI_ADDR, EPIX_HEADLESS, EPIX_TOR");
+            return;
+        }
+        Some("-V") | Some("--version") => {
+            println!("epix-server {}", env!("EPIX_VERSION"));
+            return;
+        }
+        _ => {}
+    }
     if let Some(action) = cli.first().map(String::as_str).filter(|a| actions::is_action(a)) {
         let root = platform::data_root();
         std::fs::create_dir_all(&root).expect("create data root");
