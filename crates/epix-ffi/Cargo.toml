@@ -20,7 +20,7 @@ epix-build = { path = "../epix-build" }
 [dependencies]
 epix-node = { path = "../epix-node", default-features = false }
 epix-chain = { path = "../epix-chain" }
-uniffi = { version = "0.28", features = ["tokio"] }
+uniffi = { version = "0.32", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 thiserror = "2"
 
