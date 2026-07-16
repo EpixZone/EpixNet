@@ -201,12 +201,13 @@ impl WsSession {
     /// Resolve an `inner_path` for a file/optional command to its real target
     /// `(address, inner_path)`, applying both cross-origin routings: a
     /// `cors-<address>/…` prefix (Cors permission) and a
-    /// `merged-<type>/<address>/…` prefix (MergerSite). So fileGet, fileRules,
-    /// fileNeed, and optionalFileInfo all reach a merged/cors site the same way.
+    /// `merged-<type>/<address>/…` prefix (MergerSite, permission-checked by
+    /// [`AppState::resolve_merged`]). So fileGet, fileRules, fileNeed, and
+    /// optionalFileInfo all reach a merged/cors site the same way.
     pub async fn resolve_target(&self, inner_path: &str) -> Result<(String, String), String> {
         let (address, inner) = self.cors_target(inner_path).await?;
-        match AppState::split_merged_path(&inner) {
-            Some((addr, inner)) => Ok((addr, inner)),
+        match self.state.resolve_merged(&address, &inner).await? {
+            Some(target) => Ok(target),
             None => Ok((address, inner)),
         }
     }
@@ -500,9 +501,16 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteServing { cmd: "siteResume", serving: true }),
         Arc::new(SiteDelete),
         Arc::new(SiteSetAutodownloadoptional),
-        Arc::new(OptionalHelp),
-        Arc::new(OptionalHelpRemove),
-        Arc::new(OptionalHelpAll),
+        // The optionalHelp family answers both casings: EpixNet named the
+        // commands lowercase, but the apps call them with a capital O.
+        Arc::new(OptionalHelp { cmd: "optionalHelp" }),
+        Arc::new(OptionalHelp { cmd: "OptionalHelp" }),
+        Arc::new(OptionalHelpRemove { cmd: "optionalHelpRemove" }),
+        Arc::new(OptionalHelpRemove { cmd: "OptionalHelpRemove" }),
+        Arc::new(OptionalHelpList { cmd: "optionalHelpList" }),
+        Arc::new(OptionalHelpList { cmd: "OptionalHelpList" }),
+        Arc::new(OptionalHelpAll { cmd: "optionalHelpAll" }),
+        Arc::new(OptionalHelpAll { cmd: "OptionalHelpAll" }),
         Arc::new(DbRebuild { cmd: "dbReload" }),
         Arc::new(DbRebuild { cmd: "dbRebuild" }),
         Arc::new(SiteFavourite { cmd: "siteFavourite", favorite: true }),
@@ -542,7 +550,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(DbQuery),
         // xID identity resolution (the XidResolver plugin's WS API;
         // xidResolveName is registered with the chain commands above).
-        Arc::new(XidResolve),
+        Arc::new(XidResolve { cmd: "xidResolve" }),
+        Arc::new(XidResolve { cmd: "xidResolveIdentity" }),
         Arc::new(XidResolveBatch),
         // Dashboard polling / lists - benign empty values.
         Arc::new(ServerErrors),
@@ -1489,11 +1498,14 @@ fn xid_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
 /// xID name (chain-verified, cached). When the queried address is the user's
 /// own auth address for this site and it isn't linked, the user's other
 /// addresses (master + per-site auths) are tried too, matching EpixNet.
-struct XidResolve;
+/// Also registered as `xidResolveIdentity`, the name some apps call.
+struct XidResolve {
+    cmd: &'static str,
+}
 #[async_trait]
 impl WsCommand for XidResolve {
     fn name(&self) -> &'static str {
-        "xidResolve"
+        self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = xid_param(p, "address").ok_or("xidResolve: address required")?;
@@ -2614,9 +2626,9 @@ impl WsCommand for OptionalFileDelete {
         "optionalFileDelete"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
         let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileDelete: inner_path required")?;
-        s.state.optional_file_delete(&address, inner_path).await
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        s.state.optional_file_delete(&address, &inner_path).await
     }
 }
 
@@ -2681,6 +2693,13 @@ impl WsCommand for PermissionAdd {
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("permissionAdd: permission required")?;
         s.state.add_permission(&address, permission).await;
+        // A Merger grant rebuilds the merger dbs inline (not spawned) so the
+        // page's grant callback already queries populated data - EpixNet's
+        // MergerSite actionPermissionAdd rebuilds before responding too.
+        if permission.starts_with("Merger:") {
+            s.state.rebuild_merger_dbs().await;
+        }
+        s.state.push_site_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
@@ -2982,20 +3001,41 @@ impl WsCommand for SiteDelete {
     }
 }
 
+/// The optionalHelp family may target another site (a hub the app helps
+/// distribute): allowed for the bound site itself, for anything while the
+/// bound site holds ADMIN, or for a site merged into the bound merger -
+/// MergerSite's `hasSitePermission`. Everything else is Forbidden.
+async fn require_site_permission(s: &WsSession, address: &str) -> Result<(), String> {
+    let bound = s.address()?;
+    if address == bound || s.state.site_has_admin(bound).await {
+        return Ok(());
+    }
+    if let Some(merged_type) = s.state.site_merged_type(address).await {
+        if s.state.merger_types(bound).await.contains(&merged_type) {
+            return Ok(());
+        }
+    }
+    Err("Forbidden".into())
+}
+
 /// `siteSetAutodownloadoptional` - toggle auto-downloading optional files.
 /// `optionalHelp(directory, title, address?)` - opt into helping distribute
 /// the optional files under a directory. Returns the count and total size.
-struct OptionalHelp;
+/// Registered under both casings: the apps call `OptionalHelp` (capital O).
+struct OptionalHelp {
+    cmd: &'static str,
+}
 #[async_trait]
 impl WsCommand for OptionalHelp {
     fn name(&self) -> &'static str {
-        "optionalHelp"
+        self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = match arg_str(p, "address", 2) {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
+        require_site_permission(s, &address).await?;
         let directory = arg_str(p, "directory", 0).ok_or("optionalHelp: directory required")?;
         let title = arg_str(p, "title", 1).unwrap_or_default();
         let (num, size) = s
@@ -3013,17 +3053,20 @@ impl WsCommand for OptionalHelp {
 }
 
 /// `optionalHelpRemove(directory, address?)` - stop helping a directory.
-struct OptionalHelpRemove;
+struct OptionalHelpRemove {
+    cmd: &'static str,
+}
 #[async_trait]
 impl WsCommand for OptionalHelpRemove {
     fn name(&self) -> &'static str {
-        "optionalHelpRemove"
+        self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = match arg_str(p, "address", 1) {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
+        require_site_permission(s, &address).await?;
         let directory = arg_str(p, "directory", 0).ok_or("optionalHelpRemove: directory required")?;
         if s.state.optional_help_remove(&address, &directory).await {
             Ok(Value::from("ok"))
@@ -3033,19 +3076,43 @@ impl WsCommand for OptionalHelpRemove {
     }
 }
 
+/// `optionalHelpList(address?)` - the directories being helped on a site,
+/// as the `{directory: title}` map optionalHelp recorded.
+struct OptionalHelpList {
+    cmd: &'static str,
+}
+#[async_trait]
+impl WsCommand for OptionalHelpList {
+    fn name(&self) -> &'static str {
+        self.cmd
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = match arg_str(p, "address", 0) {
+            Some(a) => a.to_string(),
+            None => s.address()?.to_string(),
+        };
+        require_site_permission(s, &address).await?;
+        let map = s.state.optional_help_list(&address).await.ok_or("Unknown site")?;
+        Ok(Value::Object(map))
+    }
+}
+
 /// `optionalHelpAll(value, address?)` - toggle auto-downloading every new
 /// optional file on the site.
-struct OptionalHelpAll;
+struct OptionalHelpAll {
+    cmd: &'static str,
+}
 #[async_trait]
 impl WsCommand for OptionalHelpAll {
     fn name(&self) -> &'static str {
-        "optionalHelpAll"
+        self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = match arg_str(p, "address", 1) {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
+        require_site_permission(s, &address).await?;
         let value = p
             .get("value")
             .or_else(|| p.as_array().and_then(|a| a.first()))

@@ -1912,6 +1912,12 @@ async fn serve_raw(
     Path((address, path)): Path<(String, String)>,
 ) -> Response {
     let address = ctx.state.canonical_key(&address).await;
+    // The same merged-path routing + permission checks as serve_file.
+    let (address, path) = match ctx.state.resolve_merged(&address, &path).await {
+        Ok(Some(target)) => target,
+        Ok(None) => (address, path),
+        Err(e) => return (StatusCode::FORBIDDEN, e).into_response(),
+    };
     let Some(bytes) = ctx.state.read_file(&address, &path).await else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
@@ -1934,7 +1940,7 @@ async fn redirect_add(Path(address): Path<String>) -> Redirect {
 
 async fn serve_file(
     State(ctx): State<Ctx>,
-    Path((address, path)): Path<(String, String)>,
+    Path((address, mut path)): Path<(String, String)>,
     Query(q): Query<FileQuery>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
@@ -1963,8 +1969,20 @@ async fn serve_file(
         }
     }
     // A `.epix` name in the URL resolves to the bech32 serving key.
-    let requested = address;
+    let mut requested = address;
     let mut address = ctx.state.canonical_key(&requested).await;
+    // A merger site's `merged-<type>/<address>/<path>` URL serves the merged
+    // site's file (MergerSite's checkMergerPath): retarget everything below -
+    // the clone/wait loop, the Range branch, and the read - at the merged site.
+    match ctx.state.resolve_merged(&address, &path).await {
+        Ok(Some((maddr, minner))) => {
+            requested = maddr.clone();
+            address = maddr;
+            path = minner;
+        }
+        Ok(None) => {}
+        Err(e) => return (StatusCode::FORBIDDEN, e).into_response(),
+    }
     // Progressive serve during an on-demand clone (EpixNet's `needFile`, per
     // file): kick the clone off (coalesced with any already running) and serve
     // each file the moment its verified bytes hit disk - the page renders
@@ -1986,9 +2004,33 @@ async fn serve_file(
     // assets still serve as they land: only an already-running page asks for
     // them, and each request waits for its own file (EpixNet's needFile).
     let is_html = content_type(&path).starts_with("text/html");
-    let still_loading = !registered
-        || !ctx.state.xite_file_exists(&address, &path).await
-        || (is_html && ctx.state.html_doc_gated(&address).await);
+    // A Range request for a declared big file we haven't started downloading:
+    // it serves through the piecewise Range branch below (which creates the
+    // sparse file and pulls just the pieces the range needs), so neither the
+    // whole-file fetch gate nor the clone wait loop may swallow it.
+    let range_bigfile = headers.get(header::RANGE).is_some()
+        && !ctx.state.xite_file_exists(&address, &path).await
+        && ctx.state.bigfile_total(&address, &path).await.is_some();
+    // An asset request for a file we don't hold but whose content.json (root
+    // or a child's - a per-user optional avatar, a merged site's lazy asset)
+    // declares: fetch just that file from peers (EpixNet's `needFile`) instead
+    // of falling into the whole-site clone path below.
+    if registered
+        && !is_html
+        && !range_bigfile
+        && !ctx.state.xite_file_exists(&address, &path).await
+        && ctx.state.file_info_any(&address, &path).await.is_some()
+    {
+        let need = ctx.state.file_need(&address, &path);
+        match tokio::time::timeout(std::time::Duration::from_secs(45), need).await {
+            Ok(Ok(true)) => {} // on disk now - the normal Range/read path serves it
+            _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        }
+    }
+    let still_loading = !range_bigfile
+        && (!registered
+            || !ctx.state.xite_file_exists(&address, &path).await
+            || (is_html && ctx.state.html_doc_gated(&address).await));
     if still_loading && plausible_xite_ref(&requested) && ctx.state.has_on_demand().await {
         // Kick the clone off; also resumes an interrupted clone (a registered
         // xite with core files missing). Keep the handle: the html gate must
@@ -2049,9 +2091,14 @@ async fn serve_file(
     // Range request → 206 Partial Content, streamed from disk (big files seek
     // in the browser without loading the whole file).
     if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        if let (Some(total), Some((start, end))) =
-            (ctx.state.file_size(&address, &path).await, parse_range(range))
-        {
+        // On-disk size; a big file never touched before has no sparse file
+        // yet, so fall back to its declared size (bigfile_fetch_range below
+        // creates the file).
+        let total = match ctx.state.file_size(&address, &path).await {
+            Some(total) => Some(total),
+            None => ctx.state.bigfile_total(&address, &path).await,
+        };
+        if let (Some(total), Some((start, end))) = (total, parse_range(range)) {
             if start < total {
                 let end = end.unwrap_or(total - 1).min(total - 1);
                 let len = (end - start + 1) as usize;

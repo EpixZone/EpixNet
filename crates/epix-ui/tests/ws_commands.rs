@@ -280,3 +280,59 @@ async fn site_clone_from_template_root_uses_root_content() {
     assert_eq!(content["title"], "My New Epix Site");
     assert!(epix_content::verify_signer(&content, &new_address), "signature verifies");
 }
+
+/// `permissionAdd("Merger:<type>")` must leave the merger's db populated
+/// before it responds (the app's grant callback queries right away - python
+/// MergerSite rebuilds in actionPermissionAdd) and push the updated siteInfo.
+#[tokio::test]
+async fn permission_add_merger_rebuilds_db_and_pushes_site_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new("ws-test");
+
+    // A merger with a version-3 schema and no data of its own.
+    let merger = "1Merger";
+    let mstore = XiteStorage::new(dir.path().join("merger"));
+    mstore
+        .write(
+            "dbschema.json",
+            br#"{ "db_name":"Merger","db_file":"db.db","version":3,
+                 "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                 "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+        )
+        .unwrap();
+    state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
+
+    // A hub of the merged type with a user's data.json already on disk.
+    let hub = XiteStorage::new(dir.path().join("hub"));
+    hub.write("data/u1/data.json", br#"{ "posts": [ {"post_id":1,"title":"hub row"} ] }"#)
+        .unwrap();
+    state
+        .add_xite("1Hub", XiteEntry { storage: hub, content: Some(json!({ "merged_type": "Test" })) })
+        .await;
+
+    let registry = CommandRegistry::with_defaults();
+    let session = WsSession::new(state.clone(), Some(merger.to_string()));
+
+    // No grant yet: the merger db holds no merged rows.
+    let rows =
+        registry.dispatch(&session, "dbQuery", &json!(["SELECT * FROM post"]), 1).await.unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 0);
+
+    let mut events = state.subscribe_events();
+    let res =
+        registry.dispatch(&session, "permissionAdd", &json!(["Merger:Test"]), 1).await.unwrap();
+    assert_eq!(res, Value::from("ok"));
+
+    // The rebuild ran inline: the hub's rows answer immediately.
+    let rows = registry
+        .dispatch(&session, "dbQuery", &json!(["SELECT title FROM post"]), 1)
+        .await
+        .unwrap();
+    assert_eq!(rows[0]["title"], "hub row", "{rows}");
+
+    // And the merger's siteInfo was pushed to its connections.
+    let pushed = std::iter::from_fn(|| events.try_recv().ok())
+        .find(|ev| ev.payload.contains("\"setSiteInfo\""))
+        .expect("permissionAdd pushes setSiteInfo");
+    assert_eq!(pushed.target.as_deref(), Some(merger));
+}
