@@ -15,7 +15,7 @@ bech32 = "0.9"
 bs58 = { version = "0.5", features = ["check"] }
 base64 = "0.22"
 hex = "0.4"
-getrandom = "0.2"
+getrandom = "0.4"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
