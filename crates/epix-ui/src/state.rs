@@ -4222,33 +4222,47 @@ impl AppState {
             if storage.verify(inner_path, &info.sha512) {
                 return Ok(true); // fetched by the caller we waited on
             }
-            let transport = self.transport.read().await.clone().ok_or("no transport")?;
-            let peers = self.connectable_peers(address, 20).await;
-            for peer in peers {
-                let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else {
-                    continue;
-                };
-                if conn.handshake().await.is_err() {
-                    continue;
-                }
-                let Ok(bytes) = conn.get_file(address, inner_path).await else { continue };
-                if XiteStorage::hash_bytes(&bytes) == info.sha512 {
-                    storage.write(inner_path, &bytes).map_err(|e| e.to_string())?;
-                    self.set_peer_connected(address, &peer, true).await;
-                    // Count optional bytes downloaded and advertise it in our
-                    // hashfield so peers can discover we now hold it.
-                    if optional {
-                        if let Some(x) = self.xites.write().await.get_mut(address) {
-                            x.settings.optional_downloaded += info.size;
-                            x.hashfield.add_hash(&info.sha512);
-                        }
-                    }
-                    return Ok(true);
-                }
-            }
-            Err("could not fetch the file from any peer".into())
+            self.fetch_file_from_peers(address, &info, optional, &storage).await
         }
         .await
+    }
+
+    /// Ask each connectable peer for the file until one hands over a blob
+    /// matching the declared hash, then write it and do the optional-file
+    /// bookkeeping. The fetch half of [`file_need`](Self::file_need).
+    async fn fetch_file_from_peers(
+        &self,
+        address: &str,
+        info: &FileEntry,
+        optional: bool,
+        storage: &XiteStorage,
+    ) -> Result<bool, String> {
+        let transport = self.transport.read().await.clone().ok_or("no transport")?;
+        let peers = self.connectable_peers(address, 20).await;
+        for peer in peers {
+            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else {
+                continue;
+            };
+            if conn.handshake().await.is_err() {
+                continue;
+            }
+            let Ok(bytes) = conn.get_file(address, &info.inner_path).await else { continue };
+            if XiteStorage::hash_bytes(&bytes) != info.sha512 {
+                continue;
+            }
+            storage.write(&info.inner_path, &bytes).map_err(|e| e.to_string())?;
+            self.set_peer_connected(address, &peer, true).await;
+            // Count optional bytes downloaded and advertise it in our
+            // hashfield so peers can discover we now hold it.
+            if optional {
+                if let Some(x) = self.xites.write().await.get_mut(address) {
+                    x.settings.optional_downloaded += info.size;
+                    x.hashfield.add_hash(&info.sha512);
+                }
+            }
+            return Ok(true);
+        }
+        Err("could not fetch the file from any peer".into())
     }
 
     /// List optional files with their state. `filter` = "downloaded" (default)
@@ -4285,50 +4299,66 @@ impl AppState {
             .into_iter()
             .find(|f| f["inner_path"] == inner_path)
             .unwrap_or(Value::Null);
-
-        // Root miss: user content declares its optional files in a child
-        // content.json (data/users/<auth>/content.json), which the root scan
-        // above never sees.
         if info.is_null() {
-            if let Some((f, true)) = self.file_info_any(address, inner_path).await {
-                let (storage, is_pinned) = {
-                    let xites = self.xites.read().await;
-                    let x = xites.get(address).ok_or("unknown xite")?;
-                    (x.storage.clone(), x.pinned.contains(inner_path))
-                };
-                info = json!({
-                    "inner_path": f.inner_path,
-                    "size": f.size,
-                    "sha512": f.sha512,
-                    "is_downloaded": storage.verify(inner_path, &f.sha512),
-                    "is_pinned": is_pinned,
-                });
-            }
+            info = self.child_optional_info(address, inner_path).await?;
         }
-
         if let Value::Object(map) = &mut info {
             // Cosmetic parity with EpixNet's file_optional db row: count
             // ourselves as the one known peer once the file is downloaded.
             let downloaded = map.get("is_downloaded").and_then(|v| v.as_bool()).unwrap_or(false);
             map.insert("peer".into(), json!(u8::from(downloaded)));
-            let size = map["size"].as_i64().unwrap_or(0);
-            if size > 1024 * 1024 {
-                if let Some((entry, dir, _)) = self.declared_entry(address, inner_path).await {
-                    let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024);
-                    let piece_num = (size + piece_size - 1) / piece_size.max(1);
-                    map.insert("is_bigfile".into(), json!(true));
-                    map.insert("piece_size".into(), json!(piece_size));
-                    map.insert("piece_num".into(), json!(piece_num));
-                    // A child content.json's piecemap path is relative to its
-                    // own dir - return it site-relative like everything else.
-                    if let Some(pm) = entry.get("piecemap").and_then(|v| v.as_str()) {
-                        let pm = if dir.is_empty() { pm.to_string() } else { format!("{dir}/{pm}") };
-                        map.insert("piecemap".into(), json!(pm));
-                    }
-                }
-            }
+            self.add_bigfile_fields(address, inner_path, map).await;
         }
         Ok(info)
+    }
+
+    /// Optional-file info from the governing child content.json, for the files
+    /// the root scan misses: user content declares its optional files in
+    /// `data/users/<auth>/content.json`. Null when undeclared or not optional.
+    async fn child_optional_info(&self, address: &str, inner_path: &str) -> Result<Value, String> {
+        let Some((f, true)) = self.file_info_any(address, inner_path).await else {
+            return Ok(Value::Null);
+        };
+        let (storage, is_pinned) = {
+            let xites = self.xites.read().await;
+            let x = xites.get(address).ok_or("unknown xite")?;
+            (x.storage.clone(), x.pinned.contains(inner_path))
+        };
+        Ok(json!({
+            "inner_path": f.inner_path,
+            "size": f.size,
+            "sha512": f.sha512,
+            "is_downloaded": storage.verify(inner_path, &f.sha512),
+            "is_pinned": is_pinned,
+        }))
+    }
+
+    /// Add the Bigfile piece layout to an optional-file info object when the
+    /// entry is >1MB and declared with a `piecemap`.
+    async fn add_bigfile_fields(
+        &self,
+        address: &str,
+        inner_path: &str,
+        map: &mut serde_json::Map<String, Value>,
+    ) {
+        let size = map["size"].as_i64().unwrap_or(0);
+        if size <= 1024 * 1024 {
+            return;
+        }
+        let Some((entry, dir, _)) = self.declared_entry(address, inner_path).await else {
+            return;
+        };
+        let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024);
+        let piece_num = (size + piece_size - 1) / piece_size.max(1);
+        map.insert("is_bigfile".into(), json!(true));
+        map.insert("piece_size".into(), json!(piece_size));
+        map.insert("piece_num".into(), json!(piece_num));
+        // A child content.json's piecemap path is relative to its own dir -
+        // return it site-relative like everything else.
+        if let Some(pm) = entry.get("piecemap").and_then(|v| v.as_str()) {
+            let pm = if dir.is_empty() { pm.to_string() } else { format!("{dir}/{pm}") };
+            map.insert("piecemap".into(), json!(pm));
+        }
     }
 
     /// On-disk size of a xite file (for HTTP Range / Content-Range).

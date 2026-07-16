@@ -70,6 +70,33 @@ fn pattern_matches(re: &Option<fancy_regex::Regex>, rel: &str) -> bool {
     re.as_ref().is_some_and(|re| re.is_match(rel).unwrap_or(false))
 }
 
+/// How `hash_unit_files` treats one dir-relative path: `None` skips it
+/// (content.json units, transient files, ignored paths, nested units, and
+/// declared-optional entries whose stored metadata must survive), otherwise
+/// whether it hashes into `files_optional` instead of `files`.
+fn unit_file_class(
+    rel: &str,
+    nested_dirs: &[String],
+    declared_optional: &serde_json::Map<String, Value>,
+    ignore: &Option<fancy_regex::Regex>,
+    optional: &Option<fancy_regex::Regex>,
+) -> Option<bool> {
+    if rel == "content.json" || rel.ends_with("/content.json") {
+        return None;
+    }
+    if skip_hashing(rel) || pattern_matches(ignore, rel) {
+        return None;
+    }
+    if nested_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
+        return None;
+    }
+    let is_optional = pattern_matches(optional, rel);
+    if !is_optional && declared_optional.contains_key(rel) {
+        return None;
+    }
+    Some(is_optional)
+}
+
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -497,19 +524,11 @@ impl Xite {
             let Some(rel) = inner.strip_prefix(prefix.as_str()).map(str::to_string) else {
                 continue;
             };
-            if rel == "content.json" || rel.ends_with("/content.json") {
+            let Some(is_optional) =
+                unit_file_class(&rel, &nested_dirs, declared_optional, ignore, optional)
+            else {
                 continue;
-            }
-            if skip_hashing(&rel) || pattern_matches(ignore, &rel) {
-                continue;
-            }
-            if nested_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
-                continue;
-            }
-            let is_optional = pattern_matches(optional, &rel);
-            if !is_optional && declared_optional.contains_key(&rel) {
-                continue;
-            }
+            };
             let bytes = self.storage.read(&inner)?;
             let entry = json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) });
             if is_optional {
