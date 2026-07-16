@@ -9,7 +9,7 @@ epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
 rmpv = "1"
 tokio = { version = "1", features = ["io-util", "net", "rt", "time", "sync"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 async-trait = "0.1"
 
