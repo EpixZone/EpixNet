@@ -60,3 +60,6 @@ ios/**/project.xcworkspace/
 
 # Android copy of the wallet build artifact (staged by gradle stageWalletExt)
 /shells/android/app/src/main/assets/extensions/
+
+# xcodebuild derived data (-derivedDataPath build)
+/ios/build/
