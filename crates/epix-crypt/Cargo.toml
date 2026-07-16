@@ -11,7 +11,7 @@ sha3 = "0.12"
 hmac = "0.13"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
-bech32 = "0.9"
+bech32 = "0.12"
 bs58 = { version = "0.5", features = ["check"] }
 base64 = "0.22"
 hex = "0.4"
