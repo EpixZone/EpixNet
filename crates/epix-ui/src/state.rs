@@ -318,7 +318,7 @@ struct PendingUpdate {
 fn retry_pending_allowed(tries: i64) -> bool {
     let bound = tries.clamp(0, 40) as u8;
     let mut b = [0u8; 1];
-    if getrandom::getrandom(&mut b).is_err() {
+    if getrandom::fill(&mut b).is_err() {
         return true;
     }
     (b[0] % (bound + 1)) < 4
@@ -661,7 +661,7 @@ fn sql_quote(v: &Value) -> String {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    let _ = getrandom::getrandom(&mut buf);
+    let _ = getrandom::fill(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

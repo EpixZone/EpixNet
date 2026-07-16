@@ -106,7 +106,7 @@ fn run_case(name: &str, num: u32) {
             "hash_sha3_512" => sink = sink.wrapping_add(Sha3_512::digest(&blob)[0] as u64),
             "random" => {
                 let mut buf = [0u8; 4096];
-                let _ = getrandom::getrandom(&mut buf);
+                let _ = getrandom::fill(&mut buf);
                 sink = sink.wrapping_add(buf[0] as u64);
             }
             _ => {}

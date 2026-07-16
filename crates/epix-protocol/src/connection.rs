@@ -58,7 +58,7 @@ fn parse_handshake(v: &Value) -> HandshakeInfo {
 
 fn random_peer_id() -> String {
     let mut b = [0u8; 6];
-    let _ = getrandom::getrandom(&mut b);
+    let _ = getrandom::fill(&mut b);
     format!("-EpixRS-{}", hex::encode(b))
 }
 

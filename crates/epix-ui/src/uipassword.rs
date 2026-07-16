@@ -22,7 +22,7 @@ fn sessions() -> &'static RwLock<HashSet<String>> {
 pub fn random_session_id() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut buf = [0u8; 26];
-    getrandom::getrandom(&mut buf).expect("os randomness");
+    getrandom::fill(&mut buf).expect("os randomness");
     buf.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
 }
 

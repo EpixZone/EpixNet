@@ -23,6 +23,9 @@ pub mod ecies;
 
 type HmacSha512 = Hmac<Sha512>;
 
+/// Human-readable part of epix addresses ("epix" is statically valid).
+const EPIX_HRP: bech32::Hrp = bech32::Hrp::parse_unchecked("epix");
+
 /// Compressed SEC1 pubkey (33 bytes) for a private key - EpixNet's `eccPrivToPub`.
 pub fn private_to_compressed_pubkey(privatekey: &str) -> Result<Vec<u8>, String> {
     Ok(compressed_pubkey(&priv_to_scalar(privatekey)?))
@@ -132,13 +135,7 @@ pub fn public_key_to_address(public_key: &[u8]) -> Result<String, String> {
     k.update(xy);
     let full = k.finalize();
     let addr20 = &full[full.len() - 20..];
-    bech32::encode("epix", to_base32(addr20), bech32::Variant::Bech32)
-        .map_err(|e| format!("bech32: {e}"))
-}
-
-fn to_base32(data: &[u8]) -> Vec<bech32::u5> {
-    use bech32::ToBase32;
-    data.to_base32()
+    bech32::encode::<bech32::Bech32>(EPIX_HRP, addr20).map_err(|e| format!("bech32: {e}"))
 }
 
 /// Parse a private key given as 64-hex chars or WIF into a scalar.
@@ -258,40 +255,33 @@ pub fn verify_keccak(data: &str, address: &str, sig_b64: &str) -> bool {
 
 /// True if `addr` is a well-formed `epix1…` bech32 address (20-byte payload).
 pub fn is_valid_address(addr: &str) -> bool {
-    match bech32::decode(addr) {
-        Ok((hrp, data, variant)) => {
-            if hrp != "epix" || variant != bech32::Variant::Bech32 {
-                return false;
-            }
-            use bech32::FromBase32;
-            Vec::<u8>::from_base32(&data).map(|b| b.len() == 20).unwrap_or(false)
-        }
-        Err(_) => false,
-    }
+    address_to_hash160(addr).is_ok()
 }
 
 /// Decode an `epix1…` address to its 20-byte hash160 payload.
+/// Requires the classic Bech32 checksum (not Bech32m).
 pub fn address_to_hash160(addr: &str) -> Result<[u8; 20], String> {
-    let (hrp, data, variant) = bech32::decode(addr).map_err(|e| format!("bech32: {e}"))?;
-    if hrp != "epix" || variant != bech32::Variant::Bech32 {
+    use bech32::primitives::decode::CheckedHrpstring;
+    let checked =
+        CheckedHrpstring::new::<bech32::Bech32>(addr).map_err(|e| format!("bech32: {e}"))?;
+    if checked.hrp() != EPIX_HRP {
         return Err("not an epix bech32 address".into());
     }
-    use bech32::FromBase32;
-    let bytes = Vec::<u8>::from_base32(&data).map_err(|e| format!("base32: {e}"))?;
+    let bytes: Vec<u8> = checked.byte_iter().collect();
     bytes.try_into().map_err(|_| "address payload not 20 bytes".to_string())
 }
 
 /// Fresh 64-hex-char master seed (32 random bytes).
 pub fn new_seed() -> String {
     let mut b = [0u8; 32];
-    getrandom::getrandom(&mut b).expect("os rng");
+    getrandom::fill(&mut b).expect("os rng");
     hex::encode(b)
 }
 
 /// Fresh random private key, WIF-encoded (reduced into the curve order).
 pub fn new_private_key() -> String {
     let mut b = [0u8; 32];
-    getrandom::getrandom(&mut b).expect("os rng");
+    getrandom::fill(&mut b).expect("os rng");
     let fb: FieldBytes = scalar_from_be_reduced(&b).to_bytes();
     let mut p = [0u8; 32];
     p.copy_from_slice(&fb);
