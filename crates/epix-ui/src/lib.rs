@@ -1353,7 +1353,7 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
          </style>\
          <div class='stats-wrap'>{body}</div>"
     );
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page_shell("Stats", "Stats", "Node diagnostics", &styled, &homepage, &theme))
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], page_shell("Stats", "Stats", "", &styled, &homepage, &theme))
         .into_response()
 }
 
