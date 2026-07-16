@@ -21,7 +21,7 @@ base64 = "0.22"
 sha2 = "0.11"
 hex = "0.4"
 rmpv = "1"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 tower = { version = "0.5", features = ["util", "make"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
 serde = { version = "1", features = ["derive"] }
