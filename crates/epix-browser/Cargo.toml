@@ -41,7 +41,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # runs, else route std streams to a log file); WM_SETICON stamping so the
 # managed Firefox's windows show the Epix icon.
 [target.'cfg(windows)'.dependencies]
-winreg = "0.52"
+winreg = "0.56"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
