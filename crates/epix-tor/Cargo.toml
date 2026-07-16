@@ -29,7 +29,7 @@ async-trait = "0.1"
 # curve25519 directly: Arti stores hs identity keys as uniform reduced
 # scalars, which ed25519-dalek's hazmat ExpandedSecretKey would re-clamp
 # (silently swapping in a different key).
-curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "digest", "zeroize"] }
+curve25519-dalek = { version = "5", default-features = false, features = ["alloc", "digest", "zeroize"] }
 sha2 = { version = "0.10", default-features = false }
 futures = "0.3"
 # Only for reading arti's guards.json in the poisoned-guard-state check.
