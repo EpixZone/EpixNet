@@ -88,10 +88,23 @@ impl FileService {
         // Optional per-file diffs (`inner_path -> [actions]`); applied to skip
         // re-downloading changed data files.
         let diffs = parse_diffs(vget(params, "diffs"));
+        // The publisher's self-declared dialable addresses (onion/i2p/open
+        // clearnet) - the only peers guaranteed to hold the pushed version's
+        // files. Unparsable entries are dropped; the fetch path re-checks
+        // dialability and drops our own addresses before use.
+        let sender_peers: Vec<PeerAddr> = match vget(params, "sender_peers") {
+            Some(Value::Array(list)) => list
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| PeerAddr::parse(s).ok())
+                .take(5)
+                .collect(),
+            _ => Vec::new(),
+        };
 
         match self
             .state
-            .apply_inbound_update(&site, &inner_path, body, modified, Some(peer.clone()), diffs)
+            .apply_inbound_update(&site, &inner_path, body, modified, Some(peer.clone()), diffs, sender_peers)
             .await
         {
             Ok(InboundUpdate::Applied) => {

@@ -53,6 +53,6 @@ async fn main() {
     let mut conn =
         epix_protocol::Connection::connect(&transport, &addr).await.expect("connect");
     conn.handshake().await.expect("handshake");
-    let reply = conn.update(address, "content.json", &body, modified, None).await;
+    let reply = conn.update(address, "content.json", &body, modified, None, &[]).await;
     println!("peer reply: {reply:?}");
 }

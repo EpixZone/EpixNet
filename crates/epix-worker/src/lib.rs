@@ -131,6 +131,7 @@ struct SyncCtx {
     feedback: Option<Arc<dyn PeerFeedback>>,
     done: Arc<std::sync::atomic::AtomicUsize>,
     total: usize,
+    max_attempts: u8,
 }
 
 impl SyncCtx {
@@ -154,7 +155,18 @@ impl SyncCtx {
             feedback,
             done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             total,
+            max_attempts: MAX_ATTEMPTS,
         }
+    }
+
+    /// Give each file up to one attempt per supplied peer (floored at the old
+    /// MAX_ATTEMPTS, capped at 12). When most peers are stale - a fresh update
+    /// only its publisher holds yet - a flat 3-attempt budget burned out on
+    /// the first three stale peers before the fetch ever reached one that
+    /// actually has the new bytes.
+    fn with_attempts_for_peers(mut self, peers: usize) -> Self {
+        self.max_attempts = peers.max(MAX_ATTEMPTS as usize).min(12) as u8;
+        self
     }
 
     /// Report a per-peer outcome to the host's feedback sink, if any.
@@ -187,29 +199,62 @@ impl SyncCtx {
     }
 }
 
-/// Await the pass's workers, but abort the stragglers the moment every file
-/// is accounted for. Without this the pass ends only when the LAST worker
-/// exits - and a worker stuck dialing a dead peer (connect timeout 15s) with
-/// an already-empty queue kept the finished download waiting, which is where
-/// most of a fresh clone's "site is up but still nothing new" time went.
-async fn drain_workers(mut join: tokio::task::JoinSet<()>, ctx: &SyncCtx) {
+/// Drive a sync pass over a fixed peer list: spawn up to `max_workers`
+/// workers from the front of the list, keep the rest as spares, and replace
+/// any worker that exits (dead peer, or out of files it can serve) with the
+/// next untried peer - so every supplied peer gets a turn while files remain.
+/// Without the replacement, only the first `max_workers` peers were ever
+/// dialed; an update whose files only the publisher held could not complete
+/// whenever the publisher sorted behind that many stale peers, which is
+/// exactly where reputation ordering puts an overlay-only publisher.
+/// Aborts stragglers the moment every file is accounted for, like the old
+/// drain loop did - a worker stuck dialing a dead peer (connect timeout 15s)
+/// must not hold a finished download hostage.
+async fn run_pool(peers: Vec<PeerAddr>, ctx: &SyncCtx, max_workers: usize) {
+    let mut spares: VecDeque<PeerAddr> = peers.into();
+    let mut join = tokio::task::JoinSet::new();
+    while join.len() < max_workers.max(1) && spawn_from_spares(&mut spares, &mut join, ctx) {}
     loop {
         if ctx.all_done().await {
-            join.abort_all();
             break;
         }
+        if join.is_empty() {
+            // Queue drained (files in flight are gone with their workers) or
+            // no peer left to try: the pass is over either way.
+            let queue_empty = ctx.queue.lock().await.is_empty();
+            if queue_empty || !spawn_from_spares(&mut spares, &mut join, ctx) {
+                break;
+            }
+        }
         tokio::select! {
-            res = join.join_next() => {
-                if res.is_none() {
-                    break; // every worker exited (queue drained or gave up)
+            Some(_) = join.join_next(), if !join.is_empty() => {
+                // A worker exited; top the pool back up while work remains.
+                if !ctx.queue.lock().await.is_empty() {
+                    spawn_from_spares(&mut spares, &mut join, ctx);
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
         }
     }
-    // Reap aborted tasks so their SyncCtx clones drop before finish().
+    // Abort stragglers and reap them so their SyncCtx clones drop before
+    // finish().
     join.abort_all();
     while join.join_next().await.is_some() {}
+}
+
+/// Spawn a worker on the next spare peer, if any. Returns whether one spawned.
+fn spawn_from_spares(
+    spares: &mut VecDeque<PeerAddr>,
+    join: &mut tokio::task::JoinSet<()>,
+    ctx: &SyncCtx,
+) -> bool {
+    match spares.pop_front() {
+        Some(p) => {
+            join.spawn(run_worker(p, ctx.clone()));
+            true
+        }
+        None => false,
+    }
 }
 
 /// One worker: connect to `peer` and pull files from the shared queue until
@@ -269,13 +314,13 @@ async fn run_worker(peer: PeerAddr, ctx: SyncCtx) {
                         cb(&file.inner_path, n, ctx.total);
                     }
                 } else {
-                    requeue_or_fail(&ctx.queue, &ctx.report, file, attempts).await;
+                    requeue_or_fail(&ctx.queue, &ctx.report, file, attempts, ctx.max_attempts).await;
                 }
             }
             _ => {
                 ctx.note(&peer, PeerOutcome::FileFail);
                 refused.insert(file.inner_path.clone());
-                requeue_or_fail(&ctx.queue, &ctx.report, file, attempts).await;
+                requeue_or_fail(&ctx.queue, &ctx.report, file, attempts, ctx.max_attempts).await;
                 // The connection may be unhealthy; reconnect for the next item.
                 match connect(ctx.transport.as_ref(), &peer).await {
                     Some(c) => conn = c,
@@ -307,13 +352,9 @@ pub async fn sync_files_list(
         return Ok(report);
     }
     let max_workers = scale_workers(max_workers, needed.len());
-    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback);
-    let worker_count = peers.len().min(max_workers.max(1));
-    let mut join = tokio::task::JoinSet::new();
-    for i in 0..worker_count {
-        join.spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone()));
-    }
-    drain_workers(join, &ctx).await;
+    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback)
+        .with_attempts_for_peers(peers.len());
+    run_pool(peers.to_vec(), &ctx, max_workers).await;
     Ok(ctx.finish().await)
 }
 
@@ -334,13 +375,9 @@ pub async fn sync_files_with_progress(
         return Ok(report);
     }
     let max_workers = scale_workers(max_workers, needed.len());
-    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback);
-    let worker_count = peers.len().min(max_workers.max(1));
-    let mut join = tokio::task::JoinSet::new();
-    for i in 0..worker_count {
-        join.spawn(run_worker(peers[i % peers.len()].clone(), ctx.clone()));
-    }
-    drain_workers(join, &ctx).await;
+    let ctx = SyncCtx::new(needed, xite, transport, on_file, feedback)
+        .with_attempts_for_peers(peers.len());
+    run_pool(peers.to_vec(), &ctx, max_workers).await;
     Ok(ctx.finish().await)
 }
 
@@ -537,8 +574,9 @@ async fn requeue_or_fail(
     report: &Arc<Mutex<SyncReport>>,
     file: FileEntry,
     attempts: u8,
+    max_attempts: u8,
 ) {
-    if attempts + 1 < MAX_ATTEMPTS {
+    if attempts + 1 < max_attempts {
         queue.lock().await.push_back((file, attempts + 1));
     } else {
         report.lock().await.failed.push(file.inner_path);

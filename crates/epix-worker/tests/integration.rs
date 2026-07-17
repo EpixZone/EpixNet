@@ -231,3 +231,61 @@ async fn streaming_sync_starts_before_discovery_finishes() {
     assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), a);
     assert_eq!(std::fs::read(dir.path().join("b.txt")).unwrap(), b);
 }
+
+/// The publisher-is-the-only-seed regression: a fresh version's file exists
+/// on ONE peer sitting at the END of the peer list, behind more stale peers
+/// (serving the old bytes, so every fetch is a hash mismatch) than there are
+/// workers. The old pass pinned one worker per leading peer and gave each
+/// file a flat 3 attempts, so it burned out before ever dialing the tail
+/// peer - which is exactly where reputation ordering puts an overlay-only
+/// publisher. The pool must walk the spares and land the file.
+#[tokio::test]
+async fn fetches_from_the_last_peer_behind_a_wall_of_stale_ones() {
+    let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+    let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+    let fresh = b"the new version of the file".to_vec();
+    let stale = b"the OLD version of the file".to_vec();
+
+    let mut content = json!({
+        "address": address,
+        "inner_path": "content.json",
+        "modified": 1777992698,
+        "files": {
+            "a.txt": { "size": fresh.len(), "sha512": XiteStorage::hash_bytes(&fresh) },
+        },
+    });
+    epix_content::sign(&mut content, priv_hex).unwrap();
+    let content_bytes = serde_json::to_vec(&content).unwrap();
+
+    // Six stale peers ahead of the one seeder, workers capped at 2.
+    let mut peers = Vec::new();
+    for _ in 0..6 {
+        let mut files = HashMap::new();
+        files.insert("a.txt".to_string(), stale.clone());
+        peers.push(PeerAddr::Ip(spawn_mock_peer(files).await));
+    }
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), fresh.clone());
+    peers.push(PeerAddr::Ip(spawn_mock_peer(files).await));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+    xite.set_content(&content_bytes).unwrap();
+    let needed = xite.files_needed();
+    assert_eq!(needed.len(), 1);
+
+    let report = epix_worker::sync_files_list(
+        needed,
+        &xite,
+        &peers,
+        Arc::new(TcpTransport),
+        2,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.downloaded, 1, "failed: {:?}", report.failed);
+    assert_eq!(xite.storage.read("a.txt").unwrap(), fresh);
+}
