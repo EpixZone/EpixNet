@@ -72,7 +72,17 @@ jobs:
       image: semgrep/semgrep
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - run: semgrep scan --config p/rust --config p/security-audit --config p/secrets --error --sarif --output semgrep.sarif crates || true
+      # The args/args-os rules are excluded: they flag EVERY read of the
+      # command line, but their actual advice - never trust argv[0] - is
+      # followed at each call site (all skip(1), none branch on the exe
+      # path). nosemgrep comments don't help here: suppressed findings stay
+      # in the SARIF and still surface as PR annotations.
+      - run: >-
+          semgrep scan
+          --config p/rust --config p/security-audit --config p/secrets
+          --exclude-rule rust.lang.security.args.args
+          --exclude-rule rust.lang.security.args-os.args-os
+          --error --sarif --output semgrep.sarif crates || true
       - uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         if: always()
         with:

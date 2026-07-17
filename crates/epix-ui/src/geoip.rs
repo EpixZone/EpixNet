@@ -28,6 +28,7 @@ impl GeoIp {
     pub fn open(path: impl AsRef<Path>) -> Option<Self> {
         // SAFETY: the .mmdb is written once by `ensure` (or shipped read-only)
         // and not mutated while mapped, so the mapping stays valid for its life.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { Reader::open_mmap(path) }
             .ok()
             .map(|reader| Self { reader })

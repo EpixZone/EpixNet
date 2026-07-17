@@ -11,7 +11,7 @@ use epix_transport::TcpTransport;
 
 #[tokio::main]
 async fn main() {
-    let mut args = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
+    let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:26552".into());
     let site = args.next().unwrap_or_default();
     let transport = TcpTransport;
