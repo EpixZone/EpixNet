@@ -4,7 +4,7 @@
 //! ConnectionServer, but bounded to a handful of peers.
 
 use epix_core::PeerAddr;
-use epix_protocol::Connection;
+use epix_protocol::{Connection, HandshakeInfo};
 use epix_transport::Transport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -17,6 +17,17 @@ struct PeerConn {
     conn: Arc<Mutex<Connection>>,
     last_ping_ms: Arc<AtomicI64>,
     onion: bool,
+    /// The peer's handshake identity (version/rev/protocol/crypt), copied out
+    /// at connect time so the Stats page renders it without touching the
+    /// connection's mutex (the conn may be mid-request).
+    peer: Option<HandshakeInfo>,
+}
+
+/// One live pooled connection, as the Stats page lists it.
+pub struct ConnDetail {
+    pub addr: PeerAddr,
+    pub ping_ms: Option<i64>,
+    pub peer: Option<HandshakeInfo>,
 }
 
 /// Aggregate connection stats for the chart/collector.
@@ -100,15 +111,38 @@ impl ConnectionPool {
             if conns.len() >= self.max || conns.contains_key(&addr) {
                 continue;
             }
+            let peer = conn.peer.clone();
             conns.insert(
                 addr,
                 PeerConn {
                     conn: Arc::new(Mutex::new(conn)),
                     last_ping_ms: Arc::new(AtomicI64::new(-1)),
                     onion,
+                    peer,
                 },
             );
         }
+    }
+
+    /// One row per live connection: address, last ping, and the peer's
+    /// handshake identity - what the Stats page shows so an operator can see
+    /// which node versions the network runs (Phase 6 handshake surfacing).
+    pub async fn connection_details(&self) -> Vec<ConnDetail> {
+        let conns = self.conns.lock().await;
+        let mut out: Vec<ConnDetail> = conns
+            .iter()
+            .map(|(addr, c)| {
+                let v = c.last_ping_ms.load(Ordering::Relaxed);
+                ConnDetail {
+                    addr: addr.clone(),
+                    ping_ms: (v >= 0).then_some(v),
+                    peer: c.peer.clone(),
+                }
+            })
+            .collect();
+        // Stable order for the page: by address string.
+        out.sort_by_key(|d| d.addr.to_string());
+        out
     }
 
     /// Ping every held connection concurrently, updating each ping and dropping
@@ -196,6 +230,8 @@ mod tests {
                             "handshake" => vmap(vec![
                                 ("cmd", RVal::from("response")),
                                 ("to", RVal::from(req_id)),
+                                ("version", RVal::from("0.9.9")),
+                                ("rev", RVal::from(4242i64)),
                                 ("protocol", RVal::from("v2")),
                                 ("peer_id", RVal::from("-Mock-000000000001")),
                                 ("crypt_supported", RVal::Array(vec![])),
@@ -241,6 +277,15 @@ mod tests {
         // ensure is idempotent - no duplicate connection to the same peer.
         pool.ensure(transport, &[peer.clone()]).await;
         assert_eq!(pool.stats().await.total, 1);
+
+        // The peer's handshake identity is retained for the Stats page.
+        let details = pool.connection_details().await;
+        assert_eq!(details.len(), 1);
+        let hs = details[0].peer.as_ref().expect("handshake info retained");
+        assert_eq!(hs.version, "0.9.9");
+        assert_eq!(hs.rev, 4242);
+        assert_eq!(hs.protocol, "v2");
+        assert!(details[0].ping_ms.is_some(), "ping carried into the detail row");
     }
 
     #[tokio::test]

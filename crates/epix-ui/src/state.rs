@@ -5399,12 +5399,31 @@ impl AppState {
         // content checks), not just file payloads - so they move even when an
         // update finds nothing new to download. The tray shows these.
         let (wire_recv, wire_sent) = epix_protocol::wire_totals();
+        // Per-connection handshake identities (Phase 6): which node versions
+        // the network runs, per live pooled connection.
+        let connections_detail: Vec<Value> = self
+            .conn_pool
+            .connection_details()
+            .await
+            .into_iter()
+            .map(|d| {
+                json!({
+                    "peer": d.addr.to_string(),
+                    "ping_ms": d.ping_ms,
+                    "version": d.peer.as_ref().map(|p| p.version.clone()),
+                    "rev": d.peer.as_ref().map(|p| p.rev),
+                    "protocol": d.peer.as_ref().map(|p| p.protocol.clone()),
+                    "crypt_supported": d.peer.as_ref().map(|p| p.crypt_supported.clone()),
+                })
+            })
+            .collect();
         json!({
             "version": self.version,
             "sites": sites,
             "peers_total": peers_total,
             "peers_connected": peers_connected,
             "connections": self.connection_stats().await.total,
+            "connections_detail": connections_detail,
             "bytes_recv": bytes_recv,
             "bytes_sent": bytes_sent,
             "wire_recv": wire_recv,
@@ -5441,32 +5460,49 @@ impl AppState {
         // Connections.
         let _ = write!(
             h,
-            "<h2>Connections ({} live, onion: {})</h2>             <table><tr><th>peer</th><th>type</th><th>ping</th></tr>",
+            "<h2>Connections ({} live, onion: {})</h2>             <table><tr><th>peer</th><th>type</th><th>version</th><th>protocol</th><th>crypt</th><th>ping</th></tr>",
             stats.total, stats.onion
         );
-        for addr in self.conn_pool.connected_addrs().await {
-            let ping = self
-                .conn_pool
-                .ping_for(&addr)
-                .await
-                .map(|ms| format!("{ms} ms"))
-                .unwrap_or_else(|| "-".into());
-            let kind = match &addr {
+        // What the handshake told us about each peer (Phase 6): the node
+        // version + rev show which releases the network runs, protocol and
+        // crypt show wire capabilities.
+        for detail in self.conn_pool.connection_details().await {
+            let ping = detail.ping_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "-".into());
+            let kind = match &detail.addr {
                 PeerAddr::Onion { .. } => "onion",
                 PeerAddr::I2p { .. } => "i2p",
                 PeerAddr::Rns(_) => "mesh",
                 PeerAddr::Ip(_) => "ip",
             };
+            let (version, protocol, crypt) = match &detail.peer {
+                Some(p) => (
+                    if p.version.is_empty() {
+                        "-".to_string()
+                    } else {
+                        format!("{} (rev{})", p.version, p.rev)
+                    },
+                    if p.protocol.is_empty() { "-".to_string() } else { p.protocol.clone() },
+                    if p.crypt_supported.is_empty() {
+                        "-".to_string()
+                    } else {
+                        p.crypt_supported.join(", ")
+                    },
+                ),
+                None => ("-".into(), "-".into(), "-".into()),
+            };
             let _ = write!(
                 h,
-                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                esc(&addr.to_string()),
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&detail.addr.to_string()),
                 kind,
+                esc(&version),
+                esc(&protocol),
+                esc(&crypt),
                 ping
             );
         }
         if stats.total == 0 {
-            h.push_str("<tr><td colspan=3 class='muted'>no live connections</td></tr>");
+            h.push_str("<tr><td colspan=6 class='muted'>no live connections</td></tr>");
         }
         h.push_str("</table>");
 
