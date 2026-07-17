@@ -797,6 +797,10 @@ fn nmh_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    // Exec plumbing, not a trust decision: current_exe comes from the kernel
+    // (not argv[0]), and anyone able to replace files next to the launcher
+    // already runs code as this user.
+    // nosemgrep: rust.lang.security.current-exe.current-exe
     let exe = std::env::current_exe().ok()?;
     let sibling = exe.parent()?.join(if cfg!(windows) { "epix-nmh.exe" } else { "epix-nmh" });
     sibling.exists().then_some(sibling)

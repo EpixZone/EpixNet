@@ -1,0 +1,12 @@
+# Paths semgrep skips (SAST scan in .github/workflows/security.yml).
+#
+# Dev diagnostics only - wire probes and one-off spikes that never ship.
+# Scanning them produced a steady drip of argv/audit findings with no
+# security surface behind them.
+**/examples/
+crates/wire-spike/
+crates/xid-spike/
+
+# Keep the implicit defaults this file would otherwise replace.
+.git/
+:include .gitignore

@@ -80,10 +80,14 @@ pub fn write_conf_data_dir(conf: &Path, dir: Option<&Path>) -> std::io::Result<(
 }
 
 fn home() -> PathBuf {
+    // Last resort for a degenerate environment (HOME and USERPROFILE both
+    // unset): the working directory, NOT the temp dir - the data root holds
+    // the node's private keys, which must not live somewhere world-shared
+    // and wiped on reboot. Operators in such environments set EPIX_DATA_DIR.
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 #[cfg(test)]
