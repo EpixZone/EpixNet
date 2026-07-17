@@ -16,6 +16,7 @@ pub fn is_action(name: &str) -> bool {
         name,
         "siteCreate"
             | "siteSign"
+            | "sitePublish"
             | "siteVerify"
             | "siteList"
             | "siteDelete"
@@ -87,6 +88,29 @@ async fn dispatch(
                 state.sign_user_content(address, &content_path, privatekey, None).await?;
             }
             println!("{content_path} signed");
+            Ok(())
+        }
+        "sitePublish" => {
+            let [address, rest @ ..] = args else {
+                return Err("usage: sitePublish <address> [inner_path]".into());
+            };
+            let inner_path = rest.first().cloned().unwrap_or_else(|| "content.json".to_string());
+            let state = open_state(data_root, version).await;
+            if !state.has_any_alias(address).await {
+                return Err(format!("Site not found: {address}"));
+            }
+            // Offline CLI: dial clearnet peers directly. Onion/i2p peers need
+            // the node's Tor/I2P clients, so the dialable-networks filter
+            // skips them here - they pull the version from the swarm on their
+            // next sync instead.
+            state.set_transport(std::sync::Arc::new(epix_transport::TcpTransport)).await;
+            let content_path = state.content_inner_path(address, &inner_path).await;
+            let published = state.publish(address, &content_path, None, true).await?;
+            if published == 0 {
+                return Err("no peers reachable right now - the update spreads on the next sync"
+                    .into());
+            }
+            println!("{content_path} published to {published} peer(s)");
             Ok(())
         }
         "siteVerify" => {

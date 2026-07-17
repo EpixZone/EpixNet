@@ -40,10 +40,10 @@ async fn main() {
             println!("Usage: epix-server [xite address | name.epix | epix://link]");
             println!("       epix-server <action> [args...]");
             println!();
-            println!("Actions: siteCreate, siteSign, siteVerify, siteList, siteDelete,");
-            println!("         siteDownload, dbRebuild, dbQuery, importBundle, cryptSign,");
-            println!("         cryptVerify, cryptGetPrivatekey, cryptPrivatekeyToAddress,");
-            println!("         peerPing, peerGetFile, peerCmd");
+            println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
+            println!("         siteDelete, siteDownload, dbRebuild, dbQuery, importBundle,");
+            println!("         cryptSign, cryptVerify, cryptGetPrivatekey,");
+            println!("         cryptPrivatekeyToAddress, peerPing, peerGetFile, peerCmd");
             println!();
             println!("Env: EPIX_DATA_DIR, EPIX_UI_ADDR, EPIX_HEADLESS, EPIX_TOR");
             return;

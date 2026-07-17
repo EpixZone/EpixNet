@@ -7478,20 +7478,26 @@ impl AppState {
             ));
         }
         let mut outcomes = Vec::new();
+        let mut accepted: Vec<String> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         while let Some(res) = set.join_next().await {
             run.done += 1;
             if let Ok(outcome) = res {
                 run.published += outcome.accepted() as usize;
                 let (peer, score, fail_label) = outcome.feedback();
-                if let Some(label) = fail_label {
-                    failed.push(format!("{peer} ({label})"));
+                match fail_label {
+                    Some(label) => failed.push(format!("{peer} ({label})")),
+                    None => accepted.push(peer.to_string()),
                 }
                 outcomes.push((peer, score));
             }
             self.publish_progress(address, run, run.attempted);
         }
         self.apply_peer_outcomes(address, outcomes).await;
+        if !accepted.is_empty() {
+            self.log("DEBUG", format!("publish {address}: accepted by: {}", accepted.join(", ")))
+                .await;
+        }
         if !failed.is_empty() {
             self.log("DEBUG", format!("publish {address}: failed candidates: {}", failed.join(", ")))
                 .await;
