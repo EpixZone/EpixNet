@@ -3786,10 +3786,18 @@ mod tests {
         assert_eq!(ns["i2p"]["reachable"], false);
         assert_eq!(ns["i2p"]["address"], Value::Null);
 
-        // Inbound destination published (non-empty b32): reachable, suffixed.
-        state.set_i2p_status(json!({ "mode": "both", "phase": "ready", "tunnels_built": 2, "b32": "xyz.b32" })).await;
+        // Inbound destination published: reachable, exactly one `.i2p`
+        // suffix. The runtime feeds the session's FULL `<hash>.b32.i2p`
+        // (this fixture previously used the bare form, which is how the
+        // doubled `.i2p.i2p` on the dashboard slipped past).
+        state.set_i2p_status(json!({ "mode": "both", "phase": "ready", "tunnels_built": 2, "b32": "xyz.b32.i2p" })).await;
         let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
         assert_eq!(ns["i2p"]["reachable"], true);
+        assert_eq!(ns["i2p"]["address"], "xyz.b32.i2p");
+
+        // A bare-form feed still gets the suffix added.
+        state.set_i2p_status(json!({ "mode": "both", "phase": "ready", "tunnels_built": 2, "b32": "xyz.b32" })).await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
         assert_eq!(ns["i2p"]["address"], "xyz.b32.i2p");
     }
 
