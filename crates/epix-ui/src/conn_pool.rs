@@ -16,7 +16,6 @@ use tokio::sync::Mutex;
 struct PeerConn {
     conn: Arc<Mutex<Connection>>,
     last_ping_ms: Arc<AtomicI64>,
-    onion: bool,
     /// The peer's handshake identity (version/rev/protocol/crypt), copied out
     /// at connect time so the Stats page renders it without touching the
     /// connection's mutex (the conn may be mid-request).
@@ -95,7 +94,6 @@ impl ConnectionPool {
         for addr in to_dial {
             let transport = transport.clone();
             set.spawn(async move {
-                let onion = matches!(addr, PeerAddr::Onion { .. });
                 // Overlay-aware dial bound: a flat few-second deadline meant
                 // the warm pool could never hold an onion/i2p connection.
                 let conn = tokio::time::timeout(addr.connect_timeout(), async {
@@ -106,11 +104,11 @@ impl ConnectionPool {
                 .await
                 .ok()
                 .flatten();
-                conn.map(|conn| (addr, onion, conn))
+                conn.map(|conn| (addr, conn))
             });
         }
         while let Some(res) = set.join_next().await {
-            let Ok(Some((addr, onion, conn))) = res else { continue };
+            let Ok(Some((addr, conn))) = res else { continue };
             let mut conns = self.conns.lock().await;
             if conns.len() >= self.max || conns.contains_key(&addr) {
                 continue;
@@ -121,7 +119,6 @@ impl ConnectionPool {
                 PeerConn {
                     conn: Arc::new(Mutex::new(conn)),
                     last_ping_ms: Arc::new(AtomicI64::new(-1)),
-                    onion,
                     peer,
                 },
             );
