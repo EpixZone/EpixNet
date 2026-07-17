@@ -582,6 +582,101 @@ fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// Counters for one publish call, shared across its batches so progress
+/// events describe the whole run: `attempted` counts candidates whose dial
+/// actually started (the progress denominator), `done` counts completed
+/// dials, `published` counts acceptors. `origin` is the progress routing
+/// (None = silent re-broadcast).
+struct PublishRun {
+    origin: Option<Option<u64>>,
+    published: usize,
+    done: usize,
+    attempted: usize,
+}
+
+/// One publish candidate's fate, fed back into the peer registry: an
+/// unreachable peer is backed off, a refuser is deprioritized, an acceptor
+/// is rewarded.
+enum PushOutcome {
+    /// The peer took the update.
+    Accepted(PeerAddr),
+    /// Dial or handshake failed/timed out: dead or unreachable.
+    Unreachable(PeerAddr),
+    /// Reachable (handshake completed) but the update didn't land: refused,
+    /// errored, or stalled mid-transfer. Scored as a file failure ONLY -
+    /// reputation dock, no backoff, no connected/response stamp. Rewarding it
+    /// with ConnectOk would reset its error count and freshen its response
+    /// time, which the selection tiebreak prefers - promoting a useless peer
+    /// above never-tried candidates and (via the connected flag) shielding it
+    /// from eviction.
+    Refused(PeerAddr),
+}
+
+impl PushOutcome {
+    fn accepted(&self) -> bool {
+        matches!(self, PushOutcome::Accepted(_))
+    }
+
+    /// The registry feedback for this outcome, plus the label it carries in
+    /// the DEBUG failed-candidates line (None = success).
+    fn feedback(self) -> (PeerAddr, epix_worker::PeerOutcome, Option<&'static str>) {
+        match self {
+            PushOutcome::Accepted(peer) => (peer, epix_worker::PeerOutcome::ConnectOk, None),
+            PushOutcome::Unreachable(peer) => {
+                (peer, epix_worker::PeerOutcome::ConnectFail, Some("unreachable"))
+            }
+            PushOutcome::Refused(peer) => {
+                (peer, epix_worker::PeerOutcome::FileFail, Some("refused"))
+            }
+        }
+    }
+}
+
+/// Dial one publish candidate and push the update, bounded by the peer's
+/// connect timeout: reachable clearnet peers answer in ~1-3s, so the deadline
+/// only ever pays for dead candidates, and overlay peers get the longer dial
+/// bound - a fresh onion circuit takes 20-40s, and cutting it off is what
+/// made publishing to Tor-only peers silently fail. A deadline that expires
+/// after the handshake succeeded is scored Refused (the peer is alive), not
+/// Unreachable - repeatedly backing off a slow-but-live overlay peer would
+/// eventually get a reachable peer evicted.
+async fn push_update_to_peer(
+    transport: Arc<dyn Transport>,
+    peer: PeerAddr,
+    address: String,
+    inner_path: String,
+    body: Arc<Vec<u8>>,
+    modified: f64,
+    diffs: Option<rmpv::Value>,
+) -> PushOutcome {
+    let deadline = peer.connect_timeout();
+    let timeout_peer = peer.clone();
+    // Set once the handshake succeeds (see the doc comment).
+    let progressed = AtomicBool::new(false);
+    let push = async {
+        let mut conn = match Connection::connect(transport.as_ref(), &peer).await {
+            Ok(conn) => conn,
+            Err(_) => return PushOutcome::Unreachable(peer),
+        };
+        if conn.handshake().await.is_err() {
+            return PushOutcome::Unreachable(peer);
+        }
+        progressed.store(true, Ordering::Relaxed);
+        if conn.update(&address, &inner_path, &body, modified, diffs).await.is_err() {
+            return PushOutcome::Refused(peer);
+        }
+        // Live-hook: tell the peer (acting as a propagation node) about the
+        // new version so peers that are offline now can pull it later.
+        let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
+        PushOutcome::Accepted(peer)
+    };
+    match tokio::time::timeout(deadline, push).await {
+        Ok(outcome) => outcome,
+        Err(_) if progressed.load(Ordering::Relaxed) => PushOutcome::Refused(timeout_peer),
+        Err(_) => PushOutcome::Unreachable(timeout_peer),
+    }
+}
+
 /// The per-announcer stats key: the tracker's canonical form - Epix
 /// announcers by their real transport (`tcp://…`, `onion://…`, `i2p://…` -
 /// the dashboard pill shows the actual protocol), BitTorrent trackers by
@@ -7279,175 +7374,124 @@ impl AppState {
         // candidates share one buffer instead of cloning a possibly-MB
         // content.json per dial.
         let body = Arc::new(body);
-        // `target` is the running count of candidates actually attempted (the
-        // batches entered so far), NOT the whole pool - a successful publish
-        // must read "5/20 peers", not "5/100" against candidates that were
-        // never dialed.
-        let push_progress = |published: usize, done: usize, target: usize| {
-            let Some(origin) = progress else { return };
-            if target == 0 {
-                return;
-            }
-            self.push_event_routed(
-                "progress",
-                json!([
-                    "publish",
-                    format!("Content published to {published}/{target} peers."),
-                    (100 * done / target) as i64,
-                ]),
-                None,
-                Some(address.to_string()),
-                None,
-                origin,
-            );
-        };
-        push_progress(0, 0, total.min(limit.max(1)));
+        let mut run = PublishRun { origin: progress, published: 0, done: 0, attempted: 0 };
+        self.publish_progress(address, &run, total.min(limit.max(1)));
 
-        /// One candidate's fate, fed back into the peer registry: an
-        /// unreachable peer is backed off, a refuser is deprioritized, an
-        /// acceptor is rewarded.
-        enum PushOutcome {
-            /// The peer took the update.
-            Accepted(PeerAddr),
-            /// Dial or handshake failed/timed out: dead or unreachable.
-            Unreachable(PeerAddr),
-            /// Reachable (handshake completed) but the update didn't land:
-            /// refused, errored, or stalled mid-transfer. Scored as a file
-            /// failure ONLY - reputation dock, no backoff, no
-            /// connected/response stamp. Rewarding it with ConnectOk would
-            /// reset its error count and freshen its response time, which the
-            /// selection tiebreak prefers - promoting a useless peer above
-            /// never-tried candidates and (via the connected flag) shielding
-            /// it from eviction.
-            Refused(PeerAddr),
-        }
-        let mut published = 0;
-        let mut done = 0;
-        let mut attempted = 0;
         for (batch_no, batch) in pool.chunks(limit.max(1)).enumerate() {
             // The pool was selected once up front; a concurrent sync pass may
             // have backed off (or evicted) peers in later batches since. Skip
             // candidates the registry now says to leave alone rather than
             // burning a bounded timeout on each.
-            let batch: Vec<PeerAddr> = if batch_no == 0 {
+            let batch = if batch_no == 0 {
                 batch.to_vec()
             } else {
-                let now = now_secs();
-                let xites = self.xites.read().await;
-                let reg = xites.get(address);
-                batch
-                    .iter()
-                    .filter(|p| {
-                        reg.and_then(|x| x.peers.get(p)).is_some_and(|peer| peer.retry_after <= now)
-                    })
-                    .cloned()
-                    .collect()
+                self.still_dialable(address, batch).await
             };
             if batch.is_empty() {
                 continue;
             }
-            attempted += batch.len();
-            // Push to every candidate of the batch concurrently (EpixNet
-            // publishes with parallel workers): a page waits on the
-            // sitePublish reply, so dead peers must cost one bounded timeout,
-            // not a serial sum of them. (An exhaustive walk still pays one
-            // bounded timeout per all-failed batch.)
-            let mut set = tokio::task::JoinSet::new();
-            for peer in batch {
-                let transport = transport.clone();
-                let address = address.to_string();
-                let inner_path = inner_path.to_string();
-                let body = body.clone();
-                let diffs = wire_diffs.clone();
-                set.spawn(async move {
-                    let deadline = peer.connect_timeout();
-                    let timeout_peer = peer.clone();
-                    // Set once the handshake succeeds, so a deadline that
-                    // expires mid-transfer is scored Refused (peer is alive),
-                    // not Unreachable - repeatedly backing off a slow-but-live
-                    // overlay peer would eventually evict a reachable peer.
-                    let progressed = Arc::new(AtomicBool::new(false));
-                    let progressed_in = progressed.clone();
-                    let push = async {
-                        let mut conn =
-                            match Connection::connect(transport.as_ref(), &peer).await {
-                                Ok(conn) => conn,
-                                Err(_) => return PushOutcome::Unreachable(peer),
-                            };
-                        if conn.handshake().await.is_err() {
-                            return PushOutcome::Unreachable(peer);
-                        }
-                        progressed_in.store(true, Ordering::Relaxed);
-                        if conn
-                            .update(&address, &inner_path, &body, modified, diffs)
-                            .await
-                            .is_err()
-                        {
-                            return PushOutcome::Refused(peer);
-                        }
-                        // Live-hook: tell the peer (acting as a propagation
-                        // node) about the new version so peers that are
-                        // offline now can pull it later.
-                        let _ =
-                            epix_propagation::announce_update(&mut conn, &address, modified as i64)
-                                .await;
-                        PushOutcome::Accepted(peer)
-                    };
-                    // Bounds the whole sitePublish reply: reachable clearnet
-                    // peers answer in ~1-3s, so the deadline only ever pays for
-                    // dead candidates. Overlay peers get the longer dial bound -
-                    // a fresh onion circuit takes 20-40s, and cutting it off is
-                    // what made publishing to Tor-only peers silently fail.
-                    match tokio::time::timeout(deadline, push).await {
-                        Ok(outcome) => outcome,
-                        Err(_) if progressed.load(Ordering::Relaxed) => {
-                            PushOutcome::Refused(timeout_peer)
-                        }
-                        Err(_) => PushOutcome::Unreachable(timeout_peer),
-                    }
-                });
-            }
-            let mut outcomes = Vec::new();
-            let mut failed: Vec<String> = Vec::new();
-            while let Some(res) = set.join_next().await {
-                done += 1;
-                match res {
-                    Ok(PushOutcome::Accepted(peer)) => {
-                        outcomes.push((peer, epix_worker::PeerOutcome::ConnectOk));
-                        published += 1;
-                    }
-                    Ok(PushOutcome::Unreachable(peer)) => {
-                        failed.push(format!("{} (unreachable)", peer));
-                        outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
-                    }
-                    Ok(PushOutcome::Refused(peer)) => {
-                        failed.push(format!("{} (refused)", peer));
-                        outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
-                    }
-                    Err(_) => {}
-                }
-                push_progress(published, done, attempted);
-            }
-            self.apply_peer_outcomes(address, outcomes).await;
-            if !failed.is_empty() {
-                self.log(
-                    "DEBUG",
-                    format!("publish {address}: failed candidates: {}", failed.join(", ")),
-                )
+            run.attempted += batch.len();
+            self.push_batch(address, inner_path, batch, &body, modified, &wire_diffs, &transport, &mut run)
                 .await;
-            }
             // One batch with any acceptor is enough: the accepted push
             // re-broadcasts peer-to-peer, and the remaining candidates get
             // the version on their next sync. Only an all-failed batch walks
             // deeper into the pool.
-            if published > 0 || !exhaustive {
+            if run.published > 0 || !exhaustive {
                 break;
             }
         }
         // Close the bar against what was actually attempted (idempotent when
         // the loop already emitted this exact event on its last candidate).
-        push_progress(published, done, done);
-        Ok(published)
+        self.publish_progress(address, &run, run.done);
+        Ok(run.published)
+    }
+
+    /// The subset of `batch` the registry still allows dialing - not backed
+    /// off (or evicted) since the publish pool was selected.
+    async fn still_dialable(&self, address: &str, batch: &[PeerAddr]) -> Vec<PeerAddr> {
+        let now = now_secs();
+        let xites = self.xites.read().await;
+        let Some(x) = xites.get(address) else { return Vec::new() };
+        batch
+            .iter()
+            .filter(|p| x.peers.get(p).is_some_and(|peer| peer.retry_after <= now))
+            .cloned()
+            .collect()
+    }
+
+    /// Emit a publish progress event ("Content published to X/Y peers.").
+    /// `target` is what has actually been dialed (the batches entered so
+    /// far), NOT the whole candidate pool - a successful publish must read
+    /// "5/20 peers", not "5/100" against candidates that were never dialed.
+    fn publish_progress(&self, address: &str, run: &PublishRun, target: usize) {
+        let Some(origin) = run.origin else { return };
+        if target == 0 {
+            return;
+        }
+        self.push_event_routed(
+            "progress",
+            json!([
+                "publish",
+                format!("Content published to {}/{target} peers.", run.published),
+                (100 * run.done / target) as i64,
+            ]),
+            None,
+            Some(address.to_string()),
+            None,
+            origin,
+        );
+    }
+
+    /// Push the update to one batch of candidates concurrently (EpixNet
+    /// publishes with parallel workers): a page waits on the sitePublish
+    /// reply, so dead peers must cost one bounded timeout, not a serial sum
+    /// of them (an exhaustive walk still pays one bounded timeout per
+    /// all-failed batch). Every outcome is fed into the peer registry, and
+    /// progress streams per completion.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_batch(
+        &self,
+        address: &str,
+        inner_path: &str,
+        batch: Vec<PeerAddr>,
+        body: &Arc<Vec<u8>>,
+        modified: f64,
+        wire_diffs: &Option<rmpv::Value>,
+        transport: &Arc<dyn Transport>,
+        run: &mut PublishRun,
+    ) {
+        let mut set = tokio::task::JoinSet::new();
+        for peer in batch {
+            set.spawn(push_update_to_peer(
+                transport.clone(),
+                peer,
+                address.to_string(),
+                inner_path.to_string(),
+                body.clone(),
+                modified,
+                wire_diffs.clone(),
+            ));
+        }
+        let mut outcomes = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        while let Some(res) = set.join_next().await {
+            run.done += 1;
+            if let Ok(outcome) = res {
+                run.published += outcome.accepted() as usize;
+                let (peer, score, fail_label) = outcome.feedback();
+                if let Some(label) = fail_label {
+                    failed.push(format!("{peer} ({label})"));
+                }
+                outcomes.push((peer, score));
+            }
+            self.publish_progress(address, run, run.attempted);
+        }
+        self.apply_peer_outcomes(address, outcomes).await;
+        if !failed.is_empty() {
+            self.log("DEBUG", format!("publish {address}: failed candidates: {}", failed.join(", ")))
+                .await;
+        }
     }
 
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
