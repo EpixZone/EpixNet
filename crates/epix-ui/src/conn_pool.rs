@@ -36,7 +36,11 @@ pub struct ConnectionStats {
     pub total: i64,
     /// Incoming connections. This node dials out, so 0 for now.
     pub incoming: i64,
+    /// Per-network split of the live pool (clearnet + onion + i2p = total;
+    /// the pool holds no mesh connections).
+    pub clearnet: i64,
     pub onion: i64,
+    pub i2p: i64,
     pub ping_avg: i64,
     pub ping_min: i64,
 }
@@ -196,10 +200,13 @@ impl ConnectionPool {
         let ping_avg =
             if pings.is_empty() { 0 } else { pings.iter().sum::<i64>() / pings.len() as i64 };
         let ping_min = pings.iter().copied().min().unwrap_or(0);
+        let count = |f: fn(&PeerAddr) -> bool| conns.keys().filter(|a| f(a)).count() as i64;
         ConnectionStats {
             total: conns.len() as i64,
             incoming: 0,
-            onion: conns.values().filter(|c| c.onion).count() as i64,
+            clearnet: count(|a| matches!(a, PeerAddr::Ip(_))),
+            onion: count(|a| matches!(a, PeerAddr::Onion { .. })),
+            i2p: count(|a| matches!(a, PeerAddr::I2p { .. })),
             ping_avg,
             ping_min,
         }

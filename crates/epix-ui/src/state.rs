@@ -5533,11 +5533,11 @@ impl AppState {
             conns = stats.total,
         );
 
-        // Connections.
+        // Connections, split by network so the mix is visible at a glance.
         let _ = write!(
             h,
-            "<h2>Connections ({} live, onion: {})</h2>             <table><tr><th>peer</th><th>type</th><th>version</th><th>protocol</th><th>crypt</th><th>ping</th></tr>",
-            stats.total, stats.onion
+            "<h2>Connections ({} live - clearnet: {}, tor: {}, i2p: {})</h2>             <table><tr><th>peer</th><th>type</th><th>version</th><th>protocol</th><th>crypt</th><th>ping</th></tr>",
+            stats.total, stats.clearnet, stats.onion, stats.i2p
         );
         // What the handshake told us about each peer (Phase 6): the node
         // version + rev show which releases the network runs, protocol and
