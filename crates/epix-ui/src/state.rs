@@ -632,6 +632,22 @@ impl PushOutcome {
     }
 }
 
+/// Fold one publish dial's outcome into the run counters and the batch's
+/// registry-feedback / failed-candidates buffers.
+fn record_push_outcome(
+    outcome: PushOutcome,
+    run: &mut PublishRun,
+    outcomes: &mut Vec<(PeerAddr, epix_worker::PeerOutcome)>,
+    failed: &mut Vec<String>,
+) {
+    run.published += outcome.accepted() as usize;
+    let (peer, score, fail_label) = outcome.feedback();
+    if let Some(label) = fail_label {
+        failed.push(format!("{peer} ({label})"));
+    }
+    outcomes.push((peer, score));
+}
+
 /// Dial one publish candidate and push the update, bounded by the peer's
 /// connect timeout: reachable clearnet peers answer in ~1-3s, so the deadline
 /// only ever pays for dead candidates, and overlay peers get the longer dial
@@ -7548,12 +7564,7 @@ impl AppState {
         while let Some(res) = set.join_next().await {
             run.done += 1;
             if let Ok(outcome) = res {
-                run.published += outcome.accepted() as usize;
-                let (peer, score, fail_label) = outcome.feedback();
-                if let Some(label) = fail_label {
-                    failed.push(format!("{peer} ({label})"));
-                }
-                outcomes.push((peer, score));
+                record_push_outcome(outcome, run, &mut outcomes, &mut failed);
             }
             self.publish_progress(address, run, run.attempted);
             // One acceptance is enough for the author: the acceptor gossips
@@ -7562,18 +7573,7 @@ impl AppState {
             // reply and let the remaining in-flight dials finish - and feed
             // the peer registry - in the background.
             if run.published > 0 && !set.is_empty() {
-                let state = self.clone();
-                let addr = address.to_string();
-                tokio::spawn(async move {
-                    let mut outcomes = Vec::new();
-                    while let Some(res) = set.join_next().await {
-                        if let Ok(outcome) = res {
-                            let (peer, score, _) = outcome.feedback();
-                            outcomes.push((peer, score));
-                        }
-                    }
-                    state.apply_peer_outcomes(&addr, outcomes).await;
-                });
+                self.drain_pushes_in_background(address, set);
                 break;
             }
         }
@@ -7582,6 +7582,27 @@ impl AppState {
             self.log("DEBUG", format!("publish {address}: failed candidates: {}", failed.join(", ")))
                 .await;
         }
+    }
+
+    /// Await a publish batch's remaining in-flight dials off the page's
+    /// critical path, still feeding each outcome into the peer registry.
+    fn drain_pushes_in_background(
+        self: &Arc<Self>,
+        address: &str,
+        mut set: tokio::task::JoinSet<PushOutcome>,
+    ) {
+        let state = self.clone();
+        let addr = address.to_string();
+        tokio::spawn(async move {
+            let mut outcomes = Vec::new();
+            while let Some(res) = set.join_next().await {
+                if let Ok(outcome) = res {
+                    let (peer, score, _) = outcome.feedback();
+                    outcomes.push((peer, score));
+                }
+            }
+            state.apply_peer_outcomes(&addr, outcomes).await;
+        });
     }
 
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire

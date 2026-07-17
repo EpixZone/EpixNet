@@ -213,44 +213,48 @@ impl SyncCtx {
 async fn run_pool(peers: Vec<PeerAddr>, ctx: &SyncCtx, max_workers: usize) {
     let mut spares: VecDeque<PeerAddr> = peers.into();
     let mut join = tokio::task::JoinSet::new();
-    while join.len() < max_workers.max(1) {
-        match spares.pop_front() {
-            Some(p) => {
-                join.spawn(run_worker(p, ctx.clone()));
-            }
-            None => break,
-        }
-    }
+    while join.len() < max_workers.max(1) && spawn_from_spares(&mut spares, &mut join, ctx) {}
     loop {
         if ctx.all_done().await {
-            join.abort_all();
             break;
         }
         if join.is_empty() {
             // Queue drained (files in flight are gone with their workers) or
             // no peer left to try: the pass is over either way.
-            if ctx.queue.lock().await.is_empty() || spares.is_empty() {
+            let queue_empty = ctx.queue.lock().await.is_empty();
+            if queue_empty || !spawn_from_spares(&mut spares, &mut join, ctx) {
                 break;
-            }
-            if let Some(p) = spares.pop_front() {
-                join.spawn(run_worker(p, ctx.clone()));
             }
         }
         tokio::select! {
             Some(_) = join.join_next(), if !join.is_empty() => {
                 // A worker exited; top the pool back up while work remains.
                 if !ctx.queue.lock().await.is_empty() {
-                    if let Some(p) = spares.pop_front() {
-                        join.spawn(run_worker(p, ctx.clone()));
-                    }
+                    spawn_from_spares(&mut spares, &mut join, ctx);
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
         }
     }
-    // Reap aborted tasks so their SyncCtx clones drop before finish().
+    // Abort stragglers and reap them so their SyncCtx clones drop before
+    // finish().
     join.abort_all();
     while join.join_next().await.is_some() {}
+}
+
+/// Spawn a worker on the next spare peer, if any. Returns whether one spawned.
+fn spawn_from_spares(
+    spares: &mut VecDeque<PeerAddr>,
+    join: &mut tokio::task::JoinSet<()>,
+    ctx: &SyncCtx,
+) -> bool {
+    match spares.pop_front() {
+        Some(p) => {
+            join.spawn(run_worker(p, ctx.clone()));
+            true
+        }
+        None => false,
+    }
 }
 
 /// One worker: connect to `peer` and pull files from the shared queue until
