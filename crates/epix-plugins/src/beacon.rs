@@ -222,7 +222,10 @@ async fn publish_owned_list(state: &Arc<AppState>, book: &mut TrackerBook) -> bo
         state.log("WARNING", format!("Beacon: could not sign {address}: {e}")).await;
         return true;
     }
-    let peers = state.publish(address, "content.json", None).await.unwrap_or(0);
+    // Best-effort: the beacon re-broadcasts hourly, so one batch is enough -
+    // an exhaustive walk would block this loop for minutes on a junk-heavy
+    // registry for no benefit.
+    let peers = state.publish(address, "content.json", None, false).await.unwrap_or(0);
     state
         .log(
             "INFO",
