@@ -36,8 +36,8 @@ pub const DEFAULT_TRACKERS: &[&str] = &[
     // Reachable over Tor / I2P only; skipped automatically while that
     // overlay is off.
     "onion://fzlzmxuz2bust72cuy5g4w6d62tx624xcjaupf2kp7ffuitbiniy2hqd.onion:15441",
-    "onion://6m4j2es4wom2xyhlvj4vjmsdsabqascped5d7t7knz3w2ku5hqlywwid.onion:26552",
-    "i2p://tcm7ivyurow2evfz2vom7pq7g6w555pbfoxf74jogwnd3uycwxsa.b32.i2p:26552",
+    "onion://jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd.onion:48333",
+    "i2p://ashvjmdch2622mesfch2qsuc6kkzl2xbtgfltr7nqjs5qtrsfbva.b32.i2p:48333",
     // Public BitTorrent trackers (hostname form - they survive IP churn).
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",
