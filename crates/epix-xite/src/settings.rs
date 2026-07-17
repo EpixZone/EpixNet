@@ -13,6 +13,22 @@ pub struct Cache {
     /// inner_path -> retry count for files that failed to download/verify.
     #[serde(default)]
     pub bad_files: HashMap<String, i64>,
+    /// Per-optional-file counters for the dashboard's Files tab:
+    /// `inner_path -> {uploaded, time_downloaded}` (EpixNet keeps these in
+    /// content.db's `file_optional` table).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub optional_stats: HashMap<String, OptionalFileStat>,
+}
+
+/// Counters for one optional file (persisted in [`Cache`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OptionalFileStat {
+    /// Bytes of this file served to peers (the Files tab's ratio dots).
+    #[serde(default)]
+    pub uploaded: i64,
+    /// Unix time the download completed (0 = not downloaded / unknown).
+    #[serde(default)]
+    pub time_downloaded: i64,
 }
 
 fn default_true() -> bool {

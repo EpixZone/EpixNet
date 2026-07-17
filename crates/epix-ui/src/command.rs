@@ -2604,9 +2604,20 @@ impl WsCommand for OptionalFileList {
         "optionalFileList"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
+        // The dashboard's Files tab queries other sites by address; honor it
+        // with the same permission gate the optionalHelp commands use.
+        let address = match p.get("address").and_then(|v| v.as_str()) {
+            Some(a) => {
+                require_site_permission(s, a).await?;
+                a.to_string()
+            }
+            None => s.address()?.to_string(),
+        };
         let filter = p.get("filter").and_then(|v| v.as_str()).unwrap_or("downloaded");
-        Ok(Value::Array(s.state.optional_file_list(&address, filter).await?))
+        let orderby =
+            p.get("orderby").and_then(|v| v.as_str()).unwrap_or("time_downloaded DESC");
+        let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        Ok(Value::Array(s.state.optional_file_list(&address, filter, orderby, limit).await?))
     }
 }
 

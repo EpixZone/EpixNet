@@ -59,8 +59,9 @@ impl FileService {
                 let sent = chunk.len() as u64;
                 let next = location + sent;
                 // Account for what we serve to peers so the Stats seeding graph
-                // (file_bytes_sent) reflects upload traffic, not just downloads.
-                self.state.record_transfer(&site, peer, 0, sent).await;
+                // (file_bytes_sent) reflects upload traffic, not just downloads
+                // - per optional file too (the Files tab's ratio dots).
+                self.state.record_upload(&site, peer, &inner_path, sent).await;
                 vmap(vec![
                     ("body", Value::Binary(chunk)),
                     ("size", Value::from(total as i64)),

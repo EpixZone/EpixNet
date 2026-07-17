@@ -2631,6 +2631,23 @@ impl AppState {
         }
     }
 
+    /// [`Self::record_transfer`] for serving a file to a peer, also counting
+    /// the per-optional-file upload bytes behind the dashboard Files tab's
+    /// ratio dots (EpixNet's `file_optional.uploaded`).
+    pub async fn record_upload(&self, address: &str, peer: &PeerAddr, inner_path: &str, sent: u64) {
+        self.record_transfer(address, peer, 0, sent).await;
+        if let Some((_, true)) = self.file_info_any(address, inner_path).await {
+            if let Some(x) = self.xites.write().await.get_mut(address) {
+                x.settings
+                    .cache
+                    .optional_stats
+                    .entry(inner_path.to_string())
+                    .or_default()
+                    .uploaded += sent as i64;
+            }
+        }
+    }
+
     /// Add to a xite's transfer totals (no per-peer attribution).
     pub async fn add_transfer(&self, address: &str, recv: u64, sent: u64) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
@@ -4534,6 +4551,21 @@ impl AppState {
                 // piecemap itself downloads through file_need.
                 Box::pin(self.bigfile_fetch_range(address, inner_path, 0, info.size.max(0) as u64))
                     .await?;
+                // First-completion stamp only: fetch_range on an already-
+                // complete bigfile is a no-op re-check, not a new download.
+                if optional {
+                    if let Some(x) = self.xites.write().await.get_mut(address) {
+                        let stat = x
+                            .settings
+                            .cache
+                            .optional_stats
+                            .entry(inner_path.to_string())
+                            .or_default();
+                        if stat.time_downloaded == 0 {
+                            stat.time_downloaded = now_secs() as i64;
+                        }
+                    }
+                }
                 return Ok(true);
             }
             if storage.verify(inner_path, &info.sha512) {
@@ -4569,12 +4601,24 @@ impl AppState {
             }
             storage.write(&info.inner_path, &bytes).map_err(|e| e.to_string())?;
             self.set_peer_connected(address, &peer, true).await;
+            // Count the transfer (site totals + per-peer) - without this the
+            // dashboard's download bytes and the Stats download graph never
+            // moved for on-demand fetches.
+            self.record_transfer(address, &peer, bytes.len() as u64, 0).await;
             // Count optional bytes downloaded and advertise it in our
             // hashfield so peers can discover we now hold it.
             if optional {
                 if let Some(x) = self.xites.write().await.get_mut(address) {
                     x.settings.optional_downloaded += info.size;
                     x.hashfield.add_hash(&info.sha512);
+                    // The Files tab's "Finished" column.
+                    let stat = x
+                        .settings
+                        .cache
+                        .optional_stats
+                        .entry(info.inner_path.clone())
+                        .or_default();
+                    stat.time_downloaded = now_secs() as i64;
                 }
             }
             return Ok(true);
@@ -4582,13 +4626,32 @@ impl AppState {
         Err("could not fetch the file from any peer".into())
     }
 
-    /// List optional files with their state. `filter` = "downloaded" (default)
-    /// or anything else for all. `optionalFileList`.
-    pub async fn optional_file_list(&self, address: &str, filter: &str) -> Result<Vec<Value>, String> {
+    /// List optional files with their state and the per-file counters the
+    /// dashboard's Files tab renders (uploaded bytes/ratio, seeder count,
+    /// finished time). `filter` = "downloaded" (default) or anything else for
+    /// all; `orderby` is the tab's SQL-ish sort ("time_downloaded DESC",
+    /// "is_pinned DESC, inner_path", ...); `limit` 0 = all. `optionalFileList`.
+    pub async fn optional_file_list(
+        &self,
+        address: &str,
+        filter: &str,
+        orderby: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
         let xite = self.xite_view(address).await?;
-        let pinned = self.xites.read().await.get(address).map(|x| x.pinned.clone()).unwrap_or_default();
+        let (pinned, stats, peer_fields) = {
+            let xites = self.xites.read().await;
+            match xites.get(address) {
+                Some(x) => (
+                    x.pinned.clone(),
+                    x.settings.cache.optional_stats.clone(),
+                    x.peer_hashfields.values().cloned().collect::<Vec<_>>(),
+                ),
+                None => Default::default(),
+            }
+        };
         let only_downloaded = filter == "downloaded";
-        Ok(xite
+        let mut out: Vec<Value> = xite
             .optional_files()
             .into_iter()
             .filter_map(|f| {
@@ -4596,22 +4659,52 @@ impl AppState {
                 if only_downloaded && !is_downloaded {
                     return None;
                 }
+                let stat = stats.get(&f.inner_path);
+                // Seeders: peers whose hashfield advertises the file, plus us.
+                let peer = peer_fields.iter().filter(|hf| hf.has_hash(&f.sha512)).count()
+                    + is_downloaded as usize;
+                // Files downloaded before the counter existed fall back to
+                // the file's mtime, so "Finished" isn't n/a for them.
+                let time_downloaded = stat
+                    .map(|s| s.time_downloaded)
+                    .filter(|t| *t > 0)
+                    .or_else(|| {
+                        if !is_downloaded {
+                            return None;
+                        }
+                        xite.storage
+                            .path(&f.inner_path)
+                            .ok()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                    })
+                    .unwrap_or(0);
                 Some(json!({
                     "inner_path": f.inner_path,
                     "size": f.size,
                     "sha512": f.sha512,
                     "is_downloaded": is_downloaded,
                     "is_pinned": pinned.contains(&f.inner_path),
+                    "uploaded": stat.map(|s| s.uploaded).unwrap_or(0),
+                    "peer": peer,
+                    "time_downloaded": time_downloaded,
                 }))
             })
-            .collect())
+            .collect();
+        sort_file_list(&mut out, orderby);
+        if limit > 0 {
+            out.truncate(limit);
+        }
+        Ok(out)
     }
 
     /// Info for one optional file, or null. `optionalFileInfo`. For a big file
     /// (>1MB with a `piecemap`) it also carries the piece layout (Bigfile).
     pub async fn optional_file_info(&self, address: &str, inner_path: &str) -> Result<Value, String> {
         let mut info = self
-            .optional_file_list(address, "all")
+            .optional_file_list(address, "all", "", 0)
             .await?
             .into_iter()
             .find(|f| f["inner_path"] == inner_path)
@@ -4791,6 +4884,7 @@ impl AppState {
                 if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
                     write_at(&storage, inner_path, poff, &data)?;
                     self.set_peer_connected(address, peer, true).await;
+                    self.record_transfer(address, peer, plen, 0).await;
                     if optional {
                         if let Some(x) = self.xites.write().await.get_mut(address) {
                             x.settings.optional_downloaded += plen as i64;
@@ -5018,6 +5112,9 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             if optional {
                 x.settings.optional_downloaded = (x.settings.optional_downloaded - info.size).max(0);
+                // Drop the per-file counters so a re-download restamps
+                // "Finished" (uploaded restarts too, like EpixNet).
+                x.settings.cache.optional_stats.remove(inner_path);
             }
             changed_pin = x.pinned.remove(inner_path);
         }
@@ -8902,6 +8999,52 @@ impl AppState {
 /// Build a xite's database from its `dbschema.json` (if present): open an
 /// in-memory db, create the tables, and populate from the xite's JSON data
 /// files. `None` if the xite has no schema or building fails.
+/// Sort a json file list by the dashboard's SQL-ish `orderby` string
+/// ("uploaded DESC", "is_pinned DESC, inner_path"). Unknown keys compare
+/// equal, so a bad orderby degrades to the input order instead of erroring.
+fn sort_file_list(items: &mut [Value], orderby: &str) {
+    let keys: Vec<(String, bool)> = orderby
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            match part.rsplit_once(' ') {
+                Some((k, d)) if d.eq_ignore_ascii_case("DESC") => Some((k.trim().into(), true)),
+                Some((k, d)) if d.eq_ignore_ascii_case("ASC") => Some((k.trim().into(), false)),
+                _ => Some((part.into(), false)),
+            }
+        })
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    items.sort_by(|a, b| {
+        for (k, desc) in &keys {
+            let ord = cmp_field(&a[k.as_str()], &b[k.as_str()]);
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn cmp_field(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&y.as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 /// Every `content.json` under `root`, as site-relative inner_paths.
 fn walk_content_json(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
@@ -10083,6 +10226,60 @@ mod tests {
         assert_eq!(on_disk, data_v2);
     }
 
+    /// The Files tab's data contract: optionalFileList carries the per-file
+    /// counters the dashboard renders (uploaded/ratio dots, seeder count,
+    /// "Finished") and honors the UI's orderby/limit params.
+    #[tokio::test]
+    async fn optional_file_list_reports_counters_and_orders() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("a.bin", b"aaaa").unwrap();
+        storage.write("b.bin", b"bbbbbbbb").unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0, "files": {},
+            "files_optional": {
+                "a.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"aaaa") },
+                "b.bin": { "size": 8, "sha512": XiteStorage::hash_bytes(b"bbbbbbbb") },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        // a.bin has served 12 bytes and finished at t=1000.
+        {
+            let mut xites = state.xites.write().await;
+            let stat = xites
+                .get_mut(addr.as_str())
+                .unwrap()
+                .settings
+                .cache
+                .optional_stats
+                .entry("a.bin".into())
+                .or_default();
+            stat.uploaded = 12;
+            stat.time_downloaded = 1000;
+        }
+
+        let list =
+            state.optional_file_list(addr, "downloaded", "uploaded DESC", 0).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["inner_path"], "a.bin");
+        assert_eq!(list[0]["uploaded"], 12);
+        assert_eq!(list[0]["time_downloaded"], 1000);
+        assert_eq!(list[0]["peer"], 1, "downloaded here = one seeder");
+        assert_eq!(list[1]["uploaded"], 0);
+        // b.bin (no stamp) fell back to the file's mtime for "Finished".
+        assert!(list[1]["time_downloaded"].as_i64().unwrap() > 0);
+
+        // Sorting by size ascending flips the order; limit truncates.
+        let by_size = state.optional_file_list(addr, "all", "size", 0).await.unwrap();
+        assert_eq!(by_size[0]["inner_path"], "a.bin");
+        assert_eq!(
+            state.optional_file_list(addr, "all", "size", 1).await.unwrap().len(),
+            1
+        );
+    }
+
     /// The bulk optional download behind "Download and help distribute all
     /// files": enumerates the root's and child content.jsons' optional
     /// declarations, skips files already present at their declared size, and
@@ -10689,10 +10886,10 @@ mod tests {
         state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
 
         // Declared but not downloaded.
-        let all = state.optional_file_list(addr, "all").await.unwrap();
+        let all = state.optional_file_list(addr, "all", "", 0).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0]["is_downloaded"], false);
-        assert!(state.optional_file_list(addr, "downloaded").await.unwrap().is_empty());
+        assert!(state.optional_file_list(addr, "downloaded", "", 0).await.unwrap().is_empty());
 
         // "Download" it (write matching bytes); now it counts as downloaded, and
         // fileNeed returns true without touching the network.
@@ -11132,7 +11329,7 @@ mod tests {
         // A fresh node over the same dir restores the pin.
         let s = AppState::with_data_dir("test", dir.path());
         s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
-        let list = s.optional_file_list(addr, "all").await.unwrap();
+        let list = s.optional_file_list(addr, "all", "", 0).await.unwrap();
         let entry = list.iter().find(|e| e["inner_path"] == "big.bin").expect("optional file listed");
         assert_eq!(entry["is_pinned"], true, "pin survived the restart");
     }
