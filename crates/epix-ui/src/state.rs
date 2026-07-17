@@ -603,13 +603,15 @@ enum PushOutcome {
     /// Dial or handshake failed/timed out: dead or unreachable.
     Unreachable(PeerAddr),
     /// Reachable (handshake completed) but the update didn't land: refused,
-    /// errored, or stalled mid-transfer. Scored as a file failure ONLY -
-    /// reputation dock, no backoff, no connected/response stamp. Rewarding it
-    /// with ConnectOk would reset its error count and freshen its response
-    /// time, which the selection tiebreak prefers - promoting a useless peer
-    /// above never-tried candidates and (via the connected flag) shielding it
-    /// from eviction.
-    Refused(PeerAddr),
+    /// errored, or stalled mid-transfer - the reason string says which (the
+    /// remote's error reply passes through verbatim, so a publisher can see
+    /// WHY its own seed rejected an update instead of a bare "refused").
+    /// Scored as a file failure ONLY - reputation dock, no backoff, no
+    /// connected/response stamp. Rewarding it with ConnectOk would reset its
+    /// error count and freshen its response time, which the selection
+    /// tiebreak prefers - promoting a useless peer above never-tried
+    /// candidates and (via the connected flag) shielding it from eviction.
+    Refused(PeerAddr, String),
 }
 
 impl PushOutcome {
@@ -619,14 +621,14 @@ impl PushOutcome {
 
     /// The registry feedback for this outcome, plus the label it carries in
     /// the DEBUG failed-candidates line (None = success).
-    fn feedback(self) -> (PeerAddr, epix_worker::PeerOutcome, Option<&'static str>) {
+    fn feedback(self) -> (PeerAddr, epix_worker::PeerOutcome, Option<String>) {
         match self {
             PushOutcome::Accepted(peer) => (peer, epix_worker::PeerOutcome::ConnectOk, None),
             PushOutcome::Unreachable(peer) => {
-                (peer, epix_worker::PeerOutcome::ConnectFail, Some("unreachable"))
+                (peer, epix_worker::PeerOutcome::ConnectFail, Some("unreachable".into()))
             }
-            PushOutcome::Refused(peer) => {
-                (peer, epix_worker::PeerOutcome::FileFail, Some("refused"))
+            PushOutcome::Refused(peer, why) => {
+                (peer, epix_worker::PeerOutcome::FileFail, Some(format!("refused: {why}")))
             }
         }
     }
@@ -681,8 +683,10 @@ async fn push_update_to_peer(
             return PushOutcome::Unreachable(peer);
         }
         progressed.store(true, Ordering::Relaxed);
-        if conn.update(&address, &inner_path, &body, modified, diffs, &sender_peers).await.is_err() {
-            return PushOutcome::Refused(peer);
+        if let Err(e) =
+            conn.update(&address, &inner_path, &body, modified, diffs, &sender_peers).await
+        {
+            return PushOutcome::Refused(peer, e.to_string());
         }
         // Live-hook: tell the peer (acting as a propagation node) about the
         // new version so peers that are offline now can pull it later.
@@ -691,7 +695,9 @@ async fn push_update_to_peer(
     };
     match tokio::time::timeout(deadline, push).await {
         Ok(outcome) => outcome,
-        Err(_) if progressed.load(Ordering::Relaxed) => PushOutcome::Refused(timeout_peer),
+        Err(_) if progressed.load(Ordering::Relaxed) => {
+            PushOutcome::Refused(timeout_peer, "timed out mid-transfer".into())
+        }
         Err(_) => PushOutcome::Unreachable(timeout_peer),
     }
 }
