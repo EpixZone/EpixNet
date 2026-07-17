@@ -481,6 +481,16 @@ pub struct AppState {
     /// downloads, so a retrying `<video>` tag can't spam the wrapper confirm.
     /// Cleared when the toggle is switched off, so a later request re-asks.
     optional_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Live UI connections bound to each xite address (`session.id`s). Pushed
+    /// confirms/prompts route to a bound connection; when NONE is bound the
+    /// broadcast reaches nobody and the dialog is lost - the "prompt only
+    /// shows after a restart" race. [`Self::pending_prompts`] buffers those.
+    bound_conns: std::sync::Mutex<HashMap<String, std::collections::HashSet<u64>>>,
+    /// Confirm/prompt payloads pushed for a xite while no connection was bound
+    /// to it, flushed to the next connection that binds (delivered once). The
+    /// callback ids are still live in [`Self::callbacks`], so the answer routes
+    /// back normally. Capped per address so an unwatched site can't grow it.
+    pending_prompts: std::sync::Mutex<HashMap<String, Vec<String>>>,
     /// Per-file locks keyed by `(address, inner_path)` so concurrent
     /// `file_need`s for the same file download it once: later callers wait on
     /// the first, then hit the verified-on-disk early return. Entries are
@@ -906,6 +916,8 @@ impl AppState {
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            bound_conns: std::sync::Mutex::new(HashMap::new()),
+            pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1026,6 +1038,8 @@ impl AppState {
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            bound_conns: std::sync::Mutex::new(HashMap::new()),
+            pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1994,7 +2008,9 @@ impl AppState {
                     x.settings.serving = saved.serving;
                     x.settings.size_limit = saved.size_limit;
                     x.settings.autodownloadoptional = saved.autodownloadoptional;
+                    x.settings.download_optional = saved.download_optional;
                     x.settings.optional_help = saved.optional_help;
+                    x.settings.modified_files_notification = saved.modified_files_notification;
                     x.settings.favorite = saved.favorite;
                     if saved.added > 0 {
                         x.settings.added = saved.added;
@@ -6535,9 +6551,76 @@ impl AppState {
         // reply comes back without an id and the waiting future times out
         // silently: an "Add N new site?" dialog whose Add button does nothing.
         let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
-        let _ =
-            self.events.send(UiEvent { channel: None, target, payload, exclude: None, only: None });
+        // If a connection for this xite is bound, broadcast reaches it. If
+        // NONE is bound (the page is still loading its websocket, or a media
+        // request raced ahead of it), the broadcast is dropped - so buffer it
+        // and let the next binding connection pick it up (the callback id
+        // stays live in `callbacks`, so the answer still routes back).
+        let has_conn = match &target {
+            Some(addr) => self.has_bound_conn(addr),
+            None => true,
+        };
+        if has_conn {
+            let _ = self.events.send(UiEvent {
+                channel: None,
+                target,
+                payload,
+                exclude: None,
+                only: None,
+            });
+        } else if let Some(addr) = target {
+            let mut pending = self.pending_prompts.lock().unwrap();
+            let queue = pending.entry(addr).or_default();
+            queue.push(payload);
+            // Cap so an unwatched xite that keeps prompting can't grow forever.
+            if queue.len() > 16 {
+                let drop = queue.len() - 16;
+                queue.drain(0..drop);
+            }
+        }
         rx
+    }
+
+    /// Whether any live UI connection is bound to `address` (so a pushed
+    /// confirm/prompt would actually reach a viewer).
+    pub fn has_bound_conn(&self, address: &str) -> bool {
+        self.bound_conns.lock().unwrap().get(address).is_some_and(|s| !s.is_empty())
+    }
+
+    /// Register a UI connection as bound to `address` and return any prompts
+    /// that were buffered while nothing was bound, so the caller can flush them
+    /// to this connection. Called once when a websocket binds to a xite.
+    pub fn register_bound_conn(&self, address: &str, conn_id: u64) -> Vec<String> {
+        self.bound_conns
+            .lock()
+            .unwrap()
+            .entry(address.to_string())
+            .or_default()
+            .insert(conn_id);
+        self.pending_prompts.lock().unwrap().remove(address).unwrap_or_default()
+    }
+
+    /// Drop a UI connection's binding (on disconnect).
+    pub fn unregister_bound_conn(&self, address: &str, conn_id: u64) {
+        let mut map = self.bound_conns.lock().unwrap();
+        if let Some(set) = map.get_mut(address) {
+            set.remove(&conn_id);
+            if set.is_empty() {
+                map.remove(address);
+            }
+        }
+    }
+
+    /// Deliver a buffered payload (a confirm/prompt built earlier) to one
+    /// connection - the flush half of the pending-prompt buffer.
+    pub fn deliver_payload_to(&self, conn_id: u64, payload: String) {
+        let _ = self.events.send(UiEvent {
+            channel: None,
+            target: None,
+            payload,
+            exclude: None,
+            only: Some(conn_id),
+        });
     }
 
     /// Resolve a pending wrapper callback (`{cmd:"response", to}`). Returns true
@@ -7130,6 +7213,11 @@ impl AppState {
             x.settings.own = owned;
         }
         self.persist_sites().await;
+        // Push the change so the wrapper/sidebar reflect it at once (reveal the
+        // owner panel, re-check the box) instead of the toggle appearing to
+        // revert on the next re-render - and so the wrapper can raise the
+        // "modified files - sign them" panel the moment you claim the site.
+        self.push_site_info(address).await;
     }
 
     /// Try to recover a xite's private key from the user's master seed via its
@@ -10327,6 +10415,37 @@ mod tests {
     /// recomputes from disk at registration (root + child declarations) so it
     /// can't stick at 0 with the files present.
     #[tokio::test]
+    async fn pending_prompt_is_buffered_until_a_connection_binds() {
+        let state = AppState::new("test");
+        let addr = "1PromptSite";
+
+        // No connection bound: a confirm buffers instead of vanishing.
+        assert!(!state.has_bound_conn(addr));
+        let rx = state.push_cmd_await("confirm", json!(["Download?", "Yes"]), Some(addr.into()));
+        assert_eq!(state.pending_prompts.lock().unwrap().get(addr).map(|v| v.len()), Some(1));
+
+        // A connection binds: it drains the buffer and gets the payload (the
+        // callback id is still live, so answering it resolves the waiter).
+        let flushed = state.register_bound_conn(addr, 42);
+        assert_eq!(flushed.len(), 1, "buffered prompt handed to the new connection");
+        assert!(state.pending_prompts.lock().unwrap().get(addr).is_none(), "buffer drained");
+        assert!(state.has_bound_conn(addr));
+
+        // The flushed payload carries the callback id; answering resolves it.
+        let id = serde_json::from_str::<Value>(&flushed[0]).unwrap()["id"].as_i64().unwrap();
+        assert!(state.resolve_callback(id, json!(true)));
+        assert_eq!(rx.await.unwrap(), json!(true));
+
+        // With a connection bound, a further confirm broadcasts (not buffered).
+        let _rx2 = state.push_cmd_await("confirm", json!(["Again?", "Yes"]), Some(addr.into()));
+        assert!(state.pending_prompts.lock().unwrap().get(addr).is_none());
+
+        // Unbinding the last connection stops delivery again.
+        state.unregister_bound_conn(addr, 42);
+        assert!(!state.has_bound_conn(addr));
+    }
+
+    #[tokio::test]
     async fn optional_optin_gate_and_disk_recount() {
         let dir = tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
@@ -11793,6 +11912,9 @@ mod tests {
     async fn confirm_resolves_via_wrapper_callback() {
         let s = AppState::new("test");
         let mut events = s.subscribe_events();
+        // A wrapper is connected and bound to the xite, so the confirm
+        // broadcasts live (rather than buffering for a later connection).
+        s.register_bound_conn("talk.epix", 1);
 
         // Server asks the wrapper to confirm; the future is pending.
         let s2 = s.clone();

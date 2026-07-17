@@ -2478,6 +2478,15 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             }
         }
     });
+    // Register this connection as bound to its xite (after subscribing, so no
+    // event can slip through the gap) and flush any confirm/prompt that was
+    // pushed for the xite while nothing was bound - the fix for prompts that
+    // only appeared after a restart. Delivered once, to this connection.
+    if let Some(addr) = session.xite.clone() {
+        for payload in ctx.state.register_bound_conn(&addr, session.id) {
+            ctx.state.deliver_payload_to(session.id, payload);
+        }
+    }
     let (mut sink, mut stream) = socket.split();
     // Replies from concurrently-running command handlers (the sink has one
     // writer: this loop).
@@ -2575,6 +2584,9 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                 }
             }
         }
+    }
+    if let Some(addr) = &session.xite {
+        ctx.state.unregister_bound_conn(addr, session.id);
     }
     pump.abort();
 }
