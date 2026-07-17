@@ -3,7 +3,7 @@
 
 use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
-use epix_peer::{DialableNets, PeerCounts, Peers};
+use epix_peer::{DialableNets, Peer, PeerCounts, Peers};
 use epix_protocol::Connection;
 use epix_transport::Transport;
 use epix_user::User;
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -580,6 +580,101 @@ fn empty_filters() -> Value {
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Counters for one publish call, shared across its batches so progress
+/// events describe the whole run: `attempted` counts candidates whose dial
+/// actually started (the progress denominator), `done` counts completed
+/// dials, `published` counts acceptors. `origin` is the progress routing
+/// (None = silent re-broadcast).
+struct PublishRun {
+    origin: Option<Option<u64>>,
+    published: usize,
+    done: usize,
+    attempted: usize,
+}
+
+/// One publish candidate's fate, fed back into the peer registry: an
+/// unreachable peer is backed off, a refuser is deprioritized, an acceptor
+/// is rewarded.
+enum PushOutcome {
+    /// The peer took the update.
+    Accepted(PeerAddr),
+    /// Dial or handshake failed/timed out: dead or unreachable.
+    Unreachable(PeerAddr),
+    /// Reachable (handshake completed) but the update didn't land: refused,
+    /// errored, or stalled mid-transfer. Scored as a file failure ONLY -
+    /// reputation dock, no backoff, no connected/response stamp. Rewarding it
+    /// with ConnectOk would reset its error count and freshen its response
+    /// time, which the selection tiebreak prefers - promoting a useless peer
+    /// above never-tried candidates and (via the connected flag) shielding it
+    /// from eviction.
+    Refused(PeerAddr),
+}
+
+impl PushOutcome {
+    fn accepted(&self) -> bool {
+        matches!(self, PushOutcome::Accepted(_))
+    }
+
+    /// The registry feedback for this outcome, plus the label it carries in
+    /// the DEBUG failed-candidates line (None = success).
+    fn feedback(self) -> (PeerAddr, epix_worker::PeerOutcome, Option<&'static str>) {
+        match self {
+            PushOutcome::Accepted(peer) => (peer, epix_worker::PeerOutcome::ConnectOk, None),
+            PushOutcome::Unreachable(peer) => {
+                (peer, epix_worker::PeerOutcome::ConnectFail, Some("unreachable"))
+            }
+            PushOutcome::Refused(peer) => {
+                (peer, epix_worker::PeerOutcome::FileFail, Some("refused"))
+            }
+        }
+    }
+}
+
+/// Dial one publish candidate and push the update, bounded by the peer's
+/// connect timeout: reachable clearnet peers answer in ~1-3s, so the deadline
+/// only ever pays for dead candidates, and overlay peers get the longer dial
+/// bound - a fresh onion circuit takes 20-40s, and cutting it off is what
+/// made publishing to Tor-only peers silently fail. A deadline that expires
+/// after the handshake succeeded is scored Refused (the peer is alive), not
+/// Unreachable - repeatedly backing off a slow-but-live overlay peer would
+/// eventually get a reachable peer evicted.
+async fn push_update_to_peer(
+    transport: Arc<dyn Transport>,
+    peer: PeerAddr,
+    address: String,
+    inner_path: String,
+    body: Arc<Vec<u8>>,
+    modified: f64,
+    diffs: Option<rmpv::Value>,
+) -> PushOutcome {
+    let deadline = peer.connect_timeout();
+    let timeout_peer = peer.clone();
+    // Set once the handshake succeeds (see the doc comment).
+    let progressed = AtomicBool::new(false);
+    let push = async {
+        let mut conn = match Connection::connect(transport.as_ref(), &peer).await {
+            Ok(conn) => conn,
+            Err(_) => return PushOutcome::Unreachable(peer),
+        };
+        if conn.handshake().await.is_err() {
+            return PushOutcome::Unreachable(peer);
+        }
+        progressed.store(true, Ordering::Relaxed);
+        if conn.update(&address, &inner_path, &body, modified, diffs).await.is_err() {
+            return PushOutcome::Refused(peer);
+        }
+        // Live-hook: tell the peer (acting as a propagation node) about the
+        // new version so peers that are offline now can pull it later.
+        let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
+        PushOutcome::Accepted(peer)
+    };
+    match tokio::time::timeout(deadline, push).await {
+        Ok(outcome) => outcome,
+        Err(_) if progressed.load(Ordering::Relaxed) => PushOutcome::Refused(timeout_peer),
+        Err(_) => PushOutcome::Unreachable(timeout_peer),
+    }
 }
 
 /// The per-announcer stats key: the tracker's canonical form - Epix
@@ -1636,11 +1731,11 @@ impl AppState {
             None => (None, None),
         };
         // Restore any peers persisted by the PeerDb plugin, keyed by the signed
-        // content address.
+        // content address - including their learned reputation/error state, so
+        // a restart doesn't flatten selection back to a blind lottery.
         let mut peers = Peers::new();
-        let saved = self.load_persisted_peers(&canonical);
-        if !saved.is_empty() {
-            peers.add_many(saved, now_secs());
+        for saved in self.load_persisted_peers(&canonical) {
+            peers.restore(saved);
         }
         // Restore optional-file pins persisted by OptionalManager.
         let pinned = self.load_persisted_pins(&canonical);
@@ -2179,32 +2274,97 @@ impl AppState {
 
     // --- PeerDb: persist known peers across restarts ------------------------
 
-    /// Load the peers persisted for a site (by signed content address).
-    fn load_persisted_peers(&self, canonical: &str) -> Vec<PeerAddr> {
+    /// Load the peers persisted for a site (by signed content address), with
+    /// their persisted learning state. Entries are either bare address strings
+    /// (the legacy format) or `{addr, rep, errors, seen}` objects; both parse,
+    /// so an old peers.json upgrades in place. Malformed/placeholder shapes
+    /// (e.g. the legacy port-1 tracker placeholder) are dropped here - the
+    /// boot restore bypasses [`Self::add_peers`]' ingest filter, so junk that
+    /// predates the filter would otherwise survive on disk forever.
+    fn load_persisted_peers(&self, canonical: &str) -> Vec<Peer> {
         let Some(path) = &self.peers_path else { return Vec::new() };
         let map: serde_json::Map<String, Value> = std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        let now = now_secs();
         map.get(canonical)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str()).filter_map(|s| PeerAddr::parse(s).ok()).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|entry| {
+                        let (addr_str, saved) = match entry {
+                            Value::String(s) => (s.as_str(), None),
+                            Value::Object(o) => (o.get("addr")?.as_str()?, Some(o)),
+                            _ => return None,
+                        };
+                        let addr = PeerAddr::parse(addr_str).ok()?;
+                        if !addr.is_wellformed() {
+                            return None;
+                        }
+                        let mut peer = Peer::new(addr, now);
+                        if let Some(o) = saved {
+                            // Saturate out-of-range values (a hand-edited or
+                            // foreign peers.json) instead of `as`-wrapping
+                            // them into nonsense reputations/counters.
+                            peer.reputation = o
+                                .get("rep")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .clamp(i32::MIN as i64, i32::MAX as i64)
+                                as i32;
+                            peer.connection_errors =
+                                o.get("errors").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64)
+                                    as u32;
+                            peer.time_response =
+                                o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
+                        }
+                        Some(peer)
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Persist every served xite's peers to `peers.json` (keyed by signed content
     /// address, so aliases share one list). Called periodically by the runtime.
-    /// Evicts dead peers first, so addresses that stopped answering (a node's
-    /// old port after a config change, adopted ephemeral ports) age out of the
-    /// table instead of being persisted and PEX-shared forever.
+    /// Sweeps first: evicts dead peers, and drops entries that never belonged -
+    /// malformed/placeholder shapes and this node's own addresses (junk that
+    /// predates the ingest filters, or an external IP detected only after the
+    /// entries were restored at boot) - so they age out of the table instead of
+    /// being persisted and PEX-shared forever. Each peer is stored with its
+    /// learned reputation/error state so a restart doesn't reset selection.
     pub async fn persist_peers(&self) {
+        // is_own_peer is async (it reads port/onion/i2p/rns state, never
+        // self.xites), so classify addresses before taking the write lock.
+        let unique: std::collections::HashSet<PeerAddr> = self
+            .xites
+            .read()
+            .await
+            .values()
+            .flat_map(|x| x.peers.peers().map(|p| p.addr.clone()))
+            .collect();
+        let mut junk: std::collections::HashSet<PeerAddr> = std::collections::HashSet::new();
+        for addr in unique {
+            if !addr.is_wellformed() || self.is_own_peer(&addr).await {
+                junk.insert(addr);
+            }
+        }
         let dropped: usize = {
             let mut xites = self.xites.write().await;
             let now = now_secs();
-            xites.values_mut().map(|x| x.peers.evict_dead(now)).sum()
+            xites
+                .values_mut()
+                .map(|x| {
+                    let evicted =
+                        x.peers.evict_dead(now) + x.peers.retain(|p| !junk.contains(&p.addr));
+                    x.settings.peers = x.peers.len() as i64;
+                    evicted
+                })
+                .sum()
         };
         if dropped > 0 {
-            self.log("INFO", format!("Evicted {dropped} dead peer(s)")).await;
+            self.log("INFO", format!("Evicted {dropped} dead/junk peer(s)")).await;
         }
         if !self.plugin_enabled("PeerDb").await {
             return;
@@ -2216,7 +2376,18 @@ impl AppState {
             if x.peers.len() == 0 {
                 continue;
             }
-            let list: Vec<Value> = x.peers.peers().map(|p| json!(p.addr.to_string())).collect();
+            let list: Vec<Value> = x
+                .peers
+                .peers()
+                .map(|p| {
+                    json!({
+                        "addr": p.addr.to_string(),
+                        "rep": p.reputation,
+                        "errors": p.connection_errors,
+                        "seen": p.time_response,
+                    })
+                })
+                .collect();
             map.insert(canonical, Value::Array(list));
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
@@ -3348,19 +3519,72 @@ impl AppState {
             // Bound each peer attempt so a slow/unresponsive peer doesn't
             // stall the whole update; overlay peers get the longer dial
             // deadline (a flat clearnet bound meant resync could never fetch
-            // content.json from an onion/i2p peer).
+            // content.json from an onion/i2p peer). The nested Option
+            // separates "dial/handshake failed" (outer None) from "connected
+            // but the fetch failed" (inner None), and `progressed` marks a
+            // handshake that succeeded before the deadline expired - so each
+            // case feeds the registry its own outcome. Without this, probe
+            // failures taught selection nothing and dead candidates were
+            // redialed every pass. A reachable-but-unserving peer gets a
+            // FileFail ONLY (reputation dock): ConnectOk would reset its
+            // error count and freshen its response time, promoting a useless
+            // peer above never-tried candidates in the selection tiebreak.
+            let progressed = AtomicBool::new(false);
             let fetched = tokio::time::timeout(peer.connect_timeout(), async {
                 let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
                 conn.handshake().await.ok()?;
-                conn.get_file(&canonical, "content.json").await.ok()
+                progressed.store(true, Ordering::Relaxed);
+                Some(conn.get_file(&canonical, "content.json").await.ok())
             })
             .await;
-            let Ok(Some(bytes)) = fetched else { continue };
+            let bytes = match fetched {
+                Ok(Some(Some(bytes))) => bytes,
+                // Alive but couldn't serve the file (or stalled mid-fetch):
+                // dialable, deprioritized.
+                Ok(Some(None)) => {
+                    self.log("DEBUG", format!("resync {address}: {peer} had no content.json"))
+                        .await;
+                    self.apply_peer_outcomes(
+                        address,
+                        vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
+                    )
+                    .await;
+                    continue;
+                }
+                Err(_) if progressed.load(Ordering::Relaxed) => {
+                    self.apply_peer_outcomes(
+                        address,
+                        vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(None) | Err(_) => {
+                    self.log("DEBUG", format!("resync {address}: {peer} unreachable")).await;
+                    self.apply_peer_outcomes(
+                        address,
+                        vec![(peer.clone(), epix_worker::PeerOutcome::ConnectFail)],
+                    )
+                    .await;
+                    continue;
+                }
+            };
             let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
+                // Answered with junk: deprioritize like a failed fetch.
+                self.apply_peer_outcomes(
+                    address,
+                    vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
+                )
+                .await;
                 continue;
             };
             let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            self.set_peer_connected(address, peer, true).await;
+            // Served a valid content.json: the genuine positive signal.
+            self.apply_peer_outcomes(
+                address,
+                vec![(peer.clone(), epix_worker::PeerOutcome::ConnectOk)],
+            )
+            .await;
             if new_modified <= local_modified {
                 return Ok(false); // already current
             }
@@ -7081,14 +7305,24 @@ impl AppState {
         address: &str,
         inner_path: &str,
         origin: Option<u64>,
+        exhaustive: bool,
     ) -> Result<usize, String> {
         let diffs = self.take_diffs(address, inner_path).await;
-        self.publish_to(address, inner_path, 20, diffs, Some(origin)).await
+        self.publish_to(address, inner_path, 20, exhaustive, diffs, Some(origin)).await
     }
 
-    /// Publish to at most `limit` connectable peers. The re-broadcast of an
-    /// accepted inbound update uses a small limit (EpixNet uses 3) so a push
-    /// floods the network without every node hammering every peer.
+    /// Publish to at most `limit` connectable peers per batch. The
+    /// re-broadcast of an accepted inbound update uses a small limit (EpixNet
+    /// uses 3) so a push floods the network without every node hammering
+    /// every peer. `exhaustive`: a user publish keeps walking the
+    /// reputation-sorted candidate pool in `limit`-sized batches until one
+    /// batch lands somewhere (or [`Self::MAX_PUBLISH_DIALS`] candidates were
+    /// tried) - without it a junk-heavy registry starved the publish on the
+    /// first 20 dead entries while a reachable peer sat at rank 21;
+    /// re-broadcasts pass `false` (one batch, best effort, the flood
+    /// redundancy covers the misses). Every dial outcome feeds the peer
+    /// registry via [`Self::apply_peer_outcomes`], so failed candidates sink
+    /// (backoff + reputation) and later batches/passes select better.
     /// `progress`: `None` = silent (re-broadcasts); `Some(origin)` = push
     /// progress events, to the originating connection only when known
     /// (EpixNet's `self.cmd("progress", …)`), else to the xite's pages.
@@ -7097,9 +7331,16 @@ impl AppState {
         address: &str,
         inner_path: &str,
         limit: usize,
+        exhaustive: bool,
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
         progress: Option<Option<u64>>,
     ) -> Result<usize, String> {
+        /// Upper bound on dial attempts for an exhaustive publish: batches of
+        /// `limit` are bounded by one connect_timeout each, so this caps the
+        /// worst case (a fully dead registry) at a few minutes while still
+        /// walking deep enough to reach the first live peer of a junk-heavy
+        /// pool. Sync keeps spreading the content afterwards regardless.
+        const MAX_PUBLISH_DIALS: usize = 100;
         let body = self
             .xites
             .read()
@@ -7114,70 +7355,143 @@ impl AppState {
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
         let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
-        let peers = self.connectable_peers(address, limit).await;
-        let total = peers.len();
+        let pool =
+            self.connectable_peers(address, if exhaustive { MAX_PUBLISH_DIALS } else { limit }).await;
+        let total = pool.len();
+        if exhaustive {
+            let overlay = pool.iter().filter(|p| p.is_overlay()).count();
+            self.log(
+                "DEBUG",
+                format!(
+                    "publish {address}: {total} candidate(s) ({} clearnet, {overlay} overlay), batch size {limit}",
+                    total - overlay
+                ),
+            )
+            .await;
+        }
         let wire_diffs = (!diffs.is_empty()).then(|| crate::fileserve::encode_diffs(&diffs));
-        let push_progress = |published: usize, done: usize| {
-            let Some(origin) = progress else { return };
-            if total == 0 {
-                return;
-            }
-            self.push_event_routed(
-                "progress",
-                json!([
-                    "publish",
-                    format!("Content published to {published}/{total} peers."),
-                    (100 * done / total) as i64,
-                ]),
-                None,
-                Some(address.to_string()),
-                None,
-                origin,
-            );
-        };
-        push_progress(0, 0);
+        // The pushed body is cloned into every spawned task; Arc it so 100
+        // candidates share one buffer instead of cloning a possibly-MB
+        // content.json per dial.
+        let body = Arc::new(body);
+        let mut run = PublishRun { origin: progress, published: 0, done: 0, attempted: 0 };
+        self.publish_progress(address, &run, total.min(limit.max(1)));
 
-        // Push to every candidate concurrently (EpixNet publishes with
-        // parallel workers): a page waits on the sitePublish reply, so dead
-        // peers must cost one bounded timeout, not a serial sum of them.
-        let mut set = tokio::task::JoinSet::new();
-        for peer in peers {
-            let transport = transport.clone();
-            let address = address.to_string();
-            let inner_path = inner_path.to_string();
-            let body = body.clone();
-            let diffs = wire_diffs.clone();
-            set.spawn(async move {
-                let deadline = peer.connect_timeout();
-                let push = async {
-                    let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
-                    conn.handshake().await.ok()?;
-                    conn.update(&address, &inner_path, &body, modified, diffs).await.ok()?;
-                    // Live-hook: tell the peer (acting as a propagation node)
-                    // about the new version so peers that are offline now can
-                    // pull it later.
-                    let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
-                    Some(peer)
-                };
-                // Bounds the whole sitePublish reply: reachable clearnet
-                // peers answer in ~1-3s, so the deadline only ever pays for
-                // dead candidates. Overlay peers get the longer dial bound -
-                // a fresh onion circuit takes 20-40s, and cutting it off is
-                // what made publishing to Tor-only peers silently fail.
-                tokio::time::timeout(deadline, push).await.ok().flatten()
-            });
-        }
-        let mut published = 0;
-        let mut done = 0;
-        while let Some(res) = set.join_next().await {
-            done += 1;
-            if let Ok(Some(peer)) = res {
-                self.set_peer_connected(address, &peer, true).await;
-                published += 1;
+        for (batch_no, batch) in pool.chunks(limit.max(1)).enumerate() {
+            // The pool was selected once up front; a concurrent sync pass may
+            // have backed off (or evicted) peers in later batches since. Skip
+            // candidates the registry now says to leave alone rather than
+            // burning a bounded timeout on each.
+            let batch = if batch_no == 0 {
+                batch.to_vec()
+            } else {
+                self.still_dialable(address, batch).await
+            };
+            if batch.is_empty() {
+                continue;
             }
-            push_progress(published, done);
+            run.attempted += batch.len();
+            self.push_batch(address, inner_path, batch, &body, modified, &wire_diffs, &transport, &mut run)
+                .await;
+            // One batch with any acceptor is enough: the accepted push
+            // re-broadcasts peer-to-peer, and the remaining candidates get
+            // the version on their next sync. Only an all-failed batch walks
+            // deeper into the pool.
+            if run.published > 0 || !exhaustive {
+                break;
+            }
         }
-        Ok(published)
+        // Close the bar against what was actually attempted (idempotent when
+        // the loop already emitted this exact event on its last candidate).
+        self.publish_progress(address, &run, run.done);
+        Ok(run.published)
+    }
+
+    /// The subset of `batch` the registry still allows dialing - not backed
+    /// off (or evicted) since the publish pool was selected.
+    async fn still_dialable(&self, address: &str, batch: &[PeerAddr]) -> Vec<PeerAddr> {
+        let now = now_secs();
+        let xites = self.xites.read().await;
+        let Some(x) = xites.get(address) else { return Vec::new() };
+        batch
+            .iter()
+            .filter(|p| x.peers.get(p).is_some_and(|peer| peer.retry_after <= now))
+            .cloned()
+            .collect()
+    }
+
+    /// Emit a publish progress event ("Content published to X/Y peers.").
+    /// `target` is what has actually been dialed (the batches entered so
+    /// far), NOT the whole candidate pool - a successful publish must read
+    /// "5/20 peers", not "5/100" against candidates that were never dialed.
+    fn publish_progress(&self, address: &str, run: &PublishRun, target: usize) {
+        let Some(origin) = run.origin else { return };
+        if target == 0 {
+            return;
+        }
+        self.push_event_routed(
+            "progress",
+            json!([
+                "publish",
+                format!("Content published to {}/{target} peers.", run.published),
+                (100 * run.done / target) as i64,
+            ]),
+            None,
+            Some(address.to_string()),
+            None,
+            origin,
+        );
+    }
+
+    /// Push the update to one batch of candidates concurrently (EpixNet
+    /// publishes with parallel workers): a page waits on the sitePublish
+    /// reply, so dead peers must cost one bounded timeout, not a serial sum
+    /// of them (an exhaustive walk still pays one bounded timeout per
+    /// all-failed batch). Every outcome is fed into the peer registry, and
+    /// progress streams per completion.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_batch(
+        &self,
+        address: &str,
+        inner_path: &str,
+        batch: Vec<PeerAddr>,
+        body: &Arc<Vec<u8>>,
+        modified: f64,
+        wire_diffs: &Option<rmpv::Value>,
+        transport: &Arc<dyn Transport>,
+        run: &mut PublishRun,
+    ) {
+        let mut set = tokio::task::JoinSet::new();
+        for peer in batch {
+            set.spawn(push_update_to_peer(
+                transport.clone(),
+                peer,
+                address.to_string(),
+                inner_path.to_string(),
+                body.clone(),
+                modified,
+                wire_diffs.clone(),
+            ));
+        }
+        let mut outcomes = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        while let Some(res) = set.join_next().await {
+            run.done += 1;
+            if let Ok(outcome) = res {
+                run.published += outcome.accepted() as usize;
+                let (peer, score, fail_label) = outcome.feedback();
+                if let Some(label) = fail_label {
+                    failed.push(format!("{peer} ({label})"));
+                }
+                outcomes.push((peer, score));
+            }
+            self.publish_progress(address, run, run.attempted);
+        }
+        self.apply_peer_outcomes(address, outcomes).await;
+        if !failed.is_empty() {
+            self.log("DEBUG", format!("publish {address}: failed candidates: {}", failed.join(", ")))
+                .await;
+        }
     }
 
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
@@ -7529,7 +7843,7 @@ impl AppState {
         // forwarding the diffs it received so they spread with the push - but
         // never a version we couldn't complete ourselves.
         if committed && self.transport.read().await.is_some() {
-            let _ = self.publish_to(&key, &inner_path, 3, diffs, None).await;
+            let _ = self.publish_to(&key, &inner_path, 3, false, diffs, None).await;
         }
         self.updates_in_flight.lock().unwrap().remove(&uri);
         // Flash the dashboard row: a peer pushed a new version and it landed.

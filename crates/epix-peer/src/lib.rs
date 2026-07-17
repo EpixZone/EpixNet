@@ -187,17 +187,21 @@ impl Peers {
 
     /// Insert a peer if unknown (returns whether it was newly added).
     pub fn add(&mut self, addr: PeerAddr, now: i64) -> bool {
-        let key = addr.to_string();
-        if self.map.contains_key(&key) {
-            return false;
-        }
-        self.map.insert(key, Peer::new(addr, now));
-        true
+        self.restore(Peer::new(addr, now))
     }
 
     /// Add many peers, returning how many were new.
     pub fn add_many(&mut self, addrs: impl IntoIterator<Item = PeerAddr>, now: i64) -> usize {
         addrs.into_iter().filter(|a| self.add(a.clone(), now)).count()
+    }
+
+    pub fn restore(&mut self, peer: Peer) -> bool {
+        let key = peer.key();
+        if self.map.contains_key(&key) {
+            return false;
+        }
+        self.map.insert(key, peer);
+        true
     }
 
     pub fn get(&self, addr: &PeerAddr) -> Option<&Peer> {
@@ -233,15 +237,20 @@ impl Peers {
     pub fn evict_dead(&mut self, now: i64) -> usize {
         const MAX_ERRORS: u32 = 6;
         const RESPONSE_GRACE_SECS: i64 = 4 * 3600;
-        let before = self.map.len();
-        self.map.retain(|_, p| {
+        self.retain(|p| {
             if p.connected || p.connection_errors < MAX_ERRORS {
                 return true;
             }
-            let responded_recently =
-                p.time_response != 0 && now - p.time_response < RESPONSE_GRACE_SECS;
-            responded_recently
-        });
+            p.time_response != 0 && now - p.time_response < RESPONSE_GRACE_SECS
+        })
+    }
+
+    /// Drop every peer failing the predicate, returning how many were
+    /// removed. The persist janitor uses this to purge entries that never
+    /// belonged (malformed placeholder shapes, the node's own addresses).
+    pub fn retain(&mut self, keep: impl Fn(&Peer) -> bool) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, p| keep(p));
         before - self.map.len()
     }
 

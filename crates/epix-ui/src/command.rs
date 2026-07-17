@@ -1852,7 +1852,9 @@ impl WsCommand for SitePublish {
                     .await?;
             }
         }
-        let published = s.state.publish(&address, &inner_path, Some(s.id)).await?;
+        // Exhaustive: a user is watching this publish fail, so walk past the
+        // first batch of dead candidates instead of giving up at 20.
+        let published = s.state.publish(&address, &inner_path, Some(s.id), true).await?;
         // Fresh siteInfo so the page re-renders post-publish (the sidebar's
         // sign/publish panel and modified-files list reset) - EpixNet's
         // `site.updateWebsocket()` at the end of cbSitePublish.

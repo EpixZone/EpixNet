@@ -78,10 +78,13 @@ impl PeerAddr {
     /// link id is not a dialable destination hash). Placeholders must never
     /// enter a peer registry: they can't be dialed, they don't round-trip
     /// `to_string()`/`parse()`, and they waste selection slots. Ip addresses
-    /// count even at port 0 (`is_connectable` handles selection).
+    /// count even at port 0 (`is_connectable` handles selection), but not at
+    /// port 1: that is a "Tor mode, no clearnet port"
+    /// tracker placeholder, still echoed around by old swarms - never a real
+    /// listener, so registering it burns a dial timeout every selection pass.
     pub fn is_wellformed(&self) -> bool {
         match self {
-            PeerAddr::Ip(_) => true,
+            PeerAddr::Ip(sa) => sa.port() != 1,
             PeerAddr::Onion { host, port } => !host.is_empty() && *port != 0,
             PeerAddr::I2p { dest, .. } => !dest.is_empty(),
             PeerAddr::Rns(hash) => *hash != [0u8; 16],
@@ -334,6 +337,9 @@ mod tests {
         // The all-zero rns sentinel an inbound mesh link is served under (its
         // link id is not a dialable destination hash) is rejected.
         assert!(!PeerAddr::Rns([0u8; 16]).is_wellformed());
+        // Port 1 is the legacy "Tor mode, no clearnet port" tracker
+        // placeholder - never a real listener.
+        assert!(!PeerAddr::parse("1.2.3.4:1").unwrap().is_wellformed());
         // Complete addresses pass, including port-0 Ip (selection filters it)
         // and portless-by-design rns.
         assert!(PeerAddr::parse("1.2.3.4:0").unwrap().is_wellformed());
