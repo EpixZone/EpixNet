@@ -128,7 +128,15 @@ impl WsCommand for SiteSetSizeLimit {
 // --- rendering ---------------------------------------------------------------
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    // The sidebar templates use single-quoted attributes throughout, so `'`
+    // MUST be escaped too: a content.json-controlled path like
+    // `x' onmouseover='...` would otherwise break out of `title='{path}'`
+    // and run script in the privileged wrapper frame.
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// The "Choose:" list under Content publishing: the root content.json plus
@@ -146,6 +154,76 @@ fn signable_contents(includes: &[String]) -> String {
 fn pct(part: f64, total: f64) -> String {
     let p = if total > 0.0 { part / total * 100.0 } else { 0.0 };
     format!("{p:.0}%")
+}
+
+/// Live progress panel for a running bulk optional-file download, from the
+/// `optional_progress` snapshot in site_info (absent/`null` when idle → ""). A
+/// spinner + status line + overall bar, and a collapsible per-file list where
+/// each file shows a state icon (spinner/check/dot/x). The list defaults
+/// collapsed; `all.js` toggles the `.expanded` class on `#optional-file-list`
+/// and re-applies it across the morphdom refresh so it survives live updates.
+fn render_optional_progress(progress: &Value) -> String {
+    let obj = match progress.as_object() {
+        Some(o) => o,
+        None => return String::new(),
+    };
+    let total = obj.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
+    let done = obj.get("done_files").and_then(|v| v.as_u64()).unwrap_or(0);
+    let failed = obj.get("failed_files").and_then(|v| v.as_u64()).unwrap_or(0);
+    let percent = obj.get("percent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let current = obj.get("current").and_then(|v| v.as_str()).unwrap_or("");
+    // Just the file name for the status line - full inner paths are long.
+    let current_name = current.rsplit('/').next().unwrap_or(current);
+    // The sampled phase ("Waiting for peers…", "Downloading… 42%"); falls back
+    // to the raw overall % if the sampler hasn't written one yet.
+    let phase = obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let phase = if phase.is_empty() { format!("{percent:.0}%") } else { esc(phase) };
+
+    let status = if !current_name.is_empty() {
+        format!("{phase} · {}", esc(current_name))
+    } else {
+        phase
+    };
+    let failed_note = if failed > 0 {
+        format!(" · <span class='opt-failed'>{failed} failed</span>")
+    } else {
+        String::new()
+    };
+
+    let mut items = String::new();
+    if let Some(files) = obj.get("files").and_then(|v| v.as_array()) {
+        for f in files {
+            let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let size = f.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            let state = f.get("state").and_then(|v| v.as_str()).unwrap_or("pending");
+            let size_mb = size as f64 / 1024.0 / 1024.0;
+            items.push_str(&format!(
+                "<li class='opt-file state-{state}'>\
+                  <span class='opt-file-icon'></span>\
+                  <span class='opt-file-name' title='{full}'>{name}</span>\
+                  <b>{size_mb:.2}MB</b></li>",
+                full = esc(path),
+                name = esc(name),
+            ));
+        }
+    }
+
+    // A <div>, not an <li>: nesting an <li> inside the section's <li> makes the
+    // HTML parser auto-close the parent, so the panel would break out into its
+    // own card (and shove the toggles out of theirs). A div keeps the legend,
+    // this panel, and the toggles together in one block.
+    format!(
+        "<div class='optional-progress'>\
+          <label><span class='opt-spinner'></span> Downloading optional files… {done} / {total}{failed_note}</label>\
+          <ul class='graph graph-stacked'>\
+           <li style='width: {bar_w}' class='downloaded back-green'></li>\
+          </ul>\
+          <div class='opt-status'>{status}</div>\
+          <a href='#OptionalFiles' class='opt-toggle-files' id='optional-files-toggle'>Show files ({total})</a>\
+          <ul class='opt-file-list' id='optional-file-list'>{items}</ul></div>",
+        bar_w = format!("{:.0}%", percent.clamp(0.0, 100.0)),
+    )
 }
 
 /// Build the sidebar panel HTML from the real site runtime. Mirrors EpixNet's
@@ -270,11 +348,13 @@ fn render_sidebar(
               <li class='color-green'><span>Downloaded:</span><b>{opt_dl_mb:.2}MB</b></li>\
               <li class='color-black'><span>Total optional:</span><b>{opt_mb:.2}MB</b></li>\
              </ul>\
+             {progress}\
              <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-downloadoptional' {dl_checked}/>\
               <div class='checkbox-skin'></div> Download optional files</label>\
              <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-autodownloadoptional' {opt_checked}/>\
               <div class='checkbox-skin'></div> Help distribute all files</label></li>",
             dl_w = pct(opt_dl_mb, opt_mb),
+            progress = render_optional_progress(&info["optional_progress"]),
             dl_checked = if download_optional { "checked='checked'" } else { "" },
             opt_checked = if autodownload { "checked='checked'" } else { "" },
         ));
@@ -429,5 +509,56 @@ mod tests {
         assert!(html2.contains("id='checkbox-owned' />"), "owned checkbox unchecked when not owned");
         assert!(html2.contains("button-sign-publish"), "owner panel always present; CSS toggles it");
         assert!(html2.contains("class='settings-owned'"));
+    }
+
+    #[test]
+    fn optional_progress_panel_renders_only_while_downloading() {
+        // Idle (optional_progress null): no live panel, no spinner.
+        let idle = json!({
+            "auth_address": "", "cert_user_id": Value::Null, "size_limit": 10,
+            "optional_progress": Value::Null,
+            "settings": { "size": 0, "own": false, "serving": true,
+                "size_optional": 4_194_304, "optional_downloaded": 0,
+                "cache": { "bad_files": {} } },
+            "content": { "title": "X", "files": 0 },
+        });
+        let counts = PeerCounts { total: 1, connected: 1, connectable: 1, onion: 0, local: 0 };
+        let html = render_sidebar("1abc", &idle, counts, 0, 0, &[]);
+        assert!(!html.contains("optional-progress"), "no live panel when idle");
+        assert!(!html.contains("opt-spinner"), "no spinner when idle");
+
+        // Downloading: spinner, counts, overall %, and a per-file list with the
+        // active file spinning and a finished file checked.
+        let mut active = idle.clone();
+        active["optional_progress"] = json!({
+            "total_files": 2, "done_files": 1, "failed_files": 0,
+            "bytes_total": 3_000_000, "bytes_done": 1_000_000, "percent": 33.0,
+            "current": "data/users/alice/video.mp4",
+            "status": "Waiting for peers…",
+            "files": [
+                { "path": "a.bin", "size": 1_000_000, "state": "done" },
+                { "path": "data/users/alice/video.mp4", "size": 2_000_000, "state": "active" },
+            ],
+        });
+        let html = render_sidebar("1abc", &active, counts, 0, 0, &[]);
+        assert!(html.contains("class='optional-progress'"), "live panel present");
+        // Must be a <div>, not an <li>: an <li> would break out of the card.
+        assert!(html.contains("<div class='optional-progress'>"), "panel is a div (one block)");
+        assert!(!html.contains("<li class='optional-progress'>"), "panel is not an li");
+        assert!(html.contains("opt-spinner"), "spinner present");
+        assert!(html.contains("1 / 2"), "completed/total count");
+        // The sampled phase drives the status line (not the raw %).
+        assert!(html.contains("Waiting for peers… · video.mp4"), "phase + current file name");
+        assert!(html.contains("width: 33%"), "overall bar sized by bytes");
+        assert!(html.contains("id='optional-files-toggle'"), "collapsible toggle");
+        assert!(html.contains("Show files (2)"), "toggle counts files");
+        assert!(html.contains("opt-file state-done"), "finished file marked done");
+        assert!(html.contains("opt-file state-active"), "current file marked active");
+        assert!(html.contains(">video.mp4<"), "file list shows base names");
+
+        // No sampled status yet -> falls back to the overall %.
+        active["optional_progress"]["status"] = json!("");
+        let html = render_sidebar("1abc", &active, counts, 0, 0, &[]);
+        assert!(html.contains("33% · video.mp4"), "falls back to % when no phase");
     }
 }
