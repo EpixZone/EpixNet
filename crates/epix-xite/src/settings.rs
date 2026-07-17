@@ -68,6 +68,14 @@ pub struct XiteSettings {
     /// Bytes of optional files actually downloaded.
     #[serde(default)]
     pub optional_downloaded: i64,
+    /// Cumulative bytes served to peers, across runs (EpixNet's
+    /// `settings.bytes_sent`). The dashboard's per-site upload/download
+    /// ratio badge divides these two.
+    #[serde(default)]
+    pub bytes_sent: u64,
+    /// Cumulative bytes downloaded from peers, across runs.
+    #[serde(default)]
+    pub bytes_recv: u64,
     #[serde(default)]
     pub size_files_optional: i64,
     /// Last known peer count for the xite.
@@ -119,6 +127,8 @@ impl XiteSettings {
             size: 0,
             size_optional: 0,
             optional_downloaded: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
             size_files_optional: 0,
             peers: 0,
             modified_files_notification: None,

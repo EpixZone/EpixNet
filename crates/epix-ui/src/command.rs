@@ -3166,7 +3166,9 @@ impl WsCommand for SiteSetDownloadoptional {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        s.state.set_download_optional(&address, on).await;
+        // Explicit toggle: enabling it downloads the currently-missing optional
+        // files now (with the sidebar progress panel).
+        s.state.set_download_optional(&address, on, true).await;
         Ok(Value::from("ok"))
     }
 }
