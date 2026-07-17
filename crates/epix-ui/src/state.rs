@@ -2990,27 +2990,11 @@ impl AppState {
             let suffix =
                 if round > 1 { format!(" (retry {round}/{rounds})") } else { String::new() };
             let base = self.optional_downloaded_now(&address).await;
-            loop {
-                if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let got = self.optional_downloaded_now(&address).await.saturating_sub(base);
                 let got = got.min(file_size); // ignore any concurrent optional traffic overshoot
-                let status = if got > 0 {
-                    if file_size > 0 {
-                        let pct = (got as f64 / file_size as f64 * 100.0).min(99.0);
-                        format!("Downloading… {pct:.0}%{suffix}")
-                    } else {
-                        format!("Downloading…{suffix}")
-                    }
-                } else {
-                    let peers = self.connectable_peers(&address, 20).await.len();
-                    if peers == 0 {
-                        format!("Waiting for peers…{suffix}")
-                    } else {
-                        format!("Fetching from {peers} peer(s)…{suffix}")
-                    }
-                };
+                let peers = self.connectable_peers(&address, 20).await.len();
+                let status = optional_fetch_status(got, file_size, peers, &suffix);
                 self.set_optional_status(&address, status, done_bytes + got).await;
                 // Short sleeps so `stop` is honored promptly when the fetch ends.
                 for _ in 0..3 {
@@ -9206,66 +9190,7 @@ impl AppState {
                 }
                 let flagged = state.optional_retry_flagged().await;
                 for (addr, dirs) in &flagged {
-                    let (fails, next_at) = schedule.get(addr).copied().unwrap_or((0, 0));
-                    if next_at > now_secs() as i64 {
-                        continue;
-                    }
-                    if state.optional_pass_in_flight(addr) {
-                        continue; // still working - check again next tick
-                    }
-                    if !state.optional_scope_missing(addr, dirs).await {
-                        // Complete: park it on the slow re-verify interval.
-                        schedule.insert(addr.clone(), (0, now_secs() as i64 + 600));
-                        continue;
-                    }
-                    if fails == 0 {
-                        state
-                            .log("INFO", format!("Resuming optional download for {addr}"))
-                            .await;
-                    }
-                    // Schedule the next look BEFORE spawning: while the pass
-                    // runs, ticks skip it via the in-flight guard; afterwards
-                    // this delay paces the next attempt if files remain.
-                    let delay = (60i64 * (1i64 << fails.min(4))).min(600);
-                    schedule.insert(addr.clone(), (fails + 1, now_secs() as i64 + delay));
-                    let state2 = state.clone();
-                    let addr2 = addr.clone();
-                    let dirs2 = dirs.clone();
-                    tokio::spawn(async move {
-                        let mut fetched_total = 0usize;
-                        match &dirs2 {
-                            None => {
-                                let (fetched, _) =
-                                    state2.download_optional_files(&addr2, None).await;
-                                fetched_total += fetched;
-                            }
-                            Some(ds) => {
-                                for d in ds {
-                                    let (fetched, _) = state2
-                                        .download_optional_files(&addr2, Some(d))
-                                        .await;
-                                    fetched_total += fetched;
-                                }
-                            }
-                        }
-                        if fetched_total > 0 {
-                            // Progress proves peers are back: reset the
-                            // backoff so the remainder is chased promptly.
-                            state2.mark_optional_dirty(&addr2);
-                        }
-                        // Completed in the background - say so. Deleted xites
-                        // (empty missing list by absence) must stay silent.
-                        if fetched_total > 0
-                            && state2.xites.read().await.contains_key(&addr2)
-                            && !state2.optional_scope_missing(&addr2, &dirs2).await
-                        {
-                            state2.push_notification(
-                                "done",
-                                &format!("Downloaded {fetched_total} optional file(s)."),
-                                12000,
-                            );
-                        }
-                    });
+                    state.retry_optional_candidate(addr, dirs, &mut schedule).await;
                 }
                 // Registered xites whose CORE files never completed - an
                 // interrupted or failed clone (the seeder was offline when
@@ -9282,41 +9207,7 @@ impl AppState {
                         .collect()
                 };
                 for addr in &core_watch {
-                    let key = format!("core:{addr}");
-                    let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
-                    if next_at > now_secs() as i64 {
-                        continue;
-                    }
-                    if state.xite_core_complete(addr).await {
-                        // Whole core on disk: park on the slow re-verify.
-                        schedule.insert(key, (0, now_secs() as i64 + 600));
-                        continue;
-                    }
-                    state
-                        .log("INFO", format!("Resuming interrupted download of {addr}"))
-                        .await;
-                    let delay = (60i64 * (1i64 << fails.min(4))).min(600);
-                    schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
-                    let state2 = state.clone();
-                    let addr2 = addr.clone();
-                    tokio::spawn(async move {
-                        // ensure_xite falls through to the resolver for a
-                        // registered-but-incomplete xite (its own in-flight
-                        // dedupe makes overlaps harmless) and resumes the
-                        // clone from whatever peers an announce finds now.
-                        if state2.ensure_xite(&addr2).await
-                            && state2.xite_core_complete(&addr2).await
-                        {
-                            state2.push_notification(
-                                "done",
-                                &format!("Downloaded xite {addr2}."),
-                                12000,
-                            );
-                            // Its optional files may be wanted next (the
-                            // toggles default on): check without delay.
-                            state2.mark_optional_dirty(&addr2);
-                        }
-                    });
+                    state.retry_clone_candidate(addr, &mut schedule).await;
                 }
                 // A xite that was toggled off, paused, or deleted leaves the
                 // watched sets - drop its schedule entries.
@@ -9325,6 +9216,108 @@ impl AppState {
                     None => flagged.iter().any(|(a, _)| a == k),
                 });
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    /// One optional-scope candidate per retry tick: gate on its schedule, an
+    /// in-flight pass, and completeness; then spawn the pass and pace the
+    /// next look. The next-look delay is set BEFORE spawning: while the pass
+    /// runs, ticks skip it via the in-flight guard; afterwards the delay
+    /// paces the next attempt if files remain.
+    async fn retry_optional_candidate(
+        self: &Arc<Self>,
+        addr: &str,
+        dirs: &Option<Vec<String>>,
+        schedule: &mut HashMap<String, (u32, i64)>,
+    ) {
+        let (fails, next_at) = schedule.get(addr).copied().unwrap_or((0, 0));
+        if next_at > now_secs() as i64 {
+            return;
+        }
+        if self.optional_pass_in_flight(addr) {
+            return; // still working - check again next tick
+        }
+        if !self.optional_scope_missing(addr, dirs).await {
+            // Complete: park it on the slow re-verify interval.
+            schedule.insert(addr.to_string(), (0, now_secs() as i64 + 600));
+            return;
+        }
+        if fails == 0 {
+            self.log("INFO", format!("Resuming optional download for {addr}")).await;
+        }
+        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        schedule.insert(addr.to_string(), (fails + 1, now_secs() as i64 + delay));
+        self.spawn_retry_pass(addr.to_string(), dirs.clone());
+    }
+
+    /// The background-initiated pass over a retry scope, with its completion
+    /// handling: progress resets the backoff (peers are back - chase the
+    /// remainder promptly), and a completed set toasts ONCE - with the xite
+    /// re-checked to still exist, because a deleted xite's empty missing
+    /// list reads as "complete".
+    fn spawn_retry_pass(self: &Arc<Self>, addr: String, dirs: Option<Vec<String>>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut fetched_total = 0usize;
+            match &dirs {
+                None => {
+                    let (fetched, _) = state.download_optional_files(&addr, None).await;
+                    fetched_total += fetched;
+                }
+                Some(ds) => {
+                    for d in ds {
+                        let (fetched, _) = state.download_optional_files(&addr, Some(d)).await;
+                        fetched_total += fetched;
+                    }
+                }
+            }
+            if fetched_total == 0 {
+                return;
+            }
+            state.mark_optional_dirty(&addr);
+            if state.xites.read().await.contains_key(&addr)
+                && !state.optional_scope_missing(&addr, &dirs).await
+            {
+                state.push_notification(
+                    "done",
+                    &format!("Downloaded {fetched_total} optional file(s)."),
+                    12000,
+                );
+            }
+        });
+    }
+
+    /// One incomplete-core candidate per retry tick: resume the interrupted
+    /// clone via `ensure_xite` (it falls through to the resolver for a
+    /// registered-but-incomplete xite; its own in-flight dedupe makes
+    /// overlaps harmless), with the same backoff pacing.
+    async fn retry_clone_candidate(
+        self: &Arc<Self>,
+        addr: &str,
+        schedule: &mut HashMap<String, (u32, i64)>,
+    ) {
+        let key = format!("core:{addr}");
+        let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
+        if next_at > now_secs() as i64 {
+            return;
+        }
+        if self.xite_core_complete(addr).await {
+            // Whole core on disk: park on the slow re-verify.
+            schedule.insert(key, (0, now_secs() as i64 + 600));
+            return;
+        }
+        self.log("INFO", format!("Resuming interrupted download of {addr}")).await;
+        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
+        let state = self.clone();
+        let addr = addr.to_string();
+        tokio::spawn(async move {
+            if state.ensure_xite(&addr).await && state.xite_core_complete(&addr).await {
+                state.push_notification("done", &format!("Downloaded xite {addr}."), 12000);
+                // Its optional files may be wanted next (the toggles
+                // default on): check without delay.
+                state.mark_optional_dirty(&addr);
             }
         });
     }
@@ -9375,6 +9368,78 @@ impl AppState {
             }
         }
         self.connectable_peers(address, 20).await.len()
+    }
+
+    /// Fetch ONE optional file within a bulk pass: mark it Active in the
+    /// snapshot, run [`Self::file_need`] with a concurrent status sampler
+    /// (file_need blocks on peer discovery/connects/pieces; the sampler
+    /// reports what it is doing and moves the bar off the byte delta), and
+    /// stop the sampler the moment the fetch returns.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_optional_with_status(
+        self: &Arc<Self>,
+        address: &str,
+        idx: usize,
+        path: &str,
+        size: u64,
+        bytes_done: u64,
+        round: usize,
+        rounds: usize,
+    ) -> Result<bool, String> {
+        self.mark_optional_file(address, idx, OptFileState::Active, path).await;
+        self.push_site_info(address).await;
+        let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = self.clone().spawn_optional_status_sampler(
+            address.to_string(),
+            sampler_stop.clone(),
+            bytes_done,
+            size,
+            round,
+            rounds,
+        );
+        let result = self.file_need(address, path).await;
+        sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sampler.await;
+        result
+    }
+
+    /// Resolve the progress panel at the end of a bulk pass: cancelled
+    /// (mandate withdrawn) drops it quietly; files still missing keep it in
+    /// a waiting state - the background retry loop is chasing them, and a
+    /// blank card between passes reads as "it gave up"; done clears it.
+    async fn finish_optional_pass(
+        self: &Arc<Self>,
+        address: &str,
+        cancelled: bool,
+        fetched: usize,
+        failed: usize,
+    ) {
+        if cancelled {
+            self.set_optional_progress(address, None).await;
+            self.log(
+                "INFO",
+                format!(
+                    "Optional download for {address} stopped (toggle off/paused/removed); \
+                     {fetched} fetched first"
+                ),
+            )
+            .await;
+        } else if failed > 0 {
+            self.set_optional_phase(address, "Waiting for peers - retrying in background…")
+                .await;
+        } else {
+            self.set_optional_progress(address, None).await;
+        }
+        if fetched > 0 {
+            self.persist_sites().await; // optional_downloaded accounting
+            // Snapshot the chart now instead of waiting up to a full sample
+            // interval (~5 min): a user who just pulled a multi-MB optional
+            // file expects the Stats download graph to move right away, not
+            // minutes later. record() stores the delta and advances its
+            // baseline, so the next scheduled snapshot isn't double-counted.
+            self.collect_chart().await;
+        }
+        self.push_site_info(address).await;
     }
 
     /// Fetch every missing optional file of a xite (or only those under
@@ -9470,27 +9535,9 @@ impl AppState {
                     cancelled = true;
                     break 'rounds;
                 }
-                // Mark this file Active before the (blocking) fetch so the
-                // sidebar shows a spinner on it and names it as the current
-                // download.
-                self.mark_optional_file(address, *idx, OptFileState::Active, path).await;
-                self.push_site_info(address).await;
-                // file_need blocks (peer discovery, connect, piece fetch for a
-                // bigfile), so a concurrent sampler reports what it's doing and
-                // moves the bar live off the optional-bytes delta. Stopped as
-                // soon as the fetch returns.
-                let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let sampler = self.clone().spawn_optional_status_sampler(
-                    address.to_string(),
-                    sampler_stop.clone(),
-                    bytes_done,
-                    *size,
-                    round,
-                    ROUNDS,
-                );
-                let result = self.file_need(address, path).await;
-                sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                let _ = sampler.await;
+                let result = self
+                    .fetch_optional_with_status(address, *idx, path, *size, bytes_done, round, ROUNDS)
+                    .await;
                 match result {
                     Ok(_) => {
                         fetched += 1;
@@ -9566,39 +9613,7 @@ impl AppState {
             queue = requeue;
         }
         self.set_worker_stats(address, 0, 0, 0).await;
-        if cancelled {
-            // The mandate is gone - drop the panel quietly, keep what landed.
-            self.set_optional_progress(address, None).await;
-            self.log(
-                "INFO",
-                format!(
-                    "Optional download for {address} stopped (toggle off/paused/removed); \
-                     {fetched} fetched first"
-                ),
-            )
-            .await;
-        } else if failed > 0 {
-            // Files are still missing and the background retry loop is
-            // chasing them: KEEP the panel, in a waiting state, so the user
-            // is not left staring at a blank card wondering what happened
-            // between retry passes (backoff can be minutes). The next pass
-            // re-seeds the snapshot; completion or toggle-off clears it.
-            self.set_optional_phase(address, "Waiting for peers - retrying in background…")
-                .await;
-        } else {
-            // All done: the panel returns to the steady-state card.
-            self.set_optional_progress(address, None).await;
-        }
-        if fetched > 0 {
-            self.persist_sites().await; // optional_downloaded accounting
-            // Snapshot the chart now instead of waiting up to a full sample
-            // interval (~5 min): a user who just pulled a multi-MB optional
-            // file expects the Stats download graph to move right away, not
-            // minutes later. record() stores the delta and advances its
-            // baseline, so the next scheduled snapshot isn't double-counted.
-            self.collect_chart().await;
-        }
-        self.push_site_info(address).await;
+        self.finish_optional_pass(address, cancelled, fetched, failed).await;
         self.log(
             "INFO",
             format!("Optional download for {address}: {fetched} fetched, {failed} failed"),
@@ -9648,21 +9663,9 @@ impl AppState {
                         continue;
                     }
                 }
-                let bigfile = info.get("piecemap").is_some();
                 let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-                let at_size = storage
-                    .path(&path)
-                    .ok()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.len() as i64 == size)
-                    .unwrap_or(false);
-                let present = if bigfile {
-                    at_size
-                        && stats.get(&path).map(|s| s.time_downloaded > 0).unwrap_or(false)
-                } else {
-                    at_size
-                };
-                if !present {
+                let bigfile = info.get("piecemap").is_some();
+                if !optional_file_present(&storage, &stats, &path, size, bigfile) {
                     out.push((path, size.max(0) as u64));
                 }
             }
@@ -10323,6 +10326,51 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 /// "Downloaded" figure. Covers the root's `files_optional` AND every stored
 /// child content.json's (per-user optional files) - the root-only walk left
 /// child files out of the hashfield, so peers never learned we held them.
+/// Whether a declared optional file is PRESENT on disk: a file at the
+/// declared size for regular files; a bigfile additionally needs its
+/// completion stamp (`optional_stats` time_downloaded, written when
+/// file_need finished the full range) - its sparse file sits at full size
+/// from the first piece, so size alone proves nothing, and treating every
+/// bigfile as missing would make the background retry loop re-hash multi-GB
+/// files forever.
+fn optional_file_present(
+    storage: &XiteStorage,
+    stats: &HashMap<String, epix_xite::OptionalFileStat>,
+    path: &str,
+    size: i64,
+    bigfile: bool,
+) -> bool {
+    let at_size = storage
+        .path(path)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() as i64 == size)
+        .unwrap_or(false);
+    if bigfile {
+        at_size && stats.get(path).map(|s| s.time_downloaded > 0).unwrap_or(false)
+    } else {
+        at_size
+    }
+}
+
+/// One status-sampler tick's phase line, from the byte delta, the file's
+/// size, and the connectable-peer count. Byte-level % only exists when bytes
+/// moved (bigfile pieces); otherwise the phase names what the fetch is doing.
+fn optional_fetch_status(got: u64, file_size: u64, peers: usize, suffix: &str) -> String {
+    if got > 0 {
+        if file_size > 0 {
+            let pct = (got as f64 / file_size as f64 * 100.0).min(99.0);
+            format!("Downloading… {pct:.0}%{suffix}")
+        } else {
+            format!("Downloading…{suffix}")
+        }
+    } else if peers == 0 {
+        format!("Waiting for peers…{suffix}")
+    } else {
+        format!("Fetching from {peers} peer(s)…{suffix}")
+    }
+}
+
 fn compute_optional_state(
     storage: &XiteStorage,
     content: Option<&Value>,
