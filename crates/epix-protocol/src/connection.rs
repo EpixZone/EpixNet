@@ -247,6 +247,7 @@ impl Connection {
         body: &[u8],
         modified: f64,
         diffs: Option<Value>,
+        sender_peers: &[String],
     ) -> Result<Value> {
         let mut fields = vec![
             ("site", Value::from(xite)),
@@ -261,6 +262,16 @@ impl Connection {
         // fetching them back - which they often can't (publisher behind NAT).
         if let Some(diffs) = diffs {
             fields.push(("diffs", diffs));
+        }
+        // Addresses WE can be dialed at (onion/i2p/open clearnet), so the
+        // receiver can fetch the pushed version's files straight from us:
+        // the socket address it sees is useless for that when we sit behind
+        // NAT, and no other peer has the new files yet.
+        if !sender_peers.is_empty() {
+            fields.push((
+                "sender_peers",
+                Value::Array(sender_peers.iter().map(|s| Value::from(s.as_str())).collect()),
+            ));
         }
         self.request("update", vmap(fields)).await
     }

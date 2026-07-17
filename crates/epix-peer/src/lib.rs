@@ -315,7 +315,28 @@ impl Peers {
                 .then(a.connection_errors.cmp(&b.connection_errors))
                 .then(b.time_response.cmp(&a.time_response))
         });
-        peers.into_iter().take(limit).map(|p| p.addr.clone()).collect()
+        if peers.len() <= limit {
+            return peers.into_iter().map(|p| p.addr.clone()).collect();
+        }
+        // Exploit + explore: half the sample follows the ranking, the rest
+        // rotates through the remaining candidates (advancing with time), so
+        // every known peer gets sampled within a bounded number of passes.
+        // Pure ranking starved the tail: a stale-but-responsive peer nets
+        // zero reputation per pass (ConnectOk +1, FileFail -1) and so keeps
+        // its slot forever, while the one peer that actually has a new
+        // version - ranked last if it is overlay-only - never gets dialed.
+        let keep = (limit / 2).max(1);
+        let mut out: Vec<PeerAddr> = peers.iter().take(keep).map(|p| p.addr.clone()).collect();
+        let rest = &peers[keep..];
+        // Advance a full window per minute, so successive retry passes walk
+        // disjoint slices of the tail and the whole registry is covered in
+        // ceil(rest/window) passes rather than one position at a time.
+        let window = (limit - keep).min(rest.len()).max(1);
+        let offset = (((now.max(0) as usize) / 60) * window) % rest.len();
+        for i in 0..window {
+            out.push(rest[(offset + i) % rest.len()].addr.clone());
+        }
+        out
     }
 
     pub fn counts(&self) -> PeerCounts {
@@ -344,6 +365,35 @@ mod tests {
 
     fn ip(s: &str) -> PeerAddr {
         PeerAddr::parse(s).unwrap()
+    }
+
+    #[test]
+    fn selection_rotates_through_the_tail_over_time() {
+        // 30 equal-reputation clearnet peers, one onion peer (ranked last by
+        // net_rank), sample limit 10. With pure ranking the onion never
+        // appeared; the rotation half of the sample must reach it within a
+        // bounded number of minute-spaced passes.
+        let mut peers = Peers::default();
+        for i in 0..30 {
+            peers.add(ip(&format!("10.0.0.{}:15441", i + 1)), 0);
+        }
+        let onion = ip("expyuzz4wqqyqhjn.onion:15441");
+        peers.add(onion.clone(), 0);
+
+        let mut seen_onion = false;
+        let mut all_seen: std::collections::HashSet<String> = Default::default();
+        for pass in 0..8 {
+            let sample = peers.connectable_dialable(10, DialableNets::all(), pass * 60);
+            assert_eq!(sample.len(), 10);
+            for a in &sample {
+                all_seen.insert(a.to_string());
+                if *a == onion {
+                    seen_onion = true;
+                }
+            }
+        }
+        assert!(seen_onion, "the tail-ranked onion peer was never sampled");
+        assert_eq!(all_seen.len(), 31, "every known peer gets a turn across passes");
     }
 
     #[test]

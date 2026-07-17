@@ -33,8 +33,11 @@ pub const DEFAULT_TRACKERS: &[&str] = &[
     "tcp://145.223.69.23:26959",
     "tcp://161.97.147.133:15441",
     "tcp://194.5.98.39:15441",
-    // Reachable over Tor only; skipped automatically while Tor is off.
+    // Reachable over Tor / I2P only; skipped automatically while that
+    // overlay is off.
     "onion://fzlzmxuz2bust72cuy5g4w6d62tx624xcjaupf2kp7ffuitbiniy2hqd.onion:15441",
+    "onion://6m4j2es4wom2xyhlvj4vjmsdsabqascped5d7t7knz3w2ku5hqlywwid.onion:26552",
+    "i2p://tcm7ivyurow2evfz2vom7pq7g6w555pbfoxf74jogwnd3uycwxsa.b32.i2p:26552",
     // Public BitTorrent trackers (hostname form - they survive IP churn).
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",

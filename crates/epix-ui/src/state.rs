@@ -648,6 +648,7 @@ async fn push_update_to_peer(
     body: Arc<Vec<u8>>,
     modified: f64,
     diffs: Option<rmpv::Value>,
+    sender_peers: Arc<Vec<String>>,
 ) -> PushOutcome {
     let deadline = peer.connect_timeout();
     let timeout_peer = peer.clone();
@@ -662,7 +663,7 @@ async fn push_update_to_peer(
             return PushOutcome::Unreachable(peer);
         }
         progressed.store(true, Ordering::Relaxed);
-        if conn.update(&address, &inner_path, &body, modified, diffs).await.is_err() {
+        if conn.update(&address, &inner_path, &body, modified, diffs, &sender_peers).await.is_err() {
             return PushOutcome::Refused(peer);
         }
         // Live-hook: tell the peer (acting as a propagation node) about the
@@ -2697,6 +2698,32 @@ impl AppState {
         self.i2p_address.read().await.clone()
     }
 
+    /// The addresses other nodes can dial US at right now: onion and i2p
+    /// service addresses plus the clearnet ip:port when the port check found
+    /// it open. Stamped onto update pushes (`sender_peers`) so receivers can
+    /// fetch a pushed version's files straight from us - the socket address
+    /// they see is not dialable when we are behind NAT.
+    pub async fn own_dialable_addresses(&self) -> Vec<String> {
+        let port = self.fileserver_port().await;
+        if port == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Some(onion) = self.onion_address().await {
+            out.push(format!("{onion}.onion:{port}"));
+        }
+        if let Some(b32) = self.i2p_address().await {
+            out.push(format!("{b32}.i2p:{port}"));
+        }
+        let (open, ip) = self.port_status().await;
+        if open {
+            if let Some(ip) = ip {
+                out.push(format!("{ip}:{port}"));
+            }
+        }
+        out
+    }
+
     /// Record whether the UI listener bound to loopback (set at serve time).
     pub async fn set_ui_loopback(&self, loopback: bool) {
         *self.ui_loopback.write().await = loopback;
@@ -3467,7 +3494,8 @@ impl AppState {
         )
         .await;
         self.set_worker_stats(key, 0, 0, 0).await;
-        self.apply_peer_outcomes(key, feedback.drain()).await;
+        let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
+        self.absorb_sync_outcomes(key, feedback.drain(), failed_files).await;
         if let Ok(report) = report {
             self.add_transfer(key, report.bytes, 0).await;
         }
@@ -3674,6 +3702,36 @@ impl AppState {
         let i2p = i2p_ready && self.i2p_transport.read().await.is_some();
         let rns = self.rns_transport.read().await.is_some();
         DialableNets { clearnet: true, onion, i2p, rns }
+    }
+
+    /// Apply a sync pass's outcomes and, when files are still missing, log
+    /// one line saying what was tried. Without it a failing fetch is
+    /// invisible: the worker skips bad peers silently and the operator only
+    /// ever saw "N file(s) not yet available" with nothing to go on.
+    async fn absorb_sync_outcomes(
+        &self,
+        key: &str,
+        outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)>,
+        failed_files: usize,
+    ) {
+        if failed_files > 0 {
+            use epix_worker::PeerOutcome as O;
+            let peers_tried: std::collections::HashSet<String> =
+                outcomes.iter().map(|(p, _)| p.to_string()).collect();
+            let count = |o: O| outcomes.iter().filter(|(_, x)| *x == o).count();
+            self.log(
+                "INFO",
+                format!(
+                    "Fetch pass for {key}: {failed_files} file(s) still missing after {} peer(s) tried ({} connect failures, {} file failures, {} files ok)",
+                    peers_tried.len(),
+                    count(O::ConnectFail),
+                    count(O::FileFail),
+                    count(O::FileOk),
+                ),
+            )
+            .await;
+        }
+        self.apply_peer_outcomes(key, outcomes).await;
     }
 
     /// Apply a sync pass's per-peer outcomes (drained from an
@@ -7301,7 +7359,7 @@ impl AppState {
     /// place, and progress pushed to the xite's pages (EpixNet's publish
     /// progress bar). Returns how many peers accepted it. `sitePublish`.
     pub async fn publish(
-        &self,
+        self: &Arc<Self>,
         address: &str,
         inner_path: &str,
         origin: Option<u64>,
@@ -7327,7 +7385,7 @@ impl AppState {
     /// progress events, to the originating connection only when known
     /// (EpixNet's `self.cmd("progress", …)`), else to the xite's pages.
     pub async fn publish_to(
-        &self,
+        self: &Arc<Self>,
         address: &str,
         inner_path: &str,
         limit: usize,
@@ -7374,6 +7432,11 @@ impl AppState {
         // candidates share one buffer instead of cloning a possibly-MB
         // content.json per dial.
         let body = Arc::new(body);
+        // Stamp every push with the addresses we can be dialed back at, so
+        // receivers behind the usual "publisher is the only seed" wall can
+        // fetch the new files from us over onion/i2p even when our clearnet
+        // port is closed.
+        let sender_peers = Arc::new(self.own_dialable_addresses().await);
         let mut run = PublishRun { origin: progress, published: 0, done: 0, attempted: 0 };
         self.publish_progress(address, &run, total.min(limit.max(1)));
 
@@ -7391,7 +7454,7 @@ impl AppState {
                 continue;
             }
             run.attempted += batch.len();
-            self.push_batch(address, inner_path, batch, &body, modified, &wire_diffs, &transport, &mut run)
+            self.push_batch(address, inner_path, batch, &body, modified, &wire_diffs, &sender_peers, &transport, &mut run)
                 .await;
             // One batch with any acceptor is enough: the accepted push
             // re-broadcasts peer-to-peer, and the remaining candidates get
@@ -7429,13 +7492,18 @@ impl AppState {
         if target == 0 {
             return;
         }
+        // No dial counters: how many of the first batch answered is plumbing,
+        // not progress the author cares about. One acceptance means the
+        // network has the update (acceptors that commit re-gossip it), so
+        // the message flips to done at the first success.
+        let message = if run.published > 0 {
+            "Changes published to the network."
+        } else {
+            "Publishing changes to the network..."
+        };
         self.push_event_routed(
             "progress",
-            json!([
-                "publish",
-                format!("Content published to {}/{target} peers.", run.published),
-                (100 * run.done / target) as i64,
-            ]),
+            json!(["publish", message, (100 * run.done / target) as i64]),
             None,
             Some(address.to_string()),
             None,
@@ -7451,13 +7519,14 @@ impl AppState {
     /// progress streams per completion.
     #[allow(clippy::too_many_arguments)]
     async fn push_batch(
-        &self,
+        self: &Arc<Self>,
         address: &str,
         inner_path: &str,
         batch: Vec<PeerAddr>,
         body: &Arc<Vec<u8>>,
         modified: f64,
         wire_diffs: &Option<rmpv::Value>,
+        sender_peers: &Arc<Vec<String>>,
         transport: &Arc<dyn Transport>,
         run: &mut PublishRun,
     ) {
@@ -7471,6 +7540,7 @@ impl AppState {
                 body.clone(),
                 modified,
                 wire_diffs.clone(),
+                sender_peers.clone(),
             ));
         }
         let mut outcomes = Vec::new();
@@ -7486,6 +7556,26 @@ impl AppState {
                 outcomes.push((peer, score));
             }
             self.publish_progress(address, run, run.attempted);
+            // One acceptance is enough for the author: the acceptor gossips
+            // the update onward (it re-publishes on commit) and the periodic
+            // sync covers stragglers. Stop holding the page's sitePublish
+            // reply and let the remaining in-flight dials finish - and feed
+            // the peer registry - in the background.
+            if run.published > 0 && !set.is_empty() {
+                let state = self.clone();
+                let addr = address.to_string();
+                tokio::spawn(async move {
+                    let mut outcomes = Vec::new();
+                    while let Some(res) = set.join_next().await {
+                        if let Ok(outcome) = res {
+                            let (peer, score, _) = outcome.feedback();
+                            outcomes.push((peer, score));
+                        }
+                    }
+                    state.apply_peer_outcomes(&addr, outcomes).await;
+                });
+                break;
+            }
         }
         self.apply_peer_outcomes(address, outcomes).await;
         if !failed.is_empty() {
@@ -7513,6 +7603,7 @@ impl AppState {
         modified_hint: Option<f64>,
         sender: Option<PeerAddr>,
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+        sender_peers: Vec<PeerAddr>,
     ) -> Result<InboundUpdate, String> {
         // A xite may be served under aliases (raw address + `.epix` name); an
         // update applies to every key sharing the pushed canonical address.
@@ -7676,6 +7767,12 @@ impl AppState {
         if let Some(s) = &sender {
             self.add_peers(&key, [s.clone()]).await;
         }
+        // Register the publisher's self-declared dialable addresses too, so
+        // even a later retry pass (after this fetch, or after a restart) can
+        // reach the one node that has the new files.
+        if !sender_peers.is_empty() {
+            self.add_peers(&key, sender_peers.iter().cloned()).await;
+        }
 
         // Download the changed files and re-publish in the background, like
         // EpixNet - the sender gets its "ok" response right away.
@@ -7686,7 +7783,17 @@ impl AppState {
         let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
         tokio::spawn(async move {
             state
-                .finish_inbound_update(keys, xite, sender, inner, uri, diffs, child_files, root_bytes)
+                .finish_inbound_update(
+                    keys,
+                    xite,
+                    sender,
+                    sender_peers,
+                    inner,
+                    uri,
+                    diffs,
+                    child_files,
+                    root_bytes,
+                )
                 .await;
         });
         Ok(InboundUpdate::Applied)
@@ -7725,10 +7832,11 @@ impl AppState {
     /// (else defer it for retry and keep serving the previous version), and
     /// re-publish to a few peers so the update spreads.
     async fn finish_inbound_update(
-        &self,
+        self: &Arc<Self>,
         keys: Vec<String>,
         xite: Xite,
         sender: Option<PeerAddr>,
+        sender_peers: Vec<PeerAddr>,
         inner_path: String,
         uri: String,
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
@@ -7777,6 +7885,21 @@ impl AppState {
                     peers.insert(0, s);
                 }
             }
+            // Even before the sender's wire address: the addresses the
+            // publisher SAYS it is dialable at (onion/i2p/open clearnet).
+            // For a NAT'd publisher these are the only routes to the new
+            // files. Own addresses are dropped (a lone seeder must not dial
+            // itself) and so are networks we cannot dial right now.
+            let nets = self.dialable_networks().await;
+            for sp in sender_peers.into_iter().rev() {
+                if nets.can_dial(&sp)
+                    && epix_peer::Peer::new(sp.clone(), 0).is_connectable()
+                    && !self.is_own_peer(&sp).await
+                    && !peers.contains(&sp)
+                {
+                    peers.insert(0, sp);
+                }
+            }
             // The files to fetch: for a root push, whatever the new root
             // declares and we lack; for a child push, the child's declared
             // files that are missing or stale.
@@ -7794,7 +7917,7 @@ impl AppState {
                 self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
                     .await;
                 let feedback = epix_worker::CollectFeedback::new();
-                if let Ok(report) = epix_worker::sync_files_list(
+                let report = epix_worker::sync_files_list(
                     needed,
                     &xite,
                     &peers,
@@ -7803,12 +7926,13 @@ impl AppState {
                     None,
                     Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
                 )
-                .await
-                {
+                .await;
+                let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
+                if let Ok(report) = &report {
                     self.add_transfer(&key, report.bytes, 0).await;
                 }
                 self.set_worker_stats(&key, 0, 0, 0).await;
-                self.apply_peer_outcomes(&key, feedback.drain()).await;
+                self.absorb_sync_outcomes(&key, feedback.drain(), failed_files).await;
                 if child_files.is_some() {
                     // Child data files (user posts) feed the db per file, so
                     // open pages see them without a full rebuild.

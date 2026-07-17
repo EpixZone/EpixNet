@@ -1863,10 +1863,14 @@ impl WsCommand for SitePublish {
         // responds "ok"; the peer count arrives as a notification - to the
         // publishing page only, like EpixNet's self.cmd).
         if published > 0 {
+            // One acceptance means the network has it: the acceptor
+            // re-gossips on commit and the periodic sync covers the rest,
+            // while the remaining dials of the batch finish in the
+            // background. A peer count here would just be dial plumbing.
             s.state.push_notification_to(
                 s.id,
                 "done",
-                &format!("Content published to {published} peers."),
+                "Changes published. They will spread through the network.",
                 5000,
             );
         } else {
