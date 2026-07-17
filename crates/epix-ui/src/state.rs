@@ -6230,7 +6230,11 @@ impl AppState {
                 "enabled": i2p_enabled,
                 "reachable": i2p_reachable,
                 "phase": i2p_str("phase"),
-                "address": i2p_b32.map(|b| format!("{b}.i2p")),
+                // The runtime's status carries the session's full
+                // `<hash>.b32.i2p` (epix-runtime feeds `s.b32` verbatim);
+                // normalize instead of appending blindly so neither feed
+                // shape renders a doubled `.i2p.i2p`.
+                "address": i2p_b32.map(|b| if b.ends_with(".i2p") { b } else { format!("{b}.i2p") }),
             },
         })
     }
