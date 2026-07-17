@@ -51,7 +51,7 @@ fn as_u64(v: &Value) -> Option<u64> {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
     let name = args.next().unwrap_or_else(|| "quasin".to_string());
     let tld = args.next().unwrap_or_else(|| "epix".to_string());
     let rpc = args.next().unwrap_or_else(|| DEFAULT_RPC.to_string());

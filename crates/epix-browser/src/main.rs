@@ -78,9 +78,11 @@ fn main() {
     // "open at login" mode). The user opens the browser from the tray. Any
     // other non-flag argument is the launch target (a xite name / epix:// URL).
     // These are the launch target and a mode flag, not used for any security
-    // decision.
-    // nosemgrep: rust.lang.security.args.args
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // decision; argv[0] is skipped. args_os + lossy, not args(): args() PANICS
+    // on a non-Unicode argument (e.g. raw bytes through a .desktop `%u`
+    // handoff), whereas a mangled target just falls back to the dashboard.
+    let args: Vec<String> =
+        std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let background = args.iter().any(|a| a == "--background");
     let raw_arg = args
         .iter()
@@ -547,6 +549,10 @@ fn windows_firefox_candidates() -> Vec<PathBuf> {
 
 /// A Firefox bundled next to this launcher inside our `.app` / install dir.
 fn bundled_firefox() -> Option<PathBuf> {
+    // Exec plumbing, not a trust decision: current_exe comes from the kernel
+    // (not argv[0]), and anyone able to replace files in the install dir
+    // already runs code as this user.
+    // nosemgrep: rust.lang.security.current-exe.current-exe
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?; // .../Contents/MacOS
     // macOS: ../Resources/firefox/<Firefox…>.app/Contents/MacOS/firefox

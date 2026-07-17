@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect(); // nosemgrep: rust.lang.security.args.args
     let [site_dir, address, privkey, peer] = &args[..4] else {
         eprintln!("usage: interop_push <site_dir> <address> <privkey_wif> <ip:port> [<html>]");
         std::process::exit(2);

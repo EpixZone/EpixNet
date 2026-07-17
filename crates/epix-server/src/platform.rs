@@ -33,6 +33,9 @@ pub fn acquire_lock(root: &std::path::Path) -> Result<InstanceLock, ()> {
             .open(&path)
             .map_err(|_| ())?;
         // Non-blocking exclusive lock; EWOULDBLOCK means another node holds it.
+        // SAFETY: plain FFI on a raw fd borrowed from `file`, which is open and
+        // outlives the call; flock reads no memory through the fd.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             return Err(());

@@ -41,7 +41,7 @@ fn recv(stream: &mut TcpStream) -> Value {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1); // nosemgrep: rust.lang.security.args.args
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:20790".to_string());
     let site = args
         .next()

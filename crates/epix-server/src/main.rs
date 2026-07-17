@@ -30,8 +30,21 @@ fn ui_bind() -> String {
 async fn main() {
     // CLI actions (siteCreate, siteSign, peerPing, ...) run and exit; the
     // action name is the first argument, Python-CLI style. Anything else is
-    // a xite target and starts the node.
-    let cli: Vec<String> = std::env::args().skip(1).collect();
+    // a xite target and starts the node. argv[0] is skipped, never trusted.
+    // args_os, not args: args() PANICS on a non-Unicode argument, and this
+    // CLI takes file paths (importBundle) that need not be valid UTF-8 -
+    // fail those with a clean usage error instead.
+    let cli: Vec<String> = match std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(args) => args,
+        Err(bad) => {
+            eprintln!("Argument is not valid Unicode: {bad:?}");
+            std::process::exit(2);
+        }
+    };
     // Guard the conventional flags: without this, `--help` would be taken for
     // a xite target and boot a full node against the real data dir.
     match cli.first().map(String::as_str) {

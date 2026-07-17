@@ -80,10 +80,14 @@ pub fn write_conf_data_dir(conf: &Path, dir: Option<&Path>) -> std::io::Result<(
 }
 
 fn home() -> PathBuf {
+    // temp_dir is the last resort for a degenerate environment (HOME and
+    // USERPROFILE both unset). Windows temp is per-user; on unix a shared
+    // /tmp data root beats refusing to start, and operators in such
+    // environments set EPIX_DATA_DIR explicitly instead.
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir())
+        .unwrap_or_else(|_| std::env::temp_dir()) // nosemgrep: rust.lang.security.temp-dir.temp-dir
 }
 
 #[cfg(test)]
