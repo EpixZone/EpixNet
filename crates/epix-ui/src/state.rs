@@ -5536,7 +5536,7 @@ impl AppState {
         // Connections, split by network so the mix is visible at a glance.
         let _ = write!(
             h,
-            "<h2>Connections ({} live - clearnet: {}, tor: {}, i2p: {})</h2>             <table><tr><th>peer</th><th>type</th><th>version</th><th>protocol</th><th>crypt</th><th>ping</th></tr>",
+            "<h2>Connections ({} live - clearnet: {}, tor: {}, i2p: {})</h2>             <table><tr><th>peer</th><th>type</th><th>version</th><th>protocol</th><th>ping</th></tr>",
             stats.total, stats.clearnet, stats.onion, stats.i2p
         );
         // What the handshake told us about each peer (Phase 6): the node
@@ -5550,31 +5550,25 @@ impl AppState {
                 PeerAddr::Rns(_) => "mesh",
                 PeerAddr::Ip(_) => "ip",
             };
-            let (version, protocol, crypt) = match &detail.peer {
+            let (version, protocol) = match &detail.peer {
                 Some(p) => (
                     if p.version.is_empty() { "-".to_string() } else { p.version.clone() },
                     if p.protocol.is_empty() { "-".to_string() } else { p.protocol.clone() },
-                    if p.crypt_supported.is_empty() {
-                        "-".to_string()
-                    } else {
-                        p.crypt_supported.join(", ")
-                    },
                 ),
-                None => ("-".into(), "-".into(), "-".into()),
+                None => ("-".into(), "-".into()),
             };
             let _ = write!(
                 h,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&detail.addr.to_string()),
                 kind,
                 esc(&version),
                 esc(&protocol),
-                esc(&crypt),
                 ping
             );
         }
         if stats.total == 0 {
-            h.push_str("<tr><td colspan=6 class='muted'>no live connections</td></tr>");
+            h.push_str("<tr><td colspan=5 class='muted'>no live connections</td></tr>");
         }
         h.push_str("</table>");
 
