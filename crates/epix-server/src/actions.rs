@@ -319,6 +319,19 @@ async fn dispatch(
 /// `Ok(None)` means the node is not running (no socket to connect to), so the
 /// caller falls back to an offline data-dir operation. `Ok(Some(value))` is the
 /// command's result. A command-level failure comes back as `Err`.
+///
+/// Windows has no admin socket (the server side is Unix-only), so this always
+/// reports the node as absent and the caller takes the offline path.
+#[cfg(not(unix))]
+async fn admin_call(
+    _data_root: &std::path::Path,
+    _cmd: &str,
+    _params: serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    Ok(None)
+}
+
+#[cfg(unix)]
 async fn admin_call(
     data_root: &std::path::Path,
     cmd: &str,
