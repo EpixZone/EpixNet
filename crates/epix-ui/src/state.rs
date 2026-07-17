@@ -5552,11 +5552,7 @@ impl AppState {
             };
             let (version, protocol, crypt) = match &detail.peer {
                 Some(p) => (
-                    if p.version.is_empty() {
-                        "-".to_string()
-                    } else {
-                        format!("{} (rev{})", p.version, p.rev)
-                    },
+                    if p.version.is_empty() { "-".to_string() } else { p.version.clone() },
                     if p.protocol.is_empty() { "-".to_string() } else { p.protocol.clone() },
                     if p.crypt_supported.is_empty() {
                         "-".to_string()
