@@ -7915,8 +7915,10 @@ impl AppState {
         // Apply diffs first: patch our old copy of each changed file and keep it
         // only if the result matches the new content.json's declared hash. A
         // bad/mismatched diff is ignored - the file just gets downloaded below.
+        // `arrived` collects every file this update landed (patched here,
+        // downloaded below) for the db ingest at the end.
+        let mut arrived: Vec<String> = Vec::new();
         if !diffs.is_empty() {
-            let mut patched = 0;
             for (file_path, actions) in &diffs {
                 let full = format!("{diff_dir}{file_path}");
                 let info = match &child_files {
@@ -7932,11 +7934,11 @@ impl AppState {
                 if XiteStorage::hash_bytes(&new) == info.sha512
                     && xite.storage.write(&full, &new).is_ok()
                 {
-                    patched += 1;
+                    arrived.push(full);
                 }
             }
-            if patched > 0 {
-                self.log("INFO", format!("Applied {patched} diff(s) for {key}")).await;
+            if !arrived.is_empty() {
+                self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
             }
         }
         if let Some(transport) = self.transport.read().await.clone() {
@@ -7997,14 +7999,19 @@ impl AppState {
                 }
                 self.set_worker_stats(&key, 0, 0, 0).await;
                 self.absorb_sync_outcomes(&key, feedback.drain(), failed_files).await;
-                if child_files.is_some() {
-                    // Child data files (user posts) feed the db per file, so
-                    // open pages see them without a full rebuild.
-                    for path in needed_paths {
-                        if xite.storage.exists(&path) {
-                            self.ingest_file_from(&key, &path, None).await;
-                        }
-                    }
+                arrived.extend(needed_paths);
+            }
+        }
+        if child_files.is_some() {
+            // Child data files (user posts) feed the db per file, so open
+            // pages see them without a full rebuild - the downloaded files
+            // AND the diff-patched ones. A patched file never enters the
+            // download list (it already verifies against the new hash), so
+            // ingesting only downloads left a pushed post on disk but
+            // invisible to queries until a restart rebuilt the db.
+            for path in &arrived {
+                if xite.storage.exists(path) {
+                    self.ingest_file_from(&key, path, None).await;
                 }
             }
         }
@@ -9749,6 +9756,121 @@ mod tests {
 
         // A file outside the db dir is ignored without error.
         state.ingest_file(addr, "index.html").await;
+    }
+
+    /// A pushed user-content update whose data file arrives as a DIFF PATCH
+    /// (not a download) must still be ingested into the xite db. The patched
+    /// file verifies against the pushed content.json, so the download list
+    /// skips it - and before the fix so did the ingest, leaving a published
+    /// reply on disk but invisible in the UI until a restart rebuilt the db.
+    #[tokio::test]
+    async fn inbound_diff_patched_data_file_is_ingested_into_the_db() {
+        let site_pk = epix_crypt::new_seed();
+        let site_addr = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let user_pk = epix_crypt::new_seed();
+        let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let user_dir = format!("data/users/{user_addr}");
+
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Talk","db_file":"data/users/talk.db","version":2,
+                     "maps": { ".+/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        // The user_contents parent whose rules the pushed child verifies against.
+        let parent = json!({
+            "address": site_addr,
+            "inner_path": "data/users/content.json",
+            "user_contents": {
+                "cert_signers": {},
+                "permissions": {},
+                "permission_rules": { ".*": { "max_size": 100000 } },
+            },
+        });
+        storage
+            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .unwrap();
+
+        // v1 on disk: one post, declared by the user's signed content.json.
+        let data_v1: &[u8] = br#"{ "posts": [ {"post_id":1,"title":"First"} ] }"#;
+        storage.write(&format!("{user_dir}/data.json"), data_v1).unwrap();
+        let mut c1 = json!({
+            "address": site_addr,
+            "inner_path": format!("{user_dir}/content.json"),
+            "modified": 1000,
+            "files": { "data.json": { "size": data_v1.len(), "sha512": XiteStorage::hash_bytes(data_v1) } },
+        });
+        epix_content::sign(&mut c1, &user_pk).unwrap();
+        storage
+            .write(&format!("{user_dir}/content.json"), &serde_json::to_vec(&c1).unwrap())
+            .unwrap();
+
+        let root = json!({ "address": site_addr, "modified": 1.0, "files": {} });
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &site_addr,
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(root) },
+            )
+            .await;
+
+        // v2 adds a reply; the publisher pushes the new signed content.json
+        // with a DIFF for data.json (what publish sends after a local edit).
+        let data_v2: &[u8] =
+            br#"{ "posts": [ {"post_id":1,"title":"First"}, {"post_id":2,"title":"Reply"} ] }"#;
+        let mut c2 = json!({
+            "address": site_addr,
+            "inner_path": format!("{user_dir}/content.json"),
+            "modified": 2000,
+            "files": { "data.json": { "size": data_v2.len(), "sha512": XiteStorage::hash_bytes(data_v2) } },
+        });
+        epix_content::sign(&mut c2, &user_pk).unwrap();
+        let mut diffs = HashMap::new();
+        diffs.insert(
+            "data.json".to_string(),
+            epix_content::diff::diff(data_v1, data_v2, Some(30 * 1024)).unwrap(),
+        );
+
+        let applied = state
+            .apply_inbound_update(
+                &site_addr,
+                &format!("{user_dir}/content.json"),
+                Some(serde_json::to_vec(&c2).unwrap()),
+                None,
+                None,
+                diffs,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, InboundUpdate::Applied);
+
+        // finish_inbound_update runs in the background. No transport is
+        // installed, so the file can ONLY arrive by the diff patch - poll the
+        // db until the ingest lands (or fail the test on timeout).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows = state
+                .db_query(&site_addr, "SELECT title FROM post ORDER BY post_id", &Value::Null)
+                .await
+                .unwrap();
+            if rows.len() == 2 {
+                assert_eq!(rows[1]["title"], "Reply");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "diff-patched data.json was never ingested; db rows: {rows:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // It really did arrive by patch: the bytes match v2 exactly.
+        let on_disk = XiteStorage::new(dir.path()).read(&format!("{user_dir}/data.json")).unwrap();
+        assert_eq!(on_disk, data_v2);
     }
 
     #[tokio::test]
