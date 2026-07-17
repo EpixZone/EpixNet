@@ -8712,6 +8712,12 @@ impl AppState {
         self.set_worker_stats(address, 0, 0, 0).await;
         if fetched > 0 {
             self.persist_sites().await; // optional_downloaded accounting
+            // Snapshot the chart now instead of waiting up to a full sample
+            // interval (~5 min): a user who just pulled a multi-MB optional
+            // file expects the Stats download graph to move right away, not
+            // minutes later. record() stores the delta and advances its
+            // baseline, so the next scheduled snapshot isn't double-counted.
+            self.collect_chart().await;
         }
         self.push_site_info(address).await;
         self.log(
