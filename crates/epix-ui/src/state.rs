@@ -477,6 +477,10 @@ pub struct AppState {
     /// ([`Self::download_optional_files`]), so overlapping triggers (the
     /// sidebar toggle plus a resync tick) don't walk the same site twice.
     optional_downloads_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Xites already asked (this session) whether to enable optional-file
+    /// downloads, so a retrying `<video>` tag can't spam the wrapper confirm.
+    /// Cleared when the toggle is switched off, so a later request re-asks.
+    optional_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Per-file locks keyed by `(address, inner_path)` so concurrent
     /// `file_need`s for the same file download it once: later callers wait on
     /// the first, then hit the verified-on-disk early return. Entries are
@@ -901,6 +905,7 @@ impl AppState {
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1020,6 +1025,7 @@ impl AppState {
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1771,8 +1777,15 @@ impl AppState {
         // Restore optional-file pins persisted by OptionalManager.
         let pinned = self.load_persisted_pins(&canonical);
         // Seed the optional-file hashfield from what's already on disk, so we
-        // advertise held optional files immediately (getHashfield/findHashIds).
-        let hashfield = compute_hashfield(&entry.storage, entry.content.as_ref());
+        // advertise held optional files immediately (getHashfield/findHashIds)
+        // - and recompute the downloaded-bytes counter from the same walk, so
+        // the sidebar's "Downloaded" figure heals itself instead of trusting
+        // a stale sites.json. (Piecewise-partial bigfiles re-count on their
+        // next fetch pass; whole files are the common case.)
+        let (hashfield, optional_on_disk) =
+            compute_optional_state(&entry.storage, entry.content.as_ref());
+        let mut settings = settings;
+        settings.optional_downloaded = optional_on_disk;
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -8437,6 +8450,68 @@ impl AppState {
         found
     }
 
+    /// Whether optional files may be fetched for this xite: either toggle -
+    /// "Download optional files" or "Help distribute all files" - grants it.
+    pub async fn optional_fetch_allowed(&self, address: &str) -> bool {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.download_optional || x.settings.autodownloadoptional)
+            .unwrap_or(false)
+    }
+
+    /// Set a xite's on-demand optional-downloads flag (`siteSetDownloadoptional`,
+    /// the sidebar's "Download optional files" toggle - also granted by the
+    /// wrapper prompt). Unlike [`Self::set_autodownloadoptional`] this fetches
+    /// nothing by itself: pages pull what they need once it is on.
+    pub async fn set_download_optional(&self, address: &str, on: bool) -> bool {
+        let found = match self.xites.write().await.get_mut(address) {
+            Some(x) => {
+                x.settings.download_optional = on;
+                true
+            }
+            None => false,
+        };
+        if found {
+            self.persist_sites().await;
+            if !on {
+                // Re-arm the one-per-session prompt: switching the toggle off
+                // means a later page request should get to ask again.
+                self.optional_prompts.lock().unwrap().remove(address);
+            }
+        }
+        found
+    }
+
+    /// A page asked for an optional file while downloads are off: ask the user
+    /// ONCE per xite per session through the wrapper confirm (the opt-in
+    /// prompt EpixNet's Python client had). Accepting turns
+    /// `download_optional` on and fetches the file that prompted the question;
+    /// declining stays quiet until the next session (or toggle flip).
+    pub fn prompt_optional_download(self: &Arc<Self>, address: &str, inner_path: &str, size: i64) {
+        if !self.optional_prompts.lock().unwrap().insert(address.to_string()) {
+            return;
+        }
+        let state = self.clone();
+        let address = address.to_string();
+        let inner_path = inner_path.to_string();
+        tokio::spawn(async move {
+            let name = inner_path.rsplit('/').next().unwrap_or(&inner_path);
+            let name = name.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            let body = format!(
+                "This xite wants to download an optional file: <b>{name}</b> \
+                 ({:.1} MB).<br>Enable optional file downloads for this xite?",
+                size as f64 / (1024.0 * 1024.0)
+            );
+            if state.confirm(&address, &body, "Download").await {
+                state.set_download_optional(&address, true).await;
+                let _ = state.file_need(&address, &inner_path).await;
+                state.push_site_info(&address).await;
+            }
+        });
+    }
+
     /// Background-fetch missing optional files with a completion notification -
     /// the websocket commands behind the sidebar toggle and `optionalHelp`
     /// return immediately while this runs.
@@ -9247,19 +9322,39 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 /// `.epix` alias shares one grant), otherwise the serving key.
 /// Build the optional-file hashfield from what's present on disk: for each
 /// `files_optional` entry we actually hold (hash-verified), record its hash id.
-fn compute_hashfield(storage: &XiteStorage, content: Option<&Value>) -> epix_xite::Hashfield {
+/// Everything optional already on disk: the hashfield to advertise
+/// (getHashfield/findHashIds) and the byte total behind the sidebar's
+/// "Downloaded" figure. Covers the root's `files_optional` AND every stored
+/// child content.json's (per-user optional files) - the root-only walk left
+/// child files out of the hashfield, so peers never learned we held them.
+fn compute_optional_state(
+    storage: &XiteStorage,
+    content: Option<&Value>,
+) -> (epix_xite::Hashfield, i64) {
     let mut hf = epix_xite::Hashfield::new();
-    let Some(files) = content.and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
-    else {
-        return hf;
-    };
-    for (path, info) in files {
-        let Some(sha512) = info.get("sha512").and_then(|v| v.as_str()) else { continue };
-        if storage.verify(path, sha512) {
-            hf.add_hash(sha512);
+    let mut bytes = 0i64;
+    let mut scan = |files: Option<&Value>, dir: &str| {
+        let Some(files) = files.and_then(|f| f.as_object()) else { return };
+        for (rel, info) in files {
+            let Some(sha512) = info.get("sha512").and_then(|v| v.as_str()) else { continue };
+            let path = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+            if storage.verify(&path, sha512) {
+                hf.add_hash(sha512);
+                bytes += info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+            }
         }
+    };
+    scan(content.and_then(|c| c.get("files_optional")), "");
+    for child in walk_content_json(storage.root()) {
+        if child == "content.json" {
+            continue; // the root was scanned from memory above
+        }
+        let Ok(raw) = storage.read(&child) else { continue };
+        let Ok(json) = serde_json::from_slice::<Value>(&raw) else { continue };
+        let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        scan(json.get("files_optional"), dir);
     }
-    hf
+    (hf, bytes)
 }
 
 fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
@@ -10224,6 +10319,64 @@ mod tests {
         // It really did arrive by patch: the bytes match v2 exactly.
         let on_disk = XiteStorage::new(dir.path()).read(&format!("{user_dir}/data.json")).unwrap();
         assert_eq!(on_disk, data_v2);
+    }
+
+    /// The two-toggle model: on-demand optional fetches are opt-in
+    /// (`download_optional`), help-distribute implies them, disabling re-arms
+    /// the one-per-session prompt, and the sidebar's Downloaded counter
+    /// recomputes from disk at registration (root + child declarations) so it
+    /// can't stick at 0 with the files present.
+    #[tokio::test]
+    async fn optional_optin_gate_and_disk_recount() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let video: &[u8] = b"video-bytes";
+        storage.write("video.webm", video).unwrap();
+        // A child-declared optional file on disk counts (and is advertised) too.
+        let avatar: &[u8] = b"png";
+        storage.write("data/users/alice/avatar.png", avatar).unwrap();
+        storage
+            .write(
+                "data/users/alice/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": {
+                        "avatar.png": { "size": avatar.len(), "sha512": XiteStorage::hash_bytes(avatar) }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0, "files": {},
+            "files_optional": {
+                "video.webm": { "size": video.len(), "sha512": XiteStorage::hash_bytes(video) },
+                "missing.bin": { "size": 99, "sha512": "ab" },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        {
+            let xites = state.xites.read().await;
+            let x = xites.get(addr.as_str()).unwrap();
+            assert_eq!(
+                x.settings.optional_downloaded,
+                (video.len() + avatar.len()) as i64,
+                "counter recomputed from disk, root + child files"
+            );
+            assert!(
+                x.hashfield.has_hash(&XiteStorage::hash_bytes(avatar)),
+                "child optional file advertised in the hashfield"
+            );
+        }
+
+        assert!(!state.optional_fetch_allowed(addr).await, "opt-in: off by default");
+        assert!(state.set_download_optional(addr, true).await);
+        assert!(state.optional_fetch_allowed(addr).await);
+        assert!(state.set_download_optional(addr, false).await);
+        assert!(!state.optional_fetch_allowed(addr).await);
+        assert!(state.set_autodownloadoptional(addr, true).await);
+        assert!(state.optional_fetch_allowed(addr).await, "help-distribute implies downloads");
     }
 
     /// The Files tab's data contract: optionalFileList carries the per-file

@@ -82,6 +82,12 @@ pub struct XiteSettings {
     pub size_limit: Option<i64>,
     #[serde(default)]
     pub autodownloadoptional: bool,
+    /// Optional files may be fetched on demand for this xite (the sidebar's
+    /// "Download optional files" toggle, also granted through the wrapper
+    /// prompt the first time a page asks for one). `autodownloadoptional`
+    /// (help distribute = fetch everything) implies this.
+    #[serde(default)]
+    pub download_optional: bool,
     /// Directories the user opted to help distribute (optionalHelp):
     /// `{dir_prefix: title}`. Files under these auto-download like
     /// autodownloadoptional does for the whole site.
@@ -118,6 +124,7 @@ impl XiteSettings {
             modified_files_notification: None,
             size_limit: None,
             autodownloadoptional: false,
+            download_optional: false,
             optional_help: Map::new(),
             favorite: false,
             wrapper_key: epix_crypt::new_seed(),

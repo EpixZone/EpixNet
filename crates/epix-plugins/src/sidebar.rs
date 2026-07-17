@@ -170,6 +170,9 @@ fn render_sidebar(
     let serving = info["settings"]["serving"].as_bool().unwrap_or(true);
     let favorite = info["settings"]["favorite"].as_bool().unwrap_or(false);
     let autodownload = info["settings"]["autodownloadoptional"].as_bool().unwrap_or(false);
+    // Help-distribute implies on-demand downloads, so its checkbox shows on.
+    let download_optional =
+        info["settings"]["download_optional"].as_bool().unwrap_or(false) || autodownload;
     let size_optional = info["settings"]["size_optional"].as_i64().unwrap_or(0);
     let optional_downloaded = info["settings"]["optional_downloaded"].as_i64().unwrap_or(0);
     let bad_files = info["settings"]["cache"]["bad_files"].as_object().map(|m| m.len()).unwrap_or(0);
@@ -267,9 +270,12 @@ fn render_sidebar(
               <li class='color-green'><span>Downloaded:</span><b>{opt_dl_mb:.2}MB</b></li>\
               <li class='color-black'><span>Total optional:</span><b>{opt_mb:.2}MB</b></li>\
              </ul>\
+             <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-downloadoptional' {dl_checked}/>\
+              <div class='checkbox-skin'></div> Download optional files</label>\
              <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-autodownloadoptional' {opt_checked}/>\
-              <div class='checkbox-skin'></div> Download and help distribute all files</label></li>",
+              <div class='checkbox-skin'></div> Help distribute all files</label></li>",
             dl_w = pct(opt_dl_mb, opt_mb),
+            dl_checked = if download_optional { "checked='checked'" } else { "" },
             opt_checked = if autodownload { "checked='checked'" } else { "" },
         ));
     }

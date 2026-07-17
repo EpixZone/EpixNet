@@ -1180,7 +1180,17 @@ window.initScrollable = function () {
       })(this));
       this.tag.find("#checkbox-autodownloadoptional").off("click touchend").on("click touchend", (function(_this) {
         return function() {
-          return _this.wrapper.ws.cmd("siteSetAutodownloadoptional", [_this.tag.find("#checkbox-autodownloadoptional").is(":checked")]);
+          var checked = _this.tag.find("#checkbox-autodownloadoptional").is(":checked");
+          if (checked) {
+            // Help distribute implies on-demand downloads; reflect it live.
+            _this.tag.find("#checkbox-downloadoptional").prop("checked", true);
+          }
+          return _this.wrapper.ws.cmd("siteSetAutodownloadoptional", [checked]);
+        };
+      })(this));
+      this.tag.find("#checkbox-downloadoptional").off("click touchend").on("click touchend", (function(_this) {
+        return function() {
+          return _this.wrapper.ws.cmd("siteSetDownloadoptional", [_this.tag.find("#checkbox-downloadoptional").is(":checked")]);
         };
       })(this));
       this.tag.find("#button-identity").off("click touchend").on("click touchend", (function(_this) {
