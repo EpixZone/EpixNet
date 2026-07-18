@@ -30,6 +30,20 @@ NMH="$REPO_ROOT/target/release/epix-nmh"
 [ -x "$LAUNCHER" ] || { echo "missing $LAUNCHER"; exit 1; }
 [ -x "$NMH" ] || { echo "missing $NMH"; exit 1; }
 
+# The shipped binaries must only load system libraries. A Homebrew/MacPorts
+# dylib path baked in here (e.g. liblzma from pkg-config) makes the app crash
+# at launch on every Mac that doesn't have that exact library installed.
+for bin in "$LAUNCHER" "$NMH"; do
+  bad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+        | grep -v -e '^/usr/lib/' -e '^/System/' -e '^@' || true)"
+  if [ -n "$bad" ]; then
+    echo "error: $bin links non-system libraries that won't exist on user machines:"
+    echo "$bad" | sed 's/^/  /'
+    echo "hint: rebuild without EPIX_SKIP_BUILD; liblzma must be static (see epix-tor/Cargo.toml)"
+    exit 1
+  fi
+done
+
 # Pick a Firefox to bundle: explicit override, a fetched ESR (fetch-firefox-esr.sh),
 # else prefer an installed ESR > Developer > release (the launcher enables the
 # extension only on ESR/Developer/Nightly).
