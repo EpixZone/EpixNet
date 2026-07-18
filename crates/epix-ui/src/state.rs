@@ -5022,8 +5022,9 @@ impl AppState {
             }
         };
         let only_downloaded = filter == "downloaded";
-        let mut out: Vec<Value> = xite
-            .optional_files()
+        // Root + child content.json declarations: a hub's per-user optional
+        // files (avatars…) must list too, not just the root's.
+        let mut out: Vec<Value> = declared_optional_files(&xite.storage, xite.content.as_ref())
             .into_iter()
             .filter_map(|f| {
                 let is_downloaded = xite.storage.verify(&f.inner_path, &f.sha512);
@@ -9403,6 +9404,46 @@ impl AppState {
         result
     }
 
+    /// Between in-pass rounds: some files failed, so force-announce for FRESH
+    /// peers (the ones we had were tried and lacked the files) and flip the
+    /// failures back to Pending for the next round. Returns false to end the
+    /// pass - the full announce + DHT sweep found nobody, so another round
+    /// would fail identically; the background retry loop keeps chasing the
+    /// files with backoff until they arrive or the toggle is turned off. The
+    /// round itself is shown by the sampler's "(retry n/N)" tag.
+    async fn start_optional_retry_round(
+        self: &Arc<Self>,
+        address: &str,
+        round: usize,
+        rounds: usize,
+        requeued: &[usize],
+    ) -> bool {
+        self.log(
+            "INFO",
+            format!(
+                "Optional round {round}/{rounds} for {address}: {} file(s) left, announcing for fresh peers",
+                requeued.len()
+            ),
+        )
+        .await;
+        if self.ensure_optional_peers(address, true).await == 0 {
+            self.log(
+                "INFO",
+                format!(
+                    "No peers found for {address} after announcing; \
+                     pass over, background retry continues"
+                ),
+            )
+            .await;
+            return false;
+        }
+        for idx in requeued {
+            self.mark_optional_file(address, *idx, OptFileState::Pending, "").await;
+        }
+        self.push_site_info(address).await;
+        true
+    }
+
     /// Resolve the progress panel at the end of a bulk pass: cancelled
     /// (mandate withdrawn) drops it quietly; files still missing keep it in
     /// a waiting state - the background retry loop is chasing them, and a
@@ -9579,37 +9620,10 @@ impl AppState {
                 cancelled = true;
                 break;
             }
-            // Some files failed: announce for FRESH peers (forced - the ones we
-            // had were tried and lacked the files). The retry round itself is
-            // shown by the sampler's "(retry n/3)" tag.
-            self.log(
-                "INFO",
-                format!(
-                    "Optional round {round}/{ROUNDS} for {address}: {} file(s) left, announcing for fresh peers",
-                    requeue.len()
-                ),
-            )
-            .await;
-            let peers = self.ensure_optional_peers(address, true).await;
-            if peers == 0 {
-                // The full announce + DHT sweep found nobody: another in-pass
-                // round would fail identically, so end THIS pass - the
-                // background retry loop keeps chasing the files with backoff
-                // until they arrive or the toggle is turned off.
-                self.log(
-                    "INFO",
-                    format!(
-                        "No peers found for {address} after announcing; \
-                         pass over, background retry continues"
-                    ),
-                )
-                .await;
+            let indices: Vec<usize> = requeue.iter().map(|(i, _, _)| *i).collect();
+            if !self.start_optional_retry_round(address, round, ROUNDS, &indices).await {
                 break;
             }
-            for (idx, _, _) in &requeue {
-                self.mark_optional_file(address, *idx, OptFileState::Pending, "").await;
-            }
-            self.push_site_info(address).await;
             queue = requeue;
         }
         self.set_worker_stats(address, 0, 0, 0).await;
@@ -9652,35 +9666,14 @@ impl AppState {
         else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        let mut collect = |files: Option<&Value>, dir: &str| {
-            let Some(files) = files.and_then(|f| f.as_object()) else { return };
-            for (rel, info) in files {
-                let path =
-                    if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
-                if let Some(prefix) = directory {
-                    if !path.starts_with(prefix) {
-                        continue;
-                    }
-                }
-                let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-                let bigfile = info.get("piecemap").is_some();
-                if !optional_file_present(&storage, &stats, &path, size, bigfile) {
-                    out.push((path, size.max(0) as u64));
-                }
-            }
-        };
-        collect(content.as_ref().and_then(|c| c.get("files_optional")), "");
-        for child in storage.list_files() {
-            if !child.ends_with("/content.json") || child == "content.json" {
-                continue;
-            }
-            let Ok(bytes) = storage.read(&child) else { continue };
-            let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { continue };
-            let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-            collect(json.get("files_optional"), dir);
-        }
-        out
+        declared_optional_files(&storage, content.as_ref())
+            .into_iter()
+            .filter(|f| directory.map(|p| f.inner_path.starts_with(p)).unwrap_or(true))
+            .filter(|f| {
+                !optional_file_present(&storage, &stats, &f.inner_path, f.size, f.bigfile)
+            })
+            .map(|f| (f.inner_path, f.size.max(0) as u64))
+            .collect()
     }
 
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
@@ -10326,6 +10319,51 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 /// "Downloaded" figure. Covers the root's `files_optional` AND every stored
 /// child content.json's (per-user optional files) - the root-only walk left
 /// child files out of the hashfield, so peers never learned we held them.
+/// One declared optional file, from any content.json of a site.
+struct DeclaredOptional {
+    inner_path: String,
+    size: i64,
+    sha512: String,
+    bigfile: bool,
+}
+
+/// EVERY declared optional file of a site: the root content.json's
+/// `files_optional` plus every stored child content.json's (per-user
+/// optional files - avatars and the like), child paths prefixed with their
+/// directory. Root-only readers (`Xite::optional_files`) miss the per-user
+/// files entirely, which left a hub's Files-tab list empty.
+fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Vec<DeclaredOptional> {
+    let mut out = Vec::new();
+    let mut scan = |files: Option<&Value>, dir: &str| {
+        let Some(files) = files.and_then(|f| f.as_object()) else { return };
+        for (rel, info) in files {
+            let inner_path =
+                if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+            out.push(DeclaredOptional {
+                inner_path,
+                size: info.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+                sha512: info
+                    .get("sha512")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                bigfile: info.get("piecemap").is_some(),
+            });
+        }
+    };
+    scan(content.and_then(|c| c.get("files_optional")), "");
+    for child in storage.list_files() {
+        if !child.ends_with("/content.json") || child == "content.json" {
+            continue;
+        }
+        let Ok(bytes) = storage.read(&child) else { continue };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        scan(json.get("files_optional"), dir);
+    }
+    out
+}
+
 /// Whether a declared optional file is PRESENT on disk: a file at the
 /// declared size for regular files; a bigfile additionally needs its
 /// completion stamp (`optional_stats` time_downloaded, written when
@@ -11475,6 +11513,20 @@ mod tests {
         let storage = XiteStorage::new(dir.path());
         storage.write("a.bin", b"aaaa").unwrap();
         storage.write("b.bin", b"bbbbbbbb").unwrap();
+        // A per-user (child content.json) optional file - a hub's avatars
+        // live here, and a root-only walk left the Files tab empty for them.
+        storage.write("data/users/alice/avatar.png", b"png").unwrap();
+        storage
+            .write(
+                "data/users/alice/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": {
+                        "avatar.png": { "size": 3, "sha512": XiteStorage::hash_bytes(b"png") }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let content = json!({
             "address": addr, "modified": 1.0, "files": {},
@@ -11502,18 +11554,22 @@ mod tests {
 
         let list =
             state.optional_file_list(addr, "downloaded", "uploaded DESC", 0).await.unwrap();
-        assert_eq!(list.len(), 2);
+        assert_eq!(list.len(), 3, "root files AND the child-declared avatar list");
         assert_eq!(list[0]["inner_path"], "a.bin");
         assert_eq!(list[0]["uploaded"], 12);
         assert_eq!(list[0]["time_downloaded"], 1000);
         assert_eq!(list[0]["peer"], 1, "downloaded here = one seeder");
         assert_eq!(list[1]["uploaded"], 0);
-        // b.bin (no stamp) fell back to the file's mtime for "Finished".
+        // Non-stamped files fell back to the file's mtime for "Finished".
         assert!(list[1]["time_downloaded"].as_i64().unwrap() > 0);
+        assert!(
+            list.iter().any(|f| f["inner_path"] == "data/users/alice/avatar.png"),
+            "per-user optional file present with its full inner path"
+        );
 
         // Sorting by size ascending flips the order; limit truncates.
         let by_size = state.optional_file_list(addr, "all", "size", 0).await.unwrap();
-        assert_eq!(by_size[0]["inner_path"], "a.bin");
+        assert_eq!(by_size[0]["inner_path"], "data/users/alice/avatar.png");
         assert_eq!(
             state.optional_file_list(addr, "all", "size", 1).await.unwrap().len(),
             1
