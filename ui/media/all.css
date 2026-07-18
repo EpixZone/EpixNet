@@ -295,6 +295,29 @@ a {
 	cursor: url('img/fixbutton-left-up.png') 4 12, auto;
 }
 
+/* Unread-notification pill on the home/nav button, painted by the wrapper
+   when a site (e.g. Epix Mail) reports new items via notificationCount. */
+.fixbutton-badge {
+	position: absolute;
+	top: -2px;
+	right: -4px;
+	min-width: 18px;
+	height: 18px;
+	box-sizing: border-box;
+	padding: 0 5px;
+	border-radius: 999px;
+	background: #F0224B;
+	color: #fff;
+	font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+	font-size: 11px;
+	font-weight: 700;
+	line-height: 18px;
+	text-align: center;
+	z-index: 1000;
+	pointer-events: none;
+	box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.18);
+}
+
 
 /* Progress bar: slim flat accent line */
 

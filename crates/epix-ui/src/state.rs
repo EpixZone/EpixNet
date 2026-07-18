@@ -1574,6 +1574,25 @@ impl AppState {
         json!({ "results": results, "num": results.len(), "sites": sites, "muted": false })
     }
 
+    /// Aggregate unread notification count across every subscribed site,
+    /// honouring the global mute, per-site mutes, dismissals and the seen
+    /// baseline. Feeds the tray-icon badge and the wrapper's nav-icon badge
+    /// (via the `notificationCount` command); it is the single-integer form of
+    /// [`Self::notification_query`].
+    pub async fn notification_total(&self) -> i64 {
+        self.notification_query()
+            .await
+            .get("results")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("count").and_then(serde_json::Value::as_i64))
+                    .filter(|c| *c > 0)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
     /// `notificationDismiss` - record when the user cleared a site's
     /// notification, so `{last_seen}` queries can filter to newer items.
     /// Stored as milliseconds, like EpixNet.

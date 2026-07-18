@@ -1691,6 +1691,16 @@ if (window.getComputedStyle(document.body).transform) {
       if (this.inner_loaded) {
         this.reloadSiteInfo();
       }
+      // Nav-icon / tab notification badge: fetch the current unread total now
+      // and keep it fresh on a light timer (the count is cheap on the node).
+      this.pollNotificationCount();
+      if (!this.notif_poll_timer) {
+        this.notif_poll_timer = setInterval(((function (_this) {
+          return function () {
+            return _this.pollNotificationCount();
+          };
+        })(this)), 5000);
+      }
       setTimeout(((function (_this) {
         return function () {
           if (!_this.site_info) {
@@ -1746,6 +1756,111 @@ if (window.getComputedStyle(document.body).transform) {
       delete window.wrapper_key;
       delete window.script_nonce;
       return $("#script_init").remove();
+    };
+
+    Wrapper.prototype.pollNotificationCount = function () {
+      if (!this.ws || !this.ws.ws || this.ws.ws.readyState !== 1) {
+        return;
+      }
+      return this.ws.cmd("notificationCount", [], (function (_this) {
+        return function (res) {
+          if (res && typeof res.count === "number") {
+            _this.updateNotificationBadge(res.count);
+          }
+        };
+      })(this));
+    };
+
+    Wrapper.prototype.updateNotificationBadge = function (count) {
+      count = count || 0;
+      var changed = count !== (this.notif_count || 0);
+      this.notif_count = count;
+      // Re-applied every poll (cheap) so the count survives a site setting its
+      // own document.title between polls.
+      this.applyTitleBadge();
+      if (changed) {
+        this.applyFixbuttonBadge();
+        this.applyFaviconBadge();
+      }
+    };
+
+    Wrapper.prototype.applyFixbuttonBadge = function () {
+      var count = this.notif_count || 0;
+      var fixbutton = document.querySelector(".fixbutton");
+      if (!fixbutton) {
+        return;
+      }
+      var badge = fixbutton.querySelector(".fixbutton-badge");
+      if (count <= 0) {
+        if (badge) {
+          badge.style.display = "none";
+        }
+        return;
+      }
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "fixbutton-badge";
+        fixbutton.appendChild(badge);
+      }
+      badge.textContent = count > 99 ? "99+" : String(count);
+      badge.style.display = "";
+    };
+
+    Wrapper.prototype.applyTitleBadge = function () {
+      var count = this.notif_count || 0;
+      var title = window.document.title || "";
+      // Strip only the exact prefix we added last time, so a site's own
+      // "(2) ..." title is never clobbered.
+      var prev = this._title_badge || "";
+      if (prev && title.indexOf(prev) === 0) {
+        title = title.slice(prev.length);
+      }
+      var next = count > 0 ? "(" + (count > 99 ? "99+" : count) + ") " : "";
+      this._title_badge = next;
+      window.document.title = next + title;
+    };
+
+    Wrapper.prototype.applyFaviconBadge = function () {
+      try {
+        var count = this.notif_count || 0;
+        var id = "epix-notif-favicon";
+        // Remember the tab's original icon the first time we touch it, so zero
+        // restores it instead of leaving a stale red badge.
+        if (this._orig_favicon === undefined) {
+          var cur = document.querySelector("link[rel~='icon']:not(#" + id + ")");
+          this._orig_favicon = (cur && cur.href) ? cur.href : "/uimedia/img/favicon.ico";
+        }
+        var link = document.getElementById(id);
+        if (count <= 0) {
+          if (link) {
+            link.href = this._orig_favicon;
+          }
+          return;
+        }
+        var size = 32;
+        var canvas = document.createElement("canvas");
+        canvas.width = canvas.height = size;
+        var ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#F0224B";
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, size / 2, 0, 2 * Math.PI);
+        ctx.fill();
+        var label = count > 99 ? "99+" : String(count);
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "bold " + (label.length > 2 ? 14 : 20) + "px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, size / 2, size / 2 + 1);
+        if (!link) {
+          link = document.createElement("link");
+          link.id = id;
+          link.rel = "icon";
+          document.head.appendChild(link);
+        }
+        link.href = canvas.toDataURL("image/png");
+      } catch (e) {
+        // Canvas unsupported: the nav-icon and title badges still work.
+      }
     };
 
     Wrapper.prototype.sendInner = function (message) {
