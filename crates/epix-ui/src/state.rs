@@ -9702,14 +9702,26 @@ impl AppState {
     /// Returns false if the xite isn't served here.
     pub async fn rebuild_xite_db(&self, address: &str) -> bool {
         let muted = self.muted_authors().await;
-        let mut xites = self.xites.write().await;
-        let Some(x) = xites.get_mut(address) else { return false };
-        let (db, schema) = match build_xite_db(&x.storage, &muted) {
-            Some((db, schema)) => (Some(db), Some(schema)),
-            None => (None, None),
+        let is_merger = {
+            let mut xites = self.xites.write().await;
+            let Some(x) = xites.get_mut(address) else { return false };
+            let (db, schema) = match build_xite_db(&x.storage, &muted) {
+                Some((db, schema)) => (Some(db), Some(schema)),
+                None => (None, None),
+            };
+            let is_merger = schema.as_ref().map(|s| s.version == 3).unwrap_or(false);
+            x.db = db;
+            x.db_schema = schema;
+            is_merger
         };
-        x.db = db;
-        x.db_schema = schema;
+        // build_xite_db leaves a version-3 merger db EMPTY (its rows come from
+        // the merged sites, not its own tree). Refill it here, else every
+        // caller that doesn't follow up itself - the dbRebuild/dbReload ws
+        // command, db_query's lazy build, a mute change - leaves the merger
+        // site with no data until the next restart.
+        if is_merger {
+            self.rebuild_merger_dbs().await;
+        }
         true
     }
 
@@ -13124,6 +13136,46 @@ mod tests {
         assert_eq!(rows[0]["site"], "1SiteA");
         assert_eq!(rows[0]["title"], "from A");
         assert_eq!(rows[1]["site"], "1SiteB");
+    }
+
+    #[tokio::test]
+    async fn db_rebuild_refills_a_merger_db() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+
+        // Same shape as v3_merger_db_aggregates_merged_sites: a merger with a
+        // version-3 schema plus one merged site holding a post.
+        let merger = "1Merger";
+        let mstore = XiteStorage::new(dir.path().join("merger"));
+        mstore
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Merger","db_file":"db.db","version":3,
+                     "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
+        state.add_permission(merger, "Merger:ZeroMe").await;
+        let s = XiteStorage::new(dir.path().join("1SiteA"));
+        s.write("data/u/data.json", br#"{ "posts": [ {"post_id":1,"title":"hello"} ] }"#).unwrap();
+        state
+            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
+            .await;
+        state.rebuild_merger_dbs().await;
+        let rows =
+            state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(rows.len(), 1, "merger db populated before the rebuild");
+
+        // dbRebuild/dbReload (and a mute change) call rebuild_xite_db, which
+        // replaces a version-3 merger db with a fresh EMPTY one - it must be
+        // refilled from the merged sites, not left empty until the next
+        // restart (the merger page would show no posts).
+        assert!(state.rebuild_xite_db(merger).await);
+        let rows =
+            state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(rows.len(), 1, "merger db refilled after dbRebuild");
+        assert_eq!(rows[0]["title"], "hello");
     }
 
     #[tokio::test]
