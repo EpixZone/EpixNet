@@ -1,0 +1,21 @@
+[package]
+name = "epix-bt"
+version = "0.1.0"
+edition = "2021"
+description = "EpixNet's native BitTorrent bridge: magnet/metainfo parsing, hash-verified piece store, and web-seed + peer-wire sources - so the NODE fetches magnet-referenced media (through Tor when enabled) and streams it to a xite over the local Range endpoint. Compiled in only on desktop/Android (the `bittorrent` feature); the iOS build omits it entirely."
+
+[dependencies]
+# BitTorrent v1 info-hashes are SHA-1 over the bencoded info dict.
+sha1 = "0.11.0"
+hex = "0.4"
+thiserror = "2"
+percent-encoding = "2"
+# Web-seed (BEP19) + .torrent (xs=) fetches go through reqwest so they can be
+# routed through the node's Tor SOCKS proxy (socks5h://127.0.0.1:<port>) - the
+# same pattern epix-chain uses, so a fetch never leaks the node's real IP.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "stream"] }
+tokio = { version = "1", features = ["rt", "sync", "io-util", "macros", "time"] }
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
