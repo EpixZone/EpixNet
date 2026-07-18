@@ -139,13 +139,40 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Re-signing Firefox under our identity drops the entitlements Mozilla shipped.
+# Without com.apple.security.cs.allow-jit the hardened runtime denies the JIT's
+# executable memory and Firefox crashes at launch (js::jit::InitializeJit()
+# failed). Re-apply the security-relevant entitlements. --deep applies these to
+# every nested binary (main process + plugin-container content/GPU processes),
+# which all need them. Mozilla's team-specific keys (application-identifier,
+# web-browser.public-key-credential) are intentionally omitted - they'd fail to
+# sign/notarize under a different Team ID.
+FF_ENTITLEMENTS="$OUT_DIR/firefox.entitlements.plist"
+cat > "$FF_ENTITLEMENTS" <<'ENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key><true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+  <key>com.apple.security.cs.disable-library-validation</key><true/>
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
+  <key>com.apple.security.device.camera</key><true/>
+</dict>
+</plist>
+ENTS
+
 # Sign. With EPIX_SIGN_ID set (a Developer ID Application identity), do a real
 # hardened-runtime signature; otherwise ad-hoc so it runs locally.
 if [ -n "${EPIX_SIGN_ID:-}" ]; then
   echo "· codesigning with Developer ID: $EPIX_SIGN_ID"
-  # Sign inner code first (nested Firefox), then the outer app, hardened runtime.
+  # Sign inner code first (nested Firefox, with its entitlements), then our
+  # binaries, then the outer app - all hardened runtime. The outer app is signed
+  # without --deep so it does not re-sign Firefox and strip its entitlements.
   codesign --force --deep --options runtime --timestamp \
-    --sign "$EPIX_SIGN_ID" "$APP/Contents/Resources/firefox/"*.app 2>/dev/null || true
+    --entitlements "$FF_ENTITLEMENTS" \
+    --sign "$EPIX_SIGN_ID" "$APP/Contents/Resources/firefox/"*.app
   codesign --force --options runtime --timestamp \
     --sign "$EPIX_SIGN_ID" "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser"
   codesign --force --options runtime --timestamp --sign "$EPIX_SIGN_ID" "$APP"
@@ -171,8 +198,26 @@ if [ -n "${EPIX_SIGN_ID:-}" ]; then
   fi
 else
   echo "· ad-hoc codesigning (set EPIX_SIGN_ID for a release signature)"
-  codesign --force --deep --sign - "$APP" 2>/dev/null || \
+  # Same as above: Firefox with its entitlements first, then the outer app
+  # WITHOUT --deep so Firefox's entitlements survive.
+  codesign --force --deep --entitlements "$FF_ENTITLEMENTS" --sign - \
+    "$APP/Contents/Resources/firefox/"*.app 2>/dev/null || \
+    echo "  (firefox ad-hoc sign warned)"
+  codesign --force --sign - "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser" 2>/dev/null || true
+  codesign --force --sign - "$APP" 2>/dev/null || \
     echo "  (codesign warned; the app still runs locally)"
+fi
+
+# Guard: the bundled Firefox must keep its JIT entitlement, or it crashes at
+# launch on user machines (js::jit::InitializeJit() failed). Catch a regression
+# here instead of shipping it.
+FF_MAIN="$(find "$APP/Contents/Resources/firefox" -maxdepth 3 -type f -name firefox | head -1)"
+if [ -n "$FF_MAIN" ]; then
+  if ! codesign -d --entitlements :- "$FF_MAIN" 2>/dev/null | grep -q "com.apple.security.cs.allow-jit"; then
+    echo "error: bundled Firefox is missing com.apple.security.cs.allow-jit;"
+    echo "       it would crash at launch. Signing must pass --entitlements."
+    exit 1
+  fi
 fi
 
 # Register with LaunchServices so epix:// links open the app.
