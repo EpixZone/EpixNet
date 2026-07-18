@@ -51,6 +51,8 @@ pub enum EngineError {
     NoMetaSource,
     #[error("unsupported source: expected a magnet: link or an http(s) .torrent URL")]
     UnsupportedSource,
+    #[error("internal: info-hash did not yield a valid cache key")]
+    BadInfoHash,
     #[error("no reachable web seed (`ws=`/url-list) to stream from over the current transport")]
     NoWebSeed,
     #[error("requested range is not satisfiable")]
@@ -149,13 +151,24 @@ impl Session {
 
         let (primary_index, primary) = meta.primary_file();
         let (file_start, file_len) = meta.file_span(primary_index);
+        // The torrent-supplied file name is used ONLY to choose the Content-Type
+        // - never to build a filesystem path.
         let content_type = content_type_for(&primary.display_path()).to_string();
 
-        // Store under <cache>/<info-hash>/<sanitized file name>.
-        let dir = cache_dir.join(meta.info_hash_hex());
+        // The cache path is built only from the info-hash and a constant file
+        // name, so no torrent-controlled string can steer it out of the cache
+        // dir. `info_hash_hex` is `hex::encode` of a fixed `[u8; 20]` - always
+        // 40 chars of `[0-9a-f]`, no separators, no `..` - which we validate
+        // explicitly before using it as a path component: defense in depth, and
+        // an allowlist barrier that makes the "no traversal" property provable
+        // to static analysis, not just to a reader of `sanitize`.
+        let key = meta.info_hash_hex();
+        if key.len() != 40 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(EngineError::BadInfoHash);
+        }
+        let dir = cache_dir.join(&key);
         tokio::fs::create_dir_all(&dir).await.map_err(StoreError::from)?;
-        let fname = primary.path.last().cloned().unwrap_or_else(|| "video".to_string());
-        let store = PieceStore::open(&dir.join(fname), file_len, meta.piece_count()).await?;
+        let store = PieceStore::open(&dir.join("media"), file_len, meta.piece_count()).await?;
 
         let client = http::client(PIECE_TIMEOUT)?;
         let webseed = WebSeed::new(client, bases, meta.clone());
