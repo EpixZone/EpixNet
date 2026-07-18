@@ -1976,6 +1976,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-bt"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "percent-encoding",
+ "reqwest",
+ "sha1 0.11.0",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "epix-build"
 version = "0.1.0"
 
@@ -2138,6 +2151,7 @@ name = "epix-node"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "epix-bt",
  "epix-chain",
  "epix-content",
  "epix-core",
@@ -2238,6 +2252,7 @@ name = "epix-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "epix-bt",
  "epix-content",
  "epix-core",
  "epix-crypt",
@@ -2320,6 +2335,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "epix-bt",
  "epix-chain",
  "epix-content",
  "epix-core",

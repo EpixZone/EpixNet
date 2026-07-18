@@ -65,6 +65,10 @@ struct Ctx {
     state: Arc<AppState>,
     registry: Arc<CommandRegistry>,
     media: Arc<MediaBundle>,
+    /// The BitTorrent streaming engine backing `/bt/stream`. Present only in a
+    /// `bittorrent` build; the iOS binary has neither the field nor the route.
+    #[cfg(feature = "bittorrent")]
+    bt: Arc<epix_bt::Engine>,
 }
 
 /// The UI server.
@@ -87,8 +91,24 @@ impl UiServer {
         registry: CommandRegistry,
         media: MediaBundle,
     ) -> Self {
+        // Streamed BT media is cached under <data-root>/bt-cache (a temp dir if
+        // no data root is configured, e.g. in tests). Built once per server.
+        #[cfg(feature = "bittorrent")]
+        let bt = {
+            let cache = state
+                .data_root_path()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("bt-cache");
+            Arc::new(epix_bt::Engine::new(cache))
+        };
         Self {
-            ctx: Ctx { state, registry: Arc::new(registry), media: Arc::new(media) },
+            ctx: Ctx {
+                state,
+                registry: Arc::new(registry),
+                media: Arc::new(media),
+                #[cfg(feature = "bittorrent")]
+                bt,
+            },
         }
     }
 
@@ -133,6 +153,11 @@ impl UiServer {
         // Benchmark: a diagnostics page timing the node's hot paths.
         #[cfg(feature = "benchmark")]
         let router = router.route("/Benchmark", get(serve_benchmark));
+        // BitTorrent streaming gateway: a xite's <video> points here with a
+        // magnet, the node fetches + verifies pieces (through Tor when on) and
+        // returns 206 ranges. Present only in a `bittorrent` build.
+        #[cfg(feature = "bittorrent")]
+        let router = router.route("/bt/stream", get(serve_bt_stream));
         // Tier 1 UI security (EpixNet's UiRequest.route entry checks): the
         // Host allowlist (DNS-rebinding protection), the OPTIONS preflight
         // answer, and the cross-origin request gate.
@@ -458,6 +483,11 @@ fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
 fn is_global_path(path: &str) -> bool {
     path.starts_with("/uimedia/")
         || path.starts_with("/EpixNet-Internal/")
+        // The BitTorrent stream gateway identifies no xite (the magnet is in the
+        // query), so it can't be used to probe which xites this node serves;
+        // treat it like the other global endpoints so a xite's own <video> can
+        // reach it same-origin without tripping the cross-origin gate.
+        || path.starts_with("/bt/")
         || path == "/Config"
         || path == "/Plugins"
         || path == "/Stats"
@@ -2311,6 +2341,52 @@ fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap
     };
     pairs.push((header::CACHE_CONTROL, cache.to_string()));
     header_map(pairs)
+}
+
+/// The magnet a xite hands `/bt/stream`, percent-encoded by the caller so its
+/// own `&`/`=` survive query parsing (axum decodes the single `m` value back to
+/// the full `magnet:?...` URI).
+#[cfg(feature = "bittorrent")]
+#[derive(serde::Deserialize)]
+struct BtStreamQuery {
+    m: String,
+}
+
+/// Stream a magnet's largest media file as 206 ranges. The engine fetches and
+/// SHA-1-verifies pieces from web seeds (through the node's Tor proxy when it is
+/// routing), so the xite page itself never speaks BitTorrent. Engine errors map
+/// to a status the player can act on: 416 for an unsatisfiable range, 501 when
+/// nothing is streamable over the current transport (no web seed / no metadata
+/// source), 502 for an upstream fetch or verification failure.
+#[cfg(feature = "bittorrent")]
+async fn serve_bt_stream(
+    State(ctx): State<Ctx>,
+    Query(q): Query<BtStreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    match ctx.bt.stream(&q.m, range).await {
+        Ok(served) => {
+            let mut h = file_headers(&served.content_type, StatusCode::PARTIAL_CONTENT);
+            if let Ok(v) = header::HeaderValue::from_str(&format!(
+                "bytes {}-{}/{}",
+                served.start, served.end, served.total
+            )) {
+                h.insert(header::CONTENT_RANGE, v);
+            }
+            (StatusCode::PARTIAL_CONTENT, h, served.bytes).into_response()
+        }
+        Err(e) => {
+            use epix_bt::EngineError::{NoMetaSource, NoWebSeed, UnsupportedSource, Unsatisfiable};
+            let status = match e {
+                Unsatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+                UnsupportedSource => StatusCode::BAD_REQUEST,
+                NoWebSeed | NoMetaSource => StatusCode::NOT_IMPLEMENTED,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            (status, format!("bt stream: {e}")).into_response()
+        }
+    }
 }
 
 /// Serve site-file bytes with an ETag, answering a matching `If-None-Match`

@@ -212,6 +212,10 @@ pub async fn boot(
     let tor_always = false;
     #[cfg(feature = "tor")]
     epix_chain::set_chain_require_tor(tor_always);
+    // Same gate for the BT engine: in Tor-always mode a web-seed fetch must not
+    // egress until the SOCKS proxy is wired (below), or it would leak the IP.
+    #[cfg(all(feature = "tor", feature = "bittorrent"))]
+    epix_bt::http::set_require_tor(tor_always);
 
     // Resolve the launch target. In Always mode use only the on-disk cache
     // (never the chain): a name with no cache entry is deferred to the on-demand
@@ -1662,6 +1666,8 @@ async fn serve(
         // IP or the queried name to api.epix.zone during the Tor bootstrap
         // window. Set before the runtime starts, so its first resolves are gated.
         epix_chain::set_chain_require_tor(tor_mode == epix_runtime::TorMode::Always);
+        #[cfg(feature = "bittorrent")]
+        epix_bt::http::set_require_tor(tor_mode == epix_runtime::TorMode::Always);
     }
 
     // Privacy by default: turn the embedded I2P router on the first time a node
@@ -1766,6 +1772,9 @@ async fn serve(
             loop {
                 if state.tor_status().await.1 == "Always" {
                     epix_chain::set_chain_socks(Some("socks5h://127.0.0.1:43111".into()));
+                    // Route BT web-seed / .torrent fetches through the same proxy.
+                    #[cfg(feature = "bittorrent")]
+                    epix_bt::http::set_socks(Some("socks5h://127.0.0.1:43111".into()));
                     state.log("INFO", "Chain RPC now routed through Tor".to_string()).await;
                     break;
                 }
