@@ -30,6 +30,11 @@ default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]
 tor = ["epix-runtime/tor"]
 i2p = ["epix-runtime/i2p"]
 mesh = ["epix-runtime/mesh"]
+# BitTorrent bridge (desktop + Android). NOT in the mobile FFI default; the
+# Android build turns it on explicitly, the iOS build never passes it, so the
+# iOS binary contains no BT code (App Store 5.2.3). Forwards to epix-ui so the
+# `serverInfo.bittorrent` capability bit reflects this build.
+bittorrent = ["epix-runtime/bittorrent", "epix-ui/bittorrent"]
 # Inbound file server + UPnP port mapping. A phone should not accept inbound
 # clearnet connections or poke the router, so the mobile FFI leaves this off
 # (it stays reachable over its onion/i2p service, which the `tor`/`i2p`

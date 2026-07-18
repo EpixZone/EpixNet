@@ -3749,6 +3749,12 @@ mod tests {
         state.config_set("ip_external", json!("198.51.100.9")).await;
         let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(info["ip_external"], "198.51.100.9");
+
+        // The bittorrent capability bit is always a bool for xites to
+        // feature-detect, and matches how this build was compiled (true with
+        // the `bittorrent` feature - desktop/Android; false on iOS).
+        assert_eq!(info["bittorrent"], cfg!(feature = "bittorrent"));
+        assert!(info["bittorrent"].is_boolean());
     }
 
     #[tokio::test]

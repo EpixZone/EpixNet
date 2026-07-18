@@ -41,3 +41,39 @@ jobs:
       # change that compiles but breaks byte-compatibility is caught too.
       - name: Test crypto byte-compatibility
         run: cargo test -p epix-crypt --locked
+
+  mobile-profiles:
+    name: Mobile feature profiles
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EPIX_WALLET_SKIP: "1"
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Linux build deps (protoc)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The actual iOS/Android target builds need the Apple SDK / Android NDK on
+      # a matching runner (release pipeline). Here we validate the FEATURE
+      # PROFILES resolve and compile on the host - a dependency leaking into the
+      # wrong profile fails at feature resolution, which is what we guard.
+      - name: iOS profile (BitTorrent excluded)
+        run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded --locked
+      - name: Android profile (BitTorrent included)
+        run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,bittorrent --locked
+      # The App-Store guarantee, machine-checked: the iOS feature profile must
+      # NOT pull the BitTorrent engine crate. Passes today (epix-bt does not
+      # exist yet) and becomes load-bearing the moment it does - a stray
+      # `bittorrent`/`epix-bt` edge reachable from the iOS profile fails CI.
+      - name: Assert no BitTorrent in the iOS profile
+        run: |
+          if cargo tree -p epix-ffi --no-default-features --features tor,i2p-embedded --locked -e features 2>/dev/null | grep -qiE '\bepix-bt\b'; then
+            echo "::error::epix-bt reached the iOS feature profile - BitTorrent must be excluded from the iOS build (App Store 5.2.3)"
+            exit 1
+          fi
+          echo "iOS profile is BitTorrent-free."

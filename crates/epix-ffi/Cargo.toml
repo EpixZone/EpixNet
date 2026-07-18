@@ -35,6 +35,11 @@ default = ["tor", "i2p-embedded"]
 tor = ["epix-node/tor"]
 i2p = ["epix-node/i2p"]
 i2p-embedded = ["i2p", "epix-node/i2p-embedded", "epix-node/i2p-autostart"]
+# BitTorrent bridge. Deliberately NOT in `default`: the Android build script
+# opts in (`--features tor,i2p-embedded,bittorrent`), the iOS build script
+# never does, so the iOS staticlib is BT-free by construction (App Store
+# 5.2.3). CI builds the iOS profile and fails if a BT symbol appears.
+bittorrent = ["epix-node/bittorrent"]
 # Generate the `uniffi-bindgen` CLI entry point (used by the mobile build
 # scripts to emit Kotlin/Swift). Kept behind a feature so the library builds
 # without pulling the CLI into every consumer.

@@ -34,7 +34,15 @@ rustup target add "$TRIPLE" >/dev/null 2>&1 || true
 
 # Release: debug builds of the deep async stacks (Tor, reqwest) overflow
 # thread stacks on iOS.
-cargo build -p epix-ffi --release --target "$TRIPLE"
+#
+# Explicit feature list (matches epix-ffi's default, but stated so the App
+# Store guarantee is legible and can't drift): the iOS binary is built WITHOUT
+# the `bittorrent` feature, so it contains no BitTorrent code (App Store
+# 5.2.3). Magnet-referenced media plays from HTTPS web seeds instead. Do NOT
+# add `bittorrent` here - the Android build (docs/install/android.md) is where
+# it belongs. CI's "Assert no BitTorrent in the iOS profile" step enforces this.
+cargo build -p epix-ffi --release --target "$TRIPLE" \
+  --no-default-features --features tor,i2p-embedded
 
 # Swift bindings, generated from the metadata baked into the built library.
 cargo run -q -p epix-ffi --features cli --bin uniffi-bindgen -- \
