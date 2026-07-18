@@ -54,7 +54,8 @@ impl PieceStore {
         Ok(PieceStore { file: Mutex::new(file), len, have, path: path.to_path_buf() })
     }
 
-    pub fn len(&self) -> u64 {
+    /// The streamed file's total length in bytes.
+    pub fn size(&self) -> u64 {
         self.len
     }
 
@@ -110,7 +111,7 @@ mod tests {
         let path = dir.join("clip.mp4");
 
         let store = PieceStore::open(&path, 10, 3).await.unwrap();
-        assert_eq!(store.len(), 10);
+        assert_eq!(store.size(), 10);
         assert!(!store.has(0));
 
         store.write_at(2, b"hello").await.unwrap();
