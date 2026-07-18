@@ -70,6 +70,22 @@ impl MetaInfo {
         hex::encode(self.info_hash)
     }
 
+    /// The info-hash as a filesystem-safe path component: exactly 40 characters
+    /// drawn from a fixed `[0-9a-f]` alphabet, so it can never contain a path
+    /// separator, `..`, or any other traversal token. Each output byte is read
+    /// from the constant `HEX` table (the tainted nibble is only an index into
+    /// it), so the result is provably a safe path segment rather than
+    /// torrent-controlled data - both to a reader and to static analysis.
+    pub fn cache_dir_name(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(40);
+        for &byte in &self.info_hash {
+            s.push(HEX[(byte >> 4) as usize] as char);
+            s.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        s
+    }
+
     /// The byte length of piece `i` (the last piece is usually short).
     pub fn piece_size(&self, i: usize) -> u64 {
         if i + 1 < self.piece_count() {
@@ -248,6 +264,19 @@ mod tests {
         assert!(mi.verify_piece(0, b"aaaa"));
         assert!(mi.verify_piece(1, b"bb"));
         assert!(!mi.verify_piece(0, b"xxxx"));
+    }
+
+    #[test]
+    fn cache_dir_name_is_a_safe_hex_component() {
+        let (bytes, hash) = build_torrent();
+        let mi = MetaInfo::parse(&bytes, Some(hash)).unwrap();
+        let name = mi.cache_dir_name();
+        // Matches the plain hex id, and is a single safe path component.
+        assert_eq!(name, mi.info_hash_hex());
+        assert_eq!(name.len(), 40);
+        assert!(name.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!name.contains(['/', '\\', '.']));
+        assert_eq!(std::path::Path::new(&name).components().count(), 1);
     }
 
     #[test]

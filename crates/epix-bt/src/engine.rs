@@ -157,12 +157,12 @@ impl Session {
 
         // The cache path is built only from the info-hash and a constant file
         // name, so no torrent-controlled string can steer it out of the cache
-        // dir. `info_hash_hex` is `hex::encode` of a fixed `[u8; 20]` - always
-        // 40 chars of `[0-9a-f]`, no separators, no `..` - which we validate
-        // explicitly before using it as a path component: defense in depth, and
-        // an allowlist barrier that makes the "no traversal" property provable
-        // to static analysis, not just to a reader of `sanitize`.
-        let key = meta.info_hash_hex();
+        // dir. `cache_dir_name` encodes the fixed `[u8; 20]` info-hash through a
+        // constant hex table, yielding exactly 40 chars of `[0-9a-f]` - no
+        // separators, no `..`. The tainted bytes are only table indices, so the
+        // "no traversal" property holds both for a reader and for static
+        // analysis. We still re-check length/charset as a cheap belt-and-braces.
+        let key = meta.cache_dir_name();
         if key.len() != 40 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(EngineError::BadInfoHash);
         }
