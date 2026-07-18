@@ -36,6 +36,11 @@ pub struct MetaInfo {
     pub files: Vec<FileEntry>,
     /// Sum of every file's length.
     pub total_length: u64,
+    /// True when the info dict used `files` (a directory of files) rather than a
+    /// single `length`. Web-seed URL construction differs between the two
+    /// (BEP19): multi-file appends `<name>/<path>`, single-file appends just
+    /// `<name>` (or nothing when the base is the file URL itself).
+    pub multi_file: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +63,11 @@ impl MetaInfo {
     /// Total number of pieces.
     pub fn piece_count(&self) -> usize {
         self.piece_hashes.len()
+    }
+
+    /// The info-hash as lowercase hex (the canonical id, e.g. for a cache dir).
+    pub fn info_hash_hex(&self) -> String {
+        hex::encode(self.info_hash)
     }
 
     /// The byte length of piece `i` (the last piece is usually short).
@@ -117,6 +127,7 @@ impl MetaInfo {
             .to_string();
 
         // Single-file (`length`) vs multi-file (`files`).
+        let multi_file = info.get(b"length".as_slice()).and_then(Value::as_int).is_none();
         let files = if let Some(len) = info.get(b"length".as_slice()).and_then(Value::as_int) {
             vec![FileEntry { path: vec![sanitize(&name)], length: len.max(0) as u64 }]
         } else if let Some(list) = info.get(b"files".as_slice()).and_then(Value::as_list) {
@@ -146,7 +157,14 @@ impl MetaInfo {
             return Err(MetaError::Empty);
         }
 
-        Ok(MetaInfo { info_hash, name, piece_length, piece_hashes, files, total_length })
+        Ok(MetaInfo { info_hash, name, piece_length, piece_hashes, files, total_length, multi_file })
+    }
+
+    /// The global byte offset of file `i` (sum of the preceding files' lengths),
+    /// and its length - the file's span in the torrent's concatenated data.
+    pub fn file_span(&self, i: usize) -> (u64, u64) {
+        let start: u64 = self.files[..i].iter().map(|f| f.length).sum();
+        (start, self.files[i].length)
     }
 
     /// The largest playable file (the video, for a movie torrent) - what the
@@ -157,6 +175,22 @@ impl MetaInfo {
             .enumerate()
             .max_by_key(|(_, f)| f.length)
             .expect("non-empty (checked in parse)")
+    }
+}
+
+/// Web seeds declared inside the `.torrent` itself (BEP19 `url-list`, a
+/// root-level key - a byte string or a list of them). Combined with the
+/// magnet's `ws=` seeds to give the engine every HTTP source. Best-effort: a
+/// malformed torrent just yields no extra seeds.
+pub fn webseeds_from_torrent(bytes: &[u8]) -> Vec<String> {
+    let Ok(root) = bencode::decode(bytes) else { return Vec::new() };
+    let Some(list) = root.get("url-list") else { return Vec::new() };
+    match list {
+        Value::Bytes(_) => list.as_str().map(|s| vec![s.to_string()]).unwrap_or_default(),
+        Value::List(items) => {
+            items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+        }
+        _ => Vec::new(),
     }
 }
 

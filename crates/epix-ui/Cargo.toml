@@ -17,6 +17,10 @@ epix-propagation = { path = "../epix-propagation" }
 epix-worker = { path = "../epix-worker" }
 epix-crypt = { path = "../epix-crypt" }
 epix-chain = { path = "../epix-chain" }
+# The BitTorrent engine the /bt/stream endpoint drives. Optional: pulled in only
+# by the `bittorrent` feature, so the iOS build (which never enables it) has no
+# BT code. See crates/epix-bt.
+epix-bt = { path = "../epix-bt", optional = true }
 base64 = "0.22"
 sha2 = "0.11"
 hex = "0.4"
@@ -48,10 +52,11 @@ multiuser = []
 # Benchmark: a /Benchmark diagnostics page timing the node's crypto/hash/pack
 # hot paths (shows off the Rust perf win). Off by default.
 benchmark = ["dep:sha3"]
-# BitTorrent bridge present in this build. Gates the `bittorrent` capability
-# bit in `serverInfo` (and, later, any BT UI surfaces) so xites feature-detect
-# it. Forwarded from `epix-node`'s `bittorrent` feature; off on iOS.
-bittorrent = []
+# BitTorrent bridge present in this build. Pulls in the `epix-bt` engine and
+# mounts the `/bt/stream` Range endpoint, and gates the `bittorrent` capability
+# bit in `serverInfo` so xites feature-detect it. Forwarded from `epix-node`'s
+# `bittorrent` feature; off on iOS (so no BT code is in that binary).
+bittorrent = ["dep:epix-bt"]
 
 [dev-dependencies]
 epix-reticulum = { path = "../epix-reticulum" }

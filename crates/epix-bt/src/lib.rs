@@ -13,16 +13,21 @@
 //! are the HTTPS web seed (`ws=`, BEP19) and the `.torrent` at `xs=`. On
 //! clearnet the peer-wire + trackers + DHT (later modules) join in.
 //!
-//! This first landing is the verified foundation: bencode, magnet + metainfo
-//! parsing (with recomputed info-hash checks), and the HTTP client factory that
-//! routes fetches through Tor. The piece store, web-seed source, streaming
-//! engine, and peer wire build on top.
+//! The verified foundation is bencode, magnet + metainfo parsing (with
+//! recomputed info-hash checks) and the Tor-routed HTTP client; on top of it the
+//! [`engine`] streams: it fetches a `.torrent`, opens a hash-verified sparse
+//! [`store`], and pulls the playback window from a BEP19 [`webseed`] on demand.
+//! The peer wire (clearnet swarm) builds on the same pieces later.
 
 pub mod bencode;
+pub mod engine;
 pub mod http;
 pub mod magnet;
 pub mod metainfo;
+pub mod store;
+pub mod webseed;
 
+pub use engine::{Engine, EngineError, Served};
 pub use magnet::{parse as parse_magnet, MagnetLink};
 pub use metainfo::{FileEntry, MetaInfo};
 
