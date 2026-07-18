@@ -34,6 +34,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "dbReload",
     "feedQuery",
     "muteList",
+    "notificationCount",
     "notificationDismiss",
     "notificationMute",
     "notificationMuteStatus",
@@ -121,6 +122,7 @@ const GATEWAY_READ_COMMANDS: &[&str] = &[
     "chartGetPeerLocations",
     "feedQuery",
     "feedSearch",
+    "notificationCount",
     "notificationQuery",
     "optionalLimitStats",
     "serverPortcheck",
@@ -568,6 +570,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteList),
         Arc::new(ChartDbQuery),
         Arc::new(NotificationQuery),
+        Arc::new(NotificationCount),
         Arc::new(NotificationSubscribe),
         Arc::new(NotificationList),
         Arc::new(NotificationMute),
@@ -887,6 +890,22 @@ impl WsCommand for NotificationQuery {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(s.state.notification_query().await)
+    }
+}
+
+/// `notificationCount()` - the aggregate unread count as a single integer,
+/// the wrapper polls it to paint the nav-icon badge and tab title/favicon.
+/// Admin (like `notificationQuery`) so an untrusted inner page can't read the
+/// count, but the wrapper's own requests are elevated (id >= WRAPPER_ID_BASE),
+/// and it is gateway-read so a public gateway's chrome still gets it.
+struct NotificationCount;
+#[async_trait]
+impl WsCommand for NotificationCount {
+    fn name(&self) -> &'static str {
+        "notificationCount"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!({ "count": s.state.notification_total().await }))
     }
 }
 

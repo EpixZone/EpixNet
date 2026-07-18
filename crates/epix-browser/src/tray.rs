@@ -60,6 +60,8 @@ struct Snapshot {
     /// Our I2P host (without `.i2p`), once the inbound session is ready.
     i2p: Option<String>,
     tor_status: String,
+    /// Aggregate unread notification count across sites (drives the tray dot).
+    notif_count: i64,
 }
 
 async fn snapshot(state: &epix_ui::AppState) -> Snapshot {
@@ -78,6 +80,7 @@ async fn snapshot(state: &epix_ui::AppState) -> Snapshot {
         onion: state.onion_address().await,
         i2p: state.i2p_address().await,
         tor_status,
+        notif_count: 0, // filled by the refresh loop on a slower cadence
     }
 }
 
@@ -123,14 +126,25 @@ pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
     let start_url = ctx.ready.start_url.clone();
     let scheme = ctx.ready.scheme.clone();
     // Keep the tray and menu alive for the whole run; dropping either removes
-    // the icon. The loop below diverges, so these never actually drop.
-    let _tray = tray;
+    // the icon. The loop below diverges, so these never actually drop. The tray
+    // is moved into the closure so its icon can be redrawn with the unread dot.
     let _menu = menu;
+    // Whether the tray currently shows the unread dot; `None` forces the first
+    // draw so a badge already present at startup appears.
+    let mut badge_shown: Option<bool> = None;
 
     event_loop.run(move |_event, _target, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1000));
 
         refresh_menu_stats(&handles, &snap);
+
+        // Tray notification dot: redraw only when the unread total crosses zero,
+        // so we don't rebuild the icon every tick.
+        let has_unread = snap.lock().map(|s| s.notif_count > 0).unwrap_or(false);
+        if badge_shown != Some(has_unread) {
+            badge_shown = Some(has_unread);
+            let _ = tray.set_icon(Some(icon_with_badge(has_unread)));
+        }
 
         // Windows: keep the Epix icon on Firefox's windows. Applied to the
         // live windows each tick (not patched into firefox.exe), so windows
@@ -161,11 +175,20 @@ fn spawn_stats_refresh(
     snap: Arc<Mutex<Snapshot>>,
 ) {
     rt.spawn(async move {
+        let mut tick: u64 = 0;
+        let mut notif_count: i64 = 0;
         loop {
-            let s = snapshot(&state).await;
+            // The unread total costs a SQL COUNT per subscribed site; refresh it
+            // every ~5s rather than on every 1s stats tick.
+            if tick % 5 == 0 {
+                notif_count = state.notification_total().await;
+            }
+            let mut s = snapshot(&state).await;
+            s.notif_count = notif_count;
             if let Ok(mut g) = snap.lock() {
                 *g = s;
             }
+            tick = tick.wrapping_add(1);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -363,6 +386,45 @@ fn load_icon() -> Icon {
         rgba.extend_from_slice(&[0x35, 0xd0, 0x7d, 0xff]);
     }
     Icon::from_rgba(rgba, w, h).expect("static fallback icon is valid")
+}
+
+/// The tray icon, optionally with a small red "unread" dot in the top-right
+/// corner. A dot (not a count) keeps it legible at 16-22px tray sizes and
+/// avoids pulling in a font rasteriser; it just says "you have new mail".
+fn icon_with_badge(show_badge: bool) -> Icon {
+    let (mut rgba, w, h) = match image::load_from_memory(TRAY_PNG) {
+        Ok(img) => {
+            let r = img.to_rgba8();
+            let (w, h) = r.dimensions();
+            (r.into_raw(), w, h)
+        }
+        Err(_) => return load_icon(),
+    };
+    if show_badge {
+        // Solid red disc near the top-right, ringed by a cleared (transparent)
+        // band so it reads on any menu-bar background.
+        let cx = 0.74 * w as f32;
+        let cy = 0.26 * h as f32;
+        let r = 0.22 * w as f32;
+        let ring = r + w as f32 * 0.07;
+        for y in 0..h {
+            for x in 0..w {
+                let dx = x as f32 + 0.5 - cx;
+                let dy = y as f32 + 0.5 - cy;
+                let d2 = dx * dx + dy * dy;
+                let idx = ((y * w + x) * 4) as usize;
+                if d2 <= r * r {
+                    rgba[idx] = 0xF0;
+                    rgba[idx + 1] = 0x22;
+                    rgba[idx + 2] = 0x4B;
+                    rgba[idx + 3] = 0xff;
+                } else if d2 <= ring * ring {
+                    rgba[idx + 3] = 0x00;
+                }
+            }
+        }
+    }
+    Icon::from_rgba(rgba, w, h).unwrap_or_else(|_| load_icon())
 }
 
 /// Build the browser URL for a raw launch argument (`dashboard.epix`,
