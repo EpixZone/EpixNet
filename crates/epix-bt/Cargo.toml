@@ -19,3 +19,5 @@ bytes = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Securely-named unique temp dirs for tests (auto-cleaned on drop).
+tempfile = "3"

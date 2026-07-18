@@ -25,9 +25,8 @@ const WEBM_LEN: u64 = 571_346_576;
 #[tokio::test]
 #[ignore = "hits the network (webtorrent.io); run with --ignored"]
 async fn streams_verified_tears_of_steel_bytes() {
-    let dir = std::env::temp_dir().join("epixbt-tears-itest");
-    let _ = std::fs::remove_dir_all(&dir);
-    let engine = Engine::new(dir.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path());
 
     // First 256 KiB: the engine fetches + SHA-1-verifies piece 0 (512 KiB) to
     // serve it.
@@ -57,8 +56,6 @@ async fn streams_verified_tears_of_steel_bytes() {
         .expect("stream tail range");
     assert_eq!(served3.end, WEBM_LEN - 1);
     assert_eq!(served3.bytes.len(), 100);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A bare `.torrent` URL with NO web seed declared (only a UDP tracker). The
@@ -69,9 +66,8 @@ async fn streams_verified_tears_of_steel_bytes() {
 #[tokio::test]
 #[ignore = "hits the network (download.stefan.ubbink.org); run with --ignored"]
 async fn streams_from_bare_torrent_url_via_implicit_web_seed() {
-    let dir = std::env::temp_dir().join("epixbt-torrenturl-itest");
-    let _ = std::fs::remove_dir_all(&dir);
-    let engine = Engine::new(dir.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(dir.path());
 
     let url = "http://download.stefan.ubbink.org/ToS/tears_of_steel_1080p.webm.torrent";
     let served = engine.stream(url, Some("bytes=0-262143")).await.expect("stream from .torrent url");
@@ -81,6 +77,4 @@ async fn streams_from_bare_torrent_url_via_implicit_web_seed() {
     assert_eq!(served.content_type, "video/webm");
     assert_eq!(served.total, WEBM_LEN);
     assert_eq!(&served.bytes[0..4], &[0x1a, 0x45, 0xdf, 0xa3], "WebM magic bytes");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

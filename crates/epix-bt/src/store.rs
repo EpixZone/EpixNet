@@ -106,9 +106,9 @@ mod tests {
 
     #[tokio::test]
     async fn write_then_read_roundtrips_and_have_tracks() {
-        let dir = std::env::temp_dir().join(format!("epixbt-store-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("clip.mp4");
+        // A securely-named unique temp dir, cleaned up when `dir` drops.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip.mp4");
 
         let store = PieceStore::open(&path, 10, 3).await.unwrap();
         assert_eq!(store.size(), 10);
@@ -126,7 +126,5 @@ mod tests {
         // Read clipped at EOF returns only the available bytes.
         let tail = store.read_at(8, 10).await.unwrap();
         assert_eq!(tail.len(), 2);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
