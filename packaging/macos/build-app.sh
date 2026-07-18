@@ -92,6 +92,19 @@ if [ -n "$BUNDLED_FF" ]; then
   /usr/libexec/PlistBuddy -c "Set :CFBundleName EpixNet" \
     "$BUNDLED_FF/Contents/Info.plist" 2>/dev/null || true
 
+  # Give the bundled Firefox its own bundle identifier. Firefox ESR ships as
+  # org.mozilla.firefox - the same id a user's installed Firefox uses - so macOS
+  # sees two apps claiming one identifier and, at launch, pops "Open existing
+  # Firefox application?" defaulting to the user's plain Firefox. That copy has
+  # none of our profile policy (the CA trust that makes https://*.epix valid),
+  # extension, or prefs, so a cert error and missing customizations follow. A
+  # unique id makes our copy the sole owner of its identifier, so it always
+  # launches itself and the prompt never appears. (find_firefox locates it by
+  # path and edition detection reads application.ini, so neither depends on this
+  # id.)
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier zone.epix.firefox" \
+    "$BUNDLED_FF/Contents/Info.plist" 2>/dev/null || true
+
   # Firefox enterprise policy: trust the launcher's local CA so https://*.epix
   # is a secure context on machines without NSS certutil. Must be baked in
   # here, before signing - the launcher never edits the sealed .app at runtime.
