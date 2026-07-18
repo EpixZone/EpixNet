@@ -9404,6 +9404,58 @@ impl AppState {
         result
     }
 
+    /// One round of a bulk pass: try every queued file once, marking the
+    /// snapshot and counters as results land. Returns the files to requeue
+    /// (failed this round) and whether the round aborted because the user
+    /// withdrew the mandate mid-round (toggle off, pause, delete) - a
+    /// multi-GB queue nobody wants anymore must stop between files.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_optional_round<'a>(
+        self: &Arc<Self>,
+        address: &str,
+        directory: Option<&str>,
+        queue: &[(usize, &'a String, u64)],
+        round: usize,
+        rounds: usize,
+        fetched: &mut usize,
+        bytes_done: &mut u64,
+    ) -> (Vec<(usize, &'a String, u64)>, bool) {
+        let mut requeue: Vec<(usize, &'a String, u64)> = Vec::new();
+        for (pos, (idx, path, size)) in queue.iter().enumerate() {
+            if !self.optional_pass_should_continue(address, directory).await {
+                return (requeue, true);
+            }
+            let result = self
+                .fetch_optional_with_status(address, *idx, path, *size, *bytes_done, round, rounds)
+                .await;
+            match result {
+                Ok(_) => {
+                    *fetched += 1;
+                    *bytes_done += *size;
+                    self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
+                    self.bump_optional_progress(address, *fetched, requeue.len(), *bytes_done)
+                        .await;
+                    // Per-file event: open pages re-query, the sidebar's
+                    // downloaded-bytes counter moves while the pass runs.
+                    self.push_site_info_file_done(address, path, None).await;
+                }
+                Err(e) => {
+                    requeue.push((*idx, *path, *size));
+                    self.mark_optional_file(address, *idx, OptFileState::Failed, "").await;
+                    self.bump_optional_progress(address, *fetched, requeue.len(), *bytes_done)
+                        .await;
+                    self.log(
+                        "DEBUG",
+                        format!("Optional file {path} failed (round {round}/{rounds}): {e}"),
+                    )
+                    .await;
+                }
+            }
+            self.set_worker_stats(address, queue.len() - pos - 1 + requeue.len(), 1, 0).await;
+        }
+        (requeue, false)
+    }
+
     /// Between in-pass rounds: some files failed, so force-announce for FRESH
     /// peers (the ones we had were tried and lacked the files) and flip the
     /// failures back to Pending for the next round. Returns false to end the
@@ -9566,51 +9618,15 @@ impl AppState {
         // retried files flip back to Pending/Active in place in the file list.
         let mut queue: Vec<(usize, &String, u64)> =
             todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
-        'rounds: for round in 1..=ROUNDS {
-            let mut requeue: Vec<(usize, &String, u64)> = Vec::new();
-            for (pos, (idx, path, size)) in queue.iter().enumerate() {
-                // The user can withdraw the mandate mid-pass (toggle off,
-                // pause, delete): stop between files instead of finishing a
-                // multi-GB queue nobody wants anymore.
-                if !self.optional_pass_should_continue(address, directory).await {
-                    cancelled = true;
-                    break 'rounds;
-                }
-                let result = self
-                    .fetch_optional_with_status(address, *idx, path, *size, bytes_done, round, ROUNDS)
-                    .await;
-                match result {
-                    Ok(_) => {
-                        fetched += 1;
-                        bytes_done += *size;
-                        self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
-                        self.bump_optional_progress(address, fetched, requeue.len(), bytes_done)
-                            .await;
-                        // Per-file event: open pages re-query, the sidebar's
-                        // downloaded-bytes counter moves while the pass runs.
-                        self.push_site_info_file_done(address, path, None).await;
-                    }
-                    Err(e) => {
-                        requeue.push((*idx, *path, *size));
-                        self.mark_optional_file(address, *idx, OptFileState::Failed, "").await;
-                        self.bump_optional_progress(address, fetched, requeue.len(), bytes_done)
-                            .await;
-                        self.log(
-                            "DEBUG",
-                            format!("Optional file {path} failed (round {round}/{ROUNDS}): {e}"),
-                        )
-                        .await;
-                    }
-                }
-                self.set_worker_stats(
-                    address,
-                    queue.len() - pos - 1 + requeue.len(),
-                    1,
-                    0,
-                )
+        for round in 1..=ROUNDS {
+            let (requeue, aborted) = self
+                .run_optional_round(address, directory, &queue, round, ROUNDS, &mut fetched, &mut bytes_done)
                 .await;
-            }
             failed = requeue.len();
+            if aborted {
+                cancelled = true;
+                break;
+            }
             if requeue.is_empty() || round == ROUNDS {
                 break;
             }
