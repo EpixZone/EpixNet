@@ -36,6 +36,12 @@ futures = "0.3"
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros", "time"] }
 tracing = "0.1"
+# arti's "compression" pulls in liblzma-sys, which links the system liblzma
+# dynamically when pkg-config finds one. On a build machine with Homebrew that
+# bakes /opt/homebrew/.../liblzma.5.dylib into the shipped binary, and the app
+# crashes at launch on any Mac without it. The "static" feature compiles lzma
+# from the vendored source into the binary instead.
+liblzma-sys = { version = "0.4", features = ["static"] }
 
 [dev-dependencies]
 # Independent Ed25519 verifier for the OnionKey signing test.
