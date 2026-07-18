@@ -2029,12 +2029,21 @@ async fn serve_file(
         && !is_html
         && !range_bigfile
         && !ctx.state.xite_file_exists(&address, &path).await
-        && ctx.state.file_info_any(&address, &path).await.is_some()
     {
-        let need = ctx.state.file_need(&address, &path);
-        match tokio::time::timeout(std::time::Duration::from_secs(45), need).await {
-            Ok(Ok(true)) => {} // on disk now - the normal Range/read path serves it
-            _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        if let Some((info, optional)) = ctx.state.file_info_any(&address, &path).await {
+            // Optional files are opt-in: without the site's download flag,
+            // never fetch silently - ask the user once (wrapper confirm) and
+            // 404 this request; the page retries after they accept.
+            if optional && !ctx.state.optional_fetch_allowed(&address).await {
+                ctx.state.prompt_optional_download(&address, &path, info.size);
+                return (StatusCode::NOT_FOUND, "optional file (downloads disabled)")
+                    .into_response();
+            }
+            let need = ctx.state.file_need(&address, &path);
+            match tokio::time::timeout(std::time::Duration::from_secs(45), need).await {
+                Ok(Ok(true)) => {} // on disk now - the normal Range/read path serves it
+                _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
         }
     }
     let still_loading = !range_bigfile
@@ -2104,7 +2113,21 @@ async fn serve_file(
         // On-disk size; a big file never touched before has no sparse file
         // yet, so fall back to its declared size (bigfile_fetch_range below
         // creates the file).
-        let total = match ctx.state.file_size(&address, &path).await {
+        let on_disk = ctx.state.file_size(&address, &path).await;
+        // A bigfile Range request that would START a download (nothing on
+        // disk yet) is optional content arriving silently: same opt-in gate
+        // as the whole-file path above. A partially-fetched file keeps
+        // streaming - it was permitted when it started.
+        if on_disk.is_none() {
+            if let Some((info, true)) = ctx.state.file_info_any(&address, &path).await {
+                if !ctx.state.optional_fetch_allowed(&address).await {
+                    ctx.state.prompt_optional_download(&address, &path, info.size);
+                    return (StatusCode::NOT_FOUND, "optional file (downloads disabled)")
+                        .into_response();
+                }
+            }
+        }
+        let total = match on_disk {
             Some(total) => Some(total),
             None => ctx.state.bigfile_total(&address, &path).await,
         };
@@ -2455,6 +2478,15 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
             }
         }
     });
+    // Register this connection as bound to its xite (after subscribing, so no
+    // event can slip through the gap) and flush any confirm/prompt that was
+    // pushed for the xite while nothing was bound - the fix for prompts that
+    // only appeared after a restart. Delivered once, to this connection.
+    if let Some(addr) = session.xite.clone() {
+        for payload in ctx.state.register_bound_conn(&addr, session.id) {
+            ctx.state.deliver_payload_to(session.id, payload);
+        }
+    }
     let (mut sink, mut stream) = socket.split();
     // Replies from concurrently-running command handlers (the sink has one
     // writer: this loop).
@@ -2552,6 +2584,9 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                 }
             }
         }
+    }
+    if let Some(addr) = &session.xite {
+        ctx.state.unregister_bound_conn(addr, session.id);
     }
     pump.abort();
 }

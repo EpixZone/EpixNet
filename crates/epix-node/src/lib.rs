@@ -1568,6 +1568,17 @@ async fn serve(
         }
         _ => default_trackers(),
     };
+    // State-initiated announces (ensure_optional_peers) build the same full
+    // tracker set the announce loop uses - including this bootstrap list.
+    state.set_bootstrap_trackers(trackers.clone()).await;
+
+    // Background optional-file retry loop: any xite whose "Download optional
+    // files" / "Help distribute" toggle is on keeps fetching its missing
+    // optional files - resuming interrupted downloads at startup and retrying
+    // (with backoff) until everything arrived or the node stops. Registered
+    // after the bootstrap trackers so its on-demand announces have the full
+    // tracker set.
+    state.spawn_optional_retry_loop();
 
     // On-demand resolve + clone: typing any `talk.epix` in the browser clones
     // and serves it live.

@@ -396,6 +396,44 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
 }
 #menu-sign-publish:hover { color: #FEFEFE }
 
+/* Live optional-file download progress panel (rendered inside the same card as
+   the Downloaded/Total legend and the toggles; absent when idle). A divider
+   sets it apart within the block. */
+.optional-progress { margin: 10px 0px; padding-top: 12px; border-top: 1px solid #2E2E32; }
+.optional-progress > label { display: flex; align-items: center; color: #F2F2F6; }
+.opt-spinner {
+    display: inline-block; width: 12px; height: 12px; margin-right: 8px; flex: none;
+    border: 2px solid rgba(49, 189, 198, 0.25); border-top-color: #31BDC6;
+    border-radius: 50%; animation: opt-spin 0.8s linear infinite;
+}
+@keyframes opt-spin { to { transform: rotate(360deg); } }
+.opt-status { color: #ABABB5; font-size: 12px; margin: 4px 0px 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.opt-toggle-files { display: inline-block; color: #ABABB5; font-size: 12px; margin: 2px 0px 0px; cursor: pointer; -webkit-user-select: none; user-select: none; }
+.opt-toggle-files:hover { color: #F2F2F6; }
+.opt-toggle-files::before { content: '\25B8'; display: inline-block; margin-right: 5px; transition: transform 0.15s; }
+.opt-file-list.expanded + .opt-toggle-files::before,
+.opt-toggle-files.expanded::before { transform: rotate(90deg); }
+.opt-file-list {
+    list-style: none; margin: 6px 0px 0px; padding: 0px; overflow-y: auto;
+    max-height: 0px; transition: max-height 0.2s ease-out;
+}
+.opt-file-list.expanded { max-height: 180px; }
+.opt-file { display: flex; align-items: center; padding: 3px 0px; font-size: 12px; color: #ABABB5; }
+.opt-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.opt-file b { margin-left: auto; padding-left: 8px; font-weight: 600; color: #8A8A93; flex: none; }
+.opt-file-icon { display: inline-block; width: 12px; height: 12px; margin-right: 7px; flex: none; text-align: center; line-height: 12px; }
+.opt-file.state-pending .opt-file-icon::before { content: '\2022'; color: #55555C; }
+.opt-file.state-done { color: #F2F2F6; }
+.opt-file.state-done .opt-file-icon::before { content: '\2713'; color: #31BDC6; }
+.opt-file.state-failed .opt-file-icon::before { content: '\2715'; color: #C6314A; }
+.opt-file.state-active .opt-file-icon {
+    border: 2px solid rgba(49, 189, 198, 0.25); border-top-color: #31BDC6;
+    border-radius: 50%; width: 9px; height: 9px; box-sizing: border-box;
+    animation: opt-spin 0.8s linear infinite;
+}
+.opt-file.state-active { color: #F2F2F6; }
+.opt-failed { color: #C6314A; }
+
 /* Small screen: full-width sheet, 44px touch targets, globe behind a button. */
 @media screen and (max-width: 640px) {
     .sidebar .content { width: 100vw; padding: 0px 16px 24px; }

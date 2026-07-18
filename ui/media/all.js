@@ -1854,7 +1854,14 @@ if (window.getComputedStyle(document.body).transform) {
         this.log("Loading screen visible, but inner loaded");
         this.loading.hideScreen();
       }
-      if ((site_info != null ? (ref = site_info.settings) != null ? ref.own : void 0 : void 0) && (site_info != null ? (ref1 = site_info.settings) != null ? ref1.modified : void 0 : void 0) !== ((ref2 = this.site_info) != null ? (ref3 = ref2.settings) != null ? ref3.modified : void 0 : void 0)) {
+      var now_own = (ref = site_info.settings) != null ? ref.own : void 0;
+      var prev_settings = (ref1 = this.site_info) != null ? ref1.settings : void 0;
+      var was_own = prev_settings != null ? prev_settings.own : void 0;
+      var modified_changed = ((ref2 = site_info.settings) != null ? ref2.modified : void 0) !== (prev_settings != null ? prev_settings.modified : void 0);
+      // Refresh the "modified files - sign them" panel when the content
+      // changed OR when the user just claimed the site ("This is my site"),
+      // so the sign prompt appears immediately instead of after a refresh.
+      if (now_own && (modified_changed || !was_own)) {
         this.updateModifiedPanel();
       }
       if (this.loading.screen_visible && site_info.settings.size > site_info.size_limit * 1024 * 1024) {

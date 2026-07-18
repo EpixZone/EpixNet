@@ -13,6 +13,22 @@ pub struct Cache {
     /// inner_path -> retry count for files that failed to download/verify.
     #[serde(default)]
     pub bad_files: HashMap<String, i64>,
+    /// Per-optional-file counters for the dashboard's Files tab:
+    /// `inner_path -> {uploaded, time_downloaded}` (EpixNet keeps these in
+    /// content.db's `file_optional` table).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub optional_stats: HashMap<String, OptionalFileStat>,
+}
+
+/// Counters for one optional file (persisted in [`Cache`]).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OptionalFileStat {
+    /// Bytes of this file served to peers (the Files tab's ratio dots).
+    #[serde(default)]
+    pub uploaded: i64,
+    /// Unix time the download completed (0 = not downloaded / unknown).
+    #[serde(default)]
+    pub time_downloaded: i64,
 }
 
 fn default_true() -> bool {
@@ -52,6 +68,14 @@ pub struct XiteSettings {
     /// Bytes of optional files actually downloaded.
     #[serde(default)]
     pub optional_downloaded: i64,
+    /// Cumulative bytes served to peers, across runs (EpixNet's
+    /// `settings.bytes_sent`). The dashboard's per-site upload/download
+    /// ratio badge divides these two.
+    #[serde(default)]
+    pub bytes_sent: u64,
+    /// Cumulative bytes downloaded from peers, across runs.
+    #[serde(default)]
+    pub bytes_recv: u64,
     #[serde(default)]
     pub size_files_optional: i64,
     /// Last known peer count for the xite.
@@ -66,6 +90,12 @@ pub struct XiteSettings {
     pub size_limit: Option<i64>,
     #[serde(default)]
     pub autodownloadoptional: bool,
+    /// Optional files may be fetched on demand for this xite (the sidebar's
+    /// "Download optional files" toggle, also granted through the wrapper
+    /// prompt the first time a page asks for one). `autodownloadoptional`
+    /// (help distribute = fetch everything) implies this.
+    #[serde(default)]
+    pub download_optional: bool,
     /// Directories the user opted to help distribute (optionalHelp):
     /// `{dir_prefix: title}`. Files under these auto-download like
     /// autodownloadoptional does for the whole site.
@@ -97,11 +127,14 @@ impl XiteSettings {
             size: 0,
             size_optional: 0,
             optional_downloaded: 0,
+            bytes_sent: 0,
+            bytes_recv: 0,
             size_files_optional: 0,
             peers: 0,
             modified_files_notification: None,
             size_limit: None,
             autodownloadoptional: false,
+            download_optional: false,
             optional_help: Map::new(),
             favorite: false,
             wrapper_key: epix_crypt::new_seed(),

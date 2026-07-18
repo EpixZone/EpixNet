@@ -68,6 +68,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteResume",
     "siteSetAutodownloadBigfileLimit",
     "siteSetAutodownloadoptional",
+    "siteSetDownloadoptional",
     "siteSetLimit",
     "siteSetOwned",
     "siteSetSettingsValue",
@@ -501,6 +502,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(SiteServing { cmd: "siteResume", serving: true }),
         Arc::new(SiteDelete),
         Arc::new(SiteSetAutodownloadoptional),
+        Arc::new(SiteSetDownloadoptional),
         // The optionalHelp family answers both casings: EpixNet named the
         // commands lowercase, but the apps call them with a capital O.
         Arc::new(OptionalHelp { cmd: "optionalHelp" }),
@@ -2591,6 +2593,17 @@ impl WsCommand for FileNeed {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let inner_path = arg_str(p, "inner_path", 0).ok_or("fileNeed: inner_path required")?;
         let (address, inner_path) = s.resolve_target(inner_path).await?;
+        // Optional files are opt-in: a page can't bypass the user's toggle by
+        // calling fileNeed directly - same prompt-once flow as the media path.
+        // Already-present files pass (file_need just verifies them).
+        if let Some((info, true)) = s.state.file_info_any(&address, &inner_path).await {
+            if !s.state.optional_fetch_allowed(&address).await
+                && !s.state.xite_file_exists(&address, &inner_path).await
+            {
+                s.state.prompt_optional_download(&address, &inner_path, info.size);
+                return Err("Optional file downloads are disabled for this xite".into());
+            }
+        }
         s.state.file_need(&address, &inner_path).await?;
         Ok(Value::from("ok"))
     }
@@ -2604,9 +2617,20 @@ impl WsCommand for OptionalFileList {
         "optionalFileList"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
+        // The dashboard's Files tab queries other sites by address; honor it
+        // with the same permission gate the optionalHelp commands use.
+        let address = match p.get("address").and_then(|v| v.as_str()) {
+            Some(a) => {
+                require_site_permission(s, a).await?;
+                a.to_string()
+            }
+            None => s.address()?.to_string(),
+        };
         let filter = p.get("filter").and_then(|v| v.as_str()).unwrap_or("downloaded");
-        Ok(Value::Array(s.state.optional_file_list(&address, filter).await?))
+        let orderby =
+            p.get("orderby").and_then(|v| v.as_str()).unwrap_or("time_downloaded DESC");
+        let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        Ok(Value::Array(s.state.optional_file_list(&address, filter, orderby, limit).await?))
     }
 }
 
@@ -3126,6 +3150,26 @@ impl WsCommand for OptionalHelpAll {
             .unwrap_or(false);
         s.state.set_autodownloadoptional(&address, value).await;
         Ok(Value::from(value))
+    }
+}
+
+struct SiteSetDownloadoptional;
+#[async_trait]
+impl WsCommand for SiteSetDownloadoptional {
+    fn name(&self) -> &'static str {
+        "siteSetDownloadoptional"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let on = p
+            .get("value")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Explicit toggle: enabling it downloads the currently-missing optional
+        // files now (with the sidebar progress panel).
+        s.state.set_download_optional(&address, on, true).await;
+        Ok(Value::from("ok"))
     }
 }
 

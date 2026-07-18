@@ -198,6 +198,23 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "enable",
         "select:Enable=enable|Disable=disable",
     ),
+    // --- Optional Files: node-wide DEFAULTS for newly downloaded xites. Each
+    // xite's own sidebar toggles override these per xite afterwards; changing
+    // a default never touches xites you already have.
+    (
+        "Optional Files",
+        "download_optional_default",
+        "Download optional files on new xites",
+        "true",
+        "bool",
+    ),
+    (
+        "Optional Files",
+        "autodownloadoptional_default",
+        "Help distribute all files on new xites (keeps fetching files new versions add)",
+        "true",
+        "bool",
+    ),
     // --- Storage. `data_dir` is special: the value is the live data root and
     // the setting persists to `epixnet.conf` (see `AppState::set_data_dir`),
     // not config.json - config.json lives inside the directory it would name.
@@ -294,6 +311,85 @@ struct ManagedXite {
     /// `findHashIds` can point a downloader at peers holding a rare file.
     /// Keyed by peer address string.
     peer_hashfields: HashMap<String, epix_xite::Hashfield>,
+    /// Live progress of a running bulk optional-file download, surfaced to the
+    /// sidebar so the "help distribute" toggle shows a spinner + per-file
+    /// status instead of appearing frozen. `None` when nothing is downloading.
+    optional_progress: Option<OptionalProgress>,
+}
+
+/// Per-file state within an [`OptionalProgress`] run. Serialized to the sidebar
+/// as a short string so the UI can pick an icon (spinner / check / dot / x).
+#[derive(Clone, Copy, PartialEq)]
+enum OptFileState {
+    Pending,
+    Active,
+    Done,
+    Failed,
+}
+
+impl OptFileState {
+    fn as_str(self) -> &'static str {
+        match self {
+            OptFileState::Pending => "pending",
+            OptFileState::Active => "active",
+            OptFileState::Done => "done",
+            OptFileState::Failed => "failed",
+        }
+    }
+}
+
+/// One entry in the collapsible file list the sidebar shows during a bulk
+/// optional download.
+#[derive(Clone)]
+struct OptionalProgressFile {
+    path: String,
+    size: u64,
+    state: OptFileState,
+}
+
+/// Snapshot of a bulk optional-file download in flight, exposed via
+/// `site_info` (`optional_progress`) and rendered live by the sidebar. Bytes
+/// drive the overall %, the file list drives the collapsible per-file view.
+#[derive(Clone)]
+struct OptionalProgress {
+    total_files: usize,
+    done_files: usize,
+    failed_files: usize,
+    bytes_total: u64,
+    bytes_done: u64,
+    /// The inner_path currently being fetched (empty between files / at end).
+    current: String,
+    /// Human phase for the file in flight ("Waiting for peers…",
+    /// "Connecting to N peer(s)…", "Downloading…"), sampled live so the panel
+    /// says what it's doing instead of spinning silently.
+    status: String,
+    files: Vec<OptionalProgressFile>,
+}
+
+impl OptionalProgress {
+    fn to_json(&self) -> Value {
+        json!({
+            "total_files": self.total_files,
+            "done_files": self.done_files,
+            "failed_files": self.failed_files,
+            "bytes_total": self.bytes_total,
+            "bytes_done": self.bytes_done,
+            "current": self.current,
+            "status": self.status,
+            "percent": if self.bytes_total > 0 {
+                (self.bytes_done as f64 / self.bytes_total as f64 * 100.0).min(100.0)
+            } else if self.total_files > 0 {
+                (self.done_files as f64 / self.total_files as f64 * 100.0).min(100.0)
+            } else {
+                0.0
+            },
+            "files": self.files.iter().map(|f| json!({
+                "path": f.path,
+                "size": f.size,
+                "state": f.state.as_str(),
+            })).collect::<Vec<_>>(),
+        })
+    }
 }
 
 /// A verified root content.json waiting for its files: the signature checked
@@ -473,6 +569,29 @@ pub struct AppState {
     /// serving gate reads this: while a clone runs, the page document waits
     /// for the whole core set instead of booting half-downloaded.
     clones_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Xite addresses with a bulk optional-file download running
+    /// ([`Self::download_optional_files`]), so overlapping triggers (the
+    /// sidebar toggle plus a resync tick) don't walk the same site twice.
+    optional_downloads_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Addresses whose optional-file state may have changed (new content
+    /// landed, a toggle flipped): the background retry loop clears their
+    /// schedule entry on its next tick so they get re-checked immediately
+    /// instead of waiting out a backoff or the complete-cache interval.
+    optional_dirty: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Xites already asked (this session) whether to enable optional-file
+    /// downloads, so a retrying `<video>` tag can't spam the wrapper confirm.
+    /// Cleared when the toggle is switched off, so a later request re-asks.
+    optional_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Live UI connections bound to each xite address (`session.id`s). Pushed
+    /// confirms/prompts route to a bound connection; when NONE is bound the
+    /// broadcast reaches nobody and the dialog is lost - the "prompt only
+    /// shows after a restart" race. [`Self::pending_prompts`] buffers those.
+    bound_conns: std::sync::Mutex<HashMap<String, std::collections::HashSet<u64>>>,
+    /// Confirm/prompt payloads pushed for a xite while no connection was bound
+    /// to it, flushed to the next connection that binds (delivered once). The
+    /// callback ids are still live in [`Self::callbacks`], so the answer routes
+    /// back normally. Capped per address so an unwatched site can't grow it.
+    pending_prompts: std::sync::Mutex<HashMap<String, Vec<String>>>,
     /// Per-file locks keyed by `(address, inner_path)` so concurrent
     /// `file_need`s for the same file download it once: later callers wait on
     /// the first, then hit the verified-on-disk early return. Entries are
@@ -511,6 +630,11 @@ pub struct AppState {
     /// folded into every announce alongside the configured ones. Replaced
     /// wholesale on each refresh - not persisted, the plugin's book is.
     extra_trackers: RwLock<Vec<epix_xite::Tracker>>,
+    /// The node's bootstrap tracker list (config or built-in defaults), set
+    /// once at startup so state-initiated announces (`ensure_optional_peers`)
+    /// can use the FULL tracker set even before the Beacon's first refresh
+    /// populates `extra_trackers`.
+    bootstrap_trackers: RwLock<Vec<epix_xite::Tracker>>,
     /// Fired when the runtime-contributed tracker set changes, so the announce
     /// loop can run early instead of waiting out its period.
     trackers_changed: Arc<tokio::sync::Notify>,
@@ -896,6 +1020,11 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            bound_conns: std::sync::Mutex::new(HashMap::new()),
+            pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -907,6 +1036,7 @@ impl AppState {
             sites_path: None,
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
+            bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
@@ -1014,6 +1144,11 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            bound_conns: std::sync::Mutex::new(HashMap::new()),
+            pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
             log_file: std::sync::Mutex::new(None),
@@ -1027,6 +1162,7 @@ impl AppState {
             data_root: Some(data_root),
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
+            bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
@@ -1113,6 +1249,16 @@ impl AppState {
         self.config.read().await.get(key).cloned()
     }
 
+    /// A boolean config value. The Config page persists bools as the STRINGS
+    /// "true"/"false", so both JSON forms are accepted; an absent key returns
+    /// `default` (which must mirror the CONFIG_SCHEMA default for that key).
+    pub async fn config_bool(&self, key: &str, default: bool) -> bool {
+        self.config_get(key)
+            .await
+            .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true" || s == "on")))
+            .unwrap_or(default)
+    }
+
     // --- NoNewSites: refuse to clone/add new sites when set -----------------
 
     /// Whether the operator has disabled adding new sites to this node.
@@ -1185,6 +1331,13 @@ impl AppState {
     /// The runtime-contributed trackers (beyond the configured/static list).
     pub async fn extra_trackers(&self) -> Vec<epix_xite::Tracker> {
         self.extra_trackers.read().await.clone()
+    }
+
+    /// Record the node's bootstrap tracker list (config or built-in defaults).
+    /// Called once at startup; lets state-initiated announces build the same
+    /// full tracker set the announce loop uses.
+    pub async fn set_bootstrap_trackers(&self, trackers: Vec<epix_xite::Tracker>) {
+        *self.bootstrap_trackers.write().await = trackers;
     }
 
     /// The full tracker set for an announce: the `bootstrap` list plus the
@@ -1740,6 +1893,26 @@ impl AppState {
         // Grants are keyed by the signed content address so a site served under
         // both its raw address and a `.epix` alias shares one grant.
         let canonical = canonical_address(entry.content.as_ref(), &address);
+        // Optional-file toggles: a xite we've served before keeps its SAVED
+        // per-xite choice (sites.json) - add_xite re-runs for the launch xite
+        // every boot and for every restored xite, and clobbering with the
+        // node defaults would silently undo a user's opt-out (and persist the
+        // wrong value). Only a genuinely NEW xite inherits the node-wide
+        // defaults (Config page: "Optional Files"); help-distribute implies
+        // downloading.
+        match self.saved_optional_flags(&canonical) {
+            Some((dl, auto)) => {
+                settings.download_optional = dl;
+                settings.autodownloadoptional = auto;
+            }
+            None => {
+                let auto_default =
+                    self.config_bool("autodownloadoptional_default", true).await;
+                settings.autodownloadoptional = auto_default;
+                settings.download_optional =
+                    auto_default || self.config_bool("download_optional_default", true).await;
+            }
+        }
         if let Some(granted) = self.grants.read().await.get(&canonical) {
             settings.permissions = granted.clone();
         }
@@ -1765,8 +1938,20 @@ impl AppState {
         // Restore optional-file pins persisted by OptionalManager.
         let pinned = self.load_persisted_pins(&canonical);
         // Seed the optional-file hashfield from what's already on disk, so we
-        // advertise held optional files immediately (getHashfield/findHashIds).
-        let hashfield = compute_hashfield(&entry.storage, entry.content.as_ref());
+        // advertise held optional files immediately (getHashfield/findHashIds)
+        // - and recompute the downloaded-bytes counter from the same walk, so
+        // the sidebar's "Downloaded" figure heals itself instead of trusting
+        // a stale sites.json. (Piecewise-partial bigfiles re-count on their
+        // next fetch pass; whole files are the common case.)
+        let (hashfield, optional_on_disk, optional_declared) =
+            compute_optional_state(&entry.storage, entry.content.as_ref());
+        let mut settings = settings;
+        settings.optional_downloaded = optional_on_disk;
+        // Include per-user (child content.json) optional files in the total -
+        // the root-only content stat hid the sidebar card on user-content
+        // xites. Keep the root stat when the walk found less (mid-clone, the
+        // children may not be on disk yet).
+        settings.size_optional = settings.size_optional.max(optional_declared);
         self.xites.write().await.insert(
             address,
             ManagedXite {
@@ -1785,6 +1970,7 @@ impl AppState {
                 pinned,
                 hashfield,
                 peer_hashfields: HashMap::new(),
+                optional_progress: None,
             },
         );
         // Record the served-xite list so it is restored on the next start.
@@ -1890,6 +2076,21 @@ impl AppState {
     /// flat at the top level - so a Python node can read it and vice versa.
     /// The display alias (e.g. `dashboard.epix`) rides along as an extra
     /// `display` key inside the settings dict (Python preserves unknown keys).
+    /// The optional-download toggles persisted in sites.json for a canonical
+    /// address, if the site was served before. Consulted by [`Self::add_xite`]
+    /// so a re-add (the launch xite every boot, a restore) keeps the user's
+    /// saved choice instead of resetting to the node defaults.
+    fn saved_optional_flags(&self, canonical: &str) -> Option<(bool, bool)> {
+        let path = self.sites_path.as_ref()?;
+        let raw = std::fs::read(path).ok()?;
+        let map: Value = serde_json::from_slice(&raw).ok()?;
+        let entry = map.get(canonical)?;
+        Some((
+            entry.get("download_optional").and_then(|v| v.as_bool()).unwrap_or(false),
+            entry.get("autodownloadoptional").and_then(|v| v.as_bool()).unwrap_or(false),
+        ))
+    }
+
     pub async fn persist_sites(&self) {
         let Some(path) = &self.sites_path else { return };
         let xites = self.xites.read().await;
@@ -1941,7 +2142,20 @@ impl AppState {
             let mut xite = Xite::new(addr, storage.clone());
             let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
             if !loaded {
-                continue; // no content.json on disk yet
+                // No content.json on disk yet: a requested xite whose clone
+                // never landed (seeder offline at siteAdd time). Restore it
+                // REGISTERED-BUT-EMPTY - the background retry loop keeps
+                // resuming its clone until the seeder returns - instead of
+                // silently forgetting the user's request on restart.
+                self.log(
+                    "INFO",
+                    format!("{canonical}: no content yet; keeping it registered, download resumes in background"),
+                )
+                .await;
+                self.add_xite(&canonical, XiteEntry { storage: storage.clone(), content: None })
+                    .await;
+                restored += 1;
+                continue;
             }
             // Legacy persisted-ahead state: older builds wrote content.json to
             // disk before its files, so a crash or failed sync could leave a
@@ -1975,8 +2189,14 @@ impl AppState {
                     x.settings.serving = saved.serving;
                     x.settings.size_limit = saved.size_limit;
                     x.settings.autodownloadoptional = saved.autodownloadoptional;
+                    x.settings.download_optional = saved.download_optional;
                     x.settings.optional_help = saved.optional_help;
+                    x.settings.modified_files_notification = saved.modified_files_notification;
                     x.settings.favorite = saved.favorite;
+                    // Lifetime transfer totals (the ratio badge) carry across
+                    // restarts.
+                    x.settings.bytes_sent = saved.bytes_sent;
+                    x.settings.bytes_recv = saved.bytes_recv;
                     if saved.added > 0 {
                         x.settings.added = saved.added;
                     }
@@ -2621,7 +2841,28 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.bytes_recv += recv;
             x.bytes_sent += sent;
+            // Cumulative across runs (persisted): the dashboard's per-site
+            // upload/download ratio badge reads settings.bytes_sent/recv.
+            x.settings.bytes_recv += recv;
+            x.settings.bytes_sent += sent;
             x.peers.record_transfer(addr, recv, sent);
+        }
+    }
+
+    /// [`Self::record_transfer`] for serving a file to a peer, also counting
+    /// the per-optional-file upload bytes behind the dashboard Files tab's
+    /// ratio dots (EpixNet's `file_optional.uploaded`).
+    pub async fn record_upload(&self, address: &str, peer: &PeerAddr, inner_path: &str, sent: u64) {
+        self.record_transfer(address, peer, 0, sent).await;
+        if let Some((_, true)) = self.file_info_any(address, inner_path).await {
+            if let Some(x) = self.xites.write().await.get_mut(address) {
+                x.settings
+                    .cache
+                    .optional_stats
+                    .entry(inner_path.to_string())
+                    .or_default()
+                    .uploaded += sent as i64;
+            }
         }
     }
 
@@ -2630,6 +2871,8 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.bytes_recv += recv;
             x.bytes_sent += sent;
+            x.settings.bytes_recv += recv;
+            x.settings.bytes_sent += sent;
         }
     }
 
@@ -2640,6 +2883,128 @@ impl AppState {
             x.workers = workers;
             x.started_task_num += started_delta;
         }
+    }
+
+    /// Install (or clear, with `None`) the live optional-download progress
+    /// snapshot the sidebar renders.
+    async fn set_optional_progress(&self, address: &str, progress: Option<OptionalProgress>) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            x.optional_progress = progress;
+        }
+    }
+
+    /// Set one file's state within the running snapshot; `current` names the
+    /// file the sidebar highlights as "downloading now" (pass "" to clear it).
+    async fn mark_optional_file(
+        &self,
+        address: &str,
+        index: usize,
+        state: OptFileState,
+        current: &str,
+    ) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(p) = x.optional_progress.as_mut() {
+                if let Some(f) = p.files.get_mut(index) {
+                    f.state = state;
+                }
+                p.current = current.to_string();
+            }
+        }
+    }
+
+    /// Advance the running snapshot's aggregate counters (completed/failed file
+    /// counts and downloaded bytes) that drive the overall progress bar.
+    async fn bump_optional_progress(
+        &self,
+        address: &str,
+        done_files: usize,
+        failed_files: usize,
+        bytes_done: u64,
+    ) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(p) = x.optional_progress.as_mut() {
+                p.done_files = done_files;
+                p.failed_files = failed_files;
+                p.bytes_done = bytes_done;
+            }
+        }
+    }
+
+    /// Update the running snapshot's live status line and (optionally) the
+    /// overall byte count, without disturbing the file list. Used by the status
+    /// sampler while a file is mid-fetch.
+    async fn set_optional_status(&self, address: &str, status: String, bytes_done: u64) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(p) = x.optional_progress.as_mut() {
+                p.status = status;
+                p.bytes_done = bytes_done;
+            }
+        }
+    }
+
+    /// Set only the status line of the running snapshot (bytes untouched).
+    /// Used between fetches - announcing, waiting out a retry - when no
+    /// sampler owns the byte counter.
+    async fn set_optional_phase(&self, address: &str, status: &str) {
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            if let Some(p) = x.optional_progress.as_mut() {
+                p.status = status.to_string();
+            }
+        }
+    }
+
+    /// This xite's cumulative optional bytes downloaded this run - the sampler
+    /// diffs it to show a bigfile's pieces arriving live.
+    async fn optional_downloaded_now(&self, address: &str) -> u64 {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.optional_downloaded.max(0) as u64)
+            .unwrap_or(0)
+    }
+
+    /// Background sampler for the file currently being fetched: every ~1.5s it
+    /// reports the phase ("Waiting for peers…", "Fetching from N peer(s)…",
+    /// "Downloading N%") from the connectable-peer count and the
+    /// optional-bytes delta, and moves the overall bar as pieces land.
+    /// `done_bytes` is the total already completed; `file_size` sizes the
+    /// current file's %. Byte-level % only appears for bigfiles (their pieces
+    /// bump the counter as they land); a regular file's counter moves once at
+    /// the end, so its phase says "Fetching from…" - honest about connect +
+    /// transfer both - rather than a "Connecting…" that would sit there
+    /// through the whole transfer. `round`/`rounds` tag the status with the
+    /// retry round ("… (retry 2/3)") so retries are visible in the panel
+    /// itself - a separate between-rounds phase write gets overwritten by
+    /// this sampler within milliseconds. Runs until `stop`.
+    fn spawn_optional_status_sampler(
+        self: Arc<Self>,
+        address: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        done_bytes: u64,
+        file_size: u64,
+        round: usize,
+        rounds: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let suffix =
+                if round > 1 { format!(" (retry {round}/{rounds})") } else { String::new() };
+            let base = self.optional_downloaded_now(&address).await;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let got = self.optional_downloaded_now(&address).await.saturating_sub(base);
+                let got = got.min(file_size); // ignore any concurrent optional traffic overshoot
+                let peers = self.connectable_peers(&address, 20).await.len();
+                let status = optional_fetch_status(got, file_size, peers, &suffix);
+                self.set_optional_status(&address, status, done_bytes + got).await;
+                // Short sleeps so `stop` is honored promptly when the fetch ends.
+                for _ in 0..3 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        })
     }
 
     /// The addresses of all served xites.
@@ -3528,11 +3893,17 @@ impl AppState {
     /// Check a xite for a newer content.json among its peers and, if found,
     /// verify it and download the changed files (updating live worker stats).
     /// Returns true if an update was applied. This is the node's re-sync step.
-    pub async fn resync_xite(&self, address: &str) -> Result<bool, String> {
+    pub async fn resync_xite(self: &Arc<Self>, address: &str) -> Result<bool, String> {
         // A paused xite (sitePause) is not re-synced until resumed.
         if !self.is_serving(address).await {
             return Ok(false);
         }
+        // Nudge the optional retry loop: a resync may have brought a new
+        // content.json declaring optional files this node promised to fetch.
+        // The LOOP owns the actual passes (with backoff) - triggering a full
+        // download pass from every 5-min resync tick used to hammer trackers
+        // and flash the sidebar panel for xites whose seeder is offline.
+        self.mark_optional_dirty(address);
         let transport = self.transport.read().await.clone().ok_or("no transport")?;
         let peers = self.connectable_peers(address, 10).await;
         if peers.is_empty() {
@@ -4523,6 +4894,21 @@ impl AppState {
                 // piecemap itself downloads through file_need.
                 Box::pin(self.bigfile_fetch_range(address, inner_path, 0, info.size.max(0) as u64))
                     .await?;
+                // First-completion stamp only: fetch_range on an already-
+                // complete bigfile is a no-op re-check, not a new download.
+                if optional {
+                    if let Some(x) = self.xites.write().await.get_mut(address) {
+                        let stat = x
+                            .settings
+                            .cache
+                            .optional_stats
+                            .entry(inner_path.to_string())
+                            .or_default();
+                        if stat.time_downloaded == 0 {
+                            stat.time_downloaded = now_secs() as i64;
+                        }
+                    }
+                }
                 return Ok(true);
             }
             if storage.verify(inner_path, &info.sha512) {
@@ -4545,62 +4931,152 @@ impl AppState {
     ) -> Result<bool, String> {
         let transport = self.transport.read().await.clone().ok_or("no transport")?;
         let peers = self.connectable_peers(address, 20).await;
+        // Feed every attempt back into peer reputation/backoff (the same
+        // outcomes the worker-sync path reports). Without this the on-demand
+        // path was invisible to selection: a dead peer was redialed every
+        // fetch, and - worse - a good seeder's stale backoff was never reset
+        // by the successful download, so rare xites stayed "no peers" long
+        // after their seeder was reachable again.
+        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
+        let mut found = None;
         for peer in peers {
             let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else {
+                outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
                 continue;
             };
             if conn.handshake().await.is_err() {
+                outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
                 continue;
             }
-            let Ok(bytes) = conn.get_file(address, &info.inner_path).await else { continue };
+            let Ok(bytes) = conn.get_file(address, &info.inner_path).await else {
+                // The dial worked; only the file failed (refused/timeout).
+                outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
+                continue;
+            };
             if XiteStorage::hash_bytes(&bytes) != info.sha512 {
+                outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
                 continue;
             }
-            storage.write(&info.inner_path, &bytes).map_err(|e| e.to_string())?;
-            self.set_peer_connected(address, &peer, true).await;
-            // Count optional bytes downloaded and advertise it in our
-            // hashfield so peers can discover we now hold it.
-            if optional {
-                if let Some(x) = self.xites.write().await.get_mut(address) {
-                    x.settings.optional_downloaded += info.size;
-                    x.hashfield.add_hash(&info.sha512);
-                }
-            }
-            return Ok(true);
+            outcomes.push((peer.clone(), epix_worker::PeerOutcome::ConnectOk));
+            outcomes.push((peer.clone(), epix_worker::PeerOutcome::FileOk));
+            found = Some((peer, bytes));
+            break;
         }
-        Err("could not fetch the file from any peer".into())
+        self.apply_peer_outcomes(address, outcomes).await;
+        let Some((peer, bytes)) = found else {
+            return Err("could not fetch the file from any peer".into());
+        };
+        // A fetch that raced a siteDelete must not write: XiteStorage::write
+        // create_dir_all's the parent, which would resurrect the removed site
+        // directory with an orphan file.
+        if !self.xites.read().await.contains_key(address) {
+            return Err("xite removed".into());
+        }
+        storage.write(&info.inner_path, &bytes).map_err(|e| e.to_string())?;
+        self.set_peer_connected(address, &peer, true).await;
+        // Count the transfer (site totals + per-peer) - without this the
+        // dashboard's download bytes and the Stats download graph never
+        // moved for on-demand fetches.
+        self.record_transfer(address, &peer, bytes.len() as u64, 0).await;
+        // Count optional bytes downloaded and advertise it in our
+        // hashfield so peers can discover we now hold it.
+        if optional {
+            if let Some(x) = self.xites.write().await.get_mut(address) {
+                x.settings.optional_downloaded += info.size;
+                x.hashfield.add_hash(&info.sha512);
+                // The Files tab's "Finished" column.
+                let stat = x
+                    .settings
+                    .cache
+                    .optional_stats
+                    .entry(info.inner_path.clone())
+                    .or_default();
+                stat.time_downloaded = now_secs() as i64;
+            }
+        }
+        Ok(true)
     }
 
-    /// List optional files with their state. `filter` = "downloaded" (default)
-    /// or anything else for all. `optionalFileList`.
-    pub async fn optional_file_list(&self, address: &str, filter: &str) -> Result<Vec<Value>, String> {
+    /// List optional files with their state and the per-file counters the
+    /// dashboard's Files tab renders (uploaded bytes/ratio, seeder count,
+    /// finished time). `filter` = "downloaded" (default) or anything else for
+    /// all; `orderby` is the tab's SQL-ish sort ("time_downloaded DESC",
+    /// "is_pinned DESC, inner_path", ...); `limit` 0 = all. `optionalFileList`.
+    pub async fn optional_file_list(
+        &self,
+        address: &str,
+        filter: &str,
+        orderby: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>, String> {
         let xite = self.xite_view(address).await?;
-        let pinned = self.xites.read().await.get(address).map(|x| x.pinned.clone()).unwrap_or_default();
+        let (pinned, stats, peer_fields) = {
+            let xites = self.xites.read().await;
+            match xites.get(address) {
+                Some(x) => (
+                    x.pinned.clone(),
+                    x.settings.cache.optional_stats.clone(),
+                    x.peer_hashfields.values().cloned().collect::<Vec<_>>(),
+                ),
+                None => Default::default(),
+            }
+        };
         let only_downloaded = filter == "downloaded";
-        Ok(xite
-            .optional_files()
+        // Root + child content.json declarations: a hub's per-user optional
+        // files (avatars…) must list too, not just the root's.
+        let mut out: Vec<Value> = declared_optional_files(&xite.storage, xite.content.as_ref())
             .into_iter()
             .filter_map(|f| {
                 let is_downloaded = xite.storage.verify(&f.inner_path, &f.sha512);
                 if only_downloaded && !is_downloaded {
                     return None;
                 }
+                let stat = stats.get(&f.inner_path);
+                // Seeders: peers whose hashfield advertises the file, plus us.
+                let peer = peer_fields.iter().filter(|hf| hf.has_hash(&f.sha512)).count()
+                    + is_downloaded as usize;
+                // Files downloaded before the counter existed fall back to
+                // the file's mtime, so "Finished" isn't n/a for them.
+                let time_downloaded = stat
+                    .map(|s| s.time_downloaded)
+                    .filter(|t| *t > 0)
+                    .or_else(|| {
+                        if !is_downloaded {
+                            return None;
+                        }
+                        xite.storage
+                            .path(&f.inner_path)
+                            .ok()
+                            .and_then(|p| std::fs::metadata(p).ok())
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                    })
+                    .unwrap_or(0);
                 Some(json!({
                     "inner_path": f.inner_path,
                     "size": f.size,
                     "sha512": f.sha512,
                     "is_downloaded": is_downloaded,
                     "is_pinned": pinned.contains(&f.inner_path),
+                    "uploaded": stat.map(|s| s.uploaded).unwrap_or(0),
+                    "peer": peer,
+                    "time_downloaded": time_downloaded,
                 }))
             })
-            .collect())
+            .collect();
+        sort_file_list(&mut out, orderby);
+        if limit > 0 {
+            out.truncate(limit);
+        }
+        Ok(out)
     }
 
     /// Info for one optional file, or null. `optionalFileInfo`. For a big file
     /// (>1MB with a `piecemap`) it also carries the piece layout (Bigfile).
     pub async fn optional_file_info(&self, address: &str, inner_path: &str) -> Result<Value, String> {
         let mut info = self
-            .optional_file_list(address, "all")
+            .optional_file_list(address, "all", "", 0)
             .await?
             .into_iter()
             .find(|f| f["inner_path"] == inner_path)
@@ -4732,6 +5208,27 @@ impl AppState {
         let transport = self.transport.read().await.clone();
         let peers = self.connectable_peers(address, 20).await;
 
+        // Reputation/backoff feedback, ONE outcome per peer per call (a dead
+        // peer must not be docked once per piece - that would back it off for
+        // an hour after a single bad pass). Independent BITS per peer, not a
+        // best-wins rank: the piecefield probe's bare handshake must not mask
+        // later piece-request failures, or a reachable peer that serves
+        // nothing would be REWARDED (ConnectOk resets backoff, +1 rep) every
+        // pass and float to the top of reputation-ordered selection forever.
+        const PF_CONNECTED: u8 = 1;
+        const PF_FILE_OK: u8 = 2;
+        const PF_FILE_FAIL: u8 = 4;
+        let mut peer_flags: std::collections::HashMap<String, (PeerAddr, u8)> =
+            std::collections::HashMap::new();
+        macro_rules! rank {
+            ($peer:expr, $r:expr) => {{
+                let e = peer_flags
+                    .entry($peer.to_string())
+                    .or_insert_with(|| ($peer.clone(), 0));
+                e.1 |= $r;
+            }};
+        }
+
         // Piece-aware peer selection (Bigfile piecefields): for a multi-piece
         // fetch, ask each peer up front which pieces of this file it holds, so we
         // skip peers that don't have a given piece. `sha512` keys the piecefield.
@@ -4743,25 +5240,55 @@ impl AppState {
                 for peer in &peers {
                     if let Ok(mut conn) = Connection::connect(t.as_ref(), peer).await {
                         if conn.handshake().await.is_ok() {
+                            rank!(peer, PF_CONNECTED);
                             if let Ok(map) = conn.get_piecefields(address).await {
                                 if let Some(bytes) = map.get(&sha512) {
                                     peer_pf.insert(peer.to_string(), epix_xite::Piecefield::unpack(bytes));
                                 }
                             }
+                        } else {
+                            rank!(peer, 0);
                         }
+                    } else {
+                        rank!(peer, 0);
                     }
                 }
             }
         }
 
-        for i in first..=last {
+        // Single exit below so the accumulated peer outcomes are ALWAYS
+        // applied, including on a failed piece or disk error.
+        let mut fetch_err: Option<String> = None;
+        'pieces: for i in first..=last {
+            // Per-piece guards: a deleted xite must not have pieces written
+            // back into its removed directory, and an OPTIONAL bigfile whose
+            // toggles were switched off mid-download (a multi-GB fetch can
+            // run for a long time) stops at the next piece instead of
+            // finishing against the user's withdrawn permission.
+            {
+                let exists = self.xites.read().await.contains_key(address);
+                if !exists {
+                    fetch_err = Some("xite removed".into());
+                    break 'pieces;
+                }
+                if optional && !self.optional_fetch_allowed(address).await {
+                    fetch_err = Some("optional downloads disabled".into());
+                    break 'pieces;
+                }
+            }
             let poff = i * piece_size;
             let plen = piece_size.min(total - poff);
-            let expected = hashes.get(i as usize).ok_or("piece index past piecemap")?;
+            let Some(expected) = hashes.get(i as usize) else {
+                fetch_err = Some("piece index past piecemap".into());
+                break 'pieces;
+            };
             if piece_present(&storage, inner_path, poff, plen, expected) {
                 continue;
             }
-            let transport = transport.clone().ok_or("no transport")?;
+            let Some(transport) = transport.clone() else {
+                fetch_err = Some("no transport".into());
+                break 'pieces;
+            };
             let mut got = false;
             for peer in &peers {
                 // Skip peers we know (from their piecefield) don't have this piece.
@@ -4770,16 +5297,26 @@ impl AppState {
                         continue;
                     }
                 }
-                let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else { continue };
+                let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else {
+                    rank!(peer, 0);
+                    continue;
+                };
                 if conn.handshake().await.is_err() {
+                    rank!(peer, 0);
                     continue;
                 }
                 let Ok(data) = conn.get_file_range(address, inner_path, poff, plen).await else {
+                    rank!(peer, PF_CONNECTED | PF_FILE_FAIL);
                     continue;
                 };
                 if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
-                    write_at(&storage, inner_path, poff, &data)?;
+                    if let Err(e) = write_at(&storage, inner_path, poff, &data) {
+                        fetch_err = Some(e.to_string());
+                        break 'pieces;
+                    }
+                    rank!(peer, PF_CONNECTED | PF_FILE_OK);
                     self.set_peer_connected(address, peer, true).await;
+                    self.record_transfer(address, peer, plen, 0).await;
                     if optional {
                         if let Some(x) = self.xites.write().await.get_mut(address) {
                             x.settings.optional_downloaded += plen as i64;
@@ -4787,13 +5324,42 @@ impl AppState {
                     }
                     got = true;
                     break;
+                } else {
+                    rank!(peer, PF_CONNECTED | PF_FILE_FAIL);
                 }
             }
             if !got {
-                return Err(format!("could not fetch piece {i} of {inner_path}"));
+                fetch_err = Some(format!("could not fetch piece {i} of {inner_path}"));
+                break 'pieces;
             }
         }
-        Ok(())
+        // Flags -> outcomes: a peer that served anything is a good seeder
+        // (reset backoff, reward); a connected peer that only failed piece
+        // requests is a FileFail (dock reputation, keep backoff - same as the
+        // whole-file path); a probe-only peer proved reachable (ConnectOk);
+        // an entry with no bits never answered a dial (ConnectFail).
+        let outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = peer_flags
+            .into_values()
+            .flat_map(|(addr, f)| {
+                if f & PF_FILE_OK != 0 {
+                    vec![
+                        (addr.clone(), epix_worker::PeerOutcome::ConnectOk),
+                        (addr, epix_worker::PeerOutcome::FileOk),
+                    ]
+                } else if f & PF_FILE_FAIL != 0 {
+                    vec![(addr, epix_worker::PeerOutcome::FileFail)]
+                } else if f & PF_CONNECTED != 0 {
+                    vec![(addr, epix_worker::PeerOutcome::ConnectOk)]
+                } else {
+                    vec![(addr, epix_worker::PeerOutcome::ConnectFail)]
+                }
+            })
+            .collect();
+        self.apply_peer_outcomes(address, outcomes).await;
+        match fetch_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Which pieces of each big file we hold, keyed by the file's `sha512`
@@ -5007,6 +5573,9 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             if optional {
                 x.settings.optional_downloaded = (x.settings.optional_downloaded - info.size).max(0);
+                // Drop the per-file counters so a re-download restamps
+                // "Finished" (uploaded restarts too, like EpixNet).
+                x.settings.cache.optional_stats.remove(inner_path);
             }
             changed_pin = x.pinned.remove(inner_path);
         }
@@ -6414,9 +6983,76 @@ impl AppState {
         // reply comes back without an id and the waiting future times out
         // silently: an "Add N new site?" dialog whose Add button does nothing.
         let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
-        let _ =
-            self.events.send(UiEvent { channel: None, target, payload, exclude: None, only: None });
+        // If a connection for this xite is bound, broadcast reaches it. If
+        // NONE is bound (the page is still loading its websocket, or a media
+        // request raced ahead of it), the broadcast is dropped - so buffer it
+        // and let the next binding connection pick it up (the callback id
+        // stays live in `callbacks`, so the answer still routes back).
+        let has_conn = match &target {
+            Some(addr) => self.has_bound_conn(addr),
+            None => true,
+        };
+        if has_conn {
+            let _ = self.events.send(UiEvent {
+                channel: None,
+                target,
+                payload,
+                exclude: None,
+                only: None,
+            });
+        } else if let Some(addr) = target {
+            let mut pending = self.pending_prompts.lock().unwrap();
+            let queue = pending.entry(addr).or_default();
+            queue.push(payload);
+            // Cap so an unwatched xite that keeps prompting can't grow forever.
+            if queue.len() > 16 {
+                let drop = queue.len() - 16;
+                queue.drain(0..drop);
+            }
+        }
         rx
+    }
+
+    /// Whether any live UI connection is bound to `address` (so a pushed
+    /// confirm/prompt would actually reach a viewer).
+    pub fn has_bound_conn(&self, address: &str) -> bool {
+        self.bound_conns.lock().unwrap().get(address).is_some_and(|s| !s.is_empty())
+    }
+
+    /// Register a UI connection as bound to `address` and return any prompts
+    /// that were buffered while nothing was bound, so the caller can flush them
+    /// to this connection. Called once when a websocket binds to a xite.
+    pub fn register_bound_conn(&self, address: &str, conn_id: u64) -> Vec<String> {
+        self.bound_conns
+            .lock()
+            .unwrap()
+            .entry(address.to_string())
+            .or_default()
+            .insert(conn_id);
+        self.pending_prompts.lock().unwrap().remove(address).unwrap_or_default()
+    }
+
+    /// Drop a UI connection's binding (on disconnect).
+    pub fn unregister_bound_conn(&self, address: &str, conn_id: u64) {
+        let mut map = self.bound_conns.lock().unwrap();
+        if let Some(set) = map.get_mut(address) {
+            set.remove(&conn_id);
+            if set.is_empty() {
+                map.remove(address);
+            }
+        }
+    }
+
+    /// Deliver a buffered payload (a confirm/prompt built earlier) to one
+    /// connection - the flush half of the pending-prompt buffer.
+    pub fn deliver_payload_to(&self, conn_id: u64, payload: String) {
+        let _ = self.events.send(UiEvent {
+            channel: None,
+            target: None,
+            payload,
+            exclude: None,
+            only: Some(conn_id),
+        });
     }
 
     /// Resolve a pending wrapper callback (`{cmd:"response", to}`). Returns true
@@ -7009,6 +7645,11 @@ impl AppState {
             x.settings.own = owned;
         }
         self.persist_sites().await;
+        // Push the change so the wrapper/sidebar reflect it at once (reveal the
+        // owner panel, re-check the box) instead of the toggle appearing to
+        // revert on the next re-render - and so the wrapper can raise the
+        // "modified files - sign them" panel the moment you claim the site.
+        self.push_site_info(address).await;
     }
 
     /// Try to recover a xite's private key from the user's master seed via its
@@ -8043,6 +8684,10 @@ impl AppState {
         self.updates_in_flight.lock().unwrap().remove(&uri);
         // Flash the dashboard row: a peer pushed a new version and it landed.
         if committed {
+            // The update may declare new optional files; wake the retry loop
+            // so a xite that promised to fetch them (autodownloadoptional /
+            // optionalHelp) picks them up on its next tick.
+            self.mark_optional_dirty(&key);
             for k in &keys {
                 self.push_site_info_event(k, "updated").await;
             }
@@ -8234,7 +8879,12 @@ impl AppState {
     /// Mark a directory of optional files for distribution help
     /// (`optionalHelp`): record `{directory: title}` and report the file
     /// count + total size under it. Returns (num, size).
-    pub async fn optional_help_add(&self, address: &str, directory: &str, title: &str) -> Option<(i64, i64)> {
+    pub async fn optional_help_add(
+        self: &Arc<Self>,
+        address: &str,
+        directory: &str,
+        title: &str,
+    ) -> Option<(i64, i64)> {
         let (storage, content) = {
             let mut xites = self.xites.write().await;
             let x = xites.get_mut(address)?;
@@ -8269,6 +8919,8 @@ impl AppState {
             tally(child_json.get("files_optional"), dir);
         }
         self.persist_sites().await;
+        // Helping a directory means fetching it, not just advertising it.
+        self.spawn_optional_download(address, Some(directory.to_string()));
         Some((num, size))
     }
 
@@ -8297,14 +8949,747 @@ impl AppState {
         removed
     }
 
-    /// Set a xite's auto-download-optional flag (`siteSetAutodownloadoptional`).
-    pub async fn set_autodownloadoptional(&self, address: &str, on: bool) -> bool {
-        if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.autodownloadoptional = on;
-            true
-        } else {
-            false
+    /// Set a xite's auto-download-optional flag (`siteSetAutodownloadoptional`),
+    /// persist it, and - when turning ON - start fetching the missing optional
+    /// files right away. The toggle IS the user asking for the files; without
+    /// the kick-off it only took effect for files published later, which read
+    /// as "stuck" (the flag wasn't even persisted, so a restart lost it too).
+    pub async fn set_autodownloadoptional(self: &Arc<Self>, address: &str, on: bool) -> bool {
+        let found = match self.xites.write().await.get_mut(address) {
+            Some(x) => {
+                x.settings.autodownloadoptional = on;
+                true
+            }
+            None => false,
+        };
+        if found {
+            self.persist_sites().await;
+            if on {
+                self.spawn_optional_download(address, None);
+            } else if !self.optional_fetch_allowed(address).await {
+                // Both toggles now off: the in-flight pass (if any) aborts at
+                // its next check; drop a lingering waiting panel now.
+                self.set_optional_progress(address, None).await;
+                self.push_site_info(address).await;
+            }
         }
+        found
+    }
+
+    /// Whether optional files may be fetched for this xite: either toggle -
+    /// "Download optional files" or "Help distribute all files" - grants it.
+    pub async fn optional_fetch_allowed(&self, address: &str) -> bool {
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.download_optional || x.settings.autodownloadoptional)
+            .unwrap_or(false)
+    }
+
+    /// Set a xite's optional-downloads flag (`siteSetDownloadoptional`, the
+    /// sidebar's "Download optional files" toggle - also granted by the wrapper
+    /// prompt). When `trigger_download` is set (the explicit toggle), enabling
+    /// it kicks off a one-time bulk fetch of the currently-missing optional
+    /// files, with the sidebar's live progress panel. Unlike
+    /// [`Self::set_autodownloadoptional`] it does NOT keep pulling optional
+    /// files that later versions declare, nor commit to seeding - that's what
+    /// "Help distribute all files" adds. The prompt path passes
+    /// `trigger_download = false`: it fetches only the one file that raised the
+    /// prompt, not everything.
+    pub async fn set_download_optional(
+        self: &Arc<Self>,
+        address: &str,
+        on: bool,
+        trigger_download: bool,
+    ) -> bool {
+        let found = match self.xites.write().await.get_mut(address) {
+            Some(x) => {
+                x.settings.download_optional = on;
+                true
+            }
+            None => false,
+        };
+        if found {
+            self.persist_sites().await;
+            if on {
+                if trigger_download {
+                    self.spawn_optional_download(address, None);
+                }
+            } else {
+                // Re-arm the one-per-session prompt: switching the toggle off
+                // means a later page request should get to ask again.
+                self.optional_prompts.lock().unwrap().remove(address);
+                // Withdrawn mandate: any in-flight pass aborts at its next
+                // between-files check; drop a lingering waiting panel now.
+                if !self.optional_fetch_allowed(address).await {
+                    self.set_optional_progress(address, None).await;
+                    self.push_site_info(address).await;
+                }
+            }
+        }
+        found
+    }
+
+    /// A page asked for an optional file while downloads are off: ask the user
+    /// ONCE per xite per session through the wrapper confirm (the opt-in
+    /// prompt EpixNet's Python client had). Accepting turns
+    /// `download_optional` on and fetches the file that prompted the question;
+    /// declining stays quiet until the next session (or toggle flip).
+    pub fn prompt_optional_download(self: &Arc<Self>, address: &str, inner_path: &str, size: i64) {
+        if !self.optional_prompts.lock().unwrap().insert(address.to_string()) {
+            return;
+        }
+        let state = self.clone();
+        let address = address.to_string();
+        let inner_path = inner_path.to_string();
+        tokio::spawn(async move {
+            let name = inner_path.rsplit('/').next().unwrap_or(&inner_path);
+            let name = name.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            let body = format!(
+                "This xite wants to download an optional file: <b>{name}</b> \
+                 ({:.1} MB).<br>Enable optional file downloads for this xite?",
+                size as f64 / (1024.0 * 1024.0)
+            );
+            if state.confirm(&address, &body, "Download").await {
+                // The prompt was raised by ONE file; enable the toggle but fetch
+                // just that file here (trigger_download = false), not the whole
+                // optional set.
+                state.set_download_optional(&address, true, false).await;
+                let _ = state.file_need(&address, &inner_path).await;
+                state.push_site_info(&address).await;
+            }
+        });
+    }
+
+    /// Background-fetch missing optional files with a completion notification -
+    /// the websocket commands behind the sidebar toggle and `optionalHelp`
+    /// return immediately while this runs.
+    fn spawn_optional_download(self: &Arc<Self>, address: &str, directory: Option<String>) {
+        let state = self.clone();
+        let address = address.to_string();
+        tokio::spawn(async move {
+            let (fetched, failed) =
+                state.download_optional_files(&address, directory.as_deref()).await;
+            if fetched == 0 && failed == 0 {
+                return;
+            }
+            // A pass the user cancelled (toggle off, pause, delete) must not
+            // toast "keeps retrying in the background" - nothing will.
+            if !state.optional_pass_should_continue(&address, directory.as_deref()).await
+                && failed > 0
+            {
+                return;
+            }
+            let msg = if failed == 0 {
+                format!("Downloaded {fetched} optional file(s).")
+            } else if fetched == 0 {
+                format!(
+                    "Could not download {failed} optional file(s) yet - no \
+                     reachable peer had them. EpixNet keeps retrying in the \
+                     background until they arrive."
+                )
+            } else {
+                format!(
+                    "Downloaded {fetched} optional file(s); {failed} still \
+                     missing - EpixNet keeps retrying in the background until \
+                     they arrive."
+                )
+            };
+            state.push_notification(if failed == 0 { "done" } else { "info" }, &msg, 12000);
+        });
+    }
+
+    /// Wake the background retry loop for one xite: its next tick re-checks
+    /// the address immediately (clearing any backoff / complete-cache delay).
+    /// Called when new content lands, and by anything else that may change
+    /// which optional files are wanted or available.
+    pub fn mark_optional_dirty(&self, address: &str) {
+        self.optional_dirty.lock().unwrap().insert(address.to_string());
+    }
+
+    /// Whether a bulk optional pass for this xite is currently running.
+    fn optional_pass_in_flight(&self, address: &str) -> bool {
+        self.optional_downloads_in_flight.lock().unwrap().contains(address)
+    }
+
+    /// The xites the background optional-retry loop watches, with the scope
+    /// of each one's promise: `None` = whole-site (either sidebar toggle on),
+    /// `Some(dirs)` = only the `optionalHelp` directories. Paused xites are
+    /// left alone.
+    async fn optional_retry_flagged(&self) -> Vec<(String, Option<Vec<String>>)> {
+        let xites = self.xites.read().await;
+        xites
+            .iter()
+            .filter(|(_, x)| x.settings.serving)
+            .filter_map(|(a, x)| {
+                if x.settings.download_optional || x.settings.autodownloadoptional {
+                    Some((a.clone(), None))
+                } else if !x.settings.optional_help.is_empty() {
+                    Some((
+                        a.clone(),
+                        Some(x.settings.optional_help.keys().cloned().collect()),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Whether any file within a retry scope is still missing on disk.
+    async fn optional_scope_missing(&self, address: &str, dirs: &Option<Vec<String>>) -> bool {
+        match dirs {
+            None => !self.missing_optional_files(address, None).await.is_empty(),
+            Some(dirs) => {
+                for d in dirs {
+                    if !self.missing_optional_files(address, Some(d)).await.is_empty() {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Background retry loop: as long as a xite's optional promise stands -
+    /// either sidebar toggle, or an `optionalHelp` directory commitment - and
+    /// files within that scope are missing, KEEP fetching them: until they
+    /// are all here or the node shuts down. There is no give-up: a pass that
+    /// fails (seeder offline) backs the xite off (1 → 2 → 4 → 8 → 10 min cap)
+    /// and tries again, forever. Turning the toggle off (or pausing/deleting
+    /// the xite) drops it from the watched set, which is the only other way
+    /// out. This loop is the ONLY periodic driver of optional passes (the
+    /// resync tick just marks addresses dirty here): one place, one backoff -
+    /// not a fresh unthrottled pass with tracker announces every 5 minutes.
+    ///
+    /// Scheduling details, each load-bearing:
+    /// - Complete xites re-verify only every 10 min (`missing_optional_files`
+    ///   walks the site's content.jsons on disk - too heavy for every 30s
+    ///   tick times every xite now that the toggles default ON), EXCEPT when
+    ///   marked dirty (new content landed) - then immediately.
+    /// - Passes run as SPAWNED tasks: one xite grinding through a multi-GB
+    ///   file must not starve every other xite's retries (this loop used to
+    ///   await each pass serially). The in-flight guard skip (not the pass's
+    ///   own (0,0) return) keeps a long pass from inflating its own backoff.
+    /// - The first tick doubles as the startup resume for downloads a
+    ///   previous run left unfinished.
+    /// - Retry passes notify only on completion (with the xite re-checked to
+    ///   still exist - a deleted xite's empty missing-list must not toast
+    ///   "Downloaded"); the toggle's own pass already reported any failure.
+    pub fn spawn_optional_retry_loop(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            // Let transports come up and the first announces land.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            // Per-xite schedule: (consecutive not-done passes, next check at).
+            let mut schedule: HashMap<String, (u32, i64)> = HashMap::new();
+            loop {
+                // Dirty addresses bypass their delay this tick.
+                for addr in state.optional_dirty.lock().unwrap().drain() {
+                    schedule.remove(&addr);
+                }
+                let flagged = state.optional_retry_flagged().await;
+                for (addr, dirs) in &flagged {
+                    state.retry_optional_candidate(addr, dirs, &mut schedule).await;
+                }
+                // Registered xites whose CORE files never completed - an
+                // interrupted or failed clone (the seeder was offline when
+                // siteAdd/siteDownload ran) - keep resuming the clone with
+                // the same backoff, until it lands or the user deletes the
+                // xite. Without this, one failed resolve left a permanently
+                // empty registered site that only a manual re-add would heal.
+                let core_watch: Vec<String> = {
+                    let xites = state.xites.read().await;
+                    xites
+                        .iter()
+                        .filter(|(_, x)| x.settings.serving && !x.settings.own)
+                        .map(|(a, _)| a.clone())
+                        .collect()
+                };
+                for addr in &core_watch {
+                    state.retry_clone_candidate(addr, &mut schedule).await;
+                }
+                // A xite that was toggled off, paused, or deleted leaves the
+                // watched sets - drop its schedule entries.
+                schedule.retain(|k, _| match k.strip_prefix("core:") {
+                    Some(a) => core_watch.iter().any(|w| w == a),
+                    None => flagged.iter().any(|(a, _)| a == k),
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    /// One optional-scope candidate per retry tick: gate on its schedule, an
+    /// in-flight pass, and completeness; then spawn the pass and pace the
+    /// next look. The next-look delay is set BEFORE spawning: while the pass
+    /// runs, ticks skip it via the in-flight guard; afterwards the delay
+    /// paces the next attempt if files remain.
+    async fn retry_optional_candidate(
+        self: &Arc<Self>,
+        addr: &str,
+        dirs: &Option<Vec<String>>,
+        schedule: &mut HashMap<String, (u32, i64)>,
+    ) {
+        let (fails, next_at) = schedule.get(addr).copied().unwrap_or((0, 0));
+        if next_at > now_secs() as i64 {
+            return;
+        }
+        if self.optional_pass_in_flight(addr) {
+            return; // still working - check again next tick
+        }
+        if !self.optional_scope_missing(addr, dirs).await {
+            // Complete: park it on the slow re-verify interval.
+            schedule.insert(addr.to_string(), (0, now_secs() as i64 + 600));
+            return;
+        }
+        if fails == 0 {
+            self.log("INFO", format!("Resuming optional download for {addr}")).await;
+        }
+        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        schedule.insert(addr.to_string(), (fails + 1, now_secs() as i64 + delay));
+        self.spawn_retry_pass(addr.to_string(), dirs.clone());
+    }
+
+    /// The background-initiated pass over a retry scope, with its completion
+    /// handling: progress resets the backoff (peers are back - chase the
+    /// remainder promptly), and a completed set toasts ONCE - with the xite
+    /// re-checked to still exist, because a deleted xite's empty missing
+    /// list reads as "complete".
+    fn spawn_retry_pass(self: &Arc<Self>, addr: String, dirs: Option<Vec<String>>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut fetched_total = 0usize;
+            match &dirs {
+                None => {
+                    let (fetched, _) = state.download_optional_files(&addr, None).await;
+                    fetched_total += fetched;
+                }
+                Some(ds) => {
+                    for d in ds {
+                        let (fetched, _) = state.download_optional_files(&addr, Some(d)).await;
+                        fetched_total += fetched;
+                    }
+                }
+            }
+            if fetched_total == 0 {
+                return;
+            }
+            state.mark_optional_dirty(&addr);
+            if state.xites.read().await.contains_key(&addr)
+                && !state.optional_scope_missing(&addr, &dirs).await
+            {
+                state.push_notification(
+                    "done",
+                    &format!("Downloaded {fetched_total} optional file(s)."),
+                    12000,
+                );
+            }
+        });
+    }
+
+    /// One incomplete-core candidate per retry tick: resume the interrupted
+    /// clone via `ensure_xite` (it falls through to the resolver for a
+    /// registered-but-incomplete xite; its own in-flight dedupe makes
+    /// overlaps harmless), with the same backoff pacing.
+    async fn retry_clone_candidate(
+        self: &Arc<Self>,
+        addr: &str,
+        schedule: &mut HashMap<String, (u32, i64)>,
+    ) {
+        let key = format!("core:{addr}");
+        let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
+        if next_at > now_secs() as i64 {
+            return;
+        }
+        if self.xite_core_complete(addr).await {
+            // Whole core on disk: park on the slow re-verify.
+            schedule.insert(key, (0, now_secs() as i64 + 600));
+            return;
+        }
+        self.log("INFO", format!("Resuming interrupted download of {addr}")).await;
+        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
+        let state = self.clone();
+        let addr = addr.to_string();
+        tokio::spawn(async move {
+            if state.ensure_xite(&addr).await && state.xite_core_complete(&addr).await {
+                state.push_notification("done", &format!("Downloaded xite {addr}."), 12000);
+                // Its optional files may be wanted next (the toggles
+                // default on): check without delay.
+                state.mark_optional_dirty(&addr);
+            }
+        });
+    }
+
+    /// Whether a running bulk optional pass still has the user's mandate:
+    /// the xite exists, is being served (not paused), and the grant that
+    /// started the pass still holds (either toggle for a whole-site pass; the
+    /// helped directory for an `optionalHelp` pass). Checked between files
+    /// and rounds so toggling off / pausing / deleting a xite ACTUALLY stops
+    /// an in-flight multi-GB download instead of letting it run to the end.
+    async fn optional_pass_should_continue(&self, address: &str, directory: Option<&str>) -> bool {
+        let xites = self.xites.read().await;
+        let Some(x) = xites.get(address) else { return false };
+        if !x.settings.serving {
+            return false;
+        }
+        match directory {
+            Some(dir) => x.settings.optional_help.contains_key(dir),
+            None => x.settings.download_optional || x.settings.autodownloadoptional,
+        }
+    }
+
+    /// Make sure a bulk optional pass has peers to fetch from - ACTIVELY.
+    /// When the connectable list is empty (cold registry right after a
+    /// restart) or the caller forces it (a retry round: the peers we knew
+    /// didn't have the files), announce to the full tracker set now - the
+    /// same set the periodic announce loop uses - with a DHT lookup as the
+    /// fallback. Without this a pass just read whatever stale peer list it
+    /// inherited and gave up, even though an announce would have found the
+    /// seeder within seconds (the exact failure the startup-resume logs
+    /// showed). Live status shows "Announcing…" while it runs. Returns the
+    /// connectable-peer count afterwards.
+    async fn ensure_optional_peers(&self, address: &str, force_announce: bool) -> usize {
+        let have = self.connectable_peers(address, 20).await.len();
+        if have > 0 && !force_announce {
+            return have;
+        }
+        self.set_optional_phase(address, "Announcing…").await;
+        self.push_site_info(address).await;
+        let bootstrap = self.bootstrap_trackers.read().await.clone();
+        let trackers = self.all_trackers(&bootstrap).await;
+        let found = self.announce_to_trackers(address, &trackers).await;
+        if found.is_empty() {
+            // announce_to_trackers registers its finds; DHT results are raw.
+            let dht = self.find_peers_dht(address).await;
+            if !dht.is_empty() {
+                self.add_peers(address, dht).await;
+            }
+        }
+        self.connectable_peers(address, 20).await.len()
+    }
+
+    /// Fetch ONE optional file within a bulk pass: mark it Active in the
+    /// snapshot, run [`Self::file_need`] with a concurrent status sampler
+    /// (file_need blocks on peer discovery/connects/pieces; the sampler
+    /// reports what it is doing and moves the bar off the byte delta), and
+    /// stop the sampler the moment the fetch returns.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_optional_with_status(
+        self: &Arc<Self>,
+        address: &str,
+        idx: usize,
+        path: &str,
+        size: u64,
+        bytes_done: u64,
+        round: usize,
+        rounds: usize,
+    ) -> Result<bool, String> {
+        self.mark_optional_file(address, idx, OptFileState::Active, path).await;
+        self.push_site_info(address).await;
+        let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = self.clone().spawn_optional_status_sampler(
+            address.to_string(),
+            sampler_stop.clone(),
+            bytes_done,
+            size,
+            round,
+            rounds,
+        );
+        let result = self.file_need(address, path).await;
+        sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sampler.await;
+        result
+    }
+
+    /// One round of a bulk pass: try every queued file once, marking the
+    /// snapshot and counters as results land. Returns the files to requeue
+    /// (failed this round) and whether the round aborted because the user
+    /// withdrew the mandate mid-round (toggle off, pause, delete) - a
+    /// multi-GB queue nobody wants anymore must stop between files.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_optional_round<'a>(
+        self: &Arc<Self>,
+        address: &str,
+        directory: Option<&str>,
+        queue: &[(usize, &'a String, u64)],
+        round: usize,
+        rounds: usize,
+        fetched: &mut usize,
+        bytes_done: &mut u64,
+    ) -> (Vec<(usize, &'a String, u64)>, bool) {
+        let mut requeue: Vec<(usize, &'a String, u64)> = Vec::new();
+        for (pos, (idx, path, size)) in queue.iter().enumerate() {
+            if !self.optional_pass_should_continue(address, directory).await {
+                return (requeue, true);
+            }
+            let result = self
+                .fetch_optional_with_status(address, *idx, path, *size, *bytes_done, round, rounds)
+                .await;
+            match result {
+                Ok(_) => {
+                    *fetched += 1;
+                    *bytes_done += *size;
+                    self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
+                    self.bump_optional_progress(address, *fetched, requeue.len(), *bytes_done)
+                        .await;
+                    // Per-file event: open pages re-query, the sidebar's
+                    // downloaded-bytes counter moves while the pass runs.
+                    self.push_site_info_file_done(address, path, None).await;
+                }
+                Err(e) => {
+                    requeue.push((*idx, *path, *size));
+                    self.mark_optional_file(address, *idx, OptFileState::Failed, "").await;
+                    self.bump_optional_progress(address, *fetched, requeue.len(), *bytes_done)
+                        .await;
+                    self.log(
+                        "DEBUG",
+                        format!("Optional file {path} failed (round {round}/{rounds}): {e}"),
+                    )
+                    .await;
+                }
+            }
+            self.set_worker_stats(address, queue.len() - pos - 1 + requeue.len(), 1, 0).await;
+        }
+        (requeue, false)
+    }
+
+    /// Between in-pass rounds: some files failed, so force-announce for FRESH
+    /// peers (the ones we had were tried and lacked the files) and flip the
+    /// failures back to Pending for the next round. Returns false to end the
+    /// pass - the full announce + DHT sweep found nobody, so another round
+    /// would fail identically; the background retry loop keeps chasing the
+    /// files with backoff until they arrive or the toggle is turned off. The
+    /// round itself is shown by the sampler's "(retry n/N)" tag.
+    async fn start_optional_retry_round(
+        self: &Arc<Self>,
+        address: &str,
+        round: usize,
+        rounds: usize,
+        requeued: &[usize],
+    ) -> bool {
+        self.log(
+            "INFO",
+            format!(
+                "Optional round {round}/{rounds} for {address}: {} file(s) left, announcing for fresh peers",
+                requeued.len()
+            ),
+        )
+        .await;
+        if self.ensure_optional_peers(address, true).await == 0 {
+            self.log(
+                "INFO",
+                format!(
+                    "No peers found for {address} after announcing; \
+                     pass over, background retry continues"
+                ),
+            )
+            .await;
+            return false;
+        }
+        for idx in requeued {
+            self.mark_optional_file(address, *idx, OptFileState::Pending, "").await;
+        }
+        self.push_site_info(address).await;
+        true
+    }
+
+    /// Resolve the progress panel at the end of a bulk pass: cancelled
+    /// (mandate withdrawn) drops it quietly; files still missing keep it in
+    /// a waiting state - the background retry loop is chasing them, and a
+    /// blank card between passes reads as "it gave up"; done clears it.
+    async fn finish_optional_pass(
+        self: &Arc<Self>,
+        address: &str,
+        cancelled: bool,
+        fetched: usize,
+        failed: usize,
+    ) {
+        if cancelled {
+            self.set_optional_progress(address, None).await;
+            self.log(
+                "INFO",
+                format!(
+                    "Optional download for {address} stopped (toggle off/paused/removed); \
+                     {fetched} fetched first"
+                ),
+            )
+            .await;
+        } else if failed > 0 {
+            self.set_optional_phase(address, "Waiting for peers - retrying in background…")
+                .await;
+        } else {
+            self.set_optional_progress(address, None).await;
+        }
+        if fetched > 0 {
+            self.persist_sites().await; // optional_downloaded accounting
+            // Snapshot the chart now instead of waiting up to a full sample
+            // interval (~5 min): a user who just pulled a multi-MB optional
+            // file expects the Stats download graph to move right away, not
+            // minutes later. record() stores the delta and advances its
+            // baseline, so the next scheduled snapshot isn't double-counted.
+            self.collect_chart().await;
+        }
+        self.push_site_info(address).await;
+    }
+
+    /// Fetch every missing optional file of a xite (or only those under
+    /// `directory`) from its peers - the action behind "Download and help
+    /// distribute all files". Each file goes through [`Self::file_need`], so
+    /// bigfile pieces, request coalescing, hash verification and hashfield
+    /// bookkeeping all apply, and the worker stats drive the dashboard's
+    /// download spinner while it runs. Returns `(fetched, failed)` counts.
+    pub async fn download_optional_files(
+        self: &Arc<Self>,
+        address: &str,
+        directory: Option<&str>,
+    ) -> (usize, usize) {
+        if self.transport.read().await.is_none() {
+            return (0, 0); // offline state (CLI actions): nothing to dial
+        }
+        // One bulk pass per site at a time: a resync tick landing mid-download
+        // must not start a second walk. (file_need would dedupe the fetches;
+        // the walk itself is what this skips.)
+        if !self.optional_downloads_in_flight.lock().unwrap().insert(address.to_string()) {
+            return (0, 0);
+        }
+        struct Cleanup<'a> {
+            set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+            key: String,
+        }
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                self.set.lock().unwrap().remove(&self.key);
+            }
+        }
+        let _cleanup = Cleanup {
+            set: &self.optional_downloads_in_flight,
+            key: address.to_string(),
+        };
+
+        let todo = self.missing_optional_files(address, directory).await;
+        if todo.is_empty() {
+            return (0, 0);
+        }
+        let total = todo.len();
+        self.log("INFO", format!("Downloading {total} optional file(s) for {address}")).await;
+        self.set_worker_stats(address, total, 1, total).await;
+        // Seed the live progress snapshot the sidebar renders: every file starts
+        // Pending, and the overall bar is sized by the sum of declared bytes.
+        let bytes_total: u64 = todo.iter().map(|(_, s)| *s).sum();
+        self.set_optional_progress(
+            address,
+            Some(OptionalProgress {
+                total_files: total,
+                done_files: 0,
+                failed_files: 0,
+                bytes_total,
+                bytes_done: 0,
+                current: String::new(),
+                status: String::new(),
+                files: todo
+                    .iter()
+                    .map(|(path, size)| OptionalProgressFile {
+                        path: path.clone(),
+                        size: *size,
+                        state: OptFileState::Pending,
+                    })
+                    .collect(),
+            }),
+        )
+        .await;
+        self.push_site_info(address).await;
+        // A cold registry (right after a restart) has no peers to try yet -
+        // announce NOW instead of failing the whole pass and telling the user
+        // "could not fetch from any peer" before a single tracker was asked.
+        self.ensure_optional_peers(address, false).await;
+
+        // Up to 3 rounds over the still-missing files. Round 1 tries everything;
+        // a later round re-announces first (the peers we knew evidently didn't
+        // have the files) and retries only the failures. Bounded so the pass
+        // always terminates; the startup resume remains the restart-level retry.
+        const ROUNDS: usize = 3;
+        let (mut fetched, mut failed) = (0usize, 0usize);
+        let mut bytes_done: u64 = 0;
+        let mut cancelled = false;
+        // (snapshot index, path, size) - indices stay stable across rounds so
+        // retried files flip back to Pending/Active in place in the file list.
+        let mut queue: Vec<(usize, &String, u64)> =
+            todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        for round in 1..=ROUNDS {
+            let (requeue, aborted) = self
+                .run_optional_round(address, directory, &queue, round, ROUNDS, &mut fetched, &mut bytes_done)
+                .await;
+            failed = requeue.len();
+            if aborted {
+                cancelled = true;
+                break;
+            }
+            if requeue.is_empty() || round == ROUNDS {
+                break;
+            }
+            if !self.optional_pass_should_continue(address, directory).await {
+                // Also guards the between-round announce: a deleted xite must
+                // not be re-announced to the whole tracker set.
+                cancelled = true;
+                break;
+            }
+            let indices: Vec<usize> = requeue.iter().map(|(i, _, _)| *i).collect();
+            if !self.start_optional_retry_round(address, round, ROUNDS, &indices).await {
+                break;
+            }
+            queue = requeue;
+        }
+        self.set_worker_stats(address, 0, 0, 0).await;
+        self.finish_optional_pass(address, cancelled, fetched, failed).await;
+        self.log(
+            "INFO",
+            format!("Optional download for {address}: {fetched} fetched, {failed} failed"),
+        )
+        .await;
+        (fetched, failed)
+    }
+
+    /// The declared optional files not present on disk, as site-relative inner
+    /// paths: the root content.json's `files_optional` plus every stored child
+    /// content.json's (per-user optional files). `directory` narrows to a
+    /// prefix (`optionalHelp`). Presence = a file at the declared size (no
+    /// hashing - cheap enough for every retry tick). A BIGFILE's sparse file
+    /// sits at full size from its first piece, so size proves nothing; it
+    /// counts as present when its completion stamp (`optional_stats
+    /// time_downloaded`, written when file_need finished the full range) is
+    /// set AND the file still exists at size - without the stamp check every
+    /// bigfile would be "missing" forever and the background retry loop would
+    /// re-hash multi-GB files on every tick; without the disk check a stamp
+    /// would survive the user deleting the file. Each entry pairs the
+    /// inner_path with its declared size (bytes), so the caller can size a
+    /// progress bar without re-reading the content.jsons.
+    async fn missing_optional_files(
+        &self,
+        address: &str,
+        directory: Option<&str>,
+    ) -> Vec<(String, u64)> {
+        let Some((storage, content, stats)) = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| {
+                (x.storage.clone(), x.content.clone(), x.settings.cache.optional_stats.clone())
+            })
+        else {
+            return Vec::new();
+        };
+        declared_optional_files(&storage, content.as_ref())
+            .into_iter()
+            .filter(|f| directory.map(|p| f.inner_path.starts_with(p)).unwrap_or(true))
+            .filter(|f| {
+                !optional_file_present(&storage, &stats, &f.inner_path, f.size, f.bigfile)
+            })
+            .map(|f| (f.inner_path, f.size.max(0) as u64))
+            .collect()
     }
 
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
@@ -8479,6 +9864,11 @@ impl AppState {
             "started_task_num": entry.started_task_num,
             "tasks": entry.tasks_active,
             "workers": entry.workers,
+            "optional_progress": entry
+                .optional_progress
+                .as_ref()
+                .map(|p| p.to_json())
+                .unwrap_or(Value::Null),
             "content": content,
         })
     }
@@ -8692,6 +10082,52 @@ impl AppState {
 /// Build a xite's database from its `dbschema.json` (if present): open an
 /// in-memory db, create the tables, and populate from the xite's JSON data
 /// files. `None` if the xite has no schema or building fails.
+/// Sort a json file list by the dashboard's SQL-ish `orderby` string
+/// ("uploaded DESC", "is_pinned DESC, inner_path"). Unknown keys compare
+/// equal, so a bad orderby degrades to the input order instead of erroring.
+fn sort_file_list(items: &mut [Value], orderby: &str) {
+    let keys: Vec<(String, bool)> = orderby
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            match part.rsplit_once(' ') {
+                Some((k, d)) if d.eq_ignore_ascii_case("DESC") => Some((k.trim().into(), true)),
+                Some((k, d)) if d.eq_ignore_ascii_case("ASC") => Some((k.trim().into(), false)),
+                _ => Some((part.into(), false)),
+            }
+        })
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    items.sort_by(|a, b| {
+        for (k, desc) in &keys {
+            let ord = cmp_field(&a[k.as_str()], &b[k.as_str()]);
+            let ord = if *desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+fn cmp_field(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x
+            .as_f64()
+            .unwrap_or(0.0)
+            .partial_cmp(&y.as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
 /// Every `content.json` under `root`, as site-relative inner_paths.
 fn walk_content_json(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
@@ -8894,19 +10330,136 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 /// `.epix` alias shares one grant), otherwise the serving key.
 /// Build the optional-file hashfield from what's present on disk: for each
 /// `files_optional` entry we actually hold (hash-verified), record its hash id.
-fn compute_hashfield(storage: &XiteStorage, content: Option<&Value>) -> epix_xite::Hashfield {
-    let mut hf = epix_xite::Hashfield::new();
-    let Some(files) = content.and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
-    else {
-        return hf;
-    };
-    for (path, info) in files {
-        let Some(sha512) = info.get("sha512").and_then(|v| v.as_str()) else { continue };
-        if storage.verify(path, sha512) {
-            hf.add_hash(sha512);
+/// Everything optional already on disk: the hashfield to advertise
+/// (getHashfield/findHashIds) and the byte total behind the sidebar's
+/// "Downloaded" figure. Covers the root's `files_optional` AND every stored
+/// child content.json's (per-user optional files) - the root-only walk left
+/// child files out of the hashfield, so peers never learned we held them.
+/// One declared optional file, from any content.json of a site.
+struct DeclaredOptional {
+    inner_path: String,
+    size: i64,
+    sha512: String,
+    bigfile: bool,
+}
+
+/// EVERY declared optional file of a site: the root content.json's
+/// `files_optional` plus every stored child content.json's (per-user
+/// optional files - avatars and the like), child paths prefixed with their
+/// directory. Root-only readers (`Xite::optional_files`) miss the per-user
+/// files entirely, which left a hub's Files-tab list empty.
+fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Vec<DeclaredOptional> {
+    let mut out = Vec::new();
+    let mut scan = |files: Option<&Value>, dir: &str| {
+        let Some(files) = files.and_then(|f| f.as_object()) else { return };
+        for (rel, info) in files {
+            let inner_path =
+                if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+            out.push(DeclaredOptional {
+                inner_path,
+                size: info.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+                sha512: info
+                    .get("sha512")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                bigfile: info.get("piecemap").is_some(),
+            });
         }
+    };
+    scan(content.and_then(|c| c.get("files_optional")), "");
+    for child in storage.list_files() {
+        if !child.ends_with("/content.json") || child == "content.json" {
+            continue;
+        }
+        let Ok(bytes) = storage.read(&child) else { continue };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        scan(json.get("files_optional"), dir);
     }
-    hf
+    out
+}
+
+/// Whether a declared optional file is PRESENT on disk: a file at the
+/// declared size for regular files; a bigfile additionally needs its
+/// completion stamp (`optional_stats` time_downloaded, written when
+/// file_need finished the full range) - its sparse file sits at full size
+/// from the first piece, so size alone proves nothing, and treating every
+/// bigfile as missing would make the background retry loop re-hash multi-GB
+/// files forever.
+fn optional_file_present(
+    storage: &XiteStorage,
+    stats: &HashMap<String, epix_xite::OptionalFileStat>,
+    path: &str,
+    size: i64,
+    bigfile: bool,
+) -> bool {
+    let at_size = storage
+        .path(path)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len() as i64 == size)
+        .unwrap_or(false);
+    if bigfile {
+        at_size && stats.get(path).map(|s| s.time_downloaded > 0).unwrap_or(false)
+    } else {
+        at_size
+    }
+}
+
+/// One status-sampler tick's phase line, from the byte delta, the file's
+/// size, and the connectable-peer count. Byte-level % only exists when bytes
+/// moved (bigfile pieces); otherwise the phase names what the fetch is doing.
+fn optional_fetch_status(got: u64, file_size: u64, peers: usize, suffix: &str) -> String {
+    if got > 0 {
+        if file_size > 0 {
+            let pct = (got as f64 / file_size as f64 * 100.0).min(99.0);
+            format!("Downloading… {pct:.0}%{suffix}")
+        } else {
+            format!("Downloading…{suffix}")
+        }
+    } else if peers == 0 {
+        format!("Waiting for peers…{suffix}")
+    } else {
+        format!("Fetching from {peers} peer(s)…{suffix}")
+    }
+}
+
+fn compute_optional_state(
+    storage: &XiteStorage,
+    content: Option<&Value>,
+) -> (epix_xite::Hashfield, i64, i64) {
+    let mut hf = epix_xite::Hashfield::new();
+    let mut bytes = 0i64;
+    // Sum of ALL declared optional sizes (root + every child content.json).
+    // The root-only `size_optional` content stat misses per-user optional
+    // files entirely, which hid the sidebar's whole Optional-files card (and
+    // its toggles) on user-content xites.
+    let mut declared = 0i64;
+    let mut scan = |files: Option<&Value>, dir: &str| {
+        let Some(files) = files.and_then(|f| f.as_object()) else { return };
+        for (rel, info) in files {
+            let Some(sha512) = info.get("sha512").and_then(|v| v.as_str()) else { continue };
+            let path = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+            let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+            declared += size;
+            if storage.verify(&path, sha512) {
+                hf.add_hash(sha512);
+                bytes += size;
+            }
+        }
+    };
+    scan(content.and_then(|c| c.get("files_optional")), "");
+    for child in walk_content_json(storage.root()) {
+        if child == "content.json" {
+            continue; // the root was scanned from memory above
+        }
+        let Ok(raw) = storage.read(&child) else { continue };
+        let Ok(json) = serde_json::from_slice::<Value>(&raw) else { continue };
+        let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        scan(json.get("files_optional"), dir);
+    }
+    (hf, bytes, declared)
 }
 
 fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
@@ -9873,6 +11426,459 @@ mod tests {
         assert_eq!(on_disk, data_v2);
     }
 
+    /// The two-toggle model: on-demand optional fetches are opt-in
+    /// (`download_optional`), help-distribute implies them, disabling re-arms
+    /// the one-per-session prompt, and the sidebar's Downloaded counter
+    /// recomputes from disk at registration (root + child declarations) so it
+    /// can't stick at 0 with the files present.
+    #[tokio::test]
+    async fn pending_prompt_is_buffered_until_a_connection_binds() {
+        let state = AppState::new("test");
+        let addr = "1PromptSite";
+
+        // No connection bound: a confirm buffers instead of vanishing.
+        assert!(!state.has_bound_conn(addr));
+        let rx = state.push_cmd_await("confirm", json!(["Download?", "Yes"]), Some(addr.into()));
+        assert_eq!(state.pending_prompts.lock().unwrap().get(addr).map(|v| v.len()), Some(1));
+
+        // A connection binds: it drains the buffer and gets the payload (the
+        // callback id is still live, so answering it resolves the waiter).
+        let flushed = state.register_bound_conn(addr, 42);
+        assert_eq!(flushed.len(), 1, "buffered prompt handed to the new connection");
+        assert!(state.pending_prompts.lock().unwrap().get(addr).is_none(), "buffer drained");
+        assert!(state.has_bound_conn(addr));
+
+        // The flushed payload carries the callback id; answering resolves it.
+        let id = serde_json::from_str::<Value>(&flushed[0]).unwrap()["id"].as_i64().unwrap();
+        assert!(state.resolve_callback(id, json!(true)));
+        assert_eq!(rx.await.unwrap(), json!(true));
+
+        // With a connection bound, a further confirm broadcasts (not buffered).
+        let _rx2 = state.push_cmd_await("confirm", json!(["Again?", "Yes"]), Some(addr.into()));
+        assert!(state.pending_prompts.lock().unwrap().get(addr).is_none());
+
+        // Unbinding the last connection stops delivery again.
+        state.unregister_bound_conn(addr, 42);
+        assert!(!state.has_bound_conn(addr));
+    }
+
+    #[tokio::test]
+    async fn optional_optin_gate_and_disk_recount() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let video: &[u8] = b"video-bytes";
+        storage.write("video.webm", video).unwrap();
+        // A child-declared optional file on disk counts (and is advertised) too.
+        let avatar: &[u8] = b"png";
+        storage.write("data/users/alice/avatar.png", avatar).unwrap();
+        storage
+            .write(
+                "data/users/alice/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": {
+                        "avatar.png": { "size": avatar.len(), "sha512": XiteStorage::hash_bytes(avatar) }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0, "files": {},
+            "files_optional": {
+                "video.webm": { "size": video.len(), "sha512": XiteStorage::hash_bytes(video) },
+                "missing.bin": { "size": 99, "sha512": "ab" },
+            },
+        });
+        let state = AppState::new("test");
+        // The node-wide defaults are ON; this test exercises the opt-in gate,
+        // so run it as a node whose operator turned the defaults off.
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        {
+            let xites = state.xites.read().await;
+            let x = xites.get(addr.as_str()).unwrap();
+            assert_eq!(
+                x.settings.optional_downloaded,
+                (video.len() + avatar.len()) as i64,
+                "counter recomputed from disk, root + child files"
+            );
+            assert!(
+                x.hashfield.has_hash(&XiteStorage::hash_bytes(avatar)),
+                "child optional file advertised in the hashfield"
+            );
+        }
+
+        assert!(!state.optional_fetch_allowed(addr).await, "opt-in: off (defaults disabled)");
+        // No transport in the test, so the triggered fetch is a clean no-op.
+        assert!(state.set_download_optional(addr, true, true).await);
+        assert!(state.optional_fetch_allowed(addr).await);
+        assert!(state.set_download_optional(addr, false, false).await);
+        assert!(!state.optional_fetch_allowed(addr).await);
+        assert!(state.set_autodownloadoptional(addr, true).await);
+        assert!(state.optional_fetch_allowed(addr).await, "help-distribute implies downloads");
+    }
+
+    /// The Files tab's data contract: optionalFileList carries the per-file
+    /// counters the dashboard renders (uploaded/ratio dots, seeder count,
+    /// "Finished") and honors the UI's orderby/limit params.
+    #[tokio::test]
+    async fn optional_file_list_reports_counters_and_orders() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("a.bin", b"aaaa").unwrap();
+        storage.write("b.bin", b"bbbbbbbb").unwrap();
+        // A per-user (child content.json) optional file - a hub's avatars
+        // live here, and a root-only walk left the Files tab empty for them.
+        storage.write("data/users/alice/avatar.png", b"png").unwrap();
+        storage
+            .write(
+                "data/users/alice/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": {
+                        "avatar.png": { "size": 3, "sha512": XiteStorage::hash_bytes(b"png") }
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0, "files": {},
+            "files_optional": {
+                "a.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"aaaa") },
+                "b.bin": { "size": 8, "sha512": XiteStorage::hash_bytes(b"bbbbbbbb") },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        // a.bin has served 12 bytes and finished at t=1000.
+        {
+            let mut xites = state.xites.write().await;
+            let stat = xites
+                .get_mut(addr.as_str())
+                .unwrap()
+                .settings
+                .cache
+                .optional_stats
+                .entry("a.bin".into())
+                .or_default();
+            stat.uploaded = 12;
+            stat.time_downloaded = 1000;
+        }
+
+        let list =
+            state.optional_file_list(addr, "downloaded", "uploaded DESC", 0).await.unwrap();
+        assert_eq!(list.len(), 3, "root files AND the child-declared avatar list");
+        assert_eq!(list[0]["inner_path"], "a.bin");
+        assert_eq!(list[0]["uploaded"], 12);
+        assert_eq!(list[0]["time_downloaded"], 1000);
+        assert_eq!(list[0]["peer"], 1, "downloaded here = one seeder");
+        assert_eq!(list[1]["uploaded"], 0);
+        // Non-stamped files fell back to the file's mtime for "Finished".
+        assert!(list[1]["time_downloaded"].as_i64().unwrap() > 0);
+        assert!(
+            list.iter().any(|f| f["inner_path"] == "data/users/alice/avatar.png"),
+            "per-user optional file present with its full inner path"
+        );
+
+        // Sorting by size ascending flips the order; limit truncates.
+        let by_size = state.optional_file_list(addr, "all", "size", 0).await.unwrap();
+        assert_eq!(by_size[0]["inner_path"], "data/users/alice/avatar.png");
+        assert_eq!(
+            state.optional_file_list(addr, "all", "size", 1).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// The bulk optional download behind "Download and help distribute all
+    /// files": enumerates the root's and child content.jsons' optional
+    /// declarations, skips files already present at their declared size, and
+    /// honors the optionalHelp directory prefix. The toggle also has to
+    /// persist the flag - it used to be write-only in memory.
+    #[tokio::test]
+    async fn optional_download_targets_missing_declarations_and_toggle_sticks() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("have.bin", b"12345").unwrap();
+        storage
+            .write(
+                "data/users/alice/content.json",
+                &serde_json::to_vec(&json!({
+                    "files_optional": { "video.mp4": { "size": 99, "sha512": "aa" } }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let content = json!({
+            "address": "1Opt",
+            "modified": 1.0,
+            "files": {},
+            "files_optional": {
+                "have.bin": { "size": 5, "sha512": "ab" },
+                "missing.bin": { "size": 7, "sha512": "cd" },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite("1Opt", XiteEntry { storage, content: Some(content) }).await;
+
+        let mut missing: Vec<String> = state
+            .missing_optional_files("1Opt", None)
+            .await
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        missing.sort();
+        assert_eq!(missing, vec!["data/users/alice/video.mp4", "missing.bin"]);
+        // A stale partial file (wrong size) counts as missing again.
+        XiteStorage::new(dir.path()).write("have.bin", b"123").unwrap();
+        assert_eq!(state.missing_optional_files("1Opt", None).await.len(), 3);
+        // optionalHelp narrows to the directory prefix.
+        let helped: Vec<String> = state
+            .missing_optional_files("1Opt", Some("data/users/alice"))
+            .await
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(helped, vec!["data/users/alice/video.mp4"]);
+
+        // The toggle sets (and would persist) the flag, and reports unknown
+        // sites; with no transport the spawned fetch is a clean no-op.
+        assert!(state.set_autodownloadoptional("1Opt", true).await);
+        assert!(!state.set_autodownloadoptional("1Nope", true).await);
+        assert!(
+            state.xites.read().await.get("1Opt").unwrap().settings.autodownloadoptional,
+            "toggle must stick on the settings"
+        );
+        assert_eq!(state.download_optional_files("1Opt", None).await, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn optional_pass_announces_retries_and_stops_when_no_peers_exist() {
+        // A pass with a transport but NO peers/trackers must: run round 1
+        // (every file fails - nobody to ask), force-announce, find nothing,
+        // stop early (no pointless further rounds), report every file failed,
+        // and clear the progress snapshot. This is the offline-seeder path;
+        // with peers the same loop retries up to 3 rounds.
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let content = json!({
+            "address": "1Opt", "modified": 1.0, "files": {},
+            "files_optional": {
+                "a.bin": { "size": 5, "sha512": "aa" },
+                "b.bin": { "size": 7, "sha512": "bb" },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite("1Opt", XiteEntry { storage, content: Some(content) }).await;
+        state.set_transport(Arc::new(epix_transport::TcpTransport)).await;
+
+        // Offline helper is a clean no-op: no trackers, no DHT hook -> 0 peers.
+        assert_eq!(state.ensure_optional_peers("1Opt", true).await, 0);
+        // Phase setter without a live snapshot must not panic.
+        state.set_optional_phase("1Opt", "Announcing…").await;
+
+        // The pass needs a standing mandate or it cancels immediately.
+        state.set_download_optional("1Opt", true, false).await;
+        let (fetched, failed) = state.download_optional_files("1Opt", None).await;
+        assert_eq!((fetched, failed), (0, 2), "both files fail, counted once each");
+        // Files are still missing and the background loop keeps chasing them,
+        // so the panel STAYS - in a waiting state - instead of going blank.
+        let progress = state.site_info("1Opt").await["optional_progress"].clone();
+        assert!(!progress.is_null(), "waiting panel persists after a failed pass");
+        assert!(
+            progress["status"].as_str().unwrap_or("").contains("retrying in background"),
+            "waiting status names the background retry"
+        );
+        // Withdrawing the mandate needs BOTH toggles off (the node defaults
+        // seeded autodownloadoptional on); only then does the panel clear.
+        state.set_download_optional("1Opt", false, false).await;
+        assert!(
+            !state.site_info("1Opt").await["optional_progress"].is_null(),
+            "help-distribute still on -> mandate stands, panel stays"
+        );
+        state.set_autodownloadoptional("1Opt", false).await;
+        assert!(
+            state.site_info("1Opt").await["optional_progress"].is_null(),
+            "panel cleared when the last toggle goes off"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_retry_flagged_tracks_toggle_serving_and_missing() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let content = json!({
+            "address": "1Opt", "modified": 1.0, "files": {},
+            "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
+        });
+        let state = AppState::new("test");
+        // Exercise the toggle-off path: disable the node-wide ON defaults.
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite("1Opt", XiteEntry { storage: storage.clone(), content: Some(content) }).await;
+
+        // Toggle off (and no optionalHelp) -> not watched, even with files missing.
+        assert!(state.optional_retry_flagged().await.is_empty());
+
+        // Toggle on -> watched with whole-site scope, and the scope is missing.
+        state.set_download_optional("1Opt", true, false).await;
+        let flagged = state.optional_retry_flagged().await;
+        assert_eq!(flagged, vec![("1Opt".to_string(), None)]);
+        assert!(state.optional_scope_missing("1Opt", &None).await);
+
+        // Paused xites are left alone.
+        if let Some(x) = state.xites.write().await.get_mut("1Opt") {
+            x.settings.serving = false;
+        }
+        assert!(state.optional_retry_flagged().await.is_empty());
+        if let Some(x) = state.xites.write().await.get_mut("1Opt") {
+            x.settings.serving = true;
+        }
+
+        // File arrives at the declared size -> scope complete (the loop then
+        // parks the xite on its slow re-verify interval).
+        storage.write("a.bin", b"12345").unwrap();
+        assert!(!state.optional_scope_missing("1Opt", &None).await);
+
+        // An optionalHelp commitment (toggles off) is watched dir-scoped.
+        state.set_download_optional("1Opt", false, false).await;
+        if let Some(x) = state.xites.write().await.get_mut("1Opt") {
+            x.settings.optional_help.insert("data/users/alice".into(), "1".into());
+        }
+        let flagged = state.optional_retry_flagged().await;
+        assert_eq!(
+            flagged,
+            vec![("1Opt".to_string(), Some(vec!["data/users/alice".to_string()]))]
+        );
+    }
+
+    #[tokio::test]
+    async fn new_xites_inherit_the_node_wide_optional_defaults() {
+        let content = json!({
+            "address": "1New", "modified": 1.0, "files": {},
+            "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
+        });
+
+        // Defaults untouched -> both toggles ON for a fresh xite.
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state
+            .add_xite(
+                "1New",
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) },
+            )
+            .await;
+        {
+            let xites = state.xites.read().await;
+            let s = &xites.get("1New").unwrap().settings;
+            assert!(s.download_optional, "download on by default");
+            assert!(s.autodownloadoptional, "help-distribute on by default");
+        }
+        assert!(state.optional_fetch_allowed("1New").await);
+
+        // Operator turned the help-distribute default off but left download on.
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state
+            .add_xite(
+                "1New",
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) },
+            )
+            .await;
+        {
+            let xites = state.xites.read().await;
+            let s = &xites.get("1New").unwrap().settings;
+            assert!(s.download_optional, "download default still on");
+            assert!(!s.autodownloadoptional, "help-distribute default honored");
+        }
+
+        // Help-distribute default ON implies downloading even if the download
+        // default was turned off.
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state
+            .add_xite(
+                "1New",
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) },
+            )
+            .await;
+        {
+            let xites = state.xites.read().await;
+            let s = &xites.get("1New").unwrap().settings;
+            assert!(s.download_optional, "help-distribute implies download");
+            assert!(s.autodownloadoptional);
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_trackers_feed_state_initiated_announces() {
+        let state = AppState::new("test");
+        let t = epix_xite::Tracker::parse("udp://boot.example:6969").unwrap();
+        state.set_bootstrap_trackers(vec![t.clone()]).await;
+        // The stored bootstrap list flows into the same full set the announce
+        // loop builds (all_trackers already deduped shared+extra on top).
+        let stored = state.bootstrap_trackers.read().await.clone();
+        assert_eq!(stored, vec![t.clone()]);
+        let all = state.all_trackers(&stored).await;
+        assert!(all.contains(&t), "bootstrap tracker present in the announce set");
+    }
+
+    #[tokio::test]
+    async fn optional_progress_snapshot_surfaces_in_site_info() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let content = json!({
+            "address": "1Opt", "modified": 1.0, "files": {},
+            "files_optional": { "a.bin": { "size": 10, "sha512": "aa" } },
+        });
+        let state = AppState::new("test");
+        state.add_xite("1Opt", XiteEntry { storage, content: Some(content) }).await;
+
+        // Idle: no snapshot -> null in site_info.
+        assert!(state.site_info("1Opt").await["optional_progress"].is_null());
+
+        // Install a snapshot with one done + one active file mid-download.
+        state
+            .set_optional_progress(
+                "1Opt",
+                Some(OptionalProgress {
+                    total_files: 2,
+                    done_files: 0,
+                    failed_files: 0,
+                    bytes_total: 30,
+                    bytes_done: 0,
+                    current: String::new(),
+                    status: String::new(),
+                    files: vec![
+                        OptionalProgressFile { path: "a.bin".into(), size: 10, state: OptFileState::Pending },
+                        OptionalProgressFile { path: "b.bin".into(), size: 20, state: OptFileState::Pending },
+                    ],
+                }),
+            )
+            .await;
+        state.mark_optional_file("1Opt", 0, OptFileState::Done, "b.bin").await;
+        state.mark_optional_file("1Opt", 1, OptFileState::Active, "b.bin").await;
+        state.bump_optional_progress("1Opt", 1, 0, 10).await;
+
+        let info = state.site_info("1Opt").await;
+        let p = &info["optional_progress"];
+        assert_eq!(p["total_files"], 2);
+        assert_eq!(p["done_files"], 1);
+        assert_eq!(p["current"], "b.bin");
+        // 10 of 30 bytes -> ~33%.
+        assert!((p["percent"].as_f64().unwrap() - 33.33).abs() < 0.1, "percent from bytes");
+        assert_eq!(p["files"][0]["state"], "done");
+        assert_eq!(p["files"][1]["state"], "active");
+
+        // Clearing hides the panel again.
+        state.set_optional_progress("1Opt", None).await;
+        assert!(state.site_info("1Opt").await["optional_progress"].is_null());
+    }
+
     #[tokio::test]
     async fn optional_limit_evicts_oldest_unpinned_and_keeps_pinned() {
         let dir = tempdir().unwrap();
@@ -10427,10 +12433,10 @@ mod tests {
         state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
 
         // Declared but not downloaded.
-        let all = state.optional_file_list(addr, "all").await.unwrap();
+        let all = state.optional_file_list(addr, "all", "", 0).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0]["is_downloaded"], false);
-        assert!(state.optional_file_list(addr, "downloaded").await.unwrap().is_empty());
+        assert!(state.optional_file_list(addr, "downloaded", "", 0).await.unwrap().is_empty());
 
         // "Download" it (write matching bytes); now it counts as downloaded, and
         // fileNeed returns true without touching the network.
@@ -10870,7 +12876,7 @@ mod tests {
         // A fresh node over the same dir restores the pin.
         let s = AppState::with_data_dir("test", dir.path());
         s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) }).await;
-        let list = s.optional_file_list(addr, "all").await.unwrap();
+        let list = s.optional_file_list(addr, "all", "", 0).await.unwrap();
         let entry = list.iter().find(|e| e["inner_path"] == "big.bin").expect("optional file listed");
         assert_eq!(entry["is_pinned"], true, "pin survived the restart");
     }
@@ -11181,6 +13187,9 @@ mod tests {
     async fn confirm_resolves_via_wrapper_callback() {
         let s = AppState::new("test");
         let mut events = s.subscribe_events();
+        // A wrapper is connected and bound to the xite, so the confirm
+        // broadcasts live (rather than buffering for a later connection).
+        s.register_bound_conn("talk.epix", 1);
 
         // Server asks the wrapper to confirm; the future is pending.
         let s2 = s.clone();

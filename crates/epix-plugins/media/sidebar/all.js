@@ -639,6 +639,8 @@ window.initScrollable = function () {
       this.dragStarted = 0;
       this.globe = null;
       this.preload_html = null;
+      this.optional_expanded = false;
+      this.optional_poll = null;
       this.original_set_site_info = this.wrapper.setSiteInfo;
       if (window.top.location.hash === "#EpixNet:OpenSidebar") {
         this.startDrag();
@@ -864,7 +866,51 @@ window.initScrollable = function () {
           return false;
         };
       })(this));
-      return this.tag.find("#browse-files").attr("href", document.location.pathname.replace(/(\/.*?(\/|$)).*$/, "/list$1"));
+      this.tag.find("#browse-files").attr("href", document.location.pathname.replace(/(\/.*?(\/|$)).*$/, "/list$1"));
+      this.updateOptionalProgress();
+      return this.tag.find("#browse-files");
+    };
+
+    // Live optional-download panel: keep the collapsible file list's expanded
+    // state across morphdom refreshes, wire its toggle, and self-poll the
+    // sidebar HTML while a download is in flight (per-file pushes can be sparse
+    // for a single big file, so a light timer keeps the bar/spinner moving).
+    Sidebar.prototype.updateOptionalProgress = function() {
+      var _this = this;
+      var list = this.tag.find("#optional-file-list");
+      var toggle = this.tag.find("#optional-files-toggle");
+      var active = this.tag.find(".optional-progress").length > 0;
+      if (active) {
+        if (this.optional_expanded) {
+          list.addClass("expanded");
+          toggle.addClass("expanded");
+        }
+        toggle.text((this.optional_expanded ? "Hide files" : "Show files") + " (" + list.children().length + ")");
+        toggle.off("click touchend").on("click touchend", function(e) {
+          e.preventDefault();
+          _this.optional_expanded = !_this.optional_expanded;
+          list.toggleClass("expanded", _this.optional_expanded);
+          toggle.toggleClass("expanded", _this.optional_expanded);
+          toggle.text((_this.optional_expanded ? "Hide files" : "Show files") + " (" + list.children().length + ")");
+          return false;
+        });
+        // Only self-poll while the panel is actually on screen; opening the
+        // sidebar re-fetches the HTML on its own.
+        if (this.opened && !this.optional_poll) {
+          this.optional_poll = setTimeout(function() {
+            _this.optional_poll = null;
+            if (_this.opened) {
+              _this.updateHtmlTag();
+            }
+          }, 1200);
+        }
+      } else {
+        this.optional_expanded = false;
+        if (this.optional_poll) {
+          clearTimeout(this.optional_poll);
+          this.optional_poll = null;
+        }
+      }
     };
 
     Sidebar.prototype.animDrag = function(e) {
@@ -1180,7 +1226,17 @@ window.initScrollable = function () {
       })(this));
       this.tag.find("#checkbox-autodownloadoptional").off("click touchend").on("click touchend", (function(_this) {
         return function() {
-          return _this.wrapper.ws.cmd("siteSetAutodownloadoptional", [_this.tag.find("#checkbox-autodownloadoptional").is(":checked")]);
+          var checked = _this.tag.find("#checkbox-autodownloadoptional").is(":checked");
+          if (checked) {
+            // Help distribute implies on-demand downloads; reflect it live.
+            _this.tag.find("#checkbox-downloadoptional").prop("checked", true);
+          }
+          return _this.wrapper.ws.cmd("siteSetAutodownloadoptional", [checked]);
+        };
+      })(this));
+      this.tag.find("#checkbox-downloadoptional").off("click touchend").on("click touchend", (function(_this) {
+        return function() {
+          return _this.wrapper.ws.cmd("siteSetDownloadoptional", [_this.tag.find("#checkbox-downloadoptional").is(":checked")]);
         };
       })(this));
       this.tag.find("#button-identity").off("click touchend").on("click touchend", (function(_this) {
