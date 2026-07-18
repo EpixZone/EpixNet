@@ -34,11 +34,13 @@ cd EpixNet
 
 ## 5. Build the EpixNet core for Android
 
-This compiles the node into a native library the app loads:
+This compiles the node into a native library the app loads. Android enables
+the `bittorrent` feature (the iOS build does not — see [ios.md](ios.md)), so
+Android can stream open-licensed media referenced by magnet links:
 
 ```sh
 cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
-    build -p epix-ffi --release
+    build -p epix-ffi --release --features bittorrent
 ```
 
 Then generate the Kotlin code that talks to it:

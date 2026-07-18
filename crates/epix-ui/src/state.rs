@@ -6831,6 +6831,12 @@ impl AppState {
             "tor_has_meek_bridges": false,
             "tor_use_bridges": false,
             "network_status": self.network_status().await,
+            // Capability flags for xites to feature-detect (never assume a
+            // capability exists from the platform string). `bittorrent` is
+            // true only in builds compiled with the `bittorrent` feature
+            // (desktop + Android); the iOS build reports false, so a xite's
+            // magnet player falls back to HTTPS web-seed streaming there.
+            "bittorrent": cfg!(feature = "bittorrent"),
             "epix_browser": epix_browser,
             "browser_tor_clearnet": browser_tor_clearnet,
             // Read-only gateway mode: the dashboard hides node-lifecycle

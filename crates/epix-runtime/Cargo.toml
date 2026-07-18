@@ -47,6 +47,14 @@ i2p-embedded = ["i2p", "epix-i2p/embedded"]
 # Reticulum mesh: dial + serve peers over mesh links (TCP interfaces now,
 # LoRa/BLE radios later). All platforms.
 mesh = ["dep:epix-reticulum"]
+# BitTorrent bridge: stream open-licensed media referenced by magnet links
+# (swarm fetch + web seeds). Desktop and Android only - the iOS build omits
+# this feature entirely (App Store 5.2.3: no general-purpose torrenting; iOS
+# plays such media from HTTPS web seeds instead, which needs no BT code). The
+# engine lands as the `epix-bt` crate; until then this gates nothing, but the
+# plumbing (and the "off on iOS by construction" guarantee) is in place. When
+# the crate exists: `bittorrent = ["dep:epix-bt"]`.
+bittorrent = []
 
 [dev-dependencies]
 epix-protocol = { path = "../epix-protocol" }
