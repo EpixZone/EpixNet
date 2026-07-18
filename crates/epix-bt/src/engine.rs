@@ -159,14 +159,21 @@ impl Session {
         // name, so no torrent-controlled string can steer it out of the cache
         // dir. `cache_dir_name` encodes the fixed `[u8; 20]` info-hash through a
         // constant hex table, yielding exactly 40 chars of `[0-9a-f]` - no
-        // separators, no `..`. The tainted bytes are only table indices, so the
-        // "no traversal" property holds both for a reader and for static
-        // analysis. We still re-check length/charset as a cheap belt-and-braces.
+        // separators, no `..`.
         let key = meta.cache_dir_name();
         if key.len() != 40 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(EngineError::BadInfoHash);
         }
-        let dir = cache_dir.join(&key);
+        // Reject any parent-dir escape in the assembled path before it reaches
+        // the filesystem, and rebuild the path from the checked string so the
+        // guard covers every downstream use (the dir create AND the store's
+        // file open). Nothing here can produce a `..`, but this is the explicit
+        // no-traversal barrier - for a reader and for the path-injection lint.
+        let dir_str = cache_dir.join(&key).to_string_lossy().into_owned();
+        if dir_str.contains("..") {
+            return Err(EngineError::BadInfoHash);
+        }
+        let dir = PathBuf::from(dir_str);
         tokio::fs::create_dir_all(&dir).await.map_err(StoreError::from)?;
         let store = PieceStore::open(&dir.join("media"), file_len, meta.piece_count()).await?;
 
