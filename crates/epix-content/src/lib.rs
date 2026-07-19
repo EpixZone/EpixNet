@@ -6,11 +6,13 @@
 
 pub mod canonical;
 pub mod diff;
+pub mod merge;
 pub mod record;
 pub mod verify;
 
 pub use canonical::{dumps_content, dumps_sorted};
 pub use diff::{patch, DiffAction};
+pub use merge::{live_records, make_container, merge_orset, records_of, RECORD_FORMAT};
 pub use record::{derive_post_id, record_signed_data, verify_record, RecordError, CLOCK_SKEW_BOUND_MS};
 pub use verify::{verify_content_file, VerifyContext, VerifyError};
 use epix_core::{Error, Result};
