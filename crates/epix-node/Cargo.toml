@@ -28,6 +28,11 @@ epix-bt = { path = "../epix-bt", optional = true }
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 serde_json = "1"
 async-trait = "0.1"
+# A process-wide tracing subscriber so arti's Tor bootstrap diagnostics (and
+# every other `tracing` event in the tree) actually reach the log. Without it
+# they are dropped, which is why a stalled Tor bootstrap left "no logging
+# whatsoever" in the field.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]

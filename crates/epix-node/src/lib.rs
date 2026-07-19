@@ -191,6 +191,41 @@ enum LaunchTarget {
     Deferred { display: String },
 }
 
+/// The default `tracing` filter when neither `EPIX_LOG` nor `RUST_LOG` is set.
+/// Global `warn` (so a failing Tor bootstrap's WARN/ERROR from arti is always
+/// captured) plus `info` on the transports and arti's bootstrap machinery, so
+/// the ordinary "bootstrapping … bootstrapped" story is visible without the
+/// per-circuit/per-cell debug flood.
+const DEFAULT_LOG_FILTER: &str = "warn,epix_tor=info,epix_runtime=info,epix_node=info,\
+arti_client=info,tor_dirmgr=info,tor_guardmgr=info,tor_chanmgr=info,tor_circmgr=info,\
+tor_bootstrap=info";
+
+/// Install a process-wide `tracing` subscriber the first time the node boots.
+///
+/// Without a subscriber every `tracing::{info,warn,error,debug}!` in the tree -
+/// crucially arti's Tor bootstrap diagnostics and epix-tor's own warnings - is
+/// dropped on the floor. That is why field reports of "Tor is off and there is
+/// NO logging whatsoever" (EpixNet#239) were impossible to diagnose: when the
+/// bootstrap stalled, the only trace was the two coarse `state.log` lines, and
+/// arti's explanation went nowhere.
+///
+/// Output goes to stdout, which the desktop launcher has already redirected to
+/// `<data>/log/epix-browser.log`, so it lands in the same file users already
+/// share; the server binary keeps it on the console. The filter comes from
+/// `EPIX_LOG` (or `RUST_LOG`), else [`DEFAULT_LOG_FILTER`]. `try_init` never
+/// panics if a host shell (or a second `boot`) already installed a subscriber.
+fn init_logging() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = std::env::var("EPIX_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| EnvFilter::try_new(&s).ok())
+        .unwrap_or_else(|| EnvFilter::new(DEFAULT_LOG_FILTER));
+    // No ANSI: this stream is usually a file, and colour escapes only litter it.
+    let _ = fmt().with_env_filter(filter).with_ansi(false).try_init();
+}
+
 /// Boot the node: resolve, clone + verify (unless already on disk), set up the
 /// UI server and the background runtime, and return the [`UiServer`] future to
 /// await plus the [`RunningNode`] handle. Cloning uses the network only when
@@ -198,7 +233,11 @@ enum LaunchTarget {
 pub async fn boot(
     opts: NodeOptions,
 ) -> Result<(UiServer, RunningNode), String> {
+    init_logging();
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
+    // Carry a Python client's epixnet.conf settings over into config.json before
+    // anything reads config (the Tor-Always egress gate below, then AppState).
+    migrate_legacy_conf(&opts.data_root);
 
     // Arm the chain-egress gate BEFORE resolving the launch name. In Tor-Always
     // mode the runtime only routes chain RPC through Tor once Arti has
@@ -288,6 +327,132 @@ fn resolved_launch(
         Err(_) => None,
     };
     Ok(LaunchTarget::Resolved { address, display, data_dir, content })
+}
+
+/// Python `epixnet.conf` keys the Rust node honors by seeding them into
+/// `config.json` (paired with the config key they map to), when config.json has
+/// no explicit value of its own. All three are read back through `config_get`,
+/// so seeding is enough to make them take effect - and the Config page then
+/// shows the imported value. `ui_ip`/`ui_port` are honored separately at the
+/// server bind (they never route through config); every other key stays ignored
+/// - gateway-mode switches (`ui_host`, `ui_trans_proxy`) and resolver URLs are
+/// unsafe to lift blindly from a stale Python install.
+const LEGACY_CONF_SEED_KEYS: &[&str] = &["tor", "fileserver_port", "language"];
+
+/// Legacy keys the node consumes outside config.json, so they are used - not
+/// "ignored" - and must not be warned about. `data_dir` relocates the root;
+/// `ui_ip`/`ui_port` feed the server bind.
+const LEGACY_CONF_USED_ELSEWHERE: &[&str] = &["data_dir", "ui_ip", "ui_port"];
+
+/// Merge the mapped legacy `conf` values into `cfg` for keys `cfg` does not
+/// already have, returning `(seeded_keys, ignored)`: the keys imported, and the
+/// present conf keys this version does not support. Pure, so the precedence
+/// (config.json always wins) and the ignore-list are unit-testable.
+fn apply_legacy_conf(
+    conf: &std::collections::BTreeMap<String, String>,
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+) -> (Vec<String>, Vec<String>) {
+    let mut seeded = Vec::new();
+    for &key in LEGACY_CONF_SEED_KEYS {
+        if let Some(value) = conf.get(key) {
+            if !cfg.contains_key(key) {
+                cfg.insert(key.to_string(), serde_json::Value::String(value.clone()));
+                seeded.push(key.to_string());
+            }
+        }
+    }
+    let ignored = conf
+        .keys()
+        .filter(|k| {
+            !LEGACY_CONF_SEED_KEYS.contains(&k.as_str())
+                && !LEGACY_CONF_USED_ELSEWHERE.contains(&k.as_str())
+        })
+        .cloned()
+        .collect();
+    (seeded, ignored)
+}
+
+/// Carry a Python client's `epixnet.conf` over into this node's `config.json`.
+///
+/// In Python EpixNet, `epixnet.conf` (INI) is *the* config file; a user coming
+/// from it naturally sets `tor=`, `fileserver_port=`, etc. there. The Rust node
+/// stores settings in `private/config.json` (written by the Config page) and
+/// otherwise reads `epixnet.conf` only for `data_dir` - so those edits silently
+/// did nothing (EpixNet#239: "it doesn't start despite the settings in the
+/// config file"). Seed the mapped keys once, only where config.json has no value
+/// of its own, so a hand-edit is honored while the Config page still wins.
+///
+/// Writes the file directly (before `AppState` loads it, and before the
+/// Tor-Always egress gate reads it). Skipped when `EPIX_DATA_DIR` overrides the
+/// layout: the operator is in explicit control, and it keeps tests off the
+/// machine's real conf.
+fn migrate_legacy_conf(data_root: &std::path::Path) {
+    if std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()).is_some() {
+        return;
+    }
+    let conf_path = epix_ui::paths::default_conf_path();
+    let conf = epix_ui::paths::read_conf(&conf_path);
+    if conf.is_empty() {
+        return;
+    }
+    let cfg_path = data_root.join("private").join("config.json");
+    let mut cfg: serde_json::Map<String, serde_json::Value> = std::fs::read(&cfg_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let (seeded, ignored) = apply_legacy_conf(&conf, &mut cfg);
+    if !seeded.is_empty() {
+        if let Some(parent) = cfg_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&cfg) {
+            if std::fs::write(&cfg_path, bytes).is_ok() {
+                let shown: Vec<String> =
+                    seeded.iter().map(|k| format!("{k}={}", conf[k])).collect();
+                // Migrate, don't copy: now the values live in config.json, drop
+                // them from the INI so the two never disagree and a later edit of
+                // a moved key in the INI can't silently do nothing.
+                let keys: Vec<&str> = seeded.iter().map(String::as_str).collect();
+                let _ = epix_ui::paths::remove_conf_keys(&conf_path, &keys);
+                eprintln!(
+                    "[INFO] epixnet.conf: moved legacy settings into config.json ({}). \
+                     Change them from the Config page from now on.",
+                    shown.join(", ")
+                );
+            }
+        }
+    }
+    if !ignored.is_empty() {
+        eprintln!(
+            "[WARNING] epixnet.conf: these keys are not supported by this version and were \
+             ignored: {}. Set options in the Config page (stored in private/config.json).",
+            ignored.join(", ")
+        );
+    }
+}
+
+/// The UI bind address a Python client's `epixnet.conf` asks for (`ui_ip` /
+/// `ui_port`), if either is set - so a headless/seedbox carry-over keeps its
+/// address. `None` when neither is set or `EPIX_DATA_DIR` overrides the layout.
+/// The desktop browser keeps its fixed loopback bind (its proxy depends on it);
+/// only the server binary consults this.
+pub fn legacy_ui_bind() -> Option<String> {
+    if std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()).is_some() {
+        return None;
+    }
+    legacy_ui_addr(&epix_ui::paths::read_conf(&epix_ui::paths::default_conf_path()))
+}
+
+/// Build a `ip:port` bind from a conf map's `ui_ip`/`ui_port`, defaulting the
+/// missing half to the standard loopback / UI port. `None` when neither is set.
+/// Pure, so the defaulting is unit-testable.
+fn legacy_ui_addr(conf: &std::collections::BTreeMap<String, String>) -> Option<String> {
+    let ip = conf.get("ui_ip").map(String::as_str);
+    let port = conf.get("ui_port").map(String::as_str);
+    if ip.is_none() && port.is_none() {
+        return None;
+    }
+    Some(format!("{}:{}", ip.unwrap_or("127.0.0.1"), port.unwrap_or("42222")))
 }
 
 /// Whether the effective Tor mode is Always, read from the raw node config plus
@@ -2047,6 +2212,54 @@ mod tests {
         // Offline forces Disable regardless of the tor choice.
         write_config(serde_json::json!({ "tor": "always", "offline": true }));
         assert!(!configured_tor_always(root, &opts("")));
+    }
+
+    #[test]
+    fn apply_legacy_conf_seeds_missing_keys_and_reports_ignored() {
+        use std::collections::BTreeMap;
+        let conf: BTreeMap<String, String> = [
+            ("tor", "always"),
+            ("fileserver_port", "48333"),
+            ("language", "fr"),
+            ("data_dir", "/somewhere"), // used elsewhere, never "ignored"
+            ("ui_port", "42222"),       // used elsewhere (server bind)
+            ("ui_host", "gateway.epixnet.io"), // gateway-mode: unsupported
+            ("chain_rpc_url", "https://api.epix.zone"), // resolver URL: unsupported
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        // config.json already pins `tor`: the Config page's choice must win.
+        let mut cfg = serde_json::Map::new();
+        cfg.insert("tor".into(), serde_json::json!("disable"));
+
+        let (mut seeded, mut ignored) = apply_legacy_conf(&conf, &mut cfg);
+        seeded.sort();
+        ignored.sort();
+
+        // `tor` was present, so it is not reseeded; the other two mapped keys are.
+        assert_eq!(seeded, vec!["fileserver_port".to_string(), "language".to_string()]);
+        assert_eq!(cfg.get("tor").unwrap(), &serde_json::json!("disable"), "config.json wins");
+        assert_eq!(cfg.get("fileserver_port").unwrap(), &serde_json::json!("48333"));
+        assert_eq!(cfg.get("language").unwrap(), &serde_json::json!("fr"));
+        // Only unsupported keys are reported ignored - not data_dir / ui_port.
+        assert_eq!(ignored, vec!["chain_rpc_url".to_string(), "ui_host".to_string()]);
+    }
+
+    #[test]
+    fn legacy_ui_addr_defaults_the_missing_half() {
+        use std::collections::BTreeMap;
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        assert_eq!(legacy_ui_addr(&map(&[])), None);
+        assert_eq!(legacy_ui_addr(&map(&[("ui_port", "8080")])).as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(legacy_ui_addr(&map(&[("ui_ip", "0.0.0.0")])).as_deref(), Some("0.0.0.0:42222"));
+        assert_eq!(
+            legacy_ui_addr(&map(&[("ui_ip", "0.0.0.0"), ("ui_port", "80")])).as_deref(),
+            Some("0.0.0.0:80")
+        );
     }
 }
 

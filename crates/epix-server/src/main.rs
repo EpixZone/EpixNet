@@ -18,12 +18,14 @@ const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
 /// chain name resolution being reachable.
 const DEFAULT_DASHBOARD: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
-/// The UI bind address: `EPIX_UI_ADDR` if set, else the default loopback bind.
+/// The UI bind address: `EPIX_UI_ADDR` if set, else a Python client's
+/// `epixnet.conf` `ui_ip`/`ui_port` (carry-over for a headless/seedbox node),
+/// else the default loopback bind.
 fn ui_bind() -> String {
-    std::env::var("EPIX_UI_ADDR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_UI_ADDR.to_string())
+    if let Some(addr) = std::env::var("EPIX_UI_ADDR").ok().filter(|s| !s.is_empty()) {
+        return addr;
+    }
+    epix_node::legacy_ui_bind().unwrap_or_else(|| DEFAULT_UI_ADDR.to_string())
 }
 
 #[tokio::main]

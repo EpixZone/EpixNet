@@ -1077,10 +1077,24 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "10%".to_string());
         let config_path = dir.join("config.json");
-        let config = std::fs::read(&config_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        // A missing config.json is a normal first run (defaults are correct). But
+        // a file that EXISTS and does not parse is almost always a hand-edit with
+        // a JSON slip - a trailing comma, an unquoted value. Silently defaulting
+        // then drops EVERY setting, `tor` included, with no hint why: exactly the
+        // "I edited config.json on a clean install and it did not pick up the
+        // settings" confusion in EpixNet#239. Keep defaults for this run, but say
+        // so loudly (stderr lands in the desktop log) so it is fixable.
+        let config = match std::fs::read(&config_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                eprintln!(
+                    "[ERROR] config.json at {} is not valid JSON ({e}); ignoring it \
+                     and using defaults. Fix the syntax and restart to apply your settings.",
+                    config_path.display()
+                );
+                serde_json::Map::new()
+            }),
+            Err(_) => serde_json::Map::new(),
+        };
         // Multiuser: load the extra-identities store, seeding it with the active
         // user so it is always listed.
         #[cfg(feature = "multiuser")]
@@ -6122,7 +6136,14 @@ impl AppState {
         let esc = |s: &str| {
             s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
         };
-        let (tor_enabled, tor_status) = self.tor_status().await;
+        // `tor_enabled` is only true once routing is live ("OK"/"Always"); it is
+        // false during "Bootstrapping" and "Failed" too. Report those transient
+        // states verbatim instead of collapsing them to "off", so a Tor that is
+        // still coming up (or gave up) is not indistinguishable from one the
+        // operator disabled - the confusion in EpixNet#239. Only a truly
+        // "Disabled" status reads as off.
+        let (_tor_enabled, tor_status) = self.tor_status().await;
+        let tor_display = if tor_status == "Disabled" { "off" } else { tor_status.as_str() };
         let (port_opened, ip_ext) = self.port_status().await;
         let stats = self.connection_stats().await;
         let mut h = String::new();
@@ -6135,7 +6156,7 @@ impl AppState {
             port = self.fileserver_port().await,
             opened = port_opened,
             ip = esc(&ip_ext.unwrap_or_else(|| "-".into())),
-            tor = if tor_enabled { esc(&tor_status) } else { "off".into() },
+            tor = esc(tor_display),
             conns = stats.total,
         );
 
@@ -6216,7 +6237,7 @@ impl AppState {
         let _ = write!(
             h,
             "<div class='stat-row'>status: <b>{}</b></div>",
-            if tor_enabled { esc(&tor_status) } else { "disabled".into() }
+            if tor_status == "Disabled" { "disabled".into() } else { esc(&tor_status) }
         );
         if let Some(onion) = self.onion_address().await {
             let _ = write!(h, "<div class='stat-row'>onion: {}.onion</div>", esc(&onion));

@@ -1022,6 +1022,100 @@ impl epix_xite::OnionSigner for TorOnionSigner {
     }
 }
 
+/// The result of one arti bootstrap attempt under the watchdog.
+#[cfg(feature = "tor")]
+enum BootstrapAttempt {
+    /// Tor is up and usable.
+    Ready(epix_tor::Tor),
+    /// The attempt failed or timed out; the string is a ready-to-log reason.
+    Failed(String),
+    /// Shutdown fired mid-attempt; the caller should stop.
+    Shutdown,
+}
+
+/// Bootstrap arti, returning the client once it is up, or `None` if shutdown
+/// fired before that.
+///
+/// A fresh install on a slow or filtered network (the VirtualBox Windows 10 in
+/// EpixNet#239) can take minutes or stall outright. With no timeout the task
+/// parks forever inside arti, the status stays "Bootstrapping" - which the UI
+/// renders as "off" - and nothing ever explains why. Cap each attempt (see
+/// [`bootstrap_tor_attempt`]) and keep retrying with a backoff so a transient
+/// failure self-heals once the network settles. arti's own reason now reaches
+/// the log via the node's tracing subscriber; these lines add the coarse story
+/// to the in-UI log.
+#[cfg(feature = "tor")]
+async fn bootstrap_tor_with_watchdog(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    shutdown: &Notify,
+) -> Option<epix_tor::Tor> {
+    const RETRY_BACKOFF_SECS: u64 = 30;
+    // Surface a bootstrapping state so the browser's Tor icon can show progress.
+    state.set_tor_status(false, "Bootstrapping").await;
+    loop {
+        state.log("INFO", "Tor: bootstrapping in-process Arti client …".to_string()).await;
+        match bootstrap_tor_attempt(state, data_dir, shutdown).await {
+            BootstrapAttempt::Ready(tor) => return Some(tor),
+            BootstrapAttempt::Shutdown => {
+                state.set_tor_status(false, "Disabled").await;
+                return None;
+            }
+            BootstrapAttempt::Failed(reason) => state.log("ERROR", reason).await,
+        }
+        // Make the failure visible instead of a silent perpetual "Bootstrapping",
+        // then wait before the next attempt (waking early on shutdown).
+        state.set_tor_status(false, "Failed").await;
+        state.log("INFO", format!("Tor: retrying bootstrap in {RETRY_BACKOFF_SECS}s …")).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(RETRY_BACKOFF_SECS)) => {}
+            _ = shutdown.notified() => {
+                state.set_tor_status(false, "Disabled").await;
+                return None;
+            }
+        }
+        state.set_tor_status(false, "Bootstrapping").await;
+    }
+}
+
+/// One bootstrap attempt: race the bootstrap against a heartbeat that logs
+/// progress every `HEARTBEAT_SECS` and gives up after `ATTEMPT_TIMEOUT_SECS`,
+/// and against shutdown. Dropping the bootstrap future on timeout cancels it.
+#[cfg(feature = "tor")]
+async fn bootstrap_tor_attempt(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    shutdown: &Notify,
+) -> BootstrapAttempt {
+    const HEARTBEAT_SECS: u64 = 15;
+    const ATTEMPT_TIMEOUT_SECS: u64 = 150;
+    let boot = epix_tor::Tor::bootstrap(data_dir);
+    tokio::pin!(boot);
+    let mut elapsed = 0u64;
+    let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    ticker.tick().await; // an interval fires immediately; drop the zero tick
+    loop {
+        tokio::select! {
+            res = &mut boot => {
+                return match res {
+                    Ok(tor) => BootstrapAttempt::Ready(tor),
+                    Err(e) => BootstrapAttempt::Failed(format!("Tor bootstrap failed: {e}")),
+                };
+            }
+            _ = ticker.tick() => {
+                elapsed += HEARTBEAT_SECS;
+                if elapsed >= ATTEMPT_TIMEOUT_SECS {
+                    return BootstrapAttempt::Failed(format!(
+                        "Tor bootstrap did not complete within {ATTEMPT_TIMEOUT_SECS}s"
+                    ));
+                }
+                state.log("INFO", format!("Tor: still bootstrapping ({elapsed}s elapsed) …")).await;
+            }
+            _ = shutdown.notified() => return BootstrapAttempt::Shutdown,
+        }
+    }
+}
+
 /// Bootstrap in-process Tor and run its three surfaces until shutdown: the peer
 /// transport (set on the app state so onion peers are dialable, or all traffic
 /// is Tor-routed in Always mode), an onion service whose inbound streams feed
@@ -1038,16 +1132,10 @@ async fn tor_loop(
     shutdown: Arc<Notify>,
 ) {
     use epix_protocol::RequestHandler;
-    state.log("INFO", "Tor: bootstrapping in-process Arti client …".to_string()).await;
-    // Surface a bootstrapping state so the browser's Tor icon can show progress.
-    state.set_tor_status(false, "Bootstrapping").await;
-    let tor = match epix_tor::Tor::bootstrap(&data_dir).await {
-        Ok(t) => t,
-        Err(e) => {
-            state.log("ERROR", format!("Tor bootstrap failed: {e}")).await;
-            state.set_tor_status(false, "Failed").await;
-            return;
-        }
+    // Bootstrap under a watchdog (heartbeat + timeout + retry). `None` means
+    // shutdown fired before Tor came up, so the loop stops.
+    let Some(tor) = bootstrap_tor_with_watchdog(&state, &data_dir, &shutdown).await else {
+        return;
     };
     state.log("INFO", "Tor: bootstrapped".to_string()).await;
 
