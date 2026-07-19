@@ -5728,7 +5728,7 @@ impl AppState {
 
     // --- MergerSite ----------------------------------------------------------
 
-    /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:ZeroMe`). Idempotent.
+    /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:EpixPost`). Idempotent.
     /// The grant is keyed by the signed content address (so every alias of the
     /// same site shares it) and persisted so it survives restarts.
     pub async fn add_permission(&self, address: &str, permission: &str) {
@@ -13116,12 +13116,12 @@ mod tests {
         state.add_xite("small", XiteEntry { storage: XiteStorage::new(dir.path().join("s")), content: Some(small) }).await;
     }
 
-    #[tokio::test]
-    async fn v3_merger_db_aggregates_merged_sites() {
+    /// A version-3 merger site (schema + `Merger:EpixPost` permission, no own
+    /// data). Returns the live temp dir (keep it in scope - dropping it deletes
+    /// the files), the state, and the merger address.
+    async fn new_v3_merger() -> (tempfile::TempDir, std::sync::Arc<AppState>, &'static str) {
         let dir = tempdir().unwrap();
         let state = AppState::new("test");
-
-        // A merger site: version-3 schema + Merger:ZeroMe permission, no own data.
         let merger = "1Merger";
         let mstore = XiteStorage::new(dir.path().join("merger"));
         mstore
@@ -13136,7 +13136,29 @@ mod tests {
             )
             .unwrap();
         state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
-        state.add_permission(merger, "Merger:ZeroMe").await;
+        state.add_permission(merger, "Merger:EpixPost").await;
+        (dir, state, merger)
+    }
+
+    /// [`new_v3_merger`] plus one merged site holding a single post ("hello"),
+    /// with the merger db rebuilt and asserted populated - the starting point
+    /// for the tests that then perturb the merger and check its db refills.
+    async fn merger_with_one_post() -> (tempfile::TempDir, std::sync::Arc<AppState>, &'static str) {
+        let (dir, state, merger) = new_v3_merger().await;
+        let s = XiteStorage::new(dir.path().join("1SiteA"));
+        s.write("data/u/data.json", br#"{ "posts": [ {"post_id":1,"title":"hello"} ] }"#).unwrap();
+        state
+            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "EpixPost" })) })
+            .await;
+        state.rebuild_merger_dbs().await;
+        let rows = state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(rows.len(), 1, "merger db populated before the refill trigger");
+        (dir, state, merger)
+    }
+
+    #[tokio::test]
+    async fn v3_merger_db_aggregates_merged_sites() {
+        let (dir, state, merger) = new_v3_merger().await;
 
         // Two merged sites of that type, each with a post.
         for (addr, title) in [("1SiteA", "from A"), ("1SiteB", "from B")] {
@@ -13147,7 +13169,7 @@ mod tests {
             )
             .unwrap();
             state
-                .add_xite(addr, XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
+                .add_xite(addr, XiteEntry { storage: s, content: Some(json!({ "merged_type": "EpixPost" })) })
                 .await;
         }
 
@@ -13171,32 +13193,7 @@ mod tests {
 
     #[tokio::test]
     async fn db_rebuild_refills_a_merger_db() {
-        let dir = tempdir().unwrap();
-        let state = AppState::new("test");
-
-        // Same shape as v3_merger_db_aggregates_merged_sites: a merger with a
-        // version-3 schema plus one merged site holding a post.
-        let merger = "1Merger";
-        let mstore = XiteStorage::new(dir.path().join("merger"));
-        mstore
-            .write(
-                "dbschema.json",
-                br#"{ "db_name":"Merger","db_file":"db.db","version":3,
-                     "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
-                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
-            )
-            .unwrap();
-        state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
-        state.add_permission(merger, "Merger:ZeroMe").await;
-        let s = XiteStorage::new(dir.path().join("1SiteA"));
-        s.write("data/u/data.json", br#"{ "posts": [ {"post_id":1,"title":"hello"} ] }"#).unwrap();
-        state
-            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
-            .await;
-        state.rebuild_merger_dbs().await;
-        let rows =
-            state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
-        assert_eq!(rows.len(), 1, "merger db populated before the rebuild");
+        let (_dir, state, merger) = merger_with_one_post().await;
 
         // dbRebuild/dbReload (and a mute change) call rebuild_xite_db, which
         // replaces a version-3 merger db with a fresh EMPTY one - it must be
@@ -13211,32 +13208,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_content_on_merger_refills_db() {
-        let dir = tempdir().unwrap();
-        let state = AppState::new("test");
-
-        // Same shape as db_rebuild_refills_a_merger_db: a merger with a
-        // version-3 schema plus one merged site holding a post.
-        let merger = "1Merger";
-        let mstore = XiteStorage::new(dir.path().join("merger"));
-        mstore
-            .write(
-                "dbschema.json",
-                br#"{ "db_name":"Merger","db_file":"db.db","version":3,
-                     "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
-                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
-            )
-            .unwrap();
-        state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
-        state.add_permission(merger, "Merger:ZeroMe").await;
-        let s = XiteStorage::new(dir.path().join("1SiteA"));
-        s.write("data/u/data.json", br#"{ "posts": [ {"post_id":1,"title":"hello"} ] }"#).unwrap();
-        state
-            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
-            .await;
-        state.rebuild_merger_dbs().await;
-        let rows =
-            state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
-        assert_eq!(rows.len(), 1, "merger db populated before the content update");
+        let (_dir, state, merger) = merger_with_one_post().await;
 
         // Replacing the MERGER site's own content.json (a republish, or an
         // inbound root update) rebuilds its db via build_xite_db, which leaves a
