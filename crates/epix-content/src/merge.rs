@@ -25,6 +25,17 @@ pub fn records_of(container: &Value) -> Vec<Value> {
     container.get("post").and_then(|v| v.as_array()).cloned().unwrap_or_default()
 }
 
+/// The inner-path keys a content.json declares as merge files (`files_merged`),
+/// relative to that content.json's directory. A merge file is verified
+/// per-record and bypasses whole-file hash sync.
+pub fn declared_merge_files(content: &Value) -> Vec<String> {
+    content
+        .get("files_merged")
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Wrap a set of records into a canonical container.
 pub fn make_container(records: Vec<Value>) -> Value {
     json!({ "record_format": RECORD_FORMAT, "post": records })

@@ -237,6 +237,32 @@ mod tests {
     }
 
     #[test]
+    fn sign_skips_declared_merge_files() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
+        xite.storage.write("posts.json", br#"{"record_format":"epix-orset-1","post":[]}"#).unwrap();
+        xite.storage.write("index.html", b"<h1>hi</h1>").unwrap();
+        let content = serde_json::to_vec(&json!({
+            "files_merged": { "posts.json": { "class": "epix-orset-1" } },
+        }))
+        .unwrap();
+        xite.storage.write("content.json", &content).unwrap();
+        xite.content = Some(serde_json::from_slice(&content).unwrap());
+
+        xite.sign(priv_hex, 1777992698.0).unwrap();
+
+        let content = xite.content.clone().unwrap();
+        // posts.json is NEVER hashed into files/files_optional (would re-arm LWW).
+        assert!(content["files"].get("posts.json").is_none());
+        assert!(content.get("files_optional").and_then(|o| o.get("posts.json")).is_none());
+        // A normal file still hashes, and the merge-file declaration is preserved.
+        assert!(content["files"].get("index.html").is_some());
+        assert_eq!(content["files_merged"]["posts.json"]["class"], "epix-orset-1");
+    }
+
+    #[test]
     fn sign_rejects_non_owner_key() {
         let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();
