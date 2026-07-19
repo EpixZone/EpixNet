@@ -66,6 +66,21 @@ pub fn record_signed_data(record: &Value) -> String {
 /// [`verify_record`] (the signature already binds `post_id` to the record).
 pub fn derive_post_id(author: &str, nonce: &str, date_added: i64) -> i64 {
     let input = format!("{author}:{nonce}:{date_added}");
+    truncate53(&input)
+}
+
+/// Derive a STABLE CRDT key from a natural per-author key string, e.g. a wiki
+/// slug or a vote target uri: `truncate53(sha256("<author>|<key>"))`. Two writes
+/// with the same `(author, key)` land on the same id, so editing a wiki page or
+/// re-voting supersedes the prior record instead of creating a new item. This
+/// is how non-post apps map their natural key onto the post_id-keyed OR-Set.
+pub fn derive_post_id_keyed(author: &str, key: &str) -> i64 {
+    truncate53(&format!("{author}|{key}"))
+}
+
+/// Top 53 bits of `sha256(input)` as a non-negative i64 - exact in a JS Number
+/// and INTEGER-affine for the post table.
+fn truncate53(input: &str) -> i64 {
     let digest = Sha256::digest(input.as_bytes());
     let top8: [u8; 8] = digest[..8].try_into().expect("sha256 is 32 bytes");
     (u64::from_be_bytes(top8) >> 11) as i64

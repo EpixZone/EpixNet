@@ -16,7 +16,10 @@ pub use merge::{
     declared_merge_files, live_records, make_container, merge_local, merge_orset, records_of,
     RECORD_FORMAT,
 };
-pub use record::{derive_post_id, record_signed_data, verify_record, RecordError, CLOCK_SKEW_BOUND_MS};
+pub use record::{
+    derive_post_id, derive_post_id_keyed, record_signed_data, verify_record, RecordError,
+    CLOCK_SKEW_BOUND_MS,
+};
 pub use verify::{verify_content_file, VerifyContext, VerifyError};
 use epix_core::{Error, Result};
 use serde_json::Value;

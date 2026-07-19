@@ -8176,16 +8176,23 @@ impl AppState {
             let obj = record.as_object_mut().unwrap();
             obj.insert("author".into(), Value::String(author.clone()));
             if !obj.contains_key("post_id") {
-                let nonce = obj
-                    .get("nonce")
-                    .and_then(|v| v.as_str())
-                    .ok_or("record needs a nonce")?
-                    .to_string();
-                let date_added = obj
-                    .get("date_added")
-                    .and_then(|v| v.as_i64())
-                    .ok_or("record needs a date_added")?;
-                let pid = epix_content::derive_post_id(&author, &nonce, date_added);
+                // A `key` field (a wiki slug, a vote target, ...) yields a
+                // STABLE per-(author,key) id, so edits/re-votes supersede. Else
+                // derive a unique id from the random nonce + creation time.
+                let pid = if let Some(key) = obj.get("key").and_then(|v| v.as_str()) {
+                    epix_content::derive_post_id_keyed(&author, key)
+                } else {
+                    let nonce = obj
+                        .get("nonce")
+                        .and_then(|v| v.as_str())
+                        .ok_or("record needs a nonce or a key")?
+                        .to_string();
+                    let date_added = obj
+                        .get("date_added")
+                        .and_then(|v| v.as_i64())
+                        .ok_or("record needs a date_added")?;
+                    epix_content::derive_post_id(&author, &nonce, date_added)
+                };
                 obj.insert("post_id".into(), Value::from(pid));
             }
         }
