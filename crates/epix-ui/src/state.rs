@@ -8167,11 +8167,31 @@ impl AppState {
             user.auth_privatekey(address)?
         };
         self.save_user().await; // auth_privatekey may have derived the site entry
+        // The node sets `author` authoritatively to the address this key
+        // recovers to, so a client can never claim another author. On creation
+        // (no post_id yet) it derives the immutable CRDT key; edit/delete keep
+        // the post_id the client carried over.
+        let author = epix_crypt::privatekey_to_address(&key).map_err(|e| e.to_string())?;
+        {
+            let obj = record.as_object_mut().unwrap();
+            obj.insert("author".into(), Value::String(author.clone()));
+            if !obj.contains_key("post_id") {
+                let nonce = obj
+                    .get("nonce")
+                    .and_then(|v| v.as_str())
+                    .ok_or("record needs a nonce")?
+                    .to_string();
+                let date_added = obj
+                    .get("date_added")
+                    .and_then(|v| v.as_i64())
+                    .ok_or("record needs a date_added")?;
+                let pid = epix_content::derive_post_id(&author, &nonce, date_added);
+                obj.insert("post_id".into(), Value::from(pid));
+            }
+        }
         let payload = epix_content::record_signed_data(&record);
         let sig = epix_crypt::sign(&payload, &key).map_err(|e| e.to_string())?;
-        if let Value::Object(map) = &mut record {
-            map.insert("sign".into(), Value::String(sig));
-        }
+        record.as_object_mut().unwrap().insert("sign".into(), Value::String(sig));
         Ok(record)
     }
 
@@ -8191,7 +8211,7 @@ impl AppState {
             .ok_or("unknown xite")?;
 
         // The cert fields to extend the content.json with, and the signing key.
-        let (extend, key) = {
+        let (mut extend, key) = {
             let mut user = self.user.write().await;
             let mut extend = serde_json::Map::new();
             if privatekey.is_none() {
@@ -8222,6 +8242,34 @@ impl AppState {
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
         let modified = (now_secs() as f64).max(prev + 1.0);
+
+        // Auto-declare merge files: if the owner's include allows one
+        // (merge_files rule) and it exists on disk in this directory, add it to
+        // files_merged so it is signed as a signed-CRDT file, not a hashed one.
+        // The client just writes records; it never hand-manages the declaration.
+        if let Some(rules) = self.user_content_rules(address, content_inner_path).await {
+            if let Some(allowed) = rules.get("merge_files").and_then(|v| v.as_object()) {
+                let dir = content_inner_path
+                    .strip_suffix("content.json")
+                    .unwrap_or("")
+                    .trim_end_matches('/');
+                let mut merged = serde_json::Map::new();
+                for (name, spec) in allowed {
+                    let path =
+                        if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                    if storage.exists(&path) {
+                        let class = spec
+                            .get("class")
+                            .cloned()
+                            .unwrap_or_else(|| json!("epix-orset-1"));
+                        merged.insert(name.clone(), json!({ "class": class }));
+                    }
+                }
+                if !merged.is_empty() {
+                    extend.insert("files_merged".into(), Value::Object(merged));
+                }
+            }
+        }
 
         let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
         let xite = Xite::new(addr, storage);
