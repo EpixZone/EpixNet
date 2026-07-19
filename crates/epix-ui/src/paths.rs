@@ -4,6 +4,7 @@
 //! the same file and key the Python client uses, so a customized Python
 //! install carries over.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The conventional per-OS data root: `~/Library/Application Support/EpixNet`
@@ -35,22 +36,67 @@ pub fn data_root() -> PathBuf {
     read_conf_data_dir(&default.join("epixnet.conf")).unwrap_or(default)
 }
 
-/// The `data_dir` value in an epixnet.conf, if present. The file is Python
-/// configparser INI (`[global]` + `key = value` lines); only this key matters
-/// here, so parse just the assignments.
-pub fn read_conf_data_dir(conf: &Path) -> Option<PathBuf> {
-    for line in std::fs::read_to_string(conf).ok()?.lines() {
+/// The default location's `epixnet.conf` - the same file the Python client
+/// keeps its settings in, so a customized Python install carries over. This is
+/// always in the default data root, even when that file's own `data_dir` key
+/// relocates everything else.
+pub fn default_conf_path() -> PathBuf {
+    default_data_root().join("epixnet.conf")
+}
+
+/// Every `key = value` assignment in an epixnet.conf. The file is Python
+/// configparser INI (`[section]` headers and `#`/`;` comments ignored); values
+/// are trimmed and empties dropped. On a duplicate key the last wins, matching
+/// configparser (Python EpixNet writes `language` twice, for instance).
+pub fn read_conf(conf: &Path) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(conf) else { return map };
+    for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') || line.starts_with('[') {
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') || line.starts_with('[')
+        {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
-            if key.trim() == "data_dir" && !value.trim().is_empty() {
-                return Some(PathBuf::from(value.trim()));
+            let (key, value) = (key.trim(), value.trim());
+            if !key.is_empty() && !value.is_empty() {
+                map.insert(key.to_string(), value.to_string());
             }
         }
     }
-    None
+    map
+}
+
+/// The value of `key` in an epixnet.conf, if present and non-empty.
+pub fn read_conf_value(conf: &Path, key: &str) -> Option<String> {
+    read_conf(conf).remove(key)
+}
+
+/// The `data_dir` value in an epixnet.conf, if present. The Python client uses
+/// this key to relocate the data root.
+pub fn read_conf_data_dir(conf: &Path) -> Option<PathBuf> {
+    read_conf_value(conf, "data_dir").map(PathBuf::from)
+}
+
+/// Delete the assignment lines for `keys` from an epixnet.conf, preserving every
+/// other line (comments, `[section]` headers, blank lines, and every other
+/// key). Used once a value has been migrated into config.json, so the stale INI
+/// entry can't shadow it and a later hand-edit of the moved key can't confuse.
+/// A missing file is a no-op success.
+pub fn remove_conf_keys(conf: &Path, keys: &[&str]) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(conf) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| match line.trim().split_once('=') {
+            Some((key, _)) => !keys.contains(&key.trim()),
+            None => true, // comments, section headers, blank lines
+        })
+        .collect();
+    std::fs::write(conf, kept.join("\n") + "\n")
 }
 
 /// Set (or with `None`, remove) the `data_dir` entry in an epixnet.conf,
@@ -126,5 +172,49 @@ mod tests {
     #[test]
     fn default_root_ends_with_epixnet() {
         assert!(default_data_root().ends_with("EpixNet"));
+    }
+
+    #[test]
+    fn read_conf_parses_python_ini_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("epixnet.conf");
+        // The shape Python EpixNet writes: header comment, [global], and a mix
+        // of keys - including `language` twice (configparser keeps the last).
+        std::fs::write(
+            &conf,
+            "# epixnet config file\n[global]\nlanguage = en\ntor=always\n\
+             fileserver_port=48333\n; a comment\nlanguage=fr\n",
+        )
+        .unwrap();
+        let map = read_conf(&conf);
+        assert_eq!(read_conf_value(&conf, "tor").as_deref(), Some("always"));
+        assert_eq!(map.get("fileserver_port").map(String::as_str), Some("48333"));
+        assert_eq!(map.get("language").map(String::as_str), Some("fr"), "last duplicate wins");
+        assert_eq!(read_conf_value(&conf, "absent"), None);
+        // A missing file is an empty map, never an error.
+        assert!(read_conf(&dir.path().join("nope.conf")).is_empty());
+    }
+
+    #[test]
+    fn remove_conf_keys_drops_only_named_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = dir.path().join("epixnet.conf");
+        std::fs::write(
+            &conf,
+            "# epixnet config file\n[global]\ntor=always\ndata_dir = /keep/me\n\
+             fileserver_port=48333\nui_port=42222\n",
+        )
+        .unwrap();
+        remove_conf_keys(&conf, &["tor", "fileserver_port"]).unwrap();
+        let text = std::fs::read_to_string(&conf).unwrap();
+        assert!(!text.contains("tor="), "migrated key removed: {text}");
+        assert!(!text.contains("fileserver_port"), "migrated key removed: {text}");
+        // Everything else is preserved: comment, header, still-used keys.
+        assert!(text.contains("# epixnet config file"));
+        assert!(text.contains("[global]"));
+        assert!(text.contains("data_dir = /keep/me"));
+        assert!(text.contains("ui_port=42222"));
+        // A missing file is a no-op success.
+        remove_conf_keys(&dir.path().join("nope.conf"), &["tor"]).unwrap();
     }
 }
