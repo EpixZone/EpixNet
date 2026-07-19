@@ -111,10 +111,17 @@ if [ -n "$BUNDLED_FF" ]; then
   # It writes the CA itself to ~/Library/Application Support/Mozilla/
   # Certificates/epix-ca.pem at each run.
   # SearchEngines (default DuckDuckGo) is ESR-only; the bundle is ESR.
+  # DisableAppUpdate: this Firefox lives inside our code-signed .app and can't
+  # rewrite itself in place (it would break both its own and the outer app's
+  # signature), so its updater only ever nags "couldn't update automatically".
+  # Turn it off; EpixNet controls the ESR version and ships a newer one by
+  # publishing a new build (see the header - we patch on our cadence). Windows
+  # keeps updates on: there Firefox installs to a writable dir and self-patches.
   mkdir -p "$BUNDLED_FF/Contents/Resources/distribution"
   cat > "$BUNDLED_FF/Contents/Resources/distribution/policies.json" <<'POLICIES'
 {
   "policies": {
+    "DisableAppUpdate": true,
     "Certificates": {
       "Install": ["epix-ca.pem"]
     },
