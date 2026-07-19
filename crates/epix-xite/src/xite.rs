@@ -693,6 +693,21 @@ impl Xite {
             .as_object_mut()
             .ok_or_else(|| Error::Protocol("content.json is not a JSON object".into()))?;
         for (key, val) in extend {
+            // files_merged is UNIONED, not skip-if-present: an app that adds a
+            // SECOND merge file later must get it declared too (a skipped
+            // declaration would be signed as a hashed last-writer-wins file -
+            // the exact bug the merge class prevents).
+            if key == "files_merged" {
+                let dst = map
+                    .entry("files_merged")
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let (Some(dst), Some(src)) = (dst.as_object_mut(), val.as_object()) {
+                    for (k, v) in src {
+                        dst.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                continue;
+            }
             let missing = map.get(key).map(|v| v.is_null()).unwrap_or(true);
             if missing {
                 map.insert(key.clone(), val.clone());

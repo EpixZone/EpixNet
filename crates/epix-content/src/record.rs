@@ -106,10 +106,16 @@ pub fn verify_record(
     let clock =
         obj.get("clock").and_then(|v| v.as_i64()).ok_or(RecordError::MissingField("clock"))?;
     // Identity fields must be present (they are part of the signed payload).
+    // The id provenance is either a random `nonce` (unique items) or a natural
+    // `key` (stable per-(author,key) items like a wiki slug or a vote target).
     obj.get("post_id")
         .and_then(|v| v.as_i64())
         .ok_or(RecordError::MissingField("post_id"))?;
-    obj.get("nonce").and_then(|v| v.as_str()).ok_or(RecordError::MissingField("nonce"))?;
+    let has_nonce = obj.get("nonce").and_then(|v| v.as_str()).is_some();
+    let has_key = obj.get("key").and_then(|v| v.as_str()).is_some();
+    if !has_nonce && !has_key {
+        return Err(RecordError::MissingField("nonce-or-key"));
+    }
     obj.get("date_added")
         .and_then(|v| v.as_i64())
         .ok_or(RecordError::MissingField("date_added"))?;
@@ -358,8 +364,9 @@ mod tests {
         let mut rec = signed_record(&author, PRIV, 100);
         rec.as_object_mut().unwrap().remove("author");
         assert_eq!(verify_record(&rec, &[author.clone()], 1_000_000), Err(RecordError::MissingField("author")));
+        // Removing the nonce with no `key` present fails (need one id source).
         let mut rec2 = signed_record(&author, PRIV, 100);
         rec2.as_object_mut().unwrap().remove("nonce");
-        assert_eq!(verify_record(&rec2, &[author], 1_000_000), Err(RecordError::MissingField("nonce")));
+        assert_eq!(verify_record(&rec2, &[author], 1_000_000), Err(RecordError::MissingField("nonce-or-key")));
     }
 }
