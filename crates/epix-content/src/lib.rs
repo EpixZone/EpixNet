@@ -13,7 +13,8 @@ pub mod verify;
 pub use canonical::{dumps_content, dumps_sorted};
 pub use diff::{patch, DiffAction};
 pub use merge::{
-    declared_merge_files, live_records, make_container, merge_orset, records_of, RECORD_FORMAT,
+    declared_merge_files, live_records, make_container, merge_local, merge_orset, records_of,
+    RECORD_FORMAT,
 };
 pub use record::{derive_post_id, record_signed_data, verify_record, RecordError, CLOCK_SKEW_BOUND_MS};
 pub use verify::{verify_content_file, VerifyContext, VerifyError};

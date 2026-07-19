@@ -90,6 +90,24 @@ pub fn merge_orset(local: &Value, inbound: &Value, valid_signers: &[String], now
     make_container(records)
 }
 
+/// Merge for the AUTHORING device's own `fileWrite`: union two containers by
+/// signature with NO re-verification - the local client just produced these
+/// records, and the point here is only to stop a blank/partial page-view write
+/// from wiping the on-disk set. Inbound peer merges use [`merge_orset`], which
+/// verifies every record.
+pub fn merge_local(local: &Value, incoming: &Value) -> Value {
+    let mut by_sign: BTreeMap<String, Value> = BTreeMap::new();
+    for r in records_of(local).into_iter().chain(records_of(incoming)) {
+        let sig = sign_of(&r).to_string();
+        if !sig.is_empty() {
+            by_sign.entry(sig).or_insert(r);
+        }
+    }
+    let mut records: Vec<Value> = by_sign.into_values().collect();
+    sort_records(&mut records);
+    make_container(records)
+}
+
 /// Whether version `b` causally dominates version `a`: `b` was written by an
 /// author who had already observed `a` (`b.supersedes >= a.clock`). A dominated
 /// version is superseded and drops out of the live frontier.

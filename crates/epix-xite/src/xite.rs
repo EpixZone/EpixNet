@@ -498,6 +498,30 @@ impl Xite {
             .collect()
     }
 
+    /// The authorized signer set for the content.json unit at
+    /// `content_inner_path` (root or a user content.json), resolving xID-name
+    /// signers via `xid_map`. Used by the merge path to decide which addresses
+    /// may author records in a directory. Empty if the content.json is absent
+    /// or unparseable.
+    pub fn valid_signers_for(
+        &self,
+        content_inner_path: &str,
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        let Ok(bytes) = self.storage.read(content_inner_path) else {
+            return Vec::new();
+        };
+        let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
+            return Vec::new();
+        };
+        let ctx = ChildCtx {
+            address: self.address.as_str().to_string(),
+            storage: &self.storage,
+            xid_map,
+        };
+        epix_content::verify::valid_signers(content_inner_path, &content, &ctx)
+    }
+
     /// Build the `files` and `files_optional` maps for the content.json unit
     /// rooted at `dir` (empty for the root): hash every file under `dir`,
     /// keyed by path relative to `dir`. Skips the unit's own content.json and
