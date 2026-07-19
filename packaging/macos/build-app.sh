@@ -237,13 +237,74 @@ fi
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
   -f "$APP" 2>/dev/null || true
 
-# Package a DMG for distribution (EPIX_MAKE_DMG=1). The app inside is already
-# stapled, so the DMG passes Gatekeeper; notarize the DMG too when we can.
+# Package a DMG for distribution (EPIX_MAKE_DMG=1). This is a drag-to-install
+# DMG: a window with EpixNet.app on the left and an Applications alias on the
+# right, over a background that says "drag here". Users MUST install to
+# /Applications and run it from there - not from the mounted image. Firefox
+# refuses to run cleanly from a read-only DMG (or a Gatekeeper-translocated
+# copy): it pops "Open existing Firefox application?" and, if the user's plain
+# Firefox opens instead of ours, the bundled Firefox never applies its CA policy
+# and https://*.epix shows a cert error. There is no pref to disable that check,
+# so the fix is to get the app off the DMG and into /Applications.
 if [ "${EPIX_MAKE_DMG:-0}" = "1" ]; then
   DMG="$OUT_DIR/Epix-$VERSION.dmg"
-  echo "· building $DMG"
+  echo "· building installer $DMG"
   rm -f "$DMG"
-  hdiutil create -volname "EpixNet" -srcfolder "$APP" -ov -format UDZO "$DMG" >/dev/null
+  BG_SRC="$REPO_ROOT/packaging/macos/dmg-background.tiff"
+
+  # Stage the DMG contents: the app, an /Applications drop target, the
+  # background image, and the volume icon.
+  STAGE="$OUT_DIR/dmg-stage"
+  rm -rf "$STAGE"; mkdir -p "$STAGE/.background"
+  cp -R "$APP" "$STAGE/EpixNet.app"
+  ln -s /Applications "$STAGE/Applications"
+  [ -f "$BG_SRC" ] && cp "$BG_SRC" "$STAGE/.background/background.tiff"
+
+  # Build a read-write image we can lay out in Finder, sized from the content
+  # plus slack for the .DS_Store the layout writes.
+  RW="$OUT_DIR/rw.dmg"
+  rm -f "$RW"
+  MB=$(( $(du -sm "$STAGE" | cut -f1) + 60 ))
+  hdiutil create -volname "EpixNet" -srcfolder "$STAGE" -fs HFS+ \
+    -format UDRW -size "${MB}m" -ov "$RW" >/dev/null
+
+  # Attach (private mountpoint, and read the real volume name back - a stale
+  # "EpixNet" volume already mounted would land us at "EpixNet 1", etc.).
+  ATTACH="$(hdiutil attach "$RW" -readwrite -noverify -noautoopen -nobrowse)"
+  DEV="$(echo "$ATTACH" | grep -Eo '^/dev/disk[0-9]+' | head -1)"
+  MOUNT="$(echo "$ATTACH" | grep -Eo '/Volumes/.*' | head -1)"
+  VOL="$(basename "$MOUNT")"
+
+  # Lay out the window: background, no toolbar, icon positions matching the
+  # background art (app under the arrow's tail, Applications under its head).
+  osascript >/dev/null 2>&1 <<OSA || echo "  (Finder layout step warned; DMG still usable)"
+tell application "Finder"
+  tell disk "$VOL"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    set the bounds of container window to {300, 150, 900, 550}
+    set vopts to the icon view options of container window
+    set arrangement of vopts to not arranged
+    set icon size of vopts to 112
+    set text size of vopts to 12
+    set background picture of vopts to file ".background:background.tiff"
+    set position of item "EpixNet.app" of container window to {150, 190}
+    set position of item "Applications" of container window to {450, 190}
+    update without registering applications
+    delay 1
+    close
+  end tell
+end tell
+OSA
+  sync
+  hdiutil detach "$DEV" >/dev/null 2>&1 || hdiutil detach "$MOUNT" -force >/dev/null 2>&1 || true
+
+  # Convert to a compressed, read-only image for shipping.
+  hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
+  rm -f "$RW"; rm -rf "$STAGE"
+
   if [ -n "${EPIX_SIGN_ID:-}" ]; then
     codesign --force --sign "$EPIX_SIGN_ID" --timestamp "$DMG" || true
     if [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
