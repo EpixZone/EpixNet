@@ -130,21 +130,34 @@ pub fn verify_record(
         return Err(RecordError::ClockTooFarFuture);
     }
 
-    // The author must be an authorized signer of this directory.
+    // The claimed `author` (for a moderation tombstone, the ORIGINAL author
+    // whose item is being deleted) must be an authorized signer of this dir.
     if !valid_signers.iter().any(|s| s == author) {
         return Err(RecordError::UnauthorizedAuthor);
     }
 
-    // Author-continuity: the signature must recover to the claimed `author`
-    // over the canonical payload. Accept the double-sha256 OR the keccak scheme,
-    // mirroring content.json verification (recovery always yields SOME address
-    // for a well-formed sig, so we compare to `author` under BOTH digests
-    // rather than falling back only on error). A garbage signature makes both
-    // recoveries fail the compare, yielding `BadSignature` - no panic.
     let payload = record_signed_data(record);
-    if epix_crypt::verify(&payload, author, sign)
-        || epix_crypt::verify_keccak(&payload, author, sign)
-    {
+    // A cross-author MODERATION tombstone (`deleted: true, moderated: true`)
+    // may be signed by ANY authorized signer of the directory (a moderator or
+    // the author), not just the author - so a moderator can hide another
+    // user's item. It can only DELETE (tombstone), never edit content. Every
+    // other record obeys author-continuity: the signature MUST recover to the
+    // record's own `author`, so no one can supersede another author's item.
+    let moderated = obj.get("moderated").and_then(|v| v.as_bool()).unwrap_or(false);
+    let deleted = obj.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ok = if moderated && deleted {
+        valid_signers.iter().any(|s| {
+            epix_crypt::verify(&payload, s, sign) || epix_crypt::verify_keccak(&payload, s, sign)
+        })
+    } else {
+        // Author-continuity: the signature must recover to `author` under the
+        // double-sha256 OR keccak scheme (recovery always yields SOME address
+        // for a well-formed sig, so compare to `author` under both digests; a
+        // garbage sig fails both, yielding BadSignature - never a panic).
+        epix_crypt::verify(&payload, author, sign)
+            || epix_crypt::verify_keccak(&payload, author, sign)
+    };
+    if ok {
         Ok(())
     } else {
         Err(RecordError::BadSignature)
@@ -300,6 +313,43 @@ mod tests {
         rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), PRIV).unwrap());
         // Signature is valid, but a tombstone may not carry a body.
         assert_eq!(verify_record(&rec, &[author], 1_000_000), Err(RecordError::TombstoneHasBody));
+    }
+
+    #[test]
+    fn moderation_tombstone_by_a_moderator_is_accepted() {
+        // A moderator (a different key, but an authorized signer of the dir)
+        // may tombstone the author's item when moderated:true + deleted:true.
+        let author = author_addr();
+        let mod_pk = "22b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let moderator = epix_crypt::privatekey_to_address(mod_pk).unwrap();
+        let mut rec = json!({
+            "post_id": 123_i64, "nonce": "n", "author": author, "clock": 9_i64,
+            "supersedes": 1, "deleted": true, "moderated": true, "body": "",
+            "date_added": 1737331200_i64,
+        });
+        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), mod_pk).unwrap());
+        let signers = vec![author.clone(), moderator];
+        assert_eq!(verify_record(&rec, &signers, 1_000_000), Ok(()));
+
+        // A stranger (not an authorized signer) cannot forge a moderation tombstone.
+        let stranger = "33b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let mut forged = json!({
+            "post_id": 123_i64, "nonce": "n", "author": author, "clock": 9_i64,
+            "supersedes": 1, "deleted": true, "moderated": true, "body": "",
+            "date_added": 1737331200_i64,
+        });
+        forged["sign"] = json!(epix_crypt::sign(&record_signed_data(&forged), stranger).unwrap());
+        assert_eq!(verify_record(&forged, &signers, 1_000_000), Err(RecordError::BadSignature));
+
+        // moderated flag WITHOUT delete gets no relaxation - a moderator can't
+        // edit another author's content, only tombstone it.
+        let mut edit = json!({
+            "post_id": 123_i64, "nonce": "n", "author": author, "clock": 9_i64,
+            "supersedes": 1, "deleted": false, "moderated": true, "body": "rewritten",
+            "date_added": 1737331200_i64,
+        });
+        edit["sign"] = json!(epix_crypt::sign(&record_signed_data(&edit), mod_pk).unwrap());
+        assert_eq!(verify_record(&edit, &signers, 1_000_000), Err(RecordError::BadSignature));
     }
 
     #[test]
