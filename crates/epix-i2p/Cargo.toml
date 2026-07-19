@@ -10,12 +10,12 @@ epix-transport = { path = "../epix-transport" }
 # SAMv3 client - the same regardless of which router backs it.
 yosemite = "0.7"
 # Embedded pure-Rust I2P router (the no-sidecar default). Optional so a build
-# can drop it and use only an external router. We use our fork of emissary
-# (EpixZone/emissary, branch v0.4.0-rustls): it makes the reseeder's TLS
-# pluggable so `rustls` replaces OpenSSL and the router cross-compiles to
-# Android/iOS. Pinned to a rev for reproducibility.
-emissary-core = { git = "https://github.com/EpixZone/emissary", rev = "3916e0f1d091929baa4d524ee5963fffb56880b3", optional = true, features = ["events"] }
-emissary-util = { git = "https://github.com/EpixZone/emissary", rev = "3916e0f1d091929baa4d524ee5963fffb56880b3", optional = true, default-features = false, features = ["tokio", "rustls"] }
+# can drop it and use only an external router. The reseeder's pluggable TLS
+# (our Android/iOS change) is now upstream, so we track emissary directly
+# (eepnet/emissary) instead of our fork: `rustls` replaces OpenSSL and the
+# router cross-compiles to Android/iOS. Pinned to a rev for reproducibility.
+emissary-core = { git = "https://github.com/eepnet/emissary", rev = "4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32", optional = true, features = ["events"] }
+emissary-util = { git = "https://github.com/eepnet/emissary", rev = "4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32", optional = true, default-features = false, features = ["tokio", "rustls"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
 async-trait = "0.1"
 tracing = "0.1"

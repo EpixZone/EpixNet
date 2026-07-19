@@ -29,8 +29,8 @@ thiserror = "2"
 # desktop (privacy by default). It's a leaf: transit tunnels are disabled and
 # it's not a floodfill, so it only carries our own traffic - roughly Tor-client
 # footprint (~20 MB, low CPU), which is why it's on by default on a phone too.
-# The embedded router cross-compiles to mobile because our emissary fork's
-# reseeder uses rustls, not OpenSSL. Users can still switch it off in Config.
+# The embedded router cross-compiles to mobile because emissary's reseeder can
+# use rustls instead of OpenSSL. Users can still switch it off in Config.
 default = ["tor", "i2p-embedded"]
 tor = ["epix-node/tor"]
 i2p = ["epix-node/i2p"]
