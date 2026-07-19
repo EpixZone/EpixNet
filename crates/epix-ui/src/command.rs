@@ -2728,7 +2728,7 @@ impl WsCommand for OptionalLimitSet {
 // ---- MergerSite ------------------------------------------------------------
 
 /// `permissionAdd(permission)` - grant a permission to the current xite (e.g.
-/// `Merger:ZeroMe`, which makes it a merger site).
+/// `Merger:EpixPost`, which makes it a merger site).
 struct PermissionAdd;
 #[async_trait]
 impl WsCommand for PermissionAdd {
@@ -4043,17 +4043,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
 
-        // A merger site granted `Merger:ZeroMe`.
+        // A merger site granted `Merger:EpixPost`.
         let merger = "1Merger";
         state.add_xite(merger, XiteEntry { storage: XiteStorage::new(dir.path().join("m")), content: None }).await;
-        state.add_permission(merger, "Merger:ZeroMe").await;
+        state.add_permission(merger, "Merger:EpixPost").await;
 
         // A merged site of that type, with a file.
         let merged = "1Merged";
         let mstore = XiteStorage::new(dir.path().join("d"));
         mstore.write("data.txt", b"merged file").unwrap();
         state
-            .add_xite(merged, XiteEntry { storage: mstore, content: Some(json!({ "merged_type": "ZeroMe" })) })
+            .add_xite(merged, XiteEntry { storage: mstore, content: Some(json!({ "merged_type": "EpixPost" })) })
             .await;
         // A site of a different merged type is excluded.
         state
@@ -4062,11 +4062,11 @@ mod tests {
 
         let session = WsSession::new(state.clone(), Some(merger.into()));
         let list = MergerSiteList.handle(&session, &json!([false])).await.unwrap();
-        assert_eq!(list["1Merged"], "ZeroMe");
+        assert_eq!(list["1Merged"], "EpixPost");
         assert!(list.get("1Other").is_none(), "different merged type excluded");
 
         // fileGet routes a merged-<type>/<address>/<path> read to the merged site.
-        let f = FileGet.handle(&session, &json!("merged-ZeroMe/1Merged/data.txt")).await.unwrap();
+        let f = FileGet.handle(&session, &json!("merged-EpixPost/1Merged/data.txt")).await.unwrap();
         assert_eq!(f, "merged file");
 
         // A non-merger site can't list.

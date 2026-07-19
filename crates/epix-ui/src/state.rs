@@ -5728,7 +5728,7 @@ impl AppState {
 
     // --- MergerSite ----------------------------------------------------------
 
-    /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:ZeroMe`). Idempotent.
+    /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:EpixPost`). Idempotent.
     /// The grant is keyed by the signed content address (so every alias of the
     /// same site shares it) and persisted so it survives restarts.
     pub async fn add_permission(&self, address: &str, permission: &str) {
@@ -13116,7 +13116,7 @@ mod tests {
         state.add_xite("small", XiteEntry { storage: XiteStorage::new(dir.path().join("s")), content: Some(small) }).await;
     }
 
-    /// A version-3 merger site (schema + `Merger:ZeroMe` permission, no own
+    /// A version-3 merger site (schema + `Merger:EpixPost` permission, no own
     /// data). Returns the live temp dir (keep it in scope - dropping it deletes
     /// the files), the state, and the merger address.
     async fn new_v3_merger() -> (tempfile::TempDir, std::sync::Arc<AppState>, &'static str) {
@@ -13136,7 +13136,7 @@ mod tests {
             )
             .unwrap();
         state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
-        state.add_permission(merger, "Merger:ZeroMe").await;
+        state.add_permission(merger, "Merger:EpixPost").await;
         (dir, state, merger)
     }
 
@@ -13148,7 +13148,7 @@ mod tests {
         let s = XiteStorage::new(dir.path().join("1SiteA"));
         s.write("data/u/data.json", br#"{ "posts": [ {"post_id":1,"title":"hello"} ] }"#).unwrap();
         state
-            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
+            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "EpixPost" })) })
             .await;
         state.rebuild_merger_dbs().await;
         let rows = state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
@@ -13169,7 +13169,7 @@ mod tests {
             )
             .unwrap();
             state
-                .add_xite(addr, XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
+                .add_xite(addr, XiteEntry { storage: s, content: Some(json!({ "merged_type": "EpixPost" })) })
                 .await;
         }
 
