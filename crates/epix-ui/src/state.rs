@@ -3676,7 +3676,9 @@ impl AppState {
     /// Replace a xite's content.json, refreshing its stats and rebuilding its db.
     pub async fn update_content(&self, address: &str, content: Option<Value>) {
         let muted = self.muted_authors().await;
-        if let Some(x) = self.xites.write().await.get_mut(address) {
+        let is_merger = {
+            let mut xites = self.xites.write().await;
+            let Some(x) = xites.get_mut(address) else { return };
             if let Some(c) = &content {
                 x.settings.apply_content_stats(&content_stats(c));
             }
@@ -3685,8 +3687,18 @@ impl AppState {
                 Some((db, schema)) => (Some(db), Some(schema)),
                 None => (None, None),
             };
+            let is_merger = schema.as_ref().map(|s| s.version == 3).unwrap_or(false);
             x.db = db;
             x.db_schema = schema;
+            is_merger
+        };
+        // build_xite_db leaves a version-3 merger db EMPTY (its rows come from
+        // the merged sites, not its own tree). Replacing a merger site's own
+        // content.json - a republish, or an inbound root update - must refill it
+        // like rebuild_xite_db does, else the merger's feed goes blank until the
+        // next restart or dbRebuild (the Epix Post missing-posts bug).
+        if is_merger {
+            self.rebuild_merger_dbs().await;
         }
     }
 
@@ -13194,6 +13206,48 @@ mod tests {
         let rows =
             state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
         assert_eq!(rows.len(), 1, "merger db refilled after dbRebuild");
+        assert_eq!(rows[0]["title"], "hello");
+    }
+
+    #[tokio::test]
+    async fn update_content_on_merger_refills_db() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+
+        // Same shape as db_rebuild_refills_a_merger_db: a merger with a
+        // version-3 schema plus one merged site holding a post.
+        let merger = "1Merger";
+        let mstore = XiteStorage::new(dir.path().join("merger"));
+        mstore
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Merger","db_file":"db.db","version":3,
+                     "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
+        state.add_permission(merger, "Merger:ZeroMe").await;
+        let s = XiteStorage::new(dir.path().join("1SiteA"));
+        s.write("data/u/data.json", br#"{ "posts": [ {"post_id":1,"title":"hello"} ] }"#).unwrap();
+        state
+            .add_xite("1SiteA", XiteEntry { storage: s, content: Some(json!({ "merged_type": "ZeroMe" })) })
+            .await;
+        state.rebuild_merger_dbs().await;
+        let rows =
+            state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(rows.len(), 1, "merger db populated before the content update");
+
+        // Replacing the MERGER site's own content.json (a republish, or an
+        // inbound root update) rebuilds its db via build_xite_db, which leaves a
+        // version-3 merger EMPTY. update_content must refill it from the merged
+        // sites, else the feed goes blank until the next restart or dbRebuild -
+        // the Epix Post "all posts missing except the users who posted since the
+        // last restart" bug.
+        state.update_content(merger, Some(json!({ "title": "Merger v2", "files": {} }))).await;
+        let rows =
+            state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(rows.len(), 1, "merger db refilled after its own content update");
         assert_eq!(rows[0]["title"], "hello");
     }
 
