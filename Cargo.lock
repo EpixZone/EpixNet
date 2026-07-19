@@ -1821,7 +1821,7 @@ dependencies = [
 [[package]]
 name = "emissary-core"
 version = "0.4.0"
-source = "git+https://github.com/EpixZone/emissary?rev=3916e0f1d091929baa4d524ee5963fffb56880b3#3916e0f1d091929baa4d524ee5963fffb56880b3"
+source = "git+https://github.com/eepnet/emissary?rev=4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32#4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32"
 dependencies = [
  "aes 0.8.4",
  "bytes",
@@ -1859,7 +1859,7 @@ dependencies = [
 [[package]]
 name = "emissary-util"
 version = "0.4.0"
-source = "git+https://github.com/EpixZone/emissary?rev=3916e0f1d091929baa4d524ee5963fffb56880b3#3916e0f1d091929baa4d524ee5963fffb56880b3"
+source = "git+https://github.com/eepnet/emissary?rev=4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32#4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32"
 dependencies = [
  "anyhow",
  "ed25519-dalek 3.0.0",
