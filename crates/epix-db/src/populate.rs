@@ -193,14 +193,42 @@ pub fn update_json(
             }
         }
 
+        // Merge-file rows (posts.json) attach to the SIBLING data.json json row
+        // (via `file_name`) so post -> profile joins resolve, and the versioned
+        // node is folded to its live CRDT winners first (tombstones and
+        // superseded/concurrent-losing versions dropped).
+        let table_jid = match &map.file_name {
+            Some(fname) => {
+                let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                let sibling =
+                    if dir.is_empty() { fname.clone() } else { format!("{dir}/{fname}") };
+                json_id(conn, schema, &sibling, site)?
+            }
+            None => jid,
+        };
+        let folded_owned;
+        let table_data: &Value = match &map.fold_crdt {
+            Some(fold_node) => {
+                let live = epix_content::live_records(data);
+                let mut d = data.clone();
+                if let Value::Object(m) = &mut d {
+                    m.insert(fold_node.clone(), Value::Array(live));
+                }
+                folded_owned = d;
+                &folded_owned
+            }
+            None => data,
+        };
+
         // to_table
         for entry in &map.to_table {
             let table = entry.table();
             let node = entry.node();
             let allowed = allowed_cols(schema, entry);
-            conn.execute(&format!("DELETE FROM {table} WHERE json_id = ?1"), [jid]).map_err(db_err)?;
+            conn.execute(&format!("DELETE FROM {table} WHERE json_id = ?1"), [table_jid])
+                .map_err(db_err)?;
 
-            let Some(node_data) = data.get(node) else { continue };
+            let Some(node_data) = table_data.get(node) else { continue };
 
             match entry {
                 // Dict-mapped: `key_col` carries the map key.
@@ -211,16 +239,16 @@ pub fn update_json(
                                 let mut row = Map::new();
                                 row.insert(key_col.clone(), Value::from(k.clone()));
                                 row.insert(val_col.clone(), v.clone());
-                                insert_row(conn, table, &allowed, &row, jid)?;
+                                insert_row(conn, table, &allowed, &row, table_jid)?;
                             } else if let Some(row_obj) = v.as_object() {
                                 let mut row = row_obj.clone();
                                 row.insert(key_col.clone(), Value::from(k.clone()));
-                                insert_row(conn, table, &allowed, &row, jid)?;
+                                insert_row(conn, table, &allowed, &row, table_jid)?;
                             } else if let Some(rows) = v.as_array() {
                                 for r in rows.iter().filter_map(|r| r.as_object()) {
                                     let mut row = r.clone();
                                     row.insert(key_col.clone(), Value::from(k.clone()));
-                                    insert_row(conn, table, &allowed, &row, jid)?;
+                                    insert_row(conn, table, &allowed, &row, table_jid)?;
                                 }
                             }
                         }
@@ -230,7 +258,7 @@ pub fn update_json(
                 _ => {
                     if let Some(rows) = node_data.as_array() {
                         for r in rows.iter().filter_map(|r| r.as_object()) {
-                            insert_row(conn, table, &allowed, r, jid)?;
+                            insert_row(conn, table, &allowed, r, table_jid)?;
                         }
                     }
                 }
@@ -473,5 +501,60 @@ pub fn query_value(conn: &Connection, sql: &str, params: &Value) -> Result<Vec<V
         }
         Value::Array(arr) => query(conn, sql, arr),
         _ => query(conn, sql, &[]),
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use crate::schema::{apply, DbSchema};
+    use rusqlite::Connection;
+    use serde_json::json;
+
+    fn epixpost_schema() -> DbSchema {
+        DbSchema::from_json(
+            r#"{ "db_name":"T","db_file":"db.db","version":3,
+              "maps":{
+                ".+/data/users/.+/posts.json":{"to_table":[{"node":"post","table":"post"}],"file_name":"data.json","fold_crdt":"post"},
+                ".+/data/users/.+/data.json":{"to_json_table":["user_name"]}
+              },
+              "tables":{"post":{"cols":[["post_id","INTEGER"],["body","TEXT"],["json_id","INTEGER"]],
+                                "indexes":["CREATE UNIQUE INDEX post_key ON post(json_id,post_id)"],"schema_changed":1}} }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn crdt_fold_ingests_live_winners_under_the_sibling_json_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        let schema = epixpost_schema();
+        apply(&conn, &schema).unwrap();
+        let site = "epix1hub";
+        // The user's data.json (profile) creates its json row.
+        update_json(&conn, &schema, "epix1hub/data/users/u/data.json", &json!({"user_name":"alice"}), site).unwrap();
+        // posts.json: post 1 live, post 2 edited (v2 supersedes v1), post 3 tombstoned.
+        let posts = json!({ "record_format":"epix-orset-1", "post":[
+            {"post_id":1,"body":"one","clock":1,"supersedes":0,"deleted":false},
+            {"post_id":2,"body":"two-v1","clock":1,"supersedes":0,"deleted":false},
+            {"post_id":2,"body":"two-v2","clock":5,"supersedes":1,"deleted":false},
+            {"post_id":3,"body":"gone","clock":1,"supersedes":0,"deleted":false},
+            {"post_id":3,"body":"","clock":5,"supersedes":1,"deleted":true}
+        ]});
+        update_json(&conn, &schema, "epix1hub/data/users/u/posts.json", &posts, site).unwrap();
+
+        // Live winners only, joined to the data.json profile row.
+        let mut stmt = conn
+            .prepare("SELECT p.post_id, p.body, j.user_name FROM post p JOIN json j USING(json_id) ORDER BY p.post_id")
+            .unwrap();
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, "one".into(), "alice".into()), (2, "two-v2".into(), "alice".into())],
+            "post 3 tombstoned (absent), post 2 folded to the edit, both joined to alice"
+        );
     }
 }

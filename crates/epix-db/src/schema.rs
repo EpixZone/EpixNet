@@ -58,9 +58,17 @@ pub struct MapSettings {
     pub to_json_table: Vec<String>,
     /// `to_json_table` writes onto the json row of THIS sibling file instead
     /// of the matched file's own row (EpixNet: a user's content.json carries
-    /// cert_user_id, but queries join it from the data.json row).
+    /// cert_user_id, but queries join it from the data.json row). When set, a
+    /// merge-file map's `to_table` rows ALSO attach to the sibling's json row,
+    /// so a per-record posts.json joins the user's profile from data.json.
     #[serde(default)]
     pub file_name: Option<String>,
+    /// A signed-CRDT merge file (posts.json): before `to_table` ingest, fold
+    /// this node's versioned records to their live display winners (dropping
+    /// tombstones and superseded versions), so a deleted post never leaves a
+    /// live row and a concurrent edit resolves to one deterministic winner.
+    #[serde(default)]
+    pub fold_crdt: Option<String>,
 }
 
 /// A `to_table` entry: either a bare table/node name, or a spec.
