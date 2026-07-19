@@ -9,6 +9,7 @@ epix-core = { path = "../epix-core" }
 epix-crypt = { path = "../epix-crypt" }
 serde_json = "1"
 regex = "1"
+sha2 = "0.11"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
