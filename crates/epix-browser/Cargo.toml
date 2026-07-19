@@ -17,6 +17,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
+# Decode the persisted CA cert PEM back to DER (rcgen emits PEM but can't re-parse).
+base64 = "0.22"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
