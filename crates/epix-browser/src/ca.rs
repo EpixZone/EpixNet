@@ -136,11 +136,12 @@ mod tests {
     /// trust store - a race that produced SEC_ERROR_UNKNOWN_ISSUER.
     #[test]
     fn ca_cert_is_stable_across_loads() {
-        let dir = std::env::temp_dir().join(format!("epix-ca-stable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Securely-created unique temp dir (auto-removed on drop).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
 
-        let first = LocalCa::load_or_create(&dir).expect("first load");
-        let second = LocalCa::load_or_create(&dir).expect("second load reuses persisted cert");
+        let first = LocalCa::load_or_create(dir).expect("first load");
+        let second = LocalCa::load_or_create(dir).expect("second load reuses persisted cert");
 
         assert_eq!(first.cert_pem(), second.cert_pem(), "CA PEM changed across loads");
         assert_eq!(first.ca_cert_der, second.ca_cert_der, "CA DER changed across loads");
@@ -150,8 +151,6 @@ mod tests {
         // A freshly minted leaf still chains to the reused CA (issuer name + key).
         let leaf = second.leaf_for("dashboard.epix").expect("leaf mint");
         assert_eq!(leaf.cert.len(), 2, "leaf chain should be [leaf, ca]");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
