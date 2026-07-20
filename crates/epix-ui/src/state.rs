@@ -13495,6 +13495,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crdt_merge_file_end_to_end_create_edit_delete_and_blank_survives() {
+        // End-to-end through the REAL node path: write_file (union-merge) ->
+        // ingest_file_from (fold_crdt) -> db_query. Proves create/edit/delete
+        // and, critically, that a BLANK publish never wipes existing posts.
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let site = "1Site";
+        let storage = XiteStorage::new(dir.path().join(site));
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"T","db_file":"db.db","version":2,
+                  "maps":{
+                    "data/users/.+/posts.json":{"to_table":[{"node":"post","table":"post"}],"file_name":"data.json","fold_crdt":"post"},
+                    "data/users/.+/data.json":{"to_json_table":["name"]}
+                  },
+                  "tables":{"post":{"cols":[["post_id","INTEGER"],["body","TEXT"],["json_id","INTEGER"]],
+                                    "indexes":["CREATE UNIQUE INDEX post_key ON post(json_id,post_id)"],"schema_changed":1}} }"#,
+            )
+            .unwrap();
+        // A user dir whose content.json declares posts.json as a merge file.
+        storage
+            .write(
+                "data/users/u/content.json",
+                br#"{"files_merged":{"posts.json":{"class":"epix-orset-1"}}}"#,
+            )
+            .unwrap();
+        storage.write("data/users/u/data.json", br#"{"name":"alice"}"#).unwrap();
+        state
+            .add_xite(site, XiteEntry { storage: storage.clone(), content: Some(json!({ "address": site })) })
+            .await;
+        state.ingest_file_from(site, "data/users/u/data.json", None).await;
+
+        let path = "data/users/u/posts.json";
+        // The node treats posts.json as a declared merge file.
+        assert!(state.is_declared_merge_file(site, path).await, "posts.json is a merge file");
+
+        // Build a signed-ish record (the local write path union-merges without
+        // re-verifying; signatures are covered by verify_record's own tests).
+        let rec = |post_id: i64, clock: i64, supersedes: i64, deleted: bool, body: &str, sig: &str| {
+            json!({ "post_id": post_id, "nonce": "n", "clock": clock, "supersedes": supersedes,
+                    "deleted": deleted, "body": body, "date_added": 1, "author": "epix1x", "sign": sig })
+        };
+        let write = |state: &Arc<AppState>, records: Value| {
+            let state = state.clone();
+            async move {
+                let container = json!({ "record_format": "epix-orset-1", "post": records });
+                state.write_file(site, path, &serde_json::to_vec(&container).unwrap()).await.unwrap();
+                state.ingest_file_from(site, path, None).await;
+            }
+        };
+        let bodies = |state: &Arc<AppState>| {
+            let state = state.clone();
+            async move {
+                let mut b: Vec<String> = state
+                    .db_query(site, "SELECT p.body FROM post p JOIN json j USING(json_id)", &Value::Null)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r["body"].as_str().unwrap_or("").to_string())
+                    .collect();
+                b.sort();
+                b
+            }
+        };
+
+        // CREATE two posts.
+        write(&state, json!([rec(1, 100, 0, false, "hello", "s1")])).await;
+        write(&state, json!([rec(2, 101, 0, false, "world", "s2")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello", "world"]);
+
+        // BLANK publish (the exact data-loss trigger) - posts MUST survive.
+        write(&state, json!([])).await;
+        assert_eq!(bodies(&state).await, vec!["hello", "world"], "blank publish did not wipe posts");
+
+        // A PARTIAL publish that only carries post 1 - post 2 must survive too.
+        write(&state, json!([rec(1, 100, 0, false, "hello", "s1")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello", "world"], "partial publish kept the unseen post");
+
+        // EDIT post 1 (a new version supersedes the original).
+        write(&state, json!([rec(1, 200, 100, false, "hello-edited", "s3")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello-edited", "world"], "edit folded to one live row");
+
+        // DELETE post 2 via a signed tombstone (not a splice).
+        write(&state, json!([rec(2, 201, 101, true, "", "s4")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello-edited"], "tombstone hid the post");
+
+        // The rows still join to the profile row (user_name available).
+        let names = state
+            .db_query(site, "SELECT j.name FROM post p JOIN json j USING(json_id)", &Value::Null)
+            .await
+            .unwrap();
+        assert!(names.iter().all(|r| r["name"] == "alice"), "posts join the user's data.json profile row");
+    }
+
+    #[tokio::test]
     async fn identity_persists_across_restart() {
         let dir = tempdir().unwrap();
         let addr = "talk.epix";
