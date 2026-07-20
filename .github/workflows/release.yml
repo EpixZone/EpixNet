@@ -223,7 +223,14 @@ jobs:
       - name: Build Rust core into jniLibs
         run: |
           cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
-            build -p epix-ffi --release
+            build -p epix-ffi --release --features bridges
+
+      - name: Bundle the Snowflake bridge library into jniLibs
+        run: |
+          REV=$(cat crates/iptproxy-sys/iptproxy.rev)
+          curl -fL --retry 3 \
+            -o shells/android/app/src/main/jniLibs/arm64-v8a/libepix_snowflake.so \
+            "https://github.com/EpixZone/epix-iptproxy/releases/download/$REV/epix_snowflake-aarch64-linux-android.so"
 
       - name: Generate Kotlin UniFFI bindings
         run: |

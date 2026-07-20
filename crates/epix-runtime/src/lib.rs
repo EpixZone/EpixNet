@@ -1058,15 +1058,43 @@ async fn bootstrap_tor_with_watchdog(
     state: &AppState,
     data_dir: &std::path::Path,
     shutdown: &Notify,
-    opts: &epix_tor::BootstrapOpts,
-    attempt_timeout_secs: u64,
+    force_bridges: bool,
 ) -> Option<epix_tor::Tor> {
     const RETRY_BACKOFF_SECS: u64 = 30;
+    // Consecutive direct-bootstrap failures to tolerate before auto-falling back
+    // to a Snowflake bridge (the signature of a network that blocks Tor, like
+    // EpixNet#239). `tor_use_bridges` forces the bridge up front instead.
+    #[cfg(feature = "bridges")]
+    const DIRECT_FAILURES_BEFORE_BRIDGE: u32 = 2;
+
     // Surface a bootstrapping state so the browser's Tor icon can show progress.
     state.set_tor_status(false, "Bootstrapping").await;
+
+    #[allow(unused_mut)] // both are only reassigned under the `bridges` feature
+    let mut opts = epix_tor::BootstrapOpts::default();
+    #[allow(unused_mut)]
+    let mut attempt_timeout_secs = 150u64;
+    // Snowflake guard, held for the rest of the call once started (eagerly when
+    // forced, else lazily after repeated direct failures).
+    #[cfg(feature = "bridges")]
+    let mut snowflake: Option<epix_tor::bridges::Snowflake> = None;
+    #[cfg(feature = "bridges")]
+    let mut failures = 0u32;
+
+    #[cfg(feature = "bridges")]
+    if force_bridges {
+        if let Some((guard, o, t)) = start_snowflake_bridge(state, data_dir).await {
+            snowflake = Some(guard);
+            opts = o;
+            attempt_timeout_secs = t;
+        }
+    }
+    #[cfg(not(feature = "bridges"))]
+    let _ = force_bridges;
+
     loop {
         state.log("INFO", "Tor: bootstrapping in-process Arti client …".to_string()).await;
-        match bootstrap_tor_attempt(state, data_dir, shutdown, opts, attempt_timeout_secs).await {
+        match bootstrap_tor_attempt(state, data_dir, shutdown, &opts, attempt_timeout_secs).await {
             BootstrapAttempt::Ready(tor) => return Some(tor),
             BootstrapAttempt::Shutdown => {
                 state.set_tor_status(false, "Disabled").await;
@@ -1074,6 +1102,27 @@ async fn bootstrap_tor_with_watchdog(
             }
             BootstrapAttempt::Failed(reason) => state.log("ERROR", reason).await,
         }
+
+        // Auto-fallback: after repeated direct failures, bring Snowflake up and
+        // route later attempts through it. Once up it stays up for this call.
+        #[cfg(feature = "bridges")]
+        {
+            failures += 1;
+            if snowflake.is_none() && failures >= DIRECT_FAILURES_BEFORE_BRIDGE {
+                state
+                    .log(
+                        "INFO",
+                        "Tor: direct bootstrap keeps failing; trying a Snowflake bridge".to_string(),
+                    )
+                    .await;
+                if let Some((guard, o, t)) = start_snowflake_bridge(state, data_dir).await {
+                    snowflake = Some(guard);
+                    opts = o;
+                    attempt_timeout_secs = t;
+                }
+            }
+        }
+
         // Make the failure visible instead of a silent perpetual "Bootstrapping",
         // then wait before the next attempt (waking early on shutdown).
         state.set_tor_status(false, "Failed").await;
@@ -1086,6 +1135,30 @@ async fn bootstrap_tor_with_watchdog(
             }
         }
         state.set_tor_status(false, "Bootstrapping").await;
+    }
+}
+
+/// Start the in-process Snowflake bridge and build the bootstrap options that
+/// route arti through it: `(guard, opts, attempt_timeout_secs)`. `None` if
+/// Snowflake is unavailable (the caller then keeps trying direct).
+#[cfg(all(feature = "tor", feature = "bridges"))]
+async fn start_snowflake_bridge(
+    state: &AppState,
+    data_dir: &std::path::Path,
+) -> Option<(epix_tor::bridges::Snowflake, epix_tor::BootstrapOpts, u64)> {
+    match epix_tor::bridges::start_snowflake(data_dir).await {
+        Ok((guard, port)) => {
+            state.log("INFO", format!("Tor: Snowflake up, SOCKS on 127.0.0.1:{port}")).await;
+            let opts = epix_tor::BootstrapOpts {
+                bridge: Some((epix_tor::bridges::SNOWFLAKE_BRIDGE_LINE.to_string(), port)),
+            };
+            // WebRTC rendezvous is legitimately slow on a censored link.
+            Some((guard, opts, 300))
+        }
+        Err(e) => {
+            state.log("ERROR", format!("Tor: Snowflake unavailable ({e})")).await;
+            None
+        }
     }
 }
 
@@ -1146,62 +1219,12 @@ async fn tor_loop(
 ) {
     use epix_protocol::RequestHandler;
 
-    // Bridges (Snowflake) for censored networks: start the in-process transport
-    // once, hold its guard for the loop lifetime, and hand arti the bridge line
-    // + local SOCKS port so it dials through Snowflake instead of relays. If it
-    // is unavailable (e.g. IPtProxy not bundled in this build), fall back to a
-    // direct bootstrap. `_snowflake` must outlive every bootstrap attempt.
-    let opts;
-    let attempt_timeout_secs;
-    #[cfg(feature = "bridges")]
-    let _snowflake;
-    #[cfg(feature = "bridges")]
-    {
-        if tor_use_bridges {
-            match epix_tor::bridges::start_snowflake(&data_dir).await {
-                Ok((guard, port)) => {
-                    state
-                        .log("INFO", format!("Tor: Snowflake up, SOCKS on 127.0.0.1:{port}"))
-                        .await;
-                    _snowflake = Some(guard);
-                    opts = epix_tor::BootstrapOpts {
-                        bridge: Some((
-                            epix_tor::bridges::SNOWFLAKE_BRIDGE_LINE.to_string(),
-                            port,
-                        )),
-                    };
-                    // WebRTC rendezvous is legitimately slow on a censored link.
-                    attempt_timeout_secs = 300;
-                }
-                Err(e) => {
-                    state
-                        .log(
-                            "ERROR",
-                            format!("Tor: Snowflake unavailable ({e}); trying a direct bootstrap"),
-                        )
-                        .await;
-                    _snowflake = None;
-                    opts = epix_tor::BootstrapOpts::default();
-                    attempt_timeout_secs = 150;
-                }
-            }
-        } else {
-            _snowflake = None;
-            opts = epix_tor::BootstrapOpts::default();
-            attempt_timeout_secs = 150;
-        }
-    }
-    #[cfg(not(feature = "bridges"))]
-    {
-        let _ = tor_use_bridges;
-        opts = epix_tor::BootstrapOpts::default();
-        attempt_timeout_secs = 150;
-    }
-
-    // Bootstrap under a watchdog (heartbeat + timeout + retry). `None` means
-    // shutdown fired before Tor came up, so the loop stops.
+    // Bootstrap under a watchdog (heartbeat + timeout + retry). It starts a
+    // Snowflake bridge when `tor_use_bridges` forces it, or automatically after
+    // repeated direct failures (a censored network). `None` means shutdown fired
+    // before Tor came up, so the loop stops.
     let Some(tor) =
-        bootstrap_tor_with_watchdog(&state, &data_dir, &shutdown, &opts, attempt_timeout_secs).await
+        bootstrap_tor_with_watchdog(&state, &data_dir, &shutdown, tor_use_bridges).await
     else {
         return;
     };

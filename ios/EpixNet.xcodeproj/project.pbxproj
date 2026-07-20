@@ -239,6 +239,7 @@
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"-lepix_ffi",
+					"-lepix_snowflake",
 					"-liconv",
 					"-framework",
 					Security,
@@ -269,6 +270,7 @@
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
 					"-lepix_ffi",
+					"-lepix_snowflake",
 					"-liconv",
 					"-framework",
 					Security,

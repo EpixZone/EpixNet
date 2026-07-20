@@ -33,6 +33,11 @@ if [ "$PHASE" != "pack" ]; then
   cp "$BINDIR/epix-browser.exe" "$STAGE/epix-browser.exe"
   cp "$BINDIR/epix-nmh.exe" "$STAGE/epix-nmh.exe"
 
+  # In-process Snowflake bridge library (loaded at runtime beside the exe),
+  # fetched by iptproxy-sys's build.rs into the target dir. Best-effort: absent
+  # in a bridges-off build.
+  cp "$BINDIR"/epix_snowflake-*.dll "$STAGE/" 2>/dev/null || true
+
   # Bundle Firefox ESR (fetch-firefox-esr.sh win64 then extract, or a provided dir).
   FF="${EPIX_BUNDLE_FIREFOX:-$REPO_ROOT/packaging/firefox-esr/firefox}"
   if [ -d "$FF" ]; then
