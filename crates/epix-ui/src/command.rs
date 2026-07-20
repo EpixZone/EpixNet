@@ -531,6 +531,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AesDecrypt),
         Arc::new(EcdsaVerify),
         Arc::new(EcdsaSign),
+        Arc::new(RecordSign),
         // Chain: Vrf randomness + XidResolver.
         Arc::new(VrfGetBeacon),
         Arc::new(VrfLatestBeacon),
@@ -2150,6 +2151,27 @@ impl WsCommand for EcdsaSign {
             }
         };
         Ok(Value::from(epix_crypt::sign(data, &privatekey)?))
+    }
+}
+
+/// `recordSign(record)` - sign one merge-file post record (a `posts.json`
+/// entry) with the current user's CERT-AWARE auth key, over the canonical
+/// record payload. Returns the record with `sign` embedded. Canonicalization
+/// happens only here (server side), so there is no JS/Rust byte-parity risk.
+struct RecordSign;
+#[async_trait]
+impl WsCommand for RecordSign {
+    fn name(&self) -> &'static str {
+        "recordSign"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let record = p
+            .get("record")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .cloned()
+            .ok_or("recordSign: record required")?;
+        let address = s.address()?.to_string();
+        s.state.sign_record(&address, record).await
     }
 }
 

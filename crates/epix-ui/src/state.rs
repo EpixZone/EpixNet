@@ -7861,6 +7861,25 @@ impl AppState {
             .get(address)
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
+        // A declared merge file (posts.json) is a signed CRDT: UNION the write
+        // with what is already on disk instead of replacing it, so a blank or
+        // partial write from a stale page view can never wipe the on-disk set.
+        // Local writes are trusted (the client just signed the records); inbound
+        // peer updates verify each record on their own path. No `-old` snapshot:
+        // the publish diff reads only `files`, and a merge file is not one.
+        if self.is_declared_merge_file(address, inner_path).await {
+            let incoming: Value = serde_json::from_slice(bytes)
+                .map_err(|e| format!("merge file not JSON: {e}"))?;
+            let existing = storage
+                .read(inner_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .unwrap_or_else(|| epix_content::make_container(vec![]));
+            let merged = epix_content::merge_local(&existing, &incoming);
+            let out = serde_json::to_vec(&merged).map_err(|e| e.to_string())?;
+            storage.write(inner_path, &out).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         // Keep the previous version as `<file>-old` (EpixNet's actionFileWrite):
         // the next publish diffs old vs new so peers patch their copies instead
         // of fetching the file back - which they often can't, when the
@@ -7984,6 +8003,163 @@ impl AppState {
     /// `getFileInfo()["content_inner_path"]`). EpixTalk publishes with the
     /// data file's path (`data/users/<xid>/data.json`), so this picks the
     /// user's own content.json to sign.
+    /// Whether `inner_path` is declared a merge file (`files_merged`) by its
+    /// governing content.json (the sibling/user content.json, or the root).
+    /// Merge files are the signed-CRDT class: verified per-record, union-merged,
+    /// never hash-synced.
+    pub async fn is_declared_merge_file(&self, address: &str, inner_path: &str) -> bool {
+        if inner_path.ends_with("content.json") {
+            return false;
+        }
+        let governing = self.content_inner_path(address, inner_path).await;
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return false;
+        };
+        let Ok(bytes) = storage.read(&governing) else {
+            return false;
+        };
+        let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        let dir = governing.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+        let rel = if dir.is_empty() {
+            inner_path
+        } else {
+            inner_path.strip_prefix(&format!("{dir}/")).unwrap_or(inner_path)
+        };
+        epix_content::declared_merge_files(&content).iter().any(|p| p == rel)
+    }
+
+    /// Fetch a declared merge file from `sender` (falling back to known
+    /// connectable peers) and merge it into the local copy: verify every record
+    /// against `signers`, union with what is on disk (grow-only), write, and
+    /// re-ingest. Idempotent and absence-is-not-deletion, so it is always safe
+    /// to run on any content.json bump - no diffing needed. Merge files are not
+    /// in `files`, so the normal file-sync loop never fetches them; this is how
+    /// posts propagate.
+    pub async fn fetch_and_merge_records(
+        &self,
+        address: &str,
+        inner_path: &str,
+        signers: &[String],
+        sender: Option<&PeerAddr>,
+        sender_peers: &[PeerAddr],
+    ) {
+        let Some(transport) = self.transport.read().await.clone() else {
+            return;
+        };
+        // Peers key files by the signed (canonical) address even when we serve
+        // under a `.epix` alias; storage is keyed by the served address.
+        let (storage, canonical) = {
+            let x = self.xites.read().await;
+            let Some(e) = x.get(address) else {
+                return;
+            };
+            (e.storage.clone(), canonical_address(e.content.as_ref(), address))
+        };
+        // Try the sender first (it just announced this), then its self-declared
+        // addresses. Callers that want a broader sweep (the resync anti-entropy
+        // net) pass connectable peers in `sender_peers`.
+        let mut peers: Vec<PeerAddr> = Vec::new();
+        if let Some(s) = sender {
+            peers.push(s.clone());
+        }
+        for sp in sender_peers.iter() {
+            if !peers.contains(sp) {
+                peers.push(sp.clone());
+            }
+        }
+        let mut fetched: Option<Vec<u8>> = None;
+        for p in &peers {
+            let got = tokio::time::timeout(p.connect_timeout(), async {
+                let mut conn = Connection::connect(transport.as_ref(), p).await.ok()?;
+                conn.handshake().await.ok()?;
+                conn.get_file(&canonical, inner_path).await.ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            if got.is_some() {
+                fetched = got;
+                break;
+            }
+        }
+        let Some(bytes) = fetched else {
+            return;
+        };
+        let Ok(incoming) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        let existing = storage
+            .read(inner_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or_else(|| epix_content::make_container(vec![]));
+        let merged = epix_content::merge_orset(&existing, &incoming, signers, epix_core::now_ms());
+        if let Ok(out) = serde_json::to_vec(&merged) {
+            if storage.write(inner_path, &out).is_ok() {
+                self.ingest_file_from(address, inner_path, None).await;
+            }
+        }
+    }
+
+    /// Anti-entropy for merge files: for every served xite, re-fetch + merge
+    /// each declared merge file from connectable peers. Heals a node that missed
+    /// a live content-bump push (offline, or a strip-relay that dropped
+    /// records) - the bump path only merges what a node actually witnesses.
+    /// Idempotent (union + absence-is-not-deletion), so it is safe every tick.
+    pub async fn resync_merge_files(self: &Arc<Self>) {
+        let addrs: Vec<String> = self.xites.read().await.keys().cloned().collect();
+        for address in addrs {
+            if !self.is_serving(&address).await {
+                continue;
+            }
+            let peers = self.connectable_peers(&address, 8).await;
+            if peers.is_empty() {
+                continue;
+            }
+            let Some(storage) = self.xites.read().await.get(&address).map(|x| x.storage.clone())
+            else {
+                continue;
+            };
+            let Ok(view) = self.xite_view(&address).await else {
+                continue;
+            };
+            for content_path in walk_content_json(storage.root()) {
+                self.resync_merge_dir(&address, &content_path, &storage, &view, &peers).await;
+            }
+        }
+    }
+
+    /// Anti-entropy for the merge files declared by ONE content.json unit:
+    /// re-fetch + merge each from `peers`. Broken out of [`resync_merge_files`].
+    async fn resync_merge_dir(
+        &self,
+        address: &str,
+        content_path: &str,
+        storage: &XiteStorage,
+        view: &Xite,
+        peers: &[PeerAddr],
+    ) {
+        let Ok(bytes) = storage.read(content_path) else {
+            return;
+        };
+        let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        let merge_paths = epix_content::declared_merge_files(&content);
+        if merge_paths.is_empty() {
+            return;
+        }
+        let dir = content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+        let xid_map = Self::resolve_xid_map(storage, content_path).await;
+        let signers = view.valid_signers_for(content_path, &xid_map);
+        for rel in merge_paths {
+            let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+            self.fetch_and_merge_records(address, &mpath, &signers, None, peers).await;
+        }
+    }
+
     pub async fn content_inner_path(&self, address: &str, inner_path: &str) -> String {
         if inner_path == "content.json" || inner_path.ends_with("/content.json") {
             return inner_path.to_string();
@@ -8021,6 +8197,81 @@ impl AppState {
     /// sign with the cert identity's key (or the xite's derived auth key, or
     /// an explicit `privatekey`), verify against the parent's rules, store,
     /// and ingest into the xite's database so the change shows immediately.
+    /// Sign one post record with the user's CERT-AWARE auth key for `address`
+    /// (the same key [`sign_user_content`](Self::sign_user_content) uses, NOT
+    /// the raw site key `user_auth_privatekey` returns), over the canonical
+    /// record payload (`record` minus `sign`). Returns the record with `sign`
+    /// embedded. Backs the `recordSign` WS command so record canonicalization
+    /// only ever runs in Rust - no JS/Rust byte-parity surface for signing.
+    pub async fn sign_record(&self, address: &str, mut record: Value) -> Result<Value, String> {
+        if !record.is_object() {
+            return Err("record must be a JSON object".into());
+        }
+        let key = {
+            let mut user = self.user.write().await;
+            user.auth_privatekey(address)?
+        };
+        self.save_user().await; // auth_privatekey may have derived the site entry
+        // The node sets `author` authoritatively to the address this key
+        // recovers to, so a client can never claim another author. On creation
+        // (no post_id yet) it derives the immutable CRDT key; edit/delete keep
+        // the post_id the client carried over.
+        let author = epix_crypt::privatekey_to_address(&key).map_err(|e| e.to_string())?;
+        {
+            let obj = record.as_object_mut().unwrap();
+            obj.insert("author".into(), Value::String(author.clone()));
+            if !obj.contains_key("post_id") {
+                // A `key` field (a wiki slug, a vote target, ...) yields a
+                // STABLE per-(author,key) id, so edits/re-votes supersede. Else
+                // derive a unique id from the random nonce + creation time.
+                let pid = if let Some(key) = obj.get("key").and_then(|v| v.as_str()) {
+                    epix_content::derive_post_id_keyed(&author, key)
+                } else {
+                    let nonce = obj
+                        .get("nonce")
+                        .and_then(|v| v.as_str())
+                        .ok_or("record needs a nonce or a key")?
+                        .to_string();
+                    let date_added = obj
+                        .get("date_added")
+                        .and_then(|v| v.as_i64())
+                        .ok_or("record needs a date_added")?;
+                    epix_content::derive_post_id(&author, &nonce, date_added)
+                };
+                obj.insert("post_id".into(), Value::from(pid));
+            }
+        }
+        let payload = epix_content::record_signed_data(&record);
+        let sig = epix_crypt::sign(&payload, &key).map_err(|e| e.to_string())?;
+        record.as_object_mut().unwrap().insert("sign".into(), Value::String(sig));
+        Ok(record)
+    }
+
+    /// The `files_merged` declaration to add when signing a user content.json:
+    /// for each merge file the owner include allows (its `merge_files` rule)
+    /// that exists on disk in the directory, an entry `{name: {class}}`. `None`
+    /// when there is nothing to declare - so the client never hand-manages it.
+    async fn merge_files_extend(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        storage: &XiteStorage,
+    ) -> Option<Value> {
+        let rules = self.user_content_rules(address, content_inner_path).await?;
+        let allowed = rules.get("merge_files").and_then(|v| v.as_object())?;
+        let dir =
+            content_inner_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+        let mut merged = serde_json::Map::new();
+        for (name, spec) in allowed {
+            let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+            if storage.exists(&path) {
+                let class = spec.get("class").cloned().unwrap_or_else(|| json!("epix-orset-1"));
+                merged.insert(name.clone(), json!({ "class": class }));
+            }
+        }
+        (!merged.is_empty()).then(|| Value::Object(merged))
+    }
+
     pub async fn sign_user_content(
         &self,
         address: &str,
@@ -8037,7 +8288,7 @@ impl AppState {
             .ok_or("unknown xite")?;
 
         // The cert fields to extend the content.json with, and the signing key.
-        let (extend, key) = {
+        let (mut extend, key) = {
             let mut user = self.user.write().await;
             let mut extend = serde_json::Map::new();
             if privatekey.is_none() {
@@ -8068,6 +8319,12 @@ impl AppState {
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
         let modified = (now_secs() as f64).max(prev + 1.0);
+
+        // Auto-declare merge files (posts.json etc.): the client just writes
+        // records; the declaration is derived from the owner's merge_files rule.
+        if let Some(fm) = self.merge_files_extend(address, content_inner_path, &storage).await {
+            extend.insert("files_merged".into(), fm);
+        }
 
         let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
         let xite = Xite::new(addr, storage);
@@ -8533,6 +8790,34 @@ impl AppState {
                     // Fold the child's modified clock into settings and its
                     // db columns (cert_user_id) into the site db.
                     self.ingest_file_from(&key, inner_path, None).await;
+                    // A user content.json declaring merge files (posts.json):
+                    // fetch + merge each from the sender. They are not in
+                    // `files`, so the normal file loop never fetches them - this
+                    // is how posts propagate on a content bump. Grow-only union
+                    // means an always-fetch-and-merge is safe (idempotent).
+                    let merge_paths = epix_content::declared_merge_files(&new);
+                    if !merge_paths.is_empty() {
+                        let dir = inner_path
+                            .strip_suffix("content.json")
+                            .unwrap_or("")
+                            .trim_end_matches('/');
+                        let signers = xite.valid_signers_for(inner_path, &xid_map);
+                        for rel in merge_paths {
+                            let mpath = if dir.is_empty() {
+                                rel.clone()
+                            } else {
+                                format!("{dir}/{rel}")
+                            };
+                            self.fetch_and_merge_records(
+                                &key,
+                                &mpath,
+                                &signers,
+                                sender.as_ref(),
+                                &sender_peers,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 Err(e) => {
                     self.updates_in_flight.lock().unwrap().remove(&uri);
@@ -13255,6 +13540,102 @@ mod tests {
             state.db_query(merger, "SELECT title FROM post", &Value::Null).await.unwrap();
         assert_eq!(rows.len(), 1, "merger db refilled after its own content update");
         assert_eq!(rows[0]["title"], "hello");
+    }
+
+    #[tokio::test]
+    async fn crdt_merge_file_end_to_end_create_edit_delete_and_blank_survives() {
+        // End-to-end through the REAL node path: write_file (union-merge) ->
+        // ingest_file_from (fold_crdt) -> db_query. Proves create/edit/delete
+        // and, critically, that a BLANK publish never wipes existing posts.
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let site = "1Site";
+        let storage = XiteStorage::new(dir.path().join(site));
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"T","db_file":"db.db","version":2,
+                  "maps":{
+                    "data/users/.+/posts.json":{"to_table":[{"node":"post","table":"post"}],"file_name":"data.json","fold_crdt":"post"},
+                    "data/users/.+/data.json":{"to_json_table":["name"]}
+                  },
+                  "tables":{"post":{"cols":[["post_id","INTEGER"],["body","TEXT"],["json_id","INTEGER"]],
+                                    "indexes":["CREATE UNIQUE INDEX post_key ON post(json_id,post_id)"],"schema_changed":1}} }"#,
+            )
+            .unwrap();
+        // A user dir whose content.json declares posts.json as a merge file.
+        storage
+            .write(
+                "data/users/u/content.json",
+                br#"{"files_merged":{"posts.json":{"class":"epix-orset-1"}}}"#,
+            )
+            .unwrap();
+        storage.write("data/users/u/data.json", br#"{"name":"alice"}"#).unwrap();
+        state
+            .add_xite(site, XiteEntry { storage: storage.clone(), content: Some(json!({ "address": site })) })
+            .await;
+        state.ingest_file_from(site, "data/users/u/data.json", None).await;
+
+        let path = "data/users/u/posts.json";
+        // The node treats posts.json as a declared merge file.
+        assert!(state.is_declared_merge_file(site, path).await, "posts.json is a merge file");
+
+        // Build a signed-ish record (the local write path union-merges without
+        // re-verifying; signatures are covered by verify_record's own tests).
+        let rec = |post_id: i64, clock: i64, supersedes: i64, deleted: bool, body: &str, sig: &str| {
+            json!({ "post_id": post_id, "nonce": "n", "clock": clock, "supersedes": supersedes,
+                    "deleted": deleted, "body": body, "date_added": 1, "author": "epix1x", "sign": sig })
+        };
+        let write = |state: &Arc<AppState>, records: Value| {
+            let state = state.clone();
+            async move {
+                let container = json!({ "record_format": "epix-orset-1", "post": records });
+                state.write_file(site, path, &serde_json::to_vec(&container).unwrap()).await.unwrap();
+                state.ingest_file_from(site, path, None).await;
+            }
+        };
+        let bodies = |state: &Arc<AppState>| {
+            let state = state.clone();
+            async move {
+                let mut b: Vec<String> = state
+                    .db_query(site, "SELECT p.body FROM post p JOIN json j USING(json_id)", &Value::Null)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r["body"].as_str().unwrap_or("").to_string())
+                    .collect();
+                b.sort();
+                b
+            }
+        };
+
+        // CREATE two posts.
+        write(&state, json!([rec(1, 100, 0, false, "hello", "s1")])).await;
+        write(&state, json!([rec(2, 101, 0, false, "world", "s2")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello", "world"]);
+
+        // BLANK publish (the exact data-loss trigger) - posts MUST survive.
+        write(&state, json!([])).await;
+        assert_eq!(bodies(&state).await, vec!["hello", "world"], "blank publish did not wipe posts");
+
+        // A PARTIAL publish that only carries post 1 - post 2 must survive too.
+        write(&state, json!([rec(1, 100, 0, false, "hello", "s1")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello", "world"], "partial publish kept the unseen post");
+
+        // EDIT post 1 (a new version supersedes the original).
+        write(&state, json!([rec(1, 200, 100, false, "hello-edited", "s3")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello-edited", "world"], "edit folded to one live row");
+
+        // DELETE post 2 via a signed tombstone (not a splice).
+        write(&state, json!([rec(2, 201, 101, true, "", "s4")])).await;
+        assert_eq!(bodies(&state).await, vec!["hello-edited"], "tombstone hid the post");
+
+        // The rows still join to the profile row (user_name available).
+        let names = state
+            .db_query(site, "SELECT j.name FROM post p JOIN json j USING(json_id)", &Value::Null)
+            .await
+            .unwrap();
+        assert!(names.iter().all(|r| r["name"] == "alice"), "posts join the user's data.json profile row");
     }
 
     #[tokio::test]

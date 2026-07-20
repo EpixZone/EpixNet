@@ -386,12 +386,25 @@ fn verify_content_rules(
         }
     }
     // Valid relative filenames.
-    for node in ["files", "files_optional"] {
+    for node in ["files", "files_optional", "files_merged"] {
         if let Some(files) = content.get(node).and_then(|v| v.as_object()) {
             for path in files.keys() {
                 if !is_valid_relative_path(path) {
                     return err(format!("Invalid relative path: {path}"));
                 }
+            }
+        }
+    }
+    // A merge file (`files_merged`, verified per-record, no whole-file hash) may
+    // NEVER also appear as a hashed file - that would re-arm the last-writer-
+    // wins overwrite this class exists to prevent. Universal invariant.
+    if let Some(merged) = content.get("files_merged").and_then(|v| v.as_object()) {
+        for path in merged.keys() {
+            let hashed = ["files", "files_optional"].iter().any(|n| {
+                content.get(n).and_then(|v| v.as_object()).is_some_and(|m| m.contains_key(path))
+            });
+            if hashed {
+                return err(format!("Merge file also declared as a hashed file: {path}"));
             }
         }
     }
@@ -436,6 +449,18 @@ fn verify_content_rules(
         for path in content.get("files_optional").and_then(|v| v.as_object()).into_iter().flat_map(|m| m.keys()) {
             if !regex_full_match(pat, path) {
                 return err(format!("Optional file not allowed: {path}"));
+            }
+        }
+    }
+    // A merge file must be allow-listed by the owner's include (`merge_files`),
+    // so a user cannot turn an arbitrary file into an unhashed merge file. The
+    // owner-signed include is the root of trust; a user-signed `files_merged`
+    // entry with no matching owner `merge_files` key is rejected.
+    if let Some(merged) = content.get("files_merged").and_then(|v| v.as_object()) {
+        let allowed = rules.get("merge_files").and_then(|v| v.as_object());
+        for path in merged.keys() {
+            if !allowed.is_some_and(|a| a.contains_key(path)) {
+                return err(format!("Merge file not allowed: {path}"));
             }
         }
     }
@@ -782,6 +807,55 @@ mod tests {
         let ctx = Ctx { address: "epix1site".to_string(), loaded, limit: i64::MAX };
         let (c, b) = make(&user_pk);
         assert!(verify_content_file(&inner, &c, b.len() as i64, &ctx).is_err());
+    }
+
+    #[test]
+    fn merge_file_declaration_rules() {
+        let user_pk = epix_crypt::new_seed();
+        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let inner = format!("data/users/{user}/content.json");
+
+        // Owner include allows `posts.json` as a merge file.
+        let parent = json!({
+            "inner_path": "data/users/content.json",
+            "user_contents": {
+                "cert_signers": {}, "permissions": {},
+                "permission_rules": {
+                    ".*": { "merge_files": { "posts.json": { "class": "epix-orset-1", "max_size": 3000000 } } },
+                },
+            }
+        });
+        let mut loaded = std::collections::HashMap::new();
+        loaded.insert("data/users/content.json".to_string(), parent);
+        let ctx = Ctx { address: "epix1site".to_string(), loaded, limit: i64::MAX };
+        let make = |files_merged: Value, extra_files: Value| {
+            sign_content(
+                json!({
+                    "address": "epix1site", "inner_path": inner, "modified": 2,
+                    "files": extra_files,
+                    "files_merged": files_merged,
+                }),
+                &user_pk,
+            )
+        };
+
+        // Declaring the allowed merge file (no sha512) verifies.
+        let (c, b) = make(json!({ "posts.json": { "class": "epix-orset-1" } }), json!({}));
+        assert!(verify_content_file(&inner, &c, b.len() as i64, &ctx).is_ok());
+
+        // A merge file the owner did not allow is rejected.
+        let (c, b) = make(json!({ "secret.json": { "class": "epix-orset-1" } }), json!({}));
+        let e = verify_content_file(&inner, &c, b.len() as i64, &ctx).unwrap_err();
+        assert!(format!("{e:?}").contains("Merge file not allowed"), "{e:?}");
+
+        // Declaring the same path as BOTH a merge file and a hashed file is
+        // rejected (would re-arm last-writer-wins).
+        let (c, b) = make(
+            json!({ "posts.json": { "class": "epix-orset-1" } }),
+            json!({ "posts.json": { "size": 2, "sha512": "ab" } }),
+        );
+        let e = verify_content_file(&inner, &c, b.len() as i64, &ctx).unwrap_err();
+        assert!(format!("{e:?}").contains("also declared as a hashed file"), "{e:?}");
     }
 
     #[test]

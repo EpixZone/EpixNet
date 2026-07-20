@@ -8,11 +8,13 @@ pub mod address;
 pub mod emitter;
 pub mod error;
 pub mod peer;
+pub mod time;
 
 pub use address::Address;
 pub use emitter::{CollectingEmitter, Emitter, NoopEmitter};
 pub use error::{Error, Result};
 pub use peer::{IpType, PeerAddr};
+pub use time::{now_ms, now_secs};
 
 /// The default bootstrap announcers: Epix-protocol trackers (`host:port`) and
 /// public BitTorrent trackers (announce URLs - rendezvous by `sha1(address)`

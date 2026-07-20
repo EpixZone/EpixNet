@@ -78,6 +78,7 @@ fn unit_file_class(
     rel: &str,
     nested_dirs: &[String],
     declared_optional: &serde_json::Map<String, Value>,
+    declared_merged: &serde_json::Map<String, Value>,
     ignore: &Option<fancy_regex::Regex>,
     optional: &Option<fancy_regex::Regex>,
 ) -> Option<bool> {
@@ -85,6 +86,11 @@ fn unit_file_class(
         return None;
     }
     if skip_hashing(rel) || pattern_matches(ignore, rel) {
+        return None;
+    }
+    // A declared merge file (posts.json) is verified per-record, NEVER hashed
+    // into `files`/`files_optional` - hashing it would re-arm last-writer-wins.
+    if declared_merged.contains_key(rel) {
         return None;
     }
     if nested_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
@@ -95,6 +101,29 @@ fn unit_file_class(
         return None;
     }
     Some(is_optional)
+}
+
+/// Apply a `sign` `extend` map onto a content.json object: every key is added
+/// only when missing (cert fields), EXCEPT `files_merged`, which is UNIONED -
+/// an app that declares a SECOND merge file later must get it added, not
+/// skipped (a skipped declaration would be signed as a hashed last-writer-wins
+/// file, the exact bug the merge class prevents).
+fn apply_extend(map: &mut serde_json::Map<String, Value>, extend: &serde_json::Map<String, Value>) {
+    for (key, val) in extend {
+        if key == "files_merged" {
+            let dst =
+                map.entry("files_merged").or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let (Some(dst), Some(src)) = (dst.as_object_mut(), val.as_object()) {
+                for (k, v) in src {
+                    dst.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            continue;
+        }
+        if map.get(key).map(|v| v.is_null()).unwrap_or(true) {
+            map.insert(key.clone(), val.clone());
+        }
+    }
 }
 
 /// One entry from content.json `files`.
@@ -492,6 +521,30 @@ impl Xite {
             .collect()
     }
 
+    /// The authorized signer set for the content.json unit at
+    /// `content_inner_path` (root or a user content.json), resolving xID-name
+    /// signers via `xid_map`. Used by the merge path to decide which addresses
+    /// may author records in a directory. Empty if the content.json is absent
+    /// or unparseable.
+    pub fn valid_signers_for(
+        &self,
+        content_inner_path: &str,
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        let Ok(bytes) = self.storage.read(content_inner_path) else {
+            return Vec::new();
+        };
+        let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
+            return Vec::new();
+        };
+        let ctx = ChildCtx {
+            address: self.address.as_str().to_string(),
+            storage: &self.storage,
+            xid_map,
+        };
+        epix_content::verify::valid_signers(content_inner_path, &content, &ctx)
+    }
+
     /// Build the `files` and `files_optional` maps for the content.json unit
     /// rooted at `dir` (empty for the root): hash every file under `dir`,
     /// keyed by path relative to `dir`. Skips the unit's own content.json and
@@ -506,6 +559,7 @@ impl Xite {
         &self,
         dir: &str,
         declared_optional: &serde_json::Map<String, Value>,
+        declared_merged: &serde_json::Map<String, Value>,
         ignore: &Option<fancy_regex::Regex>,
         optional: &Option<fancy_regex::Regex>,
     ) -> Result<(serde_json::Map<String, Value>, serde_json::Map<String, Value>)> {
@@ -524,9 +578,14 @@ impl Xite {
             let Some(rel) = inner.strip_prefix(prefix.as_str()).map(str::to_string) else {
                 continue;
             };
-            let Some(is_optional) =
-                unit_file_class(&rel, &nested_dirs, declared_optional, ignore, optional)
-            else {
+            let Some(is_optional) = unit_file_class(
+                &rel,
+                &nested_dirs,
+                declared_optional,
+                declared_merged,
+                ignore,
+                optional,
+            ) else {
                 continue;
             };
             let bytes = self.storage.read(&inner)?;
@@ -586,10 +645,18 @@ impl Xite {
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
+        // Declared merge files (posts.json) are re-emitted untouched (`sign`
+        // only overwrites `files`/`files_optional`) and skipped by the hasher.
+        let declared_merged: serde_json::Map<String, Value> = content
+            .get("files_merged")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
 
         let ignore = path_pattern(content.get("ignore"));
         let optional = path_pattern(content.get("optional"));
-        let (files, files_optional) = self.hash_unit_files("", &declared_optional, &ignore, &optional)?;
+        let (files, files_optional) =
+            self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional)?;
 
         let map = content.as_object_mut().ok_or_else(|| {
             Error::Protocol("content.json is not a JSON object".into())
@@ -648,12 +715,7 @@ impl Xite {
         let map = content
             .as_object_mut()
             .ok_or_else(|| Error::Protocol("content.json is not a JSON object".into()))?;
-        for (key, val) in extend {
-            let missing = map.get(key).map(|v| v.is_null()).unwrap_or(true);
-            if missing {
-                map.insert(key.clone(), val.clone());
-            }
-        }
+        apply_extend(map, extend);
 
         // EpixNet's sign-time auto-prune: the parent's rules may cap arrays in
         // this directory's data.json files (`max_items`, with age/min
@@ -682,10 +744,17 @@ impl Xite {
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
+        // Declared merge files (a user's posts.json) are re-emitted untouched
+        // and never hashed - integrity is per-record, not whole-file.
+        let declared_merged: serde_json::Map<String, Value> = map
+            .get("files_merged")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         let ignore = path_pattern(map.get("ignore"));
         let optional = path_pattern(map.get("optional"));
         let (files, files_optional) =
-            self.hash_unit_files(dir, &declared_optional, &ignore, &optional)?;
+            self.hash_unit_files(dir, &declared_optional, &declared_merged, &ignore, &optional)?;
         map.insert("files".into(), Value::Object(files));
         Self::merge_files_optional(map, files_optional, declared_optional);
         if modified.fract() == 0.0 {

@@ -935,6 +935,9 @@ async fn resync_loop(
                 // held uncommitted (the previous version keeps serving);
                 // re-fetch their missing files and commit the completed ones.
                 state.retry_pending_updates().await;
+                // Anti-entropy for merge files (posts.json): re-pull + merge
+                // from peers so a node that missed a live push still converges.
+                state.resync_merge_files().await;
                 // OptionalManager: keep optional files under the size cap.
                 let freed = state.enforce_optional_limit().await;
                 if freed > 0 {
