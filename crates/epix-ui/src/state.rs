@@ -6860,6 +6860,15 @@ impl AppState {
         };
         let fileserver_port = self.fileserver_port().await;
         let (tor_enabled, tor_status) = self.tor_status().await;
+        // Whether the BitTorrent swarm (mainline DHT peer discovery + peer wire)
+        // can run. It needs UDP, which Tor can't carry, so it is off in
+        // Tor-always mode. A xite uses this to explain to the reader that a
+        // trackerless magnet needs Tor set to enable/disable, rather than
+        // showing a bare "couldn't stream".
+        #[cfg(feature = "bittorrent")]
+        let bt_swarm = epix_bt::http::swarm_allowed();
+        #[cfg(not(feature = "bittorrent"))]
+        let bt_swarm = false;
         // The dashboard reads `fileserver_ip == "127.0.0.1"` as "route all via
         // Tor" (the fileserver is loopback-only). Only report that in Tor-always
         // mode; otherwise "*" (all interfaces), matching EpixNet's default - so
@@ -6889,6 +6898,10 @@ impl AppState {
             // (desktop + Android); the iOS build reports false, so a xite's
             // magnet player falls back to HTTPS web-seed streaming there.
             "bittorrent": cfg!(feature = "bittorrent"),
+            // Whether the DHT/peer-wire swarm can run (false in Tor-always mode,
+            // where a trackerless magnet can't be discovered). Only meaningful
+            // when `bittorrent` is true.
+            "bt_swarm": bt_swarm,
             "epix_browser": epix_browser,
             "browser_tor_clearnet": browser_tor_clearnet,
             // Read-only gateway mode: the dashboard hides node-lifecycle

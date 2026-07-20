@@ -14,10 +14,16 @@ percent-encoding = "2"
 # routed through the node's Tor SOCKS proxy (socks5h://127.0.0.1:<port>) - the
 # same pattern epix-chain uses, so a fetch never leaks the node's real IP.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "stream"] }
-tokio = { version = "1", features = ["rt", "sync", "io-util", "macros", "time"] }
+# `net` adds UdpSocket (mainline DHT, BEP5) + TcpStream (peer wire, BEP3) and the
+# async DNS resolver used to bootstrap the DHT. Peer-wire/DHT only run on
+# clearnet (Tor carries no UDP), so this is the swarm's transport.
+tokio = { version = "1", features = ["rt", "sync", "io-util", "net", "macros", "time"] }
 bytes = "1"
+# Random 20-byte DHT node id / peer id / KRPC transaction ids. `rand 0.8` is
+# already in the workspace lock, so this pulls in nothing new.
+rand = "0.8"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 # Securely-named unique temp dirs for tests (auto-cleaned on drop).
 tempfile = "3"

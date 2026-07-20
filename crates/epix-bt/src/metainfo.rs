@@ -107,6 +107,19 @@ impl MetaInfo {
         }
     }
 
+    /// Parse metainfo from a raw **info dict** (BEP9 `ut_metadata`): peers send
+    /// only the info dictionary, not a whole `.torrent`. We wrap it back into a
+    /// one-key torrent (`d4:info<info bytes>e`) and reuse [`parse`], so the same
+    /// info-hash-over-the-original-bytes check applies - a lying peer whose info
+    /// dict hashes to a different value than the magnet's `xt` is rejected.
+    pub fn from_info_dict(info: &[u8], expected: [u8; 20]) -> Result<MetaInfo, MetaError> {
+        let mut torrent = Vec::with_capacity(info.len() + 8);
+        torrent.extend_from_slice(b"d4:info");
+        torrent.extend_from_slice(info);
+        torrent.push(b'e');
+        MetaInfo::parse(&torrent, Some(expected))
+    }
+
     /// Parse metainfo from `.torrent` bytes, checking the recomputed info-hash
     /// against `expected` (the magnet's `xt`) when provided.
     pub fn parse(bytes: &[u8], expected: Option<[u8; 20]>) -> Result<MetaInfo, MetaError> {
@@ -283,6 +296,29 @@ mod tests {
     fn rejects_wrong_expected_hash() {
         let (bytes, _) = build_torrent();
         let err = MetaInfo::parse(&bytes, Some([0u8; 20])).unwrap_err();
+        assert!(matches!(err, MetaError::HashMismatch));
+    }
+
+    #[test]
+    fn from_info_dict_wraps_and_verifies() {
+        // The bare info dict (what a BEP9 peer sends) parses to the same metainfo
+        // as the full torrent, and its recomputed hash is checked against `xt`.
+        let info = d(vec![
+            ("length", Value::Int(6)),
+            ("name", Value::Bytes(b"movie.mp4".to_vec())),
+            ("piece length", Value::Int(4)),
+            ("pieces", Value::Bytes(vec![0u8; 40])),
+        ]);
+        let info_bytes = encode(&info);
+        let hash: [u8; 20] = Sha1::digest(&info_bytes).into();
+
+        let mi = MetaInfo::from_info_dict(&info_bytes, hash).unwrap();
+        assert_eq!(mi.info_hash, hash);
+        assert_eq!(mi.name, "movie.mp4");
+        assert_eq!(mi.total_length, 6);
+
+        // A peer feeding an info dict that doesn't match the magnet's xt is caught.
+        let err = MetaInfo::from_info_dict(&info_bytes, [0u8; 20]).unwrap_err();
         assert!(matches!(err, MetaError::HashMismatch));
     }
 

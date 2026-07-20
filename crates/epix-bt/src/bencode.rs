@@ -82,6 +82,16 @@ pub fn decode(input: &[u8]) -> Result<Value> {
     Ok(v)
 }
 
+/// Decode a single value from the front of `input`, returning it and the number
+/// of bytes it consumed - so a caller can read whatever trails it. BEP9's
+/// `ut_metadata` messages are exactly this shape: a bencode dict immediately
+/// followed by the raw metadata-piece bytes.
+pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize)> {
+    let mut p = Parser { buf: input, pos: 0 };
+    let v = p.value()?;
+    Ok((v, p.pos))
+}
+
 /// Decode the top-level dict AND return the exact byte span of its `info`
 /// value, if present - the two things metainfo parsing needs (the parsed tree
 /// for fields, the raw bytes for the SHA-1 info-hash). The span is `(start,
