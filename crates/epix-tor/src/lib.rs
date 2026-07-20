@@ -281,6 +281,27 @@ impl Tor {
         Ok(Self { client })
     }
 
+    /// Reconfigure the live client to start (or stop) routing its guard channel
+    /// through a Snowflake bridge, with no restart and no second client.
+    /// `Some((line, socks_port))` installs the bridge + unmanaged PT transport;
+    /// `None` returns to direct guards. Arti retires the affected circuits so new
+    /// ones build over the new path, while the onion service and SOCKS listener
+    /// keep running on the same client.
+    #[cfg(feature = "bridges")]
+    pub fn reconfigure_bridge(&self, data_dir: &Path, bridge: Option<(String, u16)>) -> Result<()> {
+        let state = data_dir.join("tor").join("state");
+        let cache = data_dir.join("tor").join("cache");
+        let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+        if let Some((line, port)) = &bridge {
+            bridges::apply_bridge(&mut builder, line, *port)?;
+        }
+        let config = builder.build().map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
+        self.client
+            .reconfigure(&config, arti_client::config::Reconfigure::WarnOnFailures)
+            .map_err(|e| Error::Protocol(format!("tor reconfigure: {e}")))?;
+        Ok(())
+    }
+
     /// The peer transport over this Tor client. With `route_all`, plain IP
     /// peers are dialed through Tor too (`--tor always`); otherwise only
     /// `.onion` peers use it.
@@ -498,6 +519,12 @@ impl Transport for MixedTransport {
             (_, Some(tor), TorMode::Always) => tor.dial(addr).await,
             (PeerAddr::Onion { .. }, None, _) => {
                 Err(Error::Protocol("onion peer but Tor is disabled".into()))
+            }
+            // Always mode with no Tor transport (the startup or re-bootstrap
+            // window) fails closed: never fall through to a clearnet dial that
+            // would leak the real IP the mode exists to hide.
+            (_, None, TorMode::Always) => {
+                Err(Error::Protocol("Always mode: Tor is not routed yet".into()))
             }
             _ => self.tcp.dial(addr).await,
         }

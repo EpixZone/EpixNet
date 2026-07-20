@@ -142,7 +142,7 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     // Active only in a bridges-enabled build (Snowflake linked); otherwise shown
     // disabled with a coming-soon note, as before.
     #[cfg(feature = "bridges")]
-    ("Network", "tor_use_bridges", "Use Tor bridges (Snowflake; for censored networks; restart EpixNet to apply)", "false", "bool"),
+    ("Network", "tor_use_bridges", "Use Tor bridges (Snowflake; for censored networks; also auto-enables if Tor is blocked)", "false", "bool"),
     #[cfg(not(feature = "bridges"))]
     ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
     (
@@ -259,7 +259,6 @@ pub const CONFIG_RESTART_KEYS: &[&str] = &[
     "fileserver_ip_type",
     "fileserver_port",
     "tor",
-    "tor_use_bridges",
     "i2p",
     "i2p_sam_port",
     "mesh",
@@ -644,6 +643,10 @@ pub struct AppState {
     /// Fired when the runtime-contributed tracker set changes, so the announce
     /// loop can run early instead of waiting out its period.
     trackers_changed: Arc<tokio::sync::Notify>,
+    /// Fired when the Tor bridges setting (`tor_use_bridges`) changes, so the
+    /// Tor loop can re-bootstrap through (or away from) Snowflake without a
+    /// node restart.
+    tor_config_changed: Arc<tokio::sync::Notify>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -1044,6 +1047,7 @@ impl AppState {
             extra_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
+            tor_config_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(HashMap::new()),
             #[cfg(feature = "multiuser")]
@@ -1184,6 +1188,7 @@ impl AppState {
             extra_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
+            tor_config_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(multi_users),
             #[cfg(feature = "multiuser")]
@@ -1383,6 +1388,11 @@ impl AppState {
     /// The signal fired when the runtime-contributed tracker set changes.
     pub fn trackers_changed(&self) -> Arc<tokio::sync::Notify> {
         self.trackers_changed.clone()
+    }
+
+    /// The Tor loop awaits this to re-bootstrap when the bridges setting changes.
+    pub fn tor_config_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.tor_config_changed.clone()
     }
 
     /// Remember a tracker that answered, so it is reused (and shared) later.
@@ -1852,6 +1862,11 @@ impl AppState {
             if let Ok(bytes) = serde_json::to_vec_pretty(&*self.config.read().await) {
                 let _ = std::fs::write(path, bytes);
             }
+        }
+        // Snowflake bridges apply live: wake the Tor loop to re-bootstrap through
+        // (or away from) the bridge instead of waiting for a node restart.
+        if key == "tor_use_bridges" {
+            self.tor_config_changed.notify_waiters();
         }
     }
 

@@ -1053,13 +1053,23 @@ enum BootstrapAttempt {
 /// failure self-heals once the network settles. arti's own reason now reaches
 /// the log via the node's tracing subscriber; these lines add the coarse story
 /// to the in-UI log.
+///
+/// Returns the bootstrapped client together with a session guard the caller
+/// holds for as long as Tor should run: under `bridges` it owns the running
+/// Snowflake (dropping it stops the transport), so the bridge stays up for the
+/// whole session, not just the bootstrap.
+#[cfg(all(feature = "tor", feature = "bridges"))]
+type SnowflakeGuard = Option<epix_tor::bridges::Snowflake>;
+#[cfg(all(feature = "tor", not(feature = "bridges")))]
+type SnowflakeGuard = ();
+
 #[cfg(feature = "tor")]
 async fn bootstrap_tor_with_watchdog(
     state: &AppState,
     data_dir: &std::path::Path,
     shutdown: &Notify,
     force_bridges: bool,
-) -> Option<epix_tor::Tor> {
+) -> Option<(epix_tor::Tor, SnowflakeGuard)> {
     const RETRY_BACKOFF_SECS: u64 = 30;
     // Consecutive direct-bootstrap failures to tolerate before auto-falling back
     // to a Snowflake bridge (the signature of a network that blocks Tor, like
@@ -1095,7 +1105,12 @@ async fn bootstrap_tor_with_watchdog(
     loop {
         state.log("INFO", "Tor: bootstrapping in-process Arti client …".to_string()).await;
         match bootstrap_tor_attempt(state, data_dir, shutdown, &opts, attempt_timeout_secs).await {
-            BootstrapAttempt::Ready(tor) => return Some(tor),
+            BootstrapAttempt::Ready(tor) => {
+                #[cfg(feature = "bridges")]
+                return Some((tor, snowflake));
+                #[cfg(not(feature = "bridges"))]
+                return Some((tor, ()));
+            }
             BootstrapAttempt::Shutdown => {
                 state.set_tor_status(false, "Disabled").await;
                 return None;
@@ -1222,8 +1237,10 @@ async fn tor_loop(
     // Bootstrap under a watchdog (heartbeat + timeout + retry). It starts a
     // Snowflake bridge when `tor_use_bridges` forces it, or automatically after
     // repeated direct failures (a censored network). `None` means shutdown fired
-    // before Tor came up, so the loop stops.
-    let Some(tor) =
+    // before Tor came up, so the loop stops. The guard keeps Snowflake up for
+    // the whole session (not just the bootstrap); it is dropped on shutdown or
+    // when the bridge is turned off live.
+    let Some((tor, snowflake_guard)) =
         bootstrap_tor_with_watchdog(&state, &data_dir, &shutdown, tor_use_bridges).await
     else {
         return;
@@ -1275,9 +1292,7 @@ async fn tor_loop(
                     // dropping it decommissions the service, so its descriptor
                     // is never published and no peer can ever reach us. Hold it
                     // for as long as we accept inbound streams (the process
-                    // lifetime) - previously it was dropped right here at the
-                    // end of the match arm, silently killing the service
-                    // milliseconds after the "onion service up" log line.
+                    // lifetime).
                     let _svc = svc;
                     while let Some(stream) = inbound.recv().await {
                         let handler = handler.clone() as Arc<dyn RequestHandler>;
@@ -1316,8 +1331,74 @@ async fn tor_loop(
         }
     }
 
-    shutdown.notified().await;
+    // Serve until shutdown. The bridges setting (`tor_use_bridges`) applies live:
+    // when it changes, reconfigure the running client to add or drop the
+    // Snowflake bridge (Arti retires the affected circuits and rebuilds them over
+    // the new path) instead of restarting the node - the onion service and SOCKS
+    // listener above keep running on the same client throughout.
+    #[cfg(feature = "bridges")]
+    {
+        let tor_config_changed = state.tor_config_changed();
+        let mut snowflake_guard = snowflake_guard;
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                _ = tor_config_changed.notified() => {
+                    apply_bridge_change(&state, &data_dir, &tor, &mut snowflake_guard).await;
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "bridges"))]
+    {
+        let _ = snowflake_guard;
+        shutdown.notified().await;
+    }
+
     state.set_tor_status(false, "Disabled").await;
+}
+
+/// Apply a live change to the Tor bridges setting on the running client: start
+/// Snowflake and reconfigure to route through it when the setting is turned on,
+/// or reconfigure back to direct guards and stop Snowflake when turned off. A
+/// no-op when the current guard state already matches the setting.
+#[cfg(all(feature = "tor", feature = "bridges"))]
+async fn apply_bridge_change(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    tor: &epix_tor::Tor,
+    guard: &mut Option<epix_tor::bridges::Snowflake>,
+) {
+    let want = state.config_bool("tor_use_bridges", false).await;
+    if want == guard.is_some() {
+        return;
+    }
+    if want {
+        // Start Snowflake, then point the live client at its bridge.
+        let Some((snowflake, opts, _)) = start_snowflake_bridge(state, data_dir).await else {
+            return; // unavailable; start_snowflake_bridge already logged why
+        };
+        match tor.reconfigure_bridge(data_dir, opts.bridge) {
+            Ok(()) => {
+                *guard = Some(snowflake);
+                state
+                    .log("INFO", "Tor: now routing through the Snowflake bridge (applied live)".to_string())
+                    .await;
+            }
+            // Dropping `snowflake` here stops the transport we could not use.
+            Err(e) => state.log("ERROR", format!("Tor: enabling the bridge failed ({e})")).await,
+        }
+    } else {
+        match tor.reconfigure_bridge(data_dir, None) {
+            Ok(()) => {
+                *guard = None; // drops the guard, stopping Snowflake
+                state
+                    .log("INFO", "Tor: routing directly again (bridge turned off, applied live)".to_string())
+                    .await;
+            }
+            Err(e) => state.log("ERROR", format!("Tor: disabling the bridge failed ({e})")).await,
+        }
+    }
 }
 
 /// Bring up I2P and run its surfaces until shutdown, none of it on the startup
