@@ -25,7 +25,12 @@ jobs:
       - uses: actions/checkout@v7.0.0
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc (mesh transport build dep)
-        run: brew install protobuf
+        run: |
+          # The macOS runner pre-taps aws/tap, which newer Homebrew treats as
+          # untrusted and warns about on every brew command. We don't use it, so
+          # untap it to keep the log clean (protobuf is from homebrew/core).
+          brew untap aws/tap 2>/dev/null || true
+          brew install protobuf
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh osx
       - name: Build (ad-hoc signed, unnotarized)
