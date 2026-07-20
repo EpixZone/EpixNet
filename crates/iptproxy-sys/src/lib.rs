@@ -79,12 +79,49 @@ fn cstrings(cfg: &SnowflakeConfig) -> Result<[std::ffi::CString; 5], Error> {
     ])
 }
 
+/// The wrapper's `EpixStartSnowflake` signature: five rendezvous strings plus the
+/// proxy count. The static backend reaches it as an extern item, the dynamic one
+/// as a loaded symbol, but both call it the same way.
+#[cfg(any(iptproxy_static, iptproxy_dynamic))]
+type StartFn = unsafe extern "C" fn(
+    *const std::os::raw::c_char,
+    *const std::os::raw::c_char,
+    *const std::os::raw::c_char,
+    *const std::os::raw::c_char,
+    *const std::os::raw::c_char,
+    std::os::raw::c_int,
+) -> std::os::raw::c_int;
+
+/// Marshal the config and call `start`. Shared by the static and dynamic backends
+/// so the FFI arguments are only spelled out once.
+#[cfg(any(iptproxy_static, iptproxy_dynamic))]
+fn invoke_start(cfg: &SnowflakeConfig, start: StartFn) -> Result<(), Error> {
+    let s = cstrings(cfg)?;
+    // SAFETY: five valid NUL-terminated pointers that outlive the call, plus the
+    // proxy count passed by value.
+    let rc = unsafe {
+        start(
+            s[0].as_ptr(),
+            s[1].as_ptr(),
+            s[2].as_ptr(),
+            s[3].as_ptr(),
+            s[4].as_ptr(),
+            std::os::raw::c_int::from(cfg.max_proxies.min(i16::MAX as u16) as i16),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::StartFailed(rc))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Static: the wrapper archive is linked into this binary.
 // ---------------------------------------------------------------------------
 #[cfg(iptproxy_static)]
 mod imp {
-    use super::{cstrings, Error, SnowflakeConfig};
+    use super::{invoke_start, Error, SnowflakeConfig};
     use std::os::raw::{c_char, c_int};
 
     extern "C" {
@@ -101,24 +138,8 @@ mod imp {
     }
 
     pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
-        let s = cstrings(cfg)?;
-        // SAFETY: five valid NUL-terminated pointers that outlive the call, plus
-        // the proxy count passed by value.
-        let rc = unsafe {
-            EpixStartSnowflake(
-                s[0].as_ptr(),
-                s[1].as_ptr(),
-                s[2].as_ptr(),
-                s[3].as_ptr(),
-                s[4].as_ptr(),
-                c_int::from(cfg.max_proxies.min(i16::MAX as u16) as i16),
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Error::StartFailed(rc))
-        }
+        // The extern item coerces to the shared `StartFn` fn pointer.
+        invoke_start(cfg, EpixStartSnowflake)
     }
 
     pub fn snowflake_port() -> u16 {
@@ -137,19 +158,11 @@ mod imp {
 // ---------------------------------------------------------------------------
 #[cfg(iptproxy_dynamic)]
 mod imp {
-    use super::{cstrings, Error, SnowflakeConfig};
+    use super::{invoke_start, Error, SnowflakeConfig, StartFn};
     use libloading::{Library, Symbol};
-    use std::os::raw::{c_char, c_int};
+    use std::os::raw::c_int;
     use std::sync::OnceLock;
 
-    type StartFn = unsafe extern "C" fn(
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        c_int,
-    ) -> c_int;
     type PortFn = unsafe extern "C" fn() -> c_int;
     type StopFn = unsafe extern "C" fn();
 
@@ -232,24 +245,7 @@ mod imp {
 
     pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
         let l = loaded().ok_or(Error::Unavailable)?;
-        let s = cstrings(cfg)?;
-        // SAFETY: five valid NUL-terminated pointers that outlive the call, plus
-        // the proxy count passed by value.
-        let rc = unsafe {
-            (l.start)(
-                s[0].as_ptr(),
-                s[1].as_ptr(),
-                s[2].as_ptr(),
-                s[3].as_ptr(),
-                s[4].as_ptr(),
-                c_int::from(cfg.max_proxies.min(i16::MAX as u16) as i16),
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Error::StartFailed(rc))
-        }
+        invoke_start(cfg, l.start)
     }
 
     pub fn snowflake_port() -> u16 {
