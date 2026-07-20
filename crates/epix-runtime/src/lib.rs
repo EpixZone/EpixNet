@@ -1158,7 +1158,7 @@ async fn tor_loop(
     #[cfg(feature = "bridges")]
     {
         if tor_use_bridges {
-            match epix_tor::bridges::start_snowflake().await {
+            match epix_tor::bridges::start_snowflake(&data_dir).await {
                 Ok((guard, port)) => {
                     state
                         .log("INFO", format!("Tor: Snowflake up, SOCKS on 127.0.0.1:{port}"))

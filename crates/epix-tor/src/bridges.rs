@@ -11,6 +11,7 @@
 use arti_client::config::pt::TransportConfigBuilder;
 use arti_client::config::{BridgeConfigBuilder, TorClientConfigBuilder};
 use epix_core::{Error, Result};
+use std::path::Path;
 use std::time::Duration;
 
 /// The arti bridge line for the Snowflake bridge. Snowflake ignores the address
@@ -22,16 +23,17 @@ pub const SNOWFLAKE_BRIDGE_LINE: &str =
     "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72";
 
 /// Current Tor-Browser Snowflake rendezvous defaults (plan R2: verify + allow
-/// config override at ship time; these rotate).
-fn default_snowflake_params() -> iptproxy_sys::SnowflakeConfig {
+/// config override at ship time; these rotate). `state_dir` is where the
+/// transport keeps its state, under the node data dir.
+fn default_snowflake_params(data_dir: &Path) -> iptproxy_sys::SnowflakeConfig {
     iptproxy_sys::SnowflakeConfig {
+        state_dir: data_dir.join("snowflake").to_string_lossy().into_owned(),
         ice_servers: "stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,\
 stun:stun.bluesip.net:3478,stun:stun.voip.blackberry.com:3478"
             .to_string(),
         broker_url: "https://snowflake-broker.torproject.net.global.prod.fastly.net/".to_string(),
         front_domains: "foursquare.com,github.githubassets.com".to_string(),
         ampcache: "https://cdn.ampproject.org/".to_string(),
-        log_file: String::new(),
     }
 }
 
@@ -50,8 +52,8 @@ impl Drop for Snowflake {
 /// running guard (hold it for as long as Tor should route through Snowflake)
 /// and the port arti should dial. Errors if IPtProxy is unavailable in this
 /// build (the stub) or never opens a port.
-pub async fn start_snowflake() -> Result<(Snowflake, u16)> {
-    let params = default_snowflake_params();
+pub async fn start_snowflake(data_dir: &Path) -> Result<(Snowflake, u16)> {
+    let params = default_snowflake_params(data_dir);
     iptproxy_sys::start_snowflake(&params)
         .map_err(|e| Error::Protocol(format!("snowflake start: {e}")))?;
     let guard = Snowflake { _private: () };

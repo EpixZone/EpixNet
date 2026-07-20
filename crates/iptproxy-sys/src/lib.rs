@@ -1,24 +1,31 @@
-//! Minimal, in-process binding to [IPtProxy], the library the official iOS Tor
-//! apps (Onion Browser, Orbot) use to run Snowflake and obfs4 as in-process
-//! threads instead of a subprocess. We use only the Snowflake surface: start
-//! it, learn the local SOCKS port it listens on, stop it. arti then dials its
-//! bridge through `127.0.0.1:<port>` as an unmanaged pluggable transport, so no
-//! binary is ever spawned and it works on iOS.
+//! Minimal, in-process binding to the [epix-iptproxy] Snowflake wrapper. It runs
+//! the Snowflake pluggable transport as in-process threads (no subprocess, so it
+//! works on iOS) and exposes a local SOCKS port; arti then dials its bridge
+//! through `127.0.0.1:<port>` as an unmanaged pluggable transport.
 //!
-//! When no prebuilt IPtProxy archive is vendored for the target (build.rs sets
-//! `iptproxy_stub`), the same API compiles against a stub whose
-//! [`start_snowflake`] returns [`Error::Unavailable`]. That keeps the `bridges`
-//! feature building on every platform before the Go artifacts are in place; the
-//! bootstrap watchdog treats "unavailable" like any other bridge failure.
+//! The wrapper exports three C functions (`EpixStartSnowflake`,
+//! `EpixSnowflakePort`, `EpixStopSnowflake`). build.rs picks how they are
+//! reached for the target:
 //!
-//! [IPtProxy]: https://github.com/tladesignz/IPtProxy
+//! - macOS / Linux / iOS: statically linked (`iptproxy_static`).
+//! - Windows / Android: loaded at runtime from the shared library shipped beside
+//!   the executable (`iptproxy_dynamic`); if the library is missing at runtime
+//!   [`start_snowflake`] returns [`Error::Unavailable`].
+//! - Neither artifact available: a stub (`iptproxy_stub`) whose start returns
+//!   [`Error::Unavailable`], so a `bridges` build always compiles.
+//!
+//! In every case an unavailable Snowflake makes the node fall back to a direct
+//! Tor bootstrap rather than misbehave.
+//!
+//! [epix-iptproxy]: https://github.com/EpixZone/epix-iptproxy
 
 use std::fmt;
 
-/// Snowflake rendezvous parameters. Strings are the same values Tor Browser
-/// ships; the caller supplies the current set (they rotate).
+/// Snowflake rendezvous parameters plus the transport's state directory.
 #[derive(Debug, Clone)]
 pub struct SnowflakeConfig {
+    /// Directory the transport keeps its state and log in.
+    pub state_dir: String,
     /// Comma-separated ICE (STUN) servers, e.g. `stun:stun.l.google.com:19302`.
     pub ice_servers: String,
     /// Broker URL the client rendezvous through.
@@ -27,104 +34,200 @@ pub struct SnowflakeConfig {
     pub front_domains: String,
     /// AMP cache URL (optional rendezvous method); empty to disable.
     pub ampcache: String,
-    /// Log file path; empty for none.
-    pub log_file: String,
 }
 
 /// Why a Snowflake call failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// This build has no IPtProxy library linked (stub), so Snowflake cannot run.
+    /// No IPtProxy library is available (stub, or the runtime library is missing).
     Unavailable,
     /// A config string contained an interior NUL and could not cross the FFI.
     BadArgument,
+    /// The transport failed to start (broker/state error); code from the wrapper.
+    StartFailed(i32),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unavailable => f.write_str(
-                "IPtProxy is not bundled in this build; Snowflake bridges are unavailable",
+                "the Snowflake library is not available in this build; bridges are unavailable",
             ),
             Error::BadArgument => f.write_str("a Snowflake config value contained a NUL byte"),
+            Error::StartFailed(c) => write!(f, "Snowflake failed to start (code {c})"),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-// ---------------------------------------------------------------------------
-// Real binding: compiled only when a prebuilt IPtProxy archive is linked.
-//
-// NOTE (plan R1): the exact IPtProxy C signatures differ between the classic
-// gomobile build and the newer C API. These are the classic gomobile symbols;
-// they are reconciled against the vendored release's header when the artifact
-// lands (phase 2). Only ever compiled with the real library present.
-// ---------------------------------------------------------------------------
-#[cfg(not(iptproxy_stub))]
-mod imp {
-    use super::{Error, SnowflakeConfig};
+/// Turn the config strings into NUL-terminated C strings (kept alive by caller).
+#[cfg(any(iptproxy_static, iptproxy_dynamic))]
+fn cstrings(cfg: &SnowflakeConfig) -> Result<[std::ffi::CString; 5], Error> {
     use std::ffi::CString;
-    use std::os::raw::{c_char, c_int, c_long};
+    let mk = |s: &str| CString::new(s).map_err(|_| Error::BadArgument);
+    Ok([
+        mk(&cfg.state_dir)?,
+        mk(&cfg.ice_servers)?,
+        mk(&cfg.broker_url)?,
+        mk(&cfg.front_domains)?,
+        mk(&cfg.ampcache)?,
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Static: the wrapper archive is linked into this binary.
+// ---------------------------------------------------------------------------
+#[cfg(iptproxy_static)]
+mod imp {
+    use super::{cstrings, Error, SnowflakeConfig};
+    use std::os::raw::{c_char, c_int};
 
     extern "C" {
-        fn IPtProxyStartSnowflake(
+        fn EpixStartSnowflake(
+            state_dir: *const c_char,
             ice: *const c_char,
-            url: *const c_char,
-            front: *const c_char,
+            broker: *const c_char,
+            fronts: *const c_char,
             ampcache: *const c_char,
-            log_file: *const c_char,
-            unsafe_logging: c_int,
-            keep_local_addresses: c_int,
-            unattended: c_int,
-            max_peers: c_long,
-        );
-        fn IPtProxyStopSnowflake();
-        fn IPtProxySnowflakePort() -> c_long;
+        ) -> c_int;
+        fn EpixSnowflakePort() -> c_int;
+        fn EpixStopSnowflake();
     }
 
     pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
-        let ice = cstr(&cfg.ice_servers)?;
-        let url = cstr(&cfg.broker_url)?;
-        let front = cstr(&cfg.front_domains)?;
-        let amp = cstr(&cfg.ampcache)?;
-        let log = cstr(&cfg.log_file)?;
-        // SAFETY: all pointers are valid, NUL-terminated CStrings that outlive
-        // the call; IPtProxy copies what it needs. Scalars are plain values.
-        unsafe {
-            IPtProxyStartSnowflake(
-                ice.as_ptr(),
-                url.as_ptr(),
-                front.as_ptr(),
-                amp.as_ptr(),
-                log.as_ptr(),
-                0, // unsafe_logging off
-                1, // keep_local_addresses (helps on some NATs)
-                1, // unattended (no interactive prompts)
-                1, // max_peers
-            );
+        let s = cstrings(cfg)?;
+        // SAFETY: five valid NUL-terminated pointers that outlive the call.
+        let rc = unsafe {
+            EpixStartSnowflake(s[0].as_ptr(), s[1].as_ptr(), s[2].as_ptr(), s[3].as_ptr(), s[4].as_ptr())
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::StartFailed(rc))
         }
-        Ok(())
     }
 
     pub fn snowflake_port() -> u16 {
         // SAFETY: no arguments; returns the listener port (0 until it binds).
-        let port = unsafe { IPtProxySnowflakePort() };
-        u16::try_from(port).unwrap_or(0)
+        u16::try_from(unsafe { EpixSnowflakePort() }).unwrap_or(0)
     }
 
     pub fn stop_snowflake() {
-        // SAFETY: no arguments; idempotent in IPtProxy.
-        unsafe { IPtProxyStopSnowflake() }
-    }
-
-    fn cstr(s: &str) -> Result<CString, Error> {
-        CString::new(s).map_err(|_| Error::BadArgument)
+        // SAFETY: no arguments; idempotent in the wrapper.
+        unsafe { EpixStopSnowflake() }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Stub: no IPtProxy library for this target. Same API, no Go.
+// Dynamic: load the shared library at runtime (Windows / Android).
+// ---------------------------------------------------------------------------
+#[cfg(iptproxy_dynamic)]
+mod imp {
+    use super::{cstrings, Error, SnowflakeConfig};
+    use libloading::{Library, Symbol};
+    use std::os::raw::{c_char, c_int};
+    use std::sync::OnceLock;
+
+    type StartFn = unsafe extern "C" fn(
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+    ) -> c_int;
+    type PortFn = unsafe extern "C" fn() -> c_int;
+    type StopFn = unsafe extern "C" fn();
+
+    struct Loaded {
+        // The library must outlive the resolved symbols; keep it owned.
+        _lib: Library,
+        start: RawStart,
+        port: RawPort,
+        stop: RawStop,
+    }
+    // Raw fn pointers copied out of the Symbols, so we do not borrow the library.
+    type RawStart = StartFn;
+    type RawPort = PortFn;
+    type RawStop = StopFn;
+
+    // Safe to share: the loaded fn pointers are plain code addresses; the wrapper
+    // guards its own state with a mutex.
+    unsafe impl Sync for Loaded {}
+    unsafe impl Send for Loaded {}
+
+    static LOADED: OnceLock<Option<Loaded>> = OnceLock::new();
+
+    /// Candidate paths for the shared library: beside the executable (where the
+    /// packaged app and `cargo run` place it), then the bare filename (OS search
+    /// path), then an explicit override.
+    fn candidates() -> Vec<std::path::PathBuf> {
+        let name = env!("IPTPROXY_LIB_FILENAME");
+        let mut v = Vec::new();
+        if let Some(dir) = std::env::var_os("EPIX_IPTPROXY_LIB") {
+            v.push(std::path::PathBuf::from(dir).join(name));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                v.push(dir.join(name));
+            }
+        }
+        v.push(std::path::PathBuf::from(name));
+        v
+    }
+
+    fn load() -> Option<Loaded> {
+        for path in candidates() {
+            // SAFETY: loading a trusted, app-shipped library; running its init.
+            let Ok(lib) = (unsafe { Library::new(&path) }) else { continue };
+            // SAFETY: the wrapper exports exactly these C symbols/signatures.
+            let loaded = unsafe {
+                let start: Symbol<StartFn> = lib.get(b"EpixStartSnowflake\0").ok()?;
+                let port: Symbol<PortFn> = lib.get(b"EpixSnowflakePort\0").ok()?;
+                let stop: Symbol<StopFn> = lib.get(b"EpixStopSnowflake\0").ok()?;
+                Loaded { start: *start, port: *port, stop: *stop, _lib: lib }
+            };
+            return Some(loaded);
+        }
+        None
+    }
+
+    fn loaded() -> Option<&'static Loaded> {
+        LOADED.get_or_init(load).as_ref()
+    }
+
+    pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
+        let l = loaded().ok_or(Error::Unavailable)?;
+        let s = cstrings(cfg)?;
+        // SAFETY: five valid NUL-terminated pointers that outlive the call.
+        let rc = unsafe {
+            (l.start)(s[0].as_ptr(), s[1].as_ptr(), s[2].as_ptr(), s[3].as_ptr(), s[4].as_ptr())
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::StartFailed(rc))
+        }
+    }
+
+    pub fn snowflake_port() -> u16 {
+        match loaded() {
+            // SAFETY: no arguments.
+            Some(l) => u16::try_from(unsafe { (l.port)() }).unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    pub fn stop_snowflake() {
+        if let Some(l) = loaded() {
+            // SAFETY: no arguments; idempotent in the wrapper.
+            unsafe { (l.stop)() }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub: no library for this target.
 // ---------------------------------------------------------------------------
 #[cfg(iptproxy_stub)]
 mod imp {
@@ -141,8 +244,9 @@ mod imp {
     pub fn stop_snowflake() {}
 }
 
-/// Whether this build actually links IPtProxy (`false` means the stub).
-pub const AVAILABLE: bool = cfg!(not(iptproxy_stub));
+/// Whether this build wires Snowflake at all (`false` is the stub). A `true`
+/// value on a dynamic target still depends on the runtime library being present.
+pub const WIRED: bool = cfg!(any(iptproxy_static, iptproxy_dynamic));
 
 /// Start Snowflake in-process. On success it begins listening on a local SOCKS
 /// port; poll [`snowflake_port`] until it is non-zero before dialing through it.
@@ -164,22 +268,22 @@ pub fn stop_snowflake() {
 mod tests {
     use super::*;
 
-    /// Without a linked IPtProxy the API degrades cleanly: start reports
-    /// `Unavailable` and the port is 0, so a bridges build with no artifact
-    /// simply falls back to a direct bootstrap instead of misbehaving.
+    /// With no library the API degrades cleanly: start reports `Unavailable`
+    /// and the port is 0, so a bridges build with no artifact falls back to a
+    /// direct bootstrap instead of misbehaving. (On a dynamic target with no
+    /// runtime library present, the same holds.)
     #[test]
-    #[cfg(iptproxy_stub)]
-    fn stub_reports_unavailable() {
-        assert!(!AVAILABLE);
+    #[cfg(any(iptproxy_stub, iptproxy_dynamic))]
+    fn missing_library_reports_unavailable() {
         let cfg = SnowflakeConfig {
+            state_dir: String::new(),
             ice_servers: String::new(),
             broker_url: String::new(),
             front_domains: String::new(),
             ampcache: String::new(),
-            log_file: String::new(),
         };
         assert_eq!(start_snowflake(&cfg), Err(Error::Unavailable));
         assert_eq!(snowflake_port(), 0);
-        stop_snowflake(); // no-op, must not panic
+        stop_snowflake(); // must not panic
     }
 }
