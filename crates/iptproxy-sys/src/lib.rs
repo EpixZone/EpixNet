@@ -34,6 +34,10 @@ pub struct SnowflakeConfig {
     pub front_domains: String,
     /// AMP cache URL (optional rendezvous method); empty to disable.
     pub ampcache: String,
+    /// How many simultaneous Snowflake proxies to collect and load-balance
+    /// across. One proxy is often slow; more improve throughput and resilience.
+    /// The wrapper clamps this to a sane range (defaults to 3 if below 1).
+    pub max_proxies: u16,
 }
 
 /// Why a Snowflake call failed.
@@ -90,6 +94,7 @@ mod imp {
             broker: *const c_char,
             fronts: *const c_char,
             ampcache: *const c_char,
+            max: c_int,
         ) -> c_int;
         fn EpixSnowflakePort() -> c_int;
         fn EpixStopSnowflake();
@@ -97,9 +102,17 @@ mod imp {
 
     pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
         let s = cstrings(cfg)?;
-        // SAFETY: five valid NUL-terminated pointers that outlive the call.
+        // SAFETY: five valid NUL-terminated pointers that outlive the call, plus
+        // the proxy count passed by value.
         let rc = unsafe {
-            EpixStartSnowflake(s[0].as_ptr(), s[1].as_ptr(), s[2].as_ptr(), s[3].as_ptr(), s[4].as_ptr())
+            EpixStartSnowflake(
+                s[0].as_ptr(),
+                s[1].as_ptr(),
+                s[2].as_ptr(),
+                s[3].as_ptr(),
+                s[4].as_ptr(),
+                c_int::from(cfg.max_proxies.min(i16::MAX as u16) as i16),
+            )
         };
         if rc == 0 {
             Ok(())
@@ -135,6 +148,7 @@ mod imp {
         *const c_char,
         *const c_char,
         *const c_char,
+        c_int,
     ) -> c_int;
     type PortFn = unsafe extern "C" fn() -> c_int;
     type StopFn = unsafe extern "C" fn();
@@ -219,9 +233,17 @@ mod imp {
     pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
         let l = loaded().ok_or(Error::Unavailable)?;
         let s = cstrings(cfg)?;
-        // SAFETY: five valid NUL-terminated pointers that outlive the call.
+        // SAFETY: five valid NUL-terminated pointers that outlive the call, plus
+        // the proxy count passed by value.
         let rc = unsafe {
-            (l.start)(s[0].as_ptr(), s[1].as_ptr(), s[2].as_ptr(), s[3].as_ptr(), s[4].as_ptr())
+            (l.start)(
+                s[0].as_ptr(),
+                s[1].as_ptr(),
+                s[2].as_ptr(),
+                s[3].as_ptr(),
+                s[4].as_ptr(),
+                c_int::from(cfg.max_proxies.min(i16::MAX as u16) as i16),
+            )
         };
         if rc == 0 {
             Ok(())
@@ -302,6 +324,7 @@ mod tests {
             broker_url: String::new(),
             front_domains: String::new(),
             ampcache: String::new(),
+            max_proxies: 3,
         };
         assert_eq!(start_snowflake(&cfg), Err(Error::Unavailable));
         assert_eq!(snowflake_port(), 0);

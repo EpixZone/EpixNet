@@ -34,6 +34,11 @@ const DEFAULT_ICE_SERVERS: &str = "stun:stun.epygi.com:3478,stun:stun.uls.co.za:
 stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.nextcloud.com:3478,\
 stun:stun.bethesda.net:3478,stun:stun.nextcloud.com:443";
 
+/// How many Snowflake proxies to collect and load-balance across by default. A
+/// single volunteer proxy is often slow and drops out; Tor's own client example
+/// uses 3. Overridable via `snowflake.json`'s `max_proxies`.
+const DEFAULT_MAX_PROXIES: u16 = 3;
+
 /// The user-editable overrides file. Lives next to `config.json` so all
 /// hand-edited node settings sit in one place.
 fn overrides_path(data_dir: &Path) -> PathBuf {
@@ -45,12 +50,13 @@ fn overrides_path(data_dir: &Path) -> PathBuf {
 /// build's refreshed defaults still take effect - only fields a user fills in
 /// are pinned.
 const OVERRIDES_TEMPLATE: &str = r#"{
-  "_comment": "Override EpixNet's built-in Snowflake rendezvous parameters when they go stale. Any field left blank uses the built-in default. After editing, toggle 'Use Tor bridges' off then on (or restart). A current set is published at Tor Browser's projects/common/bridges_list.snowflake.txt.",
+  "_comment": "Override EpixNet's built-in Snowflake rendezvous parameters when they go stale. Any field left blank uses the built-in default; max_proxies 0 uses the built-in default (3) and caps at 8. After editing, toggle 'Use Tor bridges' off then on (or restart). A current set is published at Tor Browser's projects/common/bridges_list.snowflake.txt.",
   "broker_url": "",
   "front_domains": "",
   "ice_servers": "",
   "ampcache": "",
-  "bridge": ""
+  "bridge": "",
+  "max_proxies": 0
 }
 "#;
 
@@ -110,6 +116,17 @@ fn snowflake_params(data_dir: &Path) -> iptproxy_sys::SnowflakeConfig {
         // Off unless explicitly set: the public deployment dropped AMP cache and
         // it now answers 421, which only slows rendezvous down.
         ampcache: resolved(&f, "ampcache"),
+        max_proxies: resolved_max_proxies(&f),
+    }
+}
+
+/// Resolve `max_proxies`: the user's `snowflake.json` value if set (>0), else the
+/// built-in default. The Moat API carries no proxy count, so there is no
+/// `fetched` layer here. The Go wrapper re-clamps, so a wild value is harmless.
+fn resolved_max_proxies(f: &serde_json::Value) -> u16 {
+    match f.get("max_proxies").and_then(|v| v.as_u64()).unwrap_or(0) {
+        0 => DEFAULT_MAX_PROXIES,
+        n => n.min(u16::MAX as u64) as u16,
     }
 }
 
