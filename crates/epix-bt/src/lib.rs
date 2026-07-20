@@ -20,16 +20,20 @@
 //! The peer wire (clearnet swarm) builds on the same pieces later.
 
 pub mod bencode;
+pub mod dht;
 pub mod engine;
 pub mod http;
 pub mod magnet;
 pub mod metainfo;
+pub mod peer;
 pub mod store;
+pub mod swarm;
 pub mod webseed;
 
 pub use engine::{Engine, EngineError, Served};
 pub use magnet::{parse as parse_magnet, MagnetLink};
 pub use metainfo::{FileEntry, MetaInfo};
+pub use swarm::SwarmError;
 
 /// A magnet a xite asked to stream, resolved to its usable sources - the shape
 /// the node's magnet endpoint hands to the engine. The info-hash is the id; the

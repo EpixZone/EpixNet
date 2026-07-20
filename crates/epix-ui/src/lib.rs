@@ -2377,11 +2377,19 @@ async fn serve_bt_stream(
             (StatusCode::PARTIAL_CONTENT, h, served.bytes).into_response()
         }
         Err(e) => {
-            use epix_bt::EngineError::{NoMetaSource, NoWebSeed, UnsupportedSource, Unsatisfiable};
-            let status = match e {
+            use epix_bt::EngineError::{
+                NoWebSeed, Swarm, SwarmDisabled, Unsatisfiable, UnsupportedSource,
+            };
+            use epix_bt::SwarmError::{NoMetadata, NoPeers};
+            let status = match &e {
                 Unsatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
                 UnsupportedSource => StatusCode::BAD_REQUEST,
-                NoWebSeed | NoMetaSource => StatusCode::NOT_IMPLEMENTED,
+                // Nothing streamable over this transport (no web seed, or a
+                // trackerless magnet while Tor is in always mode).
+                NoWebSeed | SwarmDisabled => StatusCode::NOT_IMPLEMENTED,
+                // Peer discovery ran but found nothing usable - a timeout the
+                // player can retry, not a permanent "not implemented".
+                Swarm(NoPeers | NoMetadata) => StatusCode::GATEWAY_TIMEOUT,
                 _ => StatusCode::BAD_GATEWAY,
             };
             (status, format!("bt stream: {e}")).into_response()

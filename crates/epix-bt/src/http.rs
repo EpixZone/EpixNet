@@ -13,6 +13,12 @@ use std::time::Duration;
 
 static BT_SOCKS: RwLock<Option<String>> = RwLock::new(None);
 static REQUIRE_TOR: AtomicBool = AtomicBool::new(false);
+/// The Tor SOCKS listener as a bare `host:port` (no scheme) - the swarm dials
+/// peers through it with a raw SOCKS5 CONNECT. Distinct from `BT_SOCKS` (a
+/// reqwest proxy URL for HTTP web seeds): set whenever Tor is running, even in
+/// plain `enable` mode, so peer traffic can ride Tor while DHT discovery (UDP,
+/// un-tunnelable) stays on clearnet.
+static PEER_SOCKS: RwLock<Option<String>> = RwLock::new(None);
 
 /// Route all BitTorrent HTTP fetches through `socks` (e.g.
 /// `socks5h://127.0.0.1:43111`), or clearnet when `None`. Set by the node as
@@ -21,6 +27,27 @@ pub fn set_socks(socks: Option<String>) {
     if let Ok(mut w) = BT_SOCKS.write() {
         *w = socks.filter(|s| !s.is_empty());
     }
+}
+
+/// Set the `host:port` the swarm dials peers through (the node's Tor SOCKS
+/// listener), or `None` for direct connections. Set whenever Tor is up.
+pub fn set_peer_socks(host_port: Option<String>) {
+    if let Ok(mut w) = PEER_SOCKS.write() {
+        *w = host_port.filter(|s| !s.is_empty());
+    }
+}
+
+/// The peer SOCKS `host:port`, if peer traffic should route through Tor.
+pub fn peer_socks() -> Option<String> {
+    PEER_SOCKS.read().ok().and_then(|s| s.clone())
+}
+
+/// Whether the DHT + peer-wire swarm may run. It needs UDP (mainline DHT), which
+/// Tor cannot carry, so it is disabled in Tor-`always` mode. In `enable`/
+/// `disable` mode discovery runs on clearnet (and peer data optionally over Tor
+/// via [`peer_socks`]).
+pub fn swarm_allowed() -> bool {
+    !REQUIRE_TOR.load(Ordering::Relaxed)
 }
 
 /// In Tor-always mode a fetch before the SOCKS proxy is wired would egress over

@@ -1947,6 +1947,26 @@ async fn serve(
             }
         });
     }
+
+    // BitTorrent swarm peer routing. Whenever Tor is on (enable OR always) - not
+    // just always mode - route peer-wire connections through the Tor SOCKS proxy
+    // once it is up. The mainline DHT that discovers peers is UDP and can't be
+    // tunneled, so it stays on clearnet (and the whole swarm is disabled in
+    // always mode via set_require_tor above); but the actual peer connection and
+    // data transfer then ride Tor, hiding the node's IP from the seeders.
+    #[cfg(all(feature = "tor", feature = "bittorrent"))]
+    if tor_mode != epix_runtime::TorMode::Disable {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if state.tor_status().await.0 {
+                    epix_bt::http::set_peer_socks(Some("127.0.0.1:43111".into()));
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
     // The runtime's loops are owned by their spawned tasks; leak the handle so
     // they run for the process lifetime (the caller serves forever).
     std::mem::forget(runtime);
