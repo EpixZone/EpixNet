@@ -7510,9 +7510,15 @@ impl AppState {
             self.log("INFO", format!("Synced user content for {address} ({bytes} bytes)")).await;
             // Per-file file_done events already fired as each file landed
             // (ingest_file); one site_info refreshes the aggregate counts.
-            let _ = files;
             self.push_site_info(address).await;
         }
+        // A per-user content.json that just arrived may declare merge files
+        // (posts) - which are NOT hash-synced, so the pull above never brings
+        // them. Fetch + merge them now for the dirs that changed, so imported
+        // posts appear immediately instead of waiting for the next
+        // resync_merge_files sweep (~5 min). Runs even when bytes == 0: a dir
+        // can bring only a content.json + merge files, with no plain data file.
+        self.fetch_merge_for_changed(address, &files).await;
         bytes
     }
 
@@ -8095,10 +8101,20 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .unwrap_or_else(|| epix_content::make_container(vec![]));
+        let before = epix_content::records_of(&existing).len();
         let merged = epix_content::merge_orset(&existing, &incoming, signers, epix_core::now_ms());
         if let Ok(out) = serde_json::to_vec(&merged) {
             if storage.write(inner_path, &out).is_ok() {
                 self.ingest_file_from(address, inner_path, None).await;
+                // Log only when the merge actually added records, so the sweep
+                // that re-fetches every merge file each tick stays quiet when
+                // nothing changed (previously this path was fully silent, which
+                // made "imported yet?" impossible to tell from the log).
+                let after = epix_content::records_of(&merged).len();
+                if after != before {
+                    self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
+                        .await;
+                }
             }
         }
     }
@@ -8157,6 +8173,35 @@ impl AppState {
         for rel in merge_paths {
             let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
             self.fetch_and_merge_records(address, &mpath, &signers, None, peers).await;
+        }
+    }
+
+    /// Right after a content pull, fetch + merge the declared merge files for
+    /// each per-user `content.json` that just arrived (`changed` = the inner
+    /// paths the pull reported landing). Merge files aren't hash-synced, so the
+    /// pull never brings them; without this a freshly imported user's posts
+    /// wait for the next [`Self::resync_merge_files`] sweep (~5 min). Scoped to
+    /// the changed dirs so a large xite doesn't re-sweep every user per pull.
+    async fn fetch_merge_for_changed(&self, address: &str, changed: &[String]) {
+        // Per-user content.json is always nested (data/users/<addr>/content.json);
+        // ending in "/content.json" naturally skips the root "content.json".
+        let content_paths: Vec<&String> =
+            changed.iter().filter(|p| p.ends_with("/content.json")).collect();
+        if content_paths.is_empty() || !self.is_serving(address).await {
+            return;
+        }
+        let peers = self.connectable_peers(address, 8).await;
+        if peers.is_empty() {
+            return;
+        }
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return;
+        };
+        let Ok(view) = self.xite_view(address).await else {
+            return;
+        };
+        for content_path in content_paths {
+            self.resync_merge_dir(address, content_path, &storage, &view, &peers).await;
         }
     }
 
