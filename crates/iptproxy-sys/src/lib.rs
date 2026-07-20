@@ -179,10 +179,27 @@ mod imp {
         v
     }
 
+    /// Open a shared library by path. On Windows a bare filename triggers the
+    /// OS DLL search, which can include the current working directory - a
+    /// DLL-planting vector; restrict it to the application and system directories
+    /// (the library ships beside the executable, so it is still found). Other
+    /// targets (Android) load through the app's own linker namespace, which
+    /// consults no such hijackable search path, so the plain open is correct.
+    #[cfg(windows)]
+    unsafe fn open_library(path: &std::path::Path) -> Result<Library, libloading::Error> {
+        use libloading::os::windows::{Library as WinLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS};
+        WinLibrary::load_with_flags(path, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS).map(Library::from)
+    }
+
+    #[cfg(not(windows))]
+    unsafe fn open_library(path: &std::path::Path) -> Result<Library, libloading::Error> {
+        Library::new(path)
+    }
+
     fn load() -> Option<Loaded> {
         for path in candidates() {
             // SAFETY: loading a trusted, app-shipped library; running its init.
-            let Ok(lib) = (unsafe { Library::new(&path) }) else { continue };
+            let Ok(lib) = (unsafe { open_library(&path) }) else { continue };
             // SAFETY: the wrapper exports exactly these C symbols/signatures.
             let loaded = unsafe {
                 let start: Symbol<StartFn> = lib.get(b"EpixStartSnowflake\0").ok()?;
