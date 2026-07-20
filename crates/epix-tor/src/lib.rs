@@ -263,6 +263,8 @@ impl Tor {
         let state = data_dir.join("tor").join("state");
         let cache = data_dir.join("tor").join("cache");
         clear_poisoned_guard_state(&state);
+        // `mut` is only needed under the `bridges` feature (apply_bridge below).
+        #[cfg_attr(not(feature = "bridges"), allow(unused_mut))]
         let mut builder = TorClientConfigBuilder::from_directories(state, cache);
         // Route the guard channel through Snowflake when a bridge is configured
         // (censored networks); otherwise arti dials relays directly as before.

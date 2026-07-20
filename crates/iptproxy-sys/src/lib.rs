@@ -264,16 +264,17 @@ pub fn stop_snowflake() {
     imp::stop_snowflake()
 }
 
-#[cfg(test)]
+// Deterministic only for the stub: start is always `Unavailable`, with no
+// network. On dynamic/static targets the outcome depends on the real library's
+// presence, so the degradation contract is not unit-tested there.
+#[cfg(all(test, iptproxy_stub))]
 mod tests {
     use super::*;
 
     /// With no library the API degrades cleanly: start reports `Unavailable`
     /// and the port is 0, so a bridges build with no artifact falls back to a
-    /// direct bootstrap instead of misbehaving. (On a dynamic target with no
-    /// runtime library present, the same holds.)
+    /// direct bootstrap instead of misbehaving.
     #[test]
-    #[cfg(any(iptproxy_stub, iptproxy_dynamic))]
     fn missing_library_reports_unavailable() {
         let cfg = SnowflakeConfig {
             state_dir: String::new(),
