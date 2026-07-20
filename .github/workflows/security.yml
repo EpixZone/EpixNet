@@ -72,16 +72,25 @@ jobs:
       image: semgrep/semgrep
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      # The args/args-os rules are excluded: they flag EVERY read of the
-      # command line, but their actual advice - never trust argv[0] - is
-      # followed at each call site (all skip(1), none branch on the exe
-      # path). nosemgrep comments don't help here: suppressed findings stay
-      # in the SARIF and still surface as PR annotations.
+      # These audit-level rules are excluded because their advice is already
+      # followed at every call site. nosemgrep comments don't help: a suppressed
+      # finding stays in the SARIF and still surfaces as a code-scanning alert,
+      # so the rule has to be dropped from the run instead.
+      #  - args/args-os: flag EVERY read of the command line; we never trust
+      #    argv[0] (all skip(1), none branch on the exe path).
+      #  - unsafe-usage: flags EVERY `unsafe` block; iptproxy-sys is an FFI crate
+      #    whose blocks are minimal calls into the Snowflake wrapper, each with a
+      #    SAFETY comment (there is no way to bind the library without unsafe).
+      #  - current-exe: iptproxy-sys calls current_exe() only to find the
+      #    Snowflake library shipped beside the executable, not as a trust
+      #    decision (an attacker who could write there could replace the exe).
       - run: >-
           semgrep scan
           --config p/rust --config p/security-audit --config p/secrets
           --exclude-rule rust.lang.security.args.args
           --exclude-rule rust.lang.security.args-os.args-os
+          --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage
+          --exclude-rule rust.lang.security.current-exe.current-exe
           --error --sarif --output semgrep.sarif crates || true
       - uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         if: always()
