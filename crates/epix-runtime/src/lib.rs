@@ -1161,22 +1161,11 @@ async fn start_snowflake_bridge(
     state: &AppState,
     data_dir: &std::path::Path,
 ) -> Option<(epix_tor::bridges::Snowflake, epix_tor::BootstrapOpts, u64)> {
-    // Operator overrides (blank = built-in default), so a rotation of the public
-    // Snowflake broker / fronts / ICE / bridge can be applied from the Config
-    // page without waiting for a new build.
-    let ov = epix_tor::bridges::SnowflakeOverrides {
-        broker_url: config_string(state, "snowflake_broker").await,
-        front_domains: config_string(state, "snowflake_fronts").await,
-        ice_servers: config_string(state, "snowflake_ice").await,
-        ampcache: config_string(state, "snowflake_ampcache").await,
-    };
-    let bridge_override = config_string(state, "snowflake_bridge").await;
-    let bridge_line = if bridge_override.trim().is_empty() {
-        epix_tor::bridges::SNOWFLAKE_BRIDGE_LINE.to_string()
-    } else {
-        bridge_override
-    };
-    match epix_tor::bridges::start_snowflake(data_dir, &ov).await {
+    // The bridge line and rendezvous params come from the built-in defaults,
+    // overridable per node via `<data_dir>/private/snowflake.json` (edited by
+    // hand when the public defaults rotate).
+    let bridge_line = epix_tor::bridges::bridge_line(data_dir);
+    match epix_tor::bridges::start_snowflake(data_dir).await {
         Ok((guard, port)) => {
             state.log("INFO", format!("Tor: Snowflake up, SOCKS on 127.0.0.1:{port}")).await;
             let opts = epix_tor::BootstrapOpts { bridge: Some((bridge_line, port)) };
@@ -1188,12 +1177,6 @@ async fn start_snowflake_bridge(
             None
         }
     }
-}
-
-/// A string node-config value, or empty if unset / not a string.
-#[cfg(all(feature = "tor", feature = "bridges"))]
-async fn config_string(state: &AppState, key: &str) -> String {
-    state.config_get(key).await.and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
 
 /// One bootstrap attempt: race the bootstrap against a heartbeat that logs
