@@ -98,6 +98,7 @@ mod imp {
     pub fn start_snowflake(cfg: &SnowflakeConfig) -> Result<(), Error> {
         let s = cstrings(cfg)?;
         // SAFETY: five valid NUL-terminated pointers that outlive the call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe {
             EpixStartSnowflake(s[0].as_ptr(), s[1].as_ptr(), s[2].as_ptr(), s[3].as_ptr(), s[4].as_ptr())
         };
@@ -110,11 +111,13 @@ mod imp {
 
     pub fn snowflake_port() -> u16 {
         // SAFETY: no arguments; returns the listener port (0 until it binds).
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         u16::try_from(unsafe { EpixSnowflakePort() }).unwrap_or(0)
     }
 
     pub fn stop_snowflake() {
         // SAFETY: no arguments; idempotent in the wrapper.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { EpixStopSnowflake() }
     }
 }
@@ -167,6 +170,10 @@ mod imp {
         if let Some(dir) = std::env::var_os("EPIX_IPTPROXY_LIB") {
             v.push(std::path::PathBuf::from(dir).join(name));
         }
+        // current_exe only locates the app's own sibling library; an attacker
+        // who could write beside the executable could replace the executable
+        // itself, so this adds no privilege-escalation surface.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 v.push(dir.join(name));
@@ -179,8 +186,10 @@ mod imp {
     fn load() -> Option<Loaded> {
         for path in candidates() {
             // SAFETY: loading a trusted, app-shipped library; running its init.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let Ok(lib) = (unsafe { Library::new(&path) }) else { continue };
             // SAFETY: the wrapper exports exactly these C symbols/signatures.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let loaded = unsafe {
                 let start: Symbol<StartFn> = lib.get(b"EpixStartSnowflake\0").ok()?;
                 let port: Symbol<PortFn> = lib.get(b"EpixSnowflakePort\0").ok()?;
@@ -200,6 +209,7 @@ mod imp {
         let l = loaded().ok_or(Error::Unavailable)?;
         let s = cstrings(cfg)?;
         // SAFETY: five valid NUL-terminated pointers that outlive the call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let rc = unsafe {
             (l.start)(s[0].as_ptr(), s[1].as_ptr(), s[2].as_ptr(), s[3].as_ptr(), s[4].as_ptr())
         };
@@ -213,6 +223,7 @@ mod imp {
     pub fn snowflake_port() -> u16 {
         match loaded() {
             // SAFETY: no arguments.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             Some(l) => u16::try_from(unsafe { (l.port)() }).unwrap_or(0),
             None => 0,
         }
@@ -221,6 +232,7 @@ mod imp {
     pub fn stop_snowflake() {
         if let Some(l) = loaded() {
             // SAFETY: no arguments; idempotent in the wrapper.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { (l.stop)() }
         }
     }

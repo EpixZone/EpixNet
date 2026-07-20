@@ -31,40 +31,46 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // Windows / Android ship a shared library loaded at runtime.
+    // Windows / Android ship a shared library loaded at runtime; everything else
+    // static-links the archive at build time.
     if matches!(target_os.as_str(), "windows" | "android") {
-        println!("cargo:rustc-cfg=iptproxy_dynamic");
-        let ext = if target_os == "windows" { "dll" } else { "so" };
-        let asset = format!("epix_snowflake-{target}.{ext}");
-        // The runtime filename the loader opens. Android ships it in jniLibs as
-        // `libepix_snowflake.so` (its packaging + dlopen expect the lib prefix);
-        // Windows loads the asset by name from beside the executable.
-        let runtime = if target_os == "android" {
-            "libepix_snowflake.so".to_string()
-        } else {
-            asset.clone()
-        };
-        println!("cargo:rustc-env=IPTPROXY_LIB_FILENAME={runtime}");
-        // Windows fetches the DLL and places it beside the exe (cargo run and the
-        // packaging script copy it on). Android's .so is put in jniLibs by the
-        // build workflow, so nothing to fetch here.
-        if target_os == "windows" {
-            if let Some(lib) = resolve(&rev, &target, &asset, &manifest, &out_dir) {
-                copy_beside_exe(&lib, &out_dir);
-            } else {
-                println!(
-                    "cargo:warning=iptproxy-sys: no epix-iptproxy runtime library for `{target}` \
-                     (rev {rev}); Snowflake reports unavailable until it is shipped beside the \
-                     executable. Set IPTPROXY_LIB_DIR or publish the release."
-                );
-            }
-        }
-        return;
+        link_dynamic(&rev, &target, &target_os, &manifest, &out_dir);
+    } else {
+        link_static(&rev, &target, &target_os, &manifest, &out_dir);
     }
+}
 
-    // macOS / Linux / iOS static-link the archive; it must exist to link.
+/// Windows / Android: the shared library is loaded at runtime, so it need not
+/// exist at build time. Windows fetches the DLL beside the exe; Android's .so is
+/// placed in jniLibs by the build workflow.
+fn link_dynamic(rev: &str, target: &str, target_os: &str, manifest: &Path, out_dir: &Path) {
+    println!("cargo:rustc-cfg=iptproxy_dynamic");
+    let ext = if target_os == "windows" { "dll" } else { "so" };
+    let asset = format!("epix_snowflake-{target}.{ext}");
+    // The runtime filename the loader opens. Android ships it in jniLibs as
+    // `libepix_snowflake.so` (its packaging + dlopen expect the lib prefix);
+    // Windows loads the asset by name from beside the executable.
+    let runtime = if target_os == "android" { "libepix_snowflake.so" } else { asset.as_str() };
+    println!("cargo:rustc-env=IPTPROXY_LIB_FILENAME={runtime}");
+    if target_os != "windows" {
+        return; // Android places its .so via the build workflow.
+    }
+    if let Some(lib) = resolve(rev, target, &asset, manifest, out_dir) {
+        copy_beside_exe(&lib, out_dir);
+    } else {
+        println!(
+            "cargo:warning=iptproxy-sys: no epix-iptproxy runtime library for `{target}` \
+             (rev {rev}); Snowflake reports unavailable until it is shipped beside the \
+             executable. Set IPTPROXY_LIB_DIR or publish the release."
+        );
+    }
+}
+
+/// macOS / Linux / iOS: static-link the archive (it must exist to link). Falls
+/// back to the stub if the archive is unavailable, so the crate still builds.
+fn link_static(rev: &str, target: &str, target_os: &str, manifest: &Path, out_dir: &Path) {
     let asset = format!("epix_snowflake-{target}.a");
-    let Some(archive) = resolve(&rev, &target, &asset, &manifest, &out_dir) else {
+    let Some(archive) = resolve(rev, target, &asset, manifest, out_dir) else {
         println!("cargo:rustc-cfg=iptproxy_stub");
         println!(
             "cargo:warning=iptproxy-sys: no epix-iptproxy archive for `{target}` (rev {rev}); \
@@ -89,7 +95,7 @@ fn main() {
         let _ = std::fs::copy(&linked, profile_dir.join("libepix_snowflake.a"));
     }
     // The Go runtime the archive carries needs these platform libraries.
-    match target_os.as_str() {
+    match target_os {
         "macos" | "ios" => {
             println!("cargo:rustc-link-lib=framework=CoreFoundation");
             println!("cargo:rustc-link-lib=framework=Security");
