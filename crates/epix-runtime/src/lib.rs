@@ -1153,6 +1153,56 @@ async fn bootstrap_tor_with_watchdog(
     }
 }
 
+/// Fetch the current Snowflake rendezvous params from Tor's Moat API - through
+/// the node's Tor SOCKS listener when it is up, so it also works on a censored
+/// link - and persist them into `snowflake.json`'s fetched section. Best-effort:
+/// any failure just leaves the existing params in place.
+#[cfg(all(feature = "tor", feature = "bridges"))]
+async fn refresh_snowflake_params(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    socks_port: Option<u16>,
+) {
+    // The SOCKS listener is bound a little later in `tor_loop`; give it a moment
+    // so the fetch routes through Tor rather than hitting an unbound port.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    state
+        .log("INFO", "Snowflake: refreshing rendezvous params from Tor's Moat API".to_string())
+        .await;
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60));
+    if let Some(port) = socks_port {
+        if let Ok(proxy) = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let Ok(client) = builder.build() else { return };
+    let resp = client
+        .get(epix_tor::bridges::MOAT_BUILTIN_URL)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status());
+    let json = match resp {
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(_) => return,
+        },
+        Err(e) => {
+            state.log("INFO", format!("Snowflake: rendezvous refresh skipped ({e})")).await;
+            return;
+        }
+    };
+    match epix_tor::bridges::persist_fetched(data_dir, &json) {
+        Ok(true) => {
+            state
+                .log("INFO", "Snowflake: refreshed rendezvous params from Tor's Moat API".to_string())
+                .await
+        }
+        Ok(false) => {}
+        Err(e) => state.log("INFO", format!("Snowflake: rendezvous refresh failed ({e})")).await,
+    }
+}
+
 /// Start the in-process Snowflake bridge and build the bootstrap options that
 /// route arti through it: `(guard, opts, attempt_timeout_secs)`. `None` if
 /// Snowflake is unavailable (the caller then keeps trying direct).
@@ -1248,6 +1298,20 @@ async fn tor_loop(
         return;
     };
     state.log("INFO", "Tor: bootstrapped".to_string()).await;
+
+    // Self-heal the Snowflake rendezvous params: now that Tor is up (possibly
+    // via the current params on a censored link), refresh them from Tor's Moat
+    // API through this Tor circuit and persist, so the next start uses a current
+    // set even if the built-in defaults have since rotated. Best-effort, in the
+    // background.
+    #[cfg(feature = "bridges")]
+    {
+        let state = state.clone();
+        let data_dir = data_dir.clone();
+        tokio::spawn(async move {
+            refresh_snowflake_params(&state, &data_dir, socks_port).await;
+        });
+    }
 
     // Route peer dials through Tor: onion peers always, everything in Always
     // mode. Wrap the existing transport type so the worker/connection code is

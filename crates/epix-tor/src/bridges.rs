@@ -71,9 +71,20 @@ fn load_overrides(data_dir: &Path) -> serde_json::Value {
     }
 }
 
-/// A trimmed string field from the overrides object, or "" if absent/not a string.
+/// A trimmed string field from an object, or "" if absent/not a string.
 fn field(f: &serde_json::Value, key: &str) -> String {
     f.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// Resolve an override field by precedence: the user's own top-level value, then
+/// the auto-fetched value (`fetched.<key>`, refreshed from Tor's Moat API), then
+/// "" so the caller applies the built-in default.
+fn resolved(f: &serde_json::Value, key: &str) -> String {
+    let user = field(f, key);
+    if !user.is_empty() {
+        return user;
+    }
+    f.get("fetched").map(|x| field(x, key)).unwrap_or_default()
 }
 
 /// Trimmed `over` if non-empty, else `default`.
@@ -81,10 +92,10 @@ fn or_default(over: &str, default: &str) -> String {
     if over.is_empty() { default.to_string() } else { over.to_string() }
 }
 
-/// The bridge line to hand arti: the overrides file's `bridge`, else the
-/// built-in default fingerprint.
+/// The bridge line to hand arti: the overrides file's `bridge` (user or fetched),
+/// else the built-in default fingerprint.
 pub fn bridge_line(data_dir: &Path) -> String {
-    or_default(&field(&load_overrides(data_dir), "bridge"), SNOWFLAKE_BRIDGE_LINE)
+    or_default(&resolved(&load_overrides(data_dir), "bridge"), SNOWFLAKE_BRIDGE_LINE)
 }
 
 /// Resolve the rendezvous config from the built-in defaults plus any overrides
@@ -93,13 +104,81 @@ fn snowflake_params(data_dir: &Path) -> iptproxy_sys::SnowflakeConfig {
     let f = load_overrides(data_dir);
     iptproxy_sys::SnowflakeConfig {
         state_dir: data_dir.join("snowflake").to_string_lossy().into_owned(),
-        ice_servers: or_default(&field(&f, "ice_servers"), DEFAULT_ICE_SERVERS),
-        broker_url: or_default(&field(&f, "broker_url"), DEFAULT_BROKER_URL),
-        front_domains: or_default(&field(&f, "front_domains"), DEFAULT_FRONT_DOMAINS),
+        ice_servers: or_default(&resolved(&f, "ice_servers"), DEFAULT_ICE_SERVERS),
+        broker_url: or_default(&resolved(&f, "broker_url"), DEFAULT_BROKER_URL),
+        front_domains: or_default(&resolved(&f, "front_domains"), DEFAULT_FRONT_DOMAINS),
         // Off unless explicitly set: the public deployment dropped AMP cache and
         // it now answers 421, which only slows rendezvous down.
-        ampcache: field(&f, "ampcache"),
+        ampcache: resolved(&f, "ampcache"),
     }
+}
+
+/// Tor's Moat "built-in bridges" endpoint: current Snowflake lines as JSON. A
+/// censored node fetches it over the Tor circuit it just built (via the current
+/// params), so the params self-heal for next time without a new release.
+pub const MOAT_BUILTIN_URL: &str = "https://bridges.torproject.org/moat/circumvention/builtin";
+
+/// Pull the primary Snowflake line out of the Moat `builtin` JSON into the
+/// `(bridge, url, fronts, ice)` we persist. Prefers the `192.0.2.3` bridge (our
+/// default fingerprint); needs a broker url + fronts to be worth keeping.
+fn parse_moat_snowflake(json: &str) -> Option<(String, String, String, String)> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = v.get("snowflake")?.as_array()?;
+    let lines: Vec<&str> = arr.iter().filter_map(|l| l.as_str()).collect();
+    let line = *lines.iter().find(|l| l.contains("192.0.2.3")).or_else(|| lines.first())?;
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    if toks.len() < 3 || toks[0] != "snowflake" {
+        return None;
+    }
+    let bridge = format!("{} {} {}", toks[0], toks[1], toks[2]);
+    let (mut url, mut fronts, mut ice) = (String::new(), String::new(), String::new());
+    for t in &toks[3..] {
+        if let Some(x) = t.strip_prefix("url=") {
+            url = x.to_string();
+        } else if let Some(x) = t.strip_prefix("fronts=") {
+            fronts = x.to_string();
+        } else if let Some(x) = t.strip_prefix("ice=") {
+            ice = x.to_string();
+        }
+    }
+    if url.is_empty() || fronts.is_empty() {
+        return None;
+    }
+    Some((bridge, url, fronts, ice))
+}
+
+/// Parse Moat `builtin` JSON and persist the current Snowflake params into
+/// `snowflake.json`'s `fetched` section, leaving the user's own top-level
+/// overrides untouched. Returns whether the stored values changed.
+pub fn persist_fetched(data_dir: &Path, moat_json: &str) -> Result<bool> {
+    let (bridge, url, fronts, ice) = parse_moat_snowflake(moat_json)
+        .ok_or_else(|| Error::Protocol("moat: no usable snowflake line".into()))?;
+    let path = overrides_path(data_dir);
+    let mut root = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
+        Err(_) => serde_json::from_str(OVERRIDES_TEMPLATE).unwrap_or_else(|_| serde_json::json!({})),
+    };
+    let fetched = serde_json::json!({
+        "_comment": "Auto-refreshed from Tor's Moat API; fill in the blank fields above to override.",
+        "bridge": bridge,
+        "broker_url": url,
+        "front_domains": fronts,
+        "ice_servers": ice,
+    });
+    // No timestamp, so this only rewrites when the params actually change.
+    let changed = root.get("fetched") != Some(&fetched);
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert("fetched".to_string(), fetched);
+    }
+    if changed {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let body = serde_json::to_string_pretty(&root)
+            .map_err(|e| Error::Protocol(format!("moat: serialize: {e}")))?;
+        std::fs::write(&path, body).map_err(|e| Error::Protocol(format!("moat: write: {e}")))?;
+    }
+    Ok(changed)
 }
 
 /// A running in-process Snowflake. Dropping it stops the transport.
@@ -160,4 +239,31 @@ pub fn apply_bridge(
         );
     builder.bridges().transports().push(transport);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_moat_snowflake_line() {
+        let json = r#"{"snowflake":[
+          "snowflake 192.0.2.4:80 8838 fingerprint=8838 url=https://other/ fronts=a.com ice=stun:x:1",
+          "snowflake 192.0.2.3:80 2B280B23 fingerprint=2B280B23 url=https://1098762253.rsc.cdn77.org/ fronts=app.datapacket.com,www.datapacket.com ice=stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478 utls-imitate=hellorandomizedalpn"
+        ]}"#;
+        let (bridge, url, fronts, ice) = parse_moat_snowflake(json).expect("parse");
+        // Prefers the 192.0.2.3 bridge (our default fingerprint), not the first line.
+        assert_eq!(bridge, "snowflake 192.0.2.3:80 2B280B23");
+        assert_eq!(url, "https://1098762253.rsc.cdn77.org/");
+        assert_eq!(fronts, "app.datapacket.com,www.datapacket.com");
+        assert!(ice.starts_with("stun:stun.epygi.com:3478,"));
+    }
+
+    #[test]
+    fn rejects_line_without_broker_or_fronts() {
+        let json = r#"{"snowflake":["snowflake 192.0.2.3:80 FP fingerprint=FP"]}"#;
+        assert!(parse_moat_snowflake(json).is_none());
+        assert!(parse_moat_snowflake("not json").is_none());
+        assert!(parse_moat_snowflake(r#"{"obfs4":[]}"#).is_none());
+    }
 }

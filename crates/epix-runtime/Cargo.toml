@@ -25,7 +25,7 @@ rmpv = "1"
 socket2 = "0.6"
 igd-next = { version = "0.17", features = ["aio_tokio"], optional = true }
 # Dial-back port checking (the Python client's PeerPortchecker services).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"], optional = true }
 
 [features]
 default = ["local-discovery", "inbound-seeding"]
@@ -40,7 +40,7 @@ inbound-seeding = ["dep:igd-next", "dep:reqwest"]
 tor = ["dep:epix-tor"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. Implies
 # tor; forwards to epix-tor's bridges feature (which links IPtProxy).
-bridges = ["tor", "epix-tor/bridges"]
+bridges = ["tor", "epix-tor/bridges", "dep:reqwest"]
 # I2P support (External router mode): dial + host .b32.i2p peers via a running
 # router's SAM bridge. Light - no embedded router, no reseeder. Mobile uses
 # this.
