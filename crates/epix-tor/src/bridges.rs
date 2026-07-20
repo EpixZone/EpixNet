@@ -22,18 +22,45 @@ use std::time::Duration;
 pub const SNOWFLAKE_BRIDGE_LINE: &str =
     "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72";
 
-/// Current Tor-Browser Snowflake rendezvous defaults (plan R2: verify + allow
-/// config override at ship time; these rotate). `state_dir` is where the
-/// transport keeps its state, under the node data dir.
-fn default_snowflake_params(data_dir: &Path) -> iptproxy_sys::SnowflakeConfig {
+/// Built-in Tor-Browser Snowflake rendezvous defaults, tracking Tor Browser's
+/// current set (Bug 41609: CDN77 domain-fronting - the earlier Fastly front
+/// through `foursquare.com` stopped working, and the AMP-cache method was
+/// dropped). These rotate, so [`SnowflakeOverrides`] lets a node replace any of
+/// them from config without waiting for a new release.
+const DEFAULT_BROKER_URL: &str = "https://1098762253.rsc.cdn77.org/";
+const DEFAULT_FRONT_DOMAINS: &str = "app.datapacket.com,www.datapacket.com";
+const DEFAULT_ICE_SERVERS: &str = "stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,\
+stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.nextcloud.com:3478,\
+stun:stun.bethesda.net:3478,stun:stun.nextcloud.com:443";
+
+/// Operator overrides for the Snowflake rendezvous parameters, read from node
+/// config so a rotation of the public defaults can be applied without a rebuild.
+/// A blank field falls back to the built-in default; `ampcache` defaults to off.
+#[derive(Debug, Default, Clone)]
+pub struct SnowflakeOverrides {
+    pub broker_url: String,
+    pub front_domains: String,
+    pub ice_servers: String,
+    pub ampcache: String,
+}
+
+/// Trimmed `over` if non-empty, else `default`.
+fn or_default(over: &str, default: &str) -> String {
+    let o = over.trim();
+    if o.is_empty() { default.to_string() } else { o.to_string() }
+}
+
+/// Resolve the rendezvous config from the defaults plus any operator overrides.
+/// `state_dir` is where the transport keeps its state, under the node data dir.
+fn snowflake_params(data_dir: &Path, ov: &SnowflakeOverrides) -> iptproxy_sys::SnowflakeConfig {
     iptproxy_sys::SnowflakeConfig {
         state_dir: data_dir.join("snowflake").to_string_lossy().into_owned(),
-        ice_servers: "stun:stun.l.google.com:19302,stun:stun.antisip.com:3478,\
-stun:stun.bluesip.net:3478,stun:stun.voip.blackberry.com:3478"
-            .to_string(),
-        broker_url: "https://snowflake-broker.torproject.net.global.prod.fastly.net/".to_string(),
-        front_domains: "foursquare.com,github.githubassets.com".to_string(),
-        ampcache: "https://cdn.ampproject.org/".to_string(),
+        ice_servers: or_default(&ov.ice_servers, DEFAULT_ICE_SERVERS),
+        broker_url: or_default(&ov.broker_url, DEFAULT_BROKER_URL),
+        front_domains: or_default(&ov.front_domains, DEFAULT_FRONT_DOMAINS),
+        // Off unless explicitly set: the public deployment dropped AMP cache and
+        // it now answers 421, which only slows rendezvous down.
+        ampcache: ov.ampcache.trim().to_string(),
     }
 }
 
@@ -52,8 +79,8 @@ impl Drop for Snowflake {
 /// running guard (hold it for as long as Tor should route through Snowflake)
 /// and the port arti should dial. Errors if IPtProxy is unavailable in this
 /// build (the stub) or never opens a port.
-pub async fn start_snowflake(data_dir: &Path) -> Result<(Snowflake, u16)> {
-    let params = default_snowflake_params(data_dir);
+pub async fn start_snowflake(data_dir: &Path, ov: &SnowflakeOverrides) -> Result<(Snowflake, u16)> {
+    let params = snowflake_params(data_dir, ov);
     iptproxy_sys::start_snowflake(&params)
         .map_err(|e| Error::Protocol(format!("snowflake start: {e}")))?;
     let guard = Snowflake { _private: () };
