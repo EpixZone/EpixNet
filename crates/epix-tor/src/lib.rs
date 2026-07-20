@@ -28,6 +28,20 @@ use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::RunningOnionService;
 use tor_proto::stream::IncomingStreamRequest;
 
+#[cfg(feature = "bridges")]
+pub mod bridges;
+
+/// Options for [`Tor::bootstrap`]. A struct so callers that do not use bridges
+/// pass `&BootstrapOpts::default()` without cfg-forking on their side.
+#[derive(Default)]
+pub struct BootstrapOpts {
+    /// Route the guard channel through a Snowflake bridge reached via a local
+    /// IPtProxy SOCKS port: `(arti bridge line, socks_port)`. Present only under
+    /// the `bridges` feature; `None` means dial relays directly, as normal.
+    #[cfg(feature = "bridges")]
+    pub bridge: Option<(String, u16)>,
+}
+
 /// How much of our traffic rides Tor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TorMode {
@@ -241,18 +255,51 @@ impl Tor {
     /// Bootstrap a Tor client, keeping its state + directory cache under
     /// `data_dir` (`<data>/tor/state`, `<data>/tor/cache`) so later starts
     /// are fast. Returns once the client is usable.
-    pub async fn bootstrap(data_dir: &Path) -> Result<Self> {
+    pub async fn bootstrap(data_dir: &Path, opts: &BootstrapOpts) -> Result<Self> {
+        // `opts` is only read under the `bridges` feature.
+        #[cfg(not(feature = "bridges"))]
+        let _ = opts;
         install_crypto_provider();
         let state = data_dir.join("tor").join("state");
         let cache = data_dir.join("tor").join("cache");
         clear_poisoned_guard_state(&state);
-        let config = TorClientConfigBuilder::from_directories(state, cache)
+        // `mut` is only needed under the `bridges` feature (apply_bridge below).
+        #[cfg_attr(not(feature = "bridges"), allow(unused_mut))]
+        let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+        // Route the guard channel through Snowflake when a bridge is configured
+        // (censored networks); otherwise arti dials relays directly as before.
+        #[cfg(feature = "bridges")]
+        if let Some((bridge_line, socks_port)) = &opts.bridge {
+            bridges::apply_bridge(&mut builder, bridge_line, *socks_port)?;
+        }
+        let config = builder
             .build()
             .map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
         let client = TorClient::create_bootstrapped(config)
             .await
             .map_err(|e| Error::Protocol(format!("tor bootstrap: {e}")))?;
         Ok(Self { client })
+    }
+
+    /// Reconfigure the live client to start (or stop) routing its guard channel
+    /// through a Snowflake bridge, with no restart and no second client.
+    /// `Some((line, socks_port))` installs the bridge + unmanaged PT transport;
+    /// `None` returns to direct guards. Arti retires the affected circuits so new
+    /// ones build over the new path, while the onion service and SOCKS listener
+    /// keep running on the same client.
+    #[cfg(feature = "bridges")]
+    pub fn reconfigure_bridge(&self, data_dir: &Path, bridge: Option<(String, u16)>) -> Result<()> {
+        let state = data_dir.join("tor").join("state");
+        let cache = data_dir.join("tor").join("cache");
+        let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+        if let Some((line, port)) = &bridge {
+            bridges::apply_bridge(&mut builder, line, *port)?;
+        }
+        let config = builder.build().map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
+        self.client
+            .reconfigure(&config, arti_client::config::Reconfigure::WarnOnFailures)
+            .map_err(|e| Error::Protocol(format!("tor reconfigure: {e}")))?;
+        Ok(())
     }
 
     /// The peer transport over this Tor client. With `route_all`, plain IP
@@ -473,6 +520,12 @@ impl Transport for MixedTransport {
             (PeerAddr::Onion { .. }, None, _) => {
                 Err(Error::Protocol("onion peer but Tor is disabled".into()))
             }
+            // Always mode with no Tor transport (the startup or re-bootstrap
+            // window) fails closed: never fall through to a clearnet dial that
+            // would leak the real IP the mode exists to hide.
+            (_, None, TorMode::Always) => {
+                Err(Error::Protocol("Always mode: Tor is not routed yet".into()))
+            }
             _ => self.tcp.dial(addr).await,
         }
     }
@@ -679,7 +732,7 @@ mod tests {
     #[ignore]
     async fn live_bootstrap_and_onion_dial() {
         let dir = tempfile::tempdir().unwrap();
-        let tor = Tor::bootstrap(dir.path()).await.expect("bootstrap");
+        let tor = Tor::bootstrap(dir.path(), &BootstrapOpts::default()).await.expect("bootstrap");
         // DuckDuckGo's v3 onion, port 80.
         let onion = PeerAddr::Onion {
             host: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad".into(),
@@ -712,7 +765,7 @@ mod tests {
     #[ignore]
     async fn live_onion_service_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let tor = Tor::bootstrap(dir.path()).await.expect("bootstrap");
+        let tor = Tor::bootstrap(dir.path(), &BootstrapOpts::default()).await.expect("bootstrap");
         let (_svc, host, mut inbound) =
             tor.launch_onion_service("epix-test", 26552).expect("launch");
         assert_eq!(host.len(), 56, "v3 onion host: {host}");

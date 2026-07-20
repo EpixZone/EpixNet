@@ -57,6 +57,10 @@ benchmark = ["dep:sha3"]
 # bit in `serverInfo` so xites feature-detect it. Forwarded from `epix-node`'s
 # `bittorrent` feature; off on iOS (so no BT code is in that binary).
 bittorrent = ["dep:epix-bt"]
+# Tor bridges (Snowflake) present in this build. Only activates the Config-page
+# "Use Tor bridges" toggle (and the matching serverInfo flag); the actual
+# transport lives in epix-tor. Forwarded from epix-node's `bridges` feature.
+bridges = []
 
 [dev-dependencies]
 epix-reticulum = { path = "../epix-reticulum" }

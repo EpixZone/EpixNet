@@ -33,6 +33,10 @@ thiserror = "2"
 # use rustls instead of OpenSSL. Users can still switch it off in Config.
 default = ["tor", "i2p-embedded"]
 tor = ["epix-node/tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. NOT in
+# `default`: only opted-in builds carry the IPtProxy (Go) dependency. Android
+# and iOS opt in via their build scripts once the artifact is vendored.
+bridges = ["epix-node/bridges"]
 i2p = ["epix-node/i2p"]
 i2p-embedded = ["i2p", "epix-node/i2p-embedded", "epix-node/i2p-autostart"]
 # BitTorrent bridge. Deliberately NOT in `default`: the Android build script

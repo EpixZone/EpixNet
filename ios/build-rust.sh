@@ -42,7 +42,7 @@ rustup target add "$TRIPLE" >/dev/null 2>&1 || true
 # add `bittorrent` here - the Android build (docs/install/android.md) is where
 # it belongs. CI's "Assert no BitTorrent in the iOS profile" step enforces this.
 cargo build -p epix-ffi --release --target "$TRIPLE" \
-  --no-default-features --features tor,i2p-embedded
+  --no-default-features --features tor,i2p-embedded,bridges
 
 # Swift bindings, generated from the metadata baked into the built library.
 cargo run -q -p epix-ffi --features cli --bin uniffi-bindgen -- \

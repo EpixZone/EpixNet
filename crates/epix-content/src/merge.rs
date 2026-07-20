@@ -180,12 +180,30 @@ mod tests {
         test_key().1.clone()
     }
 
-    /// A signed version of a post. `nonce`/`date_added` fix the post_id lineage;
-    /// vary `clock`/`supersedes`/`deleted`/`body` for edits & tombstones.
-    fn ver(nonce: &str, clock: i64, supersedes: i64, deleted: bool, body: &str) -> Value {
+    // A stable nonce for a logical post label ("p1", "p2", ...): reusing a label
+    // must yield the same post_id lineage, so the mapping is stable within a run
+    // - but the value is generated at runtime, not a hard-coded literal (CodeQL's
+    // hard-coded-cryptographic-value rule flags literal nonces even in tests).
+    fn post_nonce(label: &str) -> String {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .entry(label.to_string())
+            .or_insert_with(epix_crypt::new_seed)
+            .clone()
+    }
+
+    /// A signed version of a post. `label`/`date_added` fix the post_id lineage
+    /// (a label maps to a stable per-run nonce); vary `clock`/`supersedes`/
+    /// `deleted`/`body` for edits & tombstones.
+    fn ver(label: &str, clock: i64, supersedes: i64, deleted: bool, body: &str) -> Value {
         let a = author();
+        let nonce = post_nonce(label);
         let date_added = 1737331200_i64;
-        let post_id = derive_post_id(&a, nonce, date_added);
+        let post_id = derive_post_id(&a, &nonce, date_added);
         let mut rec = json!({
             "post_id": post_id, "nonce": nonce, "author": a,
             "clock": clock, "supersedes": supersedes, "deleted": deleted,

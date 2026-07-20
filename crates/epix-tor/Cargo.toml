@@ -42,6 +42,16 @@ tracing = "0.1"
 # crashes at launch on any Mac without it. The "static" feature compiles lzma
 # from the vendored source into the binary instead.
 liblzma-sys = { version = "0.4", features = ["static"] }
+# Only under the `bridges` feature: run Snowflake in-process (no subprocess) so
+# arti can reach a bridge on a censored network. Optional so a plain `tor` build
+# never pulls the Go library.
+iptproxy-sys = { path = "../iptproxy-sys", optional = true }
+
+[features]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Enables
+# arti's bridge + pluggable-transport support and links IPtProxy. Off by default:
+# only opted-in builds carry the foreign dependency.
+bridges = ["arti-client/bridge-client", "arti-client/pt-client", "dep:iptproxy-sys"]
 
 [dev-dependencies]
 # Independent Ed25519 verifier for the OnionKey signing test.

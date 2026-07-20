@@ -28,12 +28,15 @@ tempfile = "3"
 # Desktop bundles the auth/login plugins that a mobile build leaves off (the
 # phone UI is already local to the device). Build a mobile node with
 # `--no-default-features`.
-default = ["desktop", "tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery", "bittorrent"]
+default = ["desktop", "tor", "bridges", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery", "bittorrent"]
 desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
 # BitTorrent bridge - on for the desktop/server build.
 bittorrent = ["epix-node/bittorrent"]
 # In-process Tor (Arti): onion dialing + hosting + SOCKS listener for the shell.
 tor = ["epix-node/tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Off by
+# default; a bridges-enabled desktop build opts in explicitly.
+bridges = ["epix-node/bridges"]
 i2p = ["epix-node/i2p"]
 mesh = ["epix-node/mesh"]
 # Desktop: compile the embedded router in AND auto-enable it on first run.

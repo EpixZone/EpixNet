@@ -69,5 +69,8 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 winresource = "0.1"
 
 [features]
-default = ["tor"]
+default = ["tor", "bridges"]
 tor = ["epix-node/tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Off by
+# default; a bridges-enabled desktop build opts in explicitly.
+bridges = ["epix-node/bridges"]

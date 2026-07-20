@@ -1,0 +1,19 @@
+[package]
+name = "iptproxy-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal FFI to the epix-iptproxy Snowflake wrapper: run Snowflake in-process, exposing a local SOCKS port for arti to dial bridges through. No subprocess, so it works on iOS."
+# `links` reserves the native library name so at most one crate in the graph
+# links it, and lets build.rs pass metadata to dependents.
+links = "epix_snowflake"
+
+[dependencies]
+# Runtime dynamic loading of the shared library on the platforms that ship one
+# (Windows, Android). Static-linked platforms (macOS, Linux, iOS) never use it.
+[target.'cfg(any(target_os = "windows", target_os = "android"))'.dependencies]
+libloading = "0.8"
+
+[build-dependencies]
+# Download the pinned epix-iptproxy release asset for the build target. rustls,
+# not native-tls, to match the rest of the tree (no OpenSSL on cross builds).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

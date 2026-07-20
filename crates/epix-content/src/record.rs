@@ -194,12 +194,18 @@ mod tests {
         test_key().1.clone()
     }
 
+    // A nonce generated at runtime (not a hard-coded literal): CodeQL's
+    // hard-coded-cryptographic-value rule flags literal nonces even in tests.
+    fn test_nonce() -> String {
+        epix_crypt::new_seed()
+    }
+
     /// Build a live record for `author`, sign it (dbl scheme) with `priv_hex`,
     /// and embed the signature. `clock` defaults sane.
     fn signed_record(author: &str, priv_hex: &str, clock: i64) -> Value {
-        let nonce = "9f3a1c77e0b4426d0000000000000000";
+        let nonce = test_nonce();
         let date_added = 1737331200_i64;
-        let post_id = derive_post_id(author, nonce, date_added);
+        let post_id = derive_post_id(author, &nonce, date_added);
         let mut rec = json!({
             "post_id": post_id,
             "nonce": nonce,
@@ -227,14 +233,15 @@ mod tests {
 
     #[test]
     fn derive_post_id_is_deterministic_and_in_range() {
-        let a = derive_post_id("epix1abc", "nonce123", 1737331200);
-        let b = derive_post_id("epix1abc", "nonce123", 1737331200);
+        let n = test_nonce();
+        let a = derive_post_id("epix1abc", &n, 1737331200);
+        let b = derive_post_id("epix1abc", &n, 1737331200);
         assert_eq!(a, b, "same inputs -> same id");
         assert!(a >= 0 && a < (1_i64 << 53), "id fits in 53 bits: {a}");
         // Different nonce -> different id.
-        assert_ne!(a, derive_post_id("epix1abc", "nonce124", 1737331200));
+        assert_ne!(a, derive_post_id("epix1abc", &test_nonce(), 1737331200));
         // Different author -> different id.
-        assert_ne!(a, derive_post_id("epix1abd", "nonce123", 1737331200));
+        assert_ne!(a, derive_post_id("epix1abd", &n, 1737331200));
     }
 
     #[test]
@@ -247,10 +254,11 @@ mod tests {
     #[test]
     fn verify_accepts_a_keccak_signed_record() {
         let author = author_addr();
-        let nonce = "abcd";
+        let nonce = test_nonce();
         let date_added = 1737331200_i64;
+        let post_id = derive_post_id(&author, &nonce, date_added);
         let mut rec = json!({
-            "post_id": derive_post_id(&author, nonce, date_added),
+            "post_id": post_id,
             "nonce": nonce, "author": author, "clock": 100_i64, "supersedes": 0,
             "deleted": false, "body": "k", "date_added": date_added,
         });
@@ -322,10 +330,11 @@ mod tests {
     #[test]
     fn verify_rejects_a_tombstone_with_a_body() {
         let author = author_addr();
-        let nonce = "ff";
+        let nonce = test_nonce();
         let date_added = 1737331200_i64;
+        let post_id = derive_post_id(&author, &nonce, date_added);
         let mut rec = json!({
-            "post_id": derive_post_id(&author, nonce, date_added),
+            "post_id": post_id,
             "nonce": nonce, "author": author, "clock": 100_i64, "supersedes": 0,
             "deleted": true, "body": "should be empty", "date_added": date_added,
         });
