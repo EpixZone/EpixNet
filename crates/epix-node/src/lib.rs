@@ -1893,6 +1893,11 @@ async fn serve(
         (enabled, peers, listen)
     };
 
+    // Route Tor through an in-process Snowflake bridge when the operator opts in
+    // (Config page "Use Tor bridges"), for networks that block direct Tor.
+    #[cfg(feature = "bridges")]
+    let tor_use_bridges = !offline && state.config_bool("tor_use_bridges", false).await;
+
     let runtime_config = epix_runtime::RuntimeConfig {
         fileserver_port: if offline { None } else { fileserver_port },
         offline,
@@ -1900,6 +1905,8 @@ async fn serve(
         tor_mode,
         #[cfg(feature = "tor")]
         tor_socks_port: Some(43111),
+        #[cfg(feature = "bridges")]
+        tor_use_bridges,
         #[cfg(feature = "i2p")]
         i2p_mode,
         #[cfg(feature = "i2p")]

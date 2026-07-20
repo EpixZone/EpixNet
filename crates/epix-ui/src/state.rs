@@ -139,6 +139,11 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "enable",
         "select:Disable=disable|Enable=enable|Always=always",
     ),
+    // Active only in a bridges-enabled build (Snowflake linked); otherwise shown
+    // disabled with a coming-soon note, as before.
+    #[cfg(feature = "bridges")]
+    ("Network", "tor_use_bridges", "Use Tor bridges (Snowflake; for censored networks)", "false", "bool"),
+    #[cfg(not(feature = "bridges"))]
     ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
     (
         "Network",
@@ -254,6 +259,7 @@ pub const CONFIG_RESTART_KEYS: &[&str] = &[
     "fileserver_ip_type",
     "fileserver_port",
     "tor",
+    "tor_use_bridges",
     "i2p",
     "i2p_sam_port",
     "mesh",
@@ -6827,6 +6833,12 @@ impl AppState {
             m.entry("use_system_theme").or_insert(json!(true));
         }
         let connections = self.connection_stats().await.total;
+        // Whether this node is set to route Tor through a Snowflake bridge, so
+        // xites can feature-detect it. Only meaningful in a bridges build.
+        #[cfg(feature = "bridges")]
+        let tor_use_bridges = self.config_bool("tor_use_bridges", false).await;
+        #[cfg(not(feature = "bridges"))]
+        let tor_use_bridges = false;
         let plugins = self.plugins().await;
         // The multiuser feature compiles the code in; the PLUGIN toggle (off
         // by default) decides at runtime whether the dashboard sees it.
@@ -6890,7 +6902,7 @@ impl AppState {
             "tor_enabled": tor_enabled,
             "tor_status": tor_status,
             "tor_has_meek_bridges": false,
-            "tor_use_bridges": false,
+            "tor_use_bridges": tor_use_bridges,
             "network_status": self.network_status().await,
             // Capability flags for xites to feature-detect (never assume a
             // capability exists from the platform string). `bittorrent` is

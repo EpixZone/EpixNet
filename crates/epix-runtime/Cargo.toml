@@ -38,6 +38,9 @@ inbound-seeding = ["dep:igd-next", "dep:reqwest"]
 # In-process Tor (Arti): dial .onion peers, host an onion service for inbound,
 # and a local SOCKS listener for the browser shells. On all platforms.
 tor = ["dep:epix-tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Implies
+# tor; forwards to epix-tor's bridges feature (which links IPtProxy).
+bridges = ["tor", "epix-tor/bridges"]
 # I2P support (External router mode): dial + host .b32.i2p peers via a running
 # router's SAM bridge. Light - no embedded router, no reseeder. Mobile uses
 # this.

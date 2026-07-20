@@ -28,6 +28,20 @@ use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::RunningOnionService;
 use tor_proto::stream::IncomingStreamRequest;
 
+#[cfg(feature = "bridges")]
+pub mod bridges;
+
+/// Options for [`Tor::bootstrap`]. A struct so callers that do not use bridges
+/// pass `&BootstrapOpts::default()` without cfg-forking on their side.
+#[derive(Default)]
+pub struct BootstrapOpts {
+    /// Route the guard channel through a Snowflake bridge reached via a local
+    /// IPtProxy SOCKS port: `(arti bridge line, socks_port)`. Present only under
+    /// the `bridges` feature; `None` means dial relays directly, as normal.
+    #[cfg(feature = "bridges")]
+    pub bridge: Option<(String, u16)>,
+}
+
 /// How much of our traffic rides Tor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TorMode {
@@ -241,12 +255,22 @@ impl Tor {
     /// Bootstrap a Tor client, keeping its state + directory cache under
     /// `data_dir` (`<data>/tor/state`, `<data>/tor/cache`) so later starts
     /// are fast. Returns once the client is usable.
-    pub async fn bootstrap(data_dir: &Path) -> Result<Self> {
+    pub async fn bootstrap(data_dir: &Path, opts: &BootstrapOpts) -> Result<Self> {
+        // `opts` is only read under the `bridges` feature.
+        #[cfg(not(feature = "bridges"))]
+        let _ = opts;
         install_crypto_provider();
         let state = data_dir.join("tor").join("state");
         let cache = data_dir.join("tor").join("cache");
         clear_poisoned_guard_state(&state);
-        let config = TorClientConfigBuilder::from_directories(state, cache)
+        let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+        // Route the guard channel through Snowflake when a bridge is configured
+        // (censored networks); otherwise arti dials relays directly as before.
+        #[cfg(feature = "bridges")]
+        if let Some((bridge_line, socks_port)) = &opts.bridge {
+            bridges::apply_bridge(&mut builder, bridge_line, *socks_port)?;
+        }
+        let config = builder
             .build()
             .map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
         let client = TorClient::create_bootstrapped(config)
@@ -679,7 +703,7 @@ mod tests {
     #[ignore]
     async fn live_bootstrap_and_onion_dial() {
         let dir = tempfile::tempdir().unwrap();
-        let tor = Tor::bootstrap(dir.path()).await.expect("bootstrap");
+        let tor = Tor::bootstrap(dir.path(), &BootstrapOpts::default()).await.expect("bootstrap");
         // DuckDuckGo's v3 onion, port 80.
         let onion = PeerAddr::Onion {
             host: "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad".into(),
@@ -712,7 +736,7 @@ mod tests {
     #[ignore]
     async fn live_onion_service_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let tor = Tor::bootstrap(dir.path()).await.expect("bootstrap");
+        let tor = Tor::bootstrap(dir.path(), &BootstrapOpts::default()).await.expect("bootstrap");
         let (_svc, host, mut inbound) =
             tor.launch_onion_service("epix-test", 26552).expect("launch");
         assert_eq!(host.len(), 56, "v3 onion host: {host}");

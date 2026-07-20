@@ -1,0 +1,12 @@
+[package]
+name = "iptproxy-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal FFI to IPtProxy: run Snowflake (and other pluggable transports) in-process, exposing a local SOCKS port for arti to dial bridges through. No subprocess, so it works on iOS."
+# `links` reserves the native library name so at most one crate in the graph
+# links IPtProxy, and lets build.rs pass metadata to dependents.
+links = "IPtProxy"
+
+[dependencies]
+
+[build-dependencies]

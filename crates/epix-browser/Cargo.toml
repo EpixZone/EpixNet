@@ -71,3 +71,6 @@ winresource = "0.1"
 [features]
 default = ["tor"]
 tor = ["epix-node/tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Off by
+# default; a bridges-enabled desktop build opts in explicitly.
+bridges = ["epix-node/bridges"]

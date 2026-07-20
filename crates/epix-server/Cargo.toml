@@ -34,6 +34,9 @@ desktop = ["epix-ui/ui-password", "epix-ui/multiuser", "epix-ui/benchmark"]
 bittorrent = ["epix-node/bittorrent"]
 # In-process Tor (Arti): onion dialing + hosting + SOCKS listener for the shell.
 tor = ["epix-node/tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Off by
+# default; a bridges-enabled desktop build opts in explicitly.
+bridges = ["epix-node/bridges"]
 i2p = ["epix-node/i2p"]
 mesh = ["epix-node/mesh"]
 # Desktop: compile the embedded router in AND auto-enable it on first run.

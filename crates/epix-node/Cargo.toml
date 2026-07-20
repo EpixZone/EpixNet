@@ -37,6 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [features]
 default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]
 tor = ["epix-runtime/tor"]
+# In-process Tor pluggable transports (Snowflake) for censored networks. Off by
+# default; forwards to the runtime and activates the Config-page toggle.
+bridges = ["tor", "epix-runtime/bridges", "epix-ui/bridges"]
 i2p = ["epix-runtime/i2p"]
 mesh = ["epix-runtime/mesh"]
 # BitTorrent bridge (desktop + Android). NOT in the mobile FFI default; the
