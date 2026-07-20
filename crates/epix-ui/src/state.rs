@@ -142,7 +142,7 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     // Active only in a bridges-enabled build (Snowflake linked); otherwise shown
     // disabled with a coming-soon note, as before.
     #[cfg(feature = "bridges")]
-    ("Network", "tor_use_bridges", "Use Tor bridges (Snowflake; for censored networks)", "false", "bool"),
+    ("Network", "tor_use_bridges", "Use Tor bridges (Snowflake; for censored networks; restart EpixNet to apply)", "false", "bool"),
     #[cfg(not(feature = "bridges"))]
     ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
     (
