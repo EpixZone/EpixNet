@@ -103,6 +103,29 @@ fn unit_file_class(
     Some(is_optional)
 }
 
+/// Apply a `sign` `extend` map onto a content.json object: every key is added
+/// only when missing (cert fields), EXCEPT `files_merged`, which is UNIONED -
+/// an app that declares a SECOND merge file later must get it added, not
+/// skipped (a skipped declaration would be signed as a hashed last-writer-wins
+/// file, the exact bug the merge class prevents).
+fn apply_extend(map: &mut serde_json::Map<String, Value>, extend: &serde_json::Map<String, Value>) {
+    for (key, val) in extend {
+        if key == "files_merged" {
+            let dst =
+                map.entry("files_merged").or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let (Some(dst), Some(src)) = (dst.as_object_mut(), val.as_object()) {
+                for (k, v) in src {
+                    dst.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            continue;
+        }
+        if map.get(key).map(|v| v.is_null()).unwrap_or(true) {
+            map.insert(key.clone(), val.clone());
+        }
+    }
+}
+
 /// One entry from content.json `files`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -692,27 +715,7 @@ impl Xite {
         let map = content
             .as_object_mut()
             .ok_or_else(|| Error::Protocol("content.json is not a JSON object".into()))?;
-        for (key, val) in extend {
-            // files_merged is UNIONED, not skip-if-present: an app that adds a
-            // SECOND merge file later must get it declared too (a skipped
-            // declaration would be signed as a hashed last-writer-wins file -
-            // the exact bug the merge class prevents).
-            if key == "files_merged" {
-                let dst = map
-                    .entry("files_merged")
-                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
-                if let (Some(dst), Some(src)) = (dst.as_object_mut(), val.as_object()) {
-                    for (k, v) in src {
-                        dst.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                }
-                continue;
-            }
-            let missing = map.get(key).map(|v| v.is_null()).unwrap_or(true);
-            if missing {
-                map.insert(key.clone(), val.clone());
-            }
-        }
+        apply_extend(map, extend);
 
         // EpixNet's sign-time auto-prune: the parent's rules may cap arrays in
         // this directory's data.json files (`max_items`, with age/min

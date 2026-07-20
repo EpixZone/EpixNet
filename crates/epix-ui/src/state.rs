@@ -8092,26 +8092,37 @@ impl AppState {
                 continue;
             };
             for content_path in walk_content_json(storage.root()) {
-                let Ok(bytes) = storage.read(&content_path) else {
-                    continue;
-                };
-                let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
-                    continue;
-                };
-                let merge_paths = epix_content::declared_merge_files(&content);
-                if merge_paths.is_empty() {
-                    continue;
-                }
-                let dir =
-                    content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
-                let xid_map = Self::resolve_xid_map(&storage, &content_path).await;
-                let signers = view.valid_signers_for(&content_path, &xid_map);
-                for rel in merge_paths {
-                    let mpath =
-                        if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
-                    self.fetch_and_merge_records(&address, &mpath, &signers, None, &peers).await;
-                }
+                self.resync_merge_dir(&address, &content_path, &storage, &view, &peers).await;
             }
+        }
+    }
+
+    /// Anti-entropy for the merge files declared by ONE content.json unit:
+    /// re-fetch + merge each from `peers`. Broken out of [`resync_merge_files`].
+    async fn resync_merge_dir(
+        &self,
+        address: &str,
+        content_path: &str,
+        storage: &XiteStorage,
+        view: &Xite,
+        peers: &[PeerAddr],
+    ) {
+        let Ok(bytes) = storage.read(content_path) else {
+            return;
+        };
+        let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        let merge_paths = epix_content::declared_merge_files(&content);
+        if merge_paths.is_empty() {
+            return;
+        }
+        let dir = content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+        let xid_map = Self::resolve_xid_map(storage, content_path).await;
+        let signers = view.valid_signers_for(content_path, &xid_map);
+        for rel in merge_paths {
+            let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+            self.fetch_and_merge_records(address, &mpath, &signers, None, peers).await;
         }
     }
 
@@ -8202,6 +8213,31 @@ impl AppState {
         Ok(record)
     }
 
+    /// The `files_merged` declaration to add when signing a user content.json:
+    /// for each merge file the owner include allows (its `merge_files` rule)
+    /// that exists on disk in the directory, an entry `{name: {class}}`. `None`
+    /// when there is nothing to declare - so the client never hand-manages it.
+    async fn merge_files_extend(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        storage: &XiteStorage,
+    ) -> Option<Value> {
+        let rules = self.user_content_rules(address, content_inner_path).await?;
+        let allowed = rules.get("merge_files").and_then(|v| v.as_object())?;
+        let dir =
+            content_inner_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+        let mut merged = serde_json::Map::new();
+        for (name, spec) in allowed {
+            let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+            if storage.exists(&path) {
+                let class = spec.get("class").cloned().unwrap_or_else(|| json!("epix-orset-1"));
+                merged.insert(name.clone(), json!({ "class": class }));
+            }
+        }
+        (!merged.is_empty()).then(|| Value::Object(merged))
+    }
+
     pub async fn sign_user_content(
         &self,
         address: &str,
@@ -8250,32 +8286,10 @@ impl AppState {
             .unwrap_or(0.0);
         let modified = (now_secs() as f64).max(prev + 1.0);
 
-        // Auto-declare merge files: if the owner's include allows one
-        // (merge_files rule) and it exists on disk in this directory, add it to
-        // files_merged so it is signed as a signed-CRDT file, not a hashed one.
-        // The client just writes records; it never hand-manages the declaration.
-        if let Some(rules) = self.user_content_rules(address, content_inner_path).await {
-            if let Some(allowed) = rules.get("merge_files").and_then(|v| v.as_object()) {
-                let dir = content_inner_path
-                    .strip_suffix("content.json")
-                    .unwrap_or("")
-                    .trim_end_matches('/');
-                let mut merged = serde_json::Map::new();
-                for (name, spec) in allowed {
-                    let path =
-                        if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
-                    if storage.exists(&path) {
-                        let class = spec
-                            .get("class")
-                            .cloned()
-                            .unwrap_or_else(|| json!("epix-orset-1"));
-                        merged.insert(name.clone(), json!({ "class": class }));
-                    }
-                }
-                if !merged.is_empty() {
-                    extend.insert("files_merged".into(), Value::Object(merged));
-                }
-            }
+        // Auto-declare merge files (posts.json etc.): the client just writes
+        // records; the declaration is derived from the owner's merge_files rule.
+        if let Some(fm) = self.merge_files_extend(address, content_inner_path, &storage).await {
+            extend.insert("files_merged".into(), fm);
         }
 
         let addr = Address::parse(address.to_string()).map_err(|e| e.to_string())?;
