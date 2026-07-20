@@ -175,10 +175,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PRIV: &str = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+    // A test signing key generated at runtime (not a hard-coded literal),
+    // shared across this module's tests.
+    fn test_key() -> &'static (String, String) {
+        static K: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        K.get_or_init(|| {
+            let pk = epix_crypt::new_seed();
+            let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+            (pk, addr)
+        })
+    }
+
+    fn author_key() -> String {
+        test_key().0.clone()
+    }
 
     fn author_addr() -> String {
-        epix_crypt::privatekey_to_address(PRIV).unwrap()
+        test_key().1.clone()
     }
 
     /// Build a live record for `author`, sign it (dbl scheme) with `priv_hex`,
@@ -227,7 +240,7 @@ mod tests {
     #[test]
     fn verify_accepts_a_valid_record() {
         let author = author_addr();
-        let rec = signed_record(&author, PRIV, 1737331500123);
+        let rec = signed_record(&author, &author_key(), 1737331500123);
         assert_eq!(verify_record(&rec, &[author], 1737331500123), Ok(()));
     }
 
@@ -241,16 +254,16 @@ mod tests {
             "nonce": nonce, "author": author, "clock": 100_i64, "supersedes": 0,
             "deleted": false, "body": "k", "date_added": date_added,
         });
-        rec["sign"] = json!(epix_crypt::sign_keccak(&record_signed_data(&rec), PRIV).unwrap());
+        rec["sign"] = json!(epix_crypt::sign_keccak(&record_signed_data(&rec), &author_key()).unwrap());
         assert_eq!(verify_record(&rec, &[author], 1_000_000), Ok(()));
     }
 
     #[test]
     fn verify_rejects_wrong_signing_key() {
         // author claims one address but the record is signed by a different key.
-        let other = "22b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let other = epix_crypt::new_seed();
         let author = author_addr(); // authorized signer
-        let mut rec = signed_record(&author, other, 100); // signed by the wrong key
+        let mut rec = signed_record(&author, &other, 100); // signed by the wrong key
         // still declares the authorized author, but the sig recovers elsewhere.
         rec["author"] = json!(author);
         assert_eq!(verify_record(&rec, &[author], 1_000_000), Err(RecordError::BadSignature));
@@ -259,7 +272,7 @@ mod tests {
     #[test]
     fn verify_rejects_author_not_in_valid_signers() {
         let author = author_addr();
-        let rec = signed_record(&author, PRIV, 100);
+        let rec = signed_record(&author, &author_key(), 100);
         // The directory only authorizes someone else.
         let others = vec!["epix1someoneelse".to_string()];
         assert_eq!(verify_record(&rec, &others, 1_000_000), Err(RecordError::UnauthorizedAuthor));
@@ -268,7 +281,7 @@ mod tests {
     #[test]
     fn verify_rejects_a_tampered_field() {
         let author = author_addr();
-        let mut rec = signed_record(&author, PRIV, 100);
+        let mut rec = signed_record(&author, &author_key(), 100);
         rec["body"] = json!("tampered after signing");
         assert_eq!(verify_record(&rec, &[author], 1_000_000), Err(RecordError::BadSignature));
     }
@@ -276,7 +289,7 @@ mod tests {
     #[test]
     fn verify_rejects_a_flipped_deleted_flag() {
         let author = author_addr();
-        let mut rec = signed_record(&author, PRIV, 100);
+        let mut rec = signed_record(&author, &author_key(), 100);
         // Flip deleted true but keep the (now non-empty) body -> payload changes
         // AND the tombstone-body rule; both would reject. Empty the body so we
         // isolate the signature check.
@@ -288,7 +301,7 @@ mod tests {
     #[test]
     fn verify_rejects_garbage_signature_without_panicking() {
         let author = author_addr();
-        let mut rec = signed_record(&author, PRIV, 100);
+        let mut rec = signed_record(&author, &author_key(), 100);
         rec["sign"] = json!("!!!not base64!!!");
         assert_eq!(verify_record(&rec, &[author.clone()], 1_000_000), Err(RecordError::BadSignature));
         rec["sign"] = json!("YWJj"); // valid base64, wrong length
@@ -298,7 +311,7 @@ mod tests {
     #[test]
     fn verify_rejects_a_far_future_clock() {
         let author = author_addr();
-        let rec = signed_record(&author, PRIV, 10_000_000);
+        let rec = signed_record(&author, &author_key(), 10_000_000);
         // now is well before the clock, beyond the skew bound.
         let now = 10_000_000 - CLOCK_SKEW_BOUND_MS - 1;
         assert_eq!(verify_record(&rec, &[author.clone()], now), Err(RecordError::ClockTooFarFuture));
@@ -316,7 +329,7 @@ mod tests {
             "nonce": nonce, "author": author, "clock": 100_i64, "supersedes": 0,
             "deleted": true, "body": "should be empty", "date_added": date_added,
         });
-        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), PRIV).unwrap());
+        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), &author_key()).unwrap());
         // Signature is valid, but a tombstone may not carry a body.
         assert_eq!(verify_record(&rec, &[author], 1_000_000), Err(RecordError::TombstoneHasBody));
     }
@@ -326,25 +339,25 @@ mod tests {
         // A moderator (a different key, but an authorized signer of the dir)
         // may tombstone the author's item when moderated:true + deleted:true.
         let author = author_addr();
-        let mod_pk = "22b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
-        let moderator = epix_crypt::privatekey_to_address(mod_pk).unwrap();
+        let mod_pk = epix_crypt::new_seed();
+        let moderator = epix_crypt::privatekey_to_address(&mod_pk).unwrap();
         let mut rec = json!({
             "post_id": 123_i64, "nonce": "n", "author": author, "clock": 9_i64,
             "supersedes": 1, "deleted": true, "moderated": true, "body": "",
             "date_added": 1737331200_i64,
         });
-        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), mod_pk).unwrap());
+        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), &mod_pk).unwrap());
         let signers = vec![author.clone(), moderator];
         assert_eq!(verify_record(&rec, &signers, 1_000_000), Ok(()));
 
         // A stranger (not an authorized signer) cannot forge a moderation tombstone.
-        let stranger = "33b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let stranger = epix_crypt::new_seed();
         let mut forged = json!({
             "post_id": 123_i64, "nonce": "n", "author": author, "clock": 9_i64,
             "supersedes": 1, "deleted": true, "moderated": true, "body": "",
             "date_added": 1737331200_i64,
         });
-        forged["sign"] = json!(epix_crypt::sign(&record_signed_data(&forged), stranger).unwrap());
+        forged["sign"] = json!(epix_crypt::sign(&record_signed_data(&forged), &stranger).unwrap());
         assert_eq!(verify_record(&forged, &signers, 1_000_000), Err(RecordError::BadSignature));
 
         // moderated flag WITHOUT delete gets no relaxation - a moderator can't
@@ -354,18 +367,18 @@ mod tests {
             "supersedes": 1, "deleted": false, "moderated": true, "body": "rewritten",
             "date_added": 1737331200_i64,
         });
-        edit["sign"] = json!(epix_crypt::sign(&record_signed_data(&edit), mod_pk).unwrap());
+        edit["sign"] = json!(epix_crypt::sign(&record_signed_data(&edit), &mod_pk).unwrap());
         assert_eq!(verify_record(&edit, &signers, 1_000_000), Err(RecordError::BadSignature));
     }
 
     #[test]
     fn verify_rejects_missing_fields() {
         let author = author_addr();
-        let mut rec = signed_record(&author, PRIV, 100);
+        let mut rec = signed_record(&author, &author_key(), 100);
         rec.as_object_mut().unwrap().remove("author");
         assert_eq!(verify_record(&rec, &[author.clone()], 1_000_000), Err(RecordError::MissingField("author")));
         // Removing the nonce with no `key` present fails (need one id source).
-        let mut rec2 = signed_record(&author, PRIV, 100);
+        let mut rec2 = signed_record(&author, &author_key(), 100);
         rec2.as_object_mut().unwrap().remove("nonce");
         assert_eq!(verify_record(&rec2, &[author], 1_000_000), Err(RecordError::MissingField("nonce-or-key")));
     }

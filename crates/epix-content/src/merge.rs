@@ -165,10 +165,19 @@ mod tests {
     use super::*;
     use crate::record::{derive_post_id, record_signed_data};
 
-    const PRIV: &str = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+    // A test signing key generated at runtime (not a hard-coded literal), shared
+    // across this module's tests so every record has one consistent author.
+    fn test_key() -> &'static (String, String) {
+        static K: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        K.get_or_init(|| {
+            let pk = epix_crypt::new_seed();
+            let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+            (pk, addr)
+        })
+    }
 
     fn author() -> String {
-        epix_crypt::privatekey_to_address(PRIV).unwrap()
+        test_key().1.clone()
     }
 
     /// A signed version of a post. `nonce`/`date_added` fix the post_id lineage;
@@ -182,7 +191,7 @@ mod tests {
             "clock": clock, "supersedes": supersedes, "deleted": deleted,
             "body": body, "date_added": date_added,
         });
-        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), PRIV).unwrap());
+        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), &test_key().0).unwrap());
         rec
     }
 
