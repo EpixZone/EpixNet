@@ -69,8 +69,13 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 winresource = "0.1"
 
 [features]
-default = ["tor", "bridges"]
+default = ["tor", "bridges", "bittorrent"]
 tor = ["epix-node/tor"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. Off by
 # default; a bridges-enabled desktop build opts in explicitly.
 bridges = ["epix-node/bridges"]
+# BitTorrent bridge (magnet/web-seed streaming). On by default for desktop, same
+# as Android; only the iOS build omits it (App Store 5.2.3). Forwards through
+# epix-node to epix-ui so `serverInfo.bittorrent` is true and xites stream video
+# instead of showing the "available on desktop or Android" fallback card.
+bittorrent = ["epix-node/bittorrent"]

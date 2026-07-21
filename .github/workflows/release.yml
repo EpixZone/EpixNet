@@ -228,7 +228,7 @@ jobs:
       - name: Build Rust core into jniLibs
         run: |
           cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
-            build -p epix-ffi --release --features bridges
+            build -p epix-ffi --release --features bridges,bittorrent
 
       - name: Bundle the Snowflake bridge library into jniLibs
         run: |
