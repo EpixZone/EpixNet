@@ -624,7 +624,9 @@ fn firefox_is_esr_build(firefox: &Path) -> bool {
 
 /// Build a `Command` that can never pop a console window on Windows - the
 /// launcher is a GUI-subsystem app, so a spawned console tool (certutil, cmd)
-/// would otherwise flash its own terminal.
+/// would otherwise flash its own terminal. (Only the certutil path uses this,
+/// which macOS no longer takes - see `install_ca`.)
+#[cfg(not(target_os = "macos"))]
 fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
@@ -638,6 +640,7 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 }
 
 /// Locate `certutil` (NSS): PATH, then keg-only Homebrew locations.
+#[cfg(not(target_os = "macos"))]
 fn find_certutil() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EPIX_CERTUTIL") {
         let p = PathBuf::from(p);
@@ -667,8 +670,8 @@ fn find_certutil() -> Option<PathBuf> {
 /// `https://*.epix` loads without a warning. Two mechanisms, tried in order:
 ///
 /// 1. NSS `certutil` into the profile's `cert9.db` - scoped to the managed
-///    profile alone. Available where NSS is installed (macOS/Linux dev boxes);
-///    essentially never on Windows.
+///    profile alone. Used on Linux, where `certutil` is the same NSS the distro
+///    Firefox is built against.
 /// 2. Firefox **enterprise policies** (`Certificates.Install`): write the CA
 ///    PEM where the policy engine searches for bare filenames, and make sure
 ///    the install's `distribution/policies.json` references it. Our shipped
@@ -676,18 +679,37 @@ fn find_certutil() -> Option<PathBuf> {
 ///    (dev runs, installs predating it) it is written here - possible wherever
 ///    the install dir is user-writable, like the per-user Windows bundle under
 ///    `%LOCALAPPDATA%\Epix`.
+///
+/// macOS uses ONLY mechanism 2. A Mac with `certutil` almost always got it from
+/// Homebrew, which ships a NEWER NSS than the one our bundled Firefox is built
+/// against; the trust that newer certutil writes into `cert9.db` is not honored
+/// by the bundled Firefox's mozilla::pkix - it reports SEC_ERROR_UNKNOWN_ISSUER
+/// even though `vfychain` accepts the exact same chain. Worse, `certutil` still
+/// exits 0, so we would wrongly believe the CA is trusted and serve https that
+/// Firefox rejects with a cert warning. The policy import is Firefox's own, so
+/// it is always honored - the same path that already works on Windows (and on
+/// Macs without `certutil`, which is most end users).
 fn install_ca(profile: &Path, firefox: &Path, ca: &LocalCa) -> Result<(), String> {
     let pem = ca.cert_pem();
-    let certutil_err = match install_ca_certutil(profile, &pem) {
-        Ok(()) => return Ok(()),
-        Err(e) => e,
-    };
-    install_ca_policies(firefox, &pem)
-        .map_err(|e| format!("certutil: {certutil_err}; policies: {e}"))
+    #[cfg(target_os = "macos")]
+    {
+        let _ = profile; // certutil (the profile cert9.db) is deliberately unused here
+        return install_ca_policies(firefox, &pem);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let certutil_err = match install_ca_certutil(profile, &pem) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        install_ca_policies(firefox, &pem)
+            .map_err(|e| format!("certutil: {certutil_err}; policies: {e}"))
+    }
 }
 
 /// Mechanism 1: `certutil -A` into the profile's NSS cert DB (`cert9.db`).
-/// Idempotent (re-add by nickname).
+/// Idempotent (re-add by nickname). Not used on macOS (see `install_ca`).
+#[cfg(not(target_os = "macos"))]
 fn install_ca_certutil(profile: &Path, pem: &str) -> Result<(), String> {
     let certutil = find_certutil().ok_or_else(|| {
         "certutil not found (install NSS, e.g. `brew install nss`, or set EPIX_CERTUTIL)".to_string()
