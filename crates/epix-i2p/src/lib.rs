@@ -210,6 +210,7 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
         s.b32 = b32;
         s.phase = I2pPhase::Ready;
     }
+    let accept_status = status.clone();
     tokio::spawn(async move {
         loop {
             match inbound.accept().await {
@@ -221,6 +222,32 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
                 Err(e) => {
                     tracing::debug!(target: "epix::i2p", "i2p accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // A wedged listening session never accepts again; rebuild it
+                    // so inbound reachability recovers instead of spinning on a
+                    // dead session. Rebuilding yields a fresh destination, so
+                    // republish our advertised address to match.
+                    if session_fatal(&e) {
+                        match new_session_raw(sam_port).await {
+                            Ok(s) => {
+                                let destination = s.destination().to_string();
+                                let b32 = b32_address(&destination).unwrap_or_default();
+                                inbound = s;
+                                let mut st = accept_status.write().await;
+                                st.destination = destination;
+                                st.b32 = b32.clone();
+                                tracing::info!(
+                                    target: "epix::i2p",
+                                    "rebuilt wedged i2p inbound session; new address {b32}",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "epix::i2p",
+                                    "i2p inbound rebuild failed, will retry: {e}",
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -229,10 +256,38 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
     Ok(())
 }
 
+/// Create a SAM stream session against the router at `sam_port`, keeping the
+/// raw `yosemite` error so callers can tell a wedged session apart from an
+/// ordinary failure.
+async fn new_session_raw(sam_port: u16) -> yosemite::Result<Session<Stream>> {
+    let options = SessionOptions { samv3_tcp_port: sam_port, ..Default::default() };
+    Session::<Stream>::new(options).await
+}
+
 /// Create a SAM stream session against the router at `sam_port`.
 async fn new_session(sam_port: u16) -> Result<Session<Stream>> {
-    let options = SessionOptions { samv3_tcp_port: sam_port, ..Default::default() };
-    Session::<Stream>::new(options).await.map_err(|e| Error::Protocol(format!("i2p session: {e}")))
+    new_session_raw(sam_port).await.map_err(|e| Error::Protocol(format!("i2p session: {e}")))
+}
+
+/// Whether a `yosemite` error means the SAM **session itself** is no longer
+/// usable - the control connection to the router dropped, or the session's
+/// state machine desynced (yosemite marks it `Poisoned`, after which every
+/// later call on that session fails with `invalid state`). Such a session must
+/// be discarded and rebuilt. A clean per-peer failure (the router reporting a
+/// specific `.b32.i2p` destination unreachable) leaves the session healthy, so
+/// it is *not* fatal and the session is kept for the next dial.
+fn session_fatal(e: &yosemite::Error) -> bool {
+    match e {
+        // Control-connection I/O died, or the router sent a reply we can't
+        // parse mid-handshake: the session is wedged.
+        yosemite::Error::IoError(_) | yosemite::Error::Malformed => true,
+        // A router error about the *peer* (e.g. CantReachPeer) is reported as
+        // `Protocol(Router(_))`; the session survives it. Any other protocol
+        // error is a state-machine desync and is fatal.
+        yosemite::Error::Protocol(p) => !matches!(p, yosemite::ProtocolError::Router(_)),
+        // Router-reported I2P errors are about the request, not the session.
+        yosemite::Error::I2p(_) => false,
+    }
 }
 
 /// Compute the short `.b32.i2p` address from a full base64 I2P destination:
@@ -289,15 +344,43 @@ impl Transport for I2pTransport {
             s.sam_port
         };
         let mut guard = self.outbound.lock().await;
-        if guard.is_none() {
-            *guard = Some(new_session(sam_port).await?);
+        // Reuse the one persistent outbound session; if a dial wedges it (the
+        // router's SAM control connection dropped, leaving the session
+        // `Poisoned` so every later dial fails), drop it and rebuild once so
+        // I2P recovers without restarting the node. A clean per-peer failure
+        // leaves the session healthy and is surfaced as-is.
+        let mut last_err = None;
+        for attempt in 0..2u8 {
+            if guard.is_none() {
+                match new_session_raw(sam_port).await {
+                    Ok(s) => *guard = Some(s),
+                    Err(e) => {
+                        let fatal = session_fatal(&e);
+                        last_err = Some(Error::Protocol(format!("i2p session: {e}")));
+                        if attempt == 0 && fatal {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            let session = guard.as_mut().expect("session set above");
+            match session.connect(&dest).await {
+                Ok(stream) => return Ok(Box::pin(stream) as PeerStream),
+                Err(e) => {
+                    let fatal = session_fatal(&e);
+                    last_err = Some(Error::Protocol(format!("i2p connect {dest}: {e}")));
+                    if attempt == 0 && fatal {
+                        // Wedged session: discard it so the retry rebuilds.
+                        tracing::debug!(target: "epix::i2p", "i2p session wedged, rebuilding: {e}");
+                        *guard = None;
+                        continue;
+                    }
+                    break;
+                }
+            }
         }
-        let session = guard.as_mut().expect("session just set");
-        let stream = session
-            .connect(&dest)
-            .await
-            .map_err(|e| Error::Protocol(format!("i2p connect {dest}: {e}")))?;
-        Ok(Box::pin(stream) as PeerStream)
+        Err(last_err.unwrap_or_else(|| Error::Protocol("i2p dial failed".into())))
     }
 }
 
@@ -312,6 +395,24 @@ mod tests {
         assert_eq!(I2pMode::parse("disable"), I2pMode::Disable);
         assert_eq!(I2pMode::parse(""), I2pMode::Disable);
         assert_eq!(I2pMode::parse("on"), I2pMode::Embedded);
+    }
+
+    #[test]
+    fn session_fatal_classifies_errors() {
+        use yosemite::{Error as YErr, I2pError, ProtocolError};
+        // Control-connection loss / unparseable reply -> rebuild the session.
+        assert!(session_fatal(&YErr::IoError(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        assert!(session_fatal(&YErr::Malformed));
+        // State-machine desync (the `Poisoned`/invalid-state path) -> rebuild.
+        assert!(session_fatal(&YErr::Protocol(ProtocolError::InvalidState)));
+        assert!(session_fatal(&YErr::Protocol(ProtocolError::InvalidMessage)));
+        // A per-peer failure leaves the session healthy -> keep it.
+        assert!(!session_fatal(&YErr::Protocol(ProtocolError::Router(
+            I2pError::CantReachPeer
+        ))));
+        assert!(!session_fatal(&YErr::I2p(I2pError::CantReachPeer)));
     }
 
     #[test]
