@@ -3066,6 +3066,33 @@ impl AppState {
         self.xites.read().await.keys().cloned().collect()
     }
 
+    /// Every downloaded xite's current version, keyed by BOTH its serving key
+    /// and its canonical address, mapped to the root content.json's `modified`
+    /// (whole seconds - a propagation notification carries an i64). The runtime
+    /// propagation poll matches a peer's `(xite, modified)` hints against this to
+    /// decide which xites are stale here; keying both forms means a hint naming
+    /// the canonical address still matches a xite we serve under a `.epix` alias.
+    /// Xites not yet downloaded are skipped - a hint should refresh what we host,
+    /// not start a fresh download.
+    pub async fn local_xite_versions(&self) -> HashMap<String, i64> {
+        let xites = self.xites.read().await;
+        let mut out = HashMap::new();
+        for (key, x) in xites.iter() {
+            if x.settings.downloaded.is_none() {
+                continue;
+            }
+            let modified = x
+                .content
+                .as_ref()
+                .and_then(|c| c.get("modified"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as i64;
+            out.insert(key.clone(), modified);
+            out.entry(canonical_address(x.content.as_ref(), key)).or_insert(modified);
+        }
+        out
+    }
+
     /// Record the fileserver's reachability (UPnP): whether the port is open to
     /// the internet and the node's external IP, if known.
     pub async fn set_port_status(&self, opened: bool, ip_external: Option<String>) {
@@ -3971,7 +3998,10 @@ impl AppState {
         // and flash the sidebar panel for xites whose seeder is offline.
         self.mark_optional_dirty(address);
         let transport = self.transport.read().await.clone().ok_or("no transport")?;
-        let peers = self.connectable_peers(address, 10).await;
+        // Reliable tracker-seeds first, then registry peers - a bumped
+        // content.json is fetched from a known seed instead of hoping the
+        // registry selection lands on one that has the new version.
+        let peers = self.fetch_candidate_peers(address, 10).await;
         if peers.is_empty() {
             return Ok(false);
         }
@@ -4143,6 +4173,70 @@ impl AppState {
             .get(address)
             .map(|x| x.peers.connectable_dialable(limit, nets, now_secs()))
             .unwrap_or_default()
+    }
+
+    /// Reliable content sources drawn from the tracker list: an Epix tracker is
+    /// an operator-run full node that also SEEDS, so its fileserver address is a
+    /// dependable place to fetch from - unlike the peer registry, which fills
+    /// with dead/unverified gossip addresses that crowd out the one seed that
+    /// actually holds a freshly published record. Dialable, connectable, not
+    /// ourselves, deduped.
+    async fn tracker_seed_peers(&self) -> Vec<PeerAddr> {
+        let nets = self.dialable_networks().await;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<PeerAddr> = Vec::new();
+        for t in self.shared_trackers().await.into_iter().chain(self.extra_trackers().await) {
+            if let epix_xite::Tracker::Epix(addr) = t {
+                if nets.can_dial(&addr)
+                    && epix_peer::Peer::new(addr.clone(), 0).is_connectable()
+                    && !self.is_own_peer(&addr).await
+                    && seen.insert(addr.to_string())
+                {
+                    out.push(addr);
+                }
+            }
+        }
+        out
+    }
+
+    /// The peers a content/merge fetch should try, best sources first: reliable
+    /// tracker-seeds ([`Self::tracker_seed_peers`]) ahead of the site's
+    /// connectable registry peers, deduped. Trying a known seed first means a
+    /// freshly published record (a post/comment/upvote in a merge file, or a
+    /// bumped content.json) is pulled in one shot instead of depending on the
+    /// registry selection stumbling onto a peer that actually has it - which,
+    /// with hundreds of dead gossip peers all at reputation 0, it often never
+    /// does within a useful window.
+    pub async fn fetch_candidate_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
+        let mut out = self.tracker_seed_peers().await;
+        let mut seen: std::collections::HashSet<String> =
+            out.iter().map(|p| p.to_string()).collect();
+        for p in self.connectable_peers(address, limit).await {
+            if seen.insert(p.to_string()) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// A deduplicated set of connectable peers across all served xites, for the
+    /// propagation poll. Every node runs the propagation service and its update
+    /// log is global (not per-xite), so one poll per peer covers every xite we
+    /// host - we just need a spread of reachable peers to ask. Capped at `limit`.
+    pub async fn propagation_peers(&self, limit: usize) -> Vec<PeerAddr> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<PeerAddr> = Vec::new();
+        for address in self.xite_addresses().await {
+            for p in self.connectable_peers(&address, 8).await {
+                if seen.insert(p.to_string()) {
+                    out.push(p);
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Which peer networks this node can DIAL right now. Clearnet always (the
@@ -8102,20 +8196,38 @@ impl AppState {
                 peers.push(sp.clone());
             }
         }
+        // Try each candidate until one serves the file, recording the outcome
+        // per peer so the registry self-heals: a peer that can't be dialed backs
+        // off (stops wasting a slot every pass), one that serves the file is
+        // rewarded and rises in selection. Without this the merge fetch was
+        // outcome-blind, so dead peers kept their slots and a good seed never
+        // gained the reputation to be picked.
         let mut fetched: Option<Vec<u8>> = None;
+        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
         for p in &peers {
-            let got = tokio::time::timeout(p.connect_timeout(), async {
+            let result = tokio::time::timeout(p.connect_timeout(), async {
                 let mut conn = Connection::connect(transport.as_ref(), p).await.ok()?;
                 conn.handshake().await.ok()?;
-                conn.get_file(&canonical, inner_path).await.ok()
+                Some(conn.get_file(&canonical, inner_path).await)
             })
             .await
             .ok()
             .flatten();
-            if got.is_some() {
-                fetched = got;
-                break;
+            match result {
+                Some(Ok(bytes)) => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
+                    fetched = Some(bytes);
+                    break;
+                }
+                // Dialed fine but couldn't serve this file: dock reputation only
+                // (it may still serve others), don't back it off.
+                Some(Err(_)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
+                // Dial/handshake failed or timed out: back it off.
+                None => outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail)),
             }
+        }
+        if !outcomes.is_empty() {
+            self.apply_peer_outcomes(address, outcomes).await;
         }
         let Some(bytes) = fetched else {
             return;
@@ -8154,23 +8266,38 @@ impl AppState {
     pub async fn resync_merge_files(self: &Arc<Self>) {
         let addrs: Vec<String> = self.xites.read().await.keys().cloned().collect();
         for address in addrs {
-            if !self.is_serving(&address).await {
-                continue;
-            }
-            let peers = self.connectable_peers(&address, 8).await;
-            if peers.is_empty() {
-                continue;
-            }
-            let Some(storage) = self.xites.read().await.get(&address).map(|x| x.storage.clone())
-            else {
-                continue;
-            };
-            let Ok(view) = self.xite_view(&address).await else {
-                continue;
-            };
-            for content_path in walk_content_json(storage.root()) {
-                self.resync_merge_dir(&address, &content_path, &storage, &view, &peers).await;
-            }
+            self.resync_merge_files_for(&address).await;
+        }
+    }
+
+    /// [`Self::resync_merge_files`] for ONE xite. On-demand callers use this so a
+    /// manual "Update" (or a propagation hint) pulls new posts/comments/upvotes
+    /// right away: those records live in CRDT merge files that bypass hash sync,
+    /// so a resync/pull that finds the content.json already current reports
+    /// "no change" and never fetches them - only this unconditional per-record
+    /// merge does. Idempotent (grow-only union), so an extra call is harmless.
+    pub async fn resync_merge_files_for(self: &Arc<Self>, address: &str) {
+        if !self.is_serving(address).await {
+            return;
+        }
+        // Reliable tracker-seeds first, then the registry peers: merge records
+        // (posts/comments/upvotes) bypass whole-file hash sync and are only ever
+        // pulled from a peer that actually holds them. The registry fills with
+        // dead gossip peers all at reputation 0, so without the seeds up front a
+        // new record can go unfetched for many passes (it did - every registry
+        // peer selected failed to serve it while a known seed had it).
+        let peers = self.fetch_candidate_peers(address, 8).await;
+        if peers.is_empty() {
+            return;
+        }
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return;
+        };
+        let Ok(view) = self.xite_view(address).await else {
+            return;
+        };
+        for content_path in walk_content_json(storage.root()) {
+            self.resync_merge_dir(address, &content_path, &storage, &view, &peers).await;
         }
     }
 

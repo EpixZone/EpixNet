@@ -1792,6 +1792,15 @@ impl WsCommand for SiteUpdate {
                     // (topics and posts live in per-user files) - sync those
                     // too, like the periodic resync cycle does.
                     state.sync_user_content(&address).await;
+                    // Posts/comments/upvotes are CRDT merge records that bypass
+                    // hash sync. The syncs above only fetch merge files for dirs
+                    // whose content.json changed in the pass; when we already
+                    // hold the author's current content.json (the common case -
+                    // it arrived on the live push, which is why the timestamp
+                    // shows at once), nothing is "changed" and a new upvote stays
+                    // invisible until the 5-min sweep. Pull them unconditionally
+                    // so a user who clicks Update sees them now.
+                    state.resync_merge_files_for(&address).await;
                     ok
                 }
             })

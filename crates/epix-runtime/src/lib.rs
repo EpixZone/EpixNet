@@ -9,12 +9,17 @@
 //! - **re-sync** - periodically check each xite for a newer content.json among
 //!   its peers and, if found, verify + download the changed files (updating the
 //!   live worker stats the sidebar shows).
+//! - **propagation** - poll peers for store-and-forward update hints on a short
+//!   interval and resync the hinted xites at once, so a freshly published post
+//!   appears in seconds instead of waiting for the next re-sync tick.
 //!
 //! [`NodeRuntime::shutdown`] signals every loop and awaits them, so the node
 //! stops cleanly.
 
 use epix_core::PeerAddr;
+use epix_protocol::Connection;
 use epix_ui::AppState;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -37,6 +42,11 @@ pub use epix_tor::TorMode;
 pub struct RuntimeConfig {
     pub announce_interval: Duration,
     pub resync_interval: Duration,
+    /// How often to poll propagation peers for update hints and resync the
+    /// hinted xites. Much shorter than `resync_interval`: this is the fast path
+    /// that makes a freshly published post/upvote appear in seconds instead of
+    /// waiting for the next full resync tick.
+    pub propagation_interval: Duration,
     pub chart_interval: Duration,
     pub connection_interval: Duration,
     /// TCP port for the inbound file server (seeding). `None` disables it (the
@@ -78,6 +88,7 @@ impl Default for RuntimeConfig {
         Self {
             announce_interval: Duration::from_secs(20 * 60),
             resync_interval: Duration::from_secs(5 * 60),
+            propagation_interval: Duration::from_secs(30),
             chart_interval: Duration::from_secs(5 * 60),
             connection_interval: Duration::from_secs(60),
             fileserver_port: None,
@@ -222,6 +233,15 @@ impl NodeRuntime {
             tor_always,
             self.shutdown.clone(),
             self.config.resync_interval,
+        )));
+        // Client half of store-and-forward propagation: poll peers for update
+        // hints and resync the hinted xites right away, so a published post
+        // appears in seconds instead of waiting for the full resync tick.
+        self.handles.push(tokio::spawn(propagation_loop(
+            self.state.clone(),
+            tor_always,
+            self.shutdown.clone(),
+            self.config.propagation_interval,
         )));
         self.handles.push(tokio::spawn(connection_loop(
             self.state.clone(),
@@ -948,6 +968,95 @@ async fn resync_loop(
                 let freed = state.enforce_optional_limit().await;
                 if freed > 0 {
                     state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
+                }
+            }
+        }
+    }
+}
+
+/// Client half of the store-and-forward propagation layer: poll peers for
+/// update hints and resync the hinted xites immediately, instead of waiting for
+/// the next full `resync_loop` tick.
+///
+/// A peer records a small `(xite, modified)` notification whenever it receives a
+/// publish push (see `push_update_to_peer`'s `announce_update` call). This loop
+/// pulls those notifications from a spread of connectable peers, keeps a
+/// per-peer cursor so each notification is seen once, and - for any hint naming
+/// a xite we host at an older version (`needs_sync`) - triggers a targeted
+/// resync of that one xite. The relay is untrusted: it only hints that an update
+/// exists; the resync re-verifies content.json signatures, so a bad hint can at
+/// worst cost a wasted resync.
+///
+/// The 5-minute `resync_loop` stays as the safety net for hints we never hear
+/// (every peer holding them was unreachable at poll time).
+async fn propagation_loop(
+    state: Arc<AppState>,
+    tor_always: bool,
+    shutdown: Arc<Notify>,
+    period: Duration,
+) {
+    // Polling dials peers; in Tor-Always mode hold until Tor routes our traffic
+    // so we never dial over clearnet during the bootstrap window.
+    if !await_tor_routed(&state, tor_always, &shutdown).await {
+        return;
+    }
+    // One cursor per propagation peer (keyed by its address), so each peer's
+    // notifications are pulled exactly once. Reset on restart, which is the
+    // correct "catch up on what I missed while offline" behavior - a re-pull
+    // from cursor 0 is filtered by `needs_sync` and stays cheap.
+    let mut clients: HashMap<String, epix_propagation::PropagationClient> = HashMap::new();
+    let mut tick = interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            _ = tick.tick() => {
+                let Some(transport) = state.transport().await else { continue };
+                let local = state.local_xite_versions().await;
+                if local.is_empty() {
+                    continue;
+                }
+                let peers = state.propagation_peers(8).await;
+                if peers.is_empty() {
+                    continue;
+                }
+                let polled_keys: HashSet<String> = peers.iter().map(|p| p.to_string()).collect();
+                let mut stale: HashSet<String> = HashSet::new();
+                for peer in peers {
+                    let client = clients.entry(peer.to_string()).or_default();
+                    let notifs = tokio::time::timeout(peer.connect_timeout(), async {
+                        let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
+                        conn.handshake().await.ok()?;
+                        client.poll(&mut conn).await.ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some(notifs) = notifs {
+                        for n in epix_propagation::needs_sync(&notifs, &local) {
+                            stale.insert(n.xite);
+                        }
+                    }
+                }
+                // Drop cursors for peers we no longer poll, so the map can't grow
+                // without bound as peer sets churn.
+                clients.retain(|k, _| polled_keys.contains(k));
+                for address in stale {
+                    if !state.is_serving(&address).await {
+                        continue;
+                    }
+                    state.log("INFO", format!("Propagation hint: resyncing {address}")).await;
+                    // Mirror the resync tick's per-xite work for this one xite:
+                    // root content.json + changed files, then user content
+                    // (posts/comments), then an unconditional merge-record pull
+                    // (upvotes/comments live in CRDT merge files that bypass hash
+                    // sync, so a "content already current" resync never fetches
+                    // them). Each fires its own file_done/updated events, so open
+                    // pages re-query as the data lands.
+                    let _ = state.resync_xite(&address).await;
+                    state.sync_user_content(&address).await;
+                    state.resync_merge_files_for(&address).await;
                 }
             }
         }
