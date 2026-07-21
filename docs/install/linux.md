@@ -113,6 +113,14 @@ sudo chown -R epix:epix /opt/epix
 
 The node keeps its data in that user's home, at `/var/lib/epix/.local/share/EpixNet`.
 
+**Run it only as the `epix` user.** If you ever launch `epix-server` as `root` (for example to test it by hand), it creates `root`-owned files in that data directory, and the service — running as `epix` — can no longer write there. The node needs to create a `lock.pid` file in the data root on startup; when it cannot, it prints the misleading message `Epix is already running (lock held in …)` even though nothing is running. If you hit that, fix the ownership:
+
+```sh
+sudo systemctl stop epix
+sudo chown -R epix:epix /var/lib/epix/.local/share/EpixNet
+sudo systemctl start epix
+```
+
 ### 3. Set up the service
 
 Create the systemd unit, pointing `ExecStart` at the extracted directory:
