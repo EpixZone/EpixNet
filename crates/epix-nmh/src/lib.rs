@@ -100,6 +100,21 @@ impl Settings {
 
 /// Handle one request, returning the response value. `resolve` is async (chain
 /// lookup), so this returns a future.
+/// GET a loopback node endpoint with a hard timeout. Without one, a wrong or
+/// half-open listener on the UI port - e.g. a stray standalone node holding the
+/// default port - makes the request hang forever. The host would then never
+/// return to read stdin, never see Firefox close the pipe, and never exit; so
+/// Firefox spawns a fresh host on every poll and they pile up (we have seen
+/// 100+). The timeout makes the query fail fast so the host answers best-effort
+/// and exits cleanly.
+async fn node_get(url: &str) -> reqwest::Result<reqwest::Response> {
+    reqwest::Client::new()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(4))
+        .send()
+        .await
+}
+
 pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
     let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     match cmd {
@@ -107,7 +122,7 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             // Fetch the node's status (Tor state + onion) over loopback; fall
             // back to a plain connect check if it isn't answering yet.
             let url = format!("http://127.0.0.1:{ui_port}/EpixNet-Internal/Status");
-            match reqwest::get(&url).await.and_then(|r| r.error_for_status()) {
+            match node_get(&url).await.and_then(|r| r.error_for_status()) {
                 Ok(resp) => match resp.json::<Value>().await {
                     Ok(mut v) => {
                         v["ui_port"] = json!(ui_port);
@@ -197,7 +212,7 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
 /// "Always"`), meaning name resolution should also go through Tor.
 async fn node_is_tor_always(ui_port: u16) -> bool {
     let url = format!("http://127.0.0.1:{ui_port}/EpixNet-Internal/Status");
-    let Ok(resp) = reqwest::get(&url).await else { return false };
+    let Ok(resp) = node_get(&url).await else { return false };
     let Ok(v) = resp.json::<Value>().await else { return false };
     v.get("tor_status").and_then(|s| s.as_str()) == Some("Always")
 }
