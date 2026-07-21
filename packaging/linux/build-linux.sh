@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Assemble a self-contained Epix tree for Linux: the launcher + native host + a
-# bundled Firefox + a .desktop file that registers the epix:// scheme. Produces
-# a tarball. (Untested in CI here - Linux scaffold; the Rust cores are the same
-# ones built and tested on the host.)
+# bundled Firefox + a .desktop file that registers the epix:// scheme, plus the
+# standalone epix-server for running a headless node on a server (no Firefox,
+# no desktop). Produces a tarball. (Untested in CI here - Linux scaffold; the
+# Rust cores are the same ones built and tested on the host.)
 #
 # Build deps: protobuf-compiler libudev-dev pkg-config, plus GTK/AppIndicator
 # for the system tray: libgtk-3-dev libayatana-appindicator3-dev libxdo-dev.
@@ -18,11 +19,14 @@ OUT_DIR="${1:-$REPO_ROOT/dist}"
 STAGE="$OUT_DIR/epix-linux"
 VERSION="${EPIX_VERSION:-0.1.0}"
 
-( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh )
+( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh -p epix-server )
 
 rm -rf "$STAGE"; mkdir -p "$STAGE/firefox"
 cp "$REPO_ROOT/target/release/epix-browser" "$STAGE/epix-browser"
 cp "$REPO_ROOT/target/release/epix-nmh" "$STAGE/epix-nmh"
+# The standalone node for headless servers: no Firefox, no GTK, honors
+# EPIX_HEADLESS / EPIX_UI_ADDR. See docs/install/linux.md.
+cp "$REPO_ROOT/target/release/epix-server" "$STAGE/epix-server"
 
 # Bundle Firefox ESR (fetch-firefox-esr.sh linux) or a provided dir.
 FF="${EPIX_BUNDLE_FIREFOX:-$REPO_ROOT/packaging/firefox-esr/firefox}"

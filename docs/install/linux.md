@@ -78,9 +78,111 @@ To open a specific site, add its name:
 ./target/release/epix-server talk.epix
 ```
 
-## Running headless (a server with no screen)
+## Run a headless node from a release binary (Ubuntu server)
 
-This is the usual way to run EpixNet on a server you reach over SSH. It serves the network but never tries to open a browser:
+If you just want to keep a node running on a server, you do not need to install Rust or build anything. The release tarball includes `epix-server`, a standalone node with no Firefox and no desktop libraries. Download it, extract it, and run it under systemd.
+
+The steps in this section replace steps 1 to 5 above. These commands assume Ubuntu (or Debian); adjust the package names for other distributions.
+
+### 1. Download the latest release and extract it
+
+The release is one `epix-linux-<version>.tar.gz` file. This finds the latest one and unpacks it into `/opt/epix`:
+
+```sh
+cd /tmp
+url=$(curl -fsSL https://api.github.com/repos/EpixZone/EpixNet/releases/latest \
+  | grep -o 'https://[^"]*epix-linux-[^"]*\.tar\.gz' | head -1)
+curl -fL -o epix-linux.tar.gz "$url"
+
+sudo mkdir -p /opt/epix
+sudo tar xzf epix-linux.tar.gz -C /opt/epix --strip-components=1
+```
+
+After this, `/opt/epix/epix-server` is the node. The tarball also carries the desktop launcher (`epix-browser`) and a bundled Firefox for desktop use; a headless server ignores them.
+
+`epix-server` links only against the standard C library, which every Ubuntu already has, so there are no extra packages to install.
+
+### 2. Create a user to run it
+
+A dedicated system user keeps the node off your login account and gives it a home for its data:
+
+```sh
+sudo useradd --system --create-home --home-dir /var/lib/epix epix
+sudo chown -R epix:epix /opt/epix
+```
+
+The node keeps its data in that user's home, at `/var/lib/epix/.local/share/EpixNet`.
+
+### 3. Set up the service
+
+Create the systemd unit, pointing `ExecStart` at the extracted directory:
+
+```sh
+sudo tee /etc/systemd/system/epix.service >/dev/null <<'UNIT'
+[Unit]
+Description=EpixNet node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=epix
+WorkingDirectory=/opt/epix
+ExecStart=/opt/epix/epix-server
+Environment=EPIX_HEADLESS=1
+Environment=EPIX_UI_ADDR=127.0.0.1:42222
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+```
+
+`EPIX_HEADLESS=1` stops it from trying to open a browser. `EPIX_UI_ADDR` sets the address the dashboard listens on (change the port if `42222` is taken). `LimitNOFILE=65536` gives the node room for many peer connections; the default limit is low enough that a busy public node can hit it.
+
+### 4. Start it and check it
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now epix
+systemctl status epix
+journalctl -u epix -f
+```
+
+You can also ask the node itself. `/StatsJson` is exempt from the origin check, so it answers a plain request:
+
+```sh
+curl -s http://127.0.0.1:42222/StatsJson
+```
+
+### 5. Reach the dashboard
+
+The node listens on `127.0.0.1:42222` on the server itself. From your own machine, open an SSH tunnel and then visit **http://127.0.0.1:42222/** in a browser:
+
+```sh
+ssh -L 42222:127.0.0.1:42222 you@server
+```
+
+Open it in a real browser. The node has a DNS-rebinding guard that blocks untraceable requests to a site path, so a bare `curl http://127.0.0.1:42222/<xite>/` returns `403 Cross-origin request blocked`. That is expected; browser page loads carry a `Sec-Fetch-Mode: navigate` header and are always allowed. Use `/StatsJson` (above) when you want a scripted health check.
+
+To serve it publicly instead, put a reverse proxy (for example nginx) in front and point it at `127.0.0.1:42222`. If you reach it by a hostname rather than an IP, add that hostname to the `ui_host` config key so the node accepts the `Host` header.
+
+### Updating to a new release
+
+Stop the service, re-run the download and extract from step 1, then start again. The data directory is separate, so upgrading does not touch the node's identity or its sites:
+
+```sh
+sudo systemctl stop epix
+# repeat the curl + tar commands from step 1
+sudo chown -R epix:epix /opt/epix
+sudo systemctl start epix
+```
+
+## Running headless from a source build
+
+If you built from source (steps 1 to 5 at the top), the server binary runs headless directly. It serves the network but never tries to open a browser:
 
 ```sh
 EPIX_HEADLESS=1 ./target/release/epix-server
