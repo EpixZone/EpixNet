@@ -436,43 +436,50 @@ impl Transport for I2pTransport {
             s.sam_port
         };
         let mut guard = self.outbound.lock().await;
-        // Reuse the one persistent outbound session; if a dial wedges it (the
+        // Reuse the one persistent outbound session. If a dial wedges it (the
         // router's SAM control connection dropped, leaving the session
-        // `Poisoned` so every later dial fails), drop it and rebuild once so
-        // I2P recovers without restarting the node. A clean per-peer failure
-        // leaves the session healthy and is surfaced as-is.
-        let mut last_err = None;
-        for attempt in 0..2u8 {
-            if guard.is_none() {
-                match new_session_raw(sam_port).await {
-                    Ok(s) => *guard = Some(s),
-                    Err(e) => {
-                        let fatal = session_fatal(&e);
-                        last_err = Some(Error::Protocol(format!("i2p session: {e}")));
-                        if attempt == 0 && fatal {
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            let session = guard.as_mut().expect("session set above");
-            match session.connect(&dest).await {
-                Ok(stream) => return Ok(Box::pin(stream) as PeerStream),
-                Err(e) => {
-                    let fatal = session_fatal(&e);
-                    last_err = Some(Error::Protocol(format!("i2p connect {dest}: {e}")));
-                    if attempt == 0 && fatal {
-                        // Wedged session: discard it so the retry rebuilds.
-                        tracing::debug!(target: "epix::i2p", "i2p session wedged, rebuilding: {e}");
-                        *guard = None;
-                        continue;
-                    }
-                    break;
-                }
+        // `Poisoned` so every later dial fails), the attempt drops it and
+        // signals a retry, so we rebuild once and I2P recovers without a node
+        // restart. A clean per-peer failure leaves the session healthy and is
+        // surfaced as-is (no retry).
+        match dial_once(&mut guard, sam_port, &dest).await {
+            Ok(stream) => return Ok(stream),
+            Err((e, retry)) if !retry => return Err(e),
+            Err(_) => tracing::debug!(target: "epix::i2p", "i2p session wedged, rebuilding"),
+        }
+        dial_once(&mut guard, sam_port, &dest).await.map_err(|(e, _)| e)
+    }
+}
+
+/// A single outbound dial: ensure a session exists in `guard`, then connect to
+/// `dest`. On success returns the stream. On failure returns the mapped error
+/// plus whether a retry may help - `true` when the session was session-fatal
+/// (in which case it has been dropped from `guard` so the next call rebuilds),
+/// `false` for a clean per-peer failure that leaves the session usable.
+async fn dial_once(
+    guard: &mut Option<Session<Stream>>,
+    sam_port: u16,
+    dest: &str,
+) -> std::result::Result<PeerStream, (Error, bool)> {
+    if guard.is_none() {
+        match new_session_raw(sam_port).await {
+            Ok(s) => *guard = Some(s),
+            Err(e) => {
+                let retry = session_fatal(&e);
+                return Err((Error::Protocol(format!("i2p session: {e}")), retry));
             }
         }
-        Err(last_err.unwrap_or_else(|| Error::Protocol("i2p dial failed".into())))
+    }
+    let session = guard.as_mut().expect("session set above");
+    match session.connect(dest).await {
+        Ok(stream) => Ok(Box::pin(stream) as PeerStream),
+        Err(e) => {
+            let wedged = session_fatal(&e);
+            if wedged {
+                *guard = None; // drop the wedged session so a retry rebuilds it
+            }
+            Err((Error::Protocol(format!("i2p connect {dest}: {e}")), wedged))
+        }
     }
 }
 
