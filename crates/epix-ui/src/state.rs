@@ -2106,6 +2106,20 @@ impl AppState {
         if !address_or_name.contains('.') {
             return address_or_name.to_string();
         }
+        // `<bech32>.epix` is the dotted ALIAS for a bare address: browsers
+        // special-case single-label (dotless) hosts - search heuristics, proxy
+        // bypass filters, PSL checks - so links and redirects carry the dotted
+        // form and it collapses to the address here. Strictly validated
+        // (checksum via epix-core), so a chain name that merely looks like an
+        // address falls through to normal resolution.
+        if let Some(label) = address_or_name.strip_suffix(".epix") {
+            if label.starts_with("epix1")
+                && !label.contains('.')
+                && epix_core::Address::parse(label).is_ok()
+            {
+                return label.to_string();
+            }
+        }
         self.resolve_name(address_or_name).await.unwrap_or_else(|| address_or_name.to_string())
     }
 
