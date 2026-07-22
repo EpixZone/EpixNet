@@ -2115,6 +2115,7 @@ version = "0.1.0"
 dependencies = [
  "epix-build",
  "epix-chain",
+ "epix-core",
  "epix-node",
  "thiserror 2.0.18",
  "tokio",
