@@ -18,6 +18,7 @@ required-features = ["cli"]
 epix-build = { path = "../epix-build" }
 
 [dependencies]
+epix-core = { path = "../epix-core" }
 epix-node = { path = "../epix-node", default-features = false }
 epix-chain = { path = "../epix-chain" }
 uniffi = { version = "0.32", features = ["tokio"] }

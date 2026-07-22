@@ -49,6 +49,44 @@ impl From<Address> for String {
     }
 }
 
+/// The bech32 data charset (excludes `1`, `b`, `i`, `o`).
+const BECH32_CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+/// How a name label (e.g. the part before `.epix`) relates to the bech32
+/// address space. One shared rule, so every resolver treats address-shaped
+/// labels identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelClass {
+    /// A checksum-valid `epix1…` address: the dotted alias. It resolves to
+    /// itself and is never looked up as an xID name, so a registered
+    /// same-string name can never take over an address.
+    Address,
+    /// Address-shaped - `epix1` plus 20 or more bech32-charset characters -
+    /// but not checksum-valid: a mistyped or forged address. Never resolved
+    /// as a name, so the typo-space around a real address cannot be
+    /// registered and used to phish.
+    AddressShaped,
+    /// An ordinary xID name. Short or non-bech32 `epix1…` brandings
+    /// (`epix1shop`, `epix1fans`) stay registrable and resolvable.
+    Name,
+}
+
+/// Classify `label` against the address space (see [`LabelClass`]).
+pub fn classify_label(label: &str) -> LabelClass {
+    if epix_crypt::is_valid_address(label) {
+        return LabelClass::Address;
+    }
+    let shaped = label
+        .strip_prefix("epix1")
+        .filter(|rest| rest.len() >= 20)
+        .is_some_and(|rest| rest.chars().all(|c| BECH32_CHARSET.contains(c)));
+    if shaped {
+        LabelClass::AddressShaped
+    } else {
+        LabelClass::Name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,6 +99,28 @@ mod tests {
         assert_eq!(a.as_str(), DASH);
         assert_eq!(a.hash160().len(), 20);
         assert!(Address::parse("not-an-address").is_err());
+    }
+
+    #[test]
+    fn classify_label_partitions_the_address_space() {
+        // A checksum-valid address is the alias, never a name.
+        assert_eq!(classify_label(DASH), LabelClass::Address);
+        // One character off: address-shaped, refused as a name (typo-squat).
+        let mut typo = DASH.to_string();
+        typo.pop();
+        typo.push('q');
+        assert_ne!(typo, DASH);
+        assert_eq!(classify_label(&typo), LabelClass::AddressShaped);
+        // A truncated-but-still-long fake is refused too.
+        assert_eq!(classify_label(&DASH[..30]), LabelClass::AddressShaped);
+        // Short or non-charset epix1 brandings are ordinary names: under the
+        // 20-char floor, or containing letters bech32 never uses (o, b, i).
+        assert_eq!(classify_label("epix1fans"), LabelClass::Name);
+        assert_eq!(classify_label("epix1shop"), LabelClass::Name);
+        assert_eq!(classify_label("epix1bobsbigblog2026extra"), LabelClass::Name);
+        // Non-epix1 labels are names regardless of shape.
+        assert_eq!(classify_label("talk"), LabelClass::Name);
+        assert_eq!(classify_label("dashboard"), LabelClass::Name);
     }
 
     #[test]

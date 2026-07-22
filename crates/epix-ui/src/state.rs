@@ -2109,15 +2109,18 @@ impl AppState {
         // `<bech32>.epix` is the dotted ALIAS for a bare address: browsers
         // special-case single-label (dotless) hosts - search heuristics, proxy
         // bypass filters, PSL checks - so links and redirects carry the dotted
-        // form and it collapses to the address here. Strictly validated
-        // (checksum via epix-core), so a chain name that merely looks like an
-        // address falls through to normal resolution.
+        // form and it collapses to the address here. Checksum-validated, so a
+        // registered same-string name is inert. An address-SHAPED label (bad
+        // checksum) is a mistyped or forged address: passed through unchanged,
+        // and every resolve path refuses it, so a typo-squatted name can never
+        // serve in an address's place.
         if let Some(label) = address_or_name.strip_suffix(".epix") {
-            if label.starts_with("epix1")
-                && !label.contains('.')
-                && epix_core::Address::parse(label).is_ok()
-            {
-                return label.to_string();
+            if !label.contains('.') {
+                match epix_core::classify_label(label) {
+                    epix_core::LabelClass::Address => return label.to_string(),
+                    epix_core::LabelClass::AddressShaped => return address_or_name.to_string(),
+                    epix_core::LabelClass::Name => {}
+                }
             }
         }
         self.resolve_name(address_or_name).await.unwrap_or_else(|| address_or_name.to_string())

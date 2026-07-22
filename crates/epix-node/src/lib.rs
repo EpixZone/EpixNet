@@ -155,6 +155,22 @@ pub async fn resolve_target(data_root: &std::path::Path, target: &str) -> (Strin
 /// Resolve a `.epix` name to its xite address on the chain, or an error string
 /// (never panics - safe to call from a request handler).
 pub async fn try_resolve_on_chain(name: &str, tld: &str) -> Result<String, String> {
+    // Typo-space guard: an exact checksum-valid address is the dotted alias
+    // and resolves to itself, never via xID (a registered same-string name is
+    // inert). An address-SHAPED label with a bad checksum is a mistyped or
+    // forged address and is refused outright - otherwise an attacker could
+    // register the typo-space around a real address as names and phish.
+    if tld == "epix" {
+        match epix_core::classify_label(name) {
+            epix_core::LabelClass::Address => return Ok(name.to_string()),
+            epix_core::LabelClass::AddressShaped => {
+                return Err(format!(
+                    "{name}.{tld} looks like a mistyped epix1 address (bad checksum); refusing to resolve it as a name"
+                ));
+            }
+            epix_core::LabelClass::Name => {}
+        }
+    }
     let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
     let domain = resolver
         .resolve(name, tld)
@@ -1352,8 +1368,20 @@ impl epix_ui::OnDemandResolver for OnDemand {
 /// A successful chain lookup is written back to the cache. Never clones.
 async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String> {
     let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-    if name.starts_with("epix1") {
+    // A bare dotless `epix1…` is in ADDRESS position: it resolves to itself
+    // (a bad one just fails to load as an address) and is never a chain name.
+    if !host.contains('.') && name.starts_with("epix1") {
         return Some(name.to_string());
+    }
+    // A dotted label classifies against the address space: Address = the
+    // dotted alias, resolves to itself. AddressShaped = a mistyped/forged
+    // address, never resolvable as a name (typo-squat guard). A plain
+    // `epix1…` branding name (epix1shop) falls through to the chain - the
+    // old prefix-only check wrongly shadowed those.
+    match epix_core::classify_label(name) {
+        epix_core::LabelClass::Address => return Some(name.to_string()),
+        epix_core::LabelClass::AddressShaped => return None,
+        epix_core::LabelClass::Name => {}
     }
     match cached_resolution(data_root, host) {
         Some((address, true)) => Some(address),
@@ -1375,7 +1403,13 @@ async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String>
 /// mode (mirrors [`resolve_host`]'s cache key).
 fn needs_chain_resolve(data_root: &std::path::Path, host: &str) -> bool {
     let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-    if name.starts_with("epix1") {
+    // Bare dotless `epix1…` is address position: never a chain name. A dotted
+    // label hits the chain only when it is a real NAME - neither an address
+    // alias (resolves to itself) nor an address-shaped label (refused) does.
+    if !host.contains('.') && name.starts_with("epix1") {
+        return false;
+    }
+    if epix_core::classify_label(name) != epix_core::LabelClass::Name {
         return false;
     }
     cached_resolution(data_root, host).is_none()
@@ -2188,6 +2222,18 @@ mod tests {
 
         // A raw address never queries the chain.
         assert!(!needs_chain_resolve(root, "epix1abcdef"));
+
+        // The dotted alias of a real address never queries the chain, and an
+        // address-shaped label (bad checksum, the typo-space around real
+        // addresses) is refused - neither waits on Tor.
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        assert!(!needs_chain_resolve(root, &format!("{DASH}.epix")));
+        let typo = format!("{}q.epix", &DASH[..DASH.len() - 1]);
+        assert!(!needs_chain_resolve(root, &typo));
+
+        // A short `epix1…` branding label is an ordinary NAME: with no cache
+        // entry it must hit the chain (the old prefix-only check shadowed it).
+        assert!(needs_chain_resolve(root, "epix1shop.epix"));
 
         // A name with no cache entry must hit the chain (and can't fall back),
         // so Always mode waits for Tor first.

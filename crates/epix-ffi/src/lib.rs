@@ -213,8 +213,19 @@ impl EpixNode {
     pub fn resolve(&self, name: String) -> Result<String, EpixError> {
         let target = epix_node::parse_target(&name);
         let (label, tld) = target.rsplit_once('.').unwrap_or((target.as_str(), "epix"));
-        if label.starts_with("epix1") {
-            return Ok(label.to_string());
+        // Same typo-space rule as the node's serving paths: a checksum-valid
+        // address resolves to itself (never via xID); an address-shaped label
+        // with a bad checksum is a mistyped or forged address and is refused;
+        // a plain epix1 branding name falls through to the chain (the old
+        // prefix-only check wrongly shadowed those).
+        match epix_core::classify_label(label) {
+            epix_core::LabelClass::Address => return Ok(label.to_string()),
+            epix_core::LabelClass::AddressShaped => {
+                return Err(EpixError::msg(format!(
+                    "{label} looks like a mistyped epix1 address (bad checksum)"
+                )));
+            }
+            epix_core::LabelClass::Name => {}
         }
         let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
         let label = label.to_string();

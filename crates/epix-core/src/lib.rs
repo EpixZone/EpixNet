@@ -10,7 +10,7 @@ pub mod error;
 pub mod peer;
 pub mod time;
 
-pub use address::Address;
+pub use address::{classify_label, Address, LabelClass};
 pub use emitter::{CollectingEmitter, Emitter, NoopEmitter};
 pub use error::{Error, Result};
 pub use peer::{IpType, PeerAddr};

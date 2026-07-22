@@ -2299,6 +2299,15 @@ impl WsCommand for XidResolveName {
             Some(tld) => (raw, tld),
             None => raw.rsplit_once('.').unwrap_or((raw, "epix")),
         };
+        // Typo-space guard (same rule as the serving paths): an address-shaped
+        // label with a bad checksum is never resolved as a name.
+        if tld == "epix"
+            && epix_core::classify_label(name) == epix_core::LabelClass::AddressShaped
+        {
+            return Ok(json!({
+                "error": format!("{name}.{tld} looks like a mistyped epix1 address (bad checksum)")
+            }));
+        }
         let resolver = epix_chain::XidResolver::new(s.state.chain_rpc_url().await);
         match resolver.resolve(name, tld).await {
             Ok(snap) => Ok(serde_json::to_value(snap).unwrap_or(Value::Null)),
