@@ -3860,8 +3860,27 @@ mod tests {
         let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
         assert_eq!(ns["reachable"], false);
         assert_eq!(ns["clearnet"]["enabled"], false);
+        assert_eq!(ns["tor"]["enabled"], false, "initial state is off, not a phase");
         assert_eq!(ns["tor"]["reachable"], false);
         assert_eq!(ns["i2p"]["reachable"], false);
+
+        // Tor bootstrapping (enabled in settings, not yet connected): the
+        // dashboard must badge the phase, not "Off" - enabled with the phase
+        // in `status`, not reachable yet. Same for a failed attempt between
+        // retries.
+        state.set_tor_status(false, "Bootstrapping").await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["tor"]["enabled"], true, "bootstrapping is a phase of enabled, not off");
+        assert_eq!(ns["tor"]["reachable"], false);
+        assert_eq!(ns["tor"]["status"], "Bootstrapping");
+        state.set_tor_status(false, "Failed").await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["tor"]["enabled"], true, "a failed bootstrap still shows as trying");
+        assert_eq!(ns["tor"]["status"], "Failed");
+        // Mode turned off: back to disabled.
+        state.set_tor_status(false, "Disabled").await;
+        let ns = ServerInfo.handle(&session, &Value::Null).await.unwrap()["network_status"].clone();
+        assert_eq!(ns["tor"]["enabled"], false);
 
         // Clearnet port open -> clearnet reachable -> node reachable.
         state.set_fileserver_port(26552).await;
