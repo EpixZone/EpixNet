@@ -195,10 +195,12 @@ async fn i2p_gate(state: &epix_ui::AppState) -> Result<u16, (String, String, Str
     Ok(sam_port)
 }
 
-/// Resolve `host` to a base64 destination: local addressbook first (jump-link
-/// entries), then the router's naming service. The error explains what to do,
-/// which differs for a `.b32.i2p` (self-certifying, so a failure means the
-/// site is unreachable) vs a plain hostname (likely just unknown).
+/// Resolve `host` to something `STREAM CONNECT` accepts: local addressbook
+/// first (jump-link destinations), then the host itself for `.b32.i2p`
+/// (self-certifying - the router does the leaseset lookup during the connect;
+/// its `NAMING LOOKUP` only serves the local hosts file and refuses b32
+/// instantly, which is also how peer dials work), then the naming service for
+/// plain hostnames. An unknown plain hostname explains jump links.
 async fn resolve(
     book: &Addressbook,
     sam_port: u16,
@@ -207,13 +209,11 @@ async fn resolve(
     if let Some(dest) = book.get(host).await {
         return Ok(dest);
     }
+    if host.ends_with(".b32.i2p") {
+        return Ok(host.to_string());
+    }
     match epix_i2p::EepsiteDialer::lookup(sam_port, host).await {
         Ok(dest) => Ok(dest),
-        Err(e) if host.ends_with(".b32.i2p") => Err((
-            "502 Bad Gateway".into(),
-            "Eepsite unreachable".into(),
-            format!("{host} could not be reached over I2P right now ({e}). The site may be down, or tunnels are still building - retry in a minute."),
-        )),
         Err(_) => Err((
             "404 Not Found".into(),
             "Unknown eepsite name".into(),
