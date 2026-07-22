@@ -973,18 +973,21 @@ async fn render_wrapper(
     let content = ctx.state.content(&address).await;
     // Reverse xID: a xite reached by its bech32 address (bare, or the dotted
     // `<addr>.epix` alias) whose content.json claims a `.epix` domain is sent
-    // to that domain's origin, so the address bar shows `talk.epix` instead of
+    // to that domain, so the address bar shows `talk.epix` instead of
     // `epix1talk…`, like DNS resolving a name for a link you clicked. The claim
     // is only trusted after the chain confirms the claimed name resolves BACK
     // to this exact address (via the XidResolver Merkle-proof path), so a site
-    // cannot hijack another's name. Only the top-level document in proxy (host)
-    // mode redirects; an already-named host, path-mode serving, or a
+    // cannot hijack another's name. Only the top-level document redirects; a
     // failed/absent verification serves the address unchanged (fail closed).
-    // The verified name is cache-hit on repeat loads.
-    if proxy_mode
-        && ((requested.starts_with("epix1") && !requested.contains('.'))
-            || address_alias(&requested).is_some())
-    {
+    // Host (proxy) mode goes to the domain's origin; path mode (the mobile
+    // shells and the loopback UI address xites by path) goes to the domain's
+    // path on the same origin - the shells' address bars then show the name
+    // via their friendly-URL mapping. Temporary redirect, so a changed xID
+    // record takes effect on the next visit. The verified name is cache-hit
+    // on repeat loads.
+    let address_form = (requested.starts_with("epix1") && !requested.contains('.'))
+        || address_alias(&requested).is_some();
+    if address_form {
         if let Some(domain) = content
             .as_ref()
             .and_then(|c| c.get("domain"))
@@ -994,14 +997,20 @@ async fn render_wrapper(
         {
             if ctx.state.resolve_for_serving(&domain).await == address {
                 // Keep the directory the document asked for and its query; the
-                // implied index.html is dropped. Scheme-relative, so https carries.
+                // implied index.html is dropped. Scheme-relative in host mode,
+                // so https carries.
                 let dir = inner_path.strip_suffix("index.html").unwrap_or(&inner_path);
                 let query = raw_query
                     .as_deref()
                     .filter(|q| !q.is_empty())
                     .map(|q| format!("?{q}"))
                     .unwrap_or_default();
-                return Redirect::temporary(&format!("//{domain}/{dir}{query}")).into_response();
+                let target = if proxy_mode {
+                    format!("//{domain}/{dir}{query}")
+                } else {
+                    format!("/{domain}/{dir}{query}")
+                };
+                return Redirect::temporary(&target).into_response();
             }
         }
     }
