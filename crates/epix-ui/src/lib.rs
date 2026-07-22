@@ -522,10 +522,8 @@ fn plausible_xite_ref(s: &str) -> bool {
 /// in URLs; checksum-validated, so a look-alike xID name never collapses.
 fn address_alias(host: &str) -> Option<&str> {
     let label = host.strip_suffix(".epix")?;
-    (label.starts_with("epix1")
-        && !label.contains('.')
-        && epix_core::Address::parse(label).is_ok())
-    .then_some(label)
+    (!label.contains('.') && epix_core::classify_label(label) == epix_core::LabelClass::Address)
+        .then_some(label)
 }
 
 /// The dotted-alias origin for a xite reference: a bare `epix1…` address gains
@@ -948,8 +946,18 @@ async fn render_wrapper(
                 // exited. Only 404 if it truly produced no address.
                 let key = ctx.state.canonical_key(&requested).await;
                 if key == requested {
-                    return (StatusCode::NOT_FOUND, format!("could not resolve {requested}"))
-                        .into_response();
+                    // A mistyped/forged address shape gets a clear message: it
+                    // was refused by policy, not "not found" on the chain.
+                    let msg = match requested
+                        .strip_suffix(".epix")
+                        .map(epix_core::classify_label)
+                    {
+                        Some(epix_core::LabelClass::AddressShaped) => format!(
+                            "{requested} looks like a mistyped epix1 address: the checksum does not match, so it will not be resolved as a name"
+                        ),
+                        _ => format!("could not resolve {requested}"),
+                    };
+                    return (StatusCode::NOT_FOUND, msg).into_response();
                 }
                 address = key;
             }
