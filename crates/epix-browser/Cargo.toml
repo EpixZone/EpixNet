@@ -9,6 +9,7 @@ name = "epix-browser"
 path = "src/main.rs"
 
 [dependencies]
+epix-i2p = { path = "../epix-i2p" }
 epix-node = { path = "../epix-node" }
 epix-ui = { path = "../epix-ui" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

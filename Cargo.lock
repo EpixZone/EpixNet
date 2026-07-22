@@ -1954,6 +1954,7 @@ dependencies = [
  "axum",
  "base64",
  "epix-build",
+ "epix-i2p",
  "epix-node",
  "epix-ui",
  "hyper",
