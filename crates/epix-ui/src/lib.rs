@@ -516,6 +516,30 @@ fn plausible_xite_ref(s: &str) -> bool {
     s.ends_with(".epix") || (s.starts_with("epix1") && s.len() > 20)
 }
 
+/// The bare bech32 address when `host` is its dotted alias `<epix1…>.epix`,
+/// else `None`. Browsers special-case dotless hosts (search fixup, proxy
+/// bypass filters), so a bare address is always presented as this dotted alias
+/// in URLs; checksum-validated, so a look-alike xID name never collapses.
+fn address_alias(host: &str) -> Option<&str> {
+    let label = host.strip_suffix(".epix")?;
+    (label.starts_with("epix1")
+        && !label.contains('.')
+        && epix_core::Address::parse(label).is_ok())
+    .then_some(label)
+}
+
+/// The dotted-alias origin for a xite reference: a bare `epix1…` address gains
+/// the `.epix` suffix (so the browser treats it as a normal dotted host); a
+/// name (or an already-dotted alias) passes through unchanged. Public so the
+/// desktop browser applies the same rule to its homepage / start URL.
+pub fn aliased_origin(xite_ref: &str) -> String {
+    if xite_ref.starts_with("epix1") && !xite_ref.contains('.') {
+        format!("{xite_ref}.epix")
+    } else {
+        xite_ref.to_string()
+    }
+}
+
 /// Rewrite a transparent-proxy request into the path form the router uses.
 /// Marks a request whose path was prefixed by [`rewrite_proxy_host`]. Lets the
 /// wrapper tell a rewritten `GET /` (serve it) apart from a URL that LITERALLY
@@ -837,9 +861,12 @@ async fn render_wrapper(
     if is_proxy_host(&host) && !headers.contains_key(PROXY_REWRITE_MARKER) {
         // Keep the directory the document was asked for, not the implied
         // index.html; keep the query. Scheme-relative, so http/https carries.
+        // A bare address becomes its dotted alias, so the browser never
+        // navigates a single-label host.
+        let origin = aliased_origin(&requested);
         let dir = inner_path.strip_suffix("index.html").unwrap_or(&inner_path);
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
-        return Redirect::temporary(&format!("//{requested}/{dir}{query}")).into_response();
+        return Redirect::temporary(&format!("//{origin}/{dir}{query}")).into_response();
     }
     let proxy_mode = host == requested;
 
@@ -944,6 +971,49 @@ async fn render_wrapper(
             .into_response();
     }
     let content = ctx.state.content(&address).await;
+    // Reverse xID: a xite reached by its bech32 address (bare, or the dotted
+    // `<addr>.epix` alias) whose content.json claims a `.epix` domain is sent
+    // to that domain, so the address bar shows `talk.epix` instead of
+    // `epix1talk…`, like DNS resolving a name for a link you clicked. The claim
+    // is only trusted after the chain confirms the claimed name resolves BACK
+    // to this exact address (via the XidResolver Merkle-proof path), so a site
+    // cannot hijack another's name. Only the top-level document redirects; a
+    // failed/absent verification serves the address unchanged (fail closed).
+    // Host (proxy) mode goes to the domain's origin; path mode (the mobile
+    // shells and the loopback UI address xites by path) goes to the domain's
+    // path on the same origin - the shells' address bars then show the name
+    // via their friendly-URL mapping. Temporary redirect, so a changed xID
+    // record takes effect on the next visit. The verified name is cache-hit
+    // on repeat loads.
+    let address_form = (requested.starts_with("epix1") && !requested.contains('.'))
+        || address_alias(&requested).is_some();
+    if address_form {
+        if let Some(domain) = content
+            .as_ref()
+            .and_then(|c| c.get("domain"))
+            .and_then(|v| v.as_str())
+            .map(|d| d.trim().to_lowercase())
+            .filter(|d| d.ends_with(".epix"))
+        {
+            if ctx.state.resolve_for_serving(&domain).await == address {
+                // Keep the directory the document asked for and its query; the
+                // implied index.html is dropped. Scheme-relative in host mode,
+                // so https carries.
+                let dir = inner_path.strip_suffix("index.html").unwrap_or(&inner_path);
+                let query = raw_query
+                    .as_deref()
+                    .filter(|q| !q.is_empty())
+                    .map(|q| format!("?{q}"))
+                    .unwrap_or_default();
+                let target = if proxy_mode {
+                    format!("//{domain}/{dir}{query}")
+                } else {
+                    format!("/{domain}/{dir}{query}")
+                };
+                return Redirect::temporary(&target).into_response();
+            }
+        }
+    }
     let title = content
         .as_ref()
         .and_then(|c| c.get("title"))
@@ -983,11 +1053,10 @@ async fn render_wrapper(
     // proxy rewrite routes as-is. File URLs stay relative to the current xite.
     let node_home = ctx.state.homepage().await.unwrap_or_else(|| requested.clone());
     let (homepage, file_url) = if proxy_mode {
-        let home = if node_home.contains('.') {
-            format!("//{node_home}")
-        } else {
-            format!("/{node_home}")
-        };
+        // Host mode always links the homepage as a dotted origin - a name
+        // as-is, a bare address via its `<addr>.epix` alias - so the browser
+        // lands on a clean origin without a path-form redirect hop.
+        let home = format!("//{}", aliased_origin(&node_home));
         (home, format!("/{inner_path}"))
     } else {
         (format!("/{node_home}"), format!("/{requested}/{inner_path}"))

@@ -263,17 +263,11 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     });
 
     let proxy_addr: SocketAddr = PROXY_ADDR.parse().unwrap();
-    {
-        let ca = ca.clone();
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(proxy_addr).await {
-                Ok(listener) => {
-                    let _ = proxy::serve(listener, proxy_app, ca).await;
-                }
-                Err(e) => eprintln!("browser proxy bind on {proxy_addr} failed: {e}"),
-            }
-        });
-    }
+    // Flipped true once setup_profile confirms the CA is trusted; the proxy then
+    // upgrades plain-http xite loads to https. Firefox launches only after that,
+    // so the flag is already correct by the time real requests arrive.
+    let proxy_secure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_browser_proxy(proxy_addr, proxy_app, ca.clone(), proxy_secure.clone());
 
     if !wait_for_port(ui_addr, Duration::from_secs(30)).await
         || !wait_for_port(proxy_addr, Duration::from_secs(10)).await
@@ -312,6 +306,11 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
         println!("· routing clearnet through Tor (clearnet is slower, and needs ~40s until Tor is up)");
     }
 
+    // A bare bech32 launch target becomes its dotted alias `<addr>.epix` for
+    // everything the browser sees (homepage pref, start URL): browsers
+    // special-case single-label hosts, and the node collapses the alias back
+    // to the address.
+    let display = epix_ui::aliased_origin(&display);
     // Write the managed profile (CA injected so https://*.epix is trusted), then
     // install the theme + wallet extension into it.
     let (profile, secure) = setup_profile(
@@ -319,6 +318,11 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     );
     ensure_search_policy(&firefox);
     install_addons(&profile, &firefox, ext_capable);
+
+    // The CA is trusted: let the proxy upgrade plain-http xite loads to https.
+    // Set before Firefox launches, so the very first navigation is already
+    // covered.
+    proxy_secure.store(secure, std::sync::atomic::Ordering::Relaxed);
 
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
@@ -352,6 +356,35 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
         i2p_on,
     };
     (ready, child)
+}
+
+/// Serve the browser proxy on `proxy_addr` in the background: TLS-terminated
+/// CONNECT plus plain http, both feeding `app` (the node's router with the
+/// transparent-proxy host rewrite). `secure` flips true once the CA is
+/// confirmed trusted; the proxy then upgrades plain-http xite loads to https.
+fn spawn_browser_proxy<S>(
+    proxy_addr: SocketAddr,
+    app: S,
+    ca: Arc<LocalCa>,
+    secure: Arc<std::sync::atomic::AtomicBool>,
+) where
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(proxy_addr).await {
+            Ok(listener) => {
+                let _ = proxy::serve(listener, app, ca, secure).await;
+            }
+            Err(e) => eprintln!("browser proxy bind on {proxy_addr} failed: {e}"),
+        }
+    });
 }
 
 /// Write the managed Firefox profile and install the local CA. Returns the
@@ -939,11 +972,19 @@ fn write_profile(
     std::fs::write(&pac_path, pac)?;
     let pac_url = file_url(&pac_path);
 
+    // failover_direct=false: when a proxy connection hiccups, necko's default
+    // is to silently retry DIRECT - for a `.epix` host that means a clearnet
+    // DNS lookup that fails as a misleading "Unable to connect" instead of a
+    // proxy error. no_proxies_on is pinned empty: if it ever picks up
+    // `<local>` (WinINet import, enterprise template), Firefox bypasses the
+    // proxy for every dotless host BEFORE consulting the PAC.
     let proxy_prefs = format!(
         "user_pref(\"network.proxy.type\", 2);\n\
          user_pref(\"network.proxy.autoconfig_url\", \"{pac_url}\");\n\
          user_pref(\"network.proxy.allow_hijacking_localhost\", true);\n\
-         user_pref(\"network.proxy.socks_remote_dns\", true);\n"
+         user_pref(\"network.proxy.socks_remote_dns\", true);\n\
+         user_pref(\"network.proxy.failover_direct\", false);\n\
+         user_pref(\"network.proxy.no_proxies_on\", \"\");\n"
     );
 
     let scheme = if secure { "https" } else { "http" };
@@ -991,6 +1032,14 @@ fn write_profile(
 // dropping the line would leave existing profiles searchless.
 user_pref("browser.fixup.dns_first_for_single_words", false);
 user_pref("keyword.enabled", true);
+// `.epix` is not in the Public Suffix List, so since Firefox 77 a bare typed
+// `dashboard.epix` is sent to the search engine instead of navigating (only an
+// explicit https://dashboard.epix/ would load). Whitelist the suffix so any
+// `*.epix` typed without a scheme navigates like a real domain - the PAC then
+// routes it to the node proxy and the bar keeps showing the name, like DNS.
+// (Bare bech32 `epix1…` addresses have no dot, so this can't reach them; the
+// urlbar WebExtension redirect handles those.)
+user_pref("browser.fixup.domainsuffixwhitelist.epix", true);
 user_pref("browser.urlbar.suggest.searches", false);
 user_pref("browser.urlbar.suggest.quickactions", false);
 // Skip first-run noise so it opens straight on the xite.

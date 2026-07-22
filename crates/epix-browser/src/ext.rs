@@ -49,7 +49,7 @@ static WALLET_TOOLBAR_48: &[u8] = include_bytes!("../assets/wallet-toolbar-48.pn
 /// transform, JS patches) but the wallet build itself does not. Folded into the
 /// version stamp so an otherwise-unchanged wallet still repacks and reloads once,
 /// picking up the new packing.
-const WALLET_PACK_VERSION: u32 = 8;
+const WALLET_PACK_VERSION: u32 = 11;
 
 /// The extension id (must match the wallet `manifest.json`'s Firefox gecko id).
 pub const EXT_ID: &str = "wallet@epix.zone";
@@ -446,25 +446,52 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
 
 /// URL-bar navigation for bare xite addresses. A bech32 `epix1…` address has no
 /// dot, so Firefox's fixup sends it to the default search engine instead of
-/// navigating (a dotted `name.epix` navigates natively). This background script
-/// catches exactly that search - a main-frame query that IS a bech32 address -
-/// before it leaves, and goes to the xite instead, like the mobile shells'
-/// address bars. Scoped to DuckDuckGo, the managed profile's default engine.
+/// navigating (a dotted `name.epix` navigates natively via the suffix
+/// whitelist). This background script catches that search - a main-frame
+/// navigation whose search term IS a bech32 address - before it leaves, and
+/// goes to the xite instead, like the mobile shells' address bars.
+///
+/// Matched on the search TERM across all main-frame navigations, not on any one
+/// engine's host, so it keeps working if the user changes their default search
+/// engine (DuckDuckGo, Google, Bing, Brave, Ecosia, Startpage, Yahoo, Baidu,
+/// Yandex, or a custom one). The term rides in a handful of well-known query
+/// keys; `epix1…` never legitimately appears as another site's query value, so a
+/// term match is unambiguous. Non-matching navigations fall straight through.
+///
+/// The redirect target is the dotted ALIAS `https://<addr>.epix/`, never the
+/// bare `https://<addr>/`: browsers special-case single-label (dotless) hosts
+/// (search fixup, proxy bypass filters, PSL heuristics - IPFS/I2P/Tor all use
+/// dotted forms for the same reason), and the node collapses the alias back to
+/// the address. A second branch rewrites main-frame navigations whose HOST is
+/// a bare address (a clicked `https://epix1…/…` link, or a hand-typed URL) to
+/// the same alias, preserving path and query.
 const EPIX_URLBAR_JS: &[u8] = concat!(
     "// Managed by epix-browser (added at pack time).\n",
     "(() => {\n",
     "  const api = globalThis.browser || globalThis.chrome;\n",
     "  if (!api || !api.webRequest) return;\n",
     "  const ADDR = /^epix1[a-z0-9]{20,80}$/;\n",
+    "  // Search-term query keys: q (DuckDuckGo/Google/Bing/Brave/Ecosia/Startpage),\n",
+    "  // p (Yahoo), query (some engines), wd (Baidu), text (Yandex), eq/kw (misc).\n",
+    "  const KEYS = [\"q\", \"query\", \"p\", \"text\", \"wd\", \"eq\", \"kw\"];\n",
     "  api.webRequest.onBeforeRequest.addListener(\n",
     "    (details) => {\n",
     "      try {\n",
-    "        const q = (new URL(details.url).searchParams.get(\"q\") || \"\").trim();\n",
-    "        if (ADDR.test(q)) return { redirectUrl: \"https://\" + q + \"/\" };\n",
+    "        const u = new URL(details.url);\n",
+    "        // A bare-address HOST navigates to its dotted alias, keeping\n",
+    "        // path + query (clicked links, typed https://epix1.../ URLs).\n",
+    "        if (ADDR.test(u.hostname)) {\n",
+    "          return { redirectUrl: \"https://\" + u.hostname + \".epix\" + u.pathname + u.search };\n",
+    "        }\n",
+    "        // A search whose term is a bare address goes to the xite.\n",
+    "        for (const k of KEYS) {\n",
+    "          const v = (u.searchParams.get(k) || \"\").trim();\n",
+    "          if (ADDR.test(v)) return { redirectUrl: \"https://\" + v + \".epix/\" };\n",
+    "        }\n",
     "      } catch (_) {}\n",
     "      return {};\n",
     "    },\n",
-    "    { urls: [\"*://duckduckgo.com/*\", \"*://*.duckduckgo.com/*\"], types: [\"main_frame\"] },\n",
+    "    { urls: [\"*://*/*\"], types: [\"main_frame\"] },\n",
     "    [\"blocking\"]\n",
     "  );\n",
     "})();\n",
@@ -518,7 +545,35 @@ fn transform_manifest(contents: &[u8], stamp: u32) -> Vec<u8> {
             }
         }
     }
+    grant_urlbar_host_permissions(&mut m);
     serde_json::to_vec(&m).unwrap_or_else(|_| stamp_manifest_version(contents, stamp))
+}
+
+/// The injected `epix-urlbar.js` runs on the wallet's background page, so it
+/// inherits the wallet's granted host permissions. Its blocking `webRequest`
+/// redirect watches all main-frame navigations (to catch a `epix1…` search on
+/// WHATEVER engine is default), so it needs host permission for all http/https
+/// origins. In a Manifest V2 add-on those host patterns must live in the
+/// `permissions` array: the wallet lists them under the `host_permissions` key
+/// instead, which Firefox IGNORES for MV2 - so without this the redirect
+/// silently no-ops and a typed `epix1…` address falls through to search. Grant
+/// `*://*/*` in the MV2 `permissions` array (idempotent; a no-op on MV3, where
+/// host_permissions is honoured, or if already present). This matches the broad
+/// host access the wallet already intends (its content scripts run on
+/// `<all_urls>`), so it grants nothing the wallet did not already ask for.
+fn grant_urlbar_host_permissions(m: &mut serde_json::Value) {
+    let is_mv2 = m.get("manifest_version").and_then(|v| v.as_u64()) == Some(2);
+    if !is_mv2 {
+        return;
+    }
+    let Some(perms) = m.get_mut("permissions").and_then(|p| p.as_array_mut()) else {
+        return;
+    };
+    let host = "*://*/*";
+    let present = perms.iter().any(|p| p.as_str() == Some(host));
+    if !present {
+        perms.push(serde_json::Value::String(host.to_string()));
+    }
 }
 
 /// Rewrite `manifest.json`'s `"version": "X.Y.Z"` to `"X.Y.Z.<stamp>"` so the
@@ -1111,6 +1166,29 @@ mod tests {
         assert!(t["theme"]["colors"].is_object());
     }
 
+    #[test]
+    fn transform_manifest_grants_mv2_urlbar_host_permissions() {
+        // MV2 wallet-shaped manifest: host grants sit in the (MV2-ignored)
+        // host_permissions key, so the urlbar shim's blocking webRequest redirect
+        // of a search has no host permission. The transform must add the
+        // all-origins pattern to the MV2 `permissions` array so the redirect
+        // works on whatever search engine is default.
+        let src = br#"{"manifest_version":2,"version":"1.0.0","permissions":["storage","webRequest","webRequestBlocking"],"host_permissions":["http://*/*","https://*/*"]}"#;
+        let m: serde_json::Value = serde_json::from_slice(&transform_manifest(src, 1)).unwrap();
+        let perms: Vec<&str> = m["permissions"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(perms.contains(&"*://*/*"), "all-origins host granted in permissions");
+        assert!(perms.contains(&"webRequestBlocking"), "existing permissions preserved");
+
+        // Idempotent, and MV3 is left untouched (host perms belong in host_permissions there).
+        let again = transform_manifest(&transform_manifest(src, 1), 1);
+        let m2: serde_json::Value = serde_json::from_slice(&again).unwrap();
+        let n = m2["permissions"].as_array().unwrap().iter().filter(|v| v.as_str() == Some("*://*/*")).count();
+        assert_eq!(n, 1, "re-running does not duplicate the grant");
+        let mv3 = br#"{"manifest_version":3,"version":"1.0.0","permissions":["webRequest"]}"#;
+        let m3: serde_json::Value = serde_json::from_slice(&transform_manifest(mv3, 1)).unwrap();
+        assert_eq!(m3["permissions"].as_array().unwrap().len(), 1, "MV3 permissions untouched");
+    }
+
     // An unchanged XPI is left in place (mtime preserved) so Firefox doesn't
     // reinstall the add-on every launch; a content change rewrites it.
     #[test]
@@ -1197,11 +1275,13 @@ mod tests {
         assert!(poly < urlbar && urlbar < bundle, "script order polyfill < urlbar < bundles: {s}");
         // No anchor -> untouched.
         assert!(patch_background_html(b"<html>changed build</html>").is_none());
-        // The injected script only rewrites bech32-address searches.
+        // The injected script only rewrites bech32-address searches and hosts.
         let js = std::str::from_utf8(EPIX_URLBAR_JS).unwrap();
-        assert!(js.contains("duckduckgo.com"), "scoped to the managed default engine");
+        assert!(js.contains("*://*/*"), "engine-agnostic: watches all main-frame navigations");
         assert!(js.contains("main_frame"), "only top-level navigations");
-        assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 query match");
+        assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 match");
+        assert!(js.contains(".epix/"), "search terms go to the dotted alias, never a dotless host");
+        assert!(js.contains("u.hostname + \".epix\""), "bare-address hosts rewrite to the alias");
     }
 
     // The packed wallet XPI carries the URL-bar script and loads it from the
