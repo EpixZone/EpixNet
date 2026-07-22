@@ -530,8 +530,9 @@ fn address_alias(host: &str) -> Option<&str> {
 
 /// The dotted-alias origin for a xite reference: a bare `epix1…` address gains
 /// the `.epix` suffix (so the browser treats it as a normal dotted host); a
-/// name (or an already-dotted alias) passes through unchanged.
-fn aliased_origin(xite_ref: &str) -> String {
+/// name (or an already-dotted alias) passes through unchanged. Public so the
+/// desktop browser applies the same rule to its homepage / start URL.
+pub fn aliased_origin(xite_ref: &str) -> String {
     if xite_ref.starts_with("epix1") && !xite_ref.contains('.') {
         format!("{xite_ref}.epix")
     } else {
