@@ -18,10 +18,18 @@ Unicode true
   !define OUT_FILE "Epix-Setup.exe"
 !endif
 
-; Installer/uninstaller icon, prebuilt from the assets repo
-; (images/icons/generated/windows/app.ico). Path is relative to this script.
+; Branding assets, prebuilt from the assets repo and committed next to this
+; script: app.ico (images/icons/generated/windows/app.ico), welcome.bmp and
+; header.bmp (scripts/generate-installer-bmps.py). Paths are relative to this
+; script.
 !define MUI_ICON "app.ico"
 !define MUI_UNICON "app.ico"
+!define MUI_WELCOMEFINISHPAGE_BITMAP "welcome.bmp"
+!define MUI_UNWELCOMEFINISHPAGE_BITMAP "welcome.bmp"
+!define MUI_HEADERIMAGE
+!define MUI_HEADERIMAGE_BITMAP "header.bmp"
+!define MUI_HEADERIMAGE_RIGHT
+!define MUI_ABORTWARNING
 
 Name "EpixNet"
 OutFile "${OUT_FILE}"
@@ -29,6 +37,28 @@ InstallDir "$LOCALAPPDATA\Epix"
 RequestExecutionLevel user
 ShowInstDetails show
 ShowUninstDetails show
+BrandingText "EpixNet ${VERSION}"
+
+; Version resource on the installer exe (Properties > Details). VIProductVersion
+; needs a numeric x.x.x.x, so strip any pre-release suffix (1.2.3-rc1 -> 1.2.3)
+; and append ".0". The display fields keep the full version string.
+!searchparse /noerrors "${VERSION}-" "" VERSION_NUM "-"
+VIProductVersion "${VERSION_NUM}.0"
+VIAddVersionKey /LANG=1033 "ProductName"     "EpixNet"
+VIAddVersionKey /LANG=1033 "CompanyName"     "Epix"
+VIAddVersionKey /LANG=1033 "FileDescription" "EpixNet Installer"
+VIAddVersionKey /LANG=1033 "FileVersion"     "${VERSION_NUM}.0"
+VIAddVersionKey /LANG=1033 "ProductVersion"  "${VERSION}"
+VIAddVersionKey /LANG=1033 "LegalCopyright"  "Copyright (c) Epix"
+
+!define MUI_WELCOMEPAGE_TITLE "Welcome to EpixNet"
+!define MUI_WELCOMEPAGE_TEXT "Setup will install EpixNet ${VERSION} on your computer.$\r$\n$\r$\nEpixNet installs for the current user only and does not require administrator rights.$\r$\n$\r$\nClick Next to continue."
+
+; Finish page: offer to launch, checked by default.
+!define MUI_FINISHPAGE_RUN "$INSTDIR\epix-browser.exe"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch EpixNet"
+!define MUI_FINISHPAGE_LINK "epix.zone"
+!define MUI_FINISHPAGE_LINK_LOCATION "https://epix.zone"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY

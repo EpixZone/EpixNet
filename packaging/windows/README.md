@@ -11,6 +11,15 @@ compiles (verified with `makensis`), and the Windows Rust build (including the
 be cross-compiled from macOS because `ring`/`aws-lc-sys` need a Windows C
 toolchain.
 
+## Branding
+
+`installer.nsi` brands the wizard with `app.ico` and two MUI2 bitmaps
+committed next to it: `welcome.bmp` (164x314, the welcome/finish sidebar) and
+`header.bmp` (150x57, the page header). All three are prebuilt from the assets
+repo. Regenerate the bitmaps with `python scripts/generate-installer-bmps.py`
+there (needs Pillow; writes into this directory). The finish page offers a
+"Launch EpixNet" checkbox, checked by default.
+
 ## Layout
 
 Ship a self-contained install directory:
