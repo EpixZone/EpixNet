@@ -23,9 +23,10 @@
 use async_trait::async_trait;
 use epix_core::{Error, PeerAddr, Result};
 use epix_transport::{PeerStream, Transport};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use yosemite::{style::Stream, Session, SessionOptions};
+use yosemite::{style::Stream, DestinationKind, RouterApi, Session, SessionOptions};
 
 mod router;
 
@@ -199,21 +200,45 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
     };
     status.write().await.sam_port = sam_port;
 
-    // Inbound: a server session whose destination is our advertised I2P
-    // address; accept forever and hand streams to the node's server.
-    let mut inbound = new_session(sam_port).await?;
-    let destination = inbound.destination().to_string();
-    let b32 = b32_address(&destination).unwrap_or_default();
+    // Our stable server identity - persisted so the advertised address survives
+    // restarts and session rebuilds.
+    let identity = load_or_create_identity(&config.data_dir, sam_port).await?;
+
+    // Inbound: a server session on our persistent destination - our advertised
+    // I2P address; accept forever and hand streams to the node's server.
+    let mut inbound = Some(
+        new_persistent_session(sam_port, &identity.private_key)
+            .await
+            .map_err(|e| Error::Protocol(format!("i2p inbound session: {e}")))?,
+    );
+    let b32 = b32_address(&identity.destination).unwrap_or_default();
     {
         let mut s = status.write().await;
-        s.destination = destination;
+        s.destination = identity.destination.clone();
         s.b32 = b32;
         s.phase = I2pPhase::Ready;
     }
-    let accept_status = status.clone();
+    let private_key = identity.private_key;
     tokio::spawn(async move {
         loop {
-            match inbound.accept().await {
+            // Rebuild the listening session if it was torn down (a wedged
+            // session was dropped below). Reusing the persistent key gives the
+            // same destination, so our advertised address never changes.
+            let session = match inbound {
+                Some(ref mut s) => s,
+                None => match new_persistent_session(sam_port, &private_key).await {
+                    Ok(s) => inbound.insert(s),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "epix::i2p",
+                            "i2p inbound rebuild failed, will retry: {e}",
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                },
+            };
+            match session.accept().await {
                 Ok(stream) => {
                     if tx.send(Box::pin(stream) as PeerStream).await.is_err() {
                         break; // node shut down
@@ -222,31 +247,16 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
                 Err(e) => {
                     tracing::debug!(target: "epix::i2p", "i2p accept error: {e}");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    // A wedged listening session never accepts again; rebuild it
-                    // so inbound reachability recovers instead of spinning on a
-                    // dead session. Rebuilding yields a fresh destination, so
-                    // republish our advertised address to match.
+                    // A wedged listening session never accepts again. Drop it so
+                    // the next iteration recreates it on the same destination -
+                    // the drop frees that destination at the router first, or the
+                    // recreate would be rejected as a duplicate.
                     if session_fatal(&e) {
-                        match new_session_raw(sam_port).await {
-                            Ok(s) => {
-                                let destination = s.destination().to_string();
-                                let b32 = b32_address(&destination).unwrap_or_default();
-                                inbound = s;
-                                let mut st = accept_status.write().await;
-                                st.destination = destination;
-                                st.b32 = b32.clone();
-                                tracing::info!(
-                                    target: "epix::i2p",
-                                    "rebuilt wedged i2p inbound session; new address {b32}",
-                                );
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "epix::i2p",
-                                    "i2p inbound rebuild failed, will retry: {e}",
-                                );
-                            }
-                        }
+                        tracing::info!(
+                            target: "epix::i2p",
+                            "rebuilding wedged i2p inbound session",
+                        );
+                        inbound = None;
                     }
                 }
             }
@@ -256,17 +266,99 @@ async fn bringup(config: I2pConfig, status: SharedStatus, tx: mpsc::Sender<PeerS
     Ok(())
 }
 
-/// Create a SAM stream session against the router at `sam_port`, keeping the
-/// raw `yosemite` error so callers can tell a wedged session apart from an
-/// ordinary failure.
+/// Create a **transient** SAM stream session against the router at `sam_port` -
+/// a throwaway destination for outbound dials. Keeps the raw `yosemite` error so
+/// callers can tell a wedged session apart from an ordinary failure.
 async fn new_session_raw(sam_port: u16) -> yosemite::Result<Session<Stream>> {
     let options = SessionOptions { samv3_tcp_port: sam_port, ..Default::default() };
     Session::<Stream>::new(options).await
 }
 
-/// Create a SAM stream session against the router at `sam_port`.
-async fn new_session(sam_port: u16) -> Result<Session<Stream>> {
-    new_session_raw(sam_port).await.map_err(|e| Error::Protocol(format!("i2p session: {e}")))
+/// Create a **persistent** SAM stream session against the router at `sam_port`,
+/// bound to `private_key`. This is our inbound (server) destination: reusing the
+/// same key keeps our advertised `.b32.i2p` address stable across restarts and
+/// session rebuilds. The caller must have dropped any previous session on this
+/// key first, or the router rejects the create as a duplicate destination.
+async fn new_persistent_session(sam_port: u16, private_key: &str) -> yosemite::Result<Session<Stream>> {
+    let options = SessionOptions {
+        samv3_tcp_port: sam_port,
+        destination: DestinationKind::Persistent { private_key: private_key.to_string() },
+        ..Default::default()
+    };
+    Session::<Stream>::new(options).await
+}
+
+/// Our stable I2P server identity: the public `destination` (what the `.b32.i2p`
+/// address is derived from and what peers connect to) and its `private_key` (the
+/// blob that recreates it via [`DestinationKind::Persistent`]).
+struct I2pIdentity {
+    destination: String,
+    private_key: String,
+}
+
+impl I2pIdentity {
+    /// Serialize as two lines (`destination`\n`private_key`) - both are
+    /// single-line I2P base64, so a line each round-trips losslessly.
+    fn serialize(&self) -> String {
+        format!("{}\n{}\n", self.destination, self.private_key)
+    }
+
+    /// Parse the two-line form written by [`Self::serialize`]; `None` if either
+    /// line is missing or empty (treated as "regenerate").
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let destination = lines.next()?.to_string();
+        let private_key = lines.next()?.to_string();
+        Some(Self { destination, private_key })
+    }
+}
+
+/// Load our persisted I2P identity from `<data_dir>/destination.key`, or - on
+/// first run, or if the file is missing/corrupt - generate a fresh one via the
+/// router and persist it (owner-only). The key blob is I2P private-key material;
+/// it sits alongside the embedded router's own identity in the same data dir,
+/// under the same local-disk trust assumption.
+async fn load_or_create_identity(data_dir: &Path, sam_port: u16) -> Result<I2pIdentity> {
+    let path = data_dir.join("destination.key");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(identity) = I2pIdentity::parse(&text) {
+            return Ok(identity);
+        }
+        tracing::warn!(target: "epix::i2p", "i2p destination.key unreadable, regenerating");
+    }
+    let (destination, private_key) = RouterApi::new(sam_port)
+        .generate_destination()
+        .await
+        .map_err(|e| Error::Protocol(format!("i2p generate destination: {e}")))?;
+    let identity = I2pIdentity { destination, private_key };
+    if let Err(e) = write_key_file(&path, &identity.serialize()) {
+        // Non-fatal: we still have a working destination this run, we just
+        // won't keep it next time. Better to run than to refuse to start.
+        tracing::warn!(target: "epix::i2p", "could not persist i2p destination.key: {e}");
+    }
+    Ok(identity)
+}
+
+/// Write `contents` to `path` owner-only (0600 on unix), creating the parent dir
+/// and replacing any existing file atomically via a temp file + rename.
+fn write_key_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("key.tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Whether a `yosemite` error means the SAM **session itself** is no longer
@@ -413,6 +505,37 @@ mod tests {
             I2pError::CantReachPeer
         ))));
         assert!(!session_fatal(&YErr::I2p(I2pError::CantReachPeer)));
+    }
+
+    #[test]
+    fn identity_round_trips() {
+        let id = I2pIdentity {
+            destination: "PUBLIC~dest-base64".to_string(),
+            private_key: "PRIVATE~key-base64".to_string(),
+        };
+        let parsed = I2pIdentity::parse(&id.serialize()).expect("parses");
+        assert_eq!(parsed.destination, id.destination);
+        assert_eq!(parsed.private_key, id.private_key);
+        // Tolerates trailing whitespace / blank lines, rejects a truncated file.
+        assert!(I2pIdentity::parse("dest\n\nkey\n").is_some());
+        assert!(I2pIdentity::parse("only-one-line\n").is_none());
+        assert!(I2pIdentity::parse("").is_none());
+    }
+
+    #[test]
+    fn write_key_file_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("destination.key");
+        write_key_file(&path, "dest\nkey\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "dest\nkey\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file must be owner-only");
+        }
+        // No temp file left behind.
+        assert!(!path.with_extension("key.tmp").exists());
     }
 
     #[test]
