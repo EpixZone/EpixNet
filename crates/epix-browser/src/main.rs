@@ -16,6 +16,7 @@
 
 mod autostart;
 mod ca;
+mod eepsite;
 mod ext;
 #[cfg(windows)]
 mod icon;
@@ -39,6 +40,8 @@ use std::time::Duration;
 const UI_ADDR: &str = "127.0.0.1:42222";
 const PROXY_ADDR: &str = "127.0.0.1:43112";
 const SOCKS_ADDR: &str = "127.0.0.1:43111";
+/// The `.i2p` (eepsite) HTTP proxy the PAC routes `*.i2p` hosts to.
+const EEPSITE_PROXY_ADDR: &str = "127.0.0.1:43113";
 
 /// The "route clearnet through Tor" setting (persisted by the native host in
 /// `<data_root>/browser-settings.json`), read at launch to build the file PAC.
@@ -268,6 +271,7 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     // so the flag is already correct by the time real requests arrive.
     let proxy_secure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     spawn_browser_proxy(proxy_addr, proxy_app, ca.clone(), proxy_secure.clone());
+    spawn_eepsite_proxy(running.state.clone(), data_root.join("i2p").join("eepsite-hosts.json"));
 
     if !wait_for_port(ui_addr, Duration::from_secs(30)).await
         || !wait_for_port(proxy_addr, Duration::from_secs(10)).await
@@ -383,6 +387,21 @@ fn spawn_browser_proxy<S>(
                 let _ = proxy::serve(listener, app, ca, secure).await;
             }
             Err(e) => eprintln!("browser proxy bind on {proxy_addr} failed: {e}"),
+        }
+    });
+}
+
+/// Serve the eepsite proxy on [`EEPSITE_PROXY_ADDR`] in the background: the
+/// PAC routes every `*.i2p` host here, and requests ride SAM streams through
+/// the node's I2P router. Serves friendly status pages while I2P is disabled
+/// or still starting, so `.i2p` never dead-ends on a closed port.
+fn spawn_eepsite_proxy(state: Arc<epix_ui::AppState>, book_path: PathBuf) {
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(EEPSITE_PROXY_ADDR).await {
+            Ok(listener) => {
+                let _ = eepsite::serve(listener, state, book_path).await;
+            }
+            Err(e) => eprintln!("eepsite proxy bind on {EEPSITE_PROXY_ADDR} failed: {e}"),
         }
     });
 }
@@ -960,6 +979,9 @@ fn write_profile(
          \x20 // the dashboard's site links and the URL-bar address navigation land on\n\
          \x20 // https://epix1.../, which must reach the node, not DNS.\n\
          \x20 if (shExpMatch(host, \"epix1*\") && dnsDomainLevels(host) === 0) {{ return \"PROXY {proxy_addr}\"; }}\n\
+         \x20 // Eepsites: the node carries `.i2p` hosts over its I2P router via a\n\
+         \x20 // dedicated local HTTP proxy (jump links and b32 addresses included).\n\
+         \x20 if (shExpMatch(host, \"*.i2p\")) {{ return \"PROXY {EEPSITE_PROXY_ADDR}\"; }}\n\
          \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
          \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
          \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\

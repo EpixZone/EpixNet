@@ -28,7 +28,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use yosemite::{style::Stream, DestinationKind, RouterApi, Session, SessionOptions};
 
+mod eepsite;
 mod router;
+
+pub use eepsite::EepsiteDialer;
 
 /// How I2P is provided.
 #[derive(Debug, Clone, PartialEq, Eq)]
