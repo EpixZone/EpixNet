@@ -62,16 +62,19 @@ mod imp {
                 .await
                 .map_err(|e| Error::Protocol(format!("i2p storage: {e}")))?;
 
-            // Fresh transport keys/IV; SSU2/SAM/NTCP2 bind OS-assigned ports
-            // (port 0) so several nodes on one host don't collide.
-            let mut iv = [0u8; 16];
-            fill_random(&mut iv);
-            let mut ntcp2_key = [0u8; 32];
-            fill_random(&mut ntcp2_key);
-            let mut ssu2_intro = [0u8; 32];
-            fill_random(&mut ssu2_intro);
-            let mut ssu2_static = [0u8; 32];
-            fill_random(&mut ssu2_static);
+            // Reuse everything the last run persisted: our transport keys and
+            // router identity, plus the cached netdb and peer profiles. This is
+            // what emissary-cli's `Config::parse` does. Two payoffs:
+            //  - a **stable** router identity across restarts (peers remember us,
+            //    profiles stay useful), and
+            //  - startup skips the HTTPS reseed whenever the cached netdb is warm
+            //    (below), so only a genuinely cold node pays the reseed cost.
+            // `Storage::new` just created any missing keys, so these are always
+            // present, even on a first run (where `routers` is empty and we do
+            // reseed). SSU2/SAM/NTCP2 still bind OS-assigned ports (port 0) so
+            // several nodes on one host don't collide - each has its own data dir
+            // and thus its own persisted keys.
+            let bundle = storage.load().await;
 
             let mut config = Config {
                 net_id: Some(2), // I2P main network.
@@ -80,8 +83,8 @@ mod imp {
                     ipv4_host: None,
                     ipv6: false,
                     ipv6_host: None,
-                    iv,
-                    key: ntcp2_key,
+                    iv: bundle.ntcp2_iv,
+                    key: bundle.ntcp2_key,
                     port: 0,
                     publish_ipv4: true,
                     publish_ipv6: false,
@@ -91,7 +94,7 @@ mod imp {
                 }),
                 ssu2: Some(Ssu2Config {
                     disable_pq: false,
-                    intro_key: ssu2_intro,
+                    intro_key: bundle.ssu2_intro_key,
                     ipv4: true,
                     ipv4_host: None,
                     ipv4_mtu: None,
@@ -102,7 +105,7 @@ mod imp {
                     publish_ipv4: true,
                     publish_ipv6: false,
                     max_connections: None,
-                    static_key: ssu2_static,
+                    static_key: bundle.ssu2_static_key,
                     ml_kem: None,
                 }),
                 samv3_config: Some(SamConfig {
@@ -110,6 +113,16 @@ mod imp {
                     udp_port: 0,
                     host: "127.0.0.1".to_string(),
                 }),
+                routers: bundle.routers,
+                profiles: bundle.profiles,
+                // Deliberately NOT reusing the persisted local `router_info`: we
+                // bind ephemeral ports (port 0) each start, so the stored info
+                // advertises last run's addresses. emissary rebuilds our local
+                // info from the persistent keys (same identity, same router
+                // hash) plus the freshly bound ports.
+                router_info: None,
+                signing_key: Some(bundle.signing_key),
+                static_key: Some(bundle.static_key),
                 ..Default::default()
             };
 
@@ -180,18 +193,6 @@ mod imp {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    }
-
-    /// Fill `buf` with OS randomness (avoids a rand dep for a few keys).
-    fn fill_random(buf: &mut [u8]) {
-        use std::hash::{BuildHasher, Hasher, RandomState};
-        let mut i = 0;
-        while i < buf.len() {
-            let bytes = RandomState::new().build_hasher().finish().to_le_bytes();
-            let n = (buf.len() - i).min(8);
-            buf[i..i + n].copy_from_slice(&bytes[..n]);
-            i += n;
         }
     }
 }
