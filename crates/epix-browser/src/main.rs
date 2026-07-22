@@ -1006,6 +1006,7 @@ fn write_profile(
          user_pref(\"network.proxy.allow_hijacking_localhost\", true);\n\
          user_pref(\"network.proxy.socks_remote_dns\", true);\n\
          user_pref(\"network.proxy.failover_direct\", false);\n\
+         user_pref(\"network.proxy.failover_timeout\", 10);\n\
          user_pref(\"network.proxy.no_proxies_on\", \"\");\n"
     );
 
