@@ -185,6 +185,8 @@ impl std::fmt::Debug for EpixCertResolver {
 
 impl ResolvesServerCert for EpixCertResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        // No SNI (some clients omit it for unusual hosts): fall back to a
+        // generic name; the leaf then won't match, surfacing as a cert error.
         let host = client_hello.server_name().unwrap_or("epix").to_string();
         self.cert_for(&host)
     }
