@@ -7077,10 +7077,18 @@ impl AppState {
         let clearnet_reachable = clearnet_enabled && port_opened;
         let clearnet_ip = configured_ip.or(detected_ip);
 
-        let (tor_enabled, tor_status) = self.tor_status().await;
+        let (tor_up, tor_status) = self.tor_status().await;
         let onion = self.onion_address().await;
         let tor_ok = matches!(tor_status.as_str(), "OK" | "Always");
-        let tor_reachable = tor_enabled && tor_ok && onion.is_some();
+        // `enabled` means configured on, not connected: while Arti bootstraps
+        // the runtime stores ("Bootstrapping", up=false), and a failed attempt
+        // stores ("Failed", up=false) between retries. Deriving `enabled` from
+        // the up-flag made the dashboard badge every one of those phases as
+        // "Off", even with Tor enabled in settings. "Disabled" is only ever
+        // stored when the mode is off (or the Tor task never started), so any
+        // other status means the transport is on and its phase should show.
+        let tor_enabled = tor_up || tor_status != "Disabled";
+        let tor_reachable = tor_up && tor_ok && onion.is_some();
 
         let i2p = self.i2p_status().await;
         let i2p_str = |k: &str| i2p.get(k).and_then(|v| v.as_str()).map(str::to_string);
