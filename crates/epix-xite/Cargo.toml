@@ -14,7 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # content.json `ignore` patterns are Python regexes with lookaheads
 # (e.g. `css/(?!all\.css)`), which the plain regex crate can't express.
-fancy-regex = "0.14"
+fancy-regex = "0.18"
 rmpv = "1"
 sha2 = "0.11"
 hex = "0.4"
