@@ -55,6 +55,6 @@ bridges = ["arti-client/bridge-client", "arti-client/pt-client", "dep:iptproxy-s
 
 [dev-dependencies]
 # Independent Ed25519 verifier for the OnionKey signing test.
-ed25519-dalek = { version = "2", default-features = false }
+ed25519-dalek = { version = "3", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
