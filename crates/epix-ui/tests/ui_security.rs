@@ -194,6 +194,85 @@ async fn cross_origin_gate_and_cors_permission() {
 }
 
 #[tokio::test]
+async fn backup_page_is_gated() {
+    // /Backup serves the node's keys, so unlike /Config it must NOT be exempt
+    // from the cross-origin gate, and it must not exist at all on a
+    // restricted / NoNewSites (public gateway) node.
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("sec-test", dir.path());
+    let xite_dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(xite_dir.path());
+    storage.write("data.json", b"{}").unwrap();
+    state
+        .add_xite("1Source", XiteEntry { storage, content: Some(json!({ "address": "1Source" })) })
+        .await;
+    std::mem::forget(xite_dir);
+    state.config_set("ui_check_cors", json!(true)).await;
+    let router = UiServer::new(state.clone()).router();
+    let host = ("host", "127.0.0.1:42222");
+
+    // User navigation reaches the page.
+    let resp = router
+        .clone()
+        .oneshot(get("/Backup", &[host, ("sec-fetch-mode", "navigate")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "navigation reaches /Backup");
+
+    // A xite's same-origin fetch() is blocked - it must never read backups.
+    let xite_fetch = |uri: &str| {
+        get(uri, &[host, ("referer", "http://127.0.0.1:42222/1Source/")])
+    };
+    let resp = router.clone().oneshot(xite_fetch("/Backup")).await.unwrap();
+    assert_eq!(resp.status(), 403, "xite fetch to /Backup blocked");
+
+    // An untraceable request is blocked too (unlike /Config, which is public).
+    let resp = router.clone().oneshot(get("/Backup", &[host])).await.unwrap();
+    assert_eq!(resp.status(), 403, "untraceable /Backup request blocked");
+
+    // A POST without the page's CSRF token is refused.
+    let post = axum::extract::Request::builder()
+        .uri("/Backup")
+        .method("POST")
+        .header("host", "127.0.0.1:42222")
+        .header("sec-fetch-mode", "navigate")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from("action=create&comp_keys=on"))
+        .unwrap();
+    let resp = router.clone().oneshot(post).await.unwrap();
+    assert_eq!(resp.status(), 403, "POST without CSRF token refused");
+
+    // A restricted (public gateway) node refuses the page outright...
+    state.config_set("ui_restrict", json!(true)).await;
+    let resp = router
+        .clone()
+        .oneshot(get("/Backup", &[host, ("sec-fetch-mode", "navigate")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "restricted node has no /Backup");
+    state.config_set("ui_restrict", json!(false)).await;
+
+    // ...as does one with NoNewSites (the gateway's locked-site-set mode)...
+    state.set_plugin_enabled("NoNewSites", true).await;
+    let resp = router
+        .clone()
+        .oneshot(get("/Backup", &[host, ("sec-fetch-mode", "navigate")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "NoNewSites node has no /Backup");
+    state.set_plugin_enabled("NoNewSites", false).await;
+
+    // ...and one where the UiBackup plugin is turned off.
+    state.set_plugin_enabled("UiBackup", false).await;
+    let resp = router
+        .clone()
+        .oneshot(get("/Backup", &[host, ("sec-fetch-mode", "navigate")]))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "disabled UiBackup removes the page");
+}
+
+#[tokio::test]
 async fn proxy_mode_subresource_with_epix_in_query_referer_passes() {
     // Regression: in transparent-proxy (host) mode a client-routed xite's own
     // referer carries its route in the query, and that route can hold both a
