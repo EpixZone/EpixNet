@@ -40,7 +40,7 @@ pub struct FindHashIdsReply {
     pub my: Vec<u16>,
 }
 
-fn parse_handshake(v: &Value) -> HandshakeInfo {
+pub(crate) fn parse_handshake(v: &Value) -> HandshakeInfo {
     let s = |k: &str| vget(v, k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let i = |k: &str| vget(v, k).and_then(|x| x.as_i64()).unwrap_or(0);
     HandshakeInfo {
@@ -133,13 +133,18 @@ pub struct Connection {
     /// self-addresses the handshake advertises (see [`crate::advert`]).
     addr: PeerAddr,
     pub peer: Option<HandshakeInfo>,
+    /// Stats-page registration; deregisters when the connection drops.
+    reg: crate::registry::ConnHandle,
 }
 
 impl Connection {
     /// Dial `addr` over `transport` and wrap the resulting stream.
     pub async fn connect(transport: &dyn Transport, addr: &PeerAddr) -> Result<Self> {
         let stream = transport.dial(addr).await?;
-        Ok(Self { stream, buf: Vec::new(), next_req_id: 0, addr: addr.clone(), peer: None })
+        let reg = crate::registry::ConnHandle::new(crate::registry::Direction::Out, addr.clone());
+        reg.activate();
+        let stream = reg.count_stream(stream);
+        Ok(Self { stream, buf: Vec::new(), next_req_id: 0, addr: addr.clone(), peer: None, reg })
     }
 
     fn next_id(&mut self) -> i64 {
@@ -151,6 +156,8 @@ impl Connection {
     /// Send `{cmd, req_id, params}` and return the matching `response` map.
     /// Inbound requests and unrelated responses are skipped.
     pub async fn request(&mut self, cmd: &str, params: Value) -> Result<Value> {
+        let xite = vget(&params, "site").and_then(|v| v.as_str()).map(str::to_string);
+        self.reg.note_cmd_sent(cmd, xite.as_deref());
         let req_id = self.next_id();
         let msg = vmap(vec![
             ("cmd", Value::from(cmd)),
@@ -181,16 +188,21 @@ impl Connection {
         let resp = self.request("handshake", params).await?;
         let hs = parse_handshake(&resp);
         self.peer = Some(hs.clone());
+        self.reg.set_peer(hs.clone());
         Ok(hs)
     }
 
     /// `ping` → `true` if the peer answers `Pong!`. Peers send the body as a
     /// msgpack string or (more commonly) binary, so accept either.
     pub async fn ping(&mut self) -> Result<bool> {
+        let start = std::time::Instant::now();
         let resp = self.request("ping", Value::Map(vec![])).await?;
         let body = vget(&resp, "body");
         let is_pong = body.and_then(|v| v.as_str()) == Some("Pong!")
             || body.and_then(|v| v.as_slice()) == Some(b"Pong!".as_slice());
+        if is_pong {
+            self.reg.set_ping_ms(start.elapsed().as_millis() as i64);
+        }
         Ok(is_pong)
     }
 

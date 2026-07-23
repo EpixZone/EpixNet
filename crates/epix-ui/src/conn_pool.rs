@@ -29,17 +29,20 @@ pub struct ConnDetail {
     pub peer: Option<HandshakeInfo>,
 }
 
-/// Aggregate connection stats for the chart/collector.
+/// Aggregate connection stats for the chart/collector and status endpoints.
+/// Built from the process-wide connection registry
+/// (`epix_protocol::registry`), so it covers every real link - warm pool,
+/// worker/resync fetches, and inbound peers - not just the pool.
 #[derive(Default, Clone, Debug)]
 pub struct ConnectionStats {
     pub total: i64,
-    /// Incoming connections. This node dials out, so 0 for now.
+    /// Live inbound connections (peers that dialed us).
     pub incoming: i64,
-    /// Per-network split of the live pool (clearnet + onion + i2p = total;
-    /// the pool holds no mesh connections).
+    /// Per-network split (clearnet + onion + i2p + mesh = total).
     pub clearnet: i64,
     pub onion: i64,
     pub i2p: i64,
+    pub mesh: i64,
     pub ping_avg: i64,
     pub ping_min: i64,
 }
@@ -186,27 +189,14 @@ impl ConnectionPool {
         }
     }
 
-    /// Current aggregate stats.
-    pub async fn stats(&self) -> ConnectionStats {
-        let conns = self.conns.lock().await;
-        let pings: Vec<i64> = conns
-            .values()
-            .map(|c| c.last_ping_ms.load(Ordering::Relaxed))
-            .filter(|v| *v >= 0)
-            .collect();
-        let ping_avg =
-            if pings.is_empty() { 0 } else { pings.iter().sum::<i64>() / pings.len() as i64 };
-        let ping_min = pings.iter().copied().min().unwrap_or(0);
-        let count = |f: fn(&PeerAddr) -> bool| conns.keys().filter(|a| f(a)).count() as i64;
-        ConnectionStats {
-            total: conns.len() as i64,
-            incoming: 0,
-            clearnet: count(|a| matches!(a, PeerAddr::Ip(_))),
-            onion: count(|a| matches!(a, PeerAddr::Onion { .. })),
-            i2p: count(|a| matches!(a, PeerAddr::I2p { .. })),
-            ping_avg,
-            ping_min,
-        }
+    /// How many connections the pool currently holds.
+    pub async fn len(&self) -> usize {
+        self.conns.lock().await.len()
+    }
+
+    /// Whether the pool holds no connections.
+    pub async fn is_empty(&self) -> bool {
+        self.conns.lock().await.is_empty()
     }
 }
 
@@ -268,19 +258,15 @@ mod tests {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
 
         pool.ensure(transport.clone(), &[peer.clone()]).await;
-        assert_eq!(pool.stats().await.total, 1, "connected to the mock peer");
+        assert_eq!(pool.len().await, 1, "connected to the mock peer");
 
         pool.ping_all().await;
-        let stats = pool.stats().await;
-        assert_eq!(stats.total, 1);
-        assert_eq!(stats.incoming, 0);
-        assert_eq!(stats.onion, 0);
+        assert_eq!(pool.len().await, 1);
         assert!(pool.ping_for(&peer).await.is_some(), "ping recorded");
-        assert!(stats.ping_avg >= 0 && stats.ping_min >= 0);
 
         // ensure is idempotent - no duplicate connection to the same peer.
         pool.ensure(transport, &[peer.clone()]).await;
-        assert_eq!(pool.stats().await.total, 1);
+        assert_eq!(pool.len().await, 1);
 
         // The peer's handshake identity is retained for the Stats page.
         let details = pool.connection_details().await;
@@ -300,6 +286,6 @@ mod tests {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
         // A mesh (Rns) peer is skipped; the cap of 1 is honoured.
         pool.ensure(transport, &[PeerAddr::Rns([0u8; 16]), p1, p2]).await;
-        assert_eq!(pool.stats().await.total, 1);
+        assert_eq!(pool.len().await, 1);
     }
 }

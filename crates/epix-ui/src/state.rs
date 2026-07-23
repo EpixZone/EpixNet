@@ -6065,15 +6065,19 @@ impl AppState {
     /// by the runtime so connection stats stay live.
     pub async fn manage_connections(&self) {
         let Some(transport) = self.transport.read().await.clone() else { return };
-        // Candidate peers across all served xites.
+        // Candidate peers across all served xites - best sources first
+        // (tracker seeds, then connectable registry peers), skipping peers in
+        // failure backoff and undialable networks. Feeding the pool the RAW
+        // peer table starved it: the table is mostly dead gossip addresses,
+        // and `ensure` only dials a couple dozen of them per cycle, so the
+        // pool sat near-empty while the node knew thousands of "peers".
+        let addresses: Vec<String> = self.xites.read().await.keys().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut candidates: Vec<PeerAddr> = Vec::new();
-        {
-            let xites = self.xites.read().await;
-            for x in xites.values() {
-                for p in x.peers.peers() {
-                    if !candidates.contains(&p.addr) {
-                        candidates.push(p.addr.clone());
-                    }
+        for address in &addresses {
+            for p in self.fetch_candidate_peers(address, 30).await {
+                if seen.insert(p.to_string()) {
+                    candidates.push(p);
                 }
             }
         }
@@ -6199,9 +6203,29 @@ impl AppState {
     }
 
     /// Live connection stats (`connection`, `connection_in`, `connection_onion`,
-    /// ping avg/min) for the chart collector.
+    /// ping avg/min) for the chart collector and status endpoints. Derived
+    /// from the process-wide connection registry, so it counts every real
+    /// link - the warm pool, worker/resync fetches, and inbound peers - not
+    /// just the pool.
     pub async fn connection_stats(&self) -> crate::conn_pool::ConnectionStats {
-        self.conn_pool.stats().await
+        use epix_protocol::registry::{ConnSnapshot, Direction};
+        let snap = epix_protocol::registry::snapshot();
+        let pings: Vec<i64> = snap.iter().filter_map(|s| s.ping_ms).collect();
+        let ping_avg =
+            if pings.is_empty() { 0 } else { pings.iter().sum::<i64>() / pings.len() as i64 };
+        let ping_min = pings.iter().copied().min().unwrap_or(0);
+        let count =
+            |f: &dyn Fn(&ConnSnapshot) -> bool| snap.iter().filter(|s| f(s)).count() as i64;
+        crate::conn_pool::ConnectionStats {
+            total: snap.len() as i64,
+            incoming: count(&|s| s.direction == Direction::In),
+            clearnet: count(&|s| matches!(s.addr, PeerAddr::Ip(_))),
+            onion: count(&|s| matches!(s.addr, PeerAddr::Onion { .. })),
+            i2p: count(&|s| matches!(s.addr, PeerAddr::I2p { .. })),
+            mesh: count(&|s| matches!(s.addr, PeerAddr::Rns(_))),
+            ping_avg,
+            ping_min,
+        }
     }
 
     /// The lightweight public stats payload (`/StatsJson`, the NoNewSites
@@ -6227,17 +6251,27 @@ impl AppState {
         // content checks), not just file payloads - so they move even when an
         // update finds nothing new to download. The tray shows these.
         let (wire_recv, wire_sent) = epix_protocol::wire_totals();
-        // Per-connection handshake identities (Phase 6): which node versions
-        // the network runs, per live pooled connection.
-        let connections_detail: Vec<Value> = self
-            .conn_pool
-            .connection_details()
-            .await
+        // Per-connection detail from the live registry: every real link
+        // (warm pool, worker fetches, inbound peers) with direction, bytes,
+        // last commands, and the peer's handshake identity.
+        let connections_detail: Vec<Value> = epix_protocol::registry::snapshot()
             .into_iter()
             .map(|d| {
                 json!({
+                    "id": d.id,
+                    "direction": match d.direction {
+                        epix_protocol::registry::Direction::In => "in",
+                        epix_protocol::registry::Direction::Out => "out",
+                    },
                     "peer": d.addr.to_string(),
                     "ping_ms": d.ping_ms,
+                    "opened_secs": d.opened_secs,
+                    "idle_secs": d.idle_secs,
+                    "bytes_sent": d.bytes_sent,
+                    "bytes_recv": d.bytes_recv,
+                    "last_cmd_sent": d.last_cmd_sent,
+                    "last_cmd_recv": d.last_cmd_recv,
+                    "xites": d.xites,
                     "version": d.peer.as_ref().map(|p| p.version.clone()),
                     "rev": d.peer.as_ref().map(|p| p.rev),
                     "protocol": d.peer.as_ref().map(|p| p.protocol.clone()),
@@ -6245,12 +6279,14 @@ impl AppState {
                 })
             })
             .collect();
+        let conn_stats = self.connection_stats().await;
         json!({
             "version": self.version,
             "sites": sites,
             "peers_total": peers_total,
             "peers_connected": peers_connected,
-            "connections": self.connection_stats().await.total,
+            "connections": conn_stats.total,
+            "connections_in": conn_stats.incoming,
             "connections_detail": connections_detail,
             "bytes_recv": bytes_recv,
             "bytes_sent": bytes_sent,
@@ -6292,42 +6328,75 @@ impl AppState {
             conns = stats.total,
         );
 
-        // Connections, split by network so the mix is visible at a glance.
+        // Connections from the live registry: every real link (warm pool,
+        // worker/resync fetches, inbound peers), like the Python client's
+        // ConnectionServer table - direction, bytes, last commands, xites.
+        let totals = epix_protocol::registry::totals();
         let _ = write!(
             h,
-            "<h2>Connections ({} live - clearnet: {}, tor: {}, i2p: {})</h2>             <table><tr><th>peer</th><th>type</th><th>version</th><th>protocol</th><th>ping</th></tr>",
-            stats.total, stats.clearnet, stats.onion, stats.i2p
+            "<h2>Connections ({} live, in: {}, out: {}, total made: {} -             clearnet: {}, tor: {}, i2p: {}, mesh: {})</h2>             <table><tr><th>id</th><th>dir</th><th>peer</th><th>type</th>             <th>version</th><th>ping</th><th>open</th><th>idle</th><th>out</th>             <th>in</th><th>last sent</th><th>last recv</th><th>xites</th></tr>",
+            stats.total,
+            stats.incoming,
+            stats.total - stats.incoming,
+            totals.made,
+            stats.clearnet,
+            stats.onion,
+            stats.i2p,
+            stats.mesh,
         );
-        // What the handshake told us about each peer (Phase 6): the node
-        // version + rev show which releases the network runs, protocol and
-        // crypt show wire capabilities.
-        for detail in self.conn_pool.connection_details().await {
-            let ping = detail.ping_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "-".into());
-            let kind = match &detail.addr {
+        let fmt_dur = |secs: u64| {
+            if secs < 60 {
+                format!("{secs}s")
+            } else if secs < 3600 {
+                format!("{}m", secs / 60)
+            } else {
+                format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+            }
+        };
+        let fmt_kb = |bytes: u64| format!("{}k", bytes.div_ceil(1024));
+        let dash = |s: &str| if s.is_empty() { "-".to_string() } else { esc(s) };
+        for d in epix_protocol::registry::snapshot() {
+            let kind = match &d.addr {
                 PeerAddr::Onion { .. } => "onion",
                 PeerAddr::I2p { .. } => "i2p",
                 PeerAddr::Rns(_) => "mesh",
                 PeerAddr::Ip(_) => "ip",
             };
-            let (version, protocol) = match &detail.peer {
-                Some(p) => (
-                    if p.version.is_empty() { "-".to_string() } else { p.version.clone() },
-                    if p.protocol.is_empty() { "-".to_string() } else { p.protocol.clone() },
-                ),
-                None => ("-".into(), "-".into()),
+            let dir = match d.direction {
+                epix_protocol::registry::Direction::In => "in",
+                epix_protocol::registry::Direction::Out => "out",
+            };
+            // Version + rev, like the Python page's "0.7.1 r4556".
+            let version = match &d.peer {
+                Some(p) if !p.version.is_empty() => esc(&format!("{} r{}", p.version, p.rev)),
+                _ => "-".into(),
+            };
+            let ping = d.ping_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "-".into());
+            let xites = if d.xites.is_empty() {
+                "-".to_string()
+            } else {
+                format!("<span title='{}'>{}</span>", esc(&d.xites.join(", ")), d.xites.len())
             };
             let _ = write!(
                 h,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                esc(&detail.addr.to_string()),
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>                 <td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>                 <td>{}</td><td>{}</td><td>{}</td></tr>",
+                d.id,
+                dir,
+                esc(&d.addr.to_string()),
                 kind,
-                esc(&version),
-                esc(&protocol),
-                ping
+                version,
+                ping,
+                fmt_dur(d.opened_secs),
+                fmt_dur(d.idle_secs),
+                fmt_kb(d.bytes_sent),
+                fmt_kb(d.bytes_recv),
+                dash(&d.last_cmd_sent),
+                dash(&d.last_cmd_recv),
+                xites,
             );
         }
         if stats.total == 0 {
-            h.push_str("<tr><td colspan=5 class='muted'>no live connections</td></tr>");
+            h.push_str("<tr><td colspan=13 class='muted'>no live connections</td></tr>");
         }
         h.push_str("</table>");
 
