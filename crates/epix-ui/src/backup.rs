@@ -669,8 +669,14 @@ fn check_csrf(form: &std::collections::HashMap<String, String>) -> Result<(), Re
 }
 
 fn flash_redirect(ok: bool, msg: &str) -> Response {
+    flash_redirect_tab("backup", ok, msg)
+}
+
+/// Redirect back to one of the page's tabs with a flash message.
+fn flash_redirect_tab(tab: &str, ok: bool, msg: &str) -> Response {
     let kind = if ok { "done" } else { "error" };
-    Redirect::to(&format!("/Backup?{kind}={}", crate::url_encode(msg))).into_response()
+    let tab_q = if tab == "restore" { "tab=restore&" } else { "" };
+    Redirect::to(&format!("/Backup?{tab_q}{kind}={}", crate::url_encode(msg))).into_response()
 }
 
 /// `GET /Backup` - the wizard page; `?restore=<name>` shows the restore step.
@@ -714,9 +720,13 @@ pub(crate) async fn serve_backup_page(
             .await
             .unwrap_or((Vec::new(), None));
     let can_restart = ctx.state.can_restart();
+    let tab = match params.get("tab").map(String::as_str) {
+        Some("restore") => "restore",
+        _ => "backup",
+    };
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        render_backup_page(&backups, pending.as_deref(), can_restart, flash, &homepage, &theme),
+        render_backup_page(tab, &backups, pending.as_deref(), can_restart, flash, &homepage, &theme),
     )
         .into_response()
 }
@@ -798,7 +808,7 @@ pub(crate) async fn backup_post(
         }
         "cancel_restore" => {
             cancel_pending_restore(&data_root);
-            flash_redirect(true, "Staged restore discarded")
+            flash_redirect_tab("restore", true, "Staged restore discarded")
         }
         "restart" => {
             ctx.state.push_notification("info", "Restarting...", 5000);
@@ -873,7 +883,7 @@ pub(crate) async fn backup_upload(
     }
     let backups = data_root.join(BACKUPS_DIR);
     if let Err(e) = tokio::fs::create_dir_all(&backups).await {
-        return flash_redirect(false, &format!("Could not create the backups folder: {e}"));
+        return flash_redirect_tab("restore", false, &format!("Could not create the backups folder: {e}"));
     }
     let (_, compact) = utc_now_strings();
     let part_path = backups.join(format!(".incoming-{compact}.part"));
@@ -886,7 +896,7 @@ pub(crate) async fn backup_upload(
         }
         let mut out = match tokio::fs::File::create(&part_path).await {
             Ok(f) => f,
-            Err(e) => return flash_redirect(false, &format!("Could not store the upload: {e}")),
+            Err(e) => return flash_redirect_tab("restore", false, &format!("Could not store the upload: {e}")),
         };
         use tokio::io::AsyncWriteExt;
         loop {
@@ -894,13 +904,13 @@ pub(crate) async fn backup_upload(
                 Ok(Some(chunk)) => {
                     if let Err(e) = out.write_all(&chunk).await {
                         let _ = tokio::fs::remove_file(&part_path).await;
-                        return flash_redirect(false, &format!("Could not store the upload: {e}"));
+                        return flash_redirect_tab("restore", false, &format!("Could not store the upload: {e}"));
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
                     let _ = tokio::fs::remove_file(&part_path).await;
-                    return flash_redirect(false, &format!("Upload failed: {e}"));
+                    return flash_redirect_tab("restore", false, &format!("Upload failed: {e}"));
                 }
             }
         }
@@ -910,7 +920,7 @@ pub(crate) async fn backup_upload(
     }
     if !wrote {
         let _ = tokio::fs::remove_file(&part_path).await;
-        return flash_redirect(false, "No file received");
+        return flash_redirect_tab("restore", false, "No file received");
     }
 
     // Validate before accepting: it must be a zip with a readable EpixNet
@@ -921,7 +931,7 @@ pub(crate) async fn backup_upload(
         .unwrap_or_else(|e| Err(e.to_string()));
     if let Err(e) = checked {
         let _ = tokio::fs::remove_file(&part_path).await;
-        return flash_redirect(false, &format!("Not a usable backup: {e}"));
+        return flash_redirect_tab("restore", false, &format!("Not a usable backup: {e}"));
     }
     let mut final_name = format!("uploaded-{compact}.zip");
     let mut n = 1;
@@ -931,9 +941,9 @@ pub(crate) async fn backup_upload(
     }
     if let Err(e) = tokio::fs::rename(&part_path, backups.join(&final_name)).await {
         let _ = tokio::fs::remove_file(&part_path).await;
-        return flash_redirect(false, &format!("Could not store the upload: {e}"));
+        return flash_redirect_tab("restore", false, &format!("Could not store the upload: {e}"));
     }
-    flash_redirect(true, &format!("Uploaded {final_name} - pick Restore next to it below"))
+    flash_redirect_tab("restore", true, &format!("Uploaded {final_name} - pick Restore next to it"))
 }
 
 // --- Rendering ----------------------------------------------------------------
@@ -948,6 +958,10 @@ fn esc(s: &str) -> String {
 
 /// Page-specific styles on top of the shared PAGE_CSS tokens.
 const BACKUP_CSS: &str = "<style>\
+.tabs{display:flex;gap:28px;border-bottom:1px solid var(--epix-border);margin:0 0 20px}\
+.tab{display:inline-block;padding:10px 2px 12px;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--epix-text-mid);text-decoration:none;border-bottom:2px solid transparent;margin-bottom:-1px}\
+.tab:hover{color:var(--epix-text)}\
+.tab.active{color:var(--epix-accent);border-bottom-color:var(--epix-accent)}\
 .backup-row{position:relative;padding:14px 0;border-bottom:1px solid var(--epix-border)}\
 .backup-row .title h3{font-size:14px;font-weight:600;margin:0;line-height:1.4;font-family:var(--epix-font-mono);overflow-wrap:anywhere}\
 .backup-row .description{font-size:13px;color:var(--epix-text-mid);margin-top:2px}\
@@ -999,6 +1013,19 @@ fn component_checkbox_row(comp: &str, checked: bool) -> String {
     )
 }
 
+/// The BACKUP | RESTORE tab bar; `active` is "backup" or "restore".
+fn tab_bar(active: &str) -> String {
+    let cls = |tab: &str| if tab == active { "tab active" } else { "tab" };
+    format!(
+        "<div class='tabs'>\
+           <a class='{b}' href='/Backup'>Backup</a>\
+           <a class='{r}' href='/Backup?tab=restore'>Restore</a>\
+         </div>",
+        b = cls("backup"),
+        r = cls("restore"),
+    )
+}
+
 fn flash_html(flash: &Option<(bool, String)>) -> String {
     match flash {
         Some((ok, msg)) => format!(
@@ -1023,6 +1050,7 @@ fn manifest_summary(info: &Manifest) -> String {
 }
 
 fn render_backup_page(
+    tab: &str,
     backups: &[BackupInfo],
     pending_from: Option<&str>,
     can_restart: bool,
@@ -1033,8 +1061,27 @@ fn render_backup_page(
     let csrf = csrf_token();
     let mut body = String::new();
     body.push_str(BACKUP_CSS);
+    body.push_str(&tab_bar(tab));
     body.push_str(&flash_html(&flash));
+    if tab == "restore" {
+        render_restore_tab(&mut body, backups, csrf);
+    } else {
+        render_create_tab(&mut body, backups, csrf);
+    }
+    body.push_str(&pending_bar(pending_from, can_restart, csrf));
+    body.push_str(BACKUP_PAGE_JS);
+    crate::page_shell(
+        "Backup & Restore",
+        "Backup &amp; Restore",
+        "Back up your keys, settings, and zites - and restore them here or on another device.",
+        &body,
+        homepage,
+        theme,
+    )
+}
 
+/// The BACKUP tab: the create form and the stored-backup list (download/delete).
+fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
     // Create card.
     body.push_str(
         "<h2 class='section-title'>Create a backup</h2>\
@@ -1074,12 +1121,12 @@ fn render_backup_page(
          </form>"
     ));
 
-    // Stored backups.
+    // Stored backups (managed here; restoring lives on the Restore tab).
     body.push_str("<h2 class='section-title'>Stored backups</h2>");
     if backups.is_empty() {
         body.push_str(
             "<div class='description' style='padding:12px 0'>No backups yet. \
-             Create one above, or upload one from another device below.</div>",
+             Create one above.</div>",
         );
     }
     for info in backups {
@@ -1088,21 +1135,10 @@ fn render_backup_page(
             Some(m) => format!("{} \u{2022} {}", manifest_summary(m), human_size(info.size)),
             None => format!("Unreadable backup \u{2022} {}", human_size(info.size)),
         };
-        let uploaded_badge = if info.file_name.starts_with("uploaded-") {
-            "<span class='badge'>uploaded</span>"
-        } else if info.file_name.starts_with("pre-restore-") {
-            "<span class='badge'>safety copy</span>"
-        } else {
-            ""
-        };
-        let restore_link = if info.manifest.is_some() {
-            format!("<a class='linkbtn' href='/Backup?restore={}'>Restore</a>", crate::url_encode(&info.file_name))
-        } else {
-            String::new()
-        };
+        let badge = backup_badge(&info.file_name);
         body.push_str(&format!(
             "<div class='backup-row'>\
-               <div class='title'><h3>{name}{uploaded_badge}</h3>\
+               <div class='title'><h3>{name}{badge}</h3>\
                  <div class='description'>{detail}</div></div>\
                <div class='backup-actions'>\
                  <form method='post' action='/Backup/Download'>\
@@ -1110,7 +1146,6 @@ fn render_backup_page(
                    <input type='hidden' name='name' value='{name}'>\
                    <button class='linkbtn' type='submit'>Download</button>\
                  </form>\
-                 {restore_link}\
                  <form method='post' action='/Backup' \
                        onsubmit=\"return confirm('Delete this backup?')\">\
                    <input type='hidden' name='csrf' value='{csrf}'>\
@@ -1122,8 +1157,37 @@ fn render_backup_page(
              </div>",
         ));
     }
+}
 
-    // Upload / restore from another device.
+/// The RESTORE tab: pick a stored backup to restore, or upload one.
+fn render_restore_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
+    body.push_str("<h2 class='section-title'>Restore a stored backup</h2>");
+    let restorable: Vec<&BackupInfo> = backups.iter().filter(|b| b.manifest.is_some()).collect();
+    if restorable.is_empty() {
+        body.push_str(
+            "<div class='description' style='padding:12px 0'>No backups on this device yet. \
+             Create one on the Backup tab, or upload one below.</div>",
+        );
+    }
+    for info in restorable {
+        let name = esc(&info.file_name);
+        let detail = match &info.manifest {
+            Some(m) => format!("{} \u{2022} {}", manifest_summary(m), human_size(info.size)),
+            None => String::new(),
+        };
+        let badge = backup_badge(&info.file_name);
+        body.push_str(&format!(
+            "<div class='backup-row'>\
+               <div class='title'><h3>{name}{badge}</h3>\
+                 <div class='description'>{detail}</div></div>\
+               <div class='backup-actions'>\
+                 <a class='linkbtn' href='/Backup?restore={q}'>Restore</a>\
+               </div>\
+             </div>",
+            q = crate::url_encode(&info.file_name),
+        ));
+    }
+
     body.push_str(&format!(
         "<h2 class='section-title'>Restore from another device</h2>\
          <div class='description'>Upload a backup file created on another device. \
@@ -1135,8 +1199,21 @@ fn render_backup_page(
            </div>\
          </form>"
     ));
+}
 
-    // Staged-restore bar (restart to apply).
+fn backup_badge(file_name: &str) -> &'static str {
+    if file_name.starts_with("uploaded-") {
+        "<span class='badge'>uploaded</span>"
+    } else if file_name.starts_with("pre-restore-") {
+        "<span class='badge'>safety copy</span>"
+    } else {
+        ""
+    }
+}
+
+/// The fixed bottom bar shown while a staged restore waits for a restart.
+fn pending_bar(pending_from: Option<&str>, can_restart: bool, csrf: &str) -> String {
+    let mut body = String::new();
     if let Some(source) = pending_from {
         let (title, button) = if can_restart {
             (
@@ -1172,16 +1249,7 @@ fn render_backup_page(
              </div>"
         ));
     }
-
-    body.push_str(BACKUP_PAGE_JS);
-    crate::page_shell(
-        "Backup & Restore",
-        "Backup &amp; Restore",
-        "Back up your keys, settings, and zites - and restore them here or on another device.",
-        &body,
-        homepage,
-        theme,
-    )
+    body
 }
 
 fn render_restore_page(
@@ -1194,6 +1262,7 @@ fn render_restore_page(
     let csrf = csrf_token();
     let mut body = String::new();
     body.push_str(BACKUP_CSS);
+    body.push_str(&tab_bar("restore"));
     body.push_str(&flash_html(&flash));
     body.push_str(&format!(
         "<p class='summary'>Backup <b>{name}</b></p>\
@@ -1205,7 +1274,7 @@ fn render_restore_page(
         body.push_str(&format!(
             "<div class='warn-box'>This backup was created by a newer EpixNet \
              (format {}). Update EpixNet to restore it.</div>\
-             <a class='button' href='/Backup'>Back</a>",
+             <a class='button' href='/Backup?tab=restore'>Back</a>",
             manifest.format_version
         ));
         return crate::page_shell("Restore backup", "Restore backup", "", &body, homepage, theme);
@@ -1257,7 +1326,7 @@ fn render_restore_page(
          A safety backup of the current data is created first, so you can undo from this page. \
          The restore applies after EpixNet restarts.</div>\
          <button class='button button-submit' type='submit'>Restore</button> \
-         <a class='linkbtn' href='/Backup' style='margin-left:14px'>Cancel</a>\
+         <a class='linkbtn' href='/Backup?tab=restore' style='margin-left:14px'>Cancel</a>\
          </form>",
     );
     crate::page_shell("Restore backup", "Restore backup", "", &body, homepage, theme)
