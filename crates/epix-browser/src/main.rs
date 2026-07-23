@@ -1080,6 +1080,11 @@ user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
 user_pref("browser.warnOnQuit", false);
+// No password manager: xites authenticate with keys, not passwords, so the
+// "save this password?" prompt is only ever noise (e.g. the Backup page's
+// archive password, which must not sit in a browser password store).
+user_pref("signon.rememberSignons", false);
+user_pref("signon.generation.enabled", false);
 // Allow userChrome.css / userContent.css styling of the browser chrome.
 user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
 {ext_prefs}"#
