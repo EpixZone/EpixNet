@@ -131,12 +131,17 @@ pub async fn serve_stream(
 async fn serve_stream_hooked(
     handler: Arc<dyn RequestHandler>,
     mut peer: PeerAddr,
-    mut stream: epix_transport::PeerStream,
+    stream: epix_transport::PeerStream,
     version: &str,
     rev: i64,
     fileserver_port: u16,
     on_inbound: Option<&InboundHook>,
 ) {
+    // Stats-page registration: listed only once the peer speaks our protocol
+    // (first parsed request), so scanners and BT crawlers that connect and say
+    // nothing never appear; deregistered when this loop returns.
+    let reg = crate::registry::ConnHandle::new(crate::registry::Direction::In, peer.clone());
+    let mut stream = reg.count_stream(stream);
     let mut buf = Vec::new();
     let mut deadline = FIRST_MSG_TIMEOUT;
     while let Ok(Ok(req)) = tokio::time::timeout(deadline, read_msg(&mut stream, &mut buf)).await {
@@ -144,9 +149,17 @@ async fn serve_stream_hooked(
         let cmd = vget(&req, "cmd").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let req_id = vget(&req, "req_id").and_then(|v| v.as_i64()).unwrap_or(0);
         let params = vget(&req, "params").cloned().unwrap_or(Value::Nil);
+        reg.activate();
+        reg.note_cmd_recv(&cmd, vget(&params, "site").and_then(|v| v.as_str()));
 
         let body = if cmd == "handshake" {
-            answer_handshake(&mut peer, &params, on_inbound, version, rev, fileserver_port)
+            let body =
+                answer_handshake(&mut peer, &params, on_inbound, version, rev, fileserver_port);
+            // Show the adopted dial-back address and what the peer's own
+            // handshake told us about it (version/rev/protocol).
+            reg.set_addr(peer.clone());
+            reg.set_peer(crate::connection::parse_handshake(&params));
+            body
         } else {
             handler.handle(&peer, &cmd, &params).await
         };
@@ -611,6 +624,104 @@ mod tests {
         let mut buf = Vec::new();
         let resp = read_msg(&mut stream, &mut buf).await.unwrap();
         assert_eq!(vget(&resp, "cmd").and_then(|v| v.as_str()), Some("response"));
+    }
+
+    /// An outbound `Connection` is listed in the registry while alive - with
+    /// direction, bytes, last command, measured ping, and the peer's
+    /// handshake identity - and delisted when it drops.
+    #[tokio::test]
+    async fn registry_tracks_outbound_connections() {
+        use crate::registry::{snapshot, Direction};
+
+        struct PongHandler;
+        #[async_trait]
+        impl RequestHandler for PongHandler {
+            async fn handle(&self, _peer: &PeerAddr, _cmd: &str, _params: &Value) -> Value {
+                vmap(vec![("body", Value::from("Pong!"))])
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(PeerServer::new(Arc::new(PongHandler)).serve(listener));
+
+        let transport = epix_transport::TcpTransport;
+        let peer = PeerAddr::Ip(addr);
+        let mut conn = crate::Connection::connect(&transport, &peer).await.unwrap();
+        conn.handshake().await.unwrap();
+        assert!(conn.ping().await.unwrap());
+
+        let snap = snapshot();
+        let out = snap
+            .iter()
+            .find(|s| s.direction == Direction::Out && s.addr == peer)
+            .expect("outbound connection listed");
+        assert!(out.bytes_sent > 0 && out.bytes_recv > 0, "raw bytes counted");
+        assert_eq!(out.last_cmd_sent, "ping");
+        assert!(out.ping_ms.is_some(), "ping round-trip recorded");
+        let hs = out.peer.as_ref().expect("peer handshake identity kept");
+        assert_eq!(hs.version, "EpixRS");
+
+        drop(conn);
+        assert!(
+            !snapshot().iter().any(|s| s.direction == Direction::Out && s.addr == peer),
+            "delisted on drop"
+        );
+    }
+
+    /// An inbound stream is listed only once the peer speaks the protocol,
+    /// shows the adopted address + the peer's own handshake info, and is
+    /// delisted when the peer disconnects.
+    #[tokio::test]
+    async fn registry_tracks_inbound_connections() {
+        use crate::registry::{snapshot, Direction};
+
+        // A unique source address so the entry is findable among parallel
+        // tests; no fileserver_port advert, so adoption keeps it verbatim.
+        let source = PeerAddr::parse("203.0.113.7:55555").unwrap();
+        let (server_side, client_side) = tokio::io::duplex(4096);
+        let served = tokio::spawn(serve_stream(
+            Arc::new(NoopHandler),
+            source.clone(),
+            Box::pin(server_side),
+            "EpixRS",
+            1,
+            0,
+        ));
+
+        let mut stream: epix_transport::PeerStream = Box::pin(client_side);
+        let mut buf = Vec::new();
+        let hs = vmap(vec![
+            ("cmd", Value::from("handshake")),
+            ("req_id", Value::from(1i64)),
+            ("params", vmap(vec![("version", Value::from("9.9.9"))])),
+        ]);
+        send_msg(&mut stream, &hs).await.unwrap();
+        let _ = read_msg(&mut stream, &mut buf).await.unwrap();
+        let ping = vmap(vec![
+            ("cmd", Value::from("ping")),
+            ("req_id", Value::from(2i64)),
+            ("params", vmap(vec![])),
+        ]);
+        send_msg(&mut stream, &ping).await.unwrap();
+        let _ = read_msg(&mut stream, &mut buf).await.unwrap();
+
+        let snap = snapshot();
+        let inb = snap
+            .iter()
+            .find(|s| s.direction == Direction::In && s.addr == source)
+            .expect("inbound connection listed after first request");
+        assert!(inb.bytes_sent > 0 && inb.bytes_recv > 0, "raw bytes counted");
+        assert_eq!(inb.last_cmd_recv, "ping");
+        let peer_hs = inb.peer.as_ref().expect("their handshake recorded");
+        assert_eq!(peer_hs.version, "9.9.9");
+
+        drop(stream);
+        served.await.unwrap();
+        assert!(
+            !snapshot().iter().any(|s| s.direction == Direction::In && s.addr == source),
+            "delisted when the peer disconnects"
+        );
     }
 
     /// A client that connects and never speaks the protocol (BT crawlers,

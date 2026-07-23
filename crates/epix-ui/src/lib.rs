@@ -704,9 +704,11 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
         "mesh_address": mesh_address,
         "connections": {
             "total": conns.total,
+            "in": conns.incoming,
             "clearnet": conns.clearnet,
             "onion": conns.onion,
             "i2p": conns.i2p,
+            "mesh": conns.mesh,
         },
     });
     (

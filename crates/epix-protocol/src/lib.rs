@@ -7,6 +7,7 @@
 pub mod advert;
 pub mod connection;
 pub mod msg;
+pub mod registry;
 pub mod server;
 
 pub use advert::{set_self_advert, update_self_advert, SelfAdvert};
