@@ -420,7 +420,7 @@ struct ApplyPlan {
 
 /// Stage a restore: verify + decrypt the selected components out of `backup`
 /// into `<data_root>/restore-pending/`, to be applied on the next start.
-/// Writes an automatic safety backup of the same components first. Blocking.
+/// Writes an automatic safety backup of the same components too. Blocking.
 pub fn stage_restore(
     data_root: &Path,
     backup_path: &Path,
@@ -429,6 +429,38 @@ pub fn stage_restore(
     app_version: &str,
 ) -> Result<(), String> {
     let manifest = read_manifest(backup_path)?;
+    let selected = validate_restore(&manifest, components, password)?;
+    let (allowed_files, allowed_sites) = restore_whitelist(&manifest, &selected);
+
+    let pending = data_root.join(PENDING_DIR);
+    // A previous staging (crashed or superseded) is discarded.
+    let _ = std::fs::remove_dir_all(&pending);
+    std::fs::create_dir_all(&pending).map_err(|e| e.to_string())?;
+
+    let result = stage_archive(
+        backup_path,
+        password,
+        manifest.encrypted,
+        &pending,
+        &allowed_files,
+        &allowed_sites,
+        &selected,
+    )
+    .and_then(|plan| finalize_staging(data_root, &pending, &plan, app_version));
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&pending);
+    }
+    result
+}
+
+/// The restore preconditions: a supported format, a password when the archive
+/// needs one, and a selection the archive actually holds. Returns the
+/// components to restore.
+fn validate_restore(
+    manifest: &Manifest,
+    components: &[String],
+    password: Option<&str>,
+) -> Result<Vec<String>, String> {
     if manifest.format_version > SUPPORTED_BACKUP_FORMAT {
         return Err(format!(
             "This backup was created by a newer EpixNet (format {}). Update EpixNet to restore it.",
@@ -446,108 +478,130 @@ pub fn stage_restore(
     if selected.is_empty() {
         return Err("Select at least one thing to restore".to_string());
     }
+    Ok(selected)
+}
 
-    let allowed_files: Vec<String> = selected
+/// What the selection allows out of the archive: the manifest-listed file
+/// names, and the site addresses whose `data/<address>/` trees may extract.
+fn restore_whitelist(manifest: &Manifest, selected: &[String]) -> (Vec<String>, Vec<String>) {
+    let files = selected
         .iter()
         .filter_map(|c| manifest.components.get(c))
         .flat_map(|e| e.files.iter().cloned())
         .collect();
-    let allowed_sites: Vec<String> = if selected.iter().any(|c| c == "zites") {
+    let sites = if selected.iter().any(|c| c == "zites") {
         manifest.components.get("zites").map(|e| e.sites.clone()).unwrap_or_default()
     } else {
         Vec::new()
     };
+    (files, sites)
+}
 
-    let pending = data_root.join(PENDING_DIR);
-    // A previous staging (crashed or superseded) is discarded.
-    let _ = std::fs::remove_dir_all(&pending);
-    std::fs::create_dir_all(&pending).map_err(|e| e.to_string())?;
+type BackupArchive = zip::ZipArchive<std::io::BufReader<std::fs::File>>;
 
-    let stage = (|| -> Result<ApplyPlan, String> {
-        let file = std::fs::File::open(backup_path).map_err(|e| e.to_string())?;
-        let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-            .map_err(|_| "Not a valid backup archive".to_string())?;
-        let names: Vec<String> = zip.file_names().map(str::to_string).collect();
-        let mut staged_files = Vec::new();
-        for name in names {
-            if name == "manifest.json" || !entry_allowed(&name, &allowed_files, &allowed_sites) {
-                continue;
-            }
-            let mut entry = match password {
-                Some(pwd) => zip.by_name_decrypt(&name, pwd.as_bytes()),
-                None => zip.by_name(&name),
-            }
-            .map_err(|e| match e {
-                zip::result::ZipError::InvalidPassword => "Wrong password".to_string(),
-                e => format!("Could not read {name} from the backup: {e}"),
-            })?;
-            if entry.is_dir() || entry.is_symlink() {
-                continue;
-            }
-            // Belt and braces on top of entry_allowed.
-            if entry.enclosed_name().is_none() {
-                return Err(format!("Unsafe path in backup: {name}"));
-            }
-            let target = join_rel(&pending, &name);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut out).map_err(|e| {
-                // A wrong AES password usually surfaces here as a failed
-                // authentication / corrupt stream error.
-                if manifest.encrypted {
-                    "Wrong password or corrupted backup".to_string()
-                } else {
-                    format!("Could not unpack {name}: {e}")
-                }
-            })?;
+/// Extract every whitelisted entry into the staging dir and build the apply
+/// plan the next boot executes.
+fn stage_archive(
+    backup_path: &Path,
+    password: Option<&str>,
+    encrypted: bool,
+    pending: &Path,
+    allowed_files: &[String],
+    allowed_sites: &[String],
+    selected: &[String],
+) -> Result<ApplyPlan, String> {
+    let file = std::fs::File::open(backup_path).map_err(|e| e.to_string())?;
+    let mut zip: BackupArchive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|_| "Not a valid backup archive".to_string())?;
+    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let mut staged_files = Vec::new();
+    for name in names {
+        if name == "manifest.json" || !entry_allowed(&name, allowed_files, allowed_sites) {
+            continue;
+        }
+        if stage_entry(&mut zip, &name, password, encrypted, pending)? {
             staged_files.push(name);
         }
-        if staged_files.is_empty() {
-            return Err("The backup holds nothing for the selected items".to_string());
-        }
-        let replace_dirs = allowed_sites
-            .iter()
-            .filter(|addr| staged_files.iter().any(|f| f.starts_with(&format!("data/{addr}/"))))
-            .map(|addr| format!("data/{addr}"))
-            .collect();
-        Ok(ApplyPlan {
-            source: backup_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            components: selected.clone(),
-            files: staged_files,
-            replace_dirs,
-        })
-    })();
-
-    match stage {
-        Ok(plan) => {
-            // Safety net, made only once the archive proved restorable (a wrong
-            // password must not litter the list with safety copies): snapshot
-            // the node's current versions of what the restart will overwrite,
-            // so a mistaken restore is recoverable from the same page.
-            let has_current =
-                selected.iter().any(|c| !component_files(data_root, c).is_empty());
-            if has_current {
-                if let Err(e) = create_backup(data_root, &selected, None, app_version, "pre-restore")
-                {
-                    let _ = std::fs::remove_dir_all(&pending);
-                    return Err(format!("Could not create the safety backup: {e}"));
-                }
-            }
-            let bytes = serde_json::to_vec_pretty(&plan).map_err(|e| e.to_string())?;
-            // Written last: its presence marks the staging as complete.
-            std::fs::write(pending.join("apply.json"), bytes).map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&pending);
-            Err(e)
-        }
     }
+    if staged_files.is_empty() {
+        return Err("The backup holds nothing for the selected items".to_string());
+    }
+    let replace_dirs = allowed_sites
+        .iter()
+        .filter(|addr| staged_files.iter().any(|f| f.starts_with(&format!("data/{addr}/"))))
+        .map(|addr| format!("data/{addr}"))
+        .collect();
+    Ok(ApplyPlan {
+        source: backup_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        components: selected.to_vec(),
+        files: staged_files,
+        replace_dirs,
+    })
+}
+
+/// Decrypt + extract one archive entry into the staging dir. `Ok(false)` means
+/// the entry was skipped (a directory or symlink), not staged.
+fn stage_entry(
+    zip: &mut BackupArchive,
+    name: &str,
+    password: Option<&str>,
+    encrypted: bool,
+    pending: &Path,
+) -> Result<bool, String> {
+    let mut entry = match password {
+        Some(pwd) => zip.by_name_decrypt(name, pwd.as_bytes()),
+        None => zip.by_name(name),
+    }
+    .map_err(|e| match e {
+        zip::result::ZipError::InvalidPassword => "Wrong password".to_string(),
+        e => format!("Could not read {name} from the backup: {e}"),
+    })?;
+    if entry.is_dir() || entry.is_symlink() {
+        return Ok(false);
+    }
+    // Belt and braces on top of entry_allowed.
+    if entry.enclosed_name().is_none() {
+        return Err(format!("Unsafe path in backup: {name}"));
+    }
+    let target = join_rel(pending, name);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut out = std::fs::File::create(&target).map_err(|e| e.to_string())?;
+    std::io::copy(&mut entry, &mut out).map_err(|e| {
+        // A wrong AES password usually surfaces here as a failed
+        // authentication / corrupt stream error.
+        if encrypted {
+            "Wrong password or corrupted backup".to_string()
+        } else {
+            format!("Could not unpack {name}: {e}")
+        }
+    })?;
+    Ok(true)
+}
+
+/// Complete a successful staging: write the safety backup, then `apply.json`
+/// last - its presence marks the staging as complete.
+fn finalize_staging(
+    data_root: &Path,
+    pending: &Path,
+    plan: &ApplyPlan,
+    app_version: &str,
+) -> Result<(), String> {
+    // Safety net, made only once the archive proved restorable (a wrong
+    // password must not litter the list with safety copies): snapshot the
+    // node's current versions of what the restart will overwrite, so a
+    // mistaken restore is recoverable from the same page.
+    let has_current = plan.components.iter().any(|c| !component_files(data_root, c).is_empty());
+    if has_current {
+        create_backup(data_root, &plan.components, None, app_version, "pre-restore")
+            .map_err(|e| format!("Could not create the safety backup: {e}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(plan).map_err(|e| e.to_string())?;
+    std::fs::write(pending.join("apply.json"), bytes).map_err(|e| e.to_string())
 }
 
 /// Whether a completed staged restore is waiting for a restart.
@@ -746,66 +800,9 @@ pub(crate) async fn backup_post(
     }
     let action = form.get("action").map(String::as_str).unwrap_or("");
     match action {
-        "create" => {
-            let components = selected_components(&form);
-            let password = form.get("password").map(String::as_str).unwrap_or("");
-            let confirm = form.get("password2").map(String::as_str).unwrap_or("");
-            if !password.is_empty() {
-                if password.len() < 8 {
-                    return flash_redirect(false, "The backup password must be at least 8 characters");
-                }
-                if password != confirm {
-                    return flash_redirect(false, "The passwords do not match");
-                }
-            }
-            let password = (!password.is_empty()).then(|| password.to_string());
-            let version = ctx.state.version.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                create_backup(&data_root, &components, password.as_deref(), &version, "epix-backup")
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
-            match result {
-                Ok(name) => flash_redirect(true, &format!("Backup created: {name}")),
-                Err(e) => flash_redirect(false, &e),
-            }
-        }
-        "delete" => {
-            let name = form.get("name").cloned().unwrap_or_default();
-            let result = tokio::task::spawn_blocking(move || {
-                let path = safe_backup_name(&data_root, &name).ok_or("No such backup")?;
-                std::fs::remove_file(&path).map_err(|e| format!("Could not delete: {e}"))?;
-                Ok::<String, String>(name)
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
-            match result {
-                Ok(name) => flash_redirect(true, &format!("Deleted {name}")),
-                Err(e) => flash_redirect(false, &e),
-            }
-        }
-        "restore" => {
-            let name = form.get("name").cloned().unwrap_or_default();
-            let components = selected_components(&form);
-            let password = form.get("password").cloned().filter(|p| !p.is_empty());
-            let version = ctx.state.version.clone();
-            let name_q = name.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let path = safe_backup_name(&data_root, &name).ok_or("No such backup")?;
-                stage_restore(&data_root, &path, &components, password.as_deref(), &version)
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
-            match result {
-                Ok(()) => Redirect::to("/Backup?staged=1").into_response(),
-                Err(e) => Redirect::to(&format!(
-                    "/Backup?restore={}&error={}",
-                    crate::url_encode(&name_q),
-                    crate::url_encode(&e)
-                ))
-                .into_response(),
-            }
-        }
+        "create" => action_create(&ctx, data_root, &form).await,
+        "delete" => action_delete(data_root, &form).await,
+        "restore" => action_restore(&ctx, data_root, &form).await,
         "cancel_restore" => {
             cancel_pending_restore(&data_root);
             flash_redirect_tab("restore", true, "Staged restore discarded")
@@ -818,6 +815,89 @@ pub(crate) async fn backup_post(
                 .into_response()
         }
         _ => Redirect::to("/Backup").into_response(),
+    }
+}
+
+/// The optional create-form password, validated (length, confirmation).
+fn create_password(form: &std::collections::HashMap<String, String>) -> Result<Option<String>, &'static str> {
+    let password = form.get("password").map(String::as_str).unwrap_or("");
+    let confirm = form.get("password2").map(String::as_str).unwrap_or("");
+    if password.is_empty() {
+        return Ok(None);
+    }
+    if password.len() < 8 {
+        return Err("The backup password must be at least 8 characters");
+    }
+    if password != confirm {
+        return Err("The passwords do not match");
+    }
+    Ok(Some(password.to_string()))
+}
+
+async fn action_create(
+    ctx: &Ctx,
+    data_root: PathBuf,
+    form: &std::collections::HashMap<String, String>,
+) -> Response {
+    let components = selected_components(form);
+    let password = match create_password(form) {
+        Ok(p) => p,
+        Err(e) => return flash_redirect(false, e),
+    };
+    let version = ctx.state.version.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        create_backup(&data_root, &components, password.as_deref(), &version, "epix-backup")
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match result {
+        Ok(name) => flash_redirect(true, &format!("Backup created: {name}")),
+        Err(e) => flash_redirect(false, &e),
+    }
+}
+
+async fn action_delete(
+    data_root: PathBuf,
+    form: &std::collections::HashMap<String, String>,
+) -> Response {
+    let name = form.get("name").cloned().unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || {
+        let path = safe_backup_name(&data_root, &name).ok_or("No such backup")?;
+        std::fs::remove_file(&path).map_err(|e| format!("Could not delete: {e}"))?;
+        Ok::<String, String>(name)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match result {
+        Ok(name) => flash_redirect(true, &format!("Deleted {name}")),
+        Err(e) => flash_redirect(false, &e),
+    }
+}
+
+async fn action_restore(
+    ctx: &Ctx,
+    data_root: PathBuf,
+    form: &std::collections::HashMap<String, String>,
+) -> Response {
+    let name = form.get("name").cloned().unwrap_or_default();
+    let components = selected_components(form);
+    let password = form.get("password").cloned().filter(|p| !p.is_empty());
+    let version = ctx.state.version.clone();
+    let name_q = name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let path = safe_backup_name(&data_root, &name).ok_or("No such backup")?;
+        stage_restore(&data_root, &path, &components, password.as_deref(), &version)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match result {
+        Ok(()) => Redirect::to("/Backup?staged=1").into_response(),
+        Err(e) => Redirect::to(&format!(
+            "/Backup?restore={}&error={}",
+            crate::url_encode(&name_q),
+            crate::url_encode(&e)
+        ))
+        .into_response(),
     }
 }
 
@@ -887,63 +967,67 @@ pub(crate) async fn backup_upload(
     }
     let (_, compact) = utc_now_strings();
     let part_path = backups.join(format!(".incoming-{compact}.part"));
+    let result = match receive_upload(&mut multipart, &part_path).await {
+        Ok(()) => accept_upload(&backups, &part_path, &compact).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(final_name) => flash_redirect_tab(
+            "restore",
+            true,
+            &format!("Uploaded {final_name} - pick Restore next to it"),
+        ),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            flash_redirect_tab("restore", false, &e)
+        }
+    }
+}
 
-    // Stream the file field to disk (a zites backup can be huge).
-    let mut wrote = false;
+/// Stream the multipart "file" field to `part_path`. A zites backup can be
+/// huge, so chunks go straight to disk.
+async fn receive_upload(
+    multipart: &mut axum::extract::Multipart,
+    part_path: &Path,
+) -> Result<(), String> {
     while let Ok(Some(mut field)) = multipart.next_field().await {
         if field.name() != Some("file") {
             continue;
         }
-        let mut out = match tokio::fs::File::create(&part_path).await {
-            Ok(f) => f,
-            Err(e) => return flash_redirect_tab("restore", false, &format!("Could not store the upload: {e}")),
-        };
         use tokio::io::AsyncWriteExt;
-        loop {
-            match field.chunk().await {
-                Ok(Some(chunk)) => {
-                    if let Err(e) = out.write_all(&chunk).await {
-                        let _ = tokio::fs::remove_file(&part_path).await;
-                        return flash_redirect_tab("restore", false, &format!("Could not store the upload: {e}"));
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&part_path).await;
-                    return flash_redirect_tab("restore", false, &format!("Upload failed: {e}"));
-                }
-            }
+        let mut out = tokio::fs::File::create(part_path)
+            .await
+            .map_err(|e| format!("Could not store the upload: {e}"))?;
+        while let Some(chunk) =
+            field.chunk().await.map_err(|e| format!("Upload failed: {e}"))?
+        {
+            out.write_all(&chunk).await.map_err(|e| format!("Could not store the upload: {e}"))?;
         }
         let _ = out.flush().await;
-        wrote = true;
-        break;
+        return Ok(());
     }
-    if !wrote {
-        let _ = tokio::fs::remove_file(&part_path).await;
-        return flash_redirect_tab("restore", false, "No file received");
-    }
+    Err("No file received".to_string())
+}
 
-    // Validate before accepting: it must be a zip with a readable EpixNet
-    // manifest (this also rejects wild non-backup zips early).
-    let part = part_path.clone();
-    let checked = tokio::task::spawn_blocking(move || read_manifest(&part))
+/// Validate a finished upload and move it into the stored-backup list under a
+/// fresh `uploaded-<ts>.zip` name. It must be a zip with a readable EpixNet
+/// manifest (this also rejects wild non-backup zips early).
+async fn accept_upload(backups: &Path, part_path: &Path, compact: &str) -> Result<String, String> {
+    let part = part_path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_manifest(&part))
         .await
-        .unwrap_or_else(|e| Err(e.to_string()));
-    if let Err(e) = checked {
-        let _ = tokio::fs::remove_file(&part_path).await;
-        return flash_redirect_tab("restore", false, &format!("Not a usable backup: {e}"));
-    }
+        .unwrap_or_else(|e| Err(e.to_string()))
+        .map_err(|e| format!("Not a usable backup: {e}"))?;
     let mut final_name = format!("uploaded-{compact}.zip");
     let mut n = 1;
     while backups.join(&final_name).exists() {
         n += 1;
         final_name = format!("uploaded-{compact}-{n}.zip");
     }
-    if let Err(e) = tokio::fs::rename(&part_path, backups.join(&final_name)).await {
-        let _ = tokio::fs::remove_file(&part_path).await;
-        return flash_redirect_tab("restore", false, &format!("Could not store the upload: {e}"));
-    }
-    flash_redirect_tab("restore", true, &format!("Uploaded {final_name} - pick Restore next to it"))
+    tokio::fs::rename(part_path, backups.join(&final_name))
+        .await
+        .map_err(|e| format!("Could not store the upload: {e}"))?;
+    Ok(final_name)
 }
 
 // --- Rendering ----------------------------------------------------------------
