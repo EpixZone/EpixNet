@@ -87,6 +87,10 @@ class MainActivity : AppCompatActivity() {
     /// permission dialog (e.g. CAMERA for the wallet's Keystone QR scanner)
     /// is up; resolved in onRequestPermissionsResult.
     private var pendingGeckoPermission: GeckoSession.PermissionDelegate.Callback? = null
+    /// A page's file prompt (an <input type=file> tap) parked while the system
+    /// document picker is up; resolved in onActivityResult.
+    private var pendingFilePrompt: GeckoSession.PromptDelegate.FilePrompt? = null
+    private var pendingFileResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
     /// Retries left for a failed load of the node's own UI (see onLoadError).
     private var nodeLoadRetries = 0
     /// Full-screen loading splash (spinning white Epix mark) shown over the
@@ -217,13 +221,19 @@ class MainActivity : AppCompatActivity() {
     /** Content prompt UI (selects, alert/confirm/prompt) over AlertDialogs. */
     private fun buildPromptDelegate() = object : GeckoSession.PromptDelegate {
         /// A prompt must be answered exactly once, but a dialog's dismiss
-        /// listener also runs after a button click - swallow the second
-        /// completion instead of crashing.
+        /// listener also runs after a button click. The response is built
+        /// lazily INSIDE the guard: even `prompt.dismiss()` throws
+        /// "Cannot confirm/dismiss a Prompt twice" once the prompt is
+        /// complete, so it must not be evaluated as a call argument (that
+        /// exact pattern crashed the app on every confirmed dialog, e.g.
+        /// deleting a backup).
         fun done(
             res: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>,
-            response: GeckoSession.PromptDelegate.PromptResponse,
+            prompt: GeckoSession.PromptDelegate.BasePrompt,
+            respond: () -> GeckoSession.PromptDelegate.PromptResponse,
         ) {
-            runCatching { res.complete(response) }
+            if (prompt.isComplete) return
+            runCatching { res.complete(respond()) }
         }
 
         override fun onAlertPrompt(
@@ -236,7 +246,7 @@ class MainActivity : AppCompatActivity() {
                 .setMessage(prompt.message)
                 .setPositiveButton(android.R.string.ok, null)
                 .create()
-            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.setOnDismissListener { done(res, prompt) { prompt.dismiss() } }
             dialog.show()
             return res
         }
@@ -250,13 +260,17 @@ class MainActivity : AppCompatActivity() {
                 .setTitle(prompt.title)
                 .setMessage(prompt.message)
                 .setPositiveButton(android.R.string.ok) { _, _ ->
-                    done(res, prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE))
+                    done(res, prompt) {
+                        prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.POSITIVE)
+                    }
                 }
                 .setNegativeButton(android.R.string.cancel) { _, _ ->
-                    done(res, prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE))
+                    done(res, prompt) {
+                        prompt.confirm(GeckoSession.PromptDelegate.ButtonPrompt.Type.NEGATIVE)
+                    }
                 }
                 .create()
-            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.setOnDismissListener { done(res, prompt) { prompt.dismiss() } }
             dialog.show()
             return res
         }
@@ -277,11 +291,11 @@ class MainActivity : AppCompatActivity() {
                 .setMessage(prompt.message)
                 .setView(wrap)
                 .setPositiveButton(android.R.string.ok) { _, _ ->
-                    done(res, prompt.confirm(input.text.toString()))
+                    done(res, prompt) { prompt.confirm(input.text.toString()) }
                 }
                 .setNegativeButton(android.R.string.cancel, null)
                 .create()
-            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.setOnDismissListener { done(res, prompt) { prompt.dismiss() } }
             dialog.show()
             return res
         }
@@ -306,22 +320,112 @@ class MainActivity : AppCompatActivity() {
                 }
                 builder.setPositiveButton(android.R.string.ok) { _, _ ->
                     val ids = flat.filterIndexed { i, _ -> checked[i] }.map { it.id }.toTypedArray()
-                    done(res, prompt.confirm(ids))
+                    done(res, prompt) { prompt.confirm(ids) }
                 }
                 builder.setNegativeButton(android.R.string.cancel, null)
             } else {
                 val selected = flat.indexOfFirst { it.selected }
                 builder.setSingleChoiceItems(labels, selected) { dialog, which ->
-                    done(res, prompt.confirm(flat[which]))
+                    done(res, prompt) { prompt.confirm(flat[which]) }
                     dialog.dismiss()
                 }
             }
             val dialog = builder.create()
-            dialog.setOnDismissListener { done(res, prompt.dismiss()) }
+            dialog.setOnDismissListener { done(res, prompt) { prompt.dismiss() } }
             dialog.show()
             return res
         }
+
+        override fun onFilePrompt(
+            session: GeckoSession,
+            prompt: GeckoSession.PromptDelegate.FilePrompt,
+        ): GeckoResult<GeckoSession.PromptDelegate.PromptResponse> {
+            // GeckoView draws no file picker either: without this, tapping a
+            // page's file input (e.g. Backup & Restore's upload) does nothing.
+            // Hand off to the system document picker; the result comes back in
+            // onActivityResult.
+            val res = GeckoResult<GeckoSession.PromptDelegate.PromptResponse>()
+            pendingFilePrompt = prompt
+            pendingFileResult = res
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                // No mime filter: downloaded backups often carry a generic
+                // type, and a strict filter would gray them out. The node
+                // validates the file server-side anyway.
+                type = "*/*"
+                if (prompt.type == GeckoSession.PromptDelegate.FilePrompt.Type.MULTIPLE) {
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                }
+            }
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, FILE_PICK_REQUEST)
+            return res
+        }
     }
+
+    /** The system file picker's answer for a parked onFilePrompt. */
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != FILE_PICK_REQUEST) return
+        val prompt = pendingFilePrompt ?: return
+        val res = pendingFileResult ?: return
+        pendingFilePrompt = null
+        pendingFileResult = null
+        if (prompt.isComplete) return
+        // A multi-select answer arrives as clipData; a single pick as data.
+        val uris = mutableListOf<Uri>()
+        data?.clipData?.let { clip -> for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri) }
+        data?.data?.takeIf { uris.isEmpty() }?.let { uris.add(it) }
+        if (resultCode != RESULT_OK || uris.isEmpty()) {
+            runCatching { res.complete(prompt.dismiss()) }
+            return
+        }
+        // Gecko cannot open a picker's content:// grant (its file delegate
+        // fails with NS_ERROR_FILE_UNRECOGNIZED_PATH and the input stays
+        // empty), so copy each pick into the app cache and hand Gecko real
+        // file:// URIs. Copied off the main thread - a backup can be huge.
+        scope.launch {
+            val files = withContext(Dispatchers.IO) {
+                val dir = java.io.File(cacheDir, "picked")
+                dir.deleteRecursively()
+                dir.mkdirs()
+                uris.mapNotNull { uri -> copyPickedFile(uri, dir) }
+            }
+            runCatching {
+                when {
+                    files.isEmpty() -> res.complete(prompt.dismiss())
+                    files.size == 1 ->
+                        res.complete(prompt.confirm(this@MainActivity, Uri.fromFile(files[0])))
+                    else -> res.complete(
+                        prompt.confirm(
+                            this@MainActivity,
+                            files.map { Uri.fromFile(it) }.toTypedArray(),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    /** Copy one picked content:// item into `dir`, keeping its display name. */
+    private fun copyPickedFile(uri: Uri, dir: java.io.File): java.io.File? = runCatching {
+        val name = (queryDisplayName(uri) ?: "upload.bin").replace('/', '_')
+        val out = java.io.File(dir, name)
+        contentResolver.openInputStream(uri)!!.use { input ->
+            out.outputStream().use { input.copyTo(it) }
+        }
+        out
+    }.getOrNull()
+
+    /** The user-facing file name behind a content:// Uri, if the provider says. */
+    private fun queryDisplayName(uri: Uri): String? = runCatching {
+        contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (c.moveToFirst() && i >= 0) c.getString(i) else null
+        }
+    }.getOrNull()
 
     /** Hardware/gesture back navigates the page history first. */
     @Deprecated("Deprecated in Java")
@@ -1056,6 +1160,8 @@ class MainActivity : AppCompatActivity() {
         // default port. The app boots the node itself, so unlike the desktop
         // native host there is no discovery/legacy-port fallback to do here.
         private const val UI_PORT = 42222
+        /// startActivityForResult request code for a page's file prompt.
+        private const val FILE_PICK_REQUEST = 4001
         private const val NODE_BASE = "http://127.0.0.1:$UI_PORT"
 
         // Must match the wallet manifest's gecko id and its native host name
