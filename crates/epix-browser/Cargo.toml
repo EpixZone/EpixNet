@@ -45,7 +45,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # managed Firefox's windows show the Epix icon.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_Threading",
