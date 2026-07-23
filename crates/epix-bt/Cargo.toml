@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["rt", "sync", "io-util", "net", "macros", "
 bytes = "1"
 # Random 20-byte DHT node id / peer id / KRPC transaction ids. `rand 0.8` is
 # already in the workspace lock, so this pulls in nothing new.
-rand = "0.8"
+rand = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
