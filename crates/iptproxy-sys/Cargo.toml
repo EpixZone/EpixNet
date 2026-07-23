@@ -11,7 +11,7 @@ links = "epix_snowflake"
 # Runtime dynamic loading of the shared library on the platforms that ship one
 # (Windows, Android). Static-linked platforms (macOS, Linux, iOS) never use it.
 [target.'cfg(any(target_os = "windows", target_os = "android"))'.dependencies]
-libloading = "0.8"
+libloading = "0.9"
 
 [build-dependencies]
 # Download the pinned epix-iptproxy release asset for the build target. rustls,
