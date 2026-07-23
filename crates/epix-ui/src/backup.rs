@@ -1080,8 +1080,46 @@ fn render_backup_page(
     )
 }
 
-/// The BACKUP tab: the create form and the stored-backup list (download/delete).
+/// The BACKUP tab: the stored-backup list (download/delete) up top, then the
+/// create form.
 fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
+    // Stored backups (managed here; restoring lives on the Restore tab).
+    body.push_str("<h2 class='section-title'>Stored backups</h2>");
+    if backups.is_empty() {
+        body.push_str(
+            "<div class='description' style='padding:12px 0'>No backups yet. \
+             Create one below.</div>",
+        );
+    }
+    for info in backups {
+        let name = esc(&info.file_name);
+        let detail = match &info.manifest {
+            Some(m) => format!("{} \u{2022} {}", manifest_summary(m), human_size(info.size)),
+            None => format!("Unreadable backup \u{2022} {}", human_size(info.size)),
+        };
+        let badge = backup_badge(&info.file_name);
+        body.push_str(&format!(
+            "<div class='backup-row'>\
+               <div class='title'><h3>{name}{badge}</h3>\
+                 <div class='description'>{detail}</div></div>\
+               <div class='backup-actions'>\
+                 <form method='post' action='/Backup/Download'>\
+                   <input type='hidden' name='csrf' value='{csrf}'>\
+                   <input type='hidden' name='name' value='{name}'>\
+                   <button class='linkbtn' type='submit'>Download</button>\
+                 </form>\
+                 <form method='post' action='/Backup' \
+                       onsubmit=\"return confirm('Delete this backup?')\">\
+                   <input type='hidden' name='csrf' value='{csrf}'>\
+                   <input type='hidden' name='action' value='delete'>\
+                   <input type='hidden' name='name' value='{name}'>\
+                   <button class='linkbtn danger' type='submit'>Delete</button>\
+                 </form>\
+               </div>\
+             </div>",
+        ));
+    }
+
     // Create card.
     body.push_str(
         "<h2 class='section-title'>Create a backup</h2>\
@@ -1117,46 +1155,9 @@ fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
          </div>\
          <button class='button button-submit create-btn' id='create-btn' type='submit'>Create backup</button>\
          <div class='description' style='margin-top:8px'>The backup is saved on this device, in the \
-          <b>backups</b> folder of the data directory. Download it below to keep a copy somewhere safe.</div>\
+          <b>backups</b> folder of the data directory. Download it above to keep a copy somewhere safe.</div>\
          </form>"
     ));
-
-    // Stored backups (managed here; restoring lives on the Restore tab).
-    body.push_str("<h2 class='section-title'>Stored backups</h2>");
-    if backups.is_empty() {
-        body.push_str(
-            "<div class='description' style='padding:12px 0'>No backups yet. \
-             Create one above.</div>",
-        );
-    }
-    for info in backups {
-        let name = esc(&info.file_name);
-        let detail = match &info.manifest {
-            Some(m) => format!("{} \u{2022} {}", manifest_summary(m), human_size(info.size)),
-            None => format!("Unreadable backup \u{2022} {}", human_size(info.size)),
-        };
-        let badge = backup_badge(&info.file_name);
-        body.push_str(&format!(
-            "<div class='backup-row'>\
-               <div class='title'><h3>{name}{badge}</h3>\
-                 <div class='description'>{detail}</div></div>\
-               <div class='backup-actions'>\
-                 <form method='post' action='/Backup/Download'>\
-                   <input type='hidden' name='csrf' value='{csrf}'>\
-                   <input type='hidden' name='name' value='{name}'>\
-                   <button class='linkbtn' type='submit'>Download</button>\
-                 </form>\
-                 <form method='post' action='/Backup' \
-                       onsubmit=\"return confirm('Delete this backup?')\">\
-                   <input type='hidden' name='csrf' value='{csrf}'>\
-                   <input type='hidden' name='action' value='delete'>\
-                   <input type='hidden' name='name' value='{name}'>\
-                   <button class='linkbtn danger' type='submit'>Delete</button>\
-                 </form>\
-               </div>\
-             </div>",
-        ));
-    }
 }
 
 /// The RESTORE tab: pick a stored backup to restore, or upload one.
