@@ -1990,7 +1990,7 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "tray-icon",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winreg",
  "winresource",
  "zip 8.6.0",
