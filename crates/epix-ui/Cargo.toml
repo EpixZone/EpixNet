@@ -35,7 +35,7 @@ async-trait = "0.1"
 include_dir = "0.7"
 futures-util = "0.3"
 libc = "0.2"
-maxminddb = { version = "0.27", features = ["mmap"] }
+maxminddb = { version = "0.30", features = ["mmap"] }
 flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tar = "0.4.46"
