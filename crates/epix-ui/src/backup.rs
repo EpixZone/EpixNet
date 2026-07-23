@@ -977,8 +977,12 @@ const BACKUP_CSS: &str = "<style>\
 .summary{font-size:13px;color:var(--epix-text-mid);margin:0 0 4px}\
 .summary b{color:var(--epix-text)}\
 .upload-row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:12px}\
-.upload-row input[type=file]{font-size:13px;color:var(--epix-text-mid);max-width:100%}\
 .upload-row .button{margin-top:0;height:38px;padding:0 18px;font-size:14px}\
+.file-btn{display:inline-flex;align-items:center;height:38px;padding:0 18px;border:1px solid var(--epix-border-strong);border-radius:8px;font-size:14px;font-weight:600;color:var(--epix-text);background:var(--epix-surface-2);cursor:pointer;user-select:none}\
+.file-btn:hover{border-color:var(--epix-accent);color:var(--epix-accent)}\
+.file-btn:focus-within{outline:2px solid var(--epix-focus);outline-offset:2px}\
+.file-btn input{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0)}\
+.file-name{font-size:13px;color:var(--epix-text-mid);overflow-wrap:anywhere;min-width:0}\
 .create-btn{margin-top:20px}\
 </style>";
 
@@ -995,6 +999,11 @@ var form=document.getElementById('create-form');\
 if(form){form.addEventListener('submit',function(){\
 var b=document.getElementById('create-btn');\
 if(b){b.disabled=true;b.textContent='Creating backup\\u2026 this can take a while';}\
+});}\
+var fi=document.getElementById('file-input');\
+if(fi){fi.addEventListener('change',function(){\
+var n=document.getElementById('file-name');\
+if(n){n.textContent=fi.files.length?fi.files[0].name:'No file chosen';}\
 });}\
 })();</script>";
 
@@ -1195,7 +1204,10 @@ fn render_restore_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
           It appears in the list above, ready to restore.</div>\
          <form method='post' action='/Backup/Upload?csrf={csrf}' enctype='multipart/form-data'>\
            <div class='upload-row'>\
-             <input type='file' name='file' accept='.zip,application/zip' required>\
+             <label class='file-btn'>Choose backup file\u{2026}\
+               <input type='file' id='file-input' name='file' accept='.zip,application/zip' required>\
+             </label>\
+             <span class='file-name' id='file-name'>No file chosen</span>\
              <button class='button' type='submit'>Upload backup</button>\
            </div>\
          </form>"
