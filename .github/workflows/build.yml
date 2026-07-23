@@ -22,7 +22,7 @@ jobs:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc (mesh transport build dep)
         run: |
@@ -47,7 +47,7 @@ jobs:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
@@ -66,7 +66,7 @@ jobs:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
