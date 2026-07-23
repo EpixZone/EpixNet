@@ -6,6 +6,7 @@
 //! `/EpixNet-Internal/Websocket?wrapper_key=…`. Commands are dispatched through
 //! the [`CommandRegistry`], which the plugin system extends.
 
+pub mod backup;
 #[cfg(feature = "benchmark")]
 pub mod benchmark;
 pub mod chart;
@@ -123,11 +124,26 @@ impl UiServer {
             .route("/Config", get(serve_config_page))
             .route("/Stats", get(serve_stats_page))
             .route("/StatsJson", get(serve_stats_json))
+            // The Backup & Restore wizard. Mutations are POSTed (passwords and
+            // destructive actions never ride a URL); the upload route gets its
+            // own generous body limit (a zites backup can be gigabytes - the
+            // global default is 2 MB) and streams to disk.
+            .route(
+                "/Backup",
+                get(backup::serve_backup_page).post(backup::backup_post),
+            )
+            .route("/Backup/Download", axum::routing::post(backup::backup_download))
+            .route(
+                "/Backup/Upload",
+                axum::routing::post(backup::backup_upload)
+                    .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024 * 1024)),
+            )
             // Trailing-slash variants would otherwise fall through to the
             // xite route ("/Stats/" -> serve_wrapper("Stats") -> 404).
             .route("/Plugins/", get(|| async { Redirect::permanent("/Plugins") }))
             .route("/Config/", get(|| async { Redirect::permanent("/Config") }))
             .route("/Stats/", get(|| async { Redirect::permanent("/Stats") }))
+            .route("/Backup/", get(|| async { Redirect::permanent("/Backup") }))
             // The Epix Wallet web app for the mobile shells (see
             // AppState::wallet_ui_dir); 404s when nothing is staged.
             .route("/EpixWallet", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
@@ -425,8 +441,17 @@ async fn is_cross_origin_request(
 }
 
 /// Routes that identify no xite (safe to answer regardless of referer).
+/// /Backup is deliberately NOT public even though it is a global path: its
+/// responses hold the node's keys, so a xite's same-origin fetch() to it must
+/// hit the full cross-origin gate (user navigation and the page's own form
+/// posts still pass as `sec-fetch-mode: navigate`).
 fn is_public_ui_path(path: &str) -> bool {
-    path == "/" || is_global_path(path)
+    (path == "/" || is_global_path(path)) && !is_backup_path(path)
+}
+
+/// The Backup & Restore wizard's routes.
+fn is_backup_path(path: &str) -> bool {
+    path == "/Backup" || path.starts_with("/Backup/")
 }
 
 /// Whether `url`'s host equals the request `host` (both with ports ignored).
@@ -495,6 +520,7 @@ fn is_global_path(path: &str) -> bool {
         || path == "/Config/"
         || path == "/Plugins/"
         || path == "/Stats/"
+        || is_backup_path(path)
         || path.starts_with("/list/")
         || path == "/Benchmark"
         || path == "/Login"
@@ -624,6 +650,7 @@ pub fn builtin_plugins() -> Vec<&'static str> {
         "Stats",
         "UiConfig",
         "UiPluginManager",
+        "UiBackup",
     ];
     #[cfg(feature = "ui-password")]
     plugins.push("UiPassword");
@@ -1189,6 +1216,7 @@ fn plugin_description(name: &str) -> &'static str {
         "Stats" => "Network stats charts and the peer world map on the dashboard.",
         "UiPluginManager" => "This plugin manager page.",
         "UiConfig" => "The node configuration page.",
+        "UiBackup" => "The Backup & Restore wizard for keys, settings, and zites.",
         "Cors" => "Cross-site file access via a Cors:<address> permission grant.",
         "PeerDb" => "Remembers known peers across restarts.",
         "Notification" => "Per-site notification subscriptions, muting, and counts.",

@@ -251,6 +251,9 @@ pub async fn boot(
 ) -> Result<(UiServer, RunningNode), String> {
     init_logging();
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
+    // A restore staged by the Backup & Restore wizard applies now, before
+    // anything reads the data dir (users.json, sites.json, config).
+    epix_ui::backup::apply_pending_restore(&opts.data_root);
     // Carry a Python client's epixnet.conf settings over into config.json before
     // anything reads config (the Tor-Always egress gate below, then AppState).
     migrate_legacy_conf(&opts.data_root);
