@@ -2553,9 +2553,18 @@ fn header_map(pairs: Vec<(header::HeaderName, String)>) -> axum::http::HeaderMap
 /// the wrapper console reports "blocked WebAssembly (script-src)" on every
 /// page view.
 fn wrapper_csp(script_nonce: &str) -> String {
+    // Passive media (img/media/font) is intentionally cross-origin. In the
+    // desktop browser each xite is its OWN origin (https://<name>.epix), so a
+    // xite that legitimately shows another's content - an EpixTalk avatar whose
+    // URL lives on the poster's xite, an embedded image or video - is
+    // cross-origin and `'self'` would block it. On the loopback/mobile path
+    // every xite shares one origin, which is why it only broke in host mode
+    // (issue #337). Broadening these adds no exfiltration surface: `connect-src`
+    // is already `*`, a strictly more capable channel. The script nonce, not
+    // the resource origins, is the real boundary here.
     format!(
         "default-src 'none'; script-src 'nonce-{script_nonce}' 'wasm-unsafe-eval'; \
-         img-src 'self' blob: data:; \
+         img-src * blob: data:; media-src * blob: data:; font-src * data:; \
          style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *"
     )
 }
@@ -2988,5 +2997,26 @@ mod gateway_tests {
         let banner_at = out.find("epix-gateway-banner").unwrap();
         assert!(banner_at < out.rfind("</body>").unwrap());
         assert!(banner_at > out.find("<h1>site</h1>").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod csp_tests {
+    use super::wrapper_csp;
+
+    #[test]
+    fn passive_media_is_cross_origin_but_scripts_stay_nonce_locked() {
+        let csp = wrapper_csp("NONCE123");
+        // Cross-origin avatars/media/fonts must load: in host mode each xite is
+        // its own origin, so 'self' would block another xite's image (issue
+        // #337). data:/blob: stay listed since `*` does not cover them.
+        assert!(csp.contains("img-src * blob: data:"), "img-src must be cross-origin");
+        assert!(csp.contains("media-src * blob: data:"), "media-src must be cross-origin");
+        assert!(csp.contains("font-src * data:"), "font-src must be cross-origin");
+        // The real boundary is untouched: only nonce'd scripts run, and the
+        // default is still deny.
+        assert!(csp.contains("script-src 'nonce-NONCE123' 'wasm-unsafe-eval'"));
+        assert!(csp.starts_with("default-src 'none'"));
+        assert!(!csp.contains("img-src 'self'"), "the 'self' image scope was the bug");
     }
 }
