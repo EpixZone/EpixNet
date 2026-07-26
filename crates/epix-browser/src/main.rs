@@ -477,7 +477,10 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
         return true;
     }
     println!("· first run: trusting the local CA in the browser profile …");
-    let shot = std::env::temp_dir().join("epix-ca-warmup.png");
+    // The throwaway screenshot lives inside the managed profile, not the
+    // world-shared temp dir, where a predictable name could be pre-created
+    // (e.g. as a symlink) by another local user.
+    let shot = profile.join("ca-warmup.png");
     for _ in 0..3 {
         let child = hidden_command(firefox)
             .arg("--headless")
