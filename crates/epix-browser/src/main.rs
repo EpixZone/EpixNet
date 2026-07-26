@@ -429,15 +429,98 @@ fn setup_profile(
         std::process::exit(1);
     }
     let secure = match install_ca(&profile, firefox, ca) {
-        Ok(()) => true,
+        Ok(()) => ensure_ca_imported(&profile, firefox, ca),
         Err(e) => {
             eprintln!("· note: could not install the local CA ({e}); falling back to http");
-            let _ =
-                write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
             false
         }
     };
+    if !secure {
+        let _ =
+            write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
+    }
     (profile, secure)
+}
+
+/// Whether the profile's NSS DB (`cert9.db`) holds this exact CA cert. NSS
+/// stores the DER verbatim, so a byte search is a reliable presence check
+/// without shelling out to certutil (which most machines don't have).
+fn profile_trusts_ca(profile: &Path, ca: &LocalCa) -> bool {
+    std::fs::read(profile.join("cert9.db"))
+        .is_ok_and(|db| db.windows(ca.cert_der().len()).any(|w| w == ca.cert_der()))
+}
+
+/// Make sure the CA the policy engine was pointed at actually landed in the
+/// profile's trust DB, warming the profile up with a short headless Firefox
+/// run when it hasn't.
+///
+/// `install_ca` succeeding only means the PEM and policies.json are in place;
+/// the import itself happens inside Firefox, asynchronously, during startup.
+/// On a first run that same startup is also syncing the sideloaded add-ons
+/// (wallet, theme), whose manifest loads spin a nested event loop that can
+/// fire the policy engine's cert-file callback before NSS is ready - the
+/// import fails ("Unable to add certificate" in the console) and the user's
+/// very first window greets them with a certificate warning. The import is
+/// retried by Firefox on every later startup, so the failure is transient,
+/// but "restart to fix the first thing you see" is not acceptable.
+///
+/// So: when `cert9.db` doesn't hold the CA yet (certutil installs put it
+/// there synchronously; policy installs on a warm profile did on a previous
+/// run), do the first startup headlessly - `--screenshot` performs a full
+/// startup (policies, add-on sync) and exits on its own; `--wait-for-browser`
+/// keeps the Windows launcher stub attached so waiting on the child means
+/// waiting for the real browser. The first warm-up run absorbs the add-on
+/// churn; the import lands in it or in the (churn-free) run after it. Falls
+/// back to http only if the CA never shows up.
+fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
+    if profile_trusts_ca(profile, ca) {
+        return true;
+    }
+    println!("· first run: trusting the local CA in the browser profile …");
+    let shot = std::env::temp_dir().join("epix-ca-warmup.png");
+    for _ in 0..3 {
+        let child = hidden_command(firefox)
+            .arg("--headless")
+            .arg("--screenshot")
+            .arg(&shot)
+            .arg("--wait-for-browser")
+            .arg("--allow-downgrade")
+            .arg("--profile")
+            .arg(profile)
+            .arg("--no-remote")
+            .arg("--new-instance")
+            .arg("about:blank")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { break };
+        // Bounded wait: a screenshot run exits by itself in a few seconds; a
+        // wedged one is killed so boot can't hang here.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+            }
+        }
+        if profile_trusts_ca(profile, ca) {
+            let _ = std::fs::remove_file(&shot);
+            return true;
+        }
+    }
+    let _ = std::fs::remove_file(&shot);
+    eprintln!(
+        "· note: the browser profile did not pick up the local CA \
+         (policy import kept failing); falling back to http"
+    );
+    false
 }
 
 /// Install the starter chrome theme and, when the edition allows unsigned
