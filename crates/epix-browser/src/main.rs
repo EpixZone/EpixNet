@@ -762,9 +762,9 @@ fn firefox_is_esr_build(firefox: &Path) -> bool {
 
 /// Build a `Command` that can never pop a console window on Windows - the
 /// launcher is a GUI-subsystem app, so a spawned console tool (certutil, cmd)
-/// would otherwise flash its own terminal. (Only the certutil path uses this,
-/// which macOS no longer takes - see `install_ca`.)
-#[cfg(not(target_os = "macos"))]
+/// would otherwise flash its own terminal. On other platforms this is just
+/// `Command::new`. Used by the certutil path (not taken on macOS, see
+/// `install_ca`) and the CA warm-up run (`ensure_ca_imported`, all platforms).
 fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
