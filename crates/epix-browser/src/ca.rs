@@ -91,6 +91,13 @@ impl LocalCa {
         self.ca_cert_pem.clone()
     }
 
+    /// The CA certificate as raw DER. NSS stores certificates verbatim in
+    /// `cert9.db`, so these exact bytes appearing in the profile's DB is proof
+    /// the CA import landed.
+    pub fn cert_der(&self) -> &[u8] {
+        &self.ca_cert_der
+    }
+
     /// Mint a leaf certificate for `host`, signed by this CA.
     fn leaf_for(&self, host: &str) -> Result<CertifiedKey, String> {
         let leaf_key = KeyPair::generate().map_err(|e| format!("leaf key: {e}"))?;

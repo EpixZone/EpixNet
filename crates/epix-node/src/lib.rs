@@ -94,12 +94,32 @@ pub struct RunningNode {
     pub ui_addr: std::net::SocketAddr,
 }
 
-/// Normalize a launch argument into a resolver target: strip an `epix://`
-/// scheme and any path/query so `epix://talk.epix/topic/1` becomes `talk.epix`
-/// (the host is the xite; the path is opened inside the wrapper afterwards).
-/// A raw address or bare name passes through unchanged.
+/// Strip a leading `scheme://` from a launch argument. Not just `epix://`:
+/// a cold start can receive a full browser URL (`https://talk.epix/?x`) from
+/// the command line, an OS protocol handoff, or a shortcut, and treating the
+/// scheme as the host made the boot resolver look up `https:.epix` and panic.
+/// Only a syntactically valid RFC 3986 scheme is stripped, so a bare name or
+/// address (no `://`) passes through untouched.
+fn strip_scheme(arg: &str) -> &str {
+    match arg.split_once("://") {
+        Some((scheme, rest))
+            if scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+        {
+            rest
+        }
+        _ => arg,
+    }
+}
+
+/// Normalize a launch argument into a resolver target: strip the scheme
+/// (`epix://`, `https://`, ...) and any path/query so `epix://talk.epix/topic/1`
+/// becomes `talk.epix` (the host is the xite; the path is opened inside the
+/// wrapper afterwards). A raw address or bare name passes through unchanged.
 pub fn parse_target(arg: &str) -> String {
-    let s = arg.strip_prefix("epix://").unwrap_or(arg);
+    let s = strip_scheme(arg);
     // Host is everything up to the first `/`, `?`, or `#`.
     let host_end = s.find(['/', '?', '#']).unwrap_or(s.len());
     let host = &s[..host_end];
@@ -114,7 +134,7 @@ pub fn parse_target(arg: &str) -> String {
 /// the host), or `""` if none. The shell navigates the wrapper here after the
 /// xite loads.
 pub fn parse_inner_path(arg: &str) -> String {
-    let s = arg.strip_prefix("epix://").unwrap_or(arg);
+    let s = strip_scheme(arg);
     match s.find(['/', '?', '#']) {
         Some(i) => s[i..].to_string(),
         None => String::new(),
@@ -2154,6 +2174,16 @@ mod tests {
         assert_eq!(parse_target("epix://dashboard.epix/?x=1#frag"), "dashboard.epix");
         // A bare scheme with no host falls back to the raw arg.
         assert_eq!(parse_target("epix://"), "epix://");
+        // Full browser URLs (cold start with a URL argument, OS handoffs):
+        // the scheme must never be mistaken for the host.
+        assert_eq!(parse_target("https://talk.epix/?Topic:123_mud.epix"), "talk.epix");
+        assert_eq!(parse_target("http://talk.epix/topic/1"), "talk.epix");
+        assert_eq!(
+            parse_target("https://epix1frc9dzz7paj0wqhdjc3rh9vl7zhdy3t6dcm647.epix/"),
+            "epix1frc9dzz7paj0wqhdjc3rh9vl7zhdy3t6dcm647.epix"
+        );
+        // `://` mid-arg without a valid scheme in front is not a scheme.
+        assert_eq!(parse_target("1://x"), "1:");
     }
 
     #[test]
@@ -2162,6 +2192,7 @@ mod tests {
         assert_eq!(parse_inner_path("epix://talk.epix/?q=2"), "/?q=2");
         assert_eq!(parse_inner_path("epix://talk.epix"), "");
         assert_eq!(parse_inner_path("talk.epix/a"), "/a");
+        assert_eq!(parse_inner_path("https://talk.epix/?Topic:123_mud.epix"), "/?Topic:123_mud.epix");
     }
 
     #[test]
