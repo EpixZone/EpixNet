@@ -214,21 +214,32 @@ fn install_crypto_provider() {
     });
 }
 
+/// Fraction of the guard sample that must be disabled for the sample to count
+/// as poisoned (see [`clear_poisoned_guard_state`]). At 85% of a full ~60-guard
+/// sample only a handful of usable guards remain; when those are also
+/// transiently down, arti rejects the whole sample and Tor is dead. A
+/// degraded-but-working sample keeps far more usable than that, so this fires
+/// only on near-total poison, not normal churn.
+const GUARD_POISON_DISABLED_RATIO: f64 = 0.85;
+
 /// Recover from a poisoned persisted guard sample.
 ///
 /// Arti persists its guard sample in `<state>/state/guards.json` and marks
 /// guards disabled after too many "indeterminate" circuit failures - which a
-/// laptop accumulates by sleeping mid-circuit. Once EVERY guard in the sample
-/// is disabled, no circuit can ever be built again: each start "bootstraps"
-/// from the directory cache, then rejects the whole sample (`AllGuardsDown`,
-/// 0 accepted) and every dial fails, while nothing ever resamples. The node
-/// looks healthy (bootstrapped, onion service registered) but is mute.
+/// laptop accumulates by sleeping mid-circuit. Once too much of the sample is
+/// disabled, no circuit can be built: each start "bootstraps" from the
+/// directory cache, then rejects the whole sample (`No usable guards`, 0
+/// accepted) and every dial fails, while nothing ever resamples. The node looks
+/// healthy (bootstrapped, onion service registered) but is mute.
 ///
-/// Detect exactly that state - a non-empty sample with all guards disabled -
-/// and delete the file so bootstrap draws a fresh sample. It holds only
-/// resumable network state; onion-service keys live elsewhere (`hss/`,
-/// `keystore/`), so the node's onion address is unaffected. Any parse
-/// surprise (format change, missing fields) leaves the file alone.
+/// It does not take ALL guards disabled to reach this. A real-world poison is
+/// ~95% disabled with the few survivors transiently unreachable, so arti
+/// rejects every guard while a strict all-disabled test never fires. Detect the
+/// broader condition - a non-empty sample that is overwhelmingly disabled - and
+/// delete the file so bootstrap draws a fresh sample. It holds only resumable
+/// network state; onion-service keys live elsewhere (`hss/`, `keystore/`), so
+/// the node's onion address is unaffected. Any parse surprise (format change,
+/// missing fields) leaves the file alone.
 fn clear_poisoned_guard_state(state_dir: &Path) {
     let path = state_dir.join("state").join("guards.json");
     let Ok(bytes) = std::fs::read(&path) else { return };
@@ -240,11 +251,12 @@ fn clear_poisoned_guard_state(state_dir: &Path) {
     if guards.is_empty() {
         return;
     }
-    let all_disabled =
-        guards.iter().all(|g| g.get("disabled").is_some_and(|d| !d.is_null()));
-    if all_disabled && std::fs::remove_file(&path).is_ok() {
+    let disabled =
+        guards.iter().filter(|g| g.get("disabled").is_some_and(|d| !d.is_null())).count();
+    let poisoned = disabled as f64 >= guards.len() as f64 * GUARD_POISON_DISABLED_RATIO;
+    if poisoned && std::fs::remove_file(&path).is_ok() {
         tracing::warn!(
-            "tor: cleared poisoned guard state ({} sampled guards, all disabled); \
+            "tor: cleared poisoned guard state ({disabled}/{} sampled guards disabled); \
              a fresh sample will be drawn",
             guards.len()
         );
@@ -651,29 +663,49 @@ mod tests {
         path
     }
 
+    /// A sample of `total` guards with `disabled` of them disabled.
+    fn sample(total: usize, disabled: usize) -> Vec<serde_json::Value> {
+        let bad = serde_json::json!({"type": "TooManyIndeterminateFailures"});
+        (0..total).map(|i| if i < disabled { bad.clone() } else { serde_json::Value::Null }).collect()
+    }
+
     #[test]
     fn poisoned_guard_state_is_cleared() {
+        // All disabled.
         let dir = tempfile::tempdir().unwrap();
-        let poisoned = serde_json::json!({"type": "TooManyIndeterminateFailures"});
-        let path = write_guards(dir.path(), &[poisoned.clone(), poisoned]);
+        let path = write_guards(dir.path(), &sample(2, 2));
         clear_poisoned_guard_state(dir.path());
         assert!(!path.exists(), "an all-disabled sample must be removed");
+
+        // The real-world poison: a full sample almost entirely disabled, the
+        // few survivors transiently down. A strict all-disabled test would miss
+        // this; it is exactly the state that leaves Tor mute.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards(dir.path(), &sample(60, 57));
+        clear_poisoned_guard_state(dir.path());
+        assert!(!path.exists(), "a 95%-disabled sample must be removed");
     }
 
     #[test]
     fn healthy_and_mixed_guard_state_is_kept() {
         // All healthy.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_guards(dir.path(), &[serde_json::Value::Null, serde_json::Value::Null]);
+        let path = write_guards(dir.path(), &sample(2, 0));
         clear_poisoned_guard_state(dir.path());
         assert!(path.exists(), "a healthy sample stays");
 
-        // One usable guard left: arti can still build circuits - keep it.
+        // One usable guard left in a tiny sample: arti can still build circuits.
         let dir = tempfile::tempdir().unwrap();
-        let poisoned = serde_json::json!({"type": "TooManyIndeterminateFailures"});
-        let path = write_guards(dir.path(), &[poisoned, serde_json::Value::Null]);
+        let path = write_guards(dir.path(), &sample(2, 1));
         clear_poisoned_guard_state(dir.path());
         assert!(path.exists(), "a partly-usable sample stays");
+
+        // Degraded but workable: two-thirds of a full sample disabled still
+        // leaves ~20 usable guards, plenty for Tor - must not be thrown away.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards(dir.path(), &sample(60, 40));
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists(), "a two-thirds-disabled sample stays");
     }
 
     #[test]
