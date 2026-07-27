@@ -279,6 +279,41 @@ async fn multi_peer_striping_and_tor_only_swarm() {
 }
 
 #[tokio::test]
+async fn a_failing_peer_is_routed_around() {
+    use epix_edx::conn::Conn;
+    use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
+    let net = sim::SimNet::new();
+    let data = test_data(300_000);
+
+    // A healthy seeded peer plus a dead peer (its far end dropped, so every
+    // request errors). Both claim the whole object; the dead one is listed
+    // first, so the scheduler tries it, and the failing-peer penalty routes
+    // the retry to the healthy peer instead of retrying the dead one.
+    let (good, id) = seed_and_connect(net.clone(), ip(20), sim::Class::Clearnet, &data).await;
+    let dead = {
+        let (a, b) = tokio::io::duplex(64);
+        let (c, _in) = Conn::start(a, true);
+        drop(b);
+        c
+    };
+    let bits = epix_blob::bitfield::GroupBits::complete(data.len() as u64);
+    let peers = vec![
+        PeerHandle { conn: dead, class: sim::Class::Clearnet, bits: bits.clone(), label: "dead".into() },
+        PeerHandle { conn: good, class: sim::Class::Clearnet, bits: bits.clone(), label: "good".into() },
+    ];
+
+    let (store, _g) = temp_store();
+    let mut swarm = Swarm::new(store.clone(), id, data.len() as u64);
+    store.ensure_sparse(id, Ns::Plain, data.len() as u64, 1).unwrap();
+    let needed = needed_groups(&store, id, data.len() as u64).unwrap();
+    let report = swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+
+    assert!(store.is_complete(id).unwrap(), "object completes despite a failing peer");
+    assert_eq!(store.read_bytes(id, 3).unwrap(), data);
+    assert!(report.by_peer.contains_key("good"), "the healthy peer served the object");
+}
+
+#[tokio::test]
 async fn governed_server_chokes_bulk_but_serves_first_paint() {
     use epix_edx::choke::{Choker, Reach};
     use epix_edx::msg::{err, Req, Resp};

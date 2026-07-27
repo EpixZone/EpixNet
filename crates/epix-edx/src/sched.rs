@@ -238,6 +238,10 @@ impl Swarm {
         // Ensure the sparse object exists before writing slices.
         self.store.ensure_sparse(self.obj, epix_blob::Ns::Plain, self.size, now)?;
 
+        // Per-peer failure counts across rounds: a peer that errors or serves
+        // bytes that fail verification is deprioritized (picked last) so the
+        // swarm routes around it instead of retrying it every round.
+        let mut fails = vec![0u32; peers.len()];
         while !remaining.is_empty() {
             let order = rarest_first_order(&remaining, peers);
             if order.is_empty() {
@@ -254,7 +258,7 @@ impl Swarm {
             let mut tasks = Vec::new();
             for batch in batches.into_iter().take(peers.len().max(1) * 2) {
                 let bgroups = self.groups_of(&batch);
-                match self.pick_peer(&bgroups, peers, &load) {
+                match self.pick_peer(&bgroups, peers, &load, &fails) {
                     Some(idx) => {
                         load[idx] += 1;
                         report.requests_issued += 1;
@@ -270,7 +274,7 @@ impl Swarm {
                         // object stuck incomplete.
                         for sub in split_by_holder(&bgroups, peers, self.size) {
                             let sgroups = self.groups_of(&sub);
-                            let Some(idx) = self.pick_peer(&sgroups, peers, &load) else {
+                            let Some(idx) = self.pick_peer(&sgroups, peers, &load, &fails) else {
                                 continue;
                             };
                             load[idx] += 1;
@@ -291,6 +295,12 @@ impl Swarm {
                 // the next round's timeout/duplication uses real RTT.
                 if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
                     self.stats.observe(cls, el);
+                }
+                // Deprioritize a peer that failed this batch next round.
+                if let Some(p) = outcome.failed_peer {
+                    if let Some(f) = fails.get_mut(p) {
+                        *f = f.saturating_add(1);
+                    }
                 }
                 let Some(label) = outcome.winner_label else { continue };
                 for g in &outcome.groups {
@@ -317,12 +327,15 @@ impl Swarm {
     /// Least-loaded peer this round that holds every group in `groups`,
     /// ties broken by class RTT (fast peers preferred). Spreads
     /// concurrent batches so a multi-peer swarm actually stripes.
-    fn pick_peer(&self, groups: &[u64], peers: &[PeerHandle], load: &[u32]) -> Option<usize> {
+    fn pick_peer(&self, groups: &[u64], peers: &[PeerHandle], load: &[u32], fails: &[u32]) -> Option<usize> {
         peers
             .iter()
             .enumerate()
             .filter(|(_, p)| groups.iter().all(|g| p.bits.contains(*g)))
-            .min_by_key(|(i, p)| (load[*i], self.stats.rtt(p.class)))
+            // Fewest prior failures first, then least-loaded, then fastest
+            // class: a peer that failed verification or errored is used only
+            // when no healthier peer holds the groups.
+            .min_by_key(|(i, p)| (fails[*i], load[*i], self.stats.rtt(p.class)))
             .map(|(i, _)| i)
     }
 
@@ -388,14 +401,14 @@ impl Swarm {
             // No duplication possible. If the primary already errored there
             // is nothing left to try; otherwise wait it out.
             if primary_errored {
-                return BatchOutcome::failed(0);
+                return BatchOutcome::failed(0, Some(primary));
             }
             return match primary_fut.await {
                 Ok(_) => {
                     let cls = peers[primary].class;
                     BatchOutcome::won(groups, peers[primary].label.clone(), 0, cls, start.elapsed())
                 }
-                Err(_) => BatchOutcome::failed(0),
+                Err(_) => BatchOutcome::failed(0, Some(primary)),
             };
         }
 
@@ -417,7 +430,7 @@ impl Swarm {
                 let cls = peers[winner].class;
                 BatchOutcome::won(groups, peers[winner].label.clone(), dups, cls, start.elapsed())
             }
-            None => BatchOutcome::failed(dups),
+            None => BatchOutcome::failed(dups, Some(primary)),
         }
     }
 }
@@ -432,6 +445,9 @@ struct BatchOutcome {
     duplicates: u64,
     winner_class: Option<Class>,
     elapsed: Option<Duration>,
+    /// The peer index that failed this batch (a network error or, worse,
+    /// bytes that failed verification), so later rounds deprioritize it.
+    failed_peer: Option<usize>,
 }
 
 impl BatchOutcome {
@@ -442,10 +458,18 @@ impl BatchOutcome {
             duplicates,
             winner_class: Some(class),
             elapsed: Some(elapsed),
+            failed_peer: None,
         }
     }
-    fn failed(duplicates: u64) -> Self {
-        Self { groups: Vec::new(), winner_label: None, duplicates, winner_class: None, elapsed: None }
+    fn failed(duplicates: u64, failed_peer: Option<usize>) -> Self {
+        Self {
+            groups: Vec::new(),
+            winner_label: None,
+            duplicates,
+            winner_class: None,
+            elapsed: None,
+            failed_peer,
+        }
     }
 }
 
