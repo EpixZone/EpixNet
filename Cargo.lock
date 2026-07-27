@@ -2062,6 +2062,7 @@ version = "0.1.0"
 dependencies = [
  "bao-tree",
  "blake3",
+ "epix-selfenc",
  "positioned-io",
  "postcard",
  "redb",
