@@ -233,6 +233,11 @@ impl Store {
         Ok(self.get_record(id)?.map(|r| r.is_complete()).unwrap_or(false))
     }
 
+    /// (size, complete) for an indexed object, `None` if unknown.
+    pub fn info(&self, id: ObjId) -> io::Result<Option<(u64, bool)>> {
+        Ok(self.get_record(id)?.map(|r| (r.size, r.is_complete())))
+    }
+
     /// Insert a COMPLETE object (verified against its id before a byte is
     /// written — a poisoned insert fails, it does not stick). Returns
     /// false if the object was already present (dedup hit).

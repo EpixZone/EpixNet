@@ -53,6 +53,9 @@ struct ConnInner {
 struct Shared {
     /// req_stream -> where to deliver its response frames.
     waiters: Mutex<HashMap<u64, mpsc::Sender<FrameBody>>>,
+    /// Streams the PEER cancelled that we may be serving; serve tasks
+    /// poll [`Conn::take_cancelled`] between frames and abort encode.
+    cancelled: Mutex<std::collections::HashSet<u64>>,
     /// Set when either connection task has stopped.
     closed: std::sync::atomic::AtomicBool,
 }
@@ -82,6 +85,7 @@ impl Conn {
         });
         let shared = Arc::new(Shared {
             waiters: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(std::collections::HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -147,10 +151,22 @@ impl Conn {
         self.outbound.send(frame).await.map_err(|_| closed_err())
     }
 
+    /// Blocking [`Self::send`] for spawn_blocking encode threads. Applies
+    /// the same queue backpressure, just synchronously.
+    pub fn blocking_send(&self, frame: Frame) -> std::io::Result<()> {
+        self.outbound.blocking_send(frame).map_err(|_| closed_err())
+    }
+
     /// Cancel an in-flight request stream (stops the peer's encode).
     pub async fn cancel(&self, stream: u64) -> std::io::Result<()> {
         self.shared.waiters.lock().expect("waiters").remove(&stream);
         self.send(Frame { stream, body: FrameBody::Cancel }).await
+    }
+
+    /// Whether the peer cancelled `stream` (consumes the flag). Serve
+    /// tasks call this between Data frames and stop encoding on true.
+    pub fn take_cancelled(&self, stream: u64) -> bool {
+        self.shared.cancelled.lock().expect("cancelled").remove(&stream)
     }
 }
 
@@ -199,9 +215,15 @@ fn spawn_reader<R>(
                     }
                 }
                 FrameBody::Cancel => {
-                    // Peer aborted a stream we may be serving; surface it
-                    // by dropping any waiter for that id.
+                    // Peer aborted a stream: drop any local waiter for it
+                    // and flag it for serve tasks streaming on that id.
                     shared.waiters.lock().expect("waiters").remove(&frame.stream);
+                    let mut cancelled = shared.cancelled.lock().expect("cancelled");
+                    // Bounded: a peer spamming Cancels can't grow this set.
+                    if cancelled.len() > 4096 {
+                        cancelled.clear();
+                    }
+                    cancelled.insert(frame.stream);
                 }
                 FrameBody::Ping => {
                     let _ = outbound
