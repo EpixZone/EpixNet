@@ -43,6 +43,12 @@ jobs:
       # change that compiles but breaks byte-compatibility is caught too.
       - name: Test crypto byte-compatibility
         run: cargo test -p epix-crypt --locked
+      # The EDX gates: frozen slice format golden vectors, store crash-reopen,
+      # wire protocol over sim and real TCP+Noise, self-encryption KATs, the
+      # disk-audit and independent-recompute gates. These are the proofs the
+      # edx branch rests on, so they run on every push.
+      - name: Test EDX crates
+        run: cargo test -p epix-blob -p epix-selfenc -p epix-edx -p epix-feed -p epix-search -p epix-xite -p epix-content --locked
 
   mobile-profiles:
     name: Mobile feature profiles
