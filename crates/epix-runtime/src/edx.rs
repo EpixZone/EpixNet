@@ -29,6 +29,18 @@ pub type SharedChoker = Arc<Mutex<Choker>>;
 /// by default; reciprocity is opt-in and this only bites when it is on.
 const EDX_UPLOAD_CAP_BPS: u64 = 8_000_000;
 
+/// Default object-store byte quota. Own (pinned) content is exempt; cached
+/// content fetched from others is evicted LRU past this. Override with
+/// EPIX_EDX_STORE_QUOTA_BYTES.
+const EDX_STORE_QUOTA_BYTES: u64 = 8 << 30; // 8 GiB
+
+fn store_quota() -> u64 {
+    std::env::var("EPIX_EDX_STORE_QUOTA_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(EDX_STORE_QUOTA_BYTES)
+}
+
 /// True unless `var` is explicitly set to a falsey value (`0`/`false`);
 /// unset means the default. Used for the default-on EDX kill switches.
 pub fn env_on(var: &str) -> bool {
@@ -379,6 +391,9 @@ impl EdxFetcher for RuntimeEdxFetcher {
 
         let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
         self.state.edx_materialize_file(address, inner_path, &bytes).await?;
+        // Cached content grows the store; keep it under quota (own content is
+        // pinned, so only cached-from-others objects are evicted).
+        let _ = store.enforce_quota(store_quota());
         Ok(true)
     }
 
@@ -417,6 +432,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
             .map_err(|e| e.to_string())?;
         self.credit(&report, &node_pks, now);
         let bytes = store.read_range(id, start, end - start, now).map_err(|e| e.to_string())?;
+        let _ = store.enforce_quota(store_quota());
         Ok(Some(bytes))
     }
 }

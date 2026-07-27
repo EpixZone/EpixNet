@@ -351,3 +351,27 @@ fn reopen_truncates_slab_drift() {
     assert_eq!(store.read_bytes(ida, 3).unwrap(), a);
     assert_eq!(store.read_bytes(idb, 4).unwrap(), b);
 }
+
+#[test]
+fn quota_evicts_unpinned_but_keeps_pinned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+
+    // Two objects: one pinned (own content), one cached (unpinned).
+    let own: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+    let cached: Vec<u8> = (0..40_000u32).map(|i| (i / 2) as u8).collect();
+    let own_id = ObjId::of(&own);
+    let cached_id = ObjId::of(&cached);
+    store.insert_bytes(own_id, Ns::Plain, &own, 1).unwrap();
+    store.pin(own_id).unwrap();
+    store.insert_bytes(cached_id, Ns::Plain, &cached, 2).unwrap();
+
+    assert_eq!(store.total_bytes().unwrap(), 80_000);
+
+    // Enforce a quota below the total: the unpinned object is evicted, the
+    // pinned own content survives.
+    let freed = store.enforce_quota(50_000).unwrap();
+    assert!(freed >= 40_000, "freed {freed}");
+    assert!(store.contains(own_id).unwrap(), "pinned own content survives");
+    assert!(!store.contains(cached_id).unwrap(), "unpinned cache evicted");
+}

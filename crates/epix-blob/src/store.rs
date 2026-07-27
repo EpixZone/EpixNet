@@ -599,6 +599,42 @@ impl Store {
         Ok(())
     }
 
+    /// Total logical bytes of all stored objects (the quota basis).
+    pub fn total_bytes(&self) -> io::Result<u64> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let table = txn.open_table(OBJECTS).map_err(db_err)?;
+        let mut total = 0u64;
+        for row in table.iter().map_err(db_err)? {
+            let (_, v) = row.map_err(db_err)?;
+            let rec: ObjRecord = dec(v.value())?;
+            total = total.saturating_add(rec.size);
+        }
+        Ok(total)
+    }
+
+    /// Pin an object so eviction never reclaims it (the node's own content).
+    /// Idempotent: raises refcount to at least 1, never higher, so repeated
+    /// registration across restarts does not inflate it.
+    pub fn pin(&self, id: ObjId) -> io::Result<()> {
+        let mut rec = self.required(id)?;
+        if rec.refcount == 0 {
+            rec.refcount = 1;
+            self.put_record(id, &rec)?;
+        }
+        Ok(())
+    }
+
+    /// Enforce a byte quota: if the store exceeds `quota`, evict LRU
+    /// refcount-0 (unpinned, i.e. cached-from-others) objects down to it.
+    /// Returns bytes freed. Pinned own content is never touched.
+    pub fn enforce_quota(&self, quota: u64) -> io::Result<u64> {
+        let total = self.total_bytes()?;
+        if total <= quota {
+            return Ok(0);
+        }
+        self.evict_lru(total - quota)
+    }
+
     /// Evict least-recently-used refcount-0 objects until at least
     /// `bytes_needed` are freed (or candidates run out). Returns freed
     /// bytes. Sealed slabs past the dead threshold are compacted.

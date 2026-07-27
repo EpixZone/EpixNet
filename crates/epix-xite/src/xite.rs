@@ -774,7 +774,11 @@ impl Xite {
                     })
                 };
                 match res {
-                    Ok(()) => registered += 1,
+                    Ok(()) => {
+                        // Our own content: pin it so eviction never reclaims it.
+                        let _ = store.pin(id);
+                        registered += 1;
+                    }
                     Err(_) => skipped += 1, // corrupt/changed local copy: refetch later
                 }
             }
@@ -820,7 +824,10 @@ impl Xite {
                 }
                 if ok && epix_blob::ObjId::of(&bytes) == id {
                     match store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, now) {
-                        Ok(_) => registered += 1,
+                        Ok(_) => {
+                            let _ = store.pin(id); // own content: never evict
+                            registered += 1;
+                        }
                         Err(_) => skipped += 1,
                     }
                 } else {
