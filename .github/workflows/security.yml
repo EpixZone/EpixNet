@@ -2,7 +2,9 @@ name: Security scan
 
 on:
   push:
-    branches: [main]
+    # edx: new EDX dependencies (blake3, bao-tree, snow, yamux, ...) must pass
+    # the advisory/license gates on every branch push, not first at merge time.
+    branches: [main, edx]
   pull_request:
     branches: [main]
   schedule:

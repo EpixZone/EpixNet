@@ -6,7 +6,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # edx: long-lived EDX protocol branch — every push must build and test
+    # green so the branch stays bisectable.
+    branches: [main, edx]
   pull_request:
     branches: [main]
 
