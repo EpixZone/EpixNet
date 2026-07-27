@@ -12,12 +12,11 @@ use std::io::{self, Read, Write};
 use std::ops::Range;
 
 use bao_tree::io::outboard::PreOrderOutboard;
-use bao_tree::io::round_up_to_chunks;
 use bao_tree::io::sync::{
     decode_ranges as bao_decode_ranges, encode_ranges_validated, outboard as bao_outboard,
     valid_ranges as bao_valid_ranges,
 };
-use bao_tree::{BaoTree, ByteRanges, ChunkRanges};
+use bao_tree::{BaoTree, ChunkRanges};
 use positioned_io::{ReadAt, WriteAt};
 
 use crate::{ObjId, BLOCK_SIZE};
@@ -63,16 +62,26 @@ impl OutboardBytes {
     }
 }
 
-/// Convert requested byte ranges to the chunk ranges actually transferred
-/// (requests are rounded outward to 16 KiB chunk-group boundaries).
+/// Convert requested byte ranges to the chunk ranges actually transferred.
+///
+/// Requests are rounded outward to 16 KiB CHUNK-GROUP boundaries (not
+/// 1 KiB chunk boundaries): the group is the validation unit, so a
+/// partially-covered group could neither be verified by the receiver nor
+/// re-served later. Group alignment is what makes "the pieces I fetched
+/// are pieces I can seed" hold.
 pub fn chunk_ranges(byte_ranges: &[Range<u64>]) -> ChunkRanges {
-    let mut spec = ByteRanges::empty();
+    const GROUP_BYTES: u64 = BLOCK_SIZE.bytes() as u64;
+    const CHUNKS_PER_GROUP: u64 = GROUP_BYTES / 1024;
+    let mut out = ChunkRanges::empty();
     for r in byte_ranges {
-        if r.start < r.end {
-            spec |= ByteRanges::from(r.start..r.end);
+        if r.start >= r.end {
+            continue;
         }
+        let start = (r.start / GROUP_BYTES) * CHUNKS_PER_GROUP;
+        let end = r.end.div_ceil(GROUP_BYTES) * CHUNKS_PER_GROUP;
+        out |= ChunkRanges::from(bao_tree::ChunkNum(start)..bao_tree::ChunkNum(end));
     }
-    round_up_to_chunks(&spec)
+    out
 }
 
 /// Encode the given byte ranges of `data` as a verified slice, validating
@@ -115,6 +124,57 @@ pub fn decode_slice(
         data: vec![0; tree.outboard_size() as usize],
     };
     bao_decode_ranges(encoded, &ranges, target, ob).map_err(io::Error::from)
+}
+
+/// Like [`decode_slice`], but persists the interior hashes captured from
+/// the slice into a caller-provided outboard sink (normally the object's
+/// sparse `.obao` file, pre-sized to `outboard_size(size)`).
+///
+/// This is what makes a PARTIALLY downloaded object re-servable: the
+/// parents proving the ranges we hold land at their pre-order offsets,
+/// so a later [`encode_slice_from`] over the same ranges can produce a
+/// verified slice for another peer without holding the whole file.
+pub fn decode_slice_into(
+    encoded: impl Read,
+    root: ObjId,
+    size: u64,
+    byte_ranges: &[Range<u64>],
+    target: impl WriteAt,
+    obao: impl ReadAt + WriteAt,
+) -> io::Result<()> {
+    let ranges = chunk_ranges(byte_ranges);
+    let ob = PreOrderOutboard {
+        tree: BaoTree::new(size, BLOCK_SIZE),
+        root: blake3::Hash::from_bytes(root.0),
+        data: obao,
+    };
+    bao_decode_ranges(encoded, &ranges, target, ob).map_err(io::Error::from)
+}
+
+/// Encode a verified slice from random-access `data` + a stored outboard
+/// (both may be file-backed; both may be partial as long as they cover
+/// the requested ranges). Validates before writing, so serving from a
+/// corrupted store fails instead of shipping bad bytes.
+pub fn encode_slice_from(
+    data: impl ReadAt,
+    obao: impl ReadAt,
+    root: ObjId,
+    size: u64,
+    byte_ranges: &[Range<u64>],
+    out: impl Write,
+) -> io::Result<()> {
+    let ranges = chunk_ranges(byte_ranges);
+    let ob = PreOrderOutboard {
+        tree: BaoTree::new(size, BLOCK_SIZE),
+        root: blake3::Hash::from_bytes(root.0),
+        data: obao,
+    };
+    encode_ranges_validated(data, ob, &ranges, out).map_err(io::Error::from)
+}
+
+/// Size in bytes of the outboard for an object of `size` bytes.
+pub fn outboard_size(size: u64) -> u64 {
+    BaoTree::new(size, BLOCK_SIZE).outboard_size()
 }
 
 /// Which chunk ranges of locally stored `data` actually verify against

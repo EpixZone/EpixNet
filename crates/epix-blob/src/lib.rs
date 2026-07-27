@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bitfield;
+pub mod store;
 pub mod verified;
 
 use core::fmt;
