@@ -18,6 +18,8 @@
 #![forbid(unsafe_code)]
 
 pub mod bitfield;
+pub mod bundle;
+pub mod manifest;
 pub mod store;
 pub mod verified;
 
