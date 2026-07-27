@@ -39,17 +39,19 @@ pub const MAX_CONCURRENT_SERVES: usize = 8;
 pub const FIRST_PAINT_OBJECT_BYTES: u64 = 1 << 20;
 
 /// Signed-content access the server delegates to (the real node backs
-/// this with its xite registry; tests use a fixture).
+/// this with its xite registry; tests use a fixture). Async because the
+/// node's registry is behind async locks and disk IO.
+#[async_trait::async_trait]
 pub trait SignedProvider: Send + Sync + 'static {
     /// Raw signed content.json bytes (root or per-user path).
-    fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>>;
+    async fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>>;
     /// Signed files changed since `since`: (inner_path, modified, size).
-    fn list_signed(&self, xite: &str, since: u64) -> Vec<(String, u64, u64)>;
+    async fn list_signed(&self, xite: &str, since: u64) -> Vec<(String, u64, u64)>;
     /// (signed_files, newest_modified, held_bytes) or None if unknown xite.
-    fn xite_summary(&self, xite: &str) -> Option<(u64, u64, u64)>;
+    async fn xite_summary(&self, xite: &str) -> Option<(u64, u64, u64)>;
     /// Verify + apply a pushed signed update (and its inline small
     /// objects). Ok(true) = accepted and new, Ok(false) = stale/known.
-    fn apply_update(
+    async fn apply_update(
         &self,
         xite: &str,
         inner_path: &str,
@@ -282,18 +284,18 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             let _ = conn.respond(stream, resp).await;
         }
         Req::GetSigned { xite, inner_path } => {
-            let resp = match ctx.provider.get_signed(&xite, &inner_path) {
+            let resp = match ctx.provider.get_signed(&xite, &inner_path).await {
                 Some(bytes) => Resp::Signed { bytes },
                 None => Resp::Err { code: err::NOT_FOUND, msg: format!("{xite}/{inner_path}") },
             };
             let _ = conn.respond(stream, resp).await;
         }
         Req::ListSigned { xite, since } => {
-            let entries = ctx.provider.list_signed(&xite, since);
+            let entries = ctx.provider.list_signed(&xite, since).await;
             let _ = conn.respond(stream, Resp::SignedList { entries }).await;
         }
         Req::HasXite { xite } => {
-            let resp = match ctx.provider.xite_summary(&xite) {
+            let resp = match ctx.provider.xite_summary(&xite).await {
                 Some((signed_files, newest_modified, held_bytes)) => {
                     Resp::XiteSummary { signed_files, newest_modified, held_bytes }
                 }
@@ -306,7 +308,7 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             // (see fetch.rs); as a server there is nothing to answer.
         }
         Req::Update { xite, inner_path, signed, inline } => {
-            let resp = match ctx.provider.apply_update(&xite, &inner_path, &signed, &inline) {
+            let resp = match ctx.provider.apply_update(&xite, &inner_path, &signed, &inline).await {
                 Ok(_) => Resp::Ok,
                 Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
             };

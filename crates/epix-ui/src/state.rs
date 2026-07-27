@@ -7737,6 +7737,20 @@ impl AppState {
         self.edx_store.read().await.clone()
     }
 
+    /// Register every currently-loaded xite's files into the EDX store, so a
+    /// store installed after xites already loaded still serves them (load
+    /// order independence). Returns the number of xites registered.
+    pub async fn edx_register_all_loaded(&self) -> usize {
+        let addresses: Vec<String> = self.xites.read().await.keys().cloned().collect();
+        let mut n = 0;
+        for address in addresses {
+            if self.edx_register_xite(&address).await.is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Register a xite's local files (and the bundles its manifest declares)
     /// into the EDX object store, content-addressed by BLAKE3. No re-download
     /// and no second copy: small files pack into slabs, large files adopt in

@@ -2410,6 +2410,7 @@ name = "epix-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "epix-blob",
  "epix-bt",
  "epix-content",
  "epix-core",
@@ -2417,6 +2418,7 @@ dependencies = [
  "epix-dht",
  "epix-dht-net",
  "epix-discovery",
+ "epix-edx",
  "epix-i2p",
  "epix-propagation",
  "epix-protocol",

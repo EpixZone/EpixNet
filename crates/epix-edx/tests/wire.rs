@@ -35,17 +35,18 @@ struct FixtureProvider {
     signed: std::collections::HashMap<(String, String), Vec<u8>>,
 }
 
+#[async_trait::async_trait]
 impl SignedProvider for FixtureProvider {
-    fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>> {
+    async fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>> {
         self.signed.get(&(xite.into(), inner_path.into())).cloned()
     }
-    fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
+    async fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
         vec![("content.json".into(), 1_700_000_000, 42)]
     }
-    fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
+    async fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
         Some((1, 1_700_000_000, 4096))
     }
-    fn apply_update(
+    async fn apply_update(
         &self,
         _xite: &str,
         _inner_path: &str,

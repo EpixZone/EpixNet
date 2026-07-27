@@ -16,11 +16,8 @@
 //! way.
 
 use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use epix_transport::PeerStream;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
 use crate::conn::{Conn, Incoming};
@@ -67,53 +64,8 @@ pub async fn accept(stream: PeerStream) -> io::Result<Link> {
 /// re-emitted, so the chosen path ([`accept`] for [`Sniff::Edx`], the
 /// legacy msgpack server otherwise) sees the untouched stream.
 pub async fn read_sniff(stream: PeerStream) -> io::Result<(Sniff, PeerStream)> {
-    let mut stream = stream;
-    let mut first = [0u8; 1];
-    // A clean connection-close before any byte is a normal idle peer, not
-    // an error the caller should log noisily; surface it as UnexpectedEof.
-    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first).await?;
-    let kind = frame::sniff(first[0]);
-    let rewound: PeerStream = Box::pin(Prefixed { prefix: first, pos: 0, inner: stream });
-    Ok((kind, rewound))
-}
-
-/// A stream with a few leading bytes to replay before delegating. Used by
-/// [`read_sniff`] to put the routing byte back.
-struct Prefixed {
-    prefix: [u8; 1],
-    pos: usize,
-    inner: PeerStream,
-}
-
-impl AsyncRead for Prefixed {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        if self.pos < self.prefix.len() {
-            let remaining = &self.prefix[self.pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.pos += n;
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for Prefixed {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
+    let (first, rewound) = epix_transport::peek_first_byte(stream)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e.to_string()))?;
+    Ok((frame::sniff(first), rewound))
 }

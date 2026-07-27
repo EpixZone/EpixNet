@@ -26,6 +26,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
+pub mod edx;
 pub mod handler;
 #[cfg(feature = "local-discovery")]
 pub mod local;
@@ -1066,6 +1067,13 @@ async fn propagation_loop(
 /// Serve inbound file requests (seeding) on `port` until shutdown. Peers connect
 /// with the ordinary wire protocol and pull files via `getFile`.
 #[cfg(feature = "inbound-seeding")]
+/// This node's EDX identity key (hex), for the Hello channel binding. A
+/// fresh per-boot key for now: reciprocity attribution across restarts
+/// (persisting it) rides the incentive stage.
+async fn edx_node_key(_state: &Arc<AppState>) -> String {
+    epix_crypt::new_seed()
+}
+
 async fn seed_loop(
     state: Arc<AppState>,
     handler: Arc<handler::NodeHandler>,
@@ -1080,7 +1088,33 @@ async fn seed_loop(
             return;
         }
     };
+    // EDX serving (opt-in via EPIX_EDX=1): open + install the content-
+    // addressed object store and register the already-loaded xites into it,
+    // so the file server can answer EDX peers. Sourced from EPIX_DATA_DIR.
+    if std::env::var("EPIX_EDX").map(|v| v == "1").unwrap_or(false)
+        && state.edx_store().await.is_none()
+    {
+        match std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()) {
+            Some(dir) => {
+                edx::enable_serving(&state, std::path::Path::new(&dir)).await;
+            }
+            None => {
+                state
+                    .log("WARN", "EPIX_EDX set but EPIX_DATA_DIR unset; EDX store not opened".to_string())
+                    .await;
+            }
+        }
+    }
+
     let mut server = epix_protocol::PeerServer::new(handler);
+    // EDX coexistence: when an EDX object store is installed, hand accepted
+    // streams whose first byte is 'E' to the EDX serve loop on this same
+    // port; every other peer stays on the msgpack path. No store, no fork.
+    if let Some(store) = state.edx_store().await {
+        let key = edx_node_key(&state).await;
+        server = server.with_edx(edx::edx_hook(state.clone(), store, key));
+        state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
+    }
     // A real peer reaching us over clearnet TCP proves the fileserver port is
     // open from the internet - the privacy-preserving alternative to the Python
     // client's third-party port-scan services (no phone-home). The first public

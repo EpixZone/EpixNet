@@ -11,6 +11,9 @@ epix-xite = { path = "../epix-xite" }
 epix-discovery = { path = "../epix-discovery" }
 epix-transport = { path = "../epix-transport" }
 epix-protocol = { path = "../epix-protocol" }
+epix-edx = { path = "../epix-edx" }
+epix-blob = { path = "../epix-blob" }
+epix-crypt = { path = "../epix-crypt" }
 epix-dht = { path = "../epix-dht" }
 epix-dht-net = { path = "../epix-dht-net" }
 epix-propagation = { path = "../epix-propagation" }

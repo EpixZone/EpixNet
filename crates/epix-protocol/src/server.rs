@@ -7,6 +7,8 @@ use crate::msg::{read_msg, send_msg, vget, vmap};
 use async_trait::async_trait;
 use epix_core::PeerAddr;
 use rmpv::Value;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -40,22 +42,42 @@ pub trait RequestHandler: Send + Sync {
 /// mesh inbound do not imply clearnet reachability, so they leave it unset.
 pub type InboundHook = Arc<dyn Fn(&PeerAddr) + Send + Sync>;
 
+/// Takes over an accepted stream sniffed as EDX (first byte `E` of the
+/// "EDX1" magic). The runtime installs this; it runs the Noise handshake
+/// and the EDX serve loop over the stream. Left unset (the default), an EDX
+/// peer just falls through to the msgpack path and is dropped, so a node
+/// without EDX serving is unchanged.
+pub type EdxHook = Arc<
+    dyn Fn(PeerAddr, epix_transport::PeerStream) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// A TCP peer server. (Tor/Reticulum listeners slot in the same way later.)
 pub struct PeerServer {
     handler: Arc<dyn RequestHandler>,
     version: String,
     rev: i64,
     on_inbound: Option<InboundHook>,
+    edx: Option<EdxHook>,
 }
 
 impl PeerServer {
     pub fn new(handler: Arc<dyn RequestHandler>) -> Self {
-        Self { handler, version: "EpixRS".into(), rev: 8192, on_inbound: None }
+        Self { handler, version: "EpixRS".into(), rev: 8192, on_inbound: None, edx: None }
     }
 
     /// Register a hook fired when an inbound connection answers the handshake.
     pub fn on_inbound(mut self, hook: InboundHook) -> Self {
         self.on_inbound = Some(hook);
+        self
+    }
+
+    /// Register the EDX takeover hook: an accepted stream whose first byte is
+    /// `E` is handed to it instead of the msgpack loop, so both protocols
+    /// share one accept port during the migration window.
+    pub fn with_edx(mut self, hook: EdxHook) -> Self {
+        self.edx = Some(hook);
         self
     }
 
@@ -94,9 +116,27 @@ impl PeerServer {
             let version = self.version.clone();
             let rev = self.rev;
             let on_inbound = self.on_inbound.clone();
+            let edx = self.edx.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let stream: epix_transport::PeerStream = Box::pin(sock);
+                // Sniff one byte to share this port between EDX (magic
+                // "EDX1", first byte 'E' = 0x45) and legacy msgpack (whose
+                // messages always start with a map header 0x80-0x8f/0xde/
+                // 0xdf, disjoint from 0x45). The byte is replayed to
+                // whichever path runs.
+                let (first, stream) = match epix_transport::peek_first_byte(stream).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                if first == b'E' {
+                    if let Some(hook) = edx {
+                        hook(PeerAddr::Ip(addr), stream).await;
+                        return;
+                    }
+                    // No EDX handler installed: fall through; the msgpack
+                    // reader rejects the non-map bytes and drops it.
+                }
                 serve_stream_hooked(
                     handler,
                     PeerAddr::Ip(addr),

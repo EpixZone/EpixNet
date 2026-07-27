@@ -34,17 +34,18 @@ fn test_data(n: usize) -> Vec<u8> {
 
 struct FixtureProvider;
 
+#[async_trait::async_trait]
 impl SignedProvider for FixtureProvider {
-    fn get_signed(&self, _xite: &str, _inner_path: &str) -> Option<Vec<u8>> {
+    async fn get_signed(&self, _xite: &str, _inner_path: &str) -> Option<Vec<u8>> {
         None
     }
-    fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
+    async fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
         Vec::new()
     }
-    fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
+    async fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
         None
     }
-    fn apply_update(
+    async fn apply_update(
         &self,
         _xite: &str,
         _inner_path: &str,
