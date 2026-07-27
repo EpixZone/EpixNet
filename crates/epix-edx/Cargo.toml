@@ -7,6 +7,7 @@ description = "EDX wire protocol: postcard framing over multiplexed PeerStreams,
 [dependencies]
 epix-core = { path = "../epix-core" }
 epix-blob = { path = "../epix-blob" }
+epix-crypt = { path = "../epix-crypt" }
 epix-transport = { path = "../epix-transport" }
 # default-features off: postcard's default heapless support drags the
 # unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.

@@ -17,6 +17,7 @@
 
 pub mod frame;
 pub mod msg;
+pub mod noise;
 pub mod sim;
 
 /// First-byte magic for EDX framing. During the migration window the
