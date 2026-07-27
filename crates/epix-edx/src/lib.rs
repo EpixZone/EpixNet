@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod conn;
 pub mod frame;
 pub mod msg;
 pub mod noise;
