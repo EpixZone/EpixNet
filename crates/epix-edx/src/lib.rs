@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod frame;
+pub mod msg;
 pub mod sim;
 
 /// First-byte magic for EDX framing. During the migration window the

@@ -2238,6 +2238,7 @@ name = "epix-edx"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "epix-blob",
  "epix-core",
  "epix-transport",
  "postcard",

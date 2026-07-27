@@ -39,7 +39,7 @@ pub const BLOCK_SIZE: bao_tree::BlockSize = bao_tree::BlockSize::from_chunk_log(
 /// for `Ns::Shard` objects it is the BLAKE3 hash of the ciphertext (the
 /// shard address), so a volunteer cache can verify what it stores without
 /// being able to read it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ObjId(pub [u8; 32]);
 
 impl ObjId {
