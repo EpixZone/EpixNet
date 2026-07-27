@@ -564,4 +564,66 @@ mod tests {
         let credit = choker.lock().unwrap().credit_of(&server_pk);
         assert!(credit > 0, "the serving peer should be credited, got {credit}");
     }
+
+    /// Latency floor over loopback TCP (real internet adds RTT on top): time
+    /// first paint (dial + handshake + a small file), a cold media seek, and
+    /// a full 400 KB fetch. Prints the numbers with `--nocapture`.
+    #[tokio::test]
+    async fn latency_floor_report() {
+        use std::time::Instant;
+        let (address, content_bytes, content, movie, addr, _pk) = spawn_seeder().await;
+
+        let mk_client = || async {
+            let state = AppState::new("client");
+            let dir = tempfile::tempdir().unwrap();
+            XiteStorage::new(dir.path()).write("content.json", &content_bytes).unwrap();
+            state
+                .add_xite(&address, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) })
+                .await;
+            state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+            let sd = tempfile::tempdir().unwrap();
+            state.set_edx_store(Arc::new(Store::open(sd.path()).unwrap())).await;
+            state
+                .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                    state: state.clone(),
+                    privatekey: epix_crypt::new_seed(),
+                    choker: None,
+                }))
+                .await;
+            state.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+            std::mem::forget(dir);
+            std::mem::forget(sd);
+            state
+        };
+
+        // First paint: a fresh client dials, handshakes, and fetches the
+        // small index.html (5 KB).
+        let c1 = mk_client().await;
+        let t = Instant::now();
+        assert!(c1.edx_fetch_file(&address, "index.html").await.unwrap().is_ok());
+        let first_paint = t.elapsed();
+
+        // Cold media seek: a fresh client fetches a 50 KB mid-file range.
+        let c2 = mk_client().await;
+        let t = Instant::now();
+        let seek = c2.edx_fetch_range(&address, "movie.bin", 200_000, 50_000).await.unwrap();
+        assert!(matches!(seek, Ok(Some(_))));
+        let seek_ms = t.elapsed();
+
+        // Full 400 KB fetch.
+        let c3 = mk_client().await;
+        let t = Instant::now();
+        assert!(c3.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
+        let full = t.elapsed();
+
+        eprintln!(
+            "EDX latency floor (loopback): first_paint(5KB)={:?}  cold_seek(50KB)={:?}  full_fetch({}KB)={:?}",
+            first_paint,
+            seek_ms,
+            movie.len() / 1000,
+            full
+        );
+        // Sanity: the loopback floor is comfortably under the clearnet target.
+        assert!(first_paint.as_millis() < 2500, "first paint floor {first_paint:?}");
+    }
 }
