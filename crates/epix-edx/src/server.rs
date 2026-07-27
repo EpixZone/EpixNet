@@ -323,7 +323,10 @@ async fn serve_range(
     obj: ObjId,
     ranges: Vec<(u64, u64)>,
 ) {
-    let total: u64 = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    // Saturating accumulation: a plain .sum() wraps in release, so two
+    // ranges of size 2^63 would sum to 0 and slip past the byte cap.
+    let total: u64 =
+        ranges.iter().map(|(s, e)| e.saturating_sub(*s)).fold(0u64, u64::saturating_add);
     if ranges.len() > MAX_RANGES_PER_REQ || total > MAX_BYTES_PER_REQ {
         let _ = conn
             .respond(stream, Resp::Err { code: err::LIMIT, msg: "range caps exceeded".into() })

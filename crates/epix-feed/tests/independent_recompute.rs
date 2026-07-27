@@ -39,7 +39,14 @@ fn corpus() -> Vec<Record> {
             }
         }
     }
-    // A moderator tombstones one comment.
+    // One author authors two DISTINCT comments on post0 (plus an edit of
+    // the first). The old (author, target, kind) lineage key collapsed
+    // these to a single survivor and let the edit double-count; both must
+    // now live and the edit must fold to one.
+    v.push(mk("ac0", "author", "post0", 6, Kind::Comment));
+    v.push(mk("ac1", "author", "post0", 7, Kind::Comment));
+    v.push(mk("ac0", "author", "post0", 56, Kind::Comment)); // edit of ac0
+    // A moderator tombstones one comment (victim id in the target).
     v.push(mk("t0", "mod", "c0_1", 500, Kind::Tombstone));
     v
 }
@@ -105,6 +112,40 @@ fn two_nodes_same_records_different_order_agree() {
     assert_eq!(a.rollup, b.rollup, "rollup roots diverge");
     assert_eq!(a.checkpoint, b.checkpoint, "checkpoint roots diverge");
     assert_eq!(a.history, b.history, "history roots diverge");
+}
+
+#[test]
+fn absolute_state_values_exercise_the_fixes() {
+    // Node-vs-node equality alone can't catch a bug both nodes share, so
+    // pin the absolute checkpoint and rollup values the fixes produce.
+    let base = corpus();
+    let ck = Checkpoint::compute(&base, 1000, ObjId([0; 32]));
+
+    // FIX 2 (posts): one author's five distinct posts all survive; the old
+    // (author, target, kind) lineage collapsed them to a single winner.
+    for p in 0..5 {
+        let pid = format!("post{p}");
+        assert!(
+            ck.live.iter().any(|r| r.id == pid && matches!(r.kind, Kind::Post)),
+            "post {pid} missing from live set",
+        );
+    }
+    // FIX 2 (comments): the same author's two distinct comments on post0
+    // both survive.
+    assert!(ck.live.iter().any(|r| r.id == "ac0" && r.author == "author"));
+    assert!(ck.live.iter().any(|r| r.id == "ac1" && r.author == "author"));
+    // FIX 2/3 (edit): the edit of ac0 (same id) folds to a single winner.
+    assert_eq!(ck.live.iter().filter(|r| r.id == "ac0").count(), 1);
+    // Tombstone (victim id in target) drops the moderated comment.
+    assert!(ck.tombstones.contains("c0_1"));
+    assert!(!ck.live.iter().any(|r| r.id == "c0_1"));
+
+    // FIX 1+3 (rollup): post0 counts only LIVE comment winners:
+    // c0_0, c0_2, c0_3, ac0, ac1 = 5. Edits fold to one and the tombstoned
+    // c0_1 is excluded.
+    let items: Vec<String> = (0..5).map(|p| format!("post{p}")).collect();
+    let roll = Rollup::compute(&items, &base);
+    assert_eq!(roll.get("post0").unwrap().comment_count, 5);
 }
 
 #[test]

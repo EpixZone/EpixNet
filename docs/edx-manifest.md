@@ -25,11 +25,15 @@ slice format).
 ## `bundles`
 
 ```jsonc
-"bundles": { "<bundle b3 hex>": {"size": 262144}, ... }
+"bundles": { "<bundle b3 hex>": {"size": 262144, "seq": 0}, ... }
 ```
 
 Every bundle referenced by a file entry MUST appear here (fetchers reject
-entries referencing undeclared bundles). Bundle membership is decided at
+entries referencing undeclared bundles). `seq` records the bundle's
+creation order (0-based) so re-signing recovers the append order instead
+of the hex-id order this JSON object would otherwise iterate in; it is
+optional and legacy manifests without it fall back to key order. Bundle
+membership is decided at
 signing time by the stable bundler (`epix-blob::bundle`): membership is
 carried forward from the previous manifest, new files append to the tail
 bundle, and only a changed bundle re-mints. Nothing about membership is

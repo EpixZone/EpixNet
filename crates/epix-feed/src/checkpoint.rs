@@ -41,7 +41,7 @@ pub struct Checkpoint {
 
 /// Which record ids are tombstoned. A tombstone is sticky: once present
 /// its target id can never come back, even via a higher-clock supersede.
-fn tombstoned_ids(records: &[Record]) -> BTreeSet<String> {
+pub(crate) fn tombstoned_ids(records: &[Record]) -> BTreeSet<String> {
     records
         .iter()
         .filter(|r| matches!(r.kind, Kind::Tombstone))
@@ -49,10 +49,12 @@ fn tombstoned_ids(records: &[Record]) -> BTreeSet<String> {
         .collect()
 }
 
-/// The live winner of each non-reaction lineage: highest order_key wins,
-/// excluding anything tombstoned. Reactions are represented by their
-/// counts, not individual live records.
-fn live_records(records: &[Record], tombstones: &BTreeSet<String>) -> Vec<Record> {
+/// The live winner of each non-reaction identity: highest order_key wins,
+/// excluding anything tombstoned. Keyed on `identity()` so two distinct
+/// posts/comments by the same author survive and only a real edit (same
+/// id) supersedes. Reactions are represented by their counts, not
+/// individual live records.
+pub(crate) fn live_records(records: &[Record], tombstones: &BTreeSet<String>) -> Vec<Record> {
     let mut winners: BTreeMap<String, Record> = BTreeMap::new();
     for r in records {
         if matches!(r.kind, Kind::Reaction { .. } | Kind::Tombstone) {
@@ -63,7 +65,7 @@ fn live_records(records: &[Record], tombstones: &BTreeSet<String>) -> Vec<Record
             continue;
         }
         winners
-            .entry(r.lineage())
+            .entry(r.identity())
             .and_modify(|cur| {
                 if r.order_key() > cur.order_key() {
                     *cur = r.clone();
@@ -168,6 +170,7 @@ impl Checkpoint {
         for (target, kinds) in reactions {
             m.extend_from_slice(&(target.len() as u32).to_le_bytes());
             m.extend_from_slice(target.as_bytes());
+            m.extend_from_slice(&(kinds.len() as u32).to_le_bytes());
             for (k, v) in kinds {
                 m.extend_from_slice(&(k.len() as u32).to_le_bytes());
                 m.extend_from_slice(k.as_bytes());
@@ -261,6 +264,47 @@ mod tests {
         let ck = Checkpoint::compute(&recs, 100, ObjId([0; 32]));
         assert!(ck.tombstones.contains("c1"));
         assert!(!ck.live.iter().any(|r| r.id == "c1"), "tombstoned item cannot resurrect");
+    }
+
+    #[test]
+    fn distinct_items_by_one_author_all_survive() {
+        // Identity keys on (author, id), not (author, target, kind), so two
+        // distinct posts by one author and two distinct comments by one
+        // author on the same post all survive instead of collapsing to one.
+        let recs = vec![
+            test_record("p1", "u1", "", 1, Kind::Post),
+            test_record("p2", "u1", "", 2, Kind::Post), // same author, distinct post
+            test_record("a", "u2", "p1", 3, Kind::Comment),
+            test_record("b", "u2", "p1", 4, Kind::Comment), // same author, distinct comment
+        ];
+        let ck = Checkpoint::compute(&recs, 100, ObjId([0; 32]));
+        for id in ["p1", "p2", "a", "b"] {
+            assert!(ck.live.iter().any(|r| r.id == id), "{id} missing from live set");
+        }
+        assert_eq!(ck.live.len(), 4);
+    }
+
+    #[test]
+    fn state_digest_inner_kinds_map_is_length_prefixed() {
+        // Two DIFFERENT reaction states that concatenate to identical bytes
+        // if the inner kinds map is not length-prefixed. The digest must
+        // tell them apart, else two distinct states share a checkpoint root.
+        let a: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::from([
+            ("T".to_string(), BTreeMap::from([("a".to_string(), 0u64)])),
+            ("b".to_string(), BTreeMap::from([("c".to_string(), 7205759403809570816u64)])),
+        ]);
+        let b: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::from([
+            (
+                "T".to_string(),
+                BTreeMap::from([("a".to_string(), 0u64), ("b".to_string(), 425201762305u64)]),
+            ),
+            ("d".to_string(), BTreeMap::new()),
+        ]);
+        assert_ne!(a, b);
+        let tomb = BTreeSet::new();
+        let da = Checkpoint::state_digest(&[], &a, &tomb);
+        let db = Checkpoint::state_digest(&[], &b, &tomb);
+        assert_ne!(da, db, "distinct states must not share a state digest");
     }
 
     #[test]

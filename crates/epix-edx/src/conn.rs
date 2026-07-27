@@ -28,8 +28,22 @@ use crate::frame::{self};
 use crate::msg::{Frame, FrameBody, Req, Resp};
 
 /// A streaming response: `Data`/`Resp` frames delivered in order until a
-/// frame with `last = true`.
-pub type StreamRx = mpsc::Receiver<FrameBody>;
+/// frame with `last = true`. Carries the stream `id` it was allocated so
+/// the caller can [`Conn::cancel`] exactly this stream (duplicate-on-
+/// timeout, endgame, seek-abandon).
+pub struct StreamRx {
+    /// The allocated stream id (odd for the dialer, even for the acceptor).
+    pub id: u64,
+    rx: mpsc::Receiver<FrameBody>,
+}
+
+impl StreamRx {
+    /// Await the next response frame, or `None` when the stream ends
+    /// (terminal frame delivered or the connection closed).
+    pub async fn recv(&mut self) -> Option<FrameBody> {
+        self.rx.recv().await
+    }
+}
 
 /// Handle to a live multiplexed connection. Cloneable; all clones share
 /// the one underlying stream via the writer queue. When every `Conn`
@@ -138,7 +152,7 @@ impl Conn {
             self.shared.waiters.lock().expect("waiters").remove(&stream);
             return Err(closed_err());
         }
-        Ok(rx)
+        Ok(StreamRx { id: stream, rx })
     }
 
     /// Answer an inbound request stream with a single response.

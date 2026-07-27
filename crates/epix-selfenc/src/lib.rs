@@ -3,16 +3,18 @@
 //! A file in the shard namespace is split into sub-chunks, each encrypted
 //! with a key derived from content hashes (plus an owner salt), and each
 //! ciphertext chunk is addressed by `BLAKE3(ciphertext)` — the shard
-//! address. A volunteer cache holds and verifies shards it cannot read,
-//! and identical content from the same owner deduplicates.
+//! address. A cache node can store and integrity-check shards by their
+//! address without the decryption key, and identical content from the
+//! same owner deduplicates.
 //!
 //! Two modes (see [`Mode`]):
 //!
 //! - [`Mode::SaltedConvergent`] — dedup-preserving. Each chunk's key is
 //!   derived from its own plaintext hash, its two predecessors' hashes,
-//!   its index, and the owner salt (which defeats third-party
-//!   known-plaintext confirmation by anyone who never learned the xite
-//!   address). Deduplicates across an owner's content.
+//!   its index, and the owner salt (which changes the ciphertext address
+//!   per owner so caches that never learned the xite address cannot
+//!   recompute it from known plaintext). Deduplicates across an owner's
+//!   content.
 //! - [`Mode::RandomKey`] — a random per-file key; no dedup, but the only
 //!   sound choice for guessable/low-entropy content and the only mode
 //!   supporting revocation (rotate the key, stop distributing wraps).
@@ -24,9 +26,13 @@
 //! the chunk list. No convergence at the outer layer (that would be
 //! circular). See [`seal_datamap`] / [`open_datamap`].
 //!
-//! Nonces are deterministic and domain-separated (`nonce_for`), which is
-//! safe because every derived key is single-use for exactly one chunk —
-//! (key, nonce) never repeats. See `PROVENANCE.md` (clean-room).
+//! Per-chunk nonces are deterministic and domain-separated (`nonce_for`),
+//! which is safe because every convergent/random-key chunk key is
+//! single-use for exactly one chunk, so that (key, nonce) never repeats.
+//! The data-map seal reuses one viewing-key-derived key across every
+//! re-seal, so it does NOT get a deterministic nonce: [`seal_datamap`]
+//! draws a fresh random 24-byte nonce per call and stores it alongside
+//! the ciphertext. See `PROVENANCE.md` (clean-room).
 
 #![forbid(unsafe_code)]
 
@@ -82,7 +88,8 @@ pub struct Encrypted {
 
 /// Deterministic per-chunk nonce. Safe because each derived key encrypts
 /// exactly one chunk, so (key, nonce) is globally unique. Domain-tagged
-/// so a chunk nonce can never collide with the data-map nonce.
+/// with `NONCE_CHUNK` so the tag byte is pinned as part of the frozen
+/// format. The data-map seal does not use this (it draws a random nonce).
 fn nonce_for(tag: u8, index: u64) -> XNonce {
     let mut n = [0u8; 24];
     n[0] = tag;
@@ -91,7 +98,6 @@ fn nonce_for(tag: u8, index: u64) -> XNonce {
 }
 
 const NONCE_CHUNK: u8 = 1;
-const NONCE_DATAMAP: u8 = 2;
 
 /// Derive a salted-convergent chunk key from content hashes.
 /// `key_i = BLAKE3::derive_key(ctx, salt ‖ own ‖ prev1 ‖ prev2 ‖ le64(i))`.
@@ -110,8 +116,9 @@ fn aead(key: &Hash) -> XChaCha20Poly1305 {
 }
 
 /// Encrypt `data` in [`Mode::SaltedConvergent`] under the owner `salt`.
-/// The salt lives in the data-map; deniability is scoped to volunteers
-/// who never learn the xite address (see the crate/threat-model docs).
+/// The salt is supplied to `decrypt` as key material; a reader obtains it
+/// with the owner's viewing material, so it is not secret from anyone who
+/// can resolve the xite.
 pub fn encrypt_convergent(data: &[u8], salt: &[u8]) -> Encrypted {
     let plain_chunks = split(data);
     // Precompute plaintext hashes (needed as predecessors).
@@ -201,18 +208,40 @@ pub fn decrypt(
 /// content-addressed by their own hash (returned). This is ordinary
 /// symmetric ciphertext — NOT convergent — because a data-map cannot be
 /// convergently addressed without circularity.
+///
+/// The derived key is the SAME every time a given viewing key re-seals a
+/// data-map, so the nonce must NOT be deterministic: re-sealing an updated
+/// data-map under the same viewing key with a fixed nonce would reuse the
+/// (key, nonce) pair across different plaintext, which is catastrophic for
+/// XChaCha20-Poly1305. So a fresh random 24-byte nonce is drawn per call
+/// and prepended to the ciphertext.
+///
+/// Sealed format: `nonce(24) ‖ ciphertext`, addressed by `BLAKE3` of the
+/// whole blob.
 pub fn seal_datamap(chunks: &[ChunkRef], mode: Mode, viewing_key: &Hash) -> (Hash, Vec<u8>) {
     let plain = serialize_datamap(chunks, mode);
     let key = blake3::derive_key(KDF_CONTEXT, &[viewing_key.as_slice(), b"datamap"].concat());
-    let ct = aead(&key).encrypt(&nonce_for(NONCE_DATAMAP, 0), plain.as_slice()).expect("seal");
-    (b3(&ct), ct)
+    let mut nonce = [0u8; 24];
+    getrandom::getrandom(&mut nonce).expect("os csprng");
+    let ct = aead(&key).encrypt(&XNonce::from(nonce), plain.as_slice()).expect("seal");
+    let mut sealed = Vec::with_capacity(24 + ct.len());
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&ct);
+    (b3(&sealed), sealed)
 }
 
-/// Inverse of [`seal_datamap`].
+/// Inverse of [`seal_datamap`]. Splits the 24-byte random nonce prefix
+/// from the ciphertext.
 pub fn open_datamap(sealed: &[u8], viewing_key: &Hash) -> Result<(Vec<ChunkRef>, Mode), SelfEncError> {
+    if sealed.len() < 24 {
+        return Err(SelfEncError::DatamapDecryptFailed);
+    }
+    let (nonce, ct) = sealed.split_at(24);
+    let mut nonce_bytes = [0u8; 24];
+    nonce_bytes.copy_from_slice(nonce);
     let key = blake3::derive_key(KDF_CONTEXT, &[viewing_key.as_slice(), b"datamap"].concat());
     let plain = aead(&key)
-        .decrypt(&nonce_for(NONCE_DATAMAP, 0), sealed)
+        .decrypt(&XNonce::from(nonce_bytes), ct)
         .map_err(|_| SelfEncError::DatamapDecryptFailed)?;
     deserialize_datamap(&plain)
 }
@@ -328,8 +357,8 @@ mod tests {
 
     #[test]
     fn salt_changes_every_shard_address() {
-        // The deniability property: the same plaintext under a different
-        // owner salt produces entirely different shard addresses.
+        // The same plaintext under a different owner salt produces
+        // entirely different shard addresses.
         let d = data(CHUNK_SIZE + 10);
         let a = encrypt_convergent(&d, b"salt-a");
         let b = encrypt_convergent(&d, b"salt-b");
@@ -429,30 +458,84 @@ mod tests {
         assert_eq!(got, b"");
     }
 
-    /// Known-answer test: pin the frozen derivation so a refactor that
-    /// changes key derivation, nonce, or serialization fails loudly.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Known-answer test: hard-coded frozen vectors, NOT recomputed at test
+    /// time. These hex literals were generated once from this
+    /// implementation and pinned, so any change to the KDF context, key
+    /// layout, nonce schedule, AEAD, or data-map serialization makes this
+    /// fail loudly. Regenerating them is a deliberate format revision (bump
+    /// KDF_CONTEXT). Salt "kat-salt" over a deterministic 3-chunk input.
     #[test]
     fn known_answer_vectors() {
-        // Fixed salt + fixed 100-byte plaintext -> fixed shard address.
-        let d: Vec<u8> = (0..100u8).collect();
+        let d = data(CHUNK_SIZE * 2 + 500);
         let enc = encrypt_convergent(&d, b"kat-salt");
-        assert_eq!(enc.chunks.len(), 1);
-        // If this hex ever changes, the frozen format changed.
-        let addr_hex = enc.chunks[0].cipher_addr.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(addr_hex, known_answer_addr());
-        // And it must still decrypt.
+        assert_eq!(enc.chunks.len(), 3);
+
+        const PLAIN_HASHES: [&str; 3] = [
+            "40da47a7aa27ad6b41b2dc55bf5020d88893783d4dfc79f4ba898157aad29fdd",
+            "8af4b10c2d2184f85e6a162634a8e34696d6bf8dfc5062403fbd8a77844e6e83",
+            "dd18f979a836f326e9458cf61f4fe6e887dd4ccce6fff693cbcb4cd4869db067",
+        ];
+        const CIPHER_ADDRS: [&str; 3] = [
+            "ef623e66e8c63d263b588da356fd2010482bbb07b7306ebe5b298d9065f5ce8e",
+            "eb488a5615b4096785278b67b94deae3f35e15895cc633ef6c22b50d282c9ec2",
+            "9a230413c7cad30456a1868dcb8922e42ce36b92f64f8f892553d79fa48daede",
+        ];
+        for (i, c) in enc.chunks.iter().enumerate() {
+            assert_eq!(hex(&c.plain_hash), PLAIN_HASHES[i], "chunk {i} plain hash drifted");
+            assert_eq!(hex(&c.cipher_addr), CIPHER_ADDRS[i], "chunk {i} shard address drifted");
+        }
+
+        // The convergent data-map serialization must be byte-frozen.
+        const DATAMAP_HEX: &str = "000300000040da47a7aa27ad6b41b2dc55bf5020d88893783d4dfc79f4ba898157aad29fddef623e66e8c63d263b588da356fd2010482bbb07b7306ebe5b298d9065f5ce8e000010008af4b10c2d2184f85e6a162634a8e34696d6bf8dfc5062403fbd8a77844e6e83eb488a5615b4096785278b67b94deae3f35e15895cc633ef6c22b50d282c9ec200001000dd18f979a836f326e9458cf61f4fe6e887dd4ccce6fff693cbcb4cd4869db0679a230413c7cad30456a1868dcb8922e42ce36b92f64f8f892553d79fa48daedef4010000";
+        assert_eq!(
+            hex(&serialize_datamap(&enc.chunks, enc.mode)),
+            DATAMAP_HEX,
+            "data-map wire format drifted"
+        );
+
+        // And it must still decrypt end to end.
         let shards = shard_map(&enc);
         assert_eq!(decrypt(enc.mode, &enc.chunks, b"kat-salt", |a| shards.get(a).cloned()).unwrap(), d);
     }
 
-    fn known_answer_addr() -> String {
-        // Recomputed by this implementation and frozen. A change here is a
-        // deliberate format revision (bump KDF_CONTEXT + regenerate).
-        let d: Vec<u8> = (0..100u8).collect();
-        let own = b3(&d);
-        let zero = [0u8; 32];
-        let key = convergent_key(b"kat-salt", &own, &zero, &zero, 0);
-        let ct = aead(&key).encrypt(&nonce_for(NONCE_CHUNK, 0), d.as_slice()).unwrap();
-        b3(&ct).iter().map(|b| format!("{b:02x}")).collect()
+    /// Regression for the data-map nonce-reuse bug: sealing under one
+    /// viewing key must draw a fresh random nonce every time, so re-sealing
+    /// (an updated or even identical data-map for the same readers) never
+    /// reuses the (key, nonce) pair. With the old constant nonce, identical
+    /// input produced byte-identical sealed blobs — keystream reuse.
+    #[test]
+    fn datamap_seal_uses_fresh_nonce_no_reuse() {
+        let vk = b3(b"viewing-key");
+        let enc1 = encrypt_convergent(&data(1000), b"salt");
+        let enc2 = encrypt_convergent(&data(2000), b"salt-two");
+        assert_ne!(enc1.chunks, enc2.chunks, "test needs two distinct data-maps");
+
+        // Two DIFFERENT data-maps under the SAME key: distinct blobs.
+        let (_a1, s1) = seal_datamap(&enc1.chunks, enc1.mode, &vk);
+        let (_a2, s2) = seal_datamap(&enc2.chunks, enc2.mode, &vk);
+        assert_ne!(s1, s2);
+
+        // The IDENTICAL data-map sealed twice must still differ, because the
+        // nonce is random per call (this is what the constant-nonce code got
+        // wrong). Compare the 24-byte nonce prefixes directly.
+        let (_a3, s3) = seal_datamap(&enc1.chunks, enc1.mode, &vk);
+        let (_a4, s4) = seal_datamap(&enc1.chunks, enc1.mode, &vk);
+        assert_ne!(s3[..24], s4[..24], "re-sealing must draw a fresh nonce, not reuse it");
+        assert_ne!(s3, s4, "re-sealing identical input must not produce identical bytes");
+
+        // Every sealed blob still round-trips and is content-addressed.
+        for (chunks, mode, sealed) in [
+            (&enc1.chunks, enc1.mode, &s1),
+            (&enc2.chunks, enc2.mode, &s2),
+            (&enc1.chunks, enc1.mode, &s3),
+        ] {
+            let (got, got_mode) = open_datamap(sealed, &vk).unwrap();
+            assert_eq!(&got, chunks);
+            assert_eq!(got_mode, mode);
+        }
     }
 }

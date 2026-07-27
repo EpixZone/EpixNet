@@ -11,9 +11,9 @@
 //! slabs/<n>.slab        packfiles: complete small objects, appended
 //! ```
 //!
-//! Volunteer shard caches use the same store: a shard is just an object
+//! Encrypted-shard caches use the same store: a shard is just an object
 //! in `Ns::Shard`, and the index records only `(addr, size, refcount,
-//! last_access)` — never a shard→xite association.
+//! last_access)` — never a shard-to-xite association.
 //!
 //! Durability stance: the index is transactional (redb); object bytes are
 //! synced before an insert/slice is indexed, but a crash can still leave
@@ -133,6 +133,9 @@ impl Store {
 
         let txn = db.begin_write().map_err(db_err)?;
         let open_slab;
+        // (slab id, tracked len) for every slab, so torn appends that left
+        // a slab file longer than its indexed len can be truncated back.
+        let mut slab_lens: Vec<(u32, u64)> = Vec::new();
         {
             let mut meta = txn.open_table(META).map_err(db_err)?;
             let schema = meta.get("schema").map_err(db_err)?.map(|g| g.value());
@@ -154,6 +157,7 @@ impl Store {
                 for row in slabs.iter().map_err(db_err)? {
                     let (k, v) = row.map_err(db_err)?;
                     let m: SlabMeta = dec(v.value())?;
+                    slab_lens.push((k.value(), m.len));
                     if !m.sealed {
                         found = Some((k.value(), m.len));
                     }
@@ -179,6 +183,26 @@ impl Store {
             txn.open_table(OBJECTS).map_err(db_err)?;
         }
         txn.commit().map_err(db_err)?;
+
+        // Reconcile physical slab files with the committed lengths. A write
+        // that synced bytes but crashed before the index txn committed (or a
+        // torn append) leaves the file longer than its tracked len; without
+        // this every later O_APPEND insert is recorded at the tracked offset
+        // but physically lands past the drift, so reads mis-address. Shrink
+        // any over-long slab back to its tracked len. A file shorter than
+        // its tracked len means lost committed bytes, so leave it be and let
+        // reads fail loudly instead of silently extending with zeros.
+        for (slab, len) in slab_lens {
+            let path = root.join("slabs").join(format!("{slab}.slab"));
+            match fs::metadata(&path) {
+                Ok(m) if m.len() > len => {
+                    let f = OpenOptions::new().write(true).open(&path)?;
+                    f.set_len(len)?;
+                    f.sync_all()?;
+                }
+                _ => {}
+            }
+        }
 
         Ok(Self { root, db, cfg, open_slab: Mutex::new(open_slab) })
     }
@@ -260,8 +284,13 @@ impl Store {
         let mut open = self.open_slab.lock().expect("slab lock");
         let (slab, off) = (open.0, open.1);
         let mut f = OpenOptions::new().create(true).append(true).open(self.slab_path(slab))?;
-        f.write_all(bytes)?;
-        f.sync_data()?;
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_data()) {
+            // Torn append (e.g. disk full): shrink the slab back to the
+            // pre-write offset so the next insert is not mis-addressed.
+            let _ = f.set_len(off);
+            let _ = f.sync_data();
+            return Err(e);
+        }
         let new_len = off + bytes.len() as u64;
 
         let txn = self.db.begin_write().map_err(db_err)?;
@@ -460,7 +489,19 @@ impl Store {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("{id} incomplete")));
         }
         let bytes = match rec.loc {
-            Loc::Slab { slab, off } => self.read_slab(slab, off, rec.size)?,
+            Loc::Slab { slab, off } => {
+                let b = self.read_slab(slab, off, rec.size)?;
+                // Slab reads are addressed by (slab, off); a torn append or
+                // offset drift would return a neighbor's bytes. Verify the
+                // hash so a mis-addressed read fails loudly, never silent.
+                if !verified::verify_whole(&b, id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("slab bytes for {id} are corrupt"),
+                    ));
+                }
+                b
+            }
             Loc::Sparse => fs::read(self.sparse_path(id))?,
         };
         rec.last_access = rec.last_access.max(now);
@@ -598,8 +639,13 @@ impl Store {
             let (slab, new_off) = (open.0, open.1);
             let mut f =
                 OpenOptions::new().create(true).append(true).open(self.slab_path(slab))?;
-            f.write_all(&bytes)?;
-            f.sync_data()?;
+            if let Err(e) = f.write_all(&bytes).and_then(|()| f.sync_data()) {
+                // Torn append: shrink the slab back to the pre-write offset
+                // so the next insert is not mis-addressed.
+                let _ = f.set_len(new_off);
+                let _ = f.sync_data();
+                return Err(e);
+            }
             let new_len = new_off + bytes.len() as u64;
 
             let txn = self.db.begin_write().map_err(db_err)?;
@@ -653,15 +699,18 @@ impl Store {
         let obao_bytes = fs::read(self.obao_path(id))?;
         let ob = OutboardBytes { root: id, size: rec.size, data: obao_bytes };
         let data = File::open(self.sparse_path(id))?;
-        let valid = verified::valid_ranges(&ob, &data, &claimed.to_chunk_ranges())?;
+        let valid = verified::valid_ranges(&ob, &data, &claimed.to_chunk_ranges_clamped(rec.size))?;
 
         // Intersect: keep only claimed groups whose chunks all verified.
+        // The tail group's chunk range must be clamped to the object's real
+        // chunk count, or valid_ranges (which never yields a chunk past the
+        // end) can't cover it and the pristine tail is wrongly dropped.
         let mut kept = GroupBits::new();
         for r in claimed.ranges() {
             for g in r.clone() {
                 let mut one = GroupBits::new();
                 one.add(g..g + 1);
-                if valid.is_superset(&one.to_chunk_ranges()) {
+                if valid.is_superset(&one.to_chunk_ranges_clamped(rec.size)) {
                     kept.add(g..g + 1);
                 }
             }

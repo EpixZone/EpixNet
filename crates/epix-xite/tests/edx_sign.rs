@@ -92,6 +92,51 @@ fn resign_keeps_untouched_bundles_stable() {
 }
 
 #[test]
+fn resign_adding_a_small_file_only_changes_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut xite = make_xite(dir.path());
+    // Eleven 100 KiB files pack into several bundles with a tail that has
+    // room, so a new small file appends to the tail (not a fresh bundle).
+    for i in 0..11 {
+        xite.storage
+            .write(&format!("media/f{i:02}.bin"), &vec![i as u8; 100_000])
+            .unwrap();
+    }
+    xite.sign(PRIVKEY, 1000.0).unwrap();
+    let before = signed_content(&xite);
+    let bundles_before = manifest::bundles(&before);
+    assert!(bundles_before.len() >= 2, "want several bundles, got {}", bundles_before.len());
+
+    // The tail bundle is the one with the highest creation seq.
+    let tail_before = before["bundles"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .max_by_key(|(_, m)| m["seq"].as_u64().unwrap())
+        .map(|(hex, _)| ObjId::from_hex(hex).unwrap())
+        .unwrap();
+
+    // Add ONE new small file and re-sign.
+    xite.storage.write("media/z-new.txt", &vec![0xAB; 1_000]).unwrap();
+    xite.sign(PRIVKEY, 1001.0).unwrap();
+    let after = signed_content(&xite);
+    let bundles_after = manifest::bundles(&after);
+
+    // Every earlier bundle kept its id; only the tail re-minted.
+    let surviving: Vec<_> =
+        bundles_before.keys().filter(|id| bundles_after.contains_key(id)).collect();
+    assert_eq!(
+        surviving.len(),
+        bundles_before.len() - 1,
+        "only the tail may change; before={bundles_before:?} after={bundles_after:?}"
+    );
+    assert!(
+        !bundles_after.contains_key(&tail_before),
+        "the tail bundle must have re-minted"
+    );
+}
+
+#[test]
 fn edx_register_populates_the_store_without_refetch() {
     let dir = tempfile::tempdir().unwrap();
     let mut xite = make_xite(dir.path());

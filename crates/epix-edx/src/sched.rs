@@ -143,6 +143,54 @@ pub fn batch_into_ranges(groups: &[u64], size: u64) -> Vec<std::ops::Range<u64>>
     out
 }
 
+/// Partition `groups` (ascending) into maximal contiguous byte-range
+/// batches, each fully held by at least one peer. Used when a
+/// rarest-first batch straddles disjoint holder sets: the run is only
+/// extended while the intersection of holding peers stays non-empty, so
+/// every emitted range has a common holder (worst case one group per
+/// range). Groups NO peer holds are dropped.
+fn split_by_holder(groups: &[u64], peers: &[PeerHandle], size: u64) -> Vec<std::ops::Range<u64>> {
+    use epix_blob::bitfield::bytes_of_group;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < groups.len() {
+        // Peers holding this run's first group; skip groups no peer has.
+        let mut holders: Vec<usize> = peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.bits.contains(groups[i]))
+            .map(|(k, _)| k)
+            .collect();
+        if holders.is_empty() {
+            i += 1;
+            continue;
+        }
+        let start_group = groups[i];
+        let mut end_group = start_group;
+        let mut j = i + 1;
+        while j < groups.len()
+            && groups[j] == end_group + 1
+            && (end_group + 1 - start_group) < GROUPS_PER_REQUEST
+        {
+            // Narrow to holders that also hold the next group; stop when
+            // no single peer spans the extended run.
+            let next: Vec<usize> =
+                holders.iter().copied().filter(|&k| peers[k].bits.contains(groups[j])).collect();
+            if next.is_empty() {
+                break;
+            }
+            holders = next;
+            end_group = groups[j];
+            j += 1;
+        }
+        let start = bytes_of_group(start_group, size).start;
+        let end = bytes_of_group(end_group, size).end;
+        out.push(start..end);
+        i = j;
+    }
+    out
+}
+
 /// The fetch driver for one object across a peer set.
 pub struct Swarm {
     store: Arc<Store>,
@@ -206,10 +254,31 @@ impl Swarm {
             let mut tasks = Vec::new();
             for batch in batches.into_iter().take(peers.len().max(1) * 2) {
                 let bgroups = self.groups_of(&batch);
-                let Some(idx) = self.pick_peer(&bgroups, peers, &load) else { continue };
-                load[idx] += 1;
-                report.requests_issued += 1;
-                tasks.push(self.race_batch(batch, bgroups, idx, peers, deadline, now));
+                match self.pick_peer(&bgroups, peers, &load) {
+                    Some(idx) => {
+                        load[idx] += 1;
+                        report.requests_issued += 1;
+                        tasks.push(self.race_batch(batch, bgroups, idx, peers, deadline, now));
+                    }
+                    None => {
+                        // A merged batch can straddle groups held by DISJOINT
+                        // peers (equal holder COUNTS don't mean the same
+                        // holder SET), so no single peer holds all of it.
+                        // Split into maximal sub-batches each fully held by
+                        // some peer instead of skipping it — skipping would
+                        // strand groups that ARE available and leave the
+                        // object stuck incomplete.
+                        for sub in split_by_holder(&bgroups, peers, self.size) {
+                            let sgroups = self.groups_of(&sub);
+                            let Some(idx) = self.pick_peer(&sgroups, peers, &load) else {
+                                continue;
+                            };
+                            load[idx] += 1;
+                            report.requests_issued += 1;
+                            tasks.push(self.race_batch(sub, sgroups, idx, peers, deadline, now));
+                        }
+                    }
+                }
             }
             if tasks.is_empty() {
                 break;
@@ -282,14 +351,17 @@ impl Swarm {
         let primary_fut = fetch_from(primary);
         tokio::pin!(primary_fut);
 
-        // Race the primary against its timeout.
-        match tokio::time::timeout(timeout, &mut primary_fut).await {
+        // Race the primary against its timeout. Record whether it already
+        // COMPLETED with an error: a completed async fn must never be
+        // polled again (that panics "async fn resumed after completion"),
+        // so a fast primary error must not fall through to a re-await.
+        let primary_errored = match tokio::time::timeout(timeout, &mut primary_fut).await {
             Ok(Ok(_)) => {
                 return BatchOutcome::won(groups, peers[primary].label.clone(), 0);
             }
-            Ok(Err(_)) => { /* primary failed; fall through to duplicates */ }
-            Err(_) => { /* primary slow; duplicate while it keeps running */ }
-        }
+            Ok(Err(_)) => true,  // primary finished with an error
+            Err(_) => false,     // primary still running, just slow
+        };
 
         // Duplicate onto faster-or-equal peers holding the groups.
         let ok_classes = self.stats.faster_or_equal(peers[primary].class);
@@ -306,7 +378,11 @@ impl Swarm {
             .collect();
 
         if targets.is_empty() {
-            // No duplication possible: just wait out the primary.
+            // No duplication possible. If the primary already errored there
+            // is nothing left to try; otherwise wait it out.
+            if primary_errored {
+                return BatchOutcome::failed(0);
+            }
             return match primary_fut.await {
                 Ok(_) => BatchOutcome::won(groups, peers[primary].label.clone(), 0),
                 Err(_) => BatchOutcome::failed(0),
@@ -319,7 +395,11 @@ impl Swarm {
         for &t in &targets {
             racers.push(Box::pin(async move { fetch_from(t).await.map(|_| t) }));
         }
-        racers.push(Box::pin(async move { primary_fut.await.map(|_| primary) }));
+        // Only re-race the primary if it is still pending; a completed
+        // (errored) primary must not be polled again.
+        if !primary_errored {
+            racers.push(Box::pin(async move { primary_fut.await.map(|_| primary) }));
+        }
 
         let dups = targets.len() as u64;
         match select_first_ok(racers).await {
@@ -498,5 +578,42 @@ mod tests {
         std::mem::forget(_b);
         let (c, _in) = Conn::start(a, true);
         c
+    }
+
+    /// A connection whose peer end is gone: any fetch errors almost
+    /// immediately (BrokenPipe), well before the class timeout.
+    fn dead_conn() -> Conn {
+        let (a, b) = tokio::io::duplex(64);
+        let (c, _in) = Conn::start(a, true);
+        drop(b); // peer end dropped -> writes fail, stream reports closed
+        c
+    }
+
+    #[tokio::test]
+    async fn race_batch_survives_a_fast_primary_error() {
+        // A primary peer that errors BEFORE the class timeout (here a dead
+        // connection) hits race_batch's Ok(Err(_)) arm. The completed fetch
+        // future must never be polled again — doing so panics ("async fn
+        // resumed after completion"). With no other peer the batch must
+        // fail cleanly instead of panicking.
+        use epix_blob::ObjId;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000]; // spans a few groups
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let peers = vec![PeerHandle {
+            conn: dead_conn(),
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size),
+            label: "dead".into(),
+        }];
+
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        // Must return cleanly rather than panic.
+        let report = swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+        assert_eq!(report.groups_fetched, 0, "dead-only swarm fetches nothing but must not panic");
     }
 }

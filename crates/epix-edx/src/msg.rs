@@ -22,7 +22,7 @@ pub const NET_ID: &str = "epixnet-edx-1";
 
 /// Capability bitflags in `Hello::caps`.
 pub mod caps {
-    /// Serves the encrypted-shard namespace (disk volunteer).
+    /// Serves the encrypted-shard namespace (disk cache node).
     pub const SHARDS: u32 = 1 << 0;
     /// Accepts `Update` pushes for xites it seeds.
     pub const MESH: u32 = 1 << 1;
@@ -223,6 +223,38 @@ mod tests {
                 postcard::to_stdvec(&Frame { stream: 0, body: FrameBody::Req(req.clone()) })
                     .unwrap();
             assert_eq!(bytes[2], disc, "Req discriminant moved: {req:?}");
+        }
+
+        // Resp discriminants (encoded after FrameBody::Resp = 1 and its
+        // `last` bool).
+        let resps: Vec<(Resp, u8)> = vec![
+            (
+                Resp::HelloAck(HelloAck {
+                    net: String::new(),
+                    node_pk: vec![],
+                    binding_sig: vec![],
+                    caps: 0,
+                    observed: None,
+                }),
+                0,
+            ),
+            (Resp::Signed { bytes: vec![] }, 1),
+            (Resp::SignedList { entries: vec![] }, 2),
+            (Resp::Bitfield { size: 0, runs: vec![] }, 3),
+            (Resp::XiteSummary { signed_files: 0, newest_modified: 0, held_bytes: 0 }, 4),
+            (Resp::Many { items: vec![] }, 5),
+            (Resp::Ok, 6),
+            (Resp::Err { code: 0, msg: String::new() }, 7),
+        ];
+        for (resp, disc) in resps {
+            let bytes = postcard::to_stdvec(&Frame {
+                stream: 0,
+                body: FrameBody::Resp { last: true, resp: resp.clone() },
+            })
+            .unwrap();
+            // Layout: varint(stream=0), FrameBody disc(Resp=1), last bool,
+            // then the Resp discriminant.
+            assert_eq!(bytes[3], disc, "Resp discriminant moved: {resp:?}");
         }
     }
 

@@ -40,6 +40,11 @@ pub struct Xor8 {
     seed: u64,
     block_length: u32,
     fingerprints: Vec<u8>,
+    /// True for the seed-exhaustion fallback: a filter that matches every
+    /// key. No constant fingerprint fill can express "match everything"
+    /// (contains() xors three slots), so it is an explicit state. Encoded
+    /// in the frozen format as block_length == 0 with no fingerprints.
+    match_all: bool,
 }
 
 fn mix(key: u64, seed: u64) -> u64 {
@@ -90,12 +95,14 @@ impl Xor8 {
 
         for &seed in SEEDS.iter() {
             if let Some(fp) = Self::try_build(&dedup, seed, block_length, capacity) {
-                return Self { seed, block_length, fingerprints: fp };
+                return Self { seed, block_length, fingerprints: fp, match_all: false };
             }
         }
-        // Astronomically unlikely with 32 seeds; fall back to a filter
-        // that simply matches everything (sound: no false negatives).
-        Self { seed: 0, block_length, fingerprints: vec![0xFF; capacity] }
+        // Astronomically unlikely with 32 seeds; fall back to a filter that
+        // matches everything, preserving the no-false-negative guarantee.
+        // This is an explicit state (see `match_all`): a constant
+        // fingerprint fill would only match ~1/256 of keys.
+        Self { seed: 0, block_length: 0, fingerprints: Vec::new(), match_all: true }
     }
 
     fn try_build(keys: &[u64], seed: u64, block_length: u32, capacity: usize) -> Option<Vec<u8>> {
@@ -104,7 +111,7 @@ impl Xor8 {
         let mut sets: Vec<(u64, u32)> = vec![(0, 0); capacity]; // (xor of hashes, count)
         let hashed: Vec<u64> = keys.iter().map(|k| mix(*k, seed)).collect();
 
-        let temp = Self { seed, block_length, fingerprints: Vec::new() };
+        let temp = Self { seed, block_length, fingerprints: Vec::new(), match_all: false };
         for (i, &h) in hashed.iter().enumerate() {
             let hs = temp.subhashes(h);
             for slot in [hs.h0, hs.h1, hs.h2] {
@@ -158,6 +165,9 @@ impl Xor8 {
     /// set this always returns true. May rarely return true for an absent
     /// key (~0.39%).
     pub fn contains(&self, key: u64) -> bool {
+        if self.match_all {
+            return true;
+        }
         let h = mix(key, self.seed);
         let hs = self.subhashes(h);
         let f = fingerprint(h);
@@ -168,7 +178,12 @@ impl Xor8 {
 
     /// Frozen serialization: `seed(u64 LE) ‖ block_length(u32 LE) ‖
     /// len(u32 LE) ‖ fingerprints`. Deterministic → content-addressable.
+    /// The match-all fallback is encoded canonically as all-zero header
+    /// (seed 0, block_length 0, len 0) with no fingerprint bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
+        if self.match_all {
+            return vec![0u8; 16];
+        }
         let mut out = Vec::with_capacity(16 + self.fingerprints.len());
         out.extend_from_slice(&self.seed.to_le_bytes());
         out.extend_from_slice(&self.block_length.to_le_bytes());
@@ -187,7 +202,21 @@ impl Xor8 {
         if bytes.len() != 16 + len {
             return None;
         }
-        Some(Self { seed, block_length, fingerprints: bytes[16..].to_vec() })
+        // block_length == 0 is the match-all sentinel: it carries no
+        // fingerprints. A real filter always has block_length >= 1.
+        if block_length == 0 {
+            if len != 0 {
+                return None;
+            }
+            return Some(Self { seed, block_length: 0, fingerprints: Vec::new(), match_all: true });
+        }
+        // A well-formed filter has exactly three sub-blocks of
+        // block_length each. Reject anything else so contains() can index
+        // the fingerprints without bounds-checking or panicking.
+        if len != 3 * block_length as usize {
+            return None;
+        }
+        Some(Self { seed, block_length, fingerprints: bytes[16..].to_vec(), match_all: false })
     }
 }
 
@@ -255,6 +284,47 @@ mod tests {
         let one = vec![term_hash("solo")];
         let g = Xor8::build(&one);
         assert!(g.contains(term_hash("solo")));
+    }
+
+    #[test]
+    fn match_all_fallback_never_false_negatives() {
+        // The seed-exhaustion fallback must match EVERY key, otherwise the
+        // no-false-negative guarantee inverts. Construct it directly.
+        let f = Xor8 { seed: 0, block_length: 0, fingerprints: Vec::new(), match_all: true };
+        for i in 0..1000u64 {
+            assert!(f.contains(term_hash(&format!("k{i}"))), "match-all must accept every key");
+            assert!(f.contains(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        }
+    }
+
+    #[test]
+    fn match_all_fallback_round_trips() {
+        let f = Xor8 { seed: 0, block_length: 0, fingerprints: Vec::new(), match_all: true };
+        let bytes = f.to_bytes();
+        assert_eq!(bytes, vec![0u8; 16], "canonical all-zero encoding");
+        let g = Xor8::from_bytes(&bytes).unwrap();
+        assert_eq!(f, g);
+        assert!(g.contains(term_hash("anything")));
+    }
+
+    #[test]
+    fn from_bytes_rejects_malformed_headers() {
+        // block_length > 0 but no fingerprints: the old code parsed this and
+        // then contains() indexed an empty vec and panicked. Must be None.
+        let mut bad = vec![0u8; 16];
+        bad[8] = 1; // block_length = 1, len = 0
+        assert!(Xor8::from_bytes(&bad).is_none(), "inconsistent header must be rejected");
+
+        // Truncated fingerprints: header self-consistent on length but
+        // len != 3 * block_length.
+        let mut trunc = vec![0u8; 16];
+        trunc[8] = 2; // block_length = 2 -> needs len 6
+        trunc[12] = 5; // len = 5
+        trunc.extend_from_slice(&[0u8; 5]);
+        assert!(Xor8::from_bytes(&trunc).is_none(), "wrong fingerprint count must be rejected");
+
+        // Too short to hold a header.
+        assert!(Xor8::from_bytes(&[0u8; 8]).is_none());
     }
 
     #[test]

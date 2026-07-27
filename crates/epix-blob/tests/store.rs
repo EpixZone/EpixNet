@@ -258,9 +258,96 @@ fn crash_reopen_and_revalidate_distrusts_corruption() {
     let kept = store.revalidate(id).unwrap();
     assert!(!kept.contains(2), "corrupt group must be dropped");
     assert!(kept.contains(0) && kept.contains(1) && kept.contains(3));
+    // The later groups, including the partial tail group 6 (98_304..100_000
+    // is only part of a full 16 KiB group), must SURVIVE. The tail group's
+    // chunk range has to be clamped to the object's real chunk count or the
+    // pristine tail is wrongly dropped every revalidate.
+    assert!(kept.contains(4) && kept.contains(5), "clean middle groups kept");
+    assert!(kept.contains(6), "pristine partial tail group must survive");
     assert!(!store.is_complete(id).unwrap());
 
     // The clean part still serves.
     let mut out = Vec::new();
     store.encode_slice(id, &[0..16_384], &mut out, 6).unwrap();
+    // The tail range still serves after revalidate.
+    let mut tail = Vec::new();
+    store.encode_slice(id, &[98_304..100_000], &mut tail, 7).unwrap();
+}
+
+#[test]
+fn revalidate_keeps_full_set_for_uncorrupted_object() {
+    // A non-16-KiB-multiple size: the tail group is partial. revalidate on
+    // an untouched object must return the whole present set and stay
+    // complete. Old code dropped the tail group here (its chunk range ran
+    // past the object's real chunk count) and reported incomplete.
+    let data = test_data(100_000);
+    let (id, size, slice) = slice_for(&data, &[0..100_000]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    store.write_slice(id, &[0..100_000], &slice[..], 2).unwrap();
+    assert!(store.is_complete(id).unwrap());
+
+    let before = store.present_bits(id).unwrap();
+    let kept = store.revalidate(id).unwrap();
+    assert_eq!(kept, before, "revalidate must not shrink an untouched object");
+    assert!(store.is_complete(id).unwrap(), "still complete after revalidate");
+    assert_eq!(store.read_bytes(id, 3).unwrap(), data);
+}
+
+#[test]
+fn revalidate_keeps_single_group_sparse_object() {
+    // A sub-16-KiB object is a single (partial) group. Old code wiped the
+    // whole present set on revalidate because that one group's chunk range
+    // ran past the object's real chunk count.
+    let data = test_data(5_000);
+    let (id, size, slice) = slice_for(&data, &[0..5_000]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    store.write_slice(id, &[0..5_000], &slice[..], 2).unwrap();
+    assert!(store.is_complete(id).unwrap());
+
+    let kept = store.revalidate(id).unwrap();
+    assert!(kept.contains(0), "the single group must survive");
+    assert!(store.is_complete(id).unwrap(), "still complete after revalidate");
+    assert_eq!(store.read_bytes(id, 3).unwrap(), data);
+}
+
+#[test]
+fn reopen_truncates_slab_drift() {
+    // A torn append (or a crash after sync but before the index commit) can
+    // leave a slab file physically longer than its tracked len. On reopen
+    // the store must shrink it back, or the next O_APPEND insert lands past
+    // the drift while being recorded at the tracked offset - every later
+    // read is then mis-addressed.
+    let dir = tempfile::tempdir().unwrap();
+    let a = test_data(1000);
+    let ida = oid(&a);
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.insert_bytes(ida, Ns::Plain, &a, 1).unwrap();
+    }
+
+    // Simulate drift: append garbage to the slab behind the store's back.
+    let slab_path = dir.path().join("slabs").join("0.slab");
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&slab_path).unwrap();
+        f.write_all(&test_data(777)).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Reopen (should truncate the drift) and insert a new object.
+    let store = Store::open(dir.path()).unwrap();
+    let b = test_data(1234);
+    let idb = oid(&b);
+    store.insert_bytes(idb, Ns::Plain, &b, 2).unwrap();
+
+    // Both objects read back correctly: the new one was appended at the
+    // tracked offset, not past stale drift bytes.
+    assert_eq!(store.read_bytes(ida, 3).unwrap(), a);
+    assert_eq!(store.read_bytes(idb, 4).unwrap(), b);
 }

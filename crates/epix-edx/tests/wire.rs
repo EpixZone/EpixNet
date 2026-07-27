@@ -350,8 +350,9 @@ async fn governed_server_chokes_bulk_but_serves_first_paint() {
 async fn cancel_stops_a_long_stream() {
     let net = sim::SimNet::new();
     let (server_store, _sg) = temp_store();
-    // A big object so the stream spans many frames.
-    let data = test_data(4_000_000);
+    // A big object so the stream spans many frames (more than the stream
+    // channel can buffer), so a mid-stream cancel is observable.
+    let data = test_data(12_000_000);
     let id = ObjId::of(&data);
     server_store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
 
@@ -362,24 +363,122 @@ async fn cancel_stops_a_long_stream() {
         .request_stream(Req::GetRange {
             obj: id,
             size: data.len() as u64,
-            ranges: vec![(0, 4_000_000)],
+            ranges: vec![(0, 12_000_000)],
             deadline_ms: 0,
         })
         .await
         .unwrap();
+    // Cancel the REAL stream this GetRange runs on (the handshake already
+    // used stream 1, so this is stream 3, not 1).
+    let stream_id = rx.id;
+
     // Read a couple frames, then cancel.
-    let mut frames = 0;
-    let stream_id = 1; // first dialer stream
+    let mut frames = 0usize;
+    let mut saw_last = false;
     while let Some(body) = rx.recv().await {
         frames += 1;
+        if let FrameBody::Data { last: true, .. } = body {
+            saw_last = true;
+            break;
+        }
         if frames == 2 {
             conn.cancel(stream_id).await.unwrap();
             break;
         }
-        if let FrameBody::Data { last: true, .. } = body {
-            break;
+    }
+
+    // Drain whatever was already buffered. A truly cancelled stream ends
+    // WITHOUT a terminal (last:true) frame and delivers far fewer frames
+    // than the full encode would.
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(FrameBody::Data { last: true, .. })) => {
+                saw_last = true;
+                frames += 1;
+                break;
+            }
+            Ok(Some(_)) => frames += 1,
+            Ok(None) => break, // stream closed by the cancel
+            Err(_) => break,   // no further frames within the timeout
         }
     }
+
+    assert!(!saw_last, "a cancelled stream must not deliver a terminal frame");
+    let full_frames = data.len().div_ceil(64 * 1024);
+    assert!(
+        frames < full_frames / 2,
+        "cancel should stop the stream early: got {frames} of ~{full_frames} frames"
+    );
+
     // The connection is still usable afterward (cancel didn't kill it).
     let (_size, _bits) = fetch::fetch_bitfield(&conn, id).await.unwrap();
+}
+
+#[tokio::test]
+async fn disjoint_holders_still_complete_the_object() {
+    use epix_blob::bitfield::{group_count, GroupBits};
+    use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
+    let net = sim::SimNet::new();
+
+    // Two peers that each hold only HALF the groups, interleaved at group
+    // granularity (one even, one odd). No single peer holds a whole
+    // rarest-first batch, so a holder-blind batcher strands the object
+    // even though every group IS available from some peer.
+    let data = test_data(300_000);
+    let (c_even, id) = seed_and_connect(net.clone(), ip(31), sim::Class::Clearnet, &data).await;
+    let (c_odd, _) = seed_and_connect(net.clone(), ip(32), sim::Class::Clearnet, &data).await;
+
+    let size = data.len() as u64;
+    let n = group_count(size);
+    let mut even = GroupBits::new();
+    let mut odd = GroupBits::new();
+    for g in 0..n {
+        if g % 2 == 0 {
+            even.add(g..g + 1);
+        } else {
+            odd.add(g..g + 1);
+        }
+    }
+    let peers = vec![
+        PeerHandle { conn: c_even, class: sim::Class::Clearnet, bits: even, label: "even".into() },
+        PeerHandle { conn: c_odd, class: sim::Class::Clearnet, bits: odd, label: "odd".into() },
+    ];
+
+    let (client_store, _g) = temp_store();
+    let mut swarm = Swarm::new(client_store.clone(), id, size);
+    client_store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    let needed = needed_groups(&client_store, id, size).unwrap();
+    swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+
+    assert!(client_store.is_complete(id).unwrap(), "object completes despite disjoint holders");
+    assert_eq!(client_store.read_bytes(id, 3).unwrap(), data);
+}
+
+#[tokio::test]
+async fn oversized_multirange_request_is_rejected() {
+    use epix_edx::msg::{err, Req, Resp};
+    let net = sim::SimNet::new();
+    let (server_store, _sg) = temp_store();
+    // No object needed: the byte cap is checked before any store lookup.
+    let conn = connect(net.clone(), server_store, ip(33)).await;
+
+    // Two ranges of exactly 2^63 bytes each: a naive u64 .sum() wraps to 0
+    // and slips past MAX_BYTES_PER_REQ. Saturating accumulation trips
+    // LIMIT instead.
+    let big = 1u64 << 63;
+    let resp = conn
+        .request(Req::GetRange {
+            obj: ObjId([0; 32]),
+            size: u64::MAX,
+            ranges: vec![(0, big), (0, big)],
+            deadline_ms: 0,
+        })
+        .await
+        .unwrap();
+    match resp {
+        Resp::Err { code, .. } => {
+            assert_eq!(code, err::LIMIT, "an overflowing byte total must trip LIMIT")
+        }
+        other => panic!("expected LIMIT Err, got {other:?}"),
+    }
 }

@@ -32,23 +32,30 @@ impl Rollup {
     /// Compute the rollup for a set of item ids from the full record set.
     /// Only live (non-tombstoned) comments are counted.
     pub fn compute(items: &[String], records: &[Record]) -> Self {
-        // Which (target) items are tombstoned by a moderator/self tombstone.
+        // Victim ids of every tombstone live in the tombstone's `target`
+        // (the documented shape, same as the checkpoint). Build the set
+        // once over the whole corpus.
+        let tombstones = crate::checkpoint::tombstoned_ids(records);
+        // The live winners: the exact same fold the checkpoint uses, so
+        // rollup counts and checkpoint state can never disagree. Highest
+        // order_key wins per identity, so an edit (same id) counts once
+        // and a tombstoned comment is dropped entirely.
+        let live = crate::checkpoint::live_records(records, &tombstones);
+
         let mut map = BTreeMap::new();
         for item in items {
-            let tombstoned: std::collections::HashSet<&str> = records
+            // Count only live comment winners attached to this item.
+            let comment_count = live
                 .iter()
-                .filter(|r| matches!(r.kind, Kind::Tombstone) && r.target == *item)
-                .map(|r| r.id.as_str())
-                .collect();
-
-            let mut comment_count = 0u64;
-            let mut newest = 0u64;
-            for r in records.iter().filter(|r| r.target == *item) {
-                newest = newest.max(r.clock);
-                if matches!(r.kind, Kind::Comment) && !tombstoned.contains(r.id.as_str()) {
-                    comment_count += 1;
-                }
-            }
+                .filter(|r| r.target == *item && matches!(r.kind, Kind::Comment))
+                .count() as u64;
+            // Newest activity clock across every record on this item.
+            let newest = records
+                .iter()
+                .filter(|r| r.target == *item)
+                .map(|r| r.clock)
+                .max()
+                .unwrap_or(0);
             map.insert(
                 item.clone(),
                 ItemSummary { comment_count, reactions: count(records, item), newest_clock: newest },
@@ -115,10 +122,24 @@ mod tests {
     #[test]
     fn tombstoned_comment_is_not_counted() {
         let (items, mut records) = gallery();
-        // Moderate comment c1 on gif1.
-        records.push(test_record("c1", "mod", "gif1", 20, Kind::Tombstone));
+        // Moderate comment c1: the victim id lives in the tombstone's target.
+        records.push(test_record("t1", "mod", "c1", 20, Kind::Tombstone));
         let roll = Rollup::compute(&items, &records);
         assert_eq!(roll.get("gif1").unwrap().comment_count, 1, "tombstoned comment excluded");
+    }
+
+    #[test]
+    fn edit_counts_once_not_twice() {
+        // An edit is a second record with the SAME id. The rollup must
+        // count live winners, so the edit does not inflate the count.
+        let items = vec!["gif1".to_string()];
+        let records = vec![
+            test_record("c1", "u1", "gif1", 3, Kind::Comment),
+            test_record("c1", "u1", "gif1", 9, Kind::Comment), // edit of c1
+            test_record("c2", "u2", "gif1", 4, Kind::Comment),
+        ];
+        let roll = Rollup::compute(&items, &records);
+        assert_eq!(roll.get("gif1").unwrap().comment_count, 2, "edit must not double-count");
     }
 
     #[test]

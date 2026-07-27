@@ -90,6 +90,21 @@ impl Record {
         format!("{}\u{1f}{}\u{1f}{}", self.author, self.target, kind_tag)
     }
 
+    /// The per-item identity a checkpoint/rollup fold keys on. Reactions
+    /// keep their (author, target, kind) lineage so a re-like supersedes
+    /// and an un-like retracts. Everything else (posts, comments,
+    /// tombstones) keys on (author, id): `id` is the supersede-stable CRDT
+    /// identity (an edit keeps the id, so it collapses to one winner) and
+    /// `author` prevents another user from hijacking the id. Unlike
+    /// `lineage()` this does not collapse two distinct posts/comments by
+    /// the same author on the same target.
+    pub fn identity(&self) -> String {
+        match &self.kind {
+            Kind::Reaction { .. } => self.lineage(),
+            _ => format!("{}\u{1f}{}", self.author, self.id),
+        }
+    }
+
     /// Total, deterministic ordering used everywhere a record set is
     /// serialized: by clock, then id, then author, then content address.
     /// Two nodes with the same records always produce the same order.

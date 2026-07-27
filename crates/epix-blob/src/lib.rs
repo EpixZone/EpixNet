@@ -38,8 +38,8 @@ pub const BLOCK_SIZE: bao_tree::BlockSize = bao_tree::BlockSize::from_chunk_log(
 ///
 /// For `Ns::Plain` objects this is the BLAKE3 root of the cleartext bytes;
 /// for `Ns::Shard` objects it is the BLAKE3 hash of the ciphertext (the
-/// shard address), so a volunteer cache can verify what it stores without
-/// being able to read it.
+/// shard address), so a cache node can integrity-check what it stores
+/// without the decryption key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ObjId(pub [u8; 32]);
 

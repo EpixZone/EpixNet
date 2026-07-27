@@ -12,7 +12,7 @@
 //!                   "b3": "…", "bundle": "…", "off": 0},     // EDX
 //!   "movie.mp4":  {"size": 734003200, "sha512": "…", "b3": "…"}
 //! },
-//! "bundles": {"<b3 hex>": {"size": 262144}},
+//! "bundles": {"<b3 hex>": {"size": 262144, "seq": 0}},
 //! "files_merkle_root": "<hex>"
 //! ```
 //!
@@ -92,14 +92,26 @@ pub fn bundles(content: &Value) -> BTreeMap<ObjId, u64> {
 }
 
 /// The previous bundle memberships, reconstructed from a manifest (for
-/// stable re-assignment at the next signing). Ordered by bundle
-/// appearance, members ordered by their offset.
+/// stable re-assignment at the next signing). Ordered by bundle creation
+/// order (the persisted `seq`), members ordered by their offset.
 pub fn prev_memberships(content: &Value) -> Vec<Vec<String>> {
     // bundle hex -> [(off, path)]
     let mut by_bundle: BTreeMap<String, Vec<(u64, String)>> = BTreeMap::new();
     let mut bundle_order: Vec<String> = Vec::new();
     if let Some(Value::Object(map)) = content.get("bundles") {
-        bundle_order = map.keys().cloned().collect();
+        // Order by the persisted `seq` (creation order). Legacy manifests
+        // have no `seq`; fall back to the map's key order (hex-sorted) so
+        // they still parse, keyed by enumeration index to keep it stable.
+        let mut ordered: Vec<(u64, usize, String)> = map
+            .keys()
+            .enumerate()
+            .map(|(i, hex)| {
+                let seq = map[hex].get("seq").and_then(Value::as_u64).unwrap_or(i as u64);
+                (seq, i, hex.clone())
+            })
+            .collect();
+        ordered.sort();
+        bundle_order = ordered.into_iter().map(|(_, _, hex)| hex).collect();
     }
     for key in ["files", "files_optional"] {
         if let Some(Value::Object(files)) = content.get(key) {
@@ -206,9 +218,14 @@ pub fn apply_edx(
     }
 
     let mut bundles_json = Map::new();
-    for b in &assignment.bundles {
-        bundles_json
-            .insert(b.id.to_string(), json!({"size": b.bytes.len() as u64}));
+    for (i, b) in assignment.bundles.iter().enumerate() {
+        // `seq` records the assignment (creation) order so re-signing can
+        // recover it: the JSON object is a BTreeMap here and would
+        // otherwise iterate in hex-id order, not creation order.
+        bundles_json.insert(
+            b.id.to_string(),
+            json!({"size": b.bytes.len() as u64, "seq": i as u64}),
+        );
     }
     if bundles_json.is_empty() {
         obj.remove("bundles");
@@ -291,6 +308,56 @@ mod tests {
             again.bundles.iter().map(|b| b.id).collect::<Vec<_>>(),
             assignment.bundles.iter().map(|b| b.id).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn membership_order_survives_round_trip() {
+        // Nine ~100 KiB files pack into three 256 KiB bundles, so the
+        // recovered order is not a single bundle where order is moot.
+        let files: BTreeMap<String, Vec<u8>> = (0..9)
+            .map(|i| {
+                let p = format!("m/f{i:02}.bin");
+                let seed = blake3::hash(p.as_bytes());
+                (p, vec![seed.as_bytes()[0]; 100_000])
+            })
+            .collect();
+        let (content, assignment) = manifest_for(&files);
+        assert!(
+            assignment.bundles.len() >= 3,
+            "want 3+ bundles, got {}",
+            assignment.bundles.len()
+        );
+
+        // The recovered order must equal the bundler's creation order, NOT
+        // the hex-id order the JSON object iterates in. Guard that the two
+        // actually differ so this test exercises the reordering.
+        let creation: Vec<ObjId> = assignment.bundles.iter().map(|b| b.id).collect();
+        let mut hex_sorted = creation.clone();
+        hex_sorted.sort_by_key(|id| id.to_string());
+        assert_ne!(creation, hex_sorted, "corpus must exercise hex-vs-creation order");
+
+        let expected: Vec<Vec<String>> =
+            assignment.bundles.iter().map(|b| b.members.clone()).collect();
+        let prev = prev_memberships(&content);
+        assert_eq!(prev, expected, "recovered order must equal creation order");
+    }
+
+    #[test]
+    fn legacy_manifest_without_seq_still_parses() {
+        // A manifest predating `seq`: prev_memberships must fall back to
+        // the map's key order instead of panicking or dropping bundles.
+        let b0 = ObjId([0xaa; 32]).to_string();
+        let b1 = ObjId([0xbb; 32]).to_string();
+        let content = json!({
+            "edx": 1,
+            "files": {
+                "a": {"size": 1, "b3": ObjId([1; 32]).to_string(), "bundle": b0, "off": 0},
+                "b": {"size": 1, "b3": ObjId([2; 32]).to_string(), "bundle": b1, "off": 0},
+            },
+            "bundles": {b0.clone(): {"size": 1}, b1.clone(): {"size": 1}},
+        });
+        let prev = prev_memberships(&content);
+        assert_eq!(prev, vec![vec!["a".to_string()], vec!["b".to_string()]]);
     }
 
     #[test]

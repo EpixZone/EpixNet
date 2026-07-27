@@ -20,6 +20,9 @@ pub const GROUP_BYTES: u64 = BLOCK_SIZE.bytes() as u64;
 /// Native BLAKE3 chunks per group.
 const CHUNKS_PER_GROUP: u64 = GROUP_BYTES / 1024;
 
+/// Bytes per native BLAKE3 chunk (1 KiB).
+const CHUNK_BYTES: u64 = GROUP_BYTES / CHUNKS_PER_GROUP;
+
 /// Safety cap on total groups a peer-supplied bitfield may describe
 /// (2^26 groups = 1 TiB object) so unpacking can't allocate unboundedly.
 pub const MAX_GROUPS: u64 = 1 << 26;
@@ -241,6 +244,25 @@ impl GroupBits {
             out |= ChunkRanges::from(
                 ChunkNum(r.start * CHUNKS_PER_GROUP)..ChunkNum(r.end * CHUNKS_PER_GROUP),
             );
+        }
+        out
+    }
+
+    /// Like [`Self::to_chunk_ranges`] but clamped to an object of `size`
+    /// bytes. The last group of a non-16-KiB-multiple object covers fewer
+    /// than `CHUNKS_PER_GROUP` real chunks, and bao's `valid_ranges` never
+    /// yields a chunk past `ceil(size/1024)`. Callers that check a group's
+    /// chunk range against `valid_ranges` (revalidate) must clamp, or the
+    /// pristine tail group looks unverified and gets dropped.
+    pub fn to_chunk_ranges_clamped(&self, size: u64) -> ChunkRanges {
+        let chunks = size.div_ceil(CHUNK_BYTES);
+        let mut out = ChunkRanges::empty();
+        for r in &self.runs {
+            let start = (r.start * CHUNKS_PER_GROUP).min(chunks);
+            let end = (r.end * CHUNKS_PER_GROUP).min(chunks);
+            if start < end {
+                out |= ChunkRanges::from(ChunkNum(start)..ChunkNum(end));
+            }
         }
         out
     }
