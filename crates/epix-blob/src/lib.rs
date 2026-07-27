@@ -43,6 +43,11 @@ pub const BLOCK_SIZE: bao_tree::BlockSize = bao_tree::BlockSize::from_chunk_log(
 pub struct ObjId(pub [u8; 32]);
 
 impl ObjId {
+    /// The id of these bytes (plain BLAKE3 hash).
+    pub fn of(data: &[u8]) -> Self {
+        Self(*blake3::hash(data).as_bytes())
+    }
+
     pub fn from_hex(s: &str) -> Option<Self> {
         if s.len() != 64 {
             return None;

@@ -293,6 +293,58 @@ impl Store {
         Ok(true)
     }
 
+    /// Adopt a COMPLETE file already on disk (the migration pass: existing
+    /// xite files become EDX objects with no re-download and no second
+    /// copy). The data is hard-linked into the store when possible (one
+    /// physical copy, two names) and copied only as a fallback; the
+    /// outboard is computed by streaming the file. Returns false if the
+    /// object is already in the store.
+    ///
+    /// If the original file is later edited in place, the linked object's
+    /// bytes change under us — that is caught by validated serving and
+    /// [`Self::revalidate`], never served silently. Re-signing a xite
+    /// re-adopts under the file's new id.
+    pub fn adopt_file(
+        &self,
+        id: ObjId,
+        ns: Ns,
+        path: &std::path::Path,
+        now: u64,
+    ) -> io::Result<bool> {
+        if let Some(mut rec) = self.get_record(id)? {
+            rec.last_access = rec.last_access.max(now);
+            self.put_record(id, &rec)?;
+            return Ok(false);
+        }
+        let size = fs::metadata(path)?.len();
+        let dst = self.sparse_path(id);
+        let _ = fs::remove_file(&dst);
+        if fs::hard_link(path, &dst).is_err() {
+            fs::copy(path, &dst)?;
+        }
+        let ob = OutboardBytes::from_reader(io::BufReader::new(File::open(&dst)?), size)?;
+        if ob.root != id {
+            let _ = fs::remove_file(&dst);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} does not hash to {id}", path.display()),
+            ));
+        }
+        fs::write(self.obao_path(id), &ob.data)?;
+        self.put_record(
+            id,
+            &ObjRecord {
+                size,
+                ns: ns_to_u8(ns),
+                loc: Loc::Sparse,
+                present: GroupBits::complete(size).to_wire(),
+                refcount: 0,
+                last_access: now,
+            },
+        )?;
+        Ok(true)
+    }
+
     /// Create the sparse file pair for an object we are about to fetch.
     /// Idempotent: an existing record (sparse or slab) is left alone.
     pub fn ensure_sparse(&self, id: ObjId, ns: Ns, size: u64, now: u64) -> io::Result<()> {

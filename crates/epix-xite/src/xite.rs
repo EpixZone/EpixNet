@@ -589,7 +589,13 @@ impl Xite {
                 continue;
             };
             let bytes = self.storage.read(&inner)?;
-            let entry = json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) });
+            // `b3` is the EDX per-file BLAKE3 root (docs/edx-manifest.md);
+            // `sha512` stays alongside it for the migration window.
+            let entry = json!({
+                "size": bytes.len(),
+                "sha512": XiteStorage::hash_bytes(&bytes),
+                "b3": epix_blob::ObjId::of(&bytes).to_string(),
+            });
             if is_optional {
                 files_optional.insert(rel, entry);
             } else {
@@ -677,6 +683,37 @@ impl Xite {
             map.insert("signs_required".into(), json!(1));
         }
 
+        // EDX (docs/edx-manifest.md): bundle small required files with
+        // STABLE assignment against the previous manifest, then stamp
+        // b3/bundle/off, the bundles section, files_merkle_root and edx:1.
+        let prev_bundles = self
+            .content
+            .as_ref()
+            .map(epix_blob::manifest::prev_memberships)
+            .unwrap_or_default();
+        let mut roots = std::collections::BTreeMap::new();
+        let mut bundleable = std::collections::BTreeMap::new();
+        for key in ["files", "files_optional"] {
+            let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+            for (path, e) in entries {
+                if let Some(id) =
+                    e.get("b3").and_then(Value::as_str).and_then(epix_blob::ObjId::from_hex)
+                {
+                    roots.insert(path.clone(), id);
+                }
+                // Only required files bundle: optional files must stay
+                // individually fetchable on demand.
+                if key == "files" {
+                    let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    if epix_blob::bundle::is_bundleable(size) {
+                        bundleable.insert(path.clone(), self.storage.read(path)?);
+                    }
+                }
+            }
+        }
+        let assignment = epix_blob::bundle::assign(&bundleable, &prev_bundles);
+        epix_blob::manifest::apply_edx(&mut content, &roots, &assignment);
+
         epix_content::sign(&mut content, privatekey)?;
         // Python-EpixNet's on-disk format (helper.jsonDumps): human-readable
         // and diff-friendly; the signature covers the canonical form, not this.
@@ -684,6 +721,114 @@ impl Xite {
         self.storage.write_atomic("content.json", &bytes)?;
         self.content = Some(content);
         Ok(())
+    }
+
+    /// The EDX migration pass: register this xite's local files (and the
+    /// bundles its manifest declares) as content-addressed objects in the
+    /// store — no re-download, no second copy (large files are adopted by
+    /// hard link where possible).
+    ///
+    /// Small files insert into slabs; files >= the bundle cutoff adopt in
+    /// place. Declared bundles are rebuilt from their member files and
+    /// verified against their declared id before insertion. Returns
+    /// `(registered, skipped)` — a skip is a missing/mismatched local
+    /// file, which simply stays fetchable from the swarm instead.
+    pub fn edx_register(
+        &self,
+        store: &epix_blob::store::Store,
+        now: u64,
+    ) -> Result<(usize, usize)> {
+        let Some(content) = &self.content else { return Ok((0, 0)) };
+        let mut registered = 0usize;
+        let mut skipped = 0usize;
+
+        // Per-file objects.
+        for key in ["files", "files_optional"] {
+            let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+            for (path, e) in entries {
+                let Some(id) =
+                    e.get("b3").and_then(Value::as_str).and_then(epix_blob::ObjId::from_hex)
+                else {
+                    continue; // pre-EDX entry: nothing to register
+                };
+                let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
+                if !self.storage.exists(path) {
+                    skipped += 1;
+                    continue;
+                }
+                let res = if epix_blob::bundle::is_bundleable(size) {
+                    self.storage
+                        .read(path)
+                        .and_then(|bytes| {
+                            store
+                                .insert_bytes(id, epix_blob::Ns::Plain, &bytes, now)
+                                .map_err(Error::Io)
+                        })
+                        .map(|_| ())
+                } else {
+                    self.storage.path(path).and_then(|p| {
+                        store
+                            .adopt_file(id, epix_blob::Ns::Plain, &p, now)
+                            .map(|_| ())
+                            .map_err(Error::Io)
+                    })
+                };
+                match res {
+                    Ok(()) => registered += 1,
+                    Err(_) => skipped += 1, // corrupt/changed local copy: refetch later
+                }
+            }
+        }
+
+        // Declared bundles: rebuild from member files, verify, insert.
+        let declared = epix_blob::manifest::bundles(content);
+        if !declared.is_empty() {
+            // bundle id -> ordered (off, member path).
+            let mut members: std::collections::BTreeMap<String, Vec<(u64, String)>> =
+                std::collections::BTreeMap::new();
+            for key in ["files", "files_optional"] {
+                let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+                for (path, e) in entries {
+                    if let (Some(bundle), Some(off)) = (
+                        e.get("bundle").and_then(Value::as_str),
+                        e.get("off").and_then(Value::as_u64),
+                    ) {
+                        members.entry(bundle.into()).or_default().push((off, path.clone()));
+                    }
+                }
+            }
+            for (hex, mut paths) in members {
+                let Some(id) = epix_blob::ObjId::from_hex(&hex) else { continue };
+                if !declared.contains_key(&id) {
+                    continue;
+                }
+                paths.sort();
+                let mut bytes = Vec::new();
+                let mut ok = true;
+                for (off, path) in &paths {
+                    if *off != bytes.len() as u64 {
+                        ok = false;
+                        break;
+                    }
+                    match self.storage.read(path) {
+                        Ok(b) => bytes.extend_from_slice(&b),
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && epix_blob::ObjId::of(&bytes) == id {
+                    match store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, now) {
+                        Ok(_) => registered += 1,
+                        Err(_) => skipped += 1,
+                    }
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        Ok((registered, skipped))
     }
 
     /// Sign a non-root content.json - a user content.json or include - with
