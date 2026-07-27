@@ -20,10 +20,12 @@ use epix_blob::store::Store;
 use epix_blob::ObjId;
 use tokio::sync::{mpsc, Semaphore};
 
+use crate::choke::{Choker, Reach, ServeDecision};
 use crate::conn::{Conn, Incoming};
 use crate::msg::{caps, err, Frame, FrameBody, Hello, HelloAck, Req, Resp, NET_ID};
 use crate::noise;
 use crate::MAX_FRAME_LEN;
+use std::sync::Mutex;
 
 /// Per-request caps (hard backstops, not tuning knobs).
 pub const MAX_RANGES_PER_REQ: usize = 64;
@@ -32,6 +34,9 @@ pub const MAX_MANY_ITEMS: usize = 256;
 pub const MAX_MANY_ITEM_BYTES: u64 = 64 * 1024;
 /// Concurrent serve tasks per connection.
 pub const MAX_CONCURRENT_SERVES: usize = 8;
+/// A GetRange no larger than this is treated as first-paint (index.html +
+/// first bundles), exempt from choking up to the per-peer free budget.
+pub const FIRST_PAINT_OBJECT_BYTES: u64 = 1 << 20;
 
 /// Signed-content access the server delegates to (the real node backs
 /// this with its xite registry; tests use a fixture).
@@ -63,6 +68,13 @@ pub struct ServeCtx {
     pub caps: u32,
     /// Unix-seconds clock (injectable for tests).
     pub now: fn() -> u64,
+    /// Shared upload governor (reciprocity choke + global cap). Bulk
+    /// GetRange serving consults it; None disables governance (tests /
+    /// unmetered nodes that want to serve everything).
+    pub choker: Option<Arc<Mutex<Choker>>>,
+    /// Whether the user's own foreground traffic is currently active
+    /// (drives the LEDBAT yield). A real node updates this live.
+    pub foreground: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The peer identity a completed handshake established.
@@ -81,8 +93,23 @@ fn now_unix() -> u64 {
 }
 
 impl ServeCtx {
+    /// Ungoverned context (serves everything): tests and unmetered nodes.
     pub fn new(store: Arc<Store>, provider: Arc<dyn SignedProvider>, privatekey: String) -> Self {
-        Self { store, provider, privatekey, caps: caps::MESH, now: now_unix }
+        Self {
+            store,
+            provider,
+            privatekey,
+            caps: caps::MESH,
+            now: now_unix,
+            choker: None,
+            foreground: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Attach the shared upload governor.
+    pub fn with_choker(mut self, choker: Arc<Mutex<Choker>>) -> Self {
+        self.choker = Some(choker);
+        self
     }
 }
 
@@ -203,20 +230,29 @@ pub async fn serve(
         }
     };
 
+    // Register the peer with the governor (reachability from the link
+    // type: overlay links have no handshake hash).
+    let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
+    if let Some(choker) = &ctx.choker {
+        choker.lock().expect("choker").note_peer(&identity.node_pk, reach, (ctx.now)());
+    }
+    let identity = Arc::new(identity);
+
     let serves = Arc::new(Semaphore::new(MAX_CONCURRENT_SERVES));
     while let Some(inc) = incoming.recv().await {
         let Ok(permit) = serves.clone().acquire_owned().await else { break };
         let conn = conn.clone();
         let ctx = ctx.clone();
+        let identity = identity.clone();
         tokio::spawn(async move {
-            handle(conn, ctx, inc).await;
+            handle(conn, ctx, identity, inc).await;
             drop(permit);
         });
     }
-    Some(identity)
+    Some((*identity).clone())
 }
 
-async fn handle(conn: Conn, ctx: Arc<ServeCtx>, inc: Incoming) {
+async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc: Incoming) {
     let stream = inc.stream;
     match inc.req {
         Req::Hello(_) => {
@@ -225,7 +261,7 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, inc: Incoming) {
                 .await;
         }
         Req::GetRange { obj, ranges, .. } => {
-            serve_range(conn, ctx, stream, obj, ranges).await;
+            serve_range(conn, ctx, identity, stream, obj, ranges).await;
         }
         Req::GetMany { objs } => {
             serve_many(conn, ctx, stream, objs).await;
@@ -279,15 +315,47 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, inc: Incoming) {
     }
 }
 
-async fn serve_range(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, obj: ObjId, ranges: Vec<(u64, u64)>) {
-    if ranges.len() > MAX_RANGES_PER_REQ
-        || ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum::<u64>() > MAX_BYTES_PER_REQ
-    {
+async fn serve_range(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    identity: Arc<PeerIdentity>,
+    stream: u64,
+    obj: ObjId,
+    ranges: Vec<(u64, u64)>,
+) {
+    let total: u64 = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    if ranges.len() > MAX_RANGES_PER_REQ || total > MAX_BYTES_PER_REQ {
         let _ = conn
             .respond(stream, Resp::Err { code: err::LIMIT, msg: "range caps exceeded".into() })
             .await;
         return;
     }
+
+    // Bulk governance: consult the choker. First-paint objects (index +
+    // small bundles) are exempt up to the free budget; a choked peer is
+    // told BUSY so it retries elsewhere (the swarm self-heals), and a
+    // throttled one likewise. Control-plane and first-paint bypass this.
+    if let Some(choker) = &ctx.choker {
+        let first_paint = total <= FIRST_PAINT_OBJECT_BYTES;
+        let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
+        let decision = choker.lock().expect("choker").decide(
+            &identity.node_pk,
+            total,
+            first_paint,
+            foreground,
+            (ctx.now)(),
+        );
+        match decision {
+            ServeDecision::Serve | ServeDecision::FirstPaint => {}
+            ServeDecision::Choked | ServeDecision::Throttled => {
+                let _ = conn
+                    .respond(stream, Resp::Err { code: err::BUSY, msg: "choked".into() })
+                    .await;
+                return;
+            }
+        }
+    }
+
     let byte_ranges: Vec<std::ops::Range<u64>> =
         ranges.iter().map(|(s, e)| *s..*e).collect();
 

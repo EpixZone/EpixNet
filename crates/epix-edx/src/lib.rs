@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod choke;
 pub mod conn;
 pub mod fetch;
 pub mod frame;

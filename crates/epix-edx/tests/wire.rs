@@ -91,11 +91,9 @@ async fn connect(
     let (conn, _client_in) = Conn::start(stream, true);
     let (cstore, _cctx_guard) = temp_store();
     let cctx = ServeCtx {
-        store: cstore,
-        provider: Arc::new(FixtureProvider { signed: Default::default() }),
-        privatekey: CLIENT_KEY.into(),
         caps: caps::MESH,
         now: || 0,
+        ..ServeCtx::new(cstore, Arc::new(FixtureProvider { signed: Default::default() }), CLIENT_KEY.into())
     };
     let id = epix_edx::server::client_hello(&conn, &cctx, vec![], None).await.unwrap();
     // The handshake completed, which means the net id matched and the
@@ -269,6 +267,83 @@ async fn multi_peer_striping_and_tor_only_swarm() {
     let needed2 = needed_groups(&store2, id, data.len() as u64).unwrap();
     swarm2.fetch(&needed2, &tor_peers, Deadline::background(), 2).await.unwrap();
     assert!(store2.is_complete(id).unwrap(), "Tor-only swarm completes");
+}
+
+#[tokio::test]
+async fn governed_server_chokes_bulk_but_serves_first_paint() {
+    use epix_edx::choke::{Choker, Reach};
+    use epix_edx::msg::{err, Req, Resp};
+    use std::sync::Mutex;
+
+    let net = sim::SimNet::new();
+    let (server_store, _sg) = temp_store();
+
+    // A first-paint-sized object (<= 1 MiB) and a bulk object (> 1 MiB).
+    let small = test_data(500_000);
+    let big = test_data(4_000_000);
+    let small_id = ObjId::of(&small);
+    let big_id = ObjId::of(&big);
+    server_store.insert_bytes(small_id, Ns::Plain, &small, 1).unwrap();
+    server_store.insert_bytes(big_id, Ns::Plain, &big, 1).unwrap();
+
+    // Governed server: choker with slots filled by phantom high
+    // contributors so our client (zero contribution) is choked for bulk.
+    // The client reaches us over the sim link (no Noise) => Reach::Overlay,
+    // so the phantom competitors are overlay too — otherwise the client
+    // would grab the reserved overlay slot and never be choked.
+    let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
+    {
+        let mut c = choker.lock().unwrap();
+        for i in 20..26u8 {
+            c.note_peer(&[i; 33], Reach::Overlay, 0);
+            c.credit_peer(&[i; 33], 1_000_000, 0);
+        }
+    }
+    let provider = Arc::new(FixtureProvider { signed: Default::default() });
+    let ctx = Arc::new(
+        ServeCtx { now: || 0, ..ServeCtx::new(server_store, provider, SERVER_KEY.into()) }
+            .with_choker(choker),
+    );
+
+    let server_addr = ip(20);
+    let mut inbox = net.listen(server_addr.clone());
+    tokio::spawn(async move {
+        while let Some((_from, stream)) = inbox.recv().await {
+            let (conn, incoming) = Conn::start(stream, false);
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                serve(conn, incoming, ctx, None).await;
+            });
+        }
+    });
+
+    let t = sim::SimTransport { net, local: ip(202) };
+    let stream = {
+        use epix_transport::Transport;
+        t.dial(&server_addr).await.unwrap()
+    };
+    let (conn, _in) = Conn::start(stream, true);
+    let (cstore, _cg) = temp_store();
+    let cctx = ServeCtx { now: || 0, ..ServeCtx::new(cstore, Arc::new(FixtureProvider { signed: Default::default() }), CLIENT_KEY.into()) };
+    epix_edx::server::client_hello(&conn, &cctx, vec![], None).await.unwrap();
+
+    // First-paint object: served (exempt).
+    let mut rx = conn
+        .request_stream(Req::GetRange { obj: small_id, size: small.len() as u64, ranges: vec![(0, 500_000)], deadline_ms: 250 })
+        .await
+        .unwrap();
+    let first = rx.recv().await.unwrap();
+    assert!(matches!(first, epix_edx::msg::FrameBody::Data { .. }), "first-paint served, got {first:?}");
+
+    // Bulk object from the same choked freeloader: refused BUSY.
+    let resp = conn
+        .request(Req::GetRange { obj: big_id, size: big.len() as u64, ranges: vec![(0, 4_000_000)], deadline_ms: 0 })
+        .await
+        .unwrap();
+    match resp {
+        Resp::Err { code, .. } => assert_eq!(code, err::BUSY, "bulk from a freeloader is choked"),
+        other => panic!("expected BUSY, got {other:?}"),
+    }
 }
 
 #[tokio::test]
