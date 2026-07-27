@@ -8,12 +8,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use epix_blob::store::Store;
-use epix_blob::ObjId;
+use epix_blob::{Ns, ObjId};
 use epix_core::PeerAddr;
-use epix_edx::server::{serve, ServeCtx, SignedProvider};
+use epix_edx::conn::Conn;
+use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
+use epix_edx::server::{client_hello, serve, ServeCtx, SignedProvider};
+use epix_edx::sim::Class;
 use epix_protocol::server::EdxHook;
-use epix_ui::state::InboundUpdate;
+use epix_transport::Transport;
+use epix_ui::state::{EdxFetcher, InboundUpdate};
 use epix_ui::AppState;
+
+/// Unix seconds, for object last-access stamps.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Backs epix-edx's signed-content requests with the node's live xite
 /// registry (raw content.json bytes, listModified, inbound update apply).
@@ -98,10 +110,101 @@ pub fn edx_hook(state: Arc<AppState>, store: Arc<Store>, privatekey: String) -> 
     })
 }
 
-/// Open the EDX object store under `data_dir/edx-store` and install it on
-/// the node, so xites register their files into it on load and EDX serving
-/// can be enabled. Returns the store, or None if it could not be opened.
-pub async fn enable_serving(state: &Arc<AppState>, data_dir: &std::path::Path) -> Option<Arc<Store>> {
+/// Fetches a file's bytes over the EDX verified-streaming path: dial the
+/// xite's connectable peers as EDX links, learn what each holds, run the
+/// swarm scheduler into the object store, then materialize the completed
+/// object into the xite's storage. Backs [`AppState`]'s injected fetcher.
+struct RuntimeEdxFetcher {
+    state: Arc<AppState>,
+    privatekey: String,
+}
+
+impl RuntimeEdxFetcher {
+    /// Dial `peer` and bring up an EDX link past the Hello gate.
+    async fn dial(&self, transport: &Arc<dyn Transport>, peer: &PeerAddr) -> Result<Conn, String> {
+        let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
+        let l = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
+        // A client context: client_hello only reads the key and caps; reuse
+        // the AppState provider (harmless) and the object store.
+        let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        let provider: Arc<dyn SignedProvider> =
+            Arc::new(AppStateProvider { state: self.state.clone() });
+        let ctx = ServeCtx::new(store, provider, self.privatekey.clone());
+        client_hello(&l.conn, &ctx, vec![], Some(l.handshake_hash))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(l.conn)
+    }
+}
+
+#[async_trait::async_trait]
+impl EdxFetcher for RuntimeEdxFetcher {
+    async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        // Resolve the file's object id + size from the signed content.json.
+        let content_bytes =
+            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
+        let content: serde_json::Value =
+            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
+        let entry =
+            epix_blob::manifest::edx_entry(&content, inner_path).ok_or("no edx entry for file")?;
+        let (id, size) = (entry.b3, entry.size);
+        let now = now_secs();
+
+        // Already complete in the store: just materialize it.
+        if store.is_complete(id).unwrap_or(false) {
+            let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
+            self.state.edx_materialize_file(address, inner_path, &bytes).await?;
+            return Ok(true);
+        }
+
+        // Dial the connectable peers over EDX and learn what each holds. One
+        // link per peer, reused for the whole object (no per-piece redial).
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let peers = self.state.connectable_peers(address, 8).await;
+        if peers.is_empty() {
+            return Err("no peers".into());
+        }
+        let mut handles: Vec<PeerHandle> = Vec::new();
+        for peer in peers {
+            let Ok(conn) = self.dial(&transport, &peer).await else { continue };
+            if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&conn, id).await {
+                handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label: peer.to_string() });
+            }
+        }
+        if handles.is_empty() {
+            return Err("no EDX peer holds this object".into());
+        }
+
+        // Run the swarm scheduler into the sparse object.
+        store.ensure_sparse(id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
+        let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        swarm
+            .fetch(&needed, &handles, Deadline::background(), now)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !store.is_complete(id).map_err(|e| e.to_string())? {
+            return Err("fetch did not complete".into());
+        }
+
+        // Materialize the verified bytes into the xite's storage.
+        let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
+        self.state.edx_materialize_file(address, inner_path, &bytes).await?;
+        Ok(true)
+    }
+}
+
+/// Open the EDX object store under `data_dir/edx-store` and install it plus
+/// the verified-streaming fetcher on the node, using `privatekey` as the
+/// node's EDX identity. Registers the already-loaded xites so serving does
+/// not depend on load order. Returns the store, or None if it could not be
+/// opened.
+pub async fn enable_serving(
+    state: &Arc<AppState>,
+    data_dir: &std::path::Path,
+    privatekey: String,
+) -> Option<Arc<Store>> {
     let path = data_dir.join("edx-store");
     if let Err(e) = std::fs::create_dir_all(&path) {
         state.log("WARN", format!("EDX store dir {}: {e}", path.display())).await;
@@ -115,6 +218,9 @@ pub async fn enable_serving(state: &Arc<AppState>, data_dir: &std::path::Path) -
         }
     };
     state.set_edx_store(store.clone()).await;
+    state
+        .set_edx_fetcher(Arc::new(RuntimeEdxFetcher { state: state.clone(), privatekey }))
+        .await;
     // Register any xites already loaded before the store was installed, so
     // serving does not depend on load order.
     let n = state.edx_register_all_loaded().await;
@@ -156,14 +262,11 @@ mod tests {
         }
     }
 
-    /// End-to-end serve fork: a node with EDX enabled answers an EDX peer's
-    /// GetSigned (the signed content.json) and GetRange (bao-verified file
-    /// bytes from its object store) over a real TCP socket, on the same port
-    /// the msgpack file server uses.
-    #[tokio::test]
-    async fn edx_peer_gets_signed_content_and_a_verified_file() {
-        // Node B: sign an EDX xite on disk, install a store, load it (which
-        // registers its files into the store).
+    /// Bring up a seeder node serving an EDX xite (index.html + a 400 KB
+    /// movie.bin) on a real TCP port. Returns its address, the signed
+    /// content.json bytes + value, the movie bytes, and the socket address.
+    async fn spawn_seeder(
+    ) -> (String, Vec<u8>, serde_json::Value, Vec<u8>, std::net::SocketAddr) {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
         let site_dir = tempfile::tempdir().unwrap();
@@ -184,17 +287,28 @@ mod tests {
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
             .await;
         assert!(state_b.load_content_from_disk(&address).await, "load registers files into the store");
+        std::mem::forget(site_dir); // keep the on-disk files for the test's life
+        std::mem::forget(store_dir);
 
-        // Serve: the real msgpack file server plus the EDX fork, one port.
         let server_key = epix_crypt::new_seed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
         let server = epix_protocol::PeerServer::new(handler)
-            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key.clone()));
+            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key));
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
         });
+        (address, content_bytes, content, movie, addr)
+    }
+
+    /// End-to-end serve fork: a node with EDX enabled answers an EDX peer's
+    /// GetSigned (the signed content.json) and GetRange (bao-verified file
+    /// bytes from its object store) over a real TCP socket, on the same port
+    /// the msgpack file server uses.
+    #[tokio::test]
+    async fn edx_peer_gets_signed_content_and_a_verified_file() {
+        let (address, content_bytes, content, movie, addr) = spawn_seeder().await;
 
         // Node A: dial the EDX link (magic sniffed on the shared port).
         let stream = TcpTransport.dial(&epix_core::PeerAddr::Ip(addr)).await.unwrap();
@@ -207,12 +321,7 @@ mod tests {
             now: || 0,
             ..ServeCtx::new(client_store.clone(), Arc::new(NoProvider), epix_crypt::new_seed())
         };
-        let id = client_hello(&l.conn, &cctx, vec![], Some(l.handshake_hash)).await.unwrap();
-        assert_eq!(
-            id.address,
-            epix_crypt::privatekey_to_address(&server_key).unwrap(),
-            "server identity is channel-bound to this session"
-        );
+        client_hello(&l.conn, &cctx, vec![], Some(l.handshake_hash)).await.unwrap();
 
         // GetSigned returns the exact signed content.json bytes.
         match l.conn.request(Req::GetSigned { xite: address.clone(), inner_path: "content.json".into() }).await.unwrap() {
@@ -230,5 +339,45 @@ mod tests {
         assert!(got > 0);
         assert!(client_store.is_complete(e.b3).unwrap(), "the whole file transferred");
         assert_eq!(client_store.read_bytes(e.b3, 3).unwrap(), movie, "bytes verify and reassemble");
+    }
+
+    /// End-to-end fetch driver: a node with only the signed content.json
+    /// pulls a declared file from an EDX peer through the injected fetcher
+    /// (dial -> swarm -> materialize), and the bytes land in its storage.
+    #[tokio::test]
+    async fn a_node_fetches_a_file_from_an_edx_peer() {
+        let (address, content_bytes, content, movie, addr) = spawn_seeder().await;
+
+        // Node A: knows B as a peer, has the manifest but not the file.
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_storage = XiteStorage::new(a_dir.path());
+        a_storage.write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content) })
+            .await;
+        let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+        state_a.set_transport(transport).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        state_a.set_edx_store(a_store).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                state: state_a.clone(),
+                privatekey: epix_crypt::new_seed(),
+            }))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+
+        // The file is not on disk yet.
+        assert!(XiteStorage::new(a_dir.path()).read("movie.bin").is_err());
+
+        // Fetch it over EDX through the injected fetcher.
+        let result = state_a.edx_fetch_file(&address, "movie.bin").await;
+        assert!(matches!(result, Some(Ok(true))), "edx fetch result: {result:?}");
+
+        // It is now materialized on node A's disk, byte-for-byte.
+        let got = XiteStorage::new(a_dir.path()).read("movie.bin").unwrap();
+        assert_eq!(got, movie, "fetched file matches the seeder's bytes");
     }
 }

@@ -1088,15 +1088,17 @@ async fn seed_loop(
             return;
         }
     };
-    // EDX serving (opt-in via EPIX_EDX=1): open + install the content-
-    // addressed object store and register the already-loaded xites into it,
-    // so the file server can answer EDX peers. Sourced from EPIX_DATA_DIR.
+    // EDX (opt-in via EPIX_EDX=1): open + install the content-addressed
+    // object store and the verified-streaming fetcher (from EPIX_DATA_DIR),
+    // register the already-loaded xites, and use one identity key for both
+    // serving and fetching.
+    let edx_key = edx_node_key(&state).await;
     if std::env::var("EPIX_EDX").map(|v| v == "1").unwrap_or(false)
         && state.edx_store().await.is_none()
     {
         match std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()) {
             Some(dir) => {
-                edx::enable_serving(&state, std::path::Path::new(&dir)).await;
+                edx::enable_serving(&state, std::path::Path::new(&dir), edx_key.clone()).await;
             }
             None => {
                 state
@@ -1111,8 +1113,7 @@ async fn seed_loop(
     // streams whose first byte is 'E' to the EDX serve loop on this same
     // port; every other peer stays on the msgpack path. No store, no fork.
     if let Some(store) = state.edx_store().await {
-        let key = edx_node_key(&state).await;
-        server = server.with_edx(edx::edx_hook(state.clone(), store, key));
+        server = server.with_edx(edx::edx_hook(state.clone(), store, edx_key));
         state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
     }
     // A real peer reaching us over clearnet TCP proves the fileserver port is

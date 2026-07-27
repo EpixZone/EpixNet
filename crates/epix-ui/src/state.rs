@@ -60,6 +60,18 @@ pub trait ContentSyncer: Send + Sync {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>);
 }
 
+/// Fetches a file's bytes over the EDX verified-streaming path (installed by
+/// the node, which owns the EDX client stack). Kept behind a trait so the UI
+/// crate stays free of the transport/swarm dependency, like the resolvers.
+#[async_trait::async_trait]
+pub trait EdxFetcher: Send + Sync {
+    /// Fetch `inner_path` of `address` from EDX peers, verify it against its
+    /// `b3` root, and write it into the xite's storage. `Ok(true)` when the
+    /// file is present afterward; `Err` when the EDX fetch could not complete
+    /// (the caller may fall back to the legacy path).
+    async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String>;
+}
+
 /// One file's state during an on-demand clone (progressive serve).
 pub enum LoadingFile {
     /// Verified bytes are on disk - serve them now.
@@ -468,6 +480,9 @@ pub struct AppState {
     /// unchanged; a loaded xite's local files are registered into it on
     /// load so EDX can serve and dedup them (see [`Self::edx_register_xite`]).
     edx_store: RwLock<Option<Arc<epix_blob::store::Store>>>,
+    /// EDX verified-streaming fetcher, installed by the node when EDX is
+    /// enabled. When absent, downloads use the legacy sha512/piecemap path.
+    edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -1002,6 +1017,7 @@ impl AppState {
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
+            edx_fetcher: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -1142,6 +1158,7 @@ impl AppState {
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
+            edx_fetcher: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -5072,6 +5089,20 @@ impl AppState {
         }
         let _cleanup = Cleanup { locks: &self.file_need_locks, key };
         let _guard = lock.lock().await;
+        // EDX: a file carrying a `b3` root fetches over the verified-streaming
+        // path when a fetcher is installed. On success we are done; any error
+        // falls through to the legacy sha512/piecemap fetch below.
+        if entry.get("b3").is_some() {
+            match self.edx_fetch_file(address, inner_path).await {
+                Some(Ok(true)) => return Ok(true),
+                Some(Ok(false)) => {}
+                Some(Err(e)) => {
+                    self.log("WARN", format!("EDX fetch {address}/{inner_path}: {e}; using legacy"))
+                        .await;
+                }
+                None => {} // no fetcher installed
+            }
+        }
         async {
             if is_bigfile {
                 // Fetch the missing pieces, each verified against the
@@ -7735,6 +7766,38 @@ impl AppState {
     /// The installed EDX object store, if any.
     pub async fn edx_store(&self) -> Option<Arc<epix_blob::store::Store>> {
         self.edx_store.read().await.clone()
+    }
+
+    /// Install the EDX verified-streaming fetcher (set by the node).
+    pub async fn set_edx_fetcher(&self, fetcher: Arc<dyn EdxFetcher>) {
+        *self.edx_fetcher.write().await = Some(fetcher);
+    }
+
+    /// Fetch `inner_path` of `address` over EDX via the installed fetcher.
+    /// `Ok(None)` when no fetcher is installed (fall back to the legacy path);
+    /// otherwise the fetcher's result.
+    pub async fn edx_fetch_file(&self, address: &str, inner_path: &str) -> Option<Result<bool, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_file(address, inner_path).await)
+    }
+
+    /// Write EDX-fetched bytes into a xite's storage as `inner_path`, so the
+    /// existing file readers/serve path see a normal on-disk file. Used by
+    /// the EDX fetcher to materialize a completed object.
+    pub async fn edx_materialize_file(
+        &self,
+        address: &str,
+        inner_path: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())
     }
 
     /// Register every currently-loaded xite's files into the EDX store, so a
