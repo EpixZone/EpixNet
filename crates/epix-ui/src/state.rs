@@ -7809,8 +7809,21 @@ impl AppState {
     /// The declared size of an EDX file from its signed content.json entry,
     /// so the range serve path knows the total before any bytes are on disk.
     pub async fn edx_size(&self, address: &str, inner_path: &str) -> Option<u64> {
-        let content = self.xites.read().await.get(address)?.content.clone()?;
-        epix_blob::manifest::edx_entry(&content, inner_path).map(|e| e.size)
+        // Root or child content.json: declared_entry walks to the governing
+        // content.json, so per-user files resolve too.
+        let (entry, _, _) = self.declared_entry(address, inner_path).await?;
+        entry.get("size").and_then(Value::as_u64)
+    }
+
+    /// Resolve a declared file to its EDX object id + size, from the root OR
+    /// the child/per-user content.json that governs the path. Every signed
+    /// content.json stamps a `b3` per file, so forum and per-user content is
+    /// EDX-addressable without a root-only lookup.
+    pub async fn edx_resolve(&self, address: &str, inner_path: &str) -> Option<(epix_blob::ObjId, u64)> {
+        let (entry, _dir, _opt) = self.declared_entry(address, inner_path).await?;
+        let b3 = epix_blob::ObjId::from_hex(entry.get("b3")?.as_str()?)?;
+        let size = entry.get("size").and_then(Value::as_u64)?;
+        Some((b3, size))
     }
 
     /// Write EDX-fetched bytes into a xite's storage as `inner_path`, so the

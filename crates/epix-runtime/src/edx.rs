@@ -397,13 +397,10 @@ impl RuntimeEdxFetcher {
         }
     }
 
-    /// Resolve `inner_path`'s object id + size from the signed content.json.
+    /// Resolve `inner_path`'s object id + size from the root OR the governing
+    /// child/per-user content.json (so forum and per-user files resolve too).
     async fn resolve(&self, address: &str, inner_path: &str) -> Result<Option<(ObjId, u64)>, String> {
-        let content_bytes =
-            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
-        let content: serde_json::Value =
-            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
-        Ok(epix_blob::manifest::edx_entry(&content, inner_path).map(|e| (e.b3, e.size)))
+        Ok(self.state.edx_resolve(address, inner_path).await)
     }
 
     /// Dial the xite's connectable peers as EDX links and learn what each
@@ -766,6 +763,89 @@ mod tests {
         // Only the covering groups were fetched: the object is NOT complete.
         let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
         assert!(!a_store.is_complete(id).unwrap(), "a seek must not pull the whole file");
+    }
+
+    /// Social/forum content over EDX: a per-user file declared in a child
+    /// content.json (as forums store each user's posts) is registered by the
+    /// seeder and fetched + resolved by a client through the governing child
+    /// content.json, not just the root.
+    #[tokio::test]
+    async fn a_per_user_child_file_transfers_over_edx() {
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(site_dir.path());
+        storage.write("index.html", b"<h1>forum</h1>").unwrap();
+        let post = b"a forum post by alice, delivered over EDX not msgpack".to_vec();
+        storage.write("data/users/alice/data.json", &post).unwrap();
+        // A child content.json declaring the per-user file with its b3 (what
+        // sign_child stamps in production; constructed here to skip the cert
+        // flow). The transfer path reads the files map, not the signature.
+        let b3 = epix_blob::ObjId::of(&post);
+        let child = serde_json::json!({
+            "files": { "data.json": { "size": post.len(), "b3": b3.to_string() } },
+            "modified": 1000, "address": address,
+            "inner_path": "data/users/alice/content.json",
+        });
+        storage
+            .write("data/users/alice/content.json", &serde_json::to_vec(&child).unwrap())
+            .unwrap();
+        let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
+        xite.sign(&privkey, 1000.0).unwrap();
+        let content_bytes = xite.storage.read("content.json").unwrap();
+
+        // Node B: load (registers the root AND the child file) and serve.
+        let state_b = AppState::new("node-b");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        state_b
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .await;
+        assert!(state_b.load_content_from_disk(&address).await);
+        // The per-user file's object is now in the store (child recursion).
+        assert!(store_b.contains(b3).unwrap(), "child file registered for serving");
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+        let server_key = epix_crypt::new_seed();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
+        let server = epix_protocol::PeerServer::new(handler)
+            .with_edx(edx_hook(state_b.clone(), store_b, server_key, None));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        // Node A: has root + child content.json on disk, fetches the per-user
+        // file over EDX (resolved via the child content.json).
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_storage = XiteStorage::new(a_dir.path());
+        a_storage.write("content.json", &content_bytes).unwrap();
+        a_storage
+            .write("data/users/alice/content.json", &serde_json::to_vec(&child).unwrap())
+            .unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: None })
+            .await;
+        assert!(state_a.load_content_from_disk(&address).await);
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                state: state_a.clone(),
+                privatekey: epix_crypt::new_seed(),
+                choker: None,
+            }))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+
+        let result = state_a.edx_fetch_file(&address, "data/users/alice/data.json").await;
+        assert!(matches!(result, Some(Ok(true))), "child-file fetch: {result:?}");
+        let got = XiteStorage::new(a_dir.path()).read("data/users/alice/data.json").unwrap();
+        assert_eq!(got, post, "per-user file transferred over EDX");
     }
 
     /// Encrypted shards end to end: a private file signs into content-

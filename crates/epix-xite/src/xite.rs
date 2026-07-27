@@ -918,6 +918,50 @@ impl Xite {
                 }
             }
         }
+
+        // Child / per-user content.json units: their files carry a b3 too, so
+        // register them (full path = the unit's dir + the relative path) so
+        // this node can serve forum and per-user content over EDX.
+        for cj in self.storage.list_files() {
+            if cj == "content.json" || !cj.ends_with("/content.json") {
+                continue;
+            }
+            let dir = &cj[..cj.len() - "content.json".len()]; // trailing '/'
+            let Ok(bytes) = self.storage.read(&cj) else { continue };
+            let Ok(child) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            for key in ["files", "files_optional"] {
+                let Some(entries) = child.get(key).and_then(Value::as_object) else { continue };
+                for (rel, e) in entries {
+                    let Some(id) =
+                        e.get("b3").and_then(Value::as_str).and_then(epix_blob::ObjId::from_hex)
+                    else {
+                        continue;
+                    };
+                    let full = format!("{dir}{rel}");
+                    let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
+                    if !self.storage.exists(&full) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let res = if epix_blob::bundle::is_bundleable(size) {
+                        self.storage.read(&full).and_then(|b| {
+                            store.insert_bytes(id, epix_blob::Ns::Plain, &b, now).map_err(Error::Io)
+                        }).map(|_| ())
+                    } else {
+                        self.storage.path(&full).and_then(|p| {
+                            store.adopt_file(id, epix_blob::Ns::Plain, &p, now).map(|_| ()).map_err(Error::Io)
+                        })
+                    };
+                    match res {
+                        Ok(()) => {
+                            let _ = store.pin(id);
+                            registered += 1;
+                        }
+                        Err(_) => skipped += 1,
+                    }
+                }
+            }
+        }
         Ok((registered, skipped))
     }
 
