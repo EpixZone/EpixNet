@@ -287,6 +287,11 @@ impl Swarm {
             let mut progressed = false;
             for outcome in results {
                 report.duplicates_issued += outcome.duplicates;
+                // Fold the winner's measured latency into the class prior, so
+                // the next round's timeout/duplication uses real RTT.
+                if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
+                    self.stats.observe(cls, el);
+                }
                 let Some(label) = outcome.winner_label else { continue };
                 for g in &outcome.groups {
                     remaining.remove(*g..*g + 1);
@@ -348,6 +353,7 @@ impl Swarm {
             )
         };
 
+        let start = std::time::Instant::now();
         let primary_fut = fetch_from(primary);
         tokio::pin!(primary_fut);
 
@@ -357,7 +363,8 @@ impl Swarm {
         // so a fast primary error must not fall through to a re-await.
         let primary_errored = match tokio::time::timeout(timeout, &mut primary_fut).await {
             Ok(Ok(_)) => {
-                return BatchOutcome::won(groups, peers[primary].label.clone(), 0);
+                let cls = peers[primary].class;
+                return BatchOutcome::won(groups, peers[primary].label.clone(), 0, cls, start.elapsed());
             }
             Ok(Err(_)) => true,  // primary finished with an error
             Err(_) => false,     // primary still running, just slow
@@ -384,7 +391,10 @@ impl Swarm {
                 return BatchOutcome::failed(0);
             }
             return match primary_fut.await {
-                Ok(_) => BatchOutcome::won(groups, peers[primary].label.clone(), 0),
+                Ok(_) => {
+                    let cls = peers[primary].class;
+                    BatchOutcome::won(groups, peers[primary].label.clone(), 0, cls, start.elapsed())
+                }
                 Err(_) => BatchOutcome::failed(0),
             };
         }
@@ -403,26 +413,39 @@ impl Swarm {
 
         let dups = targets.len() as u64;
         match select_first_ok(racers).await {
-            Some(winner) => BatchOutcome::won(groups, peers[winner].label.clone(), dups),
+            Some(winner) => {
+                let cls = peers[winner].class;
+                BatchOutcome::won(groups, peers[winner].label.clone(), dups, cls, start.elapsed())
+            }
             None => BatchOutcome::failed(dups),
         }
     }
 }
 
 /// The result of racing one batch: which groups landed (empty on
-/// failure), the winning peer's label, and how many duplicates fired.
+/// failure), the winning peer's label, how many duplicates fired, and the
+/// winner's class + measured request latency (fed back into the per-class
+/// EWMA so duplicate-on-timeout uses real RTT, not just the static prior).
 struct BatchOutcome {
     groups: Vec<u64>,
     winner_label: Option<String>,
     duplicates: u64,
+    winner_class: Option<Class>,
+    elapsed: Option<Duration>,
 }
 
 impl BatchOutcome {
-    fn won(groups: Vec<u64>, label: String, duplicates: u64) -> Self {
-        Self { groups, winner_label: Some(label), duplicates }
+    fn won(groups: Vec<u64>, label: String, duplicates: u64, class: Class, elapsed: Duration) -> Self {
+        Self {
+            groups,
+            winner_label: Some(label),
+            duplicates,
+            winner_class: Some(class),
+            elapsed: Some(elapsed),
+        }
     }
     fn failed(duplicates: u64) -> Self {
-        Self { groups: Vec::new(), winner_label: None, duplicates }
+        Self { groups: Vec::new(), winner_label: None, duplicates, winner_class: None, elapsed: None }
     }
 }
 

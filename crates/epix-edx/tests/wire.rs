@@ -253,6 +253,14 @@ async fn multi_peer_striping_and_tor_only_swarm() {
     let peers_used = report.by_peer.len();
     assert!(peers_used >= 2, "work should stripe across peers, used {peers_used}: {:?}", report.by_peer);
 
+    // The per-class EWMA was fed by the fetch: at least one class prior moved
+    // off its static default (duplicate-on-timeout now uses measured RTT).
+    let default = epix_edx::sched::ClassStats::default();
+    let moved = [sim::Class::Clearnet, sim::Class::I2p, sim::Class::Tor]
+        .iter()
+        .any(|c| swarm.stats().rtt(*c) != default.rtt(*c));
+    assert!(moved, "a class RTT prior should update after observing a real fetch");
+
     // A Tor-ONLY swarm still completes (no self-starvation when every
     // peer is slow — the whole reason for per-class scheduling).
     let (tc, _) = seed_and_connect(net.clone(), ip(14), sim::Class::Tor, &data).await;
