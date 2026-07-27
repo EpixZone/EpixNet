@@ -151,13 +151,24 @@ where
         if secure.load(Ordering::Relaxed) {
             if let Some(location) = https_upgrade_target(&sock).await {
                 proxy_debug(&format!("plain-http upgrade -> {location}"));
+                // Drain the request head before responding: the target was
+                // only peeked, and closing a socket that still holds unread
+                // received data sends a TCP RST instead of FIN - the RST can
+                // destroy the in-flight 307 before the browser reads it,
+                // surfacing as an intermittent "The connection was reset" on
+                // plain-http xite loads. (GET/HEAD only, so the head is the
+                // whole request.) The graceful shutdown then puts the FIN
+                // after the response bytes.
+                let _ = consume_headers(&mut sock).await;
                 let resp = format!(
                     "HTTP/1.1 307 Temporary Redirect\r\n\
                      Location: {location}\r\n\
                      Content-Length: 0\r\n\
                      Connection: close\r\n\r\n"
                 );
-                return sock.write_all(resp.as_bytes()).await.map_err(|e| e.to_string());
+                sock.write_all(resp.as_bytes()).await.map_err(|e| e.to_string())?;
+                let _ = sock.shutdown().await;
+                return Ok(());
             }
         }
         proxy_debug("plain-http serve");
