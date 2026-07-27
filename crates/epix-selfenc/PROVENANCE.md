@@ -4,9 +4,9 @@ This crate is a from-scratch implementation of the *published
 self-encryption algorithm idea* (split a file into chunks; derive each
 chunk's encryption key from content hashes so encryption is convergent;
 address ciphertext by its own hash), extended with EpixNet-specific
-changes (owner salt in the key derivation, a random-key envelope mode,
-ChaCha20-Poly1305 AEAD, BLAKE3 throughout, and a symmetric-outer
-data-map).
+changes: an owner salt folded into chunk derivation, a second
+random-envelope mode, an AEAD (XChaCha20-Poly1305), BLAKE3 hashing
+throughout, and a symmetric-outer data-map.
 
 **No source code of the GPLv3 `self_encryption` crate (or any other GPL
 implementation) was read, consulted, or referenced while designing or

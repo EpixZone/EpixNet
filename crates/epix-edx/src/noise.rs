@@ -299,10 +299,10 @@ mod tests {
     #[tokio::test]
     async fn channel_binding_signs_and_verifies() {
         let (a, b) = secured_pair().await;
-        let privkey = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
-        let node_pk = epix_crypt::private_to_compressed_pubkey(privkey).unwrap();
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let node_pk = epix_crypt::private_to_compressed_pubkey(priv_hex).unwrap();
 
-        let sig = sign_binding(&a.handshake_hash, privkey).unwrap();
+        let sig = sign_binding(&a.handshake_hash, priv_hex).unwrap();
         // The peer verifies with the SAME hash (it has its own copy).
         assert!(verify_binding(&b.handshake_hash, &node_pk, &sig));
 
