@@ -2251,6 +2251,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-feed"
+version = "0.1.0"
+dependencies = [
+ "epix-blob",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "epix-ffi"
 version = "0.1.0"
 dependencies = [

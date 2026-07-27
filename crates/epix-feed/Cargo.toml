@@ -1,0 +1,12 @@
+[package]
+name = "epix-feed"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic feed organization for social data at scale: sealed segments, no-sealer checkpoints, index-by-target, OR-set reaction counts, gallery rollups, and sticky moderation over byte-identical signed records."
+
+[dependencies]
+epix-blob = { path = "../epix-blob" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
