@@ -2514,6 +2514,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "epix-blob",
  "epix-bt",
  "epix-chain",
  "epix-content",

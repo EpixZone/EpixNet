@@ -8,6 +8,7 @@ description = "The local UI server: serves xite files over HTTP and the EpixFram
 epix-core = { path = "../epix-core" }
 epix-content = { path = "../epix-content" }
 epix-xite = { path = "../epix-xite" }
+epix-blob = { path = "../epix-blob" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
 epix-db = { path = "../epix-db" }

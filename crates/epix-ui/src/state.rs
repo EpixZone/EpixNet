@@ -462,6 +462,12 @@ pub struct AppState {
     peer_finder: RwLock<Option<Arc<dyn PeerFinder>>>,
     /// Included/user-content syncer, installed by the node.
     content_syncer: RwLock<Option<Arc<dyn ContentSyncer>>>,
+    /// Content-addressed EDX object store (bao-verified sparse objects +
+    /// slabs), installed by the node when EDX serving is enabled. When
+    /// absent (the default), the node runs the legacy XiteStorage-only path
+    /// unchanged; a loaded xite's local files are registered into it on
+    /// load so EDX can serve and dedup them (see [`Self::edx_register_xite`]).
+    edx_store: RwLock<Option<Arc<epix_blob::store::Store>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -995,6 +1001,7 @@ impl AppState {
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
+            edx_store: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -1134,6 +1141,7 @@ impl AppState {
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
+            edx_store: RwLock::new(None),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -6977,6 +6985,14 @@ impl AppState {
         // update_content also finalizes settings (size/modified via
         // apply_content_stats) and rebuilds the db from the on-disk files.
         self.update_content(address, xite.content.clone()).await;
+        // Register the just-loaded files into the EDX object store (no-op
+        // when no store is installed), so EDX can serve and dedup them
+        // without a re-download.
+        if let Some(store) = self.edx_store().await {
+            if let Err(e) = xite.edx_register(&store, now_secs().max(0) as u64) {
+                self.log("WARN", format!("edx_register {address}: {e}")).await;
+            }
+        }
         self.persist_sites().await;
         self.push_site_info(address).await;
         true
@@ -7707,6 +7723,45 @@ impl AppState {
     /// Install the included/user-content syncer (set by the node).
     pub async fn set_content_syncer(&self, syncer: Arc<dyn ContentSyncer>) {
         *self.content_syncer.write().await = Some(syncer);
+    }
+
+    /// Install the content-addressed EDX object store (set by the node when
+    /// EDX serving is enabled). Until this is called, every EDX-store hook
+    /// is a no-op and the node behaves exactly as before.
+    pub async fn set_edx_store(&self, store: Arc<epix_blob::store::Store>) {
+        *self.edx_store.write().await = Some(store);
+    }
+
+    /// The installed EDX object store, if any.
+    pub async fn edx_store(&self) -> Option<Arc<epix_blob::store::Store>> {
+        self.edx_store.read().await.clone()
+    }
+
+    /// Register a xite's local files (and the bundles its manifest declares)
+    /// into the EDX object store, content-addressed by BLAKE3. No re-download
+    /// and no second copy: small files pack into slabs, large files adopt in
+    /// place. A no-op returning `None` when no store is installed, the xite
+    /// is unknown, or it has no EDX manifest fields yet. Otherwise returns
+    /// `(registered, skipped)`; a skip is a missing or changed local file,
+    /// which simply stays fetchable from the swarm.
+    pub async fn edx_register_xite(&self, address: &str) -> Option<(usize, usize)> {
+        let store = self.edx_store().await?;
+        let storage = {
+            let xites = self.xites.read().await;
+            self.resolve_xite(&xites, address)?.storage.clone()
+        };
+        let addr = Address::parse(address.to_string()).ok()?;
+        let mut xite = Xite::new(addr, storage);
+        if !(xite.load_content().unwrap_or(false) || xite.load_content_local()) {
+            return None;
+        }
+        match xite.edx_register(&store, now_secs().max(0) as u64) {
+            Ok(counts) => Some(counts),
+            Err(e) => {
+                self.log("WARN", format!("edx_register {address}: {e}")).await;
+                None
+            }
+        }
     }
 
     /// Sync a xite's included / per-user content via the installed
