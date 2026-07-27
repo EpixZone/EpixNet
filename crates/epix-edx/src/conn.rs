@@ -177,6 +177,18 @@ impl Conn {
         self.send(Frame { stream, body: FrameBody::Cancel }).await
     }
 
+    /// Best-effort synchronous cancel for Drop paths (no await). When an
+    /// in-flight fetch future is abandoned - a duplicate racer another peer
+    /// beat, a seek that moved on, a deadline give-up - its guard fires this
+    /// to tell the peer to stop encoding a slice we no longer need. Uses
+    /// `try_send` so it never blocks a drop; a momentarily full outbound
+    /// queue just skips the frame (the stream still ends when the request or
+    /// connection does). Clears the local waiter either way.
+    pub fn cancel_now(&self, stream: u64) {
+        self.shared.waiters.lock().expect("waiters").remove(&stream);
+        let _ = self.outbound.try_send(Frame { stream, body: FrameBody::Cancel });
+    }
+
     /// Whether the peer cancelled `stream` (consumes the flag). Serve
     /// tasks call this between Data frames and stop encoding on true.
     pub fn take_cancelled(&self, stream: u64) -> bool {
