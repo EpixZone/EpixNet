@@ -309,6 +309,82 @@ impl RuntimeEdxFetcher {
         Ok((conn, identity))
     }
 
+    /// Fetch an encrypted-shard file: pull each content-addressed ciphertext
+    /// shard (Ns::Shard) from peers, then decrypt with the xite salt from the
+    /// signed content.json and materialize the plaintext. A node without the
+    /// content.json (a volunteer holding only shards by hash) cannot do this.
+    async fn fetch_shard_file(
+        &self,
+        address: &str,
+        inner_path: &str,
+        content: &serde_json::Value,
+        shard: epix_blob::manifest::ShardEntry,
+        store: &Arc<Store>,
+    ) -> Result<bool, String> {
+        let salt = epix_blob::manifest::edx_salt(content)
+            .ok_or("no edx_salt (missing viewing material)")?;
+        let now = now_secs();
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let peers = self.state.connectable_peers(address, 8).await;
+
+        // Fetch each ciphertext shard object into the store, verified by its
+        // BLAKE3 address (== the shard's bao root).
+        for c in &shard.chunks {
+            let id = c.cipher_addr;
+            let csize = c.csize as u64;
+            if store.is_complete(id).unwrap_or(false) {
+                continue;
+            }
+            store.ensure_sparse(id, Ns::Shard, csize, now).map_err(|e| e.to_string())?;
+            let mut handles: Vec<PeerHandle> = Vec::new();
+            let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
+            for peer in &peers {
+                let Ok((conn, identity)) = self.dial(&transport, peer).await else { continue };
+                if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&conn, id).await {
+                    let label = peer.to_string();
+                    node_pks.insert(label.clone(), identity.node_pk);
+                    handles.push(PeerHandle { conn, class: Class::of_addr(peer), bits, label });
+                }
+            }
+            if handles.is_empty() {
+                return Err(format!("no EDX peer holds shard {id}"));
+            }
+            let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
+            let mut swarm = Swarm::new(store.clone(), id, csize);
+            let report = swarm
+                .fetch(&needed, &handles, Deadline::background(), now)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.credit(&report, &node_pks, now);
+            if !store.is_complete(id).map_err(|e| e.to_string())? {
+                return Err(format!("shard {id} did not complete"));
+            }
+        }
+
+        // Decrypt: the store is the shard fetcher, keyed by ciphertext address.
+        let chunks: Vec<epix_selfenc::ChunkRef> = shard
+            .chunks
+            .iter()
+            .map(|c| epix_selfenc::ChunkRef {
+                plain_hash: c.plain_hash,
+                cipher_addr: c.cipher_addr.0,
+                len: c.len,
+            })
+            .collect();
+        let mode = if shard.mode == 1 {
+            epix_selfenc::Mode::RandomKey
+        } else {
+            epix_selfenc::Mode::SaltedConvergent
+        };
+        let plaintext = epix_selfenc::decrypt(mode, &chunks, &salt, |addr| {
+            store.read_bytes(epix_blob::ObjId(*addr), now).ok()
+        })
+        .map_err(|e| e.to_string())?;
+        self.state.edx_materialize_file(address, inner_path, &plaintext).await?;
+        let _ = store.enforce_quota(store_quota());
+        Ok(true)
+    }
+
     /// Credit each peer that delivered groups in `report` for the bytes it
     /// served us (reciprocity), when a shared choker is installed.
     fn credit(&self, report: &epix_edx::sched::FetchReport, node_pks: &HashMap<String, Vec<u8>>, now: u64) {
@@ -364,6 +440,14 @@ impl RuntimeEdxFetcher {
 impl EdxFetcher for RuntimeEdxFetcher {
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
         let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        // Encrypted-shard file: fetch the ciphertext shards and decrypt.
+        let content_bytes =
+            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
+        let content: serde_json::Value =
+            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
+        if let Some(shard) = epix_blob::manifest::edx_shard_entry(&content, inner_path) {
+            return self.fetch_shard_file(address, inner_path, &content, shard, &store).await;
+        }
         let Some((id, size)) = self.resolve(address, inner_path).await? else {
             return Err("no edx entry for file".into());
         };
@@ -682,6 +766,78 @@ mod tests {
         // Only the covering groups were fetched: the object is NOT complete.
         let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
         assert!(!a_store.is_complete(id).unwrap(), "a seek must not pull the whole file");
+    }
+
+    /// Encrypted shards end to end: a private file signs into content-
+    /// addressed ciphertext shards (its plaintext never enters the plain
+    /// `files` map), a seeder holds only ciphertext, and a client that has
+    /// the signed content.json (the salt + data-map) fetches the shards over
+    /// EDX and decrypts them back to the exact plaintext.
+    #[tokio::test]
+    async fn a_private_file_transfers_as_encrypted_shards() {
+        // Node B: sign a xite with a `shard` pattern; the private file is
+        // self-encrypted, so it leaves `files` for `files_shard`.
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let secret = b"the private note nobody but a viewer should read".to_vec();
+        let site_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(site_dir.path());
+        storage.write("index.html", b"<h1>public</h1>").unwrap();
+        storage.write("private/secret.txt", &secret).unwrap();
+        let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
+        xite.content = Some(serde_json::json!({ "shard": "private/.*" }));
+        xite.sign(&privkey, 1000.0).unwrap();
+        let content = xite.content.clone().unwrap();
+        // The plaintext is NOT in the plain files map; it is a shard entry.
+        assert!(content.get("files").and_then(|f| f.get("private/secret.txt")).is_none());
+        assert!(epix_blob::manifest::edx_shard_entry(&content, "private/secret.txt").is_some());
+        assert!(epix_blob::manifest::edx_salt(&content).is_some());
+        let content_bytes = xite.storage.read("content.json").unwrap();
+
+        let state_b = AppState::new("node-b");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        state_b
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .await;
+        assert!(state_b.load_content_from_disk(&address).await, "load stores shard ciphertext");
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+        let server_key = epix_crypt::new_seed();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
+        let server = epix_protocol::PeerServer::new(handler)
+            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key, None));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        // Node A: has the signed content.json (salt + data-map) but not the file.
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                state: state_a.clone(),
+                privatekey: epix_crypt::new_seed(),
+                choker: None,
+            }))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+
+        // Fetch the shard file: fetch ciphertext shards over EDX, decrypt.
+        let result = state_a.edx_fetch_file(&address, "private/secret.txt").await;
+        assert!(matches!(result, Some(Ok(true))), "shard fetch: {result:?}");
+        let got = XiteStorage::new(a_dir.path()).read("private/secret.txt").unwrap();
+        assert_eq!(got, secret, "decrypted plaintext matches");
     }
 
     /// Reciprocity: with a shared choker installed, fetching from a peer

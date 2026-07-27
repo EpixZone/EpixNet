@@ -661,6 +661,8 @@ impl Xite {
 
         let ignore = path_pattern(content.get("ignore"));
         let optional = path_pattern(content.get("optional"));
+        // Files matching the `shard` pattern are self-encrypted (private).
+        let shard = path_pattern(content.get("shard"));
         let (files, files_optional) =
             self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional)?;
 
@@ -681,6 +683,45 @@ impl Xite {
         map.insert("inner_path".into(), json!("content.json"));
         if !map.contains_key("signs_required") {
             map.insert("signs_required".into(), json!(1));
+        }
+
+        // EDX shards: files matching the `shard` pattern are self-encrypted
+        // into content-addressed ciphertext shards. Their data-map (chunk
+        // list + the xite salt) lives in the signed content.json, so a reader
+        // who resolves the xite can decrypt, while a volunteer that only holds
+        // ciphertext shards by hash cannot. They leave `files` entirely, so
+        // they are never served or hashed as plaintext.
+        if shard.is_some() {
+            let salt = self.ensure_edx_salt(&mut content);
+            content.as_object_mut().and_then(|o| o.remove("files_shard"));
+            let shard_paths: Vec<String> = content
+                .get("files")
+                .and_then(Value::as_object)
+                .map(|f| f.keys().filter(|p| pattern_matches(&shard, p)).cloned().collect())
+                .unwrap_or_default();
+            for path in shard_paths {
+                let bytes = self.storage.read(&path)?;
+                let enc = epix_selfenc::encrypt_convergent(&bytes, &salt);
+                let chunks: Vec<epix_blob::manifest::ShardChunk> = enc
+                    .chunks
+                    .iter()
+                    .zip(&enc.shards)
+                    .map(|(c, (_addr, ct))| epix_blob::manifest::ShardChunk {
+                        plain_hash: c.plain_hash,
+                        cipher_addr: epix_blob::ObjId(c.cipher_addr),
+                        len: c.len,
+                        csize: ct.len() as u32,
+                    })
+                    .collect();
+                epix_blob::manifest::set_shard_entry(
+                    &mut content,
+                    &path,
+                    &epix_blob::manifest::ShardEntry { size: bytes.len() as u64, mode: 0, chunks },
+                );
+                if let Some(f) = content.get_mut("files").and_then(Value::as_object_mut) {
+                    f.remove(&path);
+                }
+            }
         }
 
         // EDX (docs/edx-manifest.md): bundle small required files with
@@ -721,6 +762,22 @@ impl Xite {
         self.storage.write_atomic("content.json", &bytes)?;
         self.content = Some(content);
         Ok(())
+    }
+
+    /// The owner salt for salted-convergent shards, read from `edx_salt` or
+    /// freshly generated and stamped (stable across re-signs for dedup).
+    fn ensure_edx_salt(&self, content: &mut Value) -> Vec<u8> {
+        if let Some(salt) = epix_blob::manifest::edx_salt(content) {
+            return salt;
+        }
+        let hex = epix_crypt::new_seed(); // 32 random bytes, hex
+        if let Some(o) = content.as_object_mut() {
+            o.insert("edx_salt".into(), json!(hex));
+        }
+        (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect()
     }
 
     /// The EDX migration pass: register this xite's local files (and the
@@ -832,6 +889,32 @@ impl Xite {
                     }
                 } else {
                     skipped += 1;
+                }
+            }
+        }
+
+        // Encrypted shards: re-derive the ciphertext (deterministic from the
+        // plaintext + xite salt) and store each shard object by its address as
+        // Ns::Shard, so this node can serve them to peers. The addresses match
+        // the ones the signed content.json already recorded.
+        if let Some(salt) = epix_blob::manifest::edx_salt(content) {
+            if let Some(fs) = content.get("files_shard").and_then(Value::as_object) {
+                for path in fs.keys() {
+                    let Ok(bytes) = self.storage.read(path) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let enc = epix_selfenc::encrypt_convergent(&bytes, &salt);
+                    for (addr, ct) in &enc.shards {
+                        let id = epix_blob::ObjId(*addr);
+                        match store.insert_bytes(id, epix_blob::Ns::Shard, ct, now) {
+                            Ok(_) => {
+                                let _ = store.pin(id);
+                                registered += 1;
+                            }
+                            Err(_) => skipped += 1,
+                        }
+                    }
                 }
             }
         }

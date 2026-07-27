@@ -76,6 +76,75 @@ fn parse_entry(entry: &Value, content: &Value) -> Option<EdxEntry> {
     Some(EdxEntry { size, b3, bundle })
 }
 
+/// One chunk of an encrypted-shard file's data-map: the plaintext hash
+/// (for post-decrypt verification), the ciphertext object address (where
+/// the shard is stored/fetched), and the plaintext length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardChunk {
+    pub plain_hash: [u8; 32],
+    pub cipher_addr: ObjId,
+    /// Plaintext length of this chunk.
+    pub len: u32,
+    /// Ciphertext object length (what the fetcher must request for the
+    /// content-addressed shard at `cipher_addr`).
+    pub csize: u32,
+}
+
+/// A private/encrypted file's manifest entry: the plaintext size, the
+/// self-encryption mode, and the ordered chunk data-map. The data-map lives
+/// in the (signed) content.json, so a reader who resolves the xite can
+/// decrypt, while a volunteer that only holds ciphertext shards by hash
+/// (and no content.json) cannot map or read them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardEntry {
+    pub size: u64,
+    /// 0 = salted-convergent (dedup, keyed by the xite salt), 1 = random-key.
+    pub mode: u8,
+    pub chunks: Vec<ShardChunk>,
+}
+
+/// The owner salt for salted-convergent shards (from `edx_salt`, hex).
+pub fn edx_salt(content: &Value) -> Option<Vec<u8>> {
+    let hex = content.get("edx_salt")?.as_str()?;
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
+}
+
+/// Read one file's encrypted-shard entry from `files_shard`.
+pub fn edx_shard_entry(content: &Value, inner_path: &str) -> Option<ShardEntry> {
+    let e = content.get("files_shard")?.get(inner_path)?;
+    let size = e.get("size").and_then(Value::as_u64)?;
+    let mode = e.get("mode").and_then(Value::as_u64).unwrap_or(0) as u8;
+    let arr = e.get("chunks")?.as_array()?;
+    let mut chunks = Vec::with_capacity(arr.len());
+    for c in arr {
+        let mut plain_hash = [0u8; 32];
+        let ph = c.get("ph")?.as_str()?;
+        for (i, b) in plain_hash.iter_mut().enumerate() {
+            *b = u8::from_str_radix(ph.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        let cipher_addr = ObjId::from_hex(c.get("ca")?.as_str()?)?;
+        let len = c.get("len").and_then(Value::as_u64)? as u32;
+        let csize = c.get("cs").and_then(Value::as_u64)? as u32;
+        chunks.push(ShardChunk { plain_hash, cipher_addr, len, csize });
+    }
+    Some(ShardEntry { size, mode, chunks })
+}
+
+/// Write a file's shard entry into `files_shard` (used at signing time).
+pub fn set_shard_entry(content: &mut Value, inner_path: &str, entry: &ShardEntry) {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let chunks: Vec<Value> = entry
+        .chunks
+        .iter()
+        .map(|c| json!({ "ph": hex(&c.plain_hash), "ca": c.cipher_addr.to_string(), "len": c.len, "cs": c.csize }))
+        .collect();
+    let obj = content.as_object_mut().expect("content object");
+    obj.entry("files_shard").or_insert_with(|| json!({})).as_object_mut().unwrap().insert(
+        inner_path.to_string(),
+        json!({ "size": entry.size, "mode": entry.mode, "chunks": chunks }),
+    );
+}
+
 /// Every declared bundle: id -> size.
 pub fn bundles(content: &Value) -> BTreeMap<ObjId, u64> {
     let mut out = BTreeMap::new();
