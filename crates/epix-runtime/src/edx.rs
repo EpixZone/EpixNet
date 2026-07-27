@@ -29,11 +29,19 @@ pub type SharedChoker = Arc<Mutex<Choker>>;
 /// by default; reciprocity is opt-in and this only bites when it is on.
 const EDX_UPLOAD_CAP_BPS: u64 = 8_000_000;
 
-/// The shared upload governor when reciprocity is opted in
-/// (EPIX_EDX_RECIPROCITY=1), else None (serve everything, ungoverned - the
-/// default). One instance is shared between serving and fetching.
+/// True unless `var` is explicitly set to a falsey value (`0`/`false`);
+/// unset means the default. Used for the default-on EDX kill switches.
+pub fn env_on(var: &str) -> bool {
+    std::env::var(var)
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
+/// The shared upload governor. On by default (reciprocity: seed -> faster
+/// service); `EPIX_EDX_RECIPROCITY=0` disables it and serves everything
+/// ungoverned. One instance is shared between serving and fetching.
 pub fn make_choker() -> Option<SharedChoker> {
-    if std::env::var("EPIX_EDX_RECIPROCITY").map(|v| v == "1").unwrap_or(false) {
+    if env_on("EPIX_EDX_RECIPROCITY") {
         Some(Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS))))
     } else {
         None
@@ -345,6 +353,21 @@ mod tests {
     use epix_transport::{TcpTransport, Transport};
     use epix_ui::state::XiteEntry;
     use epix_xite::{Xite, XiteStorage};
+
+    /// EDX and reciprocity are on unless explicitly disabled: env_on returns
+    /// true when unset, false only for a 0/false value. This is the clean-cut
+    /// default (EDX is the transfer protocol; EPIX_EDX=0 is the kill switch).
+    #[test]
+    fn edx_is_on_by_default() {
+        assert!(env_on("EPIX_EDX_A_VAR_THAT_IS_NEVER_SET"), "unset means on");
+        std::env::set_var("EPIX_EDX_KILLSWITCH_TEST", "0");
+        assert!(!env_on("EPIX_EDX_KILLSWITCH_TEST"), "0 disables");
+        std::env::set_var("EPIX_EDX_KILLSWITCH_TEST", "false");
+        assert!(!env_on("EPIX_EDX_KILLSWITCH_TEST"), "false disables");
+        std::env::set_var("EPIX_EDX_KILLSWITCH_TEST", "1");
+        assert!(env_on("EPIX_EDX_KILLSWITCH_TEST"), "1 stays on");
+        std::env::remove_var("EPIX_EDX_KILLSWITCH_TEST");
+    }
 
     /// Client-side no-op provider: `client_hello` only needs our key.
     struct NoProvider;

@@ -1072,10 +1072,10 @@ async fn propagation_loop(
 /// identity (and its reciprocity standing) across restarts; falls back to a
 /// fresh per-boot key when there is no data dir or the file is unusable.
 async fn edx_node_key(state: &Arc<AppState>) -> String {
-    let Some(dir) = std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()) else {
+    let Some(dir) = state.data_root_path() else {
         return epix_crypt::new_seed();
     };
-    let path = std::path::Path::new(&dir).join("edx-node.key");
+    let path = dir.join("edx-node.key");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let key = existing.trim().to_string();
         if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1111,42 +1111,26 @@ async fn seed_loop(
             return;
         }
     };
-    // EDX (opt-in via EPIX_EDX=1): open + install the content-addressed
-    // object store and the verified-streaming fetcher (from EPIX_DATA_DIR),
-    // register the already-loaded xites, and use one identity key for both
-    // serving and fetching.
-    let edx_key = edx_node_key(&state).await;
-    // The shared reciprocity governor (None unless EPIX_EDX_RECIPROCITY=1);
-    // one instance drives both serving and fetch-credit.
-    let edx_choker = edx::make_choker();
-    if std::env::var("EPIX_EDX").map(|v| v == "1").unwrap_or(false)
-        && state.edx_store().await.is_none()
-    {
-        match std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()) {
-            Some(dir) => {
-                edx::enable_serving(
-                    &state,
-                    std::path::Path::new(&dir),
-                    edx_key.clone(),
-                    edx_choker.clone(),
-                )
-                .await;
-            }
-            None => {
-                state
-                    .log("WARN", "EPIX_EDX set but EPIX_DATA_DIR unset; EDX store not opened".to_string())
-                    .await;
+    let mut server = epix_protocol::PeerServer::new(handler);
+    // EDX is the default transfer protocol: open + install the content-
+    // addressed object store and the verified-streaming fetcher under the
+    // node's data dir, register the already-loaded xites, and share one
+    // identity key + reciprocity governor between serving and fetching.
+    // `EPIX_EDX=0` disables it (kill switch); an in-memory node with no data
+    // dir simply skips it. Legacy msgpack peers still interoperate via the
+    // first-byte sniff, so a straggler that has not upgraded keeps working.
+    if edx::env_on("EPIX_EDX") {
+        let edx_key = edx_node_key(&state).await;
+        let edx_choker = edx::make_choker();
+        if state.edx_store().await.is_none() {
+            if let Some(dir) = state.data_root_path() {
+                edx::enable_serving(&state, &dir, edx_key.clone(), edx_choker.clone()).await;
             }
         }
-    }
-
-    let mut server = epix_protocol::PeerServer::new(handler);
-    // EDX coexistence: when an EDX object store is installed, hand accepted
-    // streams whose first byte is 'E' to the EDX serve loop on this same
-    // port; every other peer stays on the msgpack path. No store, no fork.
-    if let Some(store) = state.edx_store().await {
-        server = server.with_edx(edx::edx_hook(state.clone(), store, edx_key, edx_choker));
-        state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
+        if let Some(store) = state.edx_store().await {
+            server = server.with_edx(edx::edx_hook(state.clone(), store, edx_key, edx_choker));
+            state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
+        }
     }
     // A real peer reaching us over clearnet TCP proves the fileserver port is
     // open from the internet - the privacy-preserving alternative to the Python
