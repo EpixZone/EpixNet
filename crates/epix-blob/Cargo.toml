@@ -1,0 +1,13 @@
+[package]
+name = "epix-blob"
+version = "0.1.0"
+edition = "2021"
+description = "EDX verified blob core: BLAKE3/bao outboard trees, verified range encode/decode, the slab store with redb index, and chunk-group bitfields."
+
+# bao-tree is pinned exactly: its encoded slice format is a wire- and
+# (future) consensus-level contract. Bumping it requires re-running the
+# golden vectors in tests/ and a deliberate spec revision.
+[dependencies]
+blake3 = "=1.8.5"
+bao-tree = "=0.16.0"
+redb = "=4.1.0"
