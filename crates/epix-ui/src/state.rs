@@ -70,6 +70,17 @@ pub trait EdxFetcher: Send + Sync {
     /// file is present afterward; `Err` when the EDX fetch could not complete
     /// (the caller may fall back to the legacy path).
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String>;
+
+    /// Fetch just the byte range `[start, start+len)` of `inner_path` over
+    /// EDX and return the verified bytes, without materializing the whole
+    /// file (media seek). `Ok(None)` when the file has no EDX entry.
+    async fn fetch_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, String>;
 }
 
 /// One file's state during an on-demand clone (progressive serve).
@@ -7779,6 +7790,27 @@ impl AppState {
     pub async fn edx_fetch_file(&self, address: &str, inner_path: &str) -> Option<Result<bool, String>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
         Some(fetcher.fetch_file(address, inner_path).await)
+    }
+
+    /// Fetch a byte range of `inner_path` over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed; otherwise the verified bytes (or
+    /// an error / `Ok(None)` for a non-EDX file).
+    pub async fn edx_fetch_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        start: u64,
+        len: u64,
+    ) -> Option<Result<Option<Vec<u8>>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_range(address, inner_path, start, len).await)
+    }
+
+    /// The declared size of an EDX file from its signed content.json entry,
+    /// so the range serve path knows the total before any bytes are on disk.
+    pub async fn edx_size(&self, address: &str, inner_path: &str) -> Option<u64> {
+        let content = self.xites.read().await.get(address)?.content.clone()?;
+        epix_blob::manifest::edx_entry(&content, inner_path).map(|e| e.size)
     }
 
     /// Write EDX-fetched bytes into a xite's storage as `inner_path`, so the

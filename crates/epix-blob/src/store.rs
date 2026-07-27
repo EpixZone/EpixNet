@@ -509,6 +509,47 @@ impl Store {
         Ok(bytes)
     }
 
+    /// Read the byte range `[start, start+len)` of an object, clamped to its
+    /// size. Requires the covering chunk groups to be present (verified on
+    /// write); errors `NotFound` otherwise. For a sparse object this reads
+    /// only the range from disk, so a media seek never materializes the whole
+    /// file.
+    pub fn read_range(&self, id: ObjId, start: u64, len: u64, now: u64) -> io::Result<Vec<u8>> {
+        let mut rec = self.required(id)?;
+        let end = start.saturating_add(len).min(rec.size);
+        if start >= rec.size || end <= start {
+            return Ok(Vec::new());
+        }
+        let bytes = match rec.loc {
+            Loc::Slab { slab, off } => {
+                let b = self.read_slab(slab, off, rec.size)?;
+                if !verified::verify_whole(&b, id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("slab bytes for {id} are corrupt"),
+                    ));
+                }
+                b[start as usize..end as usize].to_vec()
+            }
+            Loc::Sparse => {
+                let groups = crate::bitfield::groups_for_bytes(&(start..end));
+                if !rec.bits().contains_all(&groups) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{id} range [{start},{end}) not present"),
+                    ));
+                }
+                let f = File::open(self.sparse_path(id))?;
+                let mut buf = vec![0u8; (end - start) as usize];
+                positioned_io::ReadAt::read_exact_at(&f, start, &mut buf)?;
+                buf
+            }
+        };
+        rec.last_access = rec.last_access.max(now);
+        self.put_record(id, &rec)?;
+        Ok(bytes)
+    }
+
     fn read_slab(&self, slab: u32, off: u64, size: u64) -> io::Result<Vec<u8>> {
         let f = File::open(self.slab_path(slab))?;
         let mut buf = vec![0u8; size as usize];

@@ -135,31 +135,19 @@ impl RuntimeEdxFetcher {
             .map_err(|e| e.to_string())?;
         Ok(l.conn)
     }
-}
 
-#[async_trait::async_trait]
-impl EdxFetcher for RuntimeEdxFetcher {
-    async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        let store = self.state.edx_store().await.ok_or("no EDX store")?;
-        // Resolve the file's object id + size from the signed content.json.
+    /// Resolve `inner_path`'s object id + size from the signed content.json.
+    async fn resolve(&self, address: &str, inner_path: &str) -> Result<Option<(ObjId, u64)>, String> {
         let content_bytes =
             self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
         let content: serde_json::Value =
             serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
-        let entry =
-            epix_blob::manifest::edx_entry(&content, inner_path).ok_or("no edx entry for file")?;
-        let (id, size) = (entry.b3, entry.size);
-        let now = now_secs();
+        Ok(epix_blob::manifest::edx_entry(&content, inner_path).map(|e| (e.b3, e.size)))
+    }
 
-        // Already complete in the store: just materialize it.
-        if store.is_complete(id).unwrap_or(false) {
-            let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
-            self.state.edx_materialize_file(address, inner_path, &bytes).await?;
-            return Ok(true);
-        }
-
-        // Dial the connectable peers over EDX and learn what each holds. One
-        // link per peer, reused for the whole object (no per-piece redial).
+    /// Dial the xite's connectable peers as EDX links and learn what each
+    /// holds of `id`. One link per peer, reused for the whole fetch.
+    async fn build_peers(&self, address: &str, id: ObjId) -> Result<Vec<PeerHandle>, String> {
         let transport = self.state.transport().await.ok_or("no transport")?;
         let peers = self.state.connectable_peers(address, 8).await;
         if peers.is_empty() {
@@ -169,14 +157,38 @@ impl EdxFetcher for RuntimeEdxFetcher {
         for peer in peers {
             let Ok(conn) = self.dial(&transport, &peer).await else { continue };
             if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&conn, id).await {
-                handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label: peer.to_string() });
+                handles.push(PeerHandle {
+                    conn,
+                    class: Class::of_addr(&peer),
+                    bits,
+                    label: peer.to_string(),
+                });
             }
         }
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
+        Ok(handles)
+    }
+}
 
-        // Run the swarm scheduler into the sparse object.
+#[async_trait::async_trait]
+impl EdxFetcher for RuntimeEdxFetcher {
+    async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        let Some((id, size)) = self.resolve(address, inner_path).await? else {
+            return Err("no edx entry for file".into());
+        };
+        let now = now_secs();
+
+        // Already complete in the store: just materialize it.
+        if store.is_complete(id).unwrap_or(false) {
+            let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
+            self.state.edx_materialize_file(address, inner_path, &bytes).await?;
+            return Ok(true);
+        }
+
+        let handles = self.build_peers(address, id).await?;
         store.ensure_sparse(id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
         let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
         let mut swarm = Swarm::new(store.clone(), id, size);
@@ -188,10 +200,46 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return Err("fetch did not complete".into());
         }
 
-        // Materialize the verified bytes into the xite's storage.
         let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
         self.state.edx_materialize_file(address, inner_path, &bytes).await?;
         Ok(true)
+    }
+
+    async fn fetch_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        let Some((id, size)) = self.resolve(address, inner_path).await? else {
+            return Ok(None);
+        };
+        let now = now_secs();
+        store.ensure_sparse(id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
+        let end = start.saturating_add(len).min(size);
+        if end <= start {
+            return Ok(Some(Vec::new()));
+        }
+
+        // Serve straight from the store if the covering range is already
+        // present; otherwise fetch just the covering chunk groups (a seek,
+        // never the whole file).
+        if let Ok(bytes) = store.read_range(id, start, end - start, now) {
+            return Ok(Some(bytes));
+        }
+        let handles = self.build_peers(address, id).await?;
+        let groups = epix_blob::bitfield::groups_for_bytes(&(start..end));
+        let mut needed = epix_blob::bitfield::GroupBits::new();
+        needed.add(groups.start..groups.end);
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        swarm
+            .fetch(&needed, &handles, Deadline::tight(), now)
+            .await
+            .map_err(|e| e.to_string())?;
+        let bytes = store.read_range(id, start, end - start, now).map_err(|e| e.to_string())?;
+        Ok(Some(bytes))
     }
 }
 
@@ -379,5 +427,43 @@ mod tests {
         // It is now materialized on node A's disk, byte-for-byte.
         let got = XiteStorage::new(a_dir.path()).read("movie.bin").unwrap();
         assert_eq!(got, movie, "fetched file matches the seeder's bytes");
+    }
+
+    /// Media seek: a range fetch pulls only the covering bytes (verified),
+    /// not the whole file, and the returned bytes match the seeker's slice.
+    #[tokio::test]
+    async fn a_range_fetch_seeks_without_the_whole_file() {
+        let (address, content_bytes, content, movie, addr) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content.clone()) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        state_a.set_edx_store(a_store.clone()).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                state: state_a.clone(),
+                privatekey: epix_crypt::new_seed(),
+            }))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+
+        // Seek to a mid-file range.
+        let (start, len) = (200_000u64, 50_000u64);
+        let result = state_a.edx_fetch_range(&address, "movie.bin", start, len).await;
+        let bytes = match result {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range fetch: {other:?}"),
+        };
+        assert_eq!(bytes, movie[start as usize..(start + len) as usize], "range bytes match");
+
+        // Only the covering groups were fetched: the object is NOT complete.
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        assert!(!a_store.is_complete(id).unwrap(), "a seek must not pull the whole file");
     }
 }

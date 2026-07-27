@@ -2266,12 +2266,29 @@ async fn serve_file(
         }
         let total = match on_disk {
             Some(total) => Some(total),
-            None => ctx.state.bigfile_total(&address, &path).await,
+            None => match ctx.state.bigfile_total(&address, &path).await {
+                Some(t) => Some(t),
+                // An EDX file that has never been touched has no piecemap and
+                // no sparse file; its total comes from the signed manifest.
+                None => ctx.state.edx_size(&address, &path).await,
+            },
         };
         if let (Some(total), Some((start, end))) = (total, parse_range(range)) {
             if start < total {
                 let end = end.unwrap_or(total - 1).min(total - 1);
                 let len = (end - start + 1) as usize;
+                // EDX: fetch just this range over the verified path and serve it
+                // straight from the object store (media seek, no whole-file
+                // download). Falls through to the legacy path on miss/error.
+                if let Some(Ok(Some(bytes))) =
+                    ctx.state.edx_fetch_range(&address, &path, start, len as u64).await
+                {
+                    let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
+                    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                        h.insert(header::CONTENT_RANGE, v);
+                    }
+                    return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
+                }
                 // Big file: pull only the pieces this range needs (no-op otherwise).
                 let _ = ctx.state.bigfile_fetch_range(&address, &path, start, len as u64).await;
                 if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
