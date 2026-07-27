@@ -19,6 +19,7 @@ pub mod choke;
 pub mod conn;
 pub mod fetch;
 pub mod frame;
+pub mod link;
 pub mod msg;
 pub mod noise;
 pub mod sched;
