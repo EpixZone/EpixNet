@@ -50,7 +50,13 @@ impl StreamRx {
 /// clone drops, the writer's queue closes and both tasks wind down.
 #[derive(Clone)]
 pub struct Conn {
+    /// Priority lane: control frames (Hello/Ack/Ping/Pong/Cancel/Resp) and
+    /// first-paint range data. The writer drains this fully before touching
+    /// `bulk`, so tight traffic preempts a large background transfer sharing
+    /// the connection.
     outbound: mpsc::Sender<Frame>,
+    /// Bulk lane: background range data. Yields to `outbound` in the writer.
+    bulk: mpsc::Sender<Frame>,
     inner: Arc<ConnInner>,
     shared: Arc<Shared>,
 }
@@ -90,7 +96,8 @@ impl Conn {
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (read_half, write_half) = tokio::io::split(stream);
-        let (out_tx, out_rx) = mpsc::channel::<Frame>(256);
+        let (hi_tx, hi_rx) = mpsc::channel::<Frame>(256);
+        let (lo_tx, lo_rx) = mpsc::channel::<Frame>(256);
         let (in_tx, in_rx) = mpsc::channel::<Incoming>(64);
 
         let inner = Arc::new(ConnInner {
@@ -103,10 +110,11 @@ impl Conn {
             closed: std::sync::atomic::AtomicBool::new(false),
         });
 
-        spawn_writer(write_half, out_rx, shared.clone());
-        spawn_reader(read_half, shared.clone(), out_tx.clone(), in_tx);
+        spawn_writer(write_half, hi_rx, lo_rx, shared.clone());
+        // The reader answers Pings on the priority lane (Pong is control).
+        spawn_reader(read_half, shared.clone(), hi_tx.clone(), in_tx);
 
-        (Conn { outbound: out_tx, inner, shared }, in_rx)
+        (Conn { outbound: hi_tx, bulk: lo_tx, inner, shared }, in_rx)
     }
 
     fn alloc_stream(&self) -> u64 {
@@ -160,7 +168,8 @@ impl Conn {
         self.send(Frame { stream, body: FrameBody::Resp { last: true, resp } }).await
     }
 
-    /// Send one frame of a multi-frame response (data streaming).
+    /// Send one frame of a multi-frame response (data streaming) on the
+    /// PRIORITY lane. Use for control and first-paint data.
     pub async fn send(&self, frame: Frame) -> std::io::Result<()> {
         self.outbound.send(frame).await.map_err(|_| closed_err())
     }
@@ -169,6 +178,20 @@ impl Conn {
     /// the same queue backpressure, just synchronously.
     pub fn blocking_send(&self, frame: Frame) -> std::io::Result<()> {
         self.outbound.blocking_send(frame).map_err(|_| closed_err())
+    }
+
+    /// Send one frame of a BULK (background range) response. It rides the
+    /// low-priority lane, so a first-paint or control frame on the same
+    /// connection is written ahead of it instead of stuck behind a large
+    /// transfer. Order within a stream is preserved (a stream sticks to one
+    /// lane).
+    pub async fn send_bulk(&self, frame: Frame) -> std::io::Result<()> {
+        self.bulk.send(frame).await.map_err(|_| closed_err())
+    }
+
+    /// Blocking [`Self::send_bulk`] for spawn_blocking encode threads.
+    pub fn blocking_send_bulk(&self, frame: Frame) -> std::io::Result<()> {
+        self.bulk.blocking_send(frame).map_err(|_| closed_err())
     }
 
     /// Cancel an in-flight request stream (stops the peer's encode).
@@ -202,13 +225,24 @@ fn closed_err() -> std::io::Error {
 
 fn spawn_writer<W>(
     mut w: tokio::io::WriteHalf<W>,
-    mut rx: mpsc::Receiver<Frame>,
+    mut hi: mpsc::Receiver<Frame>,
+    mut lo: mpsc::Receiver<Frame>,
     shared: Arc<Shared>,
 ) where
     W: AsyncWrite + Send + 'static,
 {
     tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
+        loop {
+            // Priority drain: a ready priority frame always goes before any
+            // bulk frame (biased polls `hi` first), so first-paint/control
+            // traffic preempts a large background range on the same conn.
+            // `else` fires only when BOTH lanes are closed and drained.
+            let frame = tokio::select! {
+                biased;
+                Some(f) = hi.recv() => f,
+                Some(f) = lo.recv() => f,
+                else => break,
+            };
             if frame::write_frame(&mut w, &frame).await.is_err() {
                 break;
             }
@@ -460,6 +494,47 @@ mod tests {
         tokio::task::yield_now().await;
         let res = client.request(Req::GetBitfield { obj: ObjId([0; 32]) }).await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn priority_frame_preempts_queued_bulk() {
+        // A tiny duplex so the writer blocks partway through the first frame
+        // and can dequeue only one before we enqueue the rest. We queue a
+        // run of bulk frames, then one priority frame, and read the wire
+        // order off the raw far end. With a strict FIFO writer the priority
+        // frame would come LAST; the two-lane writer must place it near the
+        // front (at most one already-in-flight bulk frame ahead of it).
+        let (a, mut b) = tokio::io::duplex(64);
+        let (conn, _in) = Conn::start(a, true);
+
+        // Bulk frames on even stream ids 2,4,...,16; payload > 64 so the
+        // writer stalls inside the first one until we start reading.
+        for i in 0..8u64 {
+            conn.send_bulk(Frame {
+                stream: 2 + i * 2,
+                body: FrameBody::Data { last: false, bytes: vec![0u8; 2048] },
+            })
+            .await
+            .unwrap();
+        }
+        // One priority frame, enqueued AFTER all the bulk frames.
+        conn.send(Frame {
+            stream: 999,
+            body: FrameBody::Data { last: false, bytes: vec![1u8; 2048] },
+        })
+        .await
+        .unwrap();
+
+        // Drain the wire in order and find where the priority frame landed.
+        let mut order = Vec::new();
+        for _ in 0..9 {
+            order.push(frame::read_frame(&mut b).await.unwrap().stream);
+        }
+        let hi_pos = order.iter().position(|s| *s == 999).unwrap();
+        assert!(
+            hi_pos <= 1,
+            "priority frame should preempt queued bulk (pos {hi_pos}), order = {order:?}"
+        );
     }
 
     #[tokio::test]

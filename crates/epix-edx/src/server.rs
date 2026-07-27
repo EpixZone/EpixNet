@@ -262,8 +262,8 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
                 .respond(stream, Resp::Err { code: err::BAD_REQUEST, msg: "already hello'd".into() })
                 .await;
         }
-        Req::GetRange { obj, ranges, .. } => {
-            serve_range(conn, ctx, identity, stream, obj, ranges).await;
+        Req::GetRange { obj, ranges, deadline_ms, .. } => {
+            serve_range(conn, ctx, identity, stream, obj, ranges, deadline_ms).await;
         }
         Req::GetMany { objs } => {
             serve_many(conn, ctx, stream, objs).await;
@@ -324,6 +324,7 @@ async fn serve_range(
     stream: u64,
     obj: ObjId,
     ranges: Vec<(u64, u64)>,
+    deadline_ms: u32,
 ) {
     // Saturating accumulation: a plain .sum() wraps in release, so two
     // ranges of size 2^63 would sum to 0 and slip past the byte cap.
@@ -336,12 +337,19 @@ async fn serve_range(
         return;
     }
 
+    // A first-paint-sized object, or an explicitly tight-deadline request
+    // (streaming seek), streams on the connection's priority lane so it
+    // preempts a large background range; a patient bulk range (no deadline)
+    // yields to it. This is the deadline tier the plan calls for, enforced
+    // at the writer rather than only advertised to the peer.
+    let first_paint = total <= FIRST_PAINT_OBJECT_BYTES;
+    let bulk = !first_paint && deadline_ms == 0;
+
     // Bulk governance: consult the choker. First-paint objects (index +
     // small bundles) are exempt up to the free budget; a choked peer is
     // told BUSY so it retries elsewhere (the swarm self-heals), and a
     // throttled one likewise. Control-plane and first-paint bypass this.
     if let Some(choker) = &ctx.choker {
-        let first_paint = total <= FIRST_PAINT_OBJECT_BYTES;
         let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
         let decision = choker.lock().expect("choker").decide(
             &identity.node_pk,
@@ -370,7 +378,7 @@ async fn serve_range(
     let now = (ctx.now)();
     let writer_conn = conn.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let mut sink = FrameSink::new(writer_conn, stream);
+        let mut sink = FrameSink::new(writer_conn, stream, bulk);
         store.encode_slice(obj, &byte_ranges, &mut sink, now)?;
         sink.finish()
     })
@@ -441,11 +449,14 @@ struct FrameSink {
     conn: Conn,
     stream: u64,
     buf: Vec<u8>,
+    /// Route frames through the connection's bulk lane (background range)
+    /// vs the priority lane (first-paint / tight deadline).
+    bulk: bool,
 }
 
 impl FrameSink {
-    fn new(conn: Conn, stream: u64) -> Self {
-        Self { conn, stream, buf: Vec::with_capacity(MAX_FRAME_LEN) }
+    fn new(conn: Conn, stream: u64, bulk: bool) -> Self {
+        Self { conn, stream, buf: Vec::with_capacity(MAX_FRAME_LEN), bulk }
     }
 
     fn send(&mut self, last: bool) -> std::io::Result<()> {
@@ -453,9 +464,13 @@ impl FrameSink {
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "peer cancelled"));
         }
         let bytes = std::mem::take(&mut self.buf);
-        self.conn
-            .blocking_send(Frame { stream: self.stream, body: FrameBody::Data { last, bytes } })
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "conn closed"))
+        let frame = Frame { stream: self.stream, body: FrameBody::Data { last, bytes } };
+        if self.bulk {
+            self.conn.blocking_send_bulk(frame)
+        } else {
+            self.conn.blocking_send(frame)
+        }
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "conn closed"))
     }
 
     /// Flush the tail and send the terminal frame.
