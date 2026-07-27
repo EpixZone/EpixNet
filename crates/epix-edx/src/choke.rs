@@ -226,6 +226,12 @@ impl Choker {
     pub fn served_to(&self, node_pk: &[u8]) -> u64 {
         self.peers.get(node_pk).map(|a| a.served_by_us).unwrap_or(0)
     }
+
+    /// Reciprocity credit a peer has earned: bytes it has served US, which
+    /// buy it faster service in return.
+    pub fn credit_of(&self, node_pk: &[u8]) -> u64 {
+        self.peers.get(node_pk).map(|a| a.served_to_us).unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

@@ -5,19 +5,40 @@
 //! otherwise the node serves msgpack only, unchanged.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use epix_blob::store::Store;
 use epix_blob::{Ns, ObjId};
 use epix_core::PeerAddr;
+use epix_edx::choke::Choker;
 use epix_edx::conn::Conn;
 use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
-use epix_edx::server::{client_hello, serve, ServeCtx, SignedProvider};
+use epix_edx::server::{client_hello, serve, PeerIdentity, ServeCtx, SignedProvider};
 use epix_edx::sim::Class;
 use epix_protocol::server::EdxHook;
 use epix_transport::Transport;
 use epix_ui::state::{EdxFetcher, InboundUpdate};
 use epix_ui::AppState;
+
+/// A shared upload governor for reciprocity choking (seed -> faster
+/// service): the serve side consults it, the fetch side credits peers that
+/// serve us. Opt-in via EPIX_EDX_RECIPROCITY.
+pub type SharedChoker = Arc<Mutex<Choker>>;
+
+/// Global upload cap (bytes/sec) for reciprocity-governed serving. Generous
+/// by default; reciprocity is opt-in and this only bites when it is on.
+const EDX_UPLOAD_CAP_BPS: u64 = 8_000_000;
+
+/// The shared upload governor when reciprocity is opted in
+/// (EPIX_EDX_RECIPROCITY=1), else None (serve everything, ungoverned - the
+/// default). One instance is shared between serving and fetching.
+pub fn make_choker() -> Option<SharedChoker> {
+    if std::env::var("EPIX_EDX_RECIPROCITY").map(|v| v == "1").unwrap_or(false) {
+        Some(Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS))))
+    } else {
+        None
+    }
+}
 
 /// Unix seconds, for object last-access stamps.
 fn now_secs() -> u64 {
@@ -93,19 +114,28 @@ impl SignedProvider for AppStateProvider {
 /// loop, backed by `store` (the content-addressed objects) and the node's
 /// live xite registry. `privatekey` is this node's EDX identity key (hex),
 /// used for the Hello channel binding.
-pub fn edx_hook(state: Arc<AppState>, store: Arc<Store>, privatekey: String) -> EdxHook {
+pub fn edx_hook(
+    state: Arc<AppState>,
+    store: Arc<Store>,
+    privatekey: String,
+    choker: Option<SharedChoker>,
+) -> EdxHook {
     let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state });
     Arc::new(move |_peer: PeerAddr, stream| {
         let store = store.clone();
         let provider = provider.clone();
         let privatekey = privatekey.clone();
+        let choker = choker.clone();
         Box::pin(async move {
             let l = match epix_edx::link::accept(stream).await {
                 Ok(l) => l,
                 Err(_) => return,
             };
-            let ctx = Arc::new(ServeCtx::new(store, provider, privatekey));
-            serve(l.conn, l.incoming, ctx, Some(l.handshake_hash)).await;
+            let mut ctx = ServeCtx::new(store, provider, privatekey);
+            if let Some(c) = choker {
+                ctx = ctx.with_choker(c);
+            }
+            serve(l.conn, l.incoming, Arc::new(ctx), Some(l.handshake_hash)).await;
         })
     })
 }
@@ -117,11 +147,19 @@ pub fn edx_hook(state: Arc<AppState>, store: Arc<Store>, privatekey: String) -> 
 struct RuntimeEdxFetcher {
     state: Arc<AppState>,
     privatekey: String,
+    /// Shared upload governor; when present, peers that serve us are credited
+    /// after each fetch so they earn faster service from us in return.
+    choker: Option<SharedChoker>,
 }
 
 impl RuntimeEdxFetcher {
-    /// Dial `peer` and bring up an EDX link past the Hello gate.
-    async fn dial(&self, transport: &Arc<dyn Transport>, peer: &PeerAddr) -> Result<Conn, String> {
+    /// Dial `peer`, bring up an EDX link past the Hello gate, and return the
+    /// connection plus the peer's authenticated identity.
+    async fn dial(
+        &self,
+        transport: &Arc<dyn Transport>,
+        peer: &PeerAddr,
+    ) -> Result<(Conn, PeerIdentity), String> {
         let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
         let l = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
         // A client context: client_hello only reads the key and caps; reuse
@@ -130,10 +168,22 @@ impl RuntimeEdxFetcher {
         let provider: Arc<dyn SignedProvider> =
             Arc::new(AppStateProvider { state: self.state.clone() });
         let ctx = ServeCtx::new(store, provider, self.privatekey.clone());
-        client_hello(&l.conn, &ctx, vec![], Some(l.handshake_hash))
+        let identity = client_hello(&l.conn, &ctx, vec![], Some(l.handshake_hash))
             .await
             .map_err(|e| e.to_string())?;
-        Ok(l.conn)
+        Ok((l.conn, identity))
+    }
+
+    /// Credit each peer that delivered groups in `report` for the bytes it
+    /// served us (reciprocity), when a shared choker is installed.
+    fn credit(&self, report: &epix_edx::sched::FetchReport, node_pks: &HashMap<String, Vec<u8>>, now: u64) {
+        let Some(choker) = &self.choker else { return };
+        let mut c = choker.lock().expect("choker");
+        for (label, groups) in &report.by_peer {
+            if let Some(pk) = node_pks.get(label) {
+                c.credit_peer(pk, groups * epix_blob::bitfield::GROUP_BYTES, now);
+            }
+        }
     }
 
     /// Resolve `inner_path`'s object id + size from the signed content.json.
@@ -146,29 +196,32 @@ impl RuntimeEdxFetcher {
     }
 
     /// Dial the xite's connectable peers as EDX links and learn what each
-    /// holds of `id`. One link per peer, reused for the whole fetch.
-    async fn build_peers(&self, address: &str, id: ObjId) -> Result<Vec<PeerHandle>, String> {
+    /// holds of `id`. One link per peer, reused for the whole fetch. Also
+    /// returns each peer label's authenticated node key, for crediting.
+    async fn build_peers(
+        &self,
+        address: &str,
+        id: ObjId,
+    ) -> Result<(Vec<PeerHandle>, HashMap<String, Vec<u8>>), String> {
         let transport = self.state.transport().await.ok_or("no transport")?;
         let peers = self.state.connectable_peers(address, 8).await;
         if peers.is_empty() {
             return Err("no peers".into());
         }
         let mut handles: Vec<PeerHandle> = Vec::new();
+        let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for peer in peers {
-            let Ok(conn) = self.dial(&transport, &peer).await else { continue };
+            let Ok((conn, identity)) = self.dial(&transport, &peer).await else { continue };
             if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&conn, id).await {
-                handles.push(PeerHandle {
-                    conn,
-                    class: Class::of_addr(&peer),
-                    bits,
-                    label: peer.to_string(),
-                });
+                let label = peer.to_string();
+                node_pks.insert(label.clone(), identity.node_pk);
+                handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label });
             }
         }
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
-        Ok(handles)
+        Ok((handles, node_pks))
     }
 }
 
@@ -188,14 +241,15 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return Ok(true);
         }
 
-        let handles = self.build_peers(address, id).await?;
+        let (handles, node_pks) = self.build_peers(address, id).await?;
         store.ensure_sparse(id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
         let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
         let mut swarm = Swarm::new(store.clone(), id, size);
-        swarm
+        let report = swarm
             .fetch(&needed, &handles, Deadline::background(), now)
             .await
             .map_err(|e| e.to_string())?;
+        self.credit(&report, &node_pks, now);
         if !store.is_complete(id).map_err(|e| e.to_string())? {
             return Err("fetch did not complete".into());
         }
@@ -229,15 +283,16 @@ impl EdxFetcher for RuntimeEdxFetcher {
         if let Ok(bytes) = store.read_range(id, start, end - start, now) {
             return Ok(Some(bytes));
         }
-        let handles = self.build_peers(address, id).await?;
+        let (handles, node_pks) = self.build_peers(address, id).await?;
         let groups = epix_blob::bitfield::groups_for_bytes(&(start..end));
         let mut needed = epix_blob::bitfield::GroupBits::new();
         needed.add(groups.start..groups.end);
         let mut swarm = Swarm::new(store.clone(), id, size);
-        swarm
+        let report = swarm
             .fetch(&needed, &handles, Deadline::tight(), now)
             .await
             .map_err(|e| e.to_string())?;
+        self.credit(&report, &node_pks, now);
         let bytes = store.read_range(id, start, end - start, now).map_err(|e| e.to_string())?;
         Ok(Some(bytes))
     }
@@ -252,6 +307,7 @@ pub async fn enable_serving(
     state: &Arc<AppState>,
     data_dir: &std::path::Path,
     privatekey: String,
+    choker: Option<SharedChoker>,
 ) -> Option<Arc<Store>> {
     let path = data_dir.join("edx-store");
     if let Err(e) = std::fs::create_dir_all(&path) {
@@ -267,7 +323,11 @@ pub async fn enable_serving(
     };
     state.set_edx_store(store.clone()).await;
     state
-        .set_edx_fetcher(Arc::new(RuntimeEdxFetcher { state: state.clone(), privatekey }))
+        .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+            state: state.clone(),
+            privatekey,
+            choker,
+        }))
         .await;
     // Register any xites already loaded before the store was installed, so
     // serving does not depend on load order.
@@ -314,7 +374,7 @@ mod tests {
     /// movie.bin) on a real TCP port. Returns its address, the signed
     /// content.json bytes + value, the movie bytes, and the socket address.
     async fn spawn_seeder(
-    ) -> (String, Vec<u8>, serde_json::Value, Vec<u8>, std::net::SocketAddr) {
+    ) -> (String, Vec<u8>, serde_json::Value, Vec<u8>, std::net::SocketAddr, Vec<u8>) {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
         let site_dir = tempfile::tempdir().unwrap();
@@ -339,15 +399,16 @@ mod tests {
         std::mem::forget(store_dir);
 
         let server_key = epix_crypt::new_seed();
+        let server_pk = epix_crypt::private_to_compressed_pubkey(&server_key).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
         let server = epix_protocol::PeerServer::new(handler)
-            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key));
+            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key, None));
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
         });
-        (address, content_bytes, content, movie, addr)
+        (address, content_bytes, content, movie, addr, server_pk)
     }
 
     /// End-to-end serve fork: a node with EDX enabled answers an EDX peer's
@@ -356,7 +417,7 @@ mod tests {
     /// the msgpack file server uses.
     #[tokio::test]
     async fn edx_peer_gets_signed_content_and_a_verified_file() {
-        let (address, content_bytes, content, movie, addr) = spawn_seeder().await;
+        let (address, content_bytes, content, movie, addr, _server_pk) = spawn_seeder().await;
 
         // Node A: dial the EDX link (magic sniffed on the shared port).
         let stream = TcpTransport.dial(&epix_core::PeerAddr::Ip(addr)).await.unwrap();
@@ -394,7 +455,7 @@ mod tests {
     /// (dial -> swarm -> materialize), and the bytes land in its storage.
     #[tokio::test]
     async fn a_node_fetches_a_file_from_an_edx_peer() {
-        let (address, content_bytes, content, movie, addr) = spawn_seeder().await;
+        let (address, content_bytes, content, movie, addr, _server_pk) = spawn_seeder().await;
 
         // Node A: knows B as a peer, has the manifest but not the file.
         let state_a = AppState::new("node-a");
@@ -413,6 +474,7 @@ mod tests {
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
                 state: state_a.clone(),
                 privatekey: epix_crypt::new_seed(),
+                choker: None,
             }))
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
@@ -433,7 +495,7 @@ mod tests {
     /// not the whole file, and the returned bytes match the seeker's slice.
     #[tokio::test]
     async fn a_range_fetch_seeks_without_the_whole_file() {
-        let (address, content_bytes, content, movie, addr) = spawn_seeder().await;
+        let (address, content_bytes, content, movie, addr, _server_pk) = spawn_seeder().await;
 
         let state_a = AppState::new("node-a");
         let a_dir = tempfile::tempdir().unwrap();
@@ -449,6 +511,7 @@ mod tests {
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
                 state: state_a.clone(),
                 privatekey: epix_crypt::new_seed(),
+                choker: None,
             }))
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
@@ -465,5 +528,40 @@ mod tests {
         // Only the covering groups were fetched: the object is NOT complete.
         let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
         assert!(!a_store.is_complete(id).unwrap(), "a seek must not pull the whole file");
+    }
+
+    /// Reciprocity: with a shared choker installed, fetching from a peer
+    /// credits that peer (by its authenticated node key) for the bytes it
+    /// served us, so it earns faster service in return.
+    #[tokio::test]
+    async fn fetching_credits_the_serving_peer() {
+        let (address, content_bytes, content, _movie, addr, server_pk) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+
+        // Reciprocity on: the fetcher holds the shared choker.
+        let choker: SharedChoker = Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS)));
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                state: state_a.clone(),
+                privatekey: epix_crypt::new_seed(),
+                choker: Some(choker.clone()),
+            }))
+            .await;
+
+        assert!(state_a.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
+
+        // The seeder earned reciprocity credit for the bytes it served us.
+        let credit = choker.lock().unwrap().credit_of(&server_pk);
+        assert!(credit > 0, "the serving peer should be credited, got {credit}");
     }
 }

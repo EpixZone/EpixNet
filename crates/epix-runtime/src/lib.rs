@@ -1067,11 +1067,34 @@ async fn propagation_loop(
 /// Serve inbound file requests (seeding) on `port` until shutdown. Peers connect
 /// with the ordinary wire protocol and pull files via `getFile`.
 #[cfg(feature = "inbound-seeding")]
-/// This node's EDX identity key (hex), for the Hello channel binding. A
-/// fresh per-boot key for now: reciprocity attribution across restarts
-/// (persisting it) rides the incentive stage.
-async fn edx_node_key(_state: &Arc<AppState>) -> String {
-    epix_crypt::new_seed()
+/// This node's EDX identity key (hex), for the Hello channel binding.
+/// Persisted under the data dir as `edx-node.key` so a node keeps its
+/// identity (and its reciprocity standing) across restarts; falls back to a
+/// fresh per-boot key when there is no data dir or the file is unusable.
+async fn edx_node_key(state: &Arc<AppState>) -> String {
+    let Some(dir) = std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()) else {
+        return epix_crypt::new_seed();
+    };
+    let path = std::path::Path::new(&dir).join("edx-node.key");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let key = existing.trim().to_string();
+        if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return key;
+        }
+    }
+    let key = epix_crypt::new_seed();
+    match std::fs::write(&path, &key) {
+        Ok(()) => {
+            // The key is this node's identity; keep it owner-only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        Err(e) => state.log("WARN", format!("could not persist EDX node key: {e}")).await,
+    }
+    key
 }
 
 async fn seed_loop(
@@ -1093,12 +1116,21 @@ async fn seed_loop(
     // register the already-loaded xites, and use one identity key for both
     // serving and fetching.
     let edx_key = edx_node_key(&state).await;
+    // The shared reciprocity governor (None unless EPIX_EDX_RECIPROCITY=1);
+    // one instance drives both serving and fetch-credit.
+    let edx_choker = edx::make_choker();
     if std::env::var("EPIX_EDX").map(|v| v == "1").unwrap_or(false)
         && state.edx_store().await.is_none()
     {
         match std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()) {
             Some(dir) => {
-                edx::enable_serving(&state, std::path::Path::new(&dir), edx_key.clone()).await;
+                edx::enable_serving(
+                    &state,
+                    std::path::Path::new(&dir),
+                    edx_key.clone(),
+                    edx_choker.clone(),
+                )
+                .await;
             }
             None => {
                 state
@@ -1113,7 +1145,7 @@ async fn seed_loop(
     // streams whose first byte is 'E' to the EDX serve loop on this same
     // port; every other peer stays on the msgpack path. No store, no fork.
     if let Some(store) = state.edx_store().await {
-        server = server.with_edx(edx::edx_hook(state.clone(), store, edx_key));
+        server = server.with_edx(edx::edx_hook(state.clone(), store, edx_key, edx_choker));
         state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
     }
     // A real peer reaching us over clearnet TCP proves the fileserver port is
