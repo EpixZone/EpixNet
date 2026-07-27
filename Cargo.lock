@@ -2077,7 +2077,10 @@ version = "0.1.0"
 dependencies = [
  "bao-tree",
  "blake3",
+ "positioned-io",
  "redb",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -5329,6 +5332,7 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4ec4b80060f033312b99b6874025d9503d2af87aef2dd4c516e253fbfcdada7"
 dependencies = [
+ "byteorder",
  "libc",
  "winapi",
 ]

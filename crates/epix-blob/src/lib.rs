@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod verified;
+
 use core::fmt;
 
 /// Chunk-group size: bao validates at `1 KiB << CHUNK_GROUP_LOG` = 16 KiB
