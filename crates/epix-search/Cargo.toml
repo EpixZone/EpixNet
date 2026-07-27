@@ -1,0 +1,11 @@
+[package]
+name = "epix-search"
+version = "0.1.0"
+edition = "2021"
+description = "In-xite search: per-segment XOR8 skip-filters (Track 1) and a hierarchical sharded inverted index (Track 2), fetch-and-verify pointers, plus a frozen tokenizer for deterministic rebuilds."
+
+[dependencies]
+epix-blob = { path = "../epix-blob" }
+blake3 = "=1.8.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -2436,6 +2436,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-search"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "epix-blob",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "epix-selfenc"
 version = "0.1.0"
 dependencies = [
