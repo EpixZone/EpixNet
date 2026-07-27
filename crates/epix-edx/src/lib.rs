@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod sim;
+
 /// First-byte magic for EDX framing. During the migration window the
 /// accept path sniffs this against a legacy msgpack map header (legacy
 /// first bytes are 0x80–0x8f, 0xde, or 0xdf — never ASCII 'E') to route a
