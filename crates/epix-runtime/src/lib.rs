@@ -268,6 +268,11 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.announce_interval,
         )));
+        // One shared EDX serve context (store + identity key + reciprocity
+        // governor), initialized on demand by whichever transport's accept
+        // loop comes up first and reused by all of them (clearnet + overlays),
+        // so credit and storage are unified across transports.
+        let edx_cell = edx::new_serve_cell();
         // Inbound file server: let peers pull our files (seeding), and try to
         // open that port through the home router with UPnP so it's reachable.
         #[cfg(feature = "inbound-seeding")]
@@ -284,6 +289,7 @@ impl NodeRuntime {
                 self.node_handler(),
                 port,
                 clearnet_seeding,
+                edx_cell.clone(),
                 self.shutdown.clone(),
             )));
             self.handles.push(tokio::spawn(upnp_loop(
@@ -307,6 +313,7 @@ impl NodeRuntime {
                     self.config.i2p_mode.clone(),
                     self.config.i2p_sam_port,
                     self.config.fileserver_port,
+                    edx_cell.clone(),
                     self.shutdown.clone(),
                 )));
             }
@@ -324,6 +331,7 @@ impl NodeRuntime {
                 identity_path,
                 self.config.mesh_peers.clone(),
                 self.config.mesh_listen.clone(),
+                edx_cell.clone(),
                 self.shutdown.clone(),
             )));
         }
@@ -342,6 +350,7 @@ impl NodeRuntime {
                     self.config.fileserver_port,
                     self.config.tor_socks_port,
                     self.config.tor_use_bridges,
+                    edx_cell.clone(),
                     self.shutdown.clone(),
                 )));
             } else {
@@ -1067,41 +1076,13 @@ async fn propagation_loop(
 /// Serve inbound file requests (seeding) on `port` until shutdown. Peers connect
 /// with the ordinary wire protocol and pull files via `getFile`.
 #[cfg(feature = "inbound-seeding")]
-/// This node's EDX identity key (hex), for the Hello channel binding.
-/// Persisted under the data dir as `edx-node.key` so a node keeps its
-/// identity (and its reciprocity standing) across restarts; falls back to a
-/// fresh per-boot key when there is no data dir or the file is unusable.
-async fn edx_node_key(state: &Arc<AppState>) -> String {
-    let Some(dir) = state.data_root_path() else {
-        return epix_crypt::new_seed();
-    };
-    let path = dir.join("edx-node.key");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let key = existing.trim().to_string();
-        if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return key;
-        }
-    }
-    let key = epix_crypt::new_seed();
-    match std::fs::write(&path, &key) {
-        Ok(()) => {
-            // The key is this node's identity; keep it owner-only.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-        Err(e) => state.log("WARN", format!("could not persist EDX node key: {e}")).await,
-    }
-    key
-}
 
 async fn seed_loop(
     state: Arc<AppState>,
     handler: Arc<handler::NodeHandler>,
     port: u16,
     clearnet: bool,
+    edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
     let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
@@ -1112,25 +1093,15 @@ async fn seed_loop(
         }
     };
     let mut server = epix_protocol::PeerServer::new(handler);
-    // EDX is the default transfer protocol: open + install the content-
-    // addressed object store and the verified-streaming fetcher under the
-    // node's data dir, register the already-loaded xites, and share one
-    // identity key + reciprocity governor between serving and fetching.
-    // `EPIX_EDX=0` disables it (kill switch); an in-memory node with no data
-    // dir simply skips it. Legacy msgpack peers still interoperate via the
-    // first-byte sniff, so a straggler that has not upgraded keeps working.
-    if edx::env_on("EPIX_EDX") {
-        let edx_key = edx_node_key(&state).await;
-        let edx_choker = edx::make_choker();
-        if state.edx_store().await.is_none() {
-            if let Some(dir) = state.data_root_path() {
-                edx::enable_serving(&state, &dir, edx_key.clone(), edx_choker.clone()).await;
-            }
-        }
-        if let Some(store) = state.edx_store().await {
-            server = server.with_edx(edx::edx_hook(state.clone(), store, edx_key, edx_choker));
-            state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
-        }
+    // EDX is the default transfer protocol: open the content-addressed object
+    // store + the verified-streaming fetcher (shared across every transport
+    // via edx_cell), register the loaded xites, and fork clearnet TCP peers
+    // whose first byte is 'E' to the EDX serve loop with Noise. `EPIX_EDX=0`
+    // disables it; an in-memory node skips it. Legacy peers still interoperate
+    // via the first-byte sniff.
+    if let Some(es) = edx::ensure_edx_serve(&edx_cell, &state).await {
+        server = server.with_edx(es.clearnet_hook());
+        state.log("INFO", "EDX serving enabled on the file server port".to_string()).await;
     }
     // A real peer reaching us over clearnet TCP proves the fileserver port is
     // open from the internet - the privacy-preserving alternative to the Python
@@ -1442,6 +1413,7 @@ async fn tor_loop(
     fileserver_port: Option<u16>,
     socks_port: Option<u16>,
     tor_use_bridges: bool,
+    edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
     use epix_protocol::RequestHandler;
@@ -1513,6 +1485,8 @@ async fn tor_loop(
                 }
                 let handler = handler.clone();
                 let (version, rev) = epix_protocol::PeerServer::new(handler.clone()).banner();
+                let hook_state = state.clone();
+                let hook_cell = edx_cell.clone();
                 tokio::spawn(async move {
                     // The RunningOnionService handle keeps the service alive:
                     // dropping it decommissions the service, so its descriptor
@@ -1520,9 +1494,14 @@ async fn tor_loop(
                     // for as long as we accept inbound streams (the process
                     // lifetime).
                     let _svc = svc;
+                    // Onion streams are already encrypted, so EDX skips Noise
+                    // here (the overlay hook), forking EDX peers on the sniff.
+                    let edx_hook =
+                        edx::ensure_edx_serve(&hook_cell, &hook_state).await.map(|es| es.overlay_hook());
                     while let Some(stream) = inbound.recv().await {
                         let handler = handler.clone() as Arc<dyn RequestHandler>;
                         let version = version.clone();
+                        let edx_hook = edx_hook.clone();
                         // Inbound onion peers arrive with no dial-back address;
                         // the handshake rebinds this placeholder to the peer's
                         // advertised `onion` self-address (Phase 6) so it
@@ -1533,8 +1512,10 @@ async fn tor_loop(
                             port: 0,
                         };
                         tokio::spawn(async move {
-                            epix_protocol::serve_stream(handler, peer, stream, &version, rev, port)
-                                .await;
+                            epix_protocol::serve_overlay_stream(
+                                edx_hook, handler, peer, stream, &version, rev, port,
+                            )
+                            .await;
                         });
                     }
                 });
@@ -1646,6 +1627,7 @@ async fn mesh_loop(
     identity_path: Option<std::path::PathBuf>,
     tcp_peers: Vec<String>,
     tcp_listen: Option<String>,
+    edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
     use epix_protocol::RequestHandler;
@@ -1681,10 +1663,12 @@ async fn mesh_loop(
     let advert_hash = node.dest_hash_hex();
     epix_protocol::update_self_advert(move |a| a.rns = Some(advert_hash));
 
-    // Announce our destination and serve inbound links until shutdown.
+    // Announce our destination and serve inbound links until shutdown. Mesh
+    // links are already encrypted, so EDX skips Noise (the overlay hook).
     let announce = node.spawn_announce(Duration::from_secs(60));
     let handler: Arc<dyn RequestHandler> = handler;
-    let serve = tokio::spawn(async move { node.serve(handler).await });
+    let edx_hook = edx::ensure_edx_serve(&edx_cell, &state).await.map(|es| es.overlay_hook());
+    let serve = tokio::spawn(async move { node.serve(handler, edx_hook).await });
 
     shutdown.notified().await;
     announce.abort();
@@ -1699,6 +1683,7 @@ async fn i2p_loop(
     mode: String,
     sam_port: u16,
     fileserver_port: Option<u16>,
+    edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
     use epix_protocol::RequestHandler;
@@ -1717,10 +1702,15 @@ async fn i2p_loop(
     if fileserver_port.is_some() {
         let handler = handler.clone();
         let (version, rev) = epix_protocol::PeerServer::new(handler.clone()).banner();
+        let hook_state = state.clone();
         tokio::spawn(async move {
+            // I2P streams are already encrypted, so EDX skips Noise here.
+            let edx_hook =
+                edx::ensure_edx_serve(&edx_cell, &hook_state).await.map(|es| es.overlay_hook());
             while let Some(stream) = inbound.recv().await {
                 let handler = handler.clone() as Arc<dyn RequestHandler>;
                 let version = version.clone();
+                let edx_hook = edx_hook.clone();
                 // Inbound I2P peers arrive with no dial-back address; the
                 // handshake rebinds this placeholder to the peer's advertised
                 // `i2p` destination (Phase 6). Until then it is an empty
@@ -1728,7 +1718,10 @@ async fn i2p_loop(
                 let peer = epix_core::PeerAddr::I2p { dest: String::new(), port: 0 };
                 let port = fileserver_port.unwrap_or(0);
                 tokio::spawn(async move {
-                    epix_protocol::serve_stream(handler, peer, stream, &version, rev, port).await;
+                    epix_protocol::serve_overlay_stream(
+                        edx_hook, handler, peer, stream, &version, rev, port,
+                    )
+                    .await;
                 });
             }
         });

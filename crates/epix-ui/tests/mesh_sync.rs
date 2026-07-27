@@ -61,7 +61,7 @@ async fn run() {
     let a_addr = mesh_a.addr();
     let _announce = mesh_a.spawn_announce(Duration::from_millis(300));
     tokio::spawn(async move {
-        mesh_a.serve(Arc::new(FileService::new(state_a))).await;
+        mesh_a.serve(Arc::new(FileService::new(state_a)), None).await;
     });
 
     // Node B: joins the mesh through A's interface, knows only A's dest hash.

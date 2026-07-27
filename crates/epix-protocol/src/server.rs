@@ -152,6 +152,33 @@ impl PeerServer {
     }
 }
 
+/// Serve one accepted OVERLAY stream (Tor/I2P/Reticulum, already encrypted),
+/// forking to the EDX hook when the stream sniffs as EDX (first byte `E`) and
+/// a hook is installed, else the msgpack loop. The hook here must be the
+/// no-Noise overlay variant, since the transport already encrypts. Shared by
+/// every overlay accept loop so the fork is written once.
+pub async fn serve_overlay_stream(
+    edx: Option<EdxHook>,
+    handler: Arc<dyn RequestHandler>,
+    peer: PeerAddr,
+    stream: epix_transport::PeerStream,
+    version: &str,
+    rev: i64,
+    fileserver_port: u16,
+) {
+    let (first, stream) = match epix_transport::peek_first_byte(stream).await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if first == b'E' {
+        if let Some(hook) = edx {
+            hook(peer, stream).await;
+            return;
+        }
+    }
+    serve_stream(handler, peer, stream, version, rev, fileserver_port).await;
+}
+
 /// Run the request/response loop over one already-established peer stream,
 /// whatever transport it came from (TCP, Reticulum mesh, …). Reads framed
 /// requests, answers the handshake itself, dispatches the rest to `handler`,

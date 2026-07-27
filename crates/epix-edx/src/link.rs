@@ -58,6 +58,28 @@ pub async fn accept(stream: PeerStream) -> io::Result<Link> {
     Ok(Link { conn, incoming, handshake_hash: sec.handshake_hash })
 }
 
+/// Establish an EDX link over an ALREADY-ENCRYPTED overlay stream
+/// (Tor/I2P/Reticulum) as the acceptor: exchange the magic, then SKIP Noise
+/// (the transport already encrypts and authenticates the endpoint) and start
+/// the mux. There is no Noise channel binding, so serve/client_hello take
+/// `None` as the handshake hash; identity rests on the overlay endpoint plus
+/// the Hello node key, exactly as the plan describes for overlays.
+pub async fn accept_overlay(stream: PeerStream) -> io::Result<(Conn, mpsc::Receiver<Incoming>)> {
+    let mut stream = stream;
+    frame::read_magic(&mut stream).await?;
+    frame::write_magic(&mut stream).await?;
+    Ok(Conn::start(stream, false))
+}
+
+/// Dialer counterpart to [`accept_overlay`]: send the magic, skip Noise,
+/// start the mux.
+pub async fn dial_overlay(stream: PeerStream) -> io::Result<(Conn, mpsc::Receiver<Incoming>)> {
+    let mut stream = stream;
+    frame::write_magic(&mut stream).await?;
+    frame::read_magic(&mut stream).await?;
+    Ok(Conn::start(stream, true))
+}
+
 /// Read the first byte of an accepted stream to route msgpack vs EDX, and
 /// return it alongside a stream that still yields that byte. Portable
 /// across overlays (no `TcpStream::peek` needed): the byte is buffered and

@@ -126,8 +126,13 @@ impl MeshNode {
     }
 
     /// Serve the wire protocol to peers that link to us (the mesh-side
-    /// `PeerServer`). Runs forever; spawn it.
-    pub async fn serve(&self, handler: Arc<dyn RequestHandler>) {
-        ReticulumServer::new(handler).serve(self.transport.clone()).await;
+    /// `PeerServer`). Runs forever; spawn it. `edx` forks EDX-sniffed links to
+    /// the EDX serve loop (no-Noise overlay variant); None serves msgpack only.
+    pub async fn serve(
+        &self,
+        handler: Arc<dyn RequestHandler>,
+        edx: Option<epix_protocol::EdxHook>,
+    ) {
+        ReticulumServer::new(handler).with_edx(edx).serve(self.transport.clone()).await;
     }
 }

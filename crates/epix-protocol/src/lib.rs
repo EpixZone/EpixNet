@@ -13,4 +13,4 @@ pub mod server;
 pub use advert::{set_self_advert, update_self_advert, SelfAdvert};
 pub use connection::{Connection, FindHashIdsReply, HandshakeInfo, PexReply};
 pub use msg::{vget, vmap, wire_totals};
-pub use server::{serve_stream, InboundHook, PeerServer, RequestHandler};
+pub use server::{serve_overlay_stream, serve_stream, EdxHook, InboundHook, PeerServer, RequestHandler};

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use epix_core::PeerAddr;
-use epix_protocol::{serve_stream, RequestHandler};
+use epix_protocol::{serve_overlay_stream, EdxHook, RequestHandler};
 use reticulum::destination::link::LinkEvent;
 use reticulum::transport::Transport as RnsTransport;
 
@@ -19,11 +19,18 @@ pub struct ReticulumServer {
     handler: Arc<dyn RequestHandler>,
     version: String,
     rev: i64,
+    edx: Option<EdxHook>,
 }
 
 impl ReticulumServer {
     pub fn new(handler: Arc<dyn RequestHandler>) -> Self {
-        Self { handler, version: "EpixRS".into(), rev: 8192 }
+        Self { handler, version: "EpixRS".into(), rev: 8192, edx: None }
+    }
+
+    /// Fork EDX-sniffed links to the (no-Noise overlay) EDX serve loop.
+    pub fn with_edx(mut self, edx: Option<EdxHook>) -> Self {
+        self.edx = edx;
+        self
     }
 
     /// Accept inbound links on `transport` forever, serving each on its own
@@ -52,6 +59,7 @@ impl ReticulumServer {
             let handler = self.handler.clone();
             let version = self.version.clone();
             let rev = self.rev;
+            let edx = self.edx.clone();
             tokio::spawn(async move {
                 // The inbound link id (`ev.id`) is NOT the peer's dialable
                 // destination hash - it's an ephemeral per-link identifier the
@@ -60,7 +68,8 @@ impl ReticulumServer {
                 // it never enters a peer table) and let the handshake replace it
                 // with the peer's advertised `rns` self-address. Mesh
                 // destinations aren't port-addressed; advertise 0.
-                serve_stream(handler, PeerAddr::Rns([0u8; 16]), stream, &version, rev, 0).await;
+                serve_overlay_stream(edx, handler, PeerAddr::Rns([0u8; 16]), stream, &version, rev, 0)
+                    .await;
             });
         }
     }

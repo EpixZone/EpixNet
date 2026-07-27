@@ -118,10 +118,10 @@ impl SignedProvider for AppStateProvider {
     }
 }
 
-/// Build the accept-hook that hands an EDX-sniffed stream to the EDX serve
-/// loop, backed by `store` (the content-addressed objects) and the node's
-/// live xite registry. `privatekey` is this node's EDX identity key (hex),
-/// used for the Hello channel binding.
+/// Build the CLEARNET accept-hook: an EDX-sniffed TCP stream gets Noise-XX
+/// then the EDX serve loop, backed by `store` and the node's xite registry.
+/// `privatekey` is this node's EDX identity key, used for the Hello channel
+/// binding.
 pub fn edx_hook(
     state: Arc<AppState>,
     store: Arc<Store>,
@@ -148,6 +148,114 @@ pub fn edx_hook(
     })
 }
 
+/// Build the OVERLAY accept-hook (Tor/I2P/Reticulum): the transport already
+/// encrypts, so this skips Noise and serves with no channel binding.
+pub fn edx_hook_overlay(
+    state: Arc<AppState>,
+    store: Arc<Store>,
+    privatekey: String,
+    choker: Option<SharedChoker>,
+) -> EdxHook {
+    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state });
+    Arc::new(move |_peer: PeerAddr, stream| {
+        let store = store.clone();
+        let provider = provider.clone();
+        let privatekey = privatekey.clone();
+        let choker = choker.clone();
+        Box::pin(async move {
+            let (conn, incoming) = match epix_edx::link::accept_overlay(stream).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut ctx = ServeCtx::new(store, provider, privatekey);
+            if let Some(c) = choker {
+                ctx = ctx.with_choker(c);
+            }
+            serve(conn, incoming, Arc::new(ctx), None).await;
+        })
+    })
+}
+
+/// The shared EDX serve context: one object store, identity key, and
+/// reciprocity governor, built once and reused by every transport's accept
+/// loop (clearnet + overlays) so credit and storage are unified.
+#[derive(Clone)]
+pub struct EdxServe {
+    state: Arc<AppState>,
+    store: Arc<Store>,
+    privatekey: String,
+    choker: Option<SharedChoker>,
+}
+
+impl EdxServe {
+    /// The clearnet (Noise) accept hook for [`epix_protocol::PeerServer`].
+    pub fn clearnet_hook(&self) -> EdxHook {
+        edx_hook(self.state.clone(), self.store.clone(), self.privatekey.clone(), self.choker.clone())
+    }
+    /// The overlay (no-Noise) accept hook for Tor/I2P/Reticulum.
+    pub fn overlay_hook(&self) -> EdxHook {
+        edx_hook_overlay(self.state.clone(), self.store.clone(), self.privatekey.clone(), self.choker.clone())
+    }
+}
+
+/// Lazily-shared EDX serve context so every accept loop initializes the same
+/// store/key/choker exactly once regardless of which transport comes up first.
+pub type EdxServeCell = Arc<tokio::sync::Mutex<Option<EdxServe>>>;
+
+/// A fresh, uninitialized shared EDX serve cell (built in `start`, cloned
+/// into each transport's accept loop).
+pub fn new_serve_cell() -> EdxServeCell {
+    Arc::new(tokio::sync::Mutex::new(None))
+}
+
+/// This node's EDX identity key (hex), for the Hello channel binding.
+/// Persisted under the data dir as `edx-node.key` so a node keeps its
+/// identity (and reciprocity standing) across restarts; falls back to a fresh
+/// per-boot key when there is no data dir or the file is unusable.
+pub async fn node_key(state: &Arc<AppState>) -> String {
+    let Some(dir) = state.data_root_path() else {
+        return epix_crypt::new_seed();
+    };
+    let path = dir.join("edx-node.key");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let key = existing.trim().to_string();
+        if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return key;
+        }
+    }
+    let key = epix_crypt::new_seed();
+    match std::fs::write(&path, &key) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        Err(e) => state.log("WARN", format!("could not persist EDX node key: {e}")).await,
+    }
+    key
+}
+
+/// Get (initializing on first call) the shared EDX serve context. Returns
+/// None when EDX is disabled (EPIX_EDX=0) or the node keeps no data on disk.
+pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Option<EdxServe> {
+    if !env_on("EPIX_EDX") {
+        return None;
+    }
+    let mut guard = cell.lock().await;
+    if let Some(es) = guard.as_ref() {
+        return Some(es.clone());
+    }
+    let dir = state.data_root_path()?;
+    let key = node_key(state).await;
+    let choker = make_choker();
+    let store = enable_serving(state, &dir, key.clone(), choker.clone()).await?;
+    let es = EdxServe { state: state.clone(), store, privatekey: key, choker };
+    *guard = Some(es.clone());
+    Some(es)
+}
+
 /// Fetches a file's bytes over the EDX verified-streaming path: dial the
 /// xite's connectable peers as EDX links, learn what each holds, run the
 /// swarm scheduler into the object store, then materialize the completed
@@ -169,17 +277,24 @@ impl RuntimeEdxFetcher {
         peer: &PeerAddr,
     ) -> Result<(Conn, PeerIdentity), String> {
         let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
-        let l = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
         // A client context: client_hello only reads the key and caps; reuse
         // the AppState provider (harmless) and the object store.
         let store = self.state.edx_store().await.ok_or("no EDX store")?;
         let provider: Arc<dyn SignedProvider> =
             Arc::new(AppStateProvider { state: self.state.clone() });
         let ctx = ServeCtx::new(store, provider, self.privatekey.clone());
-        let identity = client_hello(&l.conn, &ctx, vec![], Some(l.handshake_hash))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok((l.conn, identity))
+        // Clearnet TCP needs Noise; overlays (Tor/I2P/Reticulum) already
+        // encrypt, so they skip it and bind with no handshake hash.
+        let (conn, hh) = if matches!(peer, PeerAddr::Ip(_)) {
+            let l = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
+            (l.conn, Some(l.handshake_hash))
+        } else {
+            let (conn, _in) = epix_edx::link::dial_overlay(stream).await.map_err(|e| e.to_string())?;
+            (conn, None)
+        };
+        let identity =
+            client_hello(&conn, &ctx, vec![], hh).await.map_err(|e| e.to_string())?;
+        Ok((conn, identity))
     }
 
     /// Credit each peer that delivered groups in `report` for the bytes it
