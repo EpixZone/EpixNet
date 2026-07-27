@@ -205,6 +205,72 @@ async fn hello_gate_rejects_pre_handshake_requests() {
     }
 }
 
+/// Bring up a server on `addr` seeding `data`, return a handshaken conn.
+async fn seed_and_connect(
+    net: Arc<sim::SimNet>,
+    addr: PeerAddr,
+    class: sim::Class,
+    data: &[u8],
+) -> (Conn, ObjId) {
+    net.set_class(addr.clone(), class);
+    let (store, guard) = temp_store();
+    let id = ObjId::of(data);
+    store.insert_bytes(id, Ns::Plain, data, 1).unwrap();
+    // Leak the guard so the store outlives this fn (test-lifetime).
+    std::mem::forget(guard);
+    let conn = connect(net, store, addr).await;
+    (conn, id)
+}
+
+#[tokio::test(start_paused = true)]
+async fn multi_peer_striping_and_tor_only_swarm() {
+    use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
+    let net = sim::SimNet::new();
+
+    // Same 2 MB object seeded on three peers of different classes.
+    let data = test_data(2_000_000);
+    let (c1, id) = seed_and_connect(net.clone(), ip(11), sim::Class::Clearnet, &data).await;
+    let (c2, _) = seed_and_connect(net.clone(), ip(12), sim::Class::I2p, &data).await;
+    let (c3, _) = seed_and_connect(net.clone(), ip(13), sim::Class::Tor, &data).await;
+
+    let bits = epix_blob::bitfield::GroupBits::complete(data.len() as u64);
+    let peers = vec![
+        PeerHandle { conn: c1, class: sim::Class::Clearnet, bits: bits.clone(), label: "clear".into() },
+        PeerHandle { conn: c2, class: sim::Class::I2p, bits: bits.clone(), label: "i2p".into() },
+        PeerHandle { conn: c3, class: sim::Class::Tor, bits: bits.clone(), label: "tor".into() },
+    ];
+
+    let (client_store, _g) = temp_store();
+    let mut swarm = Swarm::new(client_store.clone(), id, data.len() as u64);
+    client_store.ensure_sparse(id, Ns::Plain, data.len() as u64, 1).unwrap();
+    let needed = needed_groups(&client_store, id, data.len() as u64).unwrap();
+    let report = swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+
+    // The object completed and reads back correct.
+    assert!(client_store.is_complete(id).unwrap(), "object completed");
+    assert_eq!(client_store.read_bytes(id, 3).unwrap(), data);
+
+    // Striping actually spread work across peers (not all from one).
+    let peers_used = report.by_peer.len();
+    assert!(peers_used >= 2, "work should stripe across peers, used {peers_used}: {:?}", report.by_peer);
+
+    // A Tor-ONLY swarm still completes (no self-starvation when every
+    // peer is slow — the whole reason for per-class scheduling).
+    let (tc, _) = seed_and_connect(net.clone(), ip(14), sim::Class::Tor, &data).await;
+    let tor_peers = vec![PeerHandle {
+        conn: tc,
+        class: sim::Class::Tor,
+        bits: bits.clone(),
+        label: "tor-only".into(),
+    }];
+    let (store2, _g2) = temp_store();
+    let mut swarm2 = Swarm::new(store2.clone(), id, data.len() as u64);
+    store2.ensure_sparse(id, Ns::Plain, data.len() as u64, 1).unwrap();
+    let needed2 = needed_groups(&store2, id, data.len() as u64).unwrap();
+    swarm2.fetch(&needed2, &tor_peers, Deadline::background(), 2).await.unwrap();
+    assert!(store2.is_complete(id).unwrap(), "Tor-only swarm completes");
+}
+
 #[tokio::test]
 async fn cancel_stops_a_long_stream() {
     let net = sim::SimNet::new();

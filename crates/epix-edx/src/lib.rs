@@ -20,6 +20,7 @@ pub mod fetch;
 pub mod frame;
 pub mod msg;
 pub mod noise;
+pub mod sched;
 pub mod server;
 pub mod sim;
 
