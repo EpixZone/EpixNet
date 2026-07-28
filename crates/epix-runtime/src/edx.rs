@@ -17,7 +17,7 @@ use epix_edx::server::{client_hello, serve, PeerIdentity, ServeCtx, SignedProvid
 use epix_edx::sim::Class;
 use epix_protocol::server::EdxHook;
 use epix_transport::Transport;
-use epix_ui::state::{EdxFetcher, EdxPushError, InboundUpdate};
+use epix_ui::state::{EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, InboundUpdate};
 use epix_ui::AppState;
 
 /// Byte-exact wire encoding of one file's diff actions. The EDX push must
@@ -540,6 +540,76 @@ impl RuntimeEdxFetcher {
         }
         Ok((handles, node_pks))
     }
+
+    /// Dial `peers` (up to `cap`) ONCE and keep the links, so a batch fetches
+    /// every file over the same connections instead of redialing per file (the
+    /// redial-per-file cost of calling `fetch_file` in a loop). Object-
+    /// independent: the per-object bitfield is fetched later over these links.
+    async fn open_session(&self, peers: &[PeerAddr], cap: usize) -> Vec<SessionPeer> {
+        let Some(transport) = self.state.transport().await else { return Vec::new() };
+        let mut out = Vec::new();
+        for peer in peers.iter().take(cap) {
+            if let Ok((conn, identity)) = self.dial(&transport, peer).await {
+                out.push(SessionPeer {
+                    conn,
+                    class: Class::of_addr(peer),
+                    label: peer.to_string(),
+                    node_pk: identity.node_pk,
+                });
+            }
+        }
+        out
+    }
+
+    /// Fetch one object over an already-open session (reused links): learn
+    /// which links hold it (one bitfield request each), then stripe it with the
+    /// swarm. Returns whether the object is complete in the store afterward.
+    async fn fetch_one_over_session(
+        &self,
+        store: &Arc<Store>,
+        id: ObjId,
+        size: u64,
+        session: &[SessionPeer],
+        now: u64,
+    ) -> bool {
+        if store.is_complete(id).unwrap_or(false) {
+            return true;
+        }
+        if store.ensure_sparse(id, Ns::Plain, size, now).is_err() {
+            return false;
+        }
+        let mut handles: Vec<PeerHandle> = Vec::new();
+        let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
+        for p in session {
+            if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&p.conn, id).await {
+                node_pks.insert(p.label.clone(), p.node_pk.clone());
+                handles.push(PeerHandle {
+                    conn: p.conn.clone(),
+                    class: p.class,
+                    bits,
+                    label: p.label.clone(),
+                });
+            }
+        }
+        if handles.is_empty() {
+            return false;
+        }
+        let Ok(needed) = needed_groups(store, id, size) else { return false };
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+            self.credit(&report, &node_pks, now);
+        }
+        store.is_complete(id).unwrap_or(false)
+    }
+}
+
+/// One peer's reused EDX link for a batch session (dialed once, borrowed by
+/// every file's swarm via a cheap `Conn` clone).
+struct SessionPeer {
+    conn: Conn,
+    class: Class,
+    label: String,
+    node_pk: Vec<u8>,
 }
 
 #[async_trait::async_trait]
@@ -676,6 +746,133 @@ impl EdxFetcher for RuntimeEdxFetcher {
         )
         .await
         .map_err(|e| EdxPushError::Refused(e.to_string()))
+    }
+
+    async fn fetch_files(
+        &self,
+        address: &str,
+        want: Vec<EdxWant>,
+        peers: Vec<PeerAddr>,
+        on_file: Option<EdxBatchProgress>,
+    ) -> EdxBatch {
+        let mut batch = EdxBatch { done: Vec::new(), missed: Vec::new(), bytes: 0 };
+        let Some(store) = self.state.edx_store().await else {
+            // No store: every file falls back to the msgpack worker.
+            batch.missed = want.into_iter().map(|w| w.inner_path).collect();
+            return batch;
+        };
+        let now = now_secs();
+        // Read the content.json once, for shard/salt detection.
+        let content = self
+            .state
+            .read_file(address, "content.json")
+            .await
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+
+        // Resolve each want to an object id + size; split off shard files, and
+        // send anything with no EDX entry straight to the fallback.
+        struct Res {
+            path: String,
+            id: ObjId,
+            size: u64,
+        }
+        let mut plain: Vec<Res> = Vec::new();
+        let mut shard_paths: Vec<String> = Vec::new();
+        for w in want {
+            if content
+                .as_ref()
+                .is_some_and(|c| epix_blob::manifest::edx_shard_entry(c, &w.inner_path).is_some())
+            {
+                shard_paths.push(w.inner_path);
+                continue;
+            }
+            let resolved = match (w.id, w.size) {
+                (Some(id), Some(size)) => Some((id, size)),
+                _ => self.resolve(address, &w.inner_path).await.ok().flatten(),
+            };
+            match resolved {
+                Some((id, size)) => plain.push(Res { path: w.inner_path, id, size }),
+                None => batch.missed.push(w.inner_path),
+            }
+        }
+
+        // Materialize anything already complete in the store (no network).
+        let mut pending: Vec<Res> = Vec::new();
+        for r in plain {
+            if store.is_complete(r.id).unwrap_or(false) {
+                if let Ok(bytes) = store.read_bytes(r.id, now) {
+                    if self.state.edx_materialize_file(address, &r.path, &bytes).await.is_ok() {
+                        batch.bytes += bytes.len() as u64;
+                        if let Some(cb) = &on_file {
+                            cb(&r.path, bytes.len() as u64);
+                        }
+                        batch.done.push(r.path);
+                        continue;
+                    }
+                }
+            }
+            pending.push(r);
+        }
+
+        // Encrypted-shard files: no msgpack fallback exists (they are not in
+        // the plain files map), so fetch each over EDX or drop it.
+        for path in shard_paths {
+            let got = match content
+                .as_ref()
+                .and_then(|c| epix_blob::manifest::edx_shard_entry(c, &path).map(|s| (c, s)))
+            {
+                Some((c, shard)) => {
+                    matches!(self.fetch_shard_file(address, &path, c, shard, &store).await, Ok(true))
+                }
+                None => false,
+            };
+            if got {
+                if let Some(cb) = &on_file {
+                    cb(&path, 0);
+                }
+                batch.done.push(path);
+            } else {
+                batch.missed.push(path);
+            }
+        }
+
+        if pending.is_empty() {
+            return batch;
+        }
+
+        // Dial the peers ONCE, then fetch every remaining file over the reused
+        // links. A file no session peer holds (or that the swarm can't
+        // complete) goes to `missed` for the worker.
+        let session = self.open_session(&peers, 8).await;
+        if session.is_empty() {
+            batch.missed.extend(pending.into_iter().map(|r| r.path));
+            return batch;
+        }
+        for r in pending {
+            let complete = self.fetch_one_over_session(&store, r.id, r.size, &session, now).await;
+            let done = complete
+                && match store.read_bytes(r.id, now) {
+                    Ok(bytes) => {
+                        let ok =
+                            self.state.edx_materialize_file(address, &r.path, &bytes).await.is_ok();
+                        if ok {
+                            batch.bytes += bytes.len() as u64;
+                            if let Some(cb) = &on_file {
+                                cb(&r.path, bytes.len() as u64);
+                            }
+                        }
+                        ok
+                    }
+                    Err(_) => false,
+                };
+            if done {
+                batch.done.push(r.path);
+            } else {
+                batch.missed.push(r.path);
+            }
+        }
+        let _ = store.enforce_quota(store_quota());
+        batch
     }
 }
 
@@ -888,6 +1085,49 @@ mod tests {
         // It is now materialized on node A's disk, byte-for-byte.
         let got = XiteStorage::new(a_dir.path()).read("movie.bin").unwrap();
         assert_eq!(got, movie, "fetched file matches the seeder's bytes");
+    }
+
+    /// Batch fetch: one dial-once session pulls every requested file over the
+    /// reused links (the EDX analog of the worker pool), and an undeclared file
+    /// (no b3) comes back in `missed` for the msgpack fallback - it is never
+    /// silently dropped.
+    #[tokio::test]
+    async fn a_batch_fetch_gets_every_declared_file_and_reports_the_rest() {
+        let (address, content_bytes, content, movie, addr, _pk) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
+                state: state_a.clone(),
+                privatekey: epix_crypt::new_seed(),
+                choker: None,
+            }))
+            .await;
+
+        let want = vec![
+            EdxWant::path("index.html"),
+            EdxWant::path("movie.bin"),
+            EdxWant::path("not-declared.bin"), // no b3 -> must land in `missed`
+        ];
+        let peers = vec![epix_core::PeerAddr::Ip(addr)];
+        let batch = state_a.edx_fetch_files(&address, want, peers, None).await.unwrap();
+
+        assert!(batch.done.contains(&"index.html".to_string()));
+        assert!(batch.done.contains(&"movie.bin".to_string()));
+        assert_eq!(batch.missed, vec!["not-declared.bin".to_string()], "undeclared file falls back");
+        assert!(batch.bytes >= movie.len() as u64);
+
+        // Both declared files verified onto disk over the one session.
+        assert_eq!(XiteStorage::new(a_dir.path()).read("movie.bin").unwrap(), movie);
+        assert_eq!(XiteStorage::new(a_dir.path()).read("index.html").unwrap().len(), 5_000);
     }
 
     /// Media seek: a range fetch pulls only the covering bytes (verified),

@@ -101,7 +101,51 @@ pub trait EdxFetcher: Send + Sync {
         sender_peers: Arc<Vec<String>>,
         progressed: Arc<AtomicBool>,
     ) -> Result<(), EdxPushError>;
+
+    /// Fetch many files of `address` over EDX in ONE session: dial the given
+    /// `peers` once and reuse the links across every file (the EDX analog of
+    /// the msgpack worker pool, without its per-file redial). Returns which
+    /// files landed (verified, on disk) and which EDX could not get - the
+    /// exact set for the caller to hand to the msgpack worker fallback. A file
+    /// with no `b3` (undeclared for EDX) comes back in `missed`.
+    async fn fetch_files(
+        &self,
+        address: &str,
+        want: Vec<EdxWant>,
+        peers: Vec<PeerAddr>,
+        on_file: Option<EdxBatchProgress>,
+    ) -> EdxBatch;
 }
+
+/// One file to fetch in a batch. `id`/`size`, when set, let a caller that has
+/// already resolved the object pass it directly - notably a resync, whose new
+/// content.json is staged but not yet committed, so the committed manifest
+/// would resolve the OLD `b3`. When absent they resolve from the committed
+/// content.json (root or governing child).
+pub struct EdxWant {
+    pub inner_path: String,
+    pub id: Option<epix_blob::ObjId>,
+    pub size: Option<u64>,
+}
+
+impl EdxWant {
+    /// A want that resolves itself from the committed content.json.
+    pub fn path(inner_path: impl Into<String>) -> Self {
+        Self { inner_path: inner_path.into(), id: None, size: None }
+    }
+}
+
+/// Result of a batch EDX fetch: the files that landed, bytes moved, and the
+/// inner_paths EDX could not get (hand these to the msgpack worker).
+pub struct EdxBatch {
+    pub done: Vec<String>,
+    pub missed: Vec<String>,
+    pub bytes: u64,
+}
+
+/// Per-file materialized callback `(inner_path, size)` - the EDX analog of the
+/// worker's progress hook, so a batch drives the same clone/ingest UI.
+pub type EdxBatchProgress = Arc<dyn Fn(&str, u64) + Send + Sync>;
 
 /// Why an EDX update push to a peer did not land. Kept distinct so the peer
 /// registry scores an unreachable peer (dial/handshake failed - back it off)
@@ -7869,6 +7913,21 @@ impl AppState {
         Some(fetcher.fetch_file(address, inner_path).await)
     }
 
+    /// Batch EDX fetch via the installed fetcher (one dial-once session over
+    /// `peers`). `None` when no fetcher is installed - the caller then runs the
+    /// full msgpack list; otherwise the batch report, whose `missed` set is the
+    /// leftover the caller hands to the worker.
+    pub async fn edx_fetch_files(
+        &self,
+        address: &str,
+        want: Vec<EdxWant>,
+        peers: Vec<PeerAddr>,
+        on_file: Option<EdxBatchProgress>,
+    ) -> Option<EdxBatch> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_files(address, want, peers, on_file).await)
+    }
+
     /// Fetch a byte range of `inner_path` over EDX via the installed fetcher.
     /// `None` when no fetcher is installed; otherwise the verified bytes (or
     /// an error / `Ok(None)` for a non-EDX file).
@@ -12282,6 +12341,15 @@ mod tests {
                         std::future::pending().await
                     }
                 }
+            }
+            async fn fetch_files(
+                &self,
+                _: &str,
+                _: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                unreachable!()
             }
         }
 
