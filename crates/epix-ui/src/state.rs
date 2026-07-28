@@ -9652,27 +9652,34 @@ impl AppState {
                 None => xite.files_needed(),
             };
             if !needed.is_empty() && !peers.is_empty() {
+                // The full set touched by this update - all of them ingest into
+                // the db afterward whether EDX or the worker delivered them.
                 let needed_paths: Vec<String> =
                     needed.iter().map(|f| f.inner_path.clone()).collect();
-                self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
+                // EDX first over the reused session (staged content's b3 is
+                // authoritative pre-commit); the worker takes the misses.
+                let needed = self.edx_first(&key, needed, peers.clone(), xite.content.as_ref()).await;
+                if !needed.is_empty() {
+                    self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
+                        .await;
+                    let feedback = epix_worker::CollectFeedback::new();
+                    let report = epix_worker::sync_files_list(
+                        needed,
+                        &xite,
+                        &peers,
+                        transport.clone(),
+                        8,
+                        None,
+                        Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
+                    )
                     .await;
-                let feedback = epix_worker::CollectFeedback::new();
-                let report = epix_worker::sync_files_list(
-                    needed,
-                    &xite,
-                    &peers,
-                    transport.clone(),
-                    8,
-                    None,
-                    Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-                )
-                .await;
-                let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
-                if let Ok(report) = &report {
-                    self.add_transfer(&key, report.bytes, 0).await;
+                    let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
+                    if let Ok(report) = &report {
+                        self.add_transfer(&key, report.bytes, 0).await;
+                    }
+                    self.set_worker_stats(&key, 0, 0, 0).await;
+                    self.absorb_sync_outcomes(&key, feedback.drain(), failed_files).await;
                 }
-                self.set_worker_stats(&key, 0, 0, 0).await;
-                self.absorb_sync_outcomes(&key, feedback.drain(), failed_files).await;
                 arrived.extend(needed_paths);
             }
         }
