@@ -49,14 +49,21 @@ pub trait SignedProvider: Send + Sync + 'static {
     async fn list_signed(&self, xite: &str, since: u64) -> Vec<(String, u64, u64)>;
     /// (signed_files, newest_modified, held_bytes) or None if unknown xite.
     async fn xite_summary(&self, xite: &str) -> Option<(u64, u64, u64)>;
-    /// Verify + apply a pushed signed update (and its inline small
-    /// objects). Ok(true) = accepted and new, Ok(false) = stale/known.
+    /// Verify + apply a pushed signed update. `signed` is the content.json
+    /// body; `inline` are small whole objects that ride along; `modified` is
+    /// the version; `diffs` are per-file encoded action lists (the provider
+    /// decodes them) so data files patch in place; `sender_peers` are the
+    /// publisher's dial-back addresses. Ok(true) = accepted and new,
+    /// Ok(false) = stale/known.
     async fn apply_update(
         &self,
         xite: &str,
         inner_path: &str,
         signed: &[u8],
         inline: &[(ObjId, Vec<u8>)],
+        modified: f64,
+        diffs: &[(String, Vec<u8>)],
+        sender_peers: &[String],
     ) -> Result<bool, String>;
 }
 
@@ -307,8 +314,12 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             // Availability notification: consumed by the fetch scheduler
             // (see fetch.rs); as a server there is nothing to answer.
         }
-        Req::Update { xite, inner_path, signed, inline } => {
-            let resp = match ctx.provider.apply_update(&xite, &inner_path, &signed, &inline).await {
+        Req::Update { xite, inner_path, signed, inline, modified, diffs, sender_peers } => {
+            let resp = match ctx
+                .provider
+                .apply_update(&xite, &inner_path, &signed, &inline, modified, &diffs, &sender_peers)
+                .await
+            {
                 Ok(_) => Resp::Ok,
                 Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
             };

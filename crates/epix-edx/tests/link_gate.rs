@@ -48,6 +48,9 @@ impl SignedProvider for FixtureProvider {
         _p: &str,
         _s: &[u8],
         _i: &[(ObjId, Vec<u8>)],
+        _m: f64,
+        _d: &[(String, Vec<u8>)],
+        _sp: &[String],
     ) -> Result<bool, String> {
         Ok(true)
     }

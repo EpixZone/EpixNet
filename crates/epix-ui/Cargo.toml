@@ -68,7 +68,7 @@ bridges = []
 epix-reticulum = { path = "../epix-reticulum" }
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
 tempfile = "3"

@@ -81,6 +81,36 @@ pub trait EdxFetcher: Send + Sync {
         start: u64,
         len: u64,
     ) -> Result<Option<Vec<u8>>, String>;
+
+    /// Push a signed update to a single `peer` over EDX (the `Req::Update`
+    /// message: the content.json `signed` body, `modified` version, per-file
+    /// `diffs` so data files patch in place, and the publisher's dial-back
+    /// `sender_peers`). `Ok(())` when the peer accepted it (newly applied or
+    /// already-known); `Err` distinguishes an unreachable peer from one that
+    /// answered but refused, so the caller can score reputation correctly.
+    /// The impl sets `progressed` once the link is up, so a timeout after the
+    /// handshake is scored Refused (slow-but-live), not Unreachable.
+    async fn push_update(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+        signed: Arc<Vec<u8>>,
+        modified: f64,
+        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+        sender_peers: Arc<Vec<String>>,
+        progressed: Arc<AtomicBool>,
+    ) -> Result<(), EdxPushError>;
+}
+
+/// Why an EDX update push to a peer did not land. Kept distinct so the peer
+/// registry scores an unreachable peer (dial/handshake failed - back it off)
+/// differently from one that answered but refused (alive - do not evict it).
+pub enum EdxPushError {
+    /// Dial or handshake failed; the peer looks dead or unreachable.
+    Unreachable(String),
+    /// The link came up but the peer refused the update (it is alive).
+    Refused(String),
 }
 
 /// One file's state during an on-demand clone (progressive serve).
@@ -817,51 +847,65 @@ fn record_push_outcome(
     outcomes.push((peer, score));
 }
 
-/// Dial one publish candidate and push the update, bounded by the peer's
+/// Push one update to a publish candidate over EDX, bounded by the peer's
 /// connect timeout: reachable clearnet peers answer in ~1-3s, so the deadline
 /// only ever pays for dead candidates, and overlay peers get the longer dial
-/// bound - a fresh onion circuit takes 20-40s, and cutting it off is what
-/// made publishing to Tor-only peers silently fail. A deadline that expires
-/// after the handshake succeeded is scored Refused (the peer is alive), not
-/// Unreachable - repeatedly backing off a slow-but-live overlay peer would
-/// eventually get a reachable peer evicted.
+/// bound - a fresh onion circuit takes 20-40s, and cutting it off is what made
+/// publishing to Tor-only peers silently fail. The EDX push (`Req::Update`)
+/// carries the content.json, per-file diffs, version, and dial-back peers in
+/// one message; the receiver applies it exactly as a msgpack update. Its
+/// error kind distinguishes an unreachable peer (back it off) from one that
+/// answered but refused (alive - do not evict). A timeout BEFORE the link
+/// comes up is Unreachable; a timeout after it is Refused, so a slow-but-live
+/// overlay peer (a fresh onion circuit eats most of the dial bound) is not
+/// wrongly backed off and evicted.
+///
+/// The legacy msgpack `update` push is retired: EDX is the sole propagation
+/// transport now. (The offline-peer `announce_update` store-and-forward hint
+/// rode that push; migrating the propagation-hint layer to EDX is separate,
+/// and the re-broadcast flood + beacon + periodic resync still spread updates.)
+#[allow(clippy::too_many_arguments)]
 async fn push_update_to_peer(
-    transport: Arc<dyn Transport>,
+    edx: Arc<dyn EdxFetcher>,
     peer: PeerAddr,
     address: String,
     inner_path: String,
     body: Arc<Vec<u8>>,
     modified: f64,
-    diffs: Option<rmpv::Value>,
+    diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
     sender_peers: Arc<Vec<String>>,
 ) -> PushOutcome {
     let deadline = peer.connect_timeout();
     let timeout_peer = peer.clone();
-    // Set once the handshake succeeds (see the doc comment).
-    let progressed = AtomicBool::new(false);
-    let push = async {
-        let mut conn = match Connection::connect(transport.as_ref(), &peer).await {
-            Ok(conn) => conn,
-            Err(_) => return PushOutcome::Unreachable(peer),
-        };
-        if conn.handshake().await.is_err() {
-            return PushOutcome::Unreachable(peer);
+    // Set by the fetcher once the EDX link is up, so a timeout that fires
+    // after the handshake is scored Refused (alive), not a backoff.
+    let progressed = Arc::new(AtomicBool::new(false));
+    let push = {
+        let progressed = progressed.clone();
+        async move {
+            match edx
+                .push_update(
+                    peer.clone(),
+                    &address,
+                    &inner_path,
+                    body,
+                    modified,
+                    diffs,
+                    sender_peers,
+                    progressed,
+                )
+                .await
+            {
+                Ok(()) => PushOutcome::Accepted(peer),
+                Err(EdxPushError::Refused(e)) => PushOutcome::Refused(peer, e),
+                Err(EdxPushError::Unreachable(_)) => PushOutcome::Unreachable(peer),
+            }
         }
-        progressed.store(true, Ordering::Relaxed);
-        if let Err(e) =
-            conn.update(&address, &inner_path, &body, modified, diffs, &sender_peers).await
-        {
-            return PushOutcome::Refused(peer, e.to_string());
-        }
-        // Live-hook: tell the peer (acting as a propagation node) about the
-        // new version so peers that are offline now can pull it later.
-        let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
-        PushOutcome::Accepted(peer)
     };
     match tokio::time::timeout(deadline, push).await {
         Ok(outcome) => outcome,
         Err(_) if progressed.load(Ordering::Relaxed) => {
-            PushOutcome::Refused(timeout_peer, "timed out mid-transfer".into())
+            PushOutcome::Refused(timeout_peer, "timed out after the link came up".into())
         }
         Err(_) => PushOutcome::Unreachable(timeout_peer),
     }
@@ -8905,7 +8949,15 @@ impl AppState {
             .ok()
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
-        let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
+        // EDX is the sole propagation transport now; without it there is no
+        // push path (the msgpack update was retired). EPIX_EDX=0 therefore
+        // disables publishing, which is the intended clean-cut behavior.
+        let edx = self
+            .edx_fetcher
+            .read()
+            .await
+            .clone()
+            .ok_or("publishing requires EDX (it is disabled)")?;
         let pool =
             self.connectable_peers(address, if exhaustive { MAX_PUBLISH_DIALS } else { limit }).await;
         let total = pool.len();
@@ -8920,7 +8972,9 @@ impl AppState {
             )
             .await;
         }
-        let wire_diffs = (!diffs.is_empty()).then(|| crate::fileserve::encode_diffs(&diffs));
+        // Keep the diffs transport-neutral (the EDX edge lowers them to the
+        // wire form); Arc so 100 spawned pushes share one map.
+        let diffs = Arc::new(diffs);
         // The pushed body is cloned into every spawned task; Arc it so 100
         // candidates share one buffer instead of cloning a possibly-MB
         // content.json per dial.
@@ -8947,7 +9001,7 @@ impl AppState {
                 continue;
             }
             run.attempted += batch.len();
-            self.push_batch(address, inner_path, batch, &body, modified, &wire_diffs, &sender_peers, &transport, &mut run)
+            self.push_batch(address, inner_path, batch, &body, modified, &diffs, &sender_peers, &edx, &mut run)
                 .await;
             // One batch with any acceptor is enough: the accepted push
             // re-broadcasts peer-to-peer, and the remaining candidates get
@@ -9018,21 +9072,21 @@ impl AppState {
         batch: Vec<PeerAddr>,
         body: &Arc<Vec<u8>>,
         modified: f64,
-        wire_diffs: &Option<rmpv::Value>,
+        diffs: &Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
         sender_peers: &Arc<Vec<String>>,
-        transport: &Arc<dyn Transport>,
+        edx: &Arc<dyn EdxFetcher>,
         run: &mut PublishRun,
     ) {
         let mut set = tokio::task::JoinSet::new();
         for peer in batch {
             set.spawn(push_update_to_peer(
-                transport.clone(),
+                edx.clone(),
                 peer,
                 address.to_string(),
                 inner_path.to_string(),
                 body.clone(),
                 modified,
-                wire_diffs.clone(),
+                diffs.clone(),
                 sender_peers.clone(),
             ));
         }
@@ -12147,6 +12201,77 @@ mod tests {
 
         // A file outside the db dir is ignored without error.
         state.ingest_file(addr, "index.html").await;
+    }
+
+    /// push_update_to_peer maps the EDX push result to a peer outcome, and -
+    /// the reputation-critical part - scores a timeout that fires AFTER the
+    /// link came up as Refused (peer alive), not Unreachable, so a slow-but-
+    /// live overlay peer is not backed off and evicted.
+    #[tokio::test(start_paused = true)]
+    async fn edx_push_outcomes_map_and_score_timeouts() {
+        // 0 = accept, 1 = refuse, 2 = unreachable, 3 = come up then hang.
+        struct MockPush {
+            mode: u8,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for MockPush {
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _peer: PeerAddr,
+                _address: &str,
+                _inner_path: &str,
+                _signed: Arc<Vec<u8>>,
+                _modified: f64,
+                _diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+                _sender_peers: Arc<Vec<String>>,
+                progressed: Arc<AtomicBool>,
+            ) -> Result<(), EdxPushError> {
+                match self.mode {
+                    0 => Ok(()),
+                    1 => Err(EdxPushError::Refused("nope".into())),
+                    2 => Err(EdxPushError::Unreachable("dead".into())),
+                    _ => {
+                        // The link came up, then the request stalls past the
+                        // deadline.
+                        progressed.store(true, Ordering::Relaxed);
+                        std::future::pending().await
+                    }
+                }
+            }
+        }
+
+        let peer = PeerAddr::Ip("1.2.3.4:15441".parse().unwrap());
+        async fn run(mode: u8, peer: PeerAddr) -> PushOutcome {
+            push_update_to_peer(
+                Arc::new(MockPush { mode }),
+                peer,
+                "1Site".into(),
+                "content.json".into(),
+                Arc::new(vec![1, 2, 3]),
+                1.0,
+                Arc::new(HashMap::new()),
+                Arc::new(vec![]),
+            )
+            .await
+        }
+
+        assert!(matches!(run(0, peer.clone()).await, PushOutcome::Accepted(_)));
+        assert!(matches!(run(1, peer.clone()).await, PushOutcome::Refused(..)));
+        assert!(matches!(run(2, peer.clone()).await, PushOutcome::Unreachable(_)));
+        // Came up then timed out -> Refused (alive), NOT Unreachable.
+        assert!(matches!(run(3, peer.clone()).await, PushOutcome::Refused(..)));
     }
 
     /// A pushed user-content update whose data file arrives as a DIFF PATCH

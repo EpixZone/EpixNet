@@ -115,6 +115,40 @@ pub async fn fetch_ranges(
     Ok(len)
 }
 
+/// Push a signed update to a peer: the content.json `signed` body plus the
+/// version `modified`, per-file `diffs` (`inner_path -> encoded actions`),
+/// the publisher's `sender_peers` dial-back addresses, and any `inline`
+/// small objects. Returns Ok when the peer accepted it (whether newly
+/// applied or already-known); Err on a protocol rejection or a closed link.
+#[allow(clippy::too_many_arguments)]
+pub async fn push_update(
+    conn: &Conn,
+    xite: &str,
+    inner_path: &str,
+    signed: &[u8],
+    modified: f64,
+    diffs: Vec<(String, Vec<u8>)>,
+    sender_peers: Vec<String>,
+    inline: Vec<(ObjId, Vec<u8>)>,
+) -> std::io::Result<()> {
+    match conn
+        .request(Req::Update {
+            xite: xite.into(),
+            inner_path: inner_path.into(),
+            signed: signed.to_vec(),
+            inline,
+            modified,
+            diffs,
+            sender_peers,
+        })
+        .await?
+    {
+        Resp::Ok => Ok(()),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected Ok, got {other:?}"))),
+    }
+}
+
 /// Fetch a signed content.json (raw bytes — caller verifies signature).
 pub async fn fetch_signed(conn: &Conn, xite: &str, inner_path: &str) -> std::io::Result<Vec<u8>> {
     match conn

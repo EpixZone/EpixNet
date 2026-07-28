@@ -86,9 +86,26 @@ pub enum Req {
     /// Notification: these groups of `obj` became available here (RLE
     /// runs, present-first). No response.
     HaveRanges { obj: ObjId, runs: Vec<u64> },
-    /// Push publish: a signed content.json + optional inline small
-    /// objects (a forum post rides in one push, as today). Answered Ok.
-    Update { xite: String, inner_path: String, signed: Vec<u8>, inline: Vec<(ObjId, Vec<u8>)> },
+    /// Push publish: a signed content.json plus everything a receiver needs
+    /// to apply it without a second round trip - optional inline small
+    /// objects (a forum post rides in one push), the version `modified` (so
+    /// a receiver can short-circuit a stale push), the per-file line diffs
+    /// (`inner_path -> encoded actions`) so data files patch in place instead
+    /// of refetching, and the publisher's dial-back addresses so a NATed
+    /// publisher can still be pulled from. Answered Ok (accepted, whether
+    /// newly applied or already-known) or Err.
+    Update {
+        xite: String,
+        inner_path: String,
+        signed: Vec<u8>,
+        inline: Vec<(ObjId, Vec<u8>)>,
+        modified: f64,
+        /// `inner_path -> encoded action list` (the runtime lowers
+        /// `epix_content` diff actions to bytes; epix-edx stays neutral).
+        diffs: Vec<(String, Vec<u8>)>,
+        /// The publisher's self-declared dialable addresses.
+        sender_peers: Vec<String>,
+    },
     // --- Stage 4+ appends only below this line (postcard indices!) ---
 }
 
@@ -177,6 +194,18 @@ mod tests {
             },
             Frame { stream: 3, body: FrameBody::Data { last: false, bytes: vec![0xAB; 1000] } },
             Frame { stream: 3, body: FrameBody::Cancel },
+            Frame {
+                stream: 4,
+                body: FrameBody::Req(Req::Update {
+                    xite: "1Abc".into(),
+                    inner_path: "data/users/alice/content.json".into(),
+                    signed: vec![1, 2, 3, 4],
+                    inline: vec![(ObjId([9; 32]), vec![5, 6, 7])],
+                    modified: 1_700_000_123.5,
+                    diffs: vec![("data/users/alice/data.json".into(), vec![b'[', b']'])],
+                    sender_peers: vec!["abc.onion:15441".into(), "1.2.3.4:15441".into()],
+                }),
+            },
         ];
         for f in &frames {
             assert_eq!(&round_trip(f), f);
@@ -216,6 +245,7 @@ mod tests {
             (Req::Update {
                 xite: String::new(), inner_path: String::new(),
                 signed: vec![], inline: vec![],
+                modified: 0.0, diffs: vec![], sender_peers: vec![],
             }, 8),
         ];
         for (req, disc) in reqs {

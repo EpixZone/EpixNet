@@ -51,6 +51,9 @@ impl SignedProvider for FixtureProvider {
         _inner_path: &str,
         _signed: &[u8],
         _inline: &[(ObjId, Vec<u8>)],
+        _modified: f64,
+        _diffs: &[(String, Vec<u8>)],
+        _sender_peers: &[String],
     ) -> Result<bool, String> {
         Ok(true)
     }

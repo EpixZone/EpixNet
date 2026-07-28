@@ -13,6 +13,7 @@ epix-transport = { path = "../epix-transport" }
 epix-protocol = { path = "../epix-protocol" }
 epix-edx = { path = "../epix-edx" }
 epix-blob = { path = "../epix-blob" }
+epix-content = { path = "../epix-content" }
 epix-selfenc = { path = "../epix-selfenc" }
 epix-crypt = { path = "../epix-crypt" }
 epix-dht = { path = "../epix-dht" }

@@ -52,6 +52,9 @@ impl SignedProvider for FixtureProvider {
         _inner_path: &str,
         _signed: &[u8],
         _inline: &[(ObjId, Vec<u8>)],
+        _modified: f64,
+        _diffs: &[(String, Vec<u8>)],
+        _sender_peers: &[String],
     ) -> Result<bool, String> {
         Ok(true)
     }
@@ -496,6 +499,119 @@ async fn disjoint_holders_still_complete_the_object() {
 
     assert!(client_store.is_complete(id).unwrap(), "object completes despite disjoint holders");
     assert_eq!(client_store.read_bytes(id, 3).unwrap(), data);
+}
+
+/// What a peer's `apply_update` received, captured for assertions.
+#[derive(Default, Clone)]
+struct Captured {
+    xite: String,
+    inner_path: String,
+    signed: Vec<u8>,
+    inline: Vec<(ObjId, Vec<u8>)>,
+    modified: f64,
+    diffs: Vec<(String, Vec<u8>)>,
+    sender_peers: Vec<String>,
+}
+
+/// A provider that records the exact `apply_update` arguments so a test can
+/// assert the whole `Req::Update` (diffs + version + dial-back peers +
+/// inline) survives the wire and the server's destructure.
+struct CapturingProvider {
+    seen: std::sync::Arc<std::sync::Mutex<Option<Captured>>>,
+}
+
+#[async_trait::async_trait]
+impl SignedProvider for CapturingProvider {
+    async fn get_signed(&self, _: &str, _: &str) -> Option<Vec<u8>> {
+        None
+    }
+    async fn list_signed(&self, _: &str, _: u64) -> Vec<(String, u64, u64)> {
+        Vec::new()
+    }
+    async fn xite_summary(&self, _: &str) -> Option<(u64, u64, u64)> {
+        None
+    }
+    async fn apply_update(
+        &self,
+        xite: &str,
+        inner_path: &str,
+        signed: &[u8],
+        inline: &[(ObjId, Vec<u8>)],
+        modified: f64,
+        diffs: &[(String, Vec<u8>)],
+        sender_peers: &[String],
+    ) -> Result<bool, String> {
+        *self.seen.lock().unwrap() = Some(Captured {
+            xite: xite.into(),
+            inner_path: inner_path.into(),
+            signed: signed.to_vec(),
+            inline: inline.to_vec(),
+            modified,
+            diffs: diffs.to_vec(),
+            sender_peers: sender_peers.to_vec(),
+        });
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn push_update_delivers_every_field_to_the_provider() {
+    let net = sim::SimNet::new();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let provider = Arc::new(CapturingProvider { seen: seen.clone() });
+    let ctx = Arc::new(ServeCtx::new(temp_store().0, provider, SERVER_KEY.into()));
+
+    let server_addr = ip(40);
+    let mut inbox = net.listen(server_addr.clone());
+    tokio::spawn(async move {
+        while let Some((_from, stream)) = inbox.recv().await {
+            let (conn, incoming) = Conn::start(stream, false);
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                serve(conn, incoming, ctx, None).await;
+            });
+        }
+    });
+
+    let t = sim::SimTransport { net, local: ip(203) };
+    let stream = {
+        use epix_transport::Transport;
+        t.dial(&server_addr).await.unwrap()
+    };
+    let (conn, _in) = Conn::start(stream, true);
+    let (cstore, _cg) = temp_store();
+    let cctx = ServeCtx {
+        now: || 0,
+        ..ServeCtx::new(cstore, Arc::new(FixtureProvider { signed: Default::default() }), CLIENT_KEY.into())
+    };
+    epix_edx::server::client_hello(&conn, &cctx, vec![], None).await.unwrap();
+
+    // Push a fully-populated update (a forum post with a data.json diff).
+    let signed = br#"{"address":"1Forum","modified":2000}"#.to_vec();
+    let inline = vec![(ObjId([3; 32]), vec![10, 20, 30])];
+    let diffs = vec![("data.json".to_string(), br#"[["=",42],["+",["new"]]]"#.to_vec())];
+    let sender_peers = vec!["abc.onion:15441".to_string(), "1.2.3.4:15441".to_string()];
+    epix_edx::fetch::push_update(
+        &conn,
+        "1Forum",
+        "data/users/alice/content.json",
+        &signed,
+        2000.5,
+        diffs.clone(),
+        sender_peers.clone(),
+        inline.clone(),
+    )
+    .await
+    .expect("peer accepts the push");
+
+    let got = seen.lock().unwrap().clone().expect("provider saw the update");
+    assert_eq!(got.xite, "1Forum");
+    assert_eq!(got.inner_path, "data/users/alice/content.json");
+    assert_eq!(got.signed, signed);
+    assert_eq!(got.inline, inline);
+    assert_eq!(got.modified, 2000.5);
+    assert_eq!(got.diffs, diffs, "per-file diffs survive the wire");
+    assert_eq!(got.sender_peers, sender_peers, "dial-back peers survive the wire");
 }
 
 #[tokio::test]

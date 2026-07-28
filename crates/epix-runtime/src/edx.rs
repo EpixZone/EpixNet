@@ -17,8 +17,101 @@ use epix_edx::server::{client_hello, serve, PeerIdentity, ServeCtx, SignedProvid
 use epix_edx::sim::Class;
 use epix_protocol::server::EdxHook;
 use epix_transport::Transport;
-use epix_ui::state::{EdxFetcher, InboundUpdate};
+use epix_ui::state::{EdxFetcher, EdxPushError, InboundUpdate};
 use epix_ui::AppState;
+
+/// Byte-exact wire encoding of one file's diff actions. The EDX push must
+/// preserve arbitrary insert bytes: the retired msgpack encoder carried them
+/// as binary blobs, but routing through JSON/UTF-8 (`actions_to_value`) would
+/// mangle any non-UTF8 byte to U+FFFD and defeat the diff for such files.
+/// Layout: u64-LE action count, then per action a tag byte and u64-LE fields
+/// (Equal/Remove: one length; Insert: line count, then per line length+bytes).
+fn encode_actions(actions: &[epix_content::DiffAction]) -> Vec<u8> {
+    use epix_content::DiffAction;
+    let mut out = Vec::new();
+    out.extend_from_slice(&(actions.len() as u64).to_le_bytes());
+    for a in actions {
+        match a {
+            DiffAction::Equal(n) => {
+                out.push(0);
+                out.extend_from_slice(&(*n as u64).to_le_bytes());
+            }
+            DiffAction::Remove(n) => {
+                out.push(1);
+                out.extend_from_slice(&(*n as u64).to_le_bytes());
+            }
+            DiffAction::Insert(lines) => {
+                out.push(2);
+                out.extend_from_slice(&(lines.len() as u64).to_le_bytes());
+                for l in lines {
+                    out.extend_from_slice(&(l.len() as u64).to_le_bytes());
+                    out.extend_from_slice(l);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_actions`]. Returns None on any truncation or bad tag
+/// (the caller drops that file's diff and refetches it whole). Reads only what
+/// the buffer holds - a bogus length just runs off the end into None - and
+/// never pre-allocates from an untrusted count, so a crafted blob can't OOM.
+fn decode_actions(b: &[u8]) -> Option<Vec<epix_content::DiffAction>> {
+    use epix_content::DiffAction;
+    fn read_u64(b: &[u8], i: &mut usize) -> Option<u64> {
+        let end = i.checked_add(8)?;
+        let n = u64::from_le_bytes(b.get(*i..end)?.try_into().ok()?);
+        *i = end;
+        Some(n)
+    }
+    let mut i = 0usize;
+    let count = read_u64(b, &mut i)?;
+    let mut actions = Vec::new();
+    for _ in 0..count {
+        let tag = *b.get(i)?;
+        i += 1;
+        match tag {
+            0 => actions.push(DiffAction::Equal(read_u64(b, &mut i)? as usize)),
+            1 => actions.push(DiffAction::Remove(read_u64(b, &mut i)? as usize)),
+            2 => {
+                let lines_n = read_u64(b, &mut i)?;
+                let mut lines = Vec::new();
+                for _ in 0..lines_n {
+                    let len = read_u64(b, &mut i)? as usize;
+                    let end = i.checked_add(len)?;
+                    lines.push(b.get(i..end)?.to_vec());
+                    i = end;
+                }
+                actions.push(DiffAction::Insert(lines));
+            }
+            _ => return None,
+        }
+    }
+    Some(actions)
+}
+
+/// Encode the neutral diff map to the EDX wire form (byte-exact per file).
+fn encode_edx_diffs(
+    diffs: &HashMap<String, Vec<epix_content::DiffAction>>,
+) -> Vec<(String, Vec<u8>)> {
+    diffs.iter().map(|(path, actions)| (path.clone(), encode_actions(actions))).collect()
+}
+
+/// Decode the EDX wire diffs back into the neutral map. A malformed entry is
+/// dropped (the receiver just refetches that file whole - diffs are a
+/// bandwidth optimization, never a correctness dependency).
+fn decode_edx_diffs(
+    diffs: &[(String, Vec<u8>)],
+) -> HashMap<String, Vec<epix_content::DiffAction>> {
+    let mut out = HashMap::new();
+    for (path, bytes) in diffs {
+        if let Some(actions) = decode_actions(bytes) {
+            out.insert(path.clone(), actions);
+        }
+    }
+    out
+}
 
 /// A shared upload governor for reciprocity choking (seed -> faster
 /// service): the serve side consults it, the fetch side credits peers that
@@ -106,20 +199,31 @@ impl SignedProvider for AppStateProvider {
         inner_path: &str,
         signed: &[u8],
         _inline: &[(ObjId, Vec<u8>)],
+        modified: f64,
+        diffs: &[(String, Vec<u8>)],
+        sender_peers: &[String],
     ) -> Result<bool, String> {
-        // Bridge to the existing inbound-update path: the signed bytes are
-        // the content.json body. Inline objects and per-record diffs ride
-        // the propagation stage; a whole signed body is enough here.
+        // `inline` is not consumed: nothing sends it yet, and inserting pushed
+        // objects into the store before apply_inbound_update authorizes the
+        // update would let any peer fill our disk. Files land through the
+        // verified fetch that the inbound update kicks off instead.
+        //
+        // Lower the EDX message into what the inbound-update path expects:
+        // decode the per-file diffs (so data files patch in place) and parse
+        // the publisher's dial-back addresses (unparseable ones dropped).
+        let diffs = decode_edx_diffs(diffs);
+        let sender_peers: Vec<PeerAddr> =
+            sender_peers.iter().filter_map(|s| PeerAddr::parse(s).ok()).take(5).collect();
         match self
             .state
             .apply_inbound_update(
                 xite,
                 inner_path,
                 Some(signed.to_vec()),
+                Some(modified),
                 None,
-                None,
-                HashMap::new(),
-                Vec::new(),
+                diffs,
+                sender_peers,
             )
             .await
         {
@@ -516,6 +620,58 @@ impl EdxFetcher for RuntimeEdxFetcher {
         let _ = store.enforce_quota(store_quota());
         Ok(Some(bytes))
     }
+
+    async fn push_update(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+        signed: Arc<Vec<u8>>,
+        modified: f64,
+        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+        sender_peers: Arc<Vec<String>>,
+        progressed: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), EdxPushError> {
+        // Dial the peer as an EDX link and push the update. A dial/handshake
+        // failure means the peer looks unreachable (back it off); a failure
+        // after the link is up means it answered but refused (alive).
+        let transport =
+            self.state.transport().await.ok_or_else(|| EdxPushError::Unreachable("no transport".into()))?;
+        let (conn, _identity) =
+            self.dial(&transport, &peer).await.map_err(EdxPushError::Unreachable)?;
+        // The link is up: from here a timeout is a slow-but-live peer, not an
+        // unreachable one (the caller scores it Refused, not a backoff).
+        progressed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Keep the whole Req::Update under the frame cap. The signed
+        // content.json is the big, refetchable part - if it would overflow,
+        // send it body-less and let the receiver pull it via GetSigned (we
+        // are in its sender_peers); only if the diffs alone still overflow do
+        // we drop those too and let it refetch the changed files whole.
+        const FRAME_BUDGET: usize = 56 * 1024;
+        let wire_diffs = encode_edx_diffs(&diffs);
+        let diffs_len: usize = wire_diffs.iter().map(|(p, b)| p.len() + b.len() + 16).sum();
+        let (body, wire_diffs): (&[u8], Vec<(String, Vec<u8>)>) =
+            if signed.len() + diffs_len < FRAME_BUDGET {
+                (signed.as_slice(), wire_diffs)
+            } else if diffs_len < FRAME_BUDGET {
+                (&[], wire_diffs)
+            } else {
+                (&[], Vec::new())
+            };
+        epix_edx::fetch::push_update(
+            &conn,
+            address,
+            inner_path,
+            body,
+            modified,
+            wire_diffs,
+            sender_peers.as_ref().clone(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|e| EdxPushError::Refused(e.to_string()))
+    }
 }
 
 /// Open the EDX object store under `data_dir/edx-store` and install it plus
@@ -600,6 +756,9 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &[(ObjId, Vec<u8>)],
+            _: f64,
+            _: &[(String, Vec<u8>)],
+            _: &[String],
         ) -> Result<bool, String> {
             Ok(true)
         }
@@ -846,6 +1005,162 @@ mod tests {
         assert!(matches!(result, Some(Ok(true))), "child-file fetch: {result:?}");
         let got = XiteStorage::new(a_dir.path()).read("data/users/alice/data.json").unwrap();
         assert_eq!(got, post, "per-user file transferred over EDX");
+    }
+
+    /// The EDX diff wire codec is byte-exact, including non-UTF8 insert bytes
+    /// (routing diffs through JSON would mangle them to U+FFFD and defeat the
+    /// diff), and a truncated/garbage blob decodes to None so the receiver
+    /// safely refetches that file whole.
+    #[test]
+    fn diff_actions_wire_is_byte_exact_and_bounds_checked() {
+        use epix_content::DiffAction;
+        let actions = vec![
+            DiffAction::Equal(42),
+            DiffAction::Remove(7),
+            DiffAction::Insert(vec![vec![0xFF, 0xFE, b'a', 0x00, 0x80], b"plain\n".to_vec()]),
+        ];
+        let bytes = encode_actions(&actions);
+        assert_eq!(decode_actions(&bytes).as_ref(), Some(&actions), "byte-exact round trip");
+
+        // Through the map form the wire actually uses.
+        let mut map = HashMap::new();
+        map.insert("data.json".to_string(), actions.clone());
+        let back = decode_edx_diffs(&encode_edx_diffs(&map));
+        assert_eq!(back.get("data.json"), Some(&actions));
+
+        // Truncation and a too-short header both fail cleanly (no panic, None).
+        assert!(decode_actions(&bytes[..bytes.len() - 1]).is_none());
+        assert!(decode_actions(&[0xFF; 4]).is_none());
+        // A wildly large embedded count can't pre-allocate/OOM: it just runs
+        // off the end of the short buffer and returns None.
+        assert!(decode_actions(&u64::MAX.to_le_bytes()).is_none());
+    }
+
+    /// Update propagation over EDX: a publisher pushes a new signed child
+    /// content.json plus a data.json DIFF (a forum reply) to a receiver over a
+    /// real EDX link (`Req::Update`), and the receiver applies it. The
+    /// receiver has NO transport, so the patched data.json can only arrive by
+    /// applying the diff that rode the push - proving the diff (and version)
+    /// crossed EDX, not just the whole content.json.
+    #[tokio::test]
+    async fn edx_push_applies_a_forum_diff() {
+        use epix_ui::state::XiteEntry;
+
+        // --- Node B (receiver): a forum site holding v1 of alice's posts ---
+        let site_pk = epix_crypt::new_seed();
+        let site_addr = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let user_pk = epix_crypt::new_seed();
+        let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let user_dir = format!("data/users/{user_addr}");
+
+        let b_dir = tempfile::tempdir().unwrap();
+        let b_path = b_dir.path().to_path_buf();
+        let storage = XiteStorage::new(b_dir.path());
+        // Parent user_contents rules the pushed child verifies against.
+        let parent = serde_json::json!({
+            "address": site_addr,
+            "inner_path": "data/users/content.json",
+            "user_contents": {
+                "cert_signers": {},
+                "permissions": {},
+                "permission_rules": { ".*": { "max_size": 100000 } },
+            },
+        });
+        storage
+            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .unwrap();
+        let data_v1: &[u8] = br#"{ "posts": [ {"post_id":1,"title":"First"} ] }"#;
+        storage.write(&format!("{user_dir}/data.json"), data_v1).unwrap();
+        let mut c1 = serde_json::json!({
+            "address": site_addr,
+            "inner_path": format!("{user_dir}/content.json"),
+            "modified": 1000,
+            "files": { "data.json": { "size": data_v1.len(), "sha512": XiteStorage::hash_bytes(data_v1) } },
+        });
+        epix_content::sign(&mut c1, &user_pk).unwrap();
+        storage
+            .write(&format!("{user_dir}/content.json"), &serde_json::to_vec(&c1).unwrap())
+            .unwrap();
+
+        let root = serde_json::json!({ "address": site_addr, "modified": 1.0, "files": {} });
+        let state_b = AppState::new("node-b");
+        state_b
+            .add_xite(&site_addr, XiteEntry { storage: XiteStorage::new(&b_path), content: Some(root) })
+            .await;
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        std::mem::forget(b_dir);
+        std::mem::forget(store_dir);
+
+        let server_key = epix_crypt::new_seed();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
+        let server = epix_protocol::PeerServer::new(handler)
+            .with_edx(edx_hook(state_b.clone(), store_b, server_key, None));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        // --- Node A (publisher): v2 adds a reply; push the signed child + diff ---
+        let data_v2: &[u8] =
+            br#"{ "posts": [ {"post_id":1,"title":"First"}, {"post_id":2,"title":"Reply"} ] }"#;
+        let mut c2 = serde_json::json!({
+            "address": site_addr,
+            "inner_path": format!("{user_dir}/content.json"),
+            "modified": 2000,
+            "files": { "data.json": { "size": data_v2.len(), "sha512": XiteStorage::hash_bytes(data_v2) } },
+        });
+        epix_content::sign(&mut c2, &user_pk).unwrap();
+        let mut diffs = HashMap::new();
+        diffs.insert(
+            "data.json".to_string(),
+            epix_content::diff::diff(data_v1, data_v2, Some(30 * 1024)).unwrap(),
+        );
+
+        let state_a = AppState::new("node-a");
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        std::mem::forget(a_store_dir);
+        let fetcher = RuntimeEdxFetcher {
+            state: state_a.clone(),
+            privatekey: epix_crypt::new_seed(),
+            choker: None,
+        };
+
+        let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pushed = fetcher
+            .push_update(
+                epix_core::PeerAddr::Ip(addr),
+                &site_addr,
+                &format!("{user_dir}/content.json"),
+                Arc::new(serde_json::to_vec(&c2).unwrap()),
+                2000.0,
+                Arc::new(diffs),
+                Arc::new(Vec::new()),
+                progressed.clone(),
+            )
+            .await;
+        assert!(pushed.is_ok(), "the peer accepted the EDX update push");
+        assert!(progressed.load(std::sync::atomic::Ordering::Relaxed), "the link came up");
+
+        // B has no transport: the only way data.json can reach v2 is the diff
+        // patch that rode the push. Poll B's disk until it lands.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(bytes) = XiteStorage::new(&b_path).read(&format!("{user_dir}/data.json")) {
+                if bytes == data_v2 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the diff-patched data.json never landed on the receiver over EDX"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Encrypted shards end to end: a private file signs into content-
