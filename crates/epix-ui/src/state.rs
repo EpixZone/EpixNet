@@ -157,6 +157,41 @@ fn edx_want_from_staged(content: &Value, inner_path: &str) -> Option<(epix_blob:
     Some((b3, size))
 }
 
+/// Count of DISTINCT EDX-eligible files (they carry a `b3`) that fell back to
+/// the msgpack fetch because EDX could not land them. Zero on a healthy
+/// new-build clone/resync; a nonzero value on the 1b validation network flags
+/// an EDX path problem before the msgpack `getFile` fallback is removed in 1c.
+/// Legacy files with no `b3` are never EDX-eligible and never counted here.
+pub static EDX_MSGPACK_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The `(address, inner_path)` pairs already tallied, so a file counts ONCE no
+/// matter how many layers touch it: the optional flow tries EDX in the batch
+/// prepass AND again per-file in each `file_need` retry round, and an on-demand
+/// serve can retry a batch-missed file later. Without this de-dup the gauge
+/// would multiply a single unreachable file by the retry count. Reset on
+/// restart (which is how the 1b validation is run, one clone per node).
+fn edx_fallback_seen() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that an EDX-eligible file fell back to the msgpack path, counting
+/// each distinct `(address, inner_path)` at most once.
+pub fn note_edx_fallback_path(address: &str, inner_path: &str) {
+    let key = format!("{address}\u{0}{inner_path}");
+    if edx_fallback_seen().lock().unwrap().insert(key) {
+        EDX_MSGPACK_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Cumulative count of distinct EDX-eligible files that fell back to msgpack
+/// this run.
+pub fn edx_msgpack_fallbacks() -> u64 {
+    EDX_MSGPACK_FALLBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Why an EDX update push to a peer did not land. Kept distinct so the peer
 /// registry scores an unreachable peer (dial/handshake failed - back it off)
 /// differently from one that answered but refused (alive - do not evict it).
@@ -4125,7 +4160,7 @@ impl AppState {
         // EDX first: dial the peers once and pull what EDX can (verified onto
         // disk), then hand only the leftovers to the msgpack worker. No fetcher
         // installed -> None -> the whole list falls back, unchanged.
-        let needed = self.edx_first(key, needed, peers.clone(), None).await;
+        let needed = self.edx_first(key, needed, peers.clone(), None, None).await;
         if needed.is_empty() {
             return;
         }
@@ -4155,13 +4190,17 @@ impl AppState {
     /// total. When no EDX fetcher is installed (or no store), returns `needed`
     /// unchanged so the caller runs the full worker list exactly as before.
     /// `staged` carries a not-yet-committed content.json (resync) so its files
-    /// resolve against the NEW `b3`, not the stale committed manifest.
-    async fn edx_first(
+    /// resolve against the NEW `b3`, not the stale committed manifest. Made
+    /// `pub` so the node's clone/included-content passes share one EDX-first
+    /// entry point. `on_file` fires per landed file (so the clone loading bar
+    /// advances as EDX materializes files, not only when the worker runs).
+    pub async fn edx_first(
         &self,
         key: &str,
         needed: Vec<epix_xite::FileEntry>,
         peers: Vec<PeerAddr>,
         staged: Option<&Value>,
+        on_file: Option<EdxBatchProgress>,
     ) -> Vec<epix_xite::FileEntry> {
         let want: Vec<EdxWant> = needed
             .iter()
@@ -4172,11 +4211,28 @@ impl AppState {
                 EdxWant { inner_path: f.inner_path.clone(), id, size }
             })
             .collect();
-        let Some(batch) = self.edx_fetch_files(key, want, peers, None).await else {
+        let total = needed.len();
+        let Some(batch) = self.edx_fetch_files(key, want, peers, on_file).await else {
             return needed; // no EDX fetcher: whole list to the worker
         };
         if batch.bytes > 0 {
             self.add_transfer(key, batch.bytes, 0).await;
+        }
+        // A running view of how much of each sync EDX served, plus the
+        // cumulative EDX-eligible-fallback counter - the 1b validation gate for
+        // retiring the msgpack fetch. Quiet unless there was something to fetch.
+        if total > 0 {
+            self.log(
+                "DEBUG",
+                format!(
+                    "EDX {key}: landed {}/{total} file(s), {} to msgpack worker \
+                     (cum. eligible-fallbacks: {})",
+                    batch.done.len(),
+                    batch.missed.len(),
+                    edx_msgpack_fallbacks(),
+                ),
+            )
+            .await;
         }
         // Keep only the files EDX did not land; the rest are on disk, verified.
         let missed: std::collections::HashSet<&String> = batch.missed.iter().collect();
@@ -4330,7 +4386,7 @@ impl AppState {
             // files EDX could not get.
             let needed = xite.files_needed();
             let staged = xite.content.clone();
-            let _ = self.edx_first(address, needed, peers.clone(), staged.as_ref()).await;
+            let _ = self.edx_first(address, needed, peers.clone(), staged.as_ref(), None).await;
 
             let needed = xite.files_needed().len();
             let workers = peers.len().min(8);
@@ -5263,8 +5319,11 @@ impl AppState {
         if entry.get("b3").is_some() {
             match self.edx_fetch_file(address, inner_path).await {
                 Some(Ok(true)) => return Ok(true),
-                Some(Ok(false)) => {}
+                // EDX-eligible but the swarm couldn't complete it: record the
+                // fallback (the 1b validation gate) and use the legacy path.
+                Some(Ok(false)) => note_edx_fallback_path(address, inner_path),
                 Some(Err(e)) => {
+                    note_edx_fallback_path(address, inner_path);
                     self.log("WARN", format!("EDX fetch {address}/{inner_path}: {e}; using legacy"))
                         .await;
                 }
@@ -8039,7 +8098,44 @@ impl AppState {
             .get(address)
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
-        storage.write(inner_path, bytes).map_err(|e| e.to_string())
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
+        // Optional-file bookkeeping: mirror fetch_file_from_peers so an
+        // EDX-fetched optional file advertises in our hashfield (peers can
+        // discover we hold it), counts toward optional_downloaded, and stamps
+        // its finished time. Without this an optional file fetched over EDX
+        // lands on disk invisible to the swarm - it never seeds. A required
+        // file, or one not declared here, does none of this (optional=false).
+        // Idempotent: the first-completion stamp gates the once-only counter,
+        // and add_hash is a set, so a re-materialize (resync, refetch) is safe.
+        if let Some((entry, _dir, optional)) = self.declared_entry(address, inner_path).await {
+            if optional {
+                let sha512 =
+                    entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let size = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+                if let Some(x) = self.xites.write().await.get_mut(address) {
+                    let first = {
+                        let stat = x
+                            .settings
+                            .cache
+                            .optional_stats
+                            .entry(inner_path.to_string())
+                            .or_default();
+                        let first = stat.time_downloaded == 0;
+                        if first {
+                            stat.time_downloaded = now_secs() as i64;
+                        }
+                        first
+                    };
+                    if !sha512.is_empty() {
+                        x.hashfield.add_hash(&sha512);
+                    }
+                    if first {
+                        x.settings.optional_downloaded += size;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Register every currently-loaded xite's files into the EDX store, so a
@@ -9658,7 +9754,8 @@ impl AppState {
                     needed.iter().map(|f| f.inner_path.clone()).collect();
                 // EDX first over the reused session (staged content's b3 is
                 // authoritative pre-commit); the worker takes the misses.
-                let needed = self.edx_first(&key, needed, peers.clone(), xite.content.as_ref()).await;
+                let needed =
+                    self.edx_first(&key, needed, peers.clone(), xite.content.as_ref(), None).await;
                 if !needed.is_empty() {
                     self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
                         .await;
@@ -10658,6 +10755,42 @@ impl AppState {
         // retried files flip back to Pending/Active in place in the file list.
         let mut queue: Vec<(usize, &String, u64)> =
             todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        // EDX-first bulk pass: dial the seed peers ONCE and pull every optional
+        // file the verified-streaming path can serve, then the msgpack rounds
+        // below mop up only what EDX missed. Per-file bookkeeping (hashfield
+        // advertise, optional_downloaded, finished stamp) happens in
+        // edx_materialize_file, so an EDX-fetched optional file seeds just like
+        // a msgpack-fetched one. A legacy site (no `b3`) resolves nothing and
+        // this returns at once, leaving the whole queue to the rounds.
+        if !queue.is_empty() {
+            let peers = self.fetch_candidate_peers(address, 20).await;
+            if !peers.is_empty() {
+                let want: Vec<EdxWant> = todo
+                    .iter()
+                    .map(|(p, _)| EdxWant { inner_path: p.clone(), id: None, size: None })
+                    .collect();
+                if let Some(batch) = self.edx_fetch_files(address, want, peers, None).await {
+                    if batch.bytes > 0 {
+                        self.add_transfer(address, batch.bytes, 0).await;
+                    }
+                    let done: std::collections::HashSet<&str> =
+                        batch.done.iter().map(|s| s.as_str()).collect();
+                    if !done.is_empty() {
+                        for (idx, path, size) in &queue {
+                            if done.contains(path.as_str()) {
+                                fetched += 1;
+                                bytes_done += *size;
+                                self.mark_optional_file(address, *idx, OptFileState::Done, "")
+                                    .await;
+                                self.push_site_info_file_done(address, path, None).await;
+                            }
+                        }
+                        self.bump_optional_progress(address, fetched, 0, bytes_done).await;
+                        queue.retain(|(_, path, _)| !done.contains(path.as_str()));
+                    }
+                }
+            }
+        }
         for round in 1..=ROUNDS {
             let (requeue, aborted) = self
                 .run_optional_round(address, directory, &queue, round, ROUNDS, &mut fetched, &mut bytes_done)
@@ -14215,6 +14348,77 @@ mod tests {
         // A small optional file is not a bigfile.
         let small = json!({ "files_optional": { "a.txt": { "size": 10, "sha512": "x" } } });
         state.add_xite("small", XiteEntry { storage: XiteStorage::new(dir.path().join("s")), content: Some(small) }).await;
+    }
+
+    /// Optional-file bookkeeping over EDX: materializing an optional file (the
+    /// verified-streaming path's terminal step) advertises it in our hashfield,
+    /// counts its bytes toward optional_downloaded, and stamps its finished
+    /// time - so an EDX-fetched optional file seeds exactly like a msgpack one.
+    /// A re-materialize (resync/refetch) must not double-count the bytes.
+    #[tokio::test]
+    async fn edx_materialize_advertises_and_stamps_an_optional_file() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let bytes = b"an avatar fetched over EDX".to_vec();
+        let sha = XiteStorage::hash_bytes(&bytes);
+        let content = json!({
+            "files": {},
+            "files_optional": { "avatar.png": { "size": bytes.len(), "sha512": sha } },
+        });
+        let addr = "1optseed";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        state.edx_materialize_file(addr, "avatar.png", &bytes).await.unwrap();
+        {
+            let xites = state.xites.read().await;
+            let x = xites.get(addr).unwrap();
+            assert_eq!(x.storage.read("avatar.png").unwrap(), bytes, "verified bytes on disk");
+            assert!(x.hashfield.has_hash(&sha), "hashfield advertises the optional file");
+            assert_eq!(x.settings.optional_downloaded, bytes.len() as i64, "bytes counted");
+            assert!(
+                x.settings.cache.optional_stats.get("avatar.png").unwrap().time_downloaded > 0,
+                "finished time stamped",
+            );
+        }
+
+        // Idempotent: a second materialize (a resync re-fetch) must not double
+        // the downloaded-bytes counter.
+        state.edx_materialize_file(addr, "avatar.png", &bytes).await.unwrap();
+        {
+            let xites = state.xites.read().await;
+            let x = xites.get(addr).unwrap();
+            assert_eq!(
+                x.settings.optional_downloaded,
+                bytes.len() as i64,
+                "re-materialize must not double-count",
+            );
+        }
+    }
+
+    /// A required (non-optional) file materialized over EDX does none of the
+    /// optional bookkeeping - optional_downloaded stays zero and no finished
+    /// stamp is written, so the Files tab does not show a core file as an
+    /// "optional download".
+    #[tokio::test]
+    async fn edx_materialize_leaves_a_required_file_out_of_optional_bookkeeping() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let bytes = b"<h1>index</h1>".to_vec();
+        let content = json!({
+            "files": { "index.html": { "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) } },
+            "files_optional": {},
+        });
+        let addr = "1reqseed";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        state.edx_materialize_file(addr, "index.html", &bytes).await.unwrap();
+        let xites = state.xites.read().await;
+        let x = xites.get(addr).unwrap();
+        assert_eq!(x.storage.read("index.html").unwrap(), bytes);
+        assert_eq!(x.settings.optional_downloaded, 0, "required file is not optional");
+        assert!(x.settings.cache.optional_stats.get("index.html").is_none(), "no optional stamp");
     }
 
     /// A version-3 merger site (schema + `Merger:EpixPost` permission, no own

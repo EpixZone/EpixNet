@@ -845,10 +845,60 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // complete) goes to `missed` for the worker.
         let session = self.open_session(&peers, 8).await;
         if session.is_empty() {
-            batch.missed.extend(pending.into_iter().map(|r| r.path));
+            for r in pending {
+                epix_ui::state::note_edx_fallback_path(address, &r.path);
+                batch.missed.push(r.path);
+            }
             return batch;
         }
-        for r in pending {
+
+        // GetMany fast path: small whole objects (<= MAX_MANY_ITEM_BYTES) ride
+        // one round trip per <= MAX_MANY_ITEMS-id batch over a session peer,
+        // avoiding a bitfield + swarm per file - the win for a forum's many
+        // tiny post/data files. Larger files, and any small file a peer did not
+        // return, drop to the swarm pass below.
+        let cap = epix_edx::server::MAX_MANY_ITEM_BYTES;
+        let (small, mut remaining): (Vec<Res>, Vec<Res>) =
+            pending.into_iter().partition(|r| r.size > 0 && r.size <= cap);
+        if !small.is_empty() {
+            // Unique ids only (two paths can share identical bytes -> one id).
+            let mut ids: Vec<ObjId> = small.iter().map(|r| r.id).collect();
+            ids.sort();
+            ids.dedup();
+            for peer in &session {
+                let want: Vec<ObjId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !store.is_complete(*id).unwrap_or(false))
+                    .collect();
+                if want.is_empty() {
+                    break;
+                }
+                for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
+                    let _ = epix_edx::fetch::fetch_many(&peer.conn, &store, chunk, now).await;
+                }
+            }
+            // Materialize every small file the store now holds; the rest join
+            // the swarm pass (a peer that lacked it may still hold its chunks).
+            for r in small {
+                if store.is_complete(r.id).unwrap_or(false) {
+                    if let Ok(bytes) = store.read_bytes(r.id, now) {
+                        if self.state.edx_materialize_file(address, &r.path, &bytes).await.is_ok() {
+                            batch.bytes += bytes.len() as u64;
+                            if let Some(cb) = &on_file {
+                                cb(&r.path, bytes.len() as u64);
+                            }
+                            batch.done.push(r.path);
+                            continue;
+                        }
+                    }
+                }
+                remaining.push(r);
+            }
+        }
+
+        // Swarm pass: large files, plus any small file GetMany could not land.
+        for r in remaining {
             let complete = self.fetch_one_over_session(&store, r.id, r.size, &session, now).await;
             let done = complete
                 && match store.read_bytes(r.id, now) {
@@ -868,6 +918,9 @@ impl EdxFetcher for RuntimeEdxFetcher {
             if done {
                 batch.done.push(r.path);
             } else {
+                // This EDX-eligible file went to the msgpack worker (the 1b
+                // gate); counted once per distinct file across all retries.
+                epix_ui::state::note_edx_fallback_path(address, &r.path);
                 batch.missed.push(r.path);
             }
         }

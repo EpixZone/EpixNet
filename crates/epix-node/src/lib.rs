@@ -876,14 +876,21 @@ async fn clone_xite_with_progress(
     drop(pex_tx);
     drop(sync_tx);
 
-    // Per-file progress: each finished file prints its line on the loading
-    // screen and advances the progress bar (tasks/started_task_num).
-    let on_file = progress.map(|state| {
+    // Per-file progress: each finished file advances the loading bar. EDX and
+    // the msgpack worker share ONE emitter and ONE done-counter, with the
+    // denominator pinned to the pre-fetch core total - so the bar climbs
+    // monotonically 0..total no matter which layer fetched each file. Without
+    // the shared emitter the EDX prepass materialized files silently and the
+    // bar sat at 0 then jumped on well-seeded sites (exactly EDX's target).
+    let clone_total = xite.files_needed().len();
+    let emit_done: Option<Arc<dyn Fn(&str) + Send + Sync>> = progress.map(|state| {
         let state = state.clone();
         let addr = address.to_string();
         let peers_n = peer_count.max(1);
-        Arc::new(move |inner: &str, done: usize, total: usize| {
-            let left = total.saturating_sub(done);
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move |inner: &str| {
+            let d = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let left = clone_total.saturating_sub(d);
             // The wrapper hides the loading screen on index.html's file_done
             // - and index.html downloads FIRST (priority queue). Firing it
             // mid-sync dropped the user into a half-downloaded site (styles
@@ -900,11 +907,37 @@ async fn clone_xite_with_progress(
                     "peers": peers_n,
                     "bad_files": left,
                     "tasks": left,
-                    "started_task_num": total,
+                    "started_task_num": clone_total,
                 }),
             );
-        }) as epix_worker::FileProgress
+        }) as Arc<dyn Fn(&str) + Send + Sync>
     });
+    // The worker reports (inner, done, total); route it through the shared
+    // emitter (its own counts are ignored - the emitter owns the denominator).
+    let on_file = emit_done.clone().map(|emit| {
+        Arc::new(move |inner: &str, _done: usize, _total: usize| emit(inner))
+            as epix_worker::FileProgress
+    });
+    // EDX-first: pull every core file the verified-streaming path can serve
+    // from the peers discovered so far, in one dial, before the msgpack
+    // streaming sync. EDX writes verified bytes to disk, so files_needed()
+    // inside sync_files_streaming recomputes and the worker streams only what
+    // EDX could not land. A legacy site (no `b3`) resolves nothing and this
+    // returns at once - the streaming sync then runs exactly as before. The
+    // shared emitter advances the bar as EDX materializes each file.
+    if let Some(state) = progress {
+        let peers = state.connectable_peers(address, 20).await;
+        if !peers.is_empty() {
+            let needed = xite.files_needed();
+            let staged = xite.content.clone();
+            let edx_progress = emit_done.clone().map(|emit| {
+                Arc::new(move |inner: &str, _bytes: u64| emit(inner))
+                    as epix_ui::state::EdxBatchProgress
+            });
+            let _ =
+                state.edx_first(address, needed, peers, staged.as_ref(), edx_progress).await;
+        }
+    }
     let mut bytes_recv = 0;
     if let Ok(report) = epix_worker::sync_files_streaming(
         &xite,
@@ -1171,6 +1204,31 @@ async fn sync_included_content(
         state
             .log("INFO", format!("Fetching {} user-content file(s) for {address}", needed.len()))
             .await;
+    }
+    // EDX-first for the child/user data files: dial the peers ONCE and pull
+    // what the verified-streaming path can serve, ingesting each landed file so
+    // its posts appear, then hand only the misses to the worker list-sync. The
+    // child content.json files are already on disk (add_content wrote them), so
+    // declared_entry resolves each data file's `b3` from its governing child.
+    let needed = if let Some(state) = progress {
+        let before: std::collections::HashSet<String> =
+            needed.iter().map(|f| f.inner_path.clone()).collect();
+        let missed = state.edx_first(address, needed, peers.to_vec(), None, None).await;
+        let still: std::collections::HashSet<&String> =
+            missed.iter().map(|f| &f.inner_path).collect();
+        for path in &before {
+            if !still.contains(path) {
+                // EDX landed it: ingest (db + file_done) and report it.
+                state.ingest_file(address, path).await;
+                arrived.push(path.clone());
+            }
+        }
+        missed
+    } else {
+        needed
+    };
+    if needed.is_empty() {
+        return (0, arrived);
     }
     let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
     // Each data file is ingested into the site's db (and its mergers') the
