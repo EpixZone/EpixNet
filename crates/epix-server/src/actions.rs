@@ -29,7 +29,6 @@ pub fn is_action(name: &str) -> bool {
             | "cryptGetPrivatekey"
             | "cryptPrivatekeyToAddress"
             | "peerPing"
-            | "peerGetFile"
             | "peerCmd"
     )
 }
@@ -284,16 +283,6 @@ async fn dispatch(
                 conn.ping().await.map_err(|e| e.to_string())?;
                 println!("Response time: {:.3}ms", started.elapsed().as_secs_f64() * 1000.0);
             }
-            Ok(())
-        }
-        "peerGetFile" => {
-            let [ip, port, site, inner_path] = args else {
-                return Err("usage: peerGetFile <ip> <port> <site> <inner_path>".into());
-            };
-            let mut conn = connect(ip, port).await?;
-            let bytes = conn.get_file(site, inner_path).await.map_err(|e| e.to_string())?;
-            use std::io::Write;
-            std::io::stdout().write_all(&bytes).map_err(|e| e.to_string())?;
             Ok(())
         }
         "peerCmd" => {

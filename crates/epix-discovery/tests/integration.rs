@@ -4,14 +4,10 @@
 use epix_core::PeerAddr;
 use epix_discovery::{address_hash, discover_via_epix_tracker, AnnounceParams};
 use epix_protocol::msg::{read_msg, send_msg, vget, vmap};
-use epix_protocol::Connection;
 use epix_transport::TcpTransport;
 use rmpv::Value;
-use std::time::Duration;
 use tokio::net::TcpListener;
 
-const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
-const LIVE_TRACKER: &str = "145.223.69.23:26959";
 
 /// Mock Epix tracker: handshakes, then answers `announce` with one ipv4 peer.
 async fn spawn_mock_tracker(peer_ip: [u8; 4], peer_port: u16) -> std::net::SocketAddr {
@@ -102,58 +98,4 @@ async fn live_tracker_discovers_real_peers() {
         println!("  {p}");
     }
     assert!(!peers.is_empty(), "expected at least one peer from the live tracker");
-}
-
-/// Capstone: the full real-network path - discover peers via the tracker, then
-/// connect to a discovered peer and download + verify the Dashboard content.json.
-/// No local node involved.
-/// `cargo test -p epix-discovery -- --ignored live_full --nocapture`
-#[tokio::test]
-#[ignore]
-async fn live_full_discover_connect_download_verify() {
-    let hash = address_hash(DASH);
-    let params = AnnounceParams {
-        hashes: &[hash],
-        port: 0,
-        need_types: &["ipv4"],
-        need_num: 20,
-        add: &[],
-        onions: &[],
-        i2p: &[],
-        onion_signer: None,
-    };
-    let peers = discover_via_epix_tracker(&TcpTransport, &PeerAddr::parse(LIVE_TRACKER).unwrap(), &params)
-        .await
-        .expect("tracker announce");
-    println!("discovered {} peers; trying to download + verify from each…", peers.len());
-
-    for peer in &peers {
-        match tokio::time::timeout(Duration::from_secs(10), try_peer(peer)).await {
-            Ok(Ok(n)) => {
-                println!("✓ downloaded + verified content.json ({n} bytes) from {peer}");
-                return;
-            }
-            Ok(Err(e)) => println!("  {peer}: {e}"),
-            Err(_) => println!("  {peer}: timed out"),
-        }
-    }
-    panic!("no discovered peer served a verifiable content.json");
-}
-
-async fn try_peer(peer: &PeerAddr) -> Result<usize, String> {
-    let mut conn = Connection::connect(&TcpTransport, peer).await.map_err(|e| e.to_string())?;
-    conn.handshake().await.map_err(|e| e.to_string())?;
-    let bytes = conn.get_file(DASH, "content.json").await.map_err(|e| e.to_string())?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let signer = json
-        .get("signs")
-        .and_then(|s| s.as_object())
-        .and_then(|s| s.keys().next())
-        .ok_or("content.json has no signs")?;
-    if epix_content::verify_signer(&json, signer) {
-        Ok(bytes.len())
-    } else {
-        Err("signature verification failed".into())
-    }
 }

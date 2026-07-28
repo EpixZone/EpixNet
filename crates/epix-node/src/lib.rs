@@ -757,7 +757,6 @@ async fn clone_xite_with_progress(
                             spawn_pex(peer.clone(), pex_tx.clone());
                             if fetchers.len() < 4 {
                                 fetchers.spawn(fetch_content(
-                                    transport.clone(),
                                     peer,
                                     address.to_string(),
                                     progress.cloned(),
@@ -778,7 +777,6 @@ async fn clone_xite_with_progress(
                     if !got_content {
                         if let Some(peer) = untried.pop_front() {
                             fetchers.spawn(fetch_content(
-                                transport.clone(),
                                 peer,
                                 address.to_string(),
                                 progress.cloned(),
@@ -1309,7 +1307,6 @@ async fn fetch_list_modified(
 
 /// One bounded attempt to pull content.json from a peer (phase 1 of a clone).
 async fn fetch_content(
-    transport: Arc<dyn Transport>,
     peer: PeerAddr,
     address: String,
     state: Option<Arc<AppState>>,
@@ -1318,28 +1315,15 @@ async fn fetch_content(
         PeerAddr::Onion { .. } | PeerAddr::I2p { .. } => 45,
         _ => 10,
     });
-    // EDX manifest channel first: GetSigned returns the signed content.json
-    // over an EDX link, and works for ANY site (the signed bytes are served
-    // independent of per-file `b3`). Falls through to the msgpack getFile
-    // below only while that legacy path still exists.
-    if let Some(state) = &state {
-        if let Ok(Some(Ok(Some(bytes)))) = tokio::time::timeout(
-            budget,
-            state.edx_fetch_signed(peer.clone(), &address, "content.json"),
-        )
-        .await
-        {
-            return Some(bytes);
-        }
+    // EDX manifest channel: GetSigned returns the signed content.json over an
+    // EDX link, and works for ANY site (the signed bytes are served independent
+    // of per-file `b3`). With no state there is no fetcher, so nothing to do.
+    let state = state?;
+    match tokio::time::timeout(budget, state.edx_fetch_signed(peer, &address, "content.json")).await
+    {
+        Ok(Some(Ok(Some(bytes)))) => Some(bytes),
+        _ => None,
     }
-    tokio::time::timeout(budget, async {
-        let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
-        conn.handshake().await.ok()?;
-        conn.get_file(&address, "content.json").await.ok()
-    })
-    .await
-    .ok()
-    .flatten()
 }
 
 /// The on-demand resolver the browser proxy path uses: given a `.epix` host not

@@ -2289,8 +2289,9 @@ async fn serve_file(
                     }
                     return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
                 }
-                // Big file: pull only the pieces this range needs (no-op otherwise).
-                let _ = ctx.state.bigfile_fetch_range(&address, &path, start, len as u64).await;
+                // EDX range missed: serve the covering bytes if they are already
+                // on disk (a legacy file present locally); otherwise this range
+                // is unavailable (msgpack range fetch retired).
                 if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
                     let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
                     if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {

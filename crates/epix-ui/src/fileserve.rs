@@ -1,15 +1,16 @@
-//! Inbound file server - the seeding counterpart to the download path.
+//! Inbound protocol handler - the peer-facing side of the node.
 //!
-//! Implements [`epix_protocol::RequestHandler`] so other peers can pull our
-//! files over the wire protocol (`getFile`/`streamFile`), plus `ping` and a
-//! minimal `pex`. Without this the node could download from peers but never
-//! serve, so it could not seed content, Bigfile pieces, or optional files.
+//! Implements [`epix_protocol::RequestHandler`] for the msgpack commands that
+//! are NOT file transfer: `ping`, `update` (a peer pushing us a newer
+//! content.json), `pex`, `announce`, `listModified`, `getTrackers`, the
+//! hashfield/piecefield queries, and `checkport`. File transfer itself moved to
+//! EDX (verified BLAKE3 streaming), so there is no `getFile` here anymore.
 //!
 //! This handler is always compiled - it is what every inbound transport serves.
 //! The `inbound-seeding` feature only gates the CLEARNET TCP listener + UPnP
 //! (off on mobile); the onion (`tor`) and I2P (`i2p`) services mount this same
-//! handler, so a phone with no clearnet listener still serves its published
-//! files (e.g. a new EpixTalk topic) to peers over its onion/I2P address.
+//! handler, so a phone with no clearnet listener still answers peers over its
+//! onion/I2P address (and serves their files over the EDX hook alongside it).
 
 use crate::state::InboundUpdate;
 use crate::AppState;
@@ -19,9 +20,6 @@ use epix_protocol::RequestHandler;
 use rmpv::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
-
-/// The largest chunk a single `getFile` response returns (EpixNet's FILE_BUFF).
-const FILE_BUFF: usize = 1024 * 512;
 
 /// Serves our local xite files to peers.
 pub struct FileService {
@@ -44,32 +42,6 @@ impl FileService {
             .map(|(sha512, bytes)| (Value::from(sha512), Value::Binary(bytes)))
             .collect();
         vmap(vec![("piecefields_packed", Value::Map(map))])
-    }
-
-    async fn get_file(&self, peer: &PeerAddr, params: &Value) -> Value {
-        let site = vget_str(params, "site").unwrap_or_default();
-        let inner_path = vget_str(params, "inner_path").unwrap_or_default();
-        let location = vget_i64(params, "location").unwrap_or(0).max(0) as u64;
-        let read_bytes = vget_i64(params, "read_bytes")
-            .map(|n| (n.max(0) as usize).min(FILE_BUFF))
-            .unwrap_or(FILE_BUFF);
-
-        match self.state.serve_file_chunk(&site, &inner_path, location, read_bytes).await {
-            Some((chunk, total)) => {
-                let sent = chunk.len() as u64;
-                let next = location + sent;
-                // Account for what we serve to peers so the Stats seeding graph
-                // (file_bytes_sent) reflects upload traffic, not just downloads
-                // - per optional file too (the Files tab's ratio dots).
-                self.state.record_upload(&site, peer, &inner_path, sent).await;
-                vmap(vec![
-                    ("body", Value::Binary(chunk)),
-                    ("size", Value::from(total as i64)),
-                    ("location", Value::from(next as i64)),
-                ])
-            }
-            None => vmap(vec![("error", Value::from("File not found"))]),
-        }
     }
 
     /// `update {site, inner_path, body, modified}` - a peer pushing us a newer
@@ -448,7 +420,6 @@ impl RequestHandler for FileService {
     async fn handle(&self, peer: &PeerAddr, cmd: &str, params: &Value) -> Value {
         match cmd {
             "ping" => vmap(vec![("body", Value::Binary(b"Pong!".to_vec()))]),
-            "getFile" | "streamFile" => self.get_file(peer, params).await,
             "update" => self.update(peer, params).await,
             "pex" => self.pex(peer, params).await,
             "announce" => self.announce(peer, params).await,
@@ -624,56 +595,6 @@ mod tests {
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
     use serde_json::json;
-
-    #[tokio::test]
-    async fn serves_a_file_chunk_over_the_handler() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(dir.path());
-        storage.write("index.html", b"hello seeding world").unwrap();
-        let state = AppState::new("test");
-        state
-            .add_xite("1Seed", XiteEntry { storage, content: Some(json!({ "address": "1Seed" })) })
-            .await;
-        let svc = FileService::new(state.clone());
-        let peer = PeerAddr::parse("1.2.3.4:1").unwrap();
-
-        // ping
-        let pong = svc.handle(&peer, "ping", &Value::Map(vec![])).await;
-        assert_eq!(vget(&pong, "body"), Some(&Value::Binary(b"Pong!".to_vec())));
-
-        // getFile whole file
-        let params = vmap(vec![
-            ("site", Value::from("1Seed")),
-            ("inner_path", Value::from("index.html")),
-            ("location", Value::from(0i64)),
-        ]);
-        let resp = svc.handle(&peer, "getFile", &params).await;
-        assert_eq!(vget(&resp, "body"), Some(&Value::Binary(b"hello seeding world".to_vec())));
-        assert_eq!(vget_i64(&resp, "size"), Some(19));
-        assert_eq!(vget_i64(&resp, "location"), Some(19));
-
-        // getFile ranged
-        let params = vmap(vec![
-            ("site", Value::from("1Seed")),
-            ("inner_path", Value::from("index.html")),
-            ("location", Value::from(6i64)),
-            ("read_bytes", Value::from(7i64)),
-        ]);
-        let resp = svc.handle(&peer, "getFile", &params).await;
-        assert_eq!(vget(&resp, "body"), Some(&Value::Binary(b"seeding".to_vec())));
-
-        // Missing file -> error body.
-        let params = vmap(vec![
-            ("site", Value::from("1Seed")),
-            ("inner_path", Value::from("nope.txt")),
-        ]);
-        let resp = svc.handle(&peer, "getFile", &params).await;
-        assert!(vget(&resp, "error").is_some());
-
-        // Served bytes are accounted as sent (feeds the Stats seeding graph):
-        // 19 for the whole file + 7 for the range, nothing for the miss.
-        assert_eq!(state.transfer("1Seed").await.1, 26);
-    }
 
     /// Build a signed content.json for `address` at version `modified`.
     fn signed_content(address: &str, privkey: &str, modified: i64) -> (serde_json::Value, Vec<u8>) {

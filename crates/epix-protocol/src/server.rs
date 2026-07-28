@@ -1,7 +1,8 @@
 //! Inbound peer server: accept connections, answer the handshake, and dispatch
 //! requests to a [`RequestHandler`]. This is the serving counterpart to
 //! [`crate::Connection`] - the same framing, the other direction. Handlers plug
-//! in `getFile`, DHT RPCs, etc.
+//! in the peer commands (`update`, `pex`, `announce`, DHT RPCs, …); file
+//! transfer itself runs over the EDX hook forked off the same accept port.
 
 use crate::msg::{read_msg, send_msg, vget, vmap};
 use async_trait::async_trait;
@@ -231,20 +232,8 @@ async fn serve_stream_hooked(
             handler.handle(&peer, &cmd, &params).await
         };
 
-        // `streamFile` uses EpixNet's raw-stream framing: the msgpack reply
-        // carries `stream_bytes` (no `body`) and the file bytes follow raw on
-        // the socket. Handlers answer it like `getFile`; the reframe happens
-        // here so it holds for every handler and transport.
-        let (body, raw_tail) =
-            if cmd == "streamFile" { split_stream_body(body) } else { (body, None) };
-
         if send_msg(&mut stream, &response(req_id, body)).await.is_err() {
             break;
-        }
-        if let Some(bytes) = raw_tail {
-            if !send_stream_tail(&mut stream, &bytes).await {
-                break;
-            }
         }
     }
 }
@@ -365,40 +354,6 @@ fn rns_claim(params: &Value) -> Option<PeerAddr> {
     // hash - the claim replaces it outright.
     let hex = overlay_claim(params, "rns")?;
     parse_dialback(format!("rns:{hex}"))
-}
-
-/// Write the raw file bytes that follow a `streamFile` reply. Returns false if
-/// the socket errored, so the caller drops the connection.
-async fn send_stream_tail(stream: &mut epix_transport::PeerStream, bytes: &[u8]) -> bool {
-    use tokio::io::AsyncWriteExt;
-    if stream.write_all(bytes).await.is_err() || stream.flush().await.is_err() {
-        return false;
-    }
-    crate::msg::WIRE_SENT.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    true
-}
-
-/// Turn a `getFile`-shaped body (`{body, size, location}`) into the
-/// `streamFile` reply shape: drop `body`, add `stream_bytes`, and hand the
-/// raw bytes back to be written after the msgpack message. Error replies (no
-/// `body`) pass through unchanged.
-fn split_stream_body(body: Value) -> (Value, Option<Vec<u8>>) {
-    let Value::Map(mut fields) = body else { return (body, None) };
-    let mut raw: Option<Vec<u8>> = None;
-    fields.retain(|(k, v)| {
-        if k.as_str() == Some("body") {
-            if let Value::Binary(b) = v {
-                raw = Some(b.clone());
-            }
-            false
-        } else {
-            true
-        }
-    });
-    if let Some(bytes) = &raw {
-        fields.push((Value::from("stream_bytes"), Value::from(bytes.len() as i64)));
-    }
-    (Value::Map(fields), raw)
 }
 
 fn handshake_response(version: &str, rev: i64, fileserver_port: u16) -> Value {

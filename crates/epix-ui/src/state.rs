@@ -4261,7 +4261,9 @@ impl AppState {
         // download pass from every 5-min resync tick used to hammer trackers
         // and flash the sidebar panel for xites whose seeder is offline.
         self.mark_optional_dirty(address);
-        let transport = self.transport.read().await.clone().ok_or("no transport")?;
+        if self.transport.read().await.is_none() {
+            return Ok(false); // offline
+        }
         // Reliable tracker-seeds first, then registry peers - a bumped
         // content.json is fetched from a known seed instead of hoping the
         // registry selection lands on one that has the new version.
@@ -4314,19 +4316,23 @@ impl AppState {
             // peer above never-tried candidates in the selection tiebreak.
             let progressed = AtomicBool::new(false);
             let fetched = tokio::time::timeout(peer.connect_timeout(), async {
-                // EDX manifest channel first: GetSigned over an EDX link works
-                // for any site. A live link marks `progressed`; only if EDX
-                // yields nothing do we fall to the legacy msgpack getFile.
-                if let Some(Ok(Some(bytes))) =
-                    self.edx_fetch_signed(peer.clone(), &canonical, "content.json").await
-                {
-                    progressed.store(true, Ordering::Relaxed);
-                    return Some(Some(bytes));
+                // EDX manifest channel: GetSigned over an EDX link works for any
+                // site. A live link marks `progressed` so a post-handshake
+                // failure scores the peer as alive-but-unserving, not dead.
+                match self.edx_fetch_signed(peer.clone(), &canonical, "content.json").await {
+                    // Dialed and served the bytes.
+                    Some(Ok(Some(bytes))) => {
+                        progressed.store(true, Ordering::Relaxed);
+                        Some(Some(bytes))
+                    }
+                    // Dialed but no content (alive, unserving).
+                    Some(Ok(None)) => {
+                        progressed.store(true, Ordering::Relaxed);
+                        Some(None)
+                    }
+                    // Dial/link failed, or no fetcher: unreachable.
+                    Some(Err(_)) | None => None,
                 }
-                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
-                conn.handshake().await.ok()?;
-                progressed.store(true, Ordering::Relaxed);
-                Some(conn.get_file(&canonical, "content.json").await.ok())
             })
             .await;
             let bytes = match fetched {
@@ -4528,8 +4534,7 @@ impl AppState {
         DialableNets { clearnet: true, onion, i2p, rns }
     }
 
-    /// Apply a sync pass's per-peer outcomes (drained from an
-    /// [`epix_worker::CollectFeedback`]) to a xite's peer registry: a
+    /// Apply per-peer fetch outcomes to a xite's peer registry: a
     /// success clears the backoff and rewards the peer, a failure docks its
     /// reputation and backs it off exponentially. This is what feeds
     /// [`Self::connectable_peers`]' ordering - without it reputation never
@@ -5241,18 +5246,14 @@ impl AppState {
     /// Download a file (required or optional) on demand from peers, verifying
     /// its hash before writing. `fileNeed`. Returns true if present after.
     pub async fn file_need(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        let (entry, _, optional) = self
+        let (entry, _, _optional) = self
             .declared_entry(address, inner_path)
             .await
             .ok_or("file not declared in content.json")?;
-        let info = FileEntry {
-            inner_path: inner_path.to_string(),
-            size: entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
-            sha512: entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        };
+        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // A multi-piece big file's declared sha512 is a merkle root over its
-        // pieces - a whole-file flat hash never matches it, neither for the
-        // on-disk check nor for a fetched blob.
+        // pieces - a whole-file flat hash never matches it, so skip the on-disk
+        // shortcut for it and let the EDX store's completion check dedup.
         let is_bigfile = entry.get("piecemap").is_some();
         let storage = self
             .xites
@@ -5261,7 +5262,7 @@ impl AppState {
             .get(address)
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
-        if !is_bigfile && storage.verify(inner_path, &info.sha512) {
+        if !is_bigfile && storage.verify(inner_path, &sha512) {
             return Ok(true); // already have it
         }
         // Coalesce concurrent requests for the same file (a page asks for the
@@ -5286,131 +5287,22 @@ impl AppState {
         }
         let _cleanup = Cleanup { locks: &self.file_need_locks, key };
         let _guard = lock.lock().await;
-        // EDX: a file carrying a `b3` root fetches over the verified-streaming
-        // path when a fetcher is installed. On success we are done; any error
-        // falls through to the legacy sha512/piecemap fetch below.
-        if entry.get("b3").is_some() {
-            match self.edx_fetch_file(address, inner_path).await {
-                Some(Ok(true)) => return Ok(true),
-                // EDX-eligible but the swarm couldn't complete it: record the
-                // fallback (the 1b validation gate) and use the legacy path.
-                Some(Ok(false)) => note_edx_fallback_path(address, inner_path),
-                Some(Err(e)) => {
-                    note_edx_fallback_path(address, inner_path);
-                    self.log("WARN", format!("EDX fetch {address}/{inner_path}: {e}; using legacy"))
-                        .await;
-                }
-                None => {} // no fetcher installed
-            }
+        if !is_bigfile && storage.verify(inner_path, &sha512) {
+            return Ok(true); // fetched by the caller we waited on
         }
-        async {
-            if is_bigfile {
-                // Fetch the missing pieces, each verified against the
-                // piecemap (EpixNet needFile's Bigfile path). Boxed: the
-                // piecemap itself downloads through file_need.
-                Box::pin(self.bigfile_fetch_range(address, inner_path, 0, info.size.max(0) as u64))
-                    .await?;
-                // First-completion stamp only: fetch_range on an already-
-                // complete bigfile is a no-op re-check, not a new download.
-                if optional {
-                    if let Some(x) = self.xites.write().await.get_mut(address) {
-                        let stat = x
-                            .settings
-                            .cache
-                            .optional_stats
-                            .entry(inner_path.to_string())
-                            .or_default();
-                        if stat.time_downloaded == 0 {
-                            stat.time_downloaded = now_secs() as i64;
-                        }
-                    }
-                }
-                return Ok(true);
-            }
-            if storage.verify(inner_path, &info.sha512) {
-                return Ok(true); // fetched by the caller we waited on
-            }
-            self.fetch_file_from_peers(address, &info, optional, &storage).await
+        // EDX-only: a file must carry a `b3` to be fetchable. The verified-
+        // streaming path fetches and materializes it (and does the optional-file
+        // bookkeeping in edx_materialize_file). A file with no `b3`, or with no
+        // fetcher installed, cannot be fetched (msgpack retired).
+        match entry.get("b3") {
+            Some(_) => match self.edx_fetch_file(address, inner_path).await {
+                Some(Ok(true)) => Ok(true),
+                Some(Ok(false)) => Err(format!("EDX could not complete {inner_path}")),
+                Some(Err(e)) => Err(e),
+                None => Err("no EDX fetcher installed".into()),
+            },
+            None => Err(format!("{inner_path} has no b3 and cannot be fetched")),
         }
-        .await
-    }
-
-    /// Ask each connectable peer for the file until one hands over a blob
-    /// matching the declared hash, then write it and do the optional-file
-    /// bookkeeping. The fetch half of [`file_need`](Self::file_need).
-    async fn fetch_file_from_peers(
-        &self,
-        address: &str,
-        info: &FileEntry,
-        optional: bool,
-        storage: &XiteStorage,
-    ) -> Result<bool, String> {
-        let transport = self.transport.read().await.clone().ok_or("no transport")?;
-        let peers = self.connectable_peers(address, 20).await;
-        // Feed every attempt back into peer reputation/backoff (the same
-        // outcomes the worker-sync path reports). Without this the on-demand
-        // path was invisible to selection: a dead peer was redialed every
-        // fetch, and - worse - a good seeder's stale backoff was never reset
-        // by the successful download, so rare xites stayed "no peers" long
-        // after their seeder was reachable again.
-        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
-        let mut found = None;
-        for peer in peers {
-            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else {
-                outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
-                continue;
-            };
-            if conn.handshake().await.is_err() {
-                outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
-                continue;
-            }
-            let Ok(bytes) = conn.get_file(address, &info.inner_path).await else {
-                // The dial worked; only the file failed (refused/timeout).
-                outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
-                continue;
-            };
-            if XiteStorage::hash_bytes(&bytes) != info.sha512 {
-                outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
-                continue;
-            }
-            outcomes.push((peer.clone(), epix_worker::PeerOutcome::ConnectOk));
-            outcomes.push((peer.clone(), epix_worker::PeerOutcome::FileOk));
-            found = Some((peer, bytes));
-            break;
-        }
-        self.apply_peer_outcomes(address, outcomes).await;
-        let Some((peer, bytes)) = found else {
-            return Err("could not fetch the file from any peer".into());
-        };
-        // A fetch that raced a siteDelete must not write: XiteStorage::write
-        // create_dir_all's the parent, which would resurrect the removed site
-        // directory with an orphan file.
-        if !self.xites.read().await.contains_key(address) {
-            return Err("xite removed".into());
-        }
-        storage.write(&info.inner_path, &bytes).map_err(|e| e.to_string())?;
-        self.set_peer_connected(address, &peer, true).await;
-        // Count the transfer (site totals + per-peer) - without this the
-        // dashboard's download bytes and the Stats download graph never
-        // moved for on-demand fetches.
-        self.record_transfer(address, &peer, bytes.len() as u64, 0).await;
-        // Count optional bytes downloaded and advertise it in our
-        // hashfield so peers can discover we now hold it.
-        if optional {
-            if let Some(x) = self.xites.write().await.get_mut(address) {
-                x.settings.optional_downloaded += info.size;
-                x.hashfield.add_hash(&info.sha512);
-                // The Files tab's "Finished" column.
-                let stat = x
-                    .settings
-                    .cache
-                    .optional_stats
-                    .entry(info.inner_path.clone())
-                    .or_default();
-                stat.time_downloaded = now_secs() as i64;
-            }
-        }
-        Ok(true)
     }
 
     /// List optional files with their state and the per-file counters the
@@ -5575,208 +5467,6 @@ impl AppState {
         Some(entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64)
     }
 
-    /// Ensure the pieces covering `[offset, offset+size)` of a big file are
-    /// present, downloading only the missing ones from peers and verifying each
-    /// against the piecemap before writing it into the sparse file. A no-op for
-    /// files that aren't big files. This is true piecewise Bigfile download.
-    pub async fn bigfile_fetch_range(
-        &self,
-        address: &str,
-        inner_path: &str,
-        offset: u64,
-        size: u64,
-    ) -> Result<(), String> {
-        let Some((entry, dir, optional)) = self.declared_entry(address, inner_path).await else {
-            return Ok(()); // not declared -> nothing to do
-        };
-        let Some(piecemap_path) = entry.get("piecemap").and_then(|v| v.as_str()) else {
-            return Ok(()); // not a big file
-        };
-        // A child content.json's piecemap path is relative to its own dir.
-        let piecemap_path =
-            if dir.is_empty() { piecemap_path.to_string() } else { format!("{dir}/{piecemap_path}") };
-        let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024) as u64;
-        let total = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
-        if piece_size == 0 || total == 0 || size == 0 {
-            return Ok(());
-        }
-
-        let storage = self
-            .xites
-            .read()
-            .await
-            .get(address)
-            .map(|x| x.storage.clone())
-            .ok_or("unknown xite")?;
-
-        // The piecemap is itself a (small) optional file - fetch it if missing.
-        if !storage.exists(&piecemap_path) {
-            self.file_need(address, &piecemap_path).await?;
-        }
-        let pm_bytes = storage.read(&piecemap_path).map_err(|e| e.to_string())?;
-        let file_name = inner_path.rsplit('/').next().unwrap_or(inner_path);
-        let hashes = epix_xite::parse_piecemap(&pm_bytes, file_name).ok_or("malformed piecemap")?;
-
-        ensure_sparse_file(&storage, inner_path, total)?;
-
-        let last_byte = (offset + size - 1).min(total - 1);
-        let (first, last) = (offset / piece_size, last_byte / piece_size);
-        let transport = self.transport.read().await.clone();
-        let peers = self.connectable_peers(address, 20).await;
-
-        // Reputation/backoff feedback, ONE outcome per peer per call (a dead
-        // peer must not be docked once per piece - that would back it off for
-        // an hour after a single bad pass). Independent BITS per peer, not a
-        // best-wins rank: the piecefield probe's bare handshake must not mask
-        // later piece-request failures, or a reachable peer that serves
-        // nothing would be REWARDED (ConnectOk resets backoff, +1 rep) every
-        // pass and float to the top of reputation-ordered selection forever.
-        const PF_CONNECTED: u8 = 1;
-        const PF_FILE_OK: u8 = 2;
-        const PF_FILE_FAIL: u8 = 4;
-        let mut peer_flags: std::collections::HashMap<String, (PeerAddr, u8)> =
-            std::collections::HashMap::new();
-        macro_rules! rank {
-            ($peer:expr, $r:expr) => {{
-                let e = peer_flags
-                    .entry($peer.to_string())
-                    .or_insert_with(|| ($peer.clone(), 0));
-                e.1 |= $r;
-            }};
-        }
-
-        // Piece-aware peer selection (Bigfile piecefields): for a multi-piece
-        // fetch, ask each peer up front which pieces of this file it holds, so we
-        // skip peers that don't have a given piece. `sha512` keys the piecefield.
-        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut peer_pf: std::collections::HashMap<String, epix_xite::Piecefield> =
-            std::collections::HashMap::new();
-        if last > first {
-            if let Some(t) = &transport {
-                for peer in &peers {
-                    if let Ok(mut conn) = Connection::connect(t.as_ref(), peer).await {
-                        if conn.handshake().await.is_ok() {
-                            rank!(peer, PF_CONNECTED);
-                            if let Ok(map) = conn.get_piecefields(address).await {
-                                if let Some(bytes) = map.get(&sha512) {
-                                    peer_pf.insert(peer.to_string(), epix_xite::Piecefield::unpack(bytes));
-                                }
-                            }
-                        } else {
-                            rank!(peer, 0);
-                        }
-                    } else {
-                        rank!(peer, 0);
-                    }
-                }
-            }
-        }
-
-        // Single exit below so the accumulated peer outcomes are ALWAYS
-        // applied, including on a failed piece or disk error.
-        let mut fetch_err: Option<String> = None;
-        'pieces: for i in first..=last {
-            // Per-piece guards: a deleted xite must not have pieces written
-            // back into its removed directory, and an OPTIONAL bigfile whose
-            // toggles were switched off mid-download (a multi-GB fetch can
-            // run for a long time) stops at the next piece instead of
-            // finishing against the user's withdrawn permission.
-            {
-                let exists = self.xites.read().await.contains_key(address);
-                if !exists {
-                    fetch_err = Some("xite removed".into());
-                    break 'pieces;
-                }
-                if optional && !self.optional_fetch_allowed(address).await {
-                    fetch_err = Some("optional downloads disabled".into());
-                    break 'pieces;
-                }
-            }
-            let poff = i * piece_size;
-            let plen = piece_size.min(total - poff);
-            let Some(expected) = hashes.get(i as usize) else {
-                fetch_err = Some("piece index past piecemap".into());
-                break 'pieces;
-            };
-            if piece_present(&storage, inner_path, poff, plen, expected) {
-                continue;
-            }
-            let Some(transport) = transport.clone() else {
-                fetch_err = Some("no transport".into());
-                break 'pieces;
-            };
-            let mut got = false;
-            for peer in &peers {
-                // Skip peers we know (from their piecefield) don't have this piece.
-                if let Some(pf) = peer_pf.get(&peer.to_string()) {
-                    if !pf.get(i as usize) {
-                        continue;
-                    }
-                }
-                let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else {
-                    rank!(peer, 0);
-                    continue;
-                };
-                if conn.handshake().await.is_err() {
-                    rank!(peer, 0);
-                    continue;
-                }
-                let Ok(data) = conn.get_file_range(address, inner_path, poff, plen).await else {
-                    rank!(peer, PF_CONNECTED | PF_FILE_FAIL);
-                    continue;
-                };
-                if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
-                    if let Err(e) = write_at(&storage, inner_path, poff, &data) {
-                        fetch_err = Some(e.to_string());
-                        break 'pieces;
-                    }
-                    rank!(peer, PF_CONNECTED | PF_FILE_OK);
-                    self.set_peer_connected(address, peer, true).await;
-                    self.record_transfer(address, peer, plen, 0).await;
-                    if optional {
-                        if let Some(x) = self.xites.write().await.get_mut(address) {
-                            x.settings.optional_downloaded += plen as i64;
-                        }
-                    }
-                    got = true;
-                    break;
-                } else {
-                    rank!(peer, PF_CONNECTED | PF_FILE_FAIL);
-                }
-            }
-            if !got {
-                fetch_err = Some(format!("could not fetch piece {i} of {inner_path}"));
-                break 'pieces;
-            }
-        }
-        // Flags -> outcomes: a peer that served anything is a good seeder
-        // (reset backoff, reward); a connected peer that only failed piece
-        // requests is a FileFail (dock reputation, keep backoff - same as the
-        // whole-file path); a probe-only peer proved reachable (ConnectOk);
-        // an entry with no bits never answered a dial (ConnectFail).
-        let outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = peer_flags
-            .into_values()
-            .flat_map(|(addr, f)| {
-                if f & PF_FILE_OK != 0 {
-                    vec![
-                        (addr.clone(), epix_worker::PeerOutcome::ConnectOk),
-                        (addr, epix_worker::PeerOutcome::FileOk),
-                    ]
-                } else if f & PF_FILE_FAIL != 0 {
-                    vec![(addr, epix_worker::PeerOutcome::FileFail)]
-                } else if f & PF_CONNECTED != 0 {
-                    vec![(addr, epix_worker::PeerOutcome::ConnectOk)]
-                } else {
-                    vec![(addr, epix_worker::PeerOutcome::ConnectFail)]
-                }
-            })
-            .collect();
-        self.apply_peer_outcomes(address, outcomes).await;
-        match fetch_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
 
     /// Which pieces of each big file we hold, keyed by the file's `sha512`
     /// (`getPiecefields`). A big file is one with a `piecemap` + `piece_size` in
@@ -8738,9 +8428,9 @@ impl AppState {
         sender: Option<&PeerAddr>,
         sender_peers: &[PeerAddr],
     ) {
-        let Some(transport) = self.transport.read().await.clone() else {
-            return;
-        };
+        if self.transport.read().await.is_none() {
+            return; // offline
+        }
         // Peers key files by the signed (canonical) address even when we serve
         // under a `.epix` alias; storage is keyed by the served address.
         let (storage, canonical) = {
@@ -8771,25 +8461,21 @@ impl AppState {
         let mut fetched: Option<Vec<u8>> = None;
         let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
         for p in &peers {
-            let result = tokio::time::timeout(p.connect_timeout(), async {
-                let mut conn = Connection::connect(transport.as_ref(), p).await.ok()?;
-                conn.handshake().await.ok()?;
-                Some(conn.get_file(&canonical, inner_path).await)
-            })
-            .await
-            .ok()
-            .flatten();
-            match result {
-                Some(Ok(bytes)) => {
+            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
+            // link; the caller verifies them against the merge rules.
+            match self.edx_fetch_signed(p.clone(), &canonical, inner_path).await {
+                Some(Ok(Some(bytes))) => {
                     outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
                     fetched = Some(bytes);
                     break;
                 }
                 // Dialed fine but couldn't serve this file: dock reputation only
                 // (it may still serve others), don't back it off.
-                Some(Err(_)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
-                // Dial/handshake failed or timed out: back it off.
-                None => outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail)),
+                Some(Ok(None)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
+                // Dial/link failed, or no fetcher: back it off.
+                Some(Err(_)) | None => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail))
+                }
             }
         }
         if !outcomes.is_empty() {
@@ -9475,21 +9161,20 @@ impl AppState {
         let bytes = match body.filter(|b| !b.is_empty()) {
             Some(b) => b,
             None => {
-                let fetched = match (&sender, self.transport.read().await.clone()) {
-                    (Some(s), Some(transport)) => {
-                        // The sender may be an onion/i2p peer: use its dial
-                        // deadline, not a flat clearnet one.
-                        tokio::time::timeout(s.connect_timeout(), async {
-                            let mut conn =
-                                Connection::connect(transport.as_ref(), s).await.ok()?;
-                            conn.handshake().await.ok()?;
-                            conn.get_file(site, inner_path).await.ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                    }
-                    _ => None,
+                // Fetch the signed content.json back from the sender over EDX
+                // GetSigned. The sender may be an onion/i2p peer: use its dial
+                // deadline, not a flat clearnet one.
+                let fetched = match &sender {
+                    Some(s) => match tokio::time::timeout(
+                        s.connect_timeout(),
+                        self.edx_fetch_signed(s.clone(), site, inner_path),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(Some(bytes)))) => Some(bytes),
+                        _ => None,
+                    },
+                    None => None,
                 };
                 fetched.ok_or("File invalid update: Can't download updated file")?
             }
@@ -9815,26 +9500,6 @@ impl AppState {
 
     pub async fn has_xite(&self, address: &str) -> bool {
         self.xites.read().await.contains_key(address)
-    }
-
-    /// Read a file from a served xite's storage.
-    /// Serve one chunk of a local file to a peer (`getFile`): the bytes from
-    /// `offset` up to `length`, plus the file's total size. `None` if the xite or
-    /// file is not present here. Used by the inbound file server (seeding).
-    pub async fn serve_file_chunk(
-        &self,
-        address: &str,
-        inner_path: &str,
-        offset: u64,
-        length: usize,
-    ) -> Option<(Vec<u8>, u64)> {
-        let path = {
-            let xites = self.xites.read().await;
-            xites.get(address)?.storage.path(inner_path).ok()?
-        };
-        let total = std::fs::metadata(&path).ok()?.len();
-        let chunk = self.read_file_range(address, inner_path, offset, length).await?;
-        Some((chunk, total))
     }
 
     pub async fn read_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
@@ -11342,34 +11007,6 @@ fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, D
         let _ = db.populate_filtered(&schema, &db_dir, muted);
     }
     Some((db, schema))
-}
-
-/// Create (or right-size) a file at `size` bytes so pieces can be written into
-/// it sparsely at their offsets.
-fn ensure_sparse_file(storage: &XiteStorage, inner_path: &str, size: u64) -> Result<(), String> {
-    let path = storage.path(inner_path).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let wrong_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX) != size;
-    if wrong_size {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
-        f.set_len(size).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Write `data` at `offset` in an existing file.
-fn write_at(storage: &XiteStorage, inner_path: &str, offset: u64, data: &[u8]) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom, Write};
-    let path = storage.path(inner_path).map_err(|e| e.to_string())?;
-    let mut f = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| e.to_string())?;
-    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
-    f.write_all(data).map_err(|e| e.to_string())
 }
 
 /// Whether the piece at `offset` (length `len`) is present and matches `hash`.
@@ -14993,54 +14630,6 @@ mod tests {
             .resolve_merged("epix1merger", "merged-EpixTalk/epix1cloning/avatar.jpg")
             .await
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn file_need_fetches_bigfile_pieces_not_the_whole_blob() {
-        let dir = tempdir().unwrap();
-        let storage = XiteStorage::new(dir.path());
-        // A 3-piece big file, declared by a child content.json (a per-user
-        // dir) whose piecemap path is relative to that child's own dir.
-        let data = vec![7u8; 2500];
-        let hash = epix_xite::hash_bigfile(&data, 1024);
-        storage.write("data/users/A/big.bin", &data).unwrap();
-        storage
-            .write(
-                "data/users/A/big.bin.piecemap.msgpack",
-                &epix_xite::build_piecemap("big.bin", &hash),
-            )
-            .unwrap();
-        storage
-            .write(
-                "data/users/A/content.json",
-                &serde_json::to_vec(&json!({
-                    "files_optional": {
-                        "big.bin": {
-                            "sha512": hash.merkle_root,
-                            "size": 2500,
-                            "piecemap": "big.bin.piecemap.msgpack",
-                            "piece_size": 1024,
-                        }
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        let state = AppState::new("test");
-        state
-            .add_xite("epix1big", XiteEntry {
-                storage,
-                content: Some(json!({ "address": "epix1big", "files": {} })),
-            })
-            .await;
-        std::mem::forget(dir);
-
-        // The declared sha512 is a merkle root: a whole-file flat hash never
-        // matches it, so the old blob fetch path could only fail. The
-        // piecewise path verifies the on-disk pieces and succeeds without any
-        // transport.
-        assert_eq!(state.file_need("epix1big", "data/users/A/big.bin").await, Ok(true));
-        assert_eq!(state.bigfile_total("epix1big", "data/users/A/big.bin").await, Some(2500));
     }
 
     #[tokio::test]
