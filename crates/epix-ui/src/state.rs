@@ -6290,7 +6290,7 @@ impl AppState {
         let totals = epix_protocol::registry::totals();
         let _ = write!(
             h,
-            "<h2>Connections ({} live, in: {}, out: {}, total made: {} -             clearnet: {}, tor: {}, i2p: {}, mesh: {})</h2>             <table><tr><th>id</th><th>dir</th><th>peer</th><th>type</th>             <th>version</th><th>ping</th><th>open</th><th>idle</th><th>out</th>             <th>in</th><th>last sent</th><th>last recv</th><th>xites</th></tr>",
+            "<h2>Connections ({} live, in: {}, out: {}, total made: {} -             clearnet: {}, tor: {}, i2p: {}, mesh: {})</h2>             <table><tr><th>id</th><th>dir</th><th>peer</th><th>type</th>             <th>client</th><th>ping</th><th>open</th><th>idle</th><th>out</th>             <th>in</th><th>last sent</th><th>last recv</th><th>xites</th></tr>",
             stats.total,
             stats.incoming,
             stats.total - stats.incoming,
@@ -6322,9 +6322,18 @@ impl AppState {
                 epix_protocol::registry::Direction::In => "in",
                 epix_protocol::registry::Direction::Out => "out",
             };
-            // Version + rev, like the Python page's "0.7.1 r4556".
-            let version = match &d.peer {
-                Some(p) if !p.version.is_empty() => esc(&format!("{} r{}", p.version, p.rev)),
+            // Client + advertised version, e.g. "EpixNet v0.3.28". Older
+            // nodes send "EpixNet"/"EpixRS" as the version with no real
+            // number, so show just the client name for those.
+            let client = match &d.peer {
+                Some(p) if !p.version.is_empty() => {
+                    let v = p.version.trim_start_matches('v');
+                    if v.eq_ignore_ascii_case("EpixNet") || v.eq_ignore_ascii_case("EpixRS") {
+                        "EpixNet".to_string()
+                    } else {
+                        esc(&format!("EpixNet v{v}"))
+                    }
+                }
                 _ => "-".into(),
             };
             let ping = d.ping_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "-".into());
@@ -6340,7 +6349,7 @@ impl AppState {
                 dir,
                 esc(&d.addr.to_string()),
                 kind,
-                version,
+                client,
                 ping,
                 fmt_dur(d.opened_secs),
                 fmt_dur(d.idle_secs),
