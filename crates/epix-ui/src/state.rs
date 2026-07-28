@@ -71,6 +71,20 @@ pub trait EdxFetcher: Send + Sync {
     /// (the caller may fall back to the legacy path).
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String>;
 
+    /// Fetch a signed inner_path (content.json - the manifest, or a child
+    /// content.json) of `address` from a single `peer` over an EDX link, via
+    /// `GetSigned`. This is the EDX manifest channel that replaces the msgpack
+    /// `getFile` for content.json: it works for any site (the signed bytes are
+    /// served independent of per-file `b3`). `Ok(Some(bytes))` on success,
+    /// `Ok(None)` if the peer served no such content, `Err` on dial/link
+    /// failure so the caller can score the peer and try another.
+    async fn fetch_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Result<Option<Vec<u8>>, String>;
+
     /// Fetch just the byte range `[start, start+len)` of `inner_path` over
     /// EDX and return the verified bytes, without materializing the whole
     /// file (media seek). `Ok(None)` when the file has no EDX entry.
@@ -4306,6 +4320,15 @@ impl AppState {
             // peer above never-tried candidates in the selection tiebreak.
             let progressed = AtomicBool::new(false);
             let fetched = tokio::time::timeout(peer.connect_timeout(), async {
+                // EDX manifest channel first: GetSigned over an EDX link works
+                // for any site. A live link marks `progressed`; only if EDX
+                // yields nothing do we fall to the legacy msgpack getFile.
+                if let Some(Ok(Some(bytes))) =
+                    self.edx_fetch_signed(peer.clone(), &canonical, "content.json").await
+                {
+                    progressed.store(true, Ordering::Relaxed);
+                    return Some(Some(bytes));
+                }
                 let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
                 conn.handshake().await.ok()?;
                 progressed.store(true, Ordering::Relaxed);
@@ -8031,6 +8054,21 @@ impl AppState {
     pub async fn edx_fetch_file(&self, address: &str, inner_path: &str) -> Option<Result<bool, String>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
         Some(fetcher.fetch_file(address, inner_path).await)
+    }
+
+    /// Fetch a signed inner_path (content.json) of `address` from `peer` over
+    /// EDX `GetSigned`. `None` when no fetcher is installed; otherwise the
+    /// fetcher's result (`Ok(Some)` bytes, `Ok(None)` peer had none, `Err`
+    /// unreachable). The manifest channel the clone/resync use in place of the
+    /// msgpack `getFile`.
+    pub async fn edx_fetch_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Option<Result<Option<Vec<u8>>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_signed(peer, address, inner_path).await)
     }
 
     /// Batch EDX fetch via the installed fetcher (one dial-once session over
@@ -12527,6 +12565,14 @@ mod tests {
         #[async_trait::async_trait]
         impl EdxFetcher for MockPush {
             async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
                 unreachable!()
             }
             async fn fetch_range(

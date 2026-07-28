@@ -657,6 +657,24 @@ impl EdxFetcher for RuntimeEdxFetcher {
         Ok(true)
     }
 
+    async fn fetch_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        // Dial an EDX link and ask for the signed bytes. A dial/handshake
+        // failure is Err (peer unreachable - score ConnectFail); a live peer
+        // that simply does not serve this content answers with an error we
+        // map to Ok(None) (score FileFail), so the caller tries another peer.
+        let (conn, _identity) = self.dial(&transport, &peer).await?;
+        match epix_edx::fetch::fetch_signed(&conn, address, inner_path).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(_) => Ok(None),
+        }
+    }
+
     async fn fetch_range(
         &self,
         address: &str,

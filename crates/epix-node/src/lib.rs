@@ -791,6 +791,7 @@ async fn clone_xite_with_progress(
                                     transport.clone(),
                                     peer,
                                     address.to_string(),
+                                    progress.cloned(),
                                 ));
                             } else {
                                 untried.push_back(peer);
@@ -811,6 +812,7 @@ async fn clone_xite_with_progress(
                                 transport.clone(),
                                 peer,
                                 address.to_string(),
+                                progress.cloned(),
                             ));
                         }
                     }
@@ -1357,11 +1359,26 @@ async fn fetch_content(
     transport: Arc<dyn Transport>,
     peer: PeerAddr,
     address: String,
+    state: Option<Arc<AppState>>,
 ) -> Option<Vec<u8>> {
     let budget = std::time::Duration::from_secs(match peer {
         PeerAddr::Onion { .. } | PeerAddr::I2p { .. } => 45,
         _ => 10,
     });
+    // EDX manifest channel first: GetSigned returns the signed content.json
+    // over an EDX link, and works for ANY site (the signed bytes are served
+    // independent of per-file `b3`). Falls through to the msgpack getFile
+    // below only while that legacy path still exists.
+    if let Some(state) = &state {
+        if let Ok(Some(Ok(Some(bytes)))) = tokio::time::timeout(
+            budget,
+            state.edx_fetch_signed(peer.clone(), &address, "content.json"),
+        )
+        .await
+        {
+            return Some(bytes);
+        }
+    }
     tokio::time::timeout(budget, async {
         let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
         conn.handshake().await.ok()?;
