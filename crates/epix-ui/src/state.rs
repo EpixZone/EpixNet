@@ -4178,7 +4178,7 @@ impl AppState {
     /// Fetch a pending update's missing files from connectable peers, updating
     /// the live worker stats. A no-op without a transport or peers - files
     /// that arrive some other way still let the caller's commit land.
-    async fn fetch_pending_files(&self, key: &str, _xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
+    async fn fetch_pending_files(&self, key: &str, xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
         if self.transport.read().await.is_none() {
             return; // offline
         }
@@ -4186,10 +4186,13 @@ impl AppState {
         if peers.is_empty() {
             return;
         }
-        // EDX-only: dial the peers once and pull what EDX can (verified onto
-        // disk). A file with no `b3` simply does not arrive (post-msgpack
-        // contract); the caller's completeness check leaves the update pending.
-        self.edx_first(key, needed, peers, None, None).await;
+        // EDX-only, resolved against the PENDING (staged) manifest: a deferred
+        // update never touches the committed in-memory content, so without the
+        // staged content here a changed file would resolve to the OLD `b3`,
+        // fetch stale bytes that never match the new sha512, and the update
+        // could never converge. A file with no `b3` simply does not arrive.
+        let staged = xite.content.clone();
+        self.edx_first(key, needed, peers, staged.as_ref(), None).await;
     }
 
     /// EDX-first pass over a needed-file list: fetch what EDX can in one
@@ -4492,6 +4495,30 @@ impl AppState {
             }
         }
         out
+    }
+
+    /// Record EDX dial outcomes into the peer registry so a clone/batch fetch
+    /// learns which peers are alive: a dead peer sinks (backoff + reputation)
+    /// and a live one rises in selection, instead of the same unranked top-N
+    /// being redialed every pass and the clone falsely giving up while a
+    /// reachable seeder sits lower in the list. `results` pairs each peer with
+    /// whether its EDX handshake succeeded.
+    pub async fn note_edx_dials(&self, address: &str, results: Vec<(PeerAddr, bool)>) {
+        if results.is_empty() {
+            return;
+        }
+        let outcomes = results
+            .into_iter()
+            .map(|(p, ok)| {
+                let o = if ok {
+                    epix_worker::PeerOutcome::ConnectOk
+                } else {
+                    epix_worker::PeerOutcome::ConnectFail
+                };
+                (p, o)
+            })
+            .collect();
+        self.apply_peer_outcomes(address, outcomes).await;
     }
 
     /// A deduplicated set of connectable peers across all served xites, for the

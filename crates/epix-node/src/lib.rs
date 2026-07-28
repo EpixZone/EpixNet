@@ -881,58 +881,54 @@ async fn clone_xite_with_progress(
             );
         }) as Arc<dyn Fn(&str) + Send + Sync>
     });
-    // EDX-only streaming clone. Discovery keeps forwarding peers over sync_rx
-    // (each is also added to the state registry). Each pass pulls the
-    // still-missing core files from every peer known so far; when a new peer
-    // arrives, the loop retries the misses against the grown set. It ends when
-    // every core file is on disk, or discovery closes / stalls after a final
-    // pass. This is the EDX replacement for the msgpack streaming worker: a
-    // legacy site with no `b3` lands nothing and the staged-commit check below
-    // fails the clone, which is the post-msgpack contract. The shared emitter
-    // advances the loading bar as EDX materializes each file.
+    // EDX-only streaming clone. Discovery adds every peer it finds to the state
+    // registry (also fed over sync_tx, unused here); each pass pulls the
+    // still-missing core files from the best candidates - tracker seeds first,
+    // then the reputation-ranked registry. edx_first records a dial outcome per
+    // peer, so a dead peer sinks and the next pass pulls fresh candidates rather
+    // than redialing the same unreachable top-N and giving up. It ends when
+    // every core file is on disk, or after a few passes make no progress (a
+    // legacy no-b3 site never completes; nor does a b3 site whose seeder is
+    // simply unreachable). The shared emitter advances the loading bar as EDX
+    // materializes each file.
+    drop(sync_rx); // the registry (fetch_candidate_peers) carries discovered peers
     let mut bytes_recv = 0u64; // EDX bytes are counted by edx_first's add_transfer
-    let mut sync_rx = sync_rx;
-    let mut channel_open = true;
-    // Consecutive passes that fetched a peer set but made no progress. A legacy
-    // site with no `b3` never completes, and its peers keep announcing, so
-    // without this cap the loop would retry forever - give up after a few dry
-    // passes. Real progress resets it, so a slow b3 site behind trickling peers
-    // still finishes.
     let mut dry = 0u32;
+    let mut empty_waits = 0u32;
     while let Some(state) = progress {
         let before = xite.files_needed();
         if before.is_empty() {
             break;
         }
-        let peers = state.connectable_peers(address, 20).await;
-        let tried = !peers.is_empty();
-        if tried {
-            let staged = xite.content.clone();
-            let edx_progress = emit_done.clone().map(|emit| {
-                Arc::new(move |inner: &str, _bytes: u64| emit(inner))
-                    as epix_ui::state::EdxBatchProgress
-            });
-            state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress).await;
+        let peers = state.fetch_candidate_peers(address, 50).await;
+        if peers.is_empty() {
+            // No peers to dial yet - let discovery turn some up, bounded so a
+            // truly peerless clone still terminates.
+            empty_waits += 1;
+            if empty_waits > 20 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
         }
+        empty_waits = 0;
+        let staged = xite.content.clone();
+        let edx_progress = emit_done.clone().map(|emit| {
+            Arc::new(move |inner: &str, _bytes: u64| emit(inner))
+                as epix_ui::state::EdxBatchProgress
+        });
+        state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress).await;
         let after = xite.files_needed().len();
         if after == 0 {
             break;
         }
-        // Only a real attempt (peers were available) counts toward the dry cap;
-        // with no peers we just wait for discovery to turn some up.
-        if tried {
-            dry = if after < before.len() { 0 } else { dry + 1 };
-        }
-        if dry >= 3 || !channel_open {
+        dry = if after < before.len() { 0 } else { dry + 1 };
+        if dry >= 5 {
             break;
         }
-        // Wait for the next discovered peer, then retry against the grown set.
-        // A bounded wait so a stalled discovery still terminates the clone.
-        match tokio::time::timeout(std::time::Duration::from_secs(20), sync_rx.recv()).await {
-            Ok(Some(_)) => {}                 // new peer -> retry
-            Ok(None) => channel_open = false, // discovery done -> one final pass then stop
-            Err(_) => channel_open = false,   // no new peer for 20s -> final pass then stop
-        }
+        // Brief pause so the just-recorded dial outcomes settle (dead peers back
+        // off) and late-discovered peers land before the next candidate pull.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     // Staged adopt: commit the fetched content.json to disk (atomic rename)
     // only now that its core file set is complete, so neither a crash nor an

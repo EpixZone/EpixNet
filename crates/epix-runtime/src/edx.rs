@@ -127,6 +127,11 @@ const EDX_UPLOAD_CAP_BPS: u64 = 8_000_000;
 /// EPIX_EDX_STORE_QUOTA_BYTES.
 const EDX_STORE_QUOTA_BYTES: u64 = 8 << 30; // 8 GiB
 
+/// Bound each post-dial EDX request (bitfield / GetMany / GetSigned over a
+/// session) so a peer that handshakes then stalls the response cannot hang the
+/// fetch. The dial itself is bounded by `peer.connect_timeout()` in `dial()`.
+const EDX_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn store_quota() -> u64 {
     std::env::var("EPIX_EDX_STORE_QUOTA_BYTES")
         .ok()
@@ -381,6 +386,9 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
 /// xite's connectable peers as EDX links, learn what each holds, run the
 /// swarm scheduler into the object store, then materialize the completed
 /// object into the xite's storage. Backs [`AppState`]'s injected fetcher.
+/// Cheap to clone (Arc + String) - clones let a session dial its peers
+/// concurrently.
+#[derive(Clone)]
 struct RuntimeEdxFetcher {
     state: Arc<AppState>,
     privatekey: String,
@@ -397,25 +405,32 @@ impl RuntimeEdxFetcher {
         transport: &Arc<dyn Transport>,
         peer: &PeerAddr,
     ) -> Result<(Conn, PeerIdentity), String> {
-        let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
         // A client context: client_hello only reads the key and caps; reuse
         // the AppState provider (harmless) and the object store.
         let store = self.state.edx_store().await.ok_or("no EDX store")?;
         let provider: Arc<dyn SignedProvider> =
             Arc::new(AppStateProvider { state: self.state.clone() });
         let ctx = ServeCtx::new(store, provider, self.privatekey.clone());
-        // Clearnet TCP needs Noise; overlays (Tor/I2P/Reticulum) already
-        // encrypt, so they skip it and bind with no handshake hash.
-        let (conn, hh) = if matches!(peer, PeerAddr::Ip(_)) {
-            let l = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
-            (l.conn, Some(l.handshake_hash))
-        } else {
-            let (conn, _in) = epix_edx::link::dial_overlay(stream).await.map_err(|e| e.to_string())?;
-            (conn, None)
-        };
-        let identity =
-            client_hello(&conn, &ctx, vec![], hh).await.map_err(|e| e.to_string())?;
-        Ok((conn, identity))
+        // Bound the whole handshake: a peer that TCP-accepts then stalls the
+        // Noise / client_hello exchange must not hang the fetch forever (the
+        // msgpack path this replaced wrapped every dial in connect_timeout).
+        tokio::time::timeout(peer.connect_timeout(), async {
+            let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
+            // Clearnet TCP needs Noise; overlays (Tor/I2P/Reticulum) already
+            // encrypt, so they skip it and bind with no handshake hash.
+            let (conn, hh) = if matches!(peer, PeerAddr::Ip(_)) {
+                let l = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
+                (l.conn, Some(l.handshake_hash))
+            } else {
+                let (conn, _in) =
+                    epix_edx::link::dial_overlay(stream).await.map_err(|e| e.to_string())?;
+                (conn, None)
+            };
+            let identity = client_hello(&conn, &ctx, vec![], hh).await.map_err(|e| e.to_string())?;
+            Ok::<_, String>((conn, identity))
+        })
+        .await
+        .map_err(|_| "EDX dial timed out".to_string())?
     }
 
     /// Fetch an encrypted-shard file: pull each content-addressed ciphertext
@@ -449,7 +464,10 @@ impl RuntimeEdxFetcher {
             let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
             for peer in &peers {
                 let Ok((conn, identity)) = self.dial(&transport, peer).await else { continue };
-                if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&conn, id).await {
+                if let Ok(Ok((_sz, bits))) =
+                tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
+                    .await
+            {
                     let label = peer.to_string();
                     node_pks.insert(label.clone(), identity.node_pk);
                     handles.push(PeerHandle { conn, class: Class::of_addr(peer), bits, label });
@@ -529,7 +547,10 @@ impl RuntimeEdxFetcher {
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for peer in peers {
             let Ok((conn, identity)) = self.dial(&transport, &peer).await else { continue };
-            if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&conn, id).await {
+            if let Ok(Ok((_sz, bits))) =
+                tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
+                    .await
+            {
                 let label = peer.to_string();
                 node_pks.insert(label.clone(), identity.node_pk);
                 handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label });
@@ -545,19 +566,42 @@ impl RuntimeEdxFetcher {
     /// every file over the same connections instead of redialing per file (the
     /// redial-per-file cost of calling `fetch_file` in a loop). Object-
     /// independent: the per-object bitfield is fetched later over these links.
-    async fn open_session(&self, peers: &[PeerAddr], cap: usize) -> Vec<SessionPeer> {
+    ///
+    /// Dials run CONCURRENTLY: a dead peer must not serialize its full
+    /// connect_timeout ahead of a live one (the whole session would take
+    /// cap * timeout instead of one timeout). Each dial's outcome is fed back
+    /// into `address`'s peer registry (via note_edx_dials), so a dead peer
+    /// sinks and a live one rises - without this the clone kept redialing the
+    /// same unranked top-N and gave up while a reachable seeder sat lower.
+    async fn open_session(&self, address: &str, peers: &[PeerAddr], cap: usize) -> Vec<SessionPeer> {
         let Some(transport) = self.state.transport().await else { return Vec::new() };
+        let mut join = tokio::task::JoinSet::new();
+        for peer in peers.iter().take(cap).cloned() {
+            let this = self.clone();
+            let transport = transport.clone();
+            join.spawn(async move {
+                let r = this.dial(&transport, &peer).await;
+                (peer, r)
+            });
+        }
         let mut out = Vec::new();
-        for peer in peers.iter().take(cap) {
-            if let Ok((conn, identity)) = self.dial(&transport, peer).await {
-                out.push(SessionPeer {
-                    conn,
-                    class: Class::of_addr(peer),
-                    label: peer.to_string(),
-                    node_pk: identity.node_pk,
-                });
+        let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
+        while let Some(res) = join.join_next().await {
+            let Ok((peer, r)) = res else { continue };
+            match r {
+                Ok((conn, identity)) => {
+                    outcomes.push((peer.clone(), true));
+                    out.push(SessionPeer {
+                        conn,
+                        class: Class::of_addr(&peer),
+                        label: peer.to_string(),
+                        node_pk: identity.node_pk,
+                    });
+                }
+                Err(_) => outcomes.push((peer, false)),
             }
         }
+        self.state.note_edx_dials(address, outcomes).await;
         out
     }
 
@@ -581,7 +625,10 @@ impl RuntimeEdxFetcher {
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for p in session {
-            if let Ok((_sz, bits)) = epix_edx::fetch::fetch_bitfield(&p.conn, id).await {
+            if let Ok(Ok((_sz, bits))) =
+                tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&p.conn, id))
+                    .await
+            {
                 node_pks.insert(p.label.clone(), p.node_pk.clone());
                 handles.push(PeerHandle {
                     conn: p.conn.clone(),
@@ -669,9 +716,15 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // that simply does not serve this content answers with an error we
         // map to Ok(None) (score FileFail), so the caller tries another peer.
         let (conn, _identity) = self.dial(&transport, &peer).await?;
-        match epix_edx::fetch::fetch_signed(&conn, address, inner_path).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(_) => Ok(None),
+        match tokio::time::timeout(
+            EDX_FETCH_TIMEOUT,
+            epix_edx::fetch::fetch_signed(&conn, address, inner_path),
+        )
+        .await
+        {
+            Ok(Ok(bytes)) => Ok(Some(bytes)),
+            // Alive but no content, or the request stalled: try another peer.
+            Ok(Err(_)) | Err(_) => Ok(None),
         }
     }
 
@@ -685,13 +738,18 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // Dial the peers ONCE and GetSigned every path over the reused links,
         // so a forum's N user content.json files cost N requests on live
         // connections, not N dials per peer.
-        let session = self.open_session(&peers, 8).await;
+        let session = self.open_session(address, &peers, 8).await;
         if session.is_empty() {
             return out;
         }
         for path in paths {
             for p in &session {
-                if let Ok(bytes) = epix_edx::fetch::fetch_signed(&p.conn, address, &path).await {
+                if let Ok(Ok(bytes)) = tokio::time::timeout(
+                    EDX_FETCH_TIMEOUT,
+                    epix_edx::fetch::fetch_signed(&p.conn, address, &path),
+                )
+                .await
+                {
                     out.insert(path, bytes);
                     break;
                 }
@@ -886,7 +944,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // Dial the peers ONCE, then fetch every remaining file over the reused
         // links. A file no session peer holds (or that the swarm can't
         // complete) goes to `missed` for the worker.
-        let session = self.open_session(&peers, 8).await;
+        let session = self.open_session(address, &peers, 8).await;
         if session.is_empty() {
             for r in pending {
                 epix_ui::state::note_edx_fallback_path(address, &r.path);
@@ -918,7 +976,11 @@ impl EdxFetcher for RuntimeEdxFetcher {
                     break;
                 }
                 for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
-                    let _ = epix_edx::fetch::fetch_many(&peer.conn, &store, chunk, now).await;
+                    let _ = tokio::time::timeout(
+                        EDX_FETCH_TIMEOUT,
+                        epix_edx::fetch::fetch_many(&peer.conn, &store, chunk, now),
+                    )
+                    .await;
                 }
             }
             // Materialize every small file the store now holds; the rest join
