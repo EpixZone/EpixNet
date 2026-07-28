@@ -94,6 +94,20 @@ async fn dispatch(
                 return Err("usage: sitePublish <address> [inner_path]".into());
             };
             let inner_path = rest.first().cloned().unwrap_or_else(|| "content.json".to_string());
+            // Live path first: if a node is running it holds the single-writer
+            // EDX store lock (an offline publish could not open it anyway) and
+            // already has a warm swarm, so route the publish to it over the
+            // admin socket. `sign:false` - the CLI signs via `siteSign`, so this
+            // publishes the already-signed content.json as-is (CLI semantics).
+            let live_params =
+                serde_json::json!({ "inner_path": inner_path, "sign": false });
+            if let Some(_reply) =
+                admin_call(data_root, "sitePublish", Some(address), live_params).await?
+            {
+                println!("{inner_path} published via the running node [live]");
+                return Ok(());
+            }
+            // Offline path: no node running, so this command drives the publish.
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
                 return Err(format!("Site not found: {address}"));
@@ -103,6 +117,24 @@ async fn dispatch(
             // skips them here - they pull the version from the swarm on their
             // next sync instead.
             state.set_transport(std::sync::Arc::new(epix_transport::TcpTransport)).await;
+            // EDX is the sole publish transport, and its fetcher is what
+            // `publish()` pushes over. The long-running node installs it during
+            // fileserver boot (ensure_edx_serve); this one-shot command boots no
+            // fileserver, so we must open the object store + fetcher ourselves,
+            // or publish() fails with "publishing requires EDX (it is disabled)".
+            // No choker: an offline publish needs no reciprocity accounting.
+            if let Some(dir) = state.data_root_path() {
+                let node_key = epix_runtime::edx::node_key(&state).await;
+                if epix_runtime::edx::enable_serving(&state, &dir, node_key, None)
+                    .await
+                    .is_none()
+                {
+                    return Err(
+                        "could not open the EDX store (is another node instance running?)"
+                            .into(),
+                    );
+                }
+            }
             let content_path = state.content_inner_path(address, &inner_path).await;
             let published = state.publish(address, &content_path, None, true).await?;
             if published == 0 {
@@ -187,7 +219,7 @@ async fn dispatch(
                 "siteDelete" => ("siteDelete", serde_json::json!({ "address": address })),
                 _ => ("siteAdd", serde_json::json!({ "address": address })),
             };
-            match admin_call(data_root, live_cmd, params).await? {
+            match admin_call(data_root, live_cmd, None, params).await? {
                 Some(reply) => match action {
                     "siteList" => {
                         let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
@@ -315,15 +347,20 @@ async fn dispatch(
 async fn admin_call(
     _data_root: &std::path::Path,
     _cmd: &str,
+    _xite: Option<&str>,
     _params: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, String> {
     Ok(None)
 }
 
+/// `xite` binds the trusted session to a site, needed by commands that resolve
+/// their target from the connection (e.g. `sitePublish`); pass `None` for
+/// commands that carry the address in `params` (siteList/siteDelete/...).
 #[cfg(unix)]
 async fn admin_call(
     data_root: &std::path::Path,
     cmd: &str,
+    xite: Option<&str>,
     params: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -332,7 +369,11 @@ async fn admin_call(
         Ok(s) => s,
         Err(_) => return Ok(None), // node not running -> offline path
     };
-    let req = serde_json::json!({ "cmd": cmd, "params": params }).to_string();
+    let mut req_obj = serde_json::json!({ "cmd": cmd, "params": params });
+    if let Some(x) = xite {
+        req_obj["xite"] = serde_json::Value::String(x.to_string());
+    }
+    let req = req_obj.to_string();
     stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
     stream.write_all(b"\n").await.map_err(|e| e.to_string())?;
     stream.flush().await.map_err(|e| e.to_string())?;

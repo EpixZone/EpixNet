@@ -9,6 +9,7 @@ epix-build = { path = "../epix-build" }
 
 [dependencies]
 epix-node = { path = "../epix-node", default-features = false }
+epix-runtime = { path = "../epix-runtime", default-features = false }
 epix-ui = { path = "../epix-ui" }
 epix-core = { path = "../epix-core" }
 epix-crypt = { path = "../epix-crypt" }
