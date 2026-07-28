@@ -85,6 +85,19 @@ pub trait EdxFetcher: Send + Sync {
         inner_path: &str,
     ) -> Result<Option<Vec<u8>>, String>;
 
+    /// Fetch many signed inner_paths (the child/user content.json files a
+    /// user_contents site declares) in ONE session: dial `peers` once and
+    /// `GetSigned` each path over the reused links. Returns the paths that were
+    /// served, mapped to their signed bytes; a path no peer had is simply
+    /// absent. The EDX analog of the msgpack `fetch_files_raw` for manifests,
+    /// without its per-file redial.
+    async fn fetch_signed_many(
+        &self,
+        address: &str,
+        paths: Vec<String>,
+        peers: Vec<PeerAddr>,
+    ) -> HashMap<String, Vec<u8>>;
+
     /// Fetch just the byte range `[start, start+len)` of `inner_path` over
     /// EDX and return the verified bytes, without materializing the whole
     /// file (media seek). `Ok(None)` when the file has no EDX entry.
@@ -8071,6 +8084,20 @@ impl AppState {
         Some(fetcher.fetch_signed(peer, address, inner_path).await)
     }
 
+    /// Batch EDX signed-content fetch via the installed fetcher (dial `peers`
+    /// once, `GetSigned` each path). `None` when no fetcher is installed - the
+    /// caller then runs the msgpack `fetch_files_raw`; otherwise the map of the
+    /// paths that were served.
+    pub async fn edx_fetch_signed_many(
+        &self,
+        address: &str,
+        paths: Vec<String>,
+        peers: Vec<PeerAddr>,
+    ) -> Option<HashMap<String, Vec<u8>>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_signed_many(address, paths, peers).await)
+    }
+
     /// Batch EDX fetch via the installed fetcher (one dial-once session over
     /// `peers`). `None` when no fetcher is installed - the caller then runs the
     /// full msgpack list; otherwise the batch report, whose `missed` set is the
@@ -12573,6 +12600,14 @@ mod tests {
                 _: &str,
                 _: &str,
             ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+            ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
             async fn fetch_range(

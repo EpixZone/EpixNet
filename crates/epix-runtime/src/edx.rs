@@ -675,6 +675,31 @@ impl EdxFetcher for RuntimeEdxFetcher {
         }
     }
 
+    async fn fetch_signed_many(
+        &self,
+        address: &str,
+        paths: Vec<String>,
+        peers: Vec<PeerAddr>,
+    ) -> HashMap<String, Vec<u8>> {
+        let mut out = HashMap::new();
+        // Dial the peers ONCE and GetSigned every path over the reused links,
+        // so a forum's N user content.json files cost N requests on live
+        // connections, not N dials per peer.
+        let session = self.open_session(&peers, 8).await;
+        if session.is_empty() {
+            return out;
+        }
+        for path in paths {
+            for p in &session {
+                if let Ok(bytes) = epix_edx::fetch::fetch_signed(&p.conn, address, &path).await {
+                    out.insert(path, bytes);
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     async fn fetch_range(
         &self,
         address: &str,

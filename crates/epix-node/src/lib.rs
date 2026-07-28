@@ -1144,14 +1144,25 @@ async fn sync_included_content(
             }
         }
         if !to_fetch.is_empty() {
-            let mut results = epix_worker::fetch_files_raw(
-                to_fetch.iter().map(|(p, _)| p.clone()).collect(),
-                address,
-                peers,
-                transport.clone(),
-                8,
-            )
-            .await;
+            let want: Vec<String> = to_fetch.iter().map(|(p, _)| p.clone()).collect();
+            // EDX-first: dial the peers once and GetSigned every child manifest
+            // over the reused links. Only the paths EDX could not serve fall to
+            // the msgpack worker (while that path still exists).
+            let mut results = match progress {
+                Some(state) => state
+                    .edx_fetch_signed_many(address, want.clone(), peers.to_vec())
+                    .await
+                    .unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            };
+            let remaining: Vec<String> =
+                want.into_iter().filter(|p| !results.contains_key(p)).collect();
+            if !remaining.is_empty() {
+                let raw =
+                    epix_worker::fetch_files_raw(remaining, address, peers, transport.clone(), 8)
+                        .await;
+                results.extend(raw);
+            }
             for (path, disk) in to_fetch {
                 match results.remove(&path) {
                     Some(bytes) => fetched.push((path, bytes, true)),
