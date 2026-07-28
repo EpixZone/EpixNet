@@ -203,6 +203,12 @@ impl SignedProvider for AppStateProvider {
         diffs: &[(String, Vec<u8>)],
         sender_peers: &[String],
     ) -> Result<bool, String> {
+        // Gossip the hint: record (xite, modified) so peers polling us learn a
+        // new version exists and catch up fast. Done before (and regardless of)
+        // apply, so a node that only relays this site still hints it for
+        // others - the store-and-forward reach the retired msgpack announce had.
+        self.state.record_update_hint(xite, modified as i64).await;
+
         // `inline` is not consumed: nothing sends it yet, and inserting pushed
         // objects into the store before apply_inbound_update authorizes the
         // update would let any peer fill our disk. Files land through the
@@ -353,12 +359,11 @@ pub async fn node_key(state: &Arc<AppState>) -> String {
     key
 }
 
-/// Get (initializing on first call) the shared EDX serve context. Returns
-/// None when EDX is disabled (EPIX_EDX=0) or the node keeps no data on disk.
+/// Get (initializing on first call) the shared EDX serve context. Returns None
+/// only when the node keeps no data on disk (nowhere to put the object store).
+/// EDX is the transfer + propagation protocol now, so there is no on/off knob:
+/// a node that can serve, does. (Reciprocity and the store quota stay tunable.)
 pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Option<EdxServe> {
-    if !env_on("EPIX_EDX") {
-        return None;
-    }
     let mut guard = cell.lock().await;
     if let Some(es) = guard.as_ref() {
         return Some(es.clone());
@@ -722,9 +727,9 @@ mod tests {
     use epix_ui::state::XiteEntry;
     use epix_xite::{Xite, XiteStorage};
 
-    /// EDX and reciprocity are on unless explicitly disabled: env_on returns
-    /// true when unset, false only for a 0/false value. This is the clean-cut
-    /// default (EDX is the transfer protocol; EPIX_EDX=0 is the kill switch).
+    /// env_on is on unless explicitly disabled: true when unset, false only for
+    /// a 0/false value. EDX itself has no on/off knob anymore (it is the
+    /// protocol); this backs the remaining tunables like EPIX_EDX_RECIPROCITY.
     #[test]
     fn edx_is_on_by_default() {
         assert!(env_on("EPIX_EDX_A_VAR_THAT_IS_NEVER_SET"), "unset means on");
@@ -1036,6 +1041,29 @@ mod tests {
         assert!(decode_actions(&u64::MAX.to_le_bytes()).is_none());
     }
 
+    /// Gossip: an EDX update push records a `(xite, modified)` hint even on a
+    /// node that does NOT host the xite (a pure relay), so peers polling it
+    /// still learn a new version exists. The apply itself fails (unknown site),
+    /// but the hint must be recorded first.
+    #[tokio::test]
+    async fn an_edx_update_records_a_gossip_hint_even_when_not_hosting() {
+        let state = AppState::new("relay");
+        let store = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
+        state.set_prop_store(store.clone());
+        let provider = AppStateProvider { state: state.clone() };
+
+        let res = provider
+            .apply_update("1SomeXite", "content.json", b"{}", &[], 4242.0, &[], &[])
+            .await;
+        assert!(res.is_err(), "a xite we don't host is rejected: {res:?}");
+
+        let (hints, head) = store.lock().await.since(0);
+        assert_eq!(head, 1, "the hint was recorded despite the failed apply");
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].xite, "1SomeXite");
+        assert_eq!(hints[0].modified, 4242);
+    }
+
     /// Update propagation over EDX: a publisher pushes a new signed child
     /// content.json plus a data.json DIFF (a forum reply) to a receiver over a
     /// real EDX link (`Req::Update`), and the receiver applies it. The
@@ -1090,6 +1118,8 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
         state_b.set_edx_store(store_b.clone()).await;
+        let prop_b = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
+        state_b.set_prop_store(prop_b.clone());
         std::mem::forget(b_dir);
         std::mem::forget(store_dir);
 
@@ -1161,6 +1191,14 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+
+        // The same push gossiped a hint: the receiver recorded (xite, modified)
+        // so peers polling it learn the new version exists.
+        let (hints, _head) = prop_b.lock().await.since(0);
+        assert!(
+            hints.iter().any(|h| h.xite == site_addr && h.modified == 2000),
+            "the EDX update recorded a propagation hint, got {hints:?}"
+        );
     }
 
     /// Encrypted shards end to end: a private file signs into content-

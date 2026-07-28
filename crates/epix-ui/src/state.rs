@@ -524,6 +524,12 @@ pub struct AppState {
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
+    /// Shared update-hint store (set once by the node). Every EDX update we
+    /// receive records `(xite, modified)` here - the store-and-forward gossip
+    /// that lets a published post reach the network in seconds: peers polling
+    /// us learn a newer version exists and resync it immediately, instead of
+    /// waiting for the slow periodic pass. Set-once, lock-free to read.
+    prop_store: std::sync::OnceLock<Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -1073,6 +1079,7 @@ impl AppState {
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
             edx_fetcher: RwLock::new(None),
+            prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -1214,6 +1221,7 @@ impl AppState {
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
             edx_fetcher: RwLock::new(None),
+            prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -7826,6 +7834,31 @@ impl AppState {
     /// Install the EDX verified-streaming fetcher (set by the node).
     pub async fn set_edx_fetcher(&self, fetcher: Arc<dyn EdxFetcher>) {
         *self.edx_fetcher.write().await = Some(fetcher);
+    }
+
+    /// Install the shared update-hint store (the node's `PropagationStore`),
+    /// so received EDX updates gossip a hint that pollers can catch up on.
+    pub fn set_prop_store(
+        &self,
+        store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
+    ) {
+        let _ = self.prop_store.set(store);
+    }
+
+    /// Record that `xite` advanced to `modified` in the shared hint store, if
+    /// one is installed. Called for every update we receive over EDX (the
+    /// original push and every re-broadcast), so the hint spreads with the
+    /// flood - a node that only relays the site still records it for others.
+    /// No-op before the store is installed. Untrusted like the store itself:
+    /// a bad hint only ever costs a poller one wasted (signature-verified)
+    /// resync, and the store is bounded and evicts.
+    pub async fn record_update_hint(&self, xite: &str, modified: i64) {
+        if xite.is_empty() {
+            return;
+        }
+        if let Some(store) = self.prop_store.get() {
+            store.lock().await.record(xite, modified);
+        }
     }
 
     /// Fetch `inner_path` of `address` over EDX via the installed fetcher.

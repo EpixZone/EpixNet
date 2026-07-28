@@ -190,6 +190,10 @@ impl NodeRuntime {
     /// chart collector always runs; the peer-networking loops are skipped in
     /// offline mode.
     pub fn start(&mut self) {
+        // Share the propagation hint store with the app state, so a received
+        // EDX update records a gossip hint into the same book the msgpack
+        // propagation service serves and `propagation_loop` polls.
+        self.state.set_prop_store(self.prop_store.clone());
         self.handles.push(tokio::spawn(chart_loop(
             self.state.clone(),
             self.shutdown.clone(),
@@ -988,19 +992,18 @@ async fn resync_loop(
 /// update hints and resync the hinted xites immediately, instead of waiting for
 /// the next full `resync_loop` tick.
 ///
-/// A peer records a small `(xite, modified)` notification when it receives a
-/// propagation announce. This loop pulls those notifications from a spread of
-/// connectable peers, keeps a per-peer cursor so each notification is seen once,
-/// and - for any hint naming a xite we host at an older version (`needs_sync`) -
-/// triggers a targeted resync of that one xite. The relay is untrusted: it only
-/// hints that an update exists; the resync re-verifies content.json signatures,
-/// so a bad hint can at worst cost a wasted resync.
+/// A peer records a small `(xite, modified)` notification whenever it receives
+/// an EDX update push (`apply_update` calls `record_update_hint`), so the hint
+/// spreads with the publish flood - the announce is now intrinsic to the push
+/// rather than a separate msgpack message. This loop pulls those notifications
+/// from a spread of connectable peers, keeps a per-peer cursor so each is seen
+/// once, and - for any hint naming a xite we host at an older version
+/// (`needs_sync`) - triggers a targeted resync of that one xite. The relay is
+/// untrusted: it only hints that an update exists; the resync re-verifies
+/// content.json signatures, so a bad hint can at worst cost a wasted resync.
 ///
-/// NOTE: the announce that populated peers' hint books rode the legacy msgpack
-/// publish push, which was retired when propagation moved to EDX (`Req::Update`).
-/// Until the hint announce is re-issued over EDX, this loop finds nothing new
-/// and the 5-minute `resync_loop` is the propagation path - not just the safety
-/// net. Migrating the announce to EDX is a tracked follow-up.
+/// The poll itself still rides the msgpack propagation service (which serves
+/// the same shared hint book); moving the poll onto EDX too is a later cleanup.
 ///
 /// The 5-minute `resync_loop` stays as the safety net for hints we never hear
 /// (every peer holding them was unreachable at poll time).
