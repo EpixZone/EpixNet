@@ -4178,37 +4178,18 @@ impl AppState {
     /// Fetch a pending update's missing files from connectable peers, updating
     /// the live worker stats. A no-op without a transport or peers - files
     /// that arrive some other way still let the caller's commit land.
-    async fn fetch_pending_files(&self, key: &str, xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
-        let Some(transport) = self.transport.read().await.clone() else { return };
+    async fn fetch_pending_files(&self, key: &str, _xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
+        if self.transport.read().await.is_none() {
+            return; // offline
+        }
         let peers = self.connectable_peers(key, 10).await;
         if peers.is_empty() {
             return;
         }
-        // EDX first: dial the peers once and pull what EDX can (verified onto
-        // disk), then hand only the leftovers to the msgpack worker. No fetcher
-        // installed -> None -> the whole list falls back, unchanged.
-        let needed = self.edx_first(key, needed, peers.clone(), None, None).await;
-        if needed.is_empty() {
-            return;
-        }
-        self.set_worker_stats(key, needed.len(), peers.len().min(8), needed.len()).await;
-        let feedback = epix_worker::CollectFeedback::new();
-        let report = epix_worker::sync_files_list(
-            needed,
-            xite,
-            &peers,
-            transport,
-            8,
-            None,
-            Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-        )
-        .await;
-        self.set_worker_stats(key, 0, 0, 0).await;
-        let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
-        self.absorb_sync_outcomes(key, feedback.drain(), failed_files).await;
-        if let Ok(report) = report {
-            self.add_transfer(key, report.bytes, 0).await;
-        }
+        // EDX-only: dial the peers once and pull what EDX can (verified onto
+        // disk). A file with no `b3` simply does not arrive (post-msgpack
+        // contract); the caller's completeness check leaves the update pending.
+        self.edx_first(key, needed, peers, None, None).await;
     }
 
     /// EDX-first pass over a needed-file list: fetch what EDX can in one
@@ -4422,26 +4403,12 @@ impl AppState {
             // files EDX could not get.
             let needed = xite.files_needed();
             let staged = xite.content.clone();
-            let _ = self.edx_first(address, needed, peers.clone(), staged.as_ref(), None).await;
-
-            let needed = xite.files_needed().len();
-            let workers = peers.len().min(8);
-            self.set_worker_stats(address, needed, workers, needed).await;
-            let feedback = epix_worker::CollectFeedback::new();
-            let report = epix_worker::sync_files(
-                &xite,
-                &peers,
-                transport.clone(),
-                8,
-                Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-            )
-            .await;
-            // Always clear the live task counters - a leftover tasks>0 keeps
-            // the dashboard row's "Updating" spinner stuck.
-            self.set_worker_stats(address, 0, 0, 0).await;
-            self.apply_peer_outcomes(address, feedback.drain()).await;
-            let report = report.map_err(|e| e.to_string())?;
-            self.add_transfer(address, report.bytes, 0).await;
+            // EDX-only: pull the changed files over one dial-once session. The
+            // staged content.json is not committed yet, so its NEW b3 is
+            // authoritative for resolution. A changed file with no `b3` does not
+            // arrive (post-msgpack contract) and the completeness check below
+            // defers the update. edx_first counts the transferred bytes itself.
+            let _ = self.edx_first(address, needed, peers, staged.as_ref(), None).await;
 
             // Commit when complete, else defer (kept pending + retried by the
             // resync tick); either way the node serves a consistent version.
@@ -4559,36 +4526,6 @@ impl AppState {
         let i2p = i2p_ready && self.i2p_transport.read().await.is_some();
         let rns = self.rns_transport.read().await.is_some();
         DialableNets { clearnet: true, onion, i2p, rns }
-    }
-
-    /// Apply a sync pass's outcomes and, when files are still missing, log
-    /// one line saying what was tried. Without it a failing fetch is
-    /// invisible: the worker skips bad peers silently and the operator only
-    /// ever saw "N file(s) not yet available" with nothing to go on.
-    async fn absorb_sync_outcomes(
-        &self,
-        key: &str,
-        outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)>,
-        failed_files: usize,
-    ) {
-        if failed_files > 0 {
-            use epix_worker::PeerOutcome as O;
-            let peers_tried: std::collections::HashSet<String> =
-                outcomes.iter().map(|(p, _)| p.to_string()).collect();
-            let count = |o: O| outcomes.iter().filter(|(_, x)| *x == o).count();
-            self.log(
-                "INFO",
-                format!(
-                    "Fetch pass for {key}: {failed_files} file(s) still missing after {} peer(s) tried ({} connect failures, {} file failures, {} files ok)",
-                    peers_tried.len(),
-                    count(O::ConnectFail),
-                    count(O::FileFail),
-                    count(O::FileOk),
-                ),
-            )
-            .await;
-        }
-        self.apply_peer_outcomes(key, outcomes).await;
     }
 
     /// Apply a sync pass's per-peer outcomes (drained from an
@@ -9776,7 +9713,7 @@ impl AppState {
                 self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
             }
         }
-        if let Some(transport) = self.transport.read().await.clone() {
+        if self.transport.read().await.is_some() {
             let mut peers = self.connectable_peers(&key, 10).await;
             // Prefer fetching from the sender - it definitely has the files
             // it just announced - but only if its address is dialable (an
@@ -9813,36 +9750,16 @@ impl AppState {
                 None => xite.files_needed(),
             };
             if !needed.is_empty() && !peers.is_empty() {
-                // The full set touched by this update - all of them ingest into
-                // the db afterward whether EDX or the worker delivered them.
                 let needed_paths: Vec<String> =
                     needed.iter().map(|f| f.inner_path.clone()).collect();
-                // EDX first over the reused session (staged content's b3 is
-                // authoritative pre-commit); the worker takes the misses.
-                let needed =
+                // EDX-only over the reused session (staged content's b3 is
+                // authoritative pre-commit). A file with no `b3` does not
+                // arrive; only the files EDX landed are reported for db ingest.
+                let missed =
                     self.edx_first(&key, needed, peers.clone(), xite.content.as_ref(), None).await;
-                if !needed.is_empty() {
-                    self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
-                        .await;
-                    let feedback = epix_worker::CollectFeedback::new();
-                    let report = epix_worker::sync_files_list(
-                        needed,
-                        &xite,
-                        &peers,
-                        transport.clone(),
-                        8,
-                        None,
-                        Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-                    )
-                    .await;
-                    let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
-                    if let Ok(report) = &report {
-                        self.add_transfer(&key, report.bytes, 0).await;
-                    }
-                    self.set_worker_stats(&key, 0, 0, 0).await;
-                    self.absorb_sync_outcomes(&key, feedback.drain(), failed_files).await;
-                }
-                arrived.extend(needed_paths);
+                let missed: std::collections::HashSet<&String> =
+                    missed.iter().map(|f| &f.inner_path).collect();
+                arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
             }
         }
         if child_files.is_some() {

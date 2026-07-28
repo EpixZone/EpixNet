@@ -573,37 +573,6 @@ pub async fn run(opts: NodeOptions) -> Result<(), String> {
 /// against the first peers to respond, and the file download starts the
 /// moment content.json verifies - while discovery keeps feeding fresh peers
 /// (and replacement workers) into the running download.
-/// Applies worker peer outcomes to the live registry as they happen. A clone
-/// can run for minutes, so batching feedback to the end of the pass (like the
-/// short resync/push passes do) would let a dead peer keep being redialed for
-/// the whole download.
-struct LiveFeedback {
-    state: Arc<AppState>,
-    address: String,
-}
-
-impl epix_worker::PeerFeedback for LiveFeedback {
-    fn note(&self, peer: &PeerAddr, outcome: epix_worker::PeerOutcome) {
-        let state = self.state.clone();
-        let address = self.address.clone();
-        let peer = peer.clone();
-        tokio::spawn(async move {
-            state.apply_peer_outcomes(&address, vec![(peer, outcome)]).await;
-        });
-    }
-}
-
-/// The [`LiveFeedback`] sink for a clone/sync pass, when a state is present.
-fn live_feedback(
-    progress: Option<&Arc<AppState>>,
-    address: &str,
-) -> Option<Arc<dyn epix_worker::PeerFeedback>> {
-    progress.map(|state| {
-        Arc::new(LiveFeedback { state: state.clone(), address: address.to_string() })
-            as Arc<dyn epix_worker::PeerFeedback>
-    })
-}
-
 async fn clone_xite_with_progress(
     address: &str,
     data_dir: &std::path::Path,
@@ -914,44 +883,58 @@ async fn clone_xite_with_progress(
             );
         }) as Arc<dyn Fn(&str) + Send + Sync>
     });
-    // The worker reports (inner, done, total); route it through the shared
-    // emitter (its own counts are ignored - the emitter owns the denominator).
-    let on_file = emit_done.clone().map(|emit| {
-        Arc::new(move |inner: &str, _done: usize, _total: usize| emit(inner))
-            as epix_worker::FileProgress
-    });
-    // EDX-first: pull every core file the verified-streaming path can serve
-    // from the peers discovered so far, in one dial, before the msgpack
-    // streaming sync. EDX writes verified bytes to disk, so files_needed()
-    // inside sync_files_streaming recomputes and the worker streams only what
-    // EDX could not land. A legacy site (no `b3`) resolves nothing and this
-    // returns at once - the streaming sync then runs exactly as before. The
-    // shared emitter advances the bar as EDX materializes each file.
-    if let Some(state) = progress {
+    // EDX-only streaming clone. Discovery keeps forwarding peers over sync_rx
+    // (each is also added to the state registry). Each pass pulls the
+    // still-missing core files from every peer known so far; when a new peer
+    // arrives, the loop retries the misses against the grown set. It ends when
+    // every core file is on disk, or discovery closes / stalls after a final
+    // pass. This is the EDX replacement for the msgpack streaming worker: a
+    // legacy site with no `b3` lands nothing and the staged-commit check below
+    // fails the clone, which is the post-msgpack contract. The shared emitter
+    // advances the loading bar as EDX materializes each file.
+    let mut bytes_recv = 0u64; // EDX bytes are counted by edx_first's add_transfer
+    let mut sync_rx = sync_rx;
+    let mut channel_open = true;
+    // Consecutive passes that fetched a peer set but made no progress. A legacy
+    // site with no `b3` never completes, and its peers keep announcing, so
+    // without this cap the loop would retry forever - give up after a few dry
+    // passes. Real progress resets it, so a slow b3 site behind trickling peers
+    // still finishes.
+    let mut dry = 0u32;
+    while let Some(state) = progress {
+        let before = xite.files_needed();
+        if before.is_empty() {
+            break;
+        }
         let peers = state.connectable_peers(address, 20).await;
-        if !peers.is_empty() {
-            let needed = xite.files_needed();
+        let tried = !peers.is_empty();
+        if tried {
             let staged = xite.content.clone();
             let edx_progress = emit_done.clone().map(|emit| {
                 Arc::new(move |inner: &str, _bytes: u64| emit(inner))
                     as epix_ui::state::EdxBatchProgress
             });
-            let _ =
-                state.edx_first(address, needed, peers, staged.as_ref(), edx_progress).await;
+            state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress).await;
         }
-    }
-    let mut bytes_recv = 0;
-    if let Ok(report) = epix_worker::sync_files_streaming(
-        &xite,
-        sync_rx,
-        transport.clone(),
-        8,
-        on_file,
-        live_feedback(progress, address),
-    )
-    .await
-    {
-        bytes_recv = report.bytes;
+        let after = xite.files_needed().len();
+        if after == 0 {
+            break;
+        }
+        // Only a real attempt (peers were available) counts toward the dry cap;
+        // with no peers we just wait for discovery to turn some up.
+        if tried {
+            dry = if after < before.len() { 0 } else { dry + 1 };
+        }
+        if dry >= 3 || !channel_open {
+            break;
+        }
+        // Wait for the next discovered peer, then retry against the grown set.
+        // A bounded wait so a stalled discovery still terminates the clone.
+        match tokio::time::timeout(std::time::Duration::from_secs(20), sync_rx.recv()).await {
+            Ok(Some(_)) => {}                 // new peer -> retry
+            Ok(None) => channel_open = false, // discovery done -> one final pass then stop
+            Err(_) => channel_open = false,   // no new peer for 20s -> final pass then stop
+        }
     }
     // Staged adopt: commit the fetched content.json to disk (atomic rename)
     // only now that its core file set is complete, so neither a crash nor an
@@ -1145,24 +1128,16 @@ async fn sync_included_content(
         }
         if !to_fetch.is_empty() {
             let want: Vec<String> = to_fetch.iter().map(|(p, _)| p.clone()).collect();
-            // EDX-first: dial the peers once and GetSigned every child manifest
-            // over the reused links. Only the paths EDX could not serve fall to
-            // the msgpack worker (while that path still exists).
+            // EDX-only: dial the peers once and GetSigned every child manifest
+            // over the reused links. A path no peer serves stays absent and
+            // falls back to the on-disk copy (if any) below.
             let mut results = match progress {
                 Some(state) => state
-                    .edx_fetch_signed_many(address, want.clone(), peers.to_vec())
+                    .edx_fetch_signed_many(address, want, peers.to_vec())
                     .await
                     .unwrap_or_default(),
                 None => std::collections::HashMap::new(),
             };
-            let remaining: Vec<String> =
-                want.into_iter().filter(|p| !results.contains_key(p)).collect();
-            if !remaining.is_empty() {
-                let raw =
-                    epix_worker::fetch_files_raw(remaining, address, peers, transport.clone(), 8)
-                        .await;
-                results.extend(raw);
-            }
             for (path, disk) in to_fetch {
                 match results.remove(&path) {
                     Some(bytes) => fetched.push((path, bytes, true)),
@@ -1218,12 +1193,13 @@ async fn sync_included_content(
             .log("INFO", format!("Fetching {} user-content file(s) for {address}", needed.len()))
             .await;
     }
-    // EDX-first for the child/user data files: dial the peers ONCE and pull
-    // what the verified-streaming path can serve, ingesting each landed file so
-    // its posts appear, then hand only the misses to the worker list-sync. The
-    // child content.json files are already on disk (add_content wrote them), so
-    // declared_entry resolves each data file's `b3` from its governing child.
-    let needed = if let Some(state) = progress {
+    // EDX-only for the child/user data files: dial the peers ONCE and pull what
+    // EDX can, ingesting each landed file so its posts appear one by one. A file
+    // with no `b3` does not arrive (post-msgpack contract). Bytes are counted by
+    // edx_first's add_transfer. The child content.json files are already on disk
+    // (add_content wrote them), so declared_entry resolves each data file's `b3`
+    // from its governing child.
+    if let Some(state) = progress {
         let before: std::collections::HashSet<String> =
             needed.iter().map(|f| f.inner_path.clone()).collect();
         let missed = state.edx_first(address, needed, peers.to_vec(), None, None).await;
@@ -1231,46 +1207,12 @@ async fn sync_included_content(
             missed.iter().map(|f| &f.inner_path).collect();
         for path in &before {
             if !still.contains(path) {
-                // EDX landed it: ingest (db + file_done) and report it.
                 state.ingest_file(address, path).await;
                 arrived.push(path.clone());
             }
         }
-        missed
-    } else {
-        needed
-    };
-    if needed.is_empty() {
-        return (0, arrived);
     }
-    let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
-    // Each data file is ingested into the site's db (and its mergers') the
-    // moment it verifies, with its file_done pushed right after - this is
-    // what makes topics/posts appear one by one while the sync is running.
-    let on_file = progress.map(|state| {
-        let state = state.clone();
-        let addr = address.to_string();
-        Arc::new(move |inner: &str, _done: usize, _total: usize| {
-            let state = state.clone();
-            let addr = addr.clone();
-            let inner = inner.to_string();
-            tokio::spawn(async move {
-                state.ingest_file(&addr, &inner).await;
-            });
-        }) as epix_worker::FileProgress
-    });
-    let feedback = live_feedback(progress, address);
-    match epix_worker::sync_files_list(needed, xite, peers, transport, 8, on_file, feedback).await {
-        Ok(report) => {
-            // Report only the files that actually landed - a partial sync
-            // (dead peers) must not fire file_done for missing files.
-            arrived.extend(
-                needed_paths.into_iter().filter(|p| xite.storage().exists(p)),
-            );
-            (report.bytes, arrived)
-        }
-        Err(_) => (0, arrived),
-    }
+    (0, arrived)
 }
 
 /// Every non-root `content.json` under `root` (per-user / included content
