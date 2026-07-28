@@ -147,6 +147,16 @@ pub struct EdxBatch {
 /// worker's progress hook, so a batch drives the same clone/ingest UI.
 pub type EdxBatchProgress = Arc<dyn Fn(&str, u64) + Send + Sync>;
 
+/// Read a file's `(b3 ObjId, size)` from a content.json `files` map, so a
+/// staged (uncommitted) update's files resolve against the NEW manifest rather
+/// than the committed one. `None` if the file is absent or has no `b3`.
+fn edx_want_from_staged(content: &Value, inner_path: &str) -> Option<(epix_blob::ObjId, u64)> {
+    let entry = content.get("files")?.get(inner_path)?;
+    let b3 = epix_blob::ObjId::from_hex(entry.get("b3")?.as_str()?)?;
+    let size = entry.get("size").and_then(Value::as_u64)?;
+    Some((b3, size))
+}
+
 /// Why an EDX update push to a peer did not land. Kept distinct so the peer
 /// registry scores an unreachable peer (dial/handshake failed - back it off)
 /// differently from one that answered but refused (alive - do not evict it).
@@ -4112,6 +4122,13 @@ impl AppState {
         if peers.is_empty() {
             return;
         }
+        // EDX first: dial the peers once and pull what EDX can (verified onto
+        // disk), then hand only the leftovers to the msgpack worker. No fetcher
+        // installed -> None -> the whole list falls back, unchanged.
+        let needed = self.edx_first(key, needed, peers.clone(), None).await;
+        if needed.is_empty() {
+            return;
+        }
         self.set_worker_stats(key, needed.len(), peers.len().min(8), needed.len()).await;
         let feedback = epix_worker::CollectFeedback::new();
         let report = epix_worker::sync_files_list(
@@ -4130,6 +4147,40 @@ impl AppState {
         if let Ok(report) = report {
             self.add_transfer(key, report.bytes, 0).await;
         }
+    }
+
+    /// EDX-first pass over a needed-file list: fetch what EDX can in one
+    /// dial-once session and return the leftovers (EDX-missed) as `FileEntry`s
+    /// for the msgpack worker. Counts the EDX bytes into the xite's transfer
+    /// total. When no EDX fetcher is installed (or no store), returns `needed`
+    /// unchanged so the caller runs the full worker list exactly as before.
+    /// `staged` carries a not-yet-committed content.json (resync) so its files
+    /// resolve against the NEW `b3`, not the stale committed manifest.
+    async fn edx_first(
+        &self,
+        key: &str,
+        needed: Vec<epix_xite::FileEntry>,
+        peers: Vec<PeerAddr>,
+        staged: Option<&Value>,
+    ) -> Vec<epix_xite::FileEntry> {
+        let want: Vec<EdxWant> = needed
+            .iter()
+            .map(|f| {
+                let (id, size) = staged
+                    .and_then(|c| edx_want_from_staged(c, &f.inner_path))
+                    .unzip();
+                EdxWant { inner_path: f.inner_path.clone(), id, size }
+            })
+            .collect();
+        let Some(batch) = self.edx_fetch_files(key, want, peers, None).await else {
+            return needed; // no EDX fetcher: whole list to the worker
+        };
+        if batch.bytes > 0 {
+            self.add_transfer(key, batch.bytes, 0).await;
+        }
+        // Keep only the files EDX did not land; the rest are on disk, verified.
+        let missed: std::collections::HashSet<&String> = batch.missed.iter().collect();
+        needed.into_iter().filter(|f| missed.contains(&f.inner_path)).collect()
     }
 
     /// Check a xite for a newer content.json among its peers and, if found,
@@ -4270,6 +4321,16 @@ impl AppState {
             );
             let limit = self.size_limit_bytes(address).await;
             xite.stage_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
+
+            // EDX first: pull the changed files over one dial-once session. The
+            // staged content.json is not committed yet, so its NEW b3 is
+            // authoritative for resolution (the committed manifest is stale).
+            // EDX writes verified bytes to disk, so the worker below - which
+            // recomputes files_needed() from disk - then fetches only the
+            // files EDX could not get.
+            let needed = xite.files_needed();
+            let staged = xite.content.clone();
+            let _ = self.edx_first(address, needed, peers.clone(), staged.as_ref()).await;
 
             let needed = xite.files_needed().len();
             let workers = peers.len().min(8);
@@ -12293,6 +12354,24 @@ mod tests {
 
         // A file outside the db dir is ignored without error.
         state.ingest_file(addr, "index.html").await;
+    }
+
+    /// A resync stages its new content.json without committing it, so EDX must
+    /// resolve the changed files against that STAGED manifest's b3 (the
+    /// committed one is the stale version). edx_want_from_staged reads b3+size
+    /// straight from a content.json Value, and returns None when the file is
+    /// absent or un-b3'd (so it falls back to committed resolution).
+    #[test]
+    fn edx_want_from_staged_resolves_against_the_new_manifest() {
+        let id = epix_blob::ObjId::of(b"the new data.json bytes");
+        let content = json!({
+            "files": { "data.json": { "b3": id.to_string(), "size": 4242 } }
+        });
+        assert_eq!(edx_want_from_staged(&content, "data.json"), Some((id, 4242)));
+        // Absent file, or a file with no b3, resolves to None (falls back).
+        assert_eq!(edx_want_from_staged(&content, "missing.json"), None);
+        let no_b3 = json!({ "files": { "x": { "size": 1 } } });
+        assert_eq!(edx_want_from_staged(&no_b3, "x"), None);
     }
 
     /// push_update_to_peer maps the EDX push result to a peer outcome, and -
