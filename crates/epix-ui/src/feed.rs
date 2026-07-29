@@ -9,25 +9,32 @@
 //! never mutates stored records, never re-signs, and never touches the
 //! merge-file or db flow. The artifacts are a derived, content-addressed cache.
 //!
-//! STATUS: foundation, NOT production-ready. Nothing consumes it yet (the apps
-//! still read merge-files directly), so it is safe to land, but three design
-//! decisions must be settled before feeds go live - each is about cross-node
-//! determinism, the load-bearing property (a divergence forks a feed):
+//! STATUS: foundation. Nothing consumes it yet (the apps still read merge-files
+//! directly), so it is safe to land. The finality model below is DECIDED (user,
+//! 2026-07-29) but NOT YET IMPLEMENTED here; the current derivation still uses
+//! cumulative sealing + a wall-clock boundary and must be reworked to match:
 //!
-//! 1. FINALITY / MONOTONICITY. Sealing is cumulative and `verify_record` has no
-//!    lower clock bound, so a legitimately late-arriving old record re-seals an
-//!    already-sealed segment and an honest backfill reads as a spine rollback.
-//!    Needs a finality model: seal an interval over only its own records AND
-//!    only once it is old enough that no earlier-clock record can still arrive
-//!    (a finality window); recent records stay in the live tail (the gossiping
-//!    OR-set), exactly as the design's segment/checkpoint split intends.
-//! 2. INCREMENTAL DERIVATION. `recompute_feeds` re-verifies (secp256k1) and
-//!    re-seals every record of every matching file on every merged record, so a
-//!    K-file resync is O(K * n). Needs incremental update, not full recompute.
-//! 3. DETERMINISTIC ROOTS. The OPEN segment/checkpoint boundary uses `now+skew`,
-//!    so two honest nodes with identical records produce different roots. The
-//!    boundary must be a pure function of the records (e.g. quantized newest
-//!    clock), never wall clock, or the "verifiable" roots are not reproducible.
+//! DECIDED MODEL (implement before feeds go live):
+//! 1. SEGMENTATION IS f(records), NEVER wall-clock. Segment k = records whose
+//!    authored clock is in [k*I, (k+1)*I), folded canonically. Root depends
+//!    only on those records + the fixed interval, so two honest nodes with the
+//!    same records get byte-identical roots. Remove every `now`/skew from the
+//!    boundary. (Fixes the old Finding 4 determinism bug.)
+//! 2. ANTI-ROLLBACK IS RECORD-SET MONOTONE, not byte-frozen segments. The OR-set
+//!    only grows, so a late-arriving old record legitimately GROWS its interval
+//!    segment (addition, not rollback) and re-derives that ONE segment
+//!    deterministically. A peer's checkpoint is valid iff its record set is a
+//!    superset of what we hold AND every tombstone we hold stays present
+//!    (tombstones sticky). Reject only a checkpoint that DROPS a signed record
+//!    or un-sticks a tombstone. No frozen-blob / corrections machinery.
+//!    (Dissolves the old Finding 1: a backfill grows the set, so it passes.)
+//! 3. LIVE TAIL + INCREMENTAL. Interval size I = 1 day (86_400_000 ms). Seal an
+//!    interval into the spine only once it is older than a 2-DAY grace window;
+//!    the current + previous day stay the live gossiping OR-set (served as
+//!    records, not a sealed root). A new record re-derives ONLY its own
+//!    interval's segment + its target's index entries + its item's rollup,
+//!    never the whole site. (Fixes the old Finding 2 O(n^2) recompute.)
+//!    Interval/grace are per-feed-overridable defaults.
 
 use std::collections::HashSet;
 
