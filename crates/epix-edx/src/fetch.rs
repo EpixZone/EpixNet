@@ -256,6 +256,21 @@ pub async fn fetch_bitfield(conn: &Conn, obj: ObjId) -> std::io::Result<(u64, Gr
     }
 }
 
+/// Which of `addrs` the peer holds COMPLETE, as a bool per addr in the
+/// same order (mirrors `fetch_bitfield` but for many objects at once). One
+/// round trip regardless of how many shards a private file has; the packed
+/// mask is unpacked LSB-first. A peer that answers a too-short mask (fewer
+/// bits than addrs) reads as "not held" for the missing tail.
+pub async fn fetch_has_shards(conn: &Conn, addrs: &[ObjId]) -> std::io::Result<Vec<bool>> {
+    match conn.request(Req::HasShards { addrs: addrs.to_vec() }).await? {
+        Resp::ShardMask { bits } => Ok((0..addrs.len())
+            .map(|i| bits.get(i / 8).map(|b| b & (1 << (i % 8)) != 0).unwrap_or(false))
+            .collect()),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected ShardMask, got {other:?}"))),
+    }
+}
+
 // --- Control plane (caps::CONTROL): the client helpers. All are
 // single-response requests on the priority lane.
 

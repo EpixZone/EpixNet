@@ -46,6 +46,24 @@ fn slab_insert_read_dedup() {
 }
 
 #[test]
+fn ns_bytes_sums_only_the_named_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+
+    let plain = test_data(1000);
+    let shard_a = test_data(2000);
+    let shard_b = test_data(3000);
+    store.insert_bytes(oid(&plain), Ns::Plain, &plain, 1).unwrap();
+    store.insert_bytes(oid(&shard_a), Ns::Shard, &shard_a, 1).unwrap();
+    store.insert_bytes(oid(&shard_b), Ns::Shard, &shard_b, 1).unwrap();
+
+    // The shard budget counts only shard-namespace bytes, not the plain
+    // browse-cache object sharing the same store.
+    assert_eq!(store.ns_bytes(Ns::Shard).unwrap(), 5000);
+    assert_eq!(store.ns_bytes(Ns::Plain).unwrap(), 1000);
+}
+
+#[test]
 fn slab_serves_verified_slices() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

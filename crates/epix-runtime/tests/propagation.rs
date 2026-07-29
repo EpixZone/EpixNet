@@ -84,6 +84,7 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
         epix_crypt::new_seed(),
         None,
         control,
+        false,
         None,
     ));
     tokio::spawn(server.serve(listener));

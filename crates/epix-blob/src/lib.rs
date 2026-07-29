@@ -21,6 +21,7 @@ pub mod bitfield;
 pub mod bundle;
 pub mod manifest;
 pub mod policy;
+pub mod responsibility;
 pub mod store;
 pub mod verified;
 

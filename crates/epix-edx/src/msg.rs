@@ -141,6 +141,21 @@ pub enum Req {
     /// `epix-discovery` (the tracker payload shape is its own protocol).
     /// Answered `Resp::Payload`.
     Announce { payload: Vec<u8> },
+    // --- ENCRYPTED-SHARD VOLUNTEER role appends only below this line ---
+    /// Bulk availability probe: which of these shard/object addrs the peer
+    /// holds COMPLETE. Answered `Resp::ShardMask`. A fetcher of a private
+    /// file uses it to pick which volunteer to pull each shard from in one
+    /// round trip instead of one `GetBitfield` per shard.
+    HasShards { addrs: Vec<ObjId> },
+    // DEFERRED (follow-up, not built here): the PUSH accept path.
+    //   PushBlock { xite: String, inner_path: String, signed: Vec<u8>,
+    //               cipher_addr: ObjId, bytes: Vec<u8> } -> Resp::Ok/Err
+    // PULL (the volunteer driver) needs no accept-guard because it only
+    // stores an addr it found inside a signature it verified itself. PUSH
+    // lets a remote peer choose what lands on our disk, so it needs a real
+    // anti-grinding guard before it can exist:
+    //   verify(signed) && edx_shard_entry(content).chunks.any(ca==cipher_addr)
+    //     && responsible(cipher_addr) && under_quota && rate_ok(source)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -172,6 +187,12 @@ pub enum Resp {
     Trackers { trackers: Vec<String> },
     /// Opaque reply for `Kad`/`Announce`, decoded by the owning crate.
     Payload { bytes: Vec<u8> },
+    // --- ENCRYPTED-SHARD VOLUNTEER role appends only below this line ---
+    /// Bitmask (LSB-first, byte i bit j => `addrs[i*8+j]`) of which
+    /// requested addrs the responder holds COMPLETE. Length =
+    /// ceil(addrs.len()/8). Packed to one bit per shard so a large private
+    /// file's probe stays small.
+    ShardMask { bits: Vec<u8> },
 }
 
 /// Error codes for `Resp::Err`.
@@ -318,6 +339,17 @@ mod tests {
                 stream: 13,
                 body: FrameBody::Resp { last: true, resp: Resp::Payload { bytes: vec![9] } },
             },
+            // Encrypted-shard volunteer role.
+            Frame {
+                stream: 14,
+                body: FrameBody::Req(Req::HasShards {
+                    addrs: vec![ObjId([1; 32]), ObjId([2; 32]), ObjId([3; 32])],
+                }),
+            },
+            Frame {
+                stream: 14,
+                body: FrameBody::Resp { last: true, resp: Resp::ShardMask { bits: vec![0b0000_0101] } },
+            },
         ];
         for f in &frames {
             assert_eq!(&round_trip(f), f);
@@ -365,6 +397,8 @@ mod tests {
             (Req::GetTrackers, 11),
             (Req::Kad { payload: vec![] }, 12),
             (Req::Announce { payload: vec![] }, 13),
+            // Encrypted-shard volunteer role.
+            (Req::HasShards { addrs: vec![] }, 14),
         ];
         for (req, disc) in reqs {
             let bytes =
@@ -399,6 +433,8 @@ mod tests {
             (Resp::Peers { peers: vec![] }, 9),
             (Resp::Trackers { trackers: vec![] }, 10),
             (Resp::Payload { bytes: vec![] }, 11),
+            // Encrypted-shard volunteer role.
+            (Resp::ShardMask { bits: vec![] }, 12),
         ];
         for (resp, disc) in resps {
             let bytes = postcard::to_stdvec(&Frame {

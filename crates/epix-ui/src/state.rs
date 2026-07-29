@@ -456,6 +456,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "",
         "text",
     ),
+    (
+        "Storage",
+        "volunteer_quota_bytes",
+        "Donate disk to hold encrypted shards you cannot read (0 = off)",
+        "0",
+        "text",
+    ),
     // --- Performance
     (
         "Performance",
@@ -1549,6 +1556,20 @@ impl AppState {
             .await
             .and_then(|v| v.as_bool().or_else(|| v.as_str().map(|s| s == "true" || s == "on")))
             .unwrap_or(default)
+    }
+
+    /// Bytes of disk the operator donates to hold encrypted shards it cannot
+    /// read (the `volunteer_quota_bytes` config key). 0 (the default, and the
+    /// only value that parses to nothing) means not volunteering: the node
+    /// neither advertises `caps::SHARDS` nor runs the volunteer pull. The
+    /// Config page persists it as a string, so both a JSON number and a
+    /// numeric string are accepted. Read once at serve setup; a live toggle
+    /// (re-advertise the cap without a restart) is a deferred follow-up.
+    pub async fn volunteer_quota_bytes(&self) -> u64 {
+        self.config_get("volunteer_quota_bytes")
+            .await
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .unwrap_or(0)
     }
 
     // --- NoNewSites: refuse to clone/add new sites when set -----------------

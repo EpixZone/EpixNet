@@ -612,6 +612,25 @@ impl Store {
         Ok(total)
     }
 
+    /// Total logical bytes of all held objects in one namespace. Used as a
+    /// volunteer's soft budget gate (stop pulling shards once `Ns::Shard`
+    /// reaches its donated quota). Reads only `(ns, size)` per record - no
+    /// shard-to-xite association is ever consulted, preserving deniability.
+    pub fn ns_bytes(&self, ns: Ns) -> io::Result<u64> {
+        let want = ns_to_u8(ns);
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let table = txn.open_table(OBJECTS).map_err(db_err)?;
+        let mut total = 0u64;
+        for row in table.iter().map_err(db_err)? {
+            let (_, v) = row.map_err(db_err)?;
+            let rec: ObjRecord = dec(v.value())?;
+            if rec.ns == want {
+                total = total.saturating_add(rec.size);
+            }
+        }
+        Ok(total)
+    }
+
     /// Pin an object so eviction never reclaims it (the node's own content).
     /// Idempotent: raises refcount to at least 1, never higher, so repeated
     /// registration across restarts does not inflate it.

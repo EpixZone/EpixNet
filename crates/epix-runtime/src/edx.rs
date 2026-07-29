@@ -62,6 +62,7 @@ fn req_kind(req: &Req) -> &'static str {
         Req::GetMany { .. } => "GetMany",
         Req::GetBitfield { .. } => "GetBitfield",
         Req::HasXite { .. } => "HasXite",
+        Req::HasShards { .. } => "HasShards",
         Req::HaveRanges { .. } => "HaveRanges",
         Req::Update { .. } => "Update",
         Req::UpdatesSince { .. } => "UpdatesSince",
@@ -249,6 +250,22 @@ fn store_quota() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(EDX_STORE_QUOTA_BYTES)
+}
+
+/// Assumed total network shard bytes, used to turn a volunteer's byte quota
+/// into a keyspace fraction for the responsibility predicate. Nothing on
+/// chain or in the DHT sources this in the foundation (discovery is
+/// deferred), so it is a tuned constant a network operator picks; the
+/// predicate is correct and monotone for any positive value. Override with
+/// EPIX_EDX_SHARD_UNIVERSE_BYTES (also how tests make the responsible set
+/// deterministic).
+const VOLUNTEER_SHARD_UNIVERSE_BYTES: u64 = 1 << 40; // 1 TiB placeholder
+
+fn shard_universe_bytes() -> u64 {
+    std::env::var("EPIX_EDX_SHARD_UNIVERSE_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(VOLUNTEER_SHARD_UNIVERSE_BYTES)
 }
 
 /// How far ahead of the play position a served range prefetches. A few
@@ -510,6 +527,7 @@ pub fn edx_hook(
     privatekey: String,
     choker: Option<SharedChoker>,
     control: ControlHandles,
+    shards: bool,
     on_inbound: Option<InboundHook>,
 ) -> EdxHook {
     let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state: state.clone() });
@@ -527,7 +545,7 @@ pub fn edx_hook(
                 epix_edx::link::accept(stream),
             );
             let Ok(Ok(l)) = handshake.await else { return };
-            let mut ctx = serve_ctx(store, provider, privatekey, control);
+            let mut ctx = serve_ctx(store, provider, privatekey, control, shards);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
@@ -554,10 +572,12 @@ fn serve_ctx(
     provider: Arc<dyn SignedProvider>,
     privatekey: String,
     control: Arc<dyn ControlProvider>,
+    shards: bool,
 ) -> ServeCtx {
     ServeCtx::new(store, provider, privatekey)
         .with_version(epix_protocol::self_advert_version())
         .with_control(control)
+        .with_shards(shards)
 }
 
 /// Build the OVERLAY accept-hook (Tor/I2P/Reticulum): the transport already
@@ -568,6 +588,7 @@ pub fn edx_hook_overlay(
     privatekey: String,
     choker: Option<SharedChoker>,
     control: ControlHandles,
+    shards: bool,
 ) -> EdxHook {
     let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state: state.clone() });
     Arc::new(move |peer: PeerAddr, stream| {
@@ -583,7 +604,7 @@ pub fn edx_hook_overlay(
                 epix_edx::link::accept_overlay(stream),
             );
             let Ok(Ok((conn, incoming))) = handshake.await else { return };
-            let mut ctx = serve_ctx(store, provider, privatekey, control);
+            let mut ctx = serve_ctx(store, provider, privatekey, control, shards);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
@@ -605,6 +626,10 @@ pub struct EdxServe {
     privatekey: String,
     choker: Option<SharedChoker>,
     control: ControlHandles,
+    /// Whether this node volunteers disk for encrypted shards (advertises
+    /// `caps::SHARDS`). Read once from `volunteer_quota_bytes` at setup; a
+    /// live re-advertise on toggle is a deferred follow-up.
+    shards: bool,
 }
 
 impl EdxServe {
@@ -618,6 +643,7 @@ impl EdxServe {
             self.privatekey.clone(),
             self.choker.clone(),
             self.control.clone(),
+            self.shards,
             on_inbound,
         )
     }
@@ -629,6 +655,7 @@ impl EdxServe {
             self.privatekey.clone(),
             self.choker.clone(),
             self.control.clone(),
+            self.shards,
         )
     }
 }
@@ -690,12 +717,16 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
     let key = node_key(state).await;
     let choker = make_choker();
     let store = enable_serving(state, &dir, key.clone(), choker.clone()).await?;
+    // Volunteer role: advertise caps::SHARDS only when the operator donated
+    // disk. Read once here; a live toggle is a deferred follow-up.
+    let shards = state.volunteer_quota_bytes().await > 0;
     let es = EdxServe {
         state: state.clone(),
         store,
         privatekey: key,
         choker,
         control: cell.control.clone(),
+        shards,
     };
     *guard = Some(es.clone());
     Some(es)
@@ -989,6 +1020,129 @@ impl RuntimeEdxFetcher {
         self.state.edx_materialize_file(address, inner_path, &plaintext).await?;
         let _ = store.enforce_quota(store_quota());
         Ok(true)
+    }
+
+    /// This node's 20-byte account (its persisted EDX identity key ->
+    /// address -> hash160), the volunteer cache identity fed to the XOR
+    /// responsibility predicate.
+    fn node_account(&self) -> Result<[u8; 20], String> {
+        let addr = epix_crypt::privatekey_to_address(&self.privatekey)?;
+        epix_crypt::address_to_hash160(&addr)
+    }
+
+    /// The VOLUNTEER role: HOLD (never decrypt) the encrypted shards this
+    /// node is responsible for, listed in a private file's signed
+    /// content.json.
+    ///
+    /// This is PULL, and safe by construction with no accept-guard: every
+    /// `cipher_addr` comes from a content.json the CALLER already
+    /// signature-verified, and each shard lands verified by BLAKE3==addr
+    /// into `Ns::Shard`, so there is no "grind arbitrary bytes onto our
+    /// disk" vector (unlike the deferred `PushBlock`, whose remote-chosen
+    /// bytes would need one). The decrypt/materialize tail of
+    /// [`Self::fetch_shard_file`] is intentionally absent: a volunteer holds
+    /// ciphertext it cannot read, and NO shard-to-xite association is ever
+    /// written (an `Ns::Shard` insert records only addr/size/last_access),
+    /// preserving the store's deniability property.
+    ///
+    /// Two gates decide what is pulled:
+    /// - the responsibility predicate (this node's `cache_id` XOR-near the
+    ///   addr, scaled by its quota share of the shard universe), so a
+    ///   volunteer holds only its slice of the keyspace; and
+    /// - the donated byte budget: stop before pulling a new shard once
+    ///   `Ns::Shard` bytes reach `volunteer_quota_bytes` (the in-flight
+    ///   shard may push slightly over - acceptable for a foundation).
+    ///
+    /// Held shards share the store's single combined LRU with the browse
+    /// cache, so `enforce_quota` bounds total disk. A dedicated ns-aware
+    /// eviction split (so the two pools never evict each other) is a
+    /// deferred refinement. Returns the count newly held; quota 0 (not
+    /// volunteering) holds nothing.
+    async fn volunteer_hold_file(
+        &self,
+        address: &str,
+        shard: &epix_blob::manifest::ShardEntry,
+        store: &Arc<Store>,
+    ) -> Result<usize, String> {
+        let quota = self.state.volunteer_quota_bytes().await;
+        if quota == 0 {
+            return Ok(0); // 0 = not volunteering
+        }
+        let cid = epix_blob::responsibility::cache_id(&self.node_account()?);
+        let universe = shard_universe_bytes();
+        let now = now_secs();
+
+        // The shards we are responsible for and do not already hold.
+        let want: Vec<&epix_blob::manifest::ShardChunk> = shard
+            .chunks
+            .iter()
+            .filter(|c| {
+                epix_blob::responsibility::responsible(&cid, c.cipher_addr, quota, universe)
+                    && !store.is_complete(c.cipher_addr).unwrap_or(false)
+            })
+            .collect();
+        if want.is_empty() {
+            return Ok(0);
+        }
+
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let peers = self.state.connectable_peers(address, 8).await;
+        let mut held = 0usize;
+        for c in want {
+            // Soft budget gate: stop before pulling once held shard bytes
+            // reach the donated quota.
+            if store.ns_bytes(Ns::Shard).map_err(|e| e.to_string())? >= quota {
+                break;
+            }
+            let id = c.cipher_addr;
+            let csize = c.csize as u64;
+
+            // Dial the xite's peers and learn who holds this ciphertext
+            // object, then stripe it in. Same swarm path as a normal fetch -
+            // a shard is an ordinary content-addressed object - minus the
+            // decrypt tail.
+            let mut handles: Vec<PeerHandle> = Vec::new();
+            let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
+            for peer in &peers {
+                let Ok((conn, identity, reg)) = self.dial(&transport, peer).await else { continue };
+                reg.note_cmd_sent("GetBitfield", Some(address));
+                if let Ok(Ok((_sz, bits))) = tokio::time::timeout(
+                    EDX_FETCH_TIMEOUT,
+                    epix_edx::fetch::fetch_bitfield(&conn, id),
+                )
+                .await
+                {
+                    let label = peer.to_string();
+                    node_pks.insert(label.clone(), identity.node_pk);
+                    handles.push(PeerHandle { conn, class: Class::of_addr(peer), bits, label });
+                }
+            }
+            if handles.is_empty() {
+                continue; // no peer holds this shard now; try the next one
+            }
+            // Reserve the sparse record only now that a peer can serve it.
+            // Creating it earlier let an unobtainable (or attacker-declared)
+            // shard count its full claimed `csize` toward the shard budget and
+            // global quota with bytes never actually held, tripping the budget
+            // gate early and evicting legitimately held objects.
+            store.ensure_sparse(id, Ns::Shard, csize, now).map_err(|e| e.to_string())?;
+            let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
+            let mut swarm = Swarm::new(store.clone(), id, csize);
+            if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+                self.credit(&report, &node_pks, now);
+            }
+            if store.is_complete(id).unwrap_or(false) {
+                held += 1;
+            } else {
+                // Stalled or failed pull: drop the record so its claimed size
+                // does not linger as a phantom in the budget and quota.
+                let _ = store.remove(id);
+            }
+        }
+        // Held shards are unpinned (refcount 0), so keep total disk bounded
+        // by the global quota alongside the browse cache.
+        let _ = store.enforce_quota(store_quota());
+        Ok(held)
     }
 
     /// Credit each peer that delivered groups in `report` for the bytes it
@@ -1829,6 +1983,33 @@ pub async fn enable_serving(
     Some(store)
 }
 
+/// Hold this node's responsible encrypted shards of `address`/`inner_path`,
+/// read from its already-verified signed content.json. Public entry point
+/// for the volunteer role: a future DHT discovery / roster-run driver (that
+/// piece is deferred) calls this per private file it learns about. Returns
+/// the number of shards newly held, or 0 when the node is not volunteering
+/// (`volunteer_quota_bytes` = 0) or the path is not a shard file.
+///
+/// The node's persisted identity key backs the responsibility predicate, so
+/// the node holds the same slice of the keyspace across restarts.
+pub async fn volunteer_hold(
+    state: &Arc<AppState>,
+    address: &str,
+    inner_path: &str,
+) -> Result<usize, String> {
+    let store = state.edx_store().await.ok_or("no EDX store")?;
+    let content_bytes =
+        state.read_file(address, "content.json").await.ok_or("no content.json")?;
+    let content: serde_json::Value =
+        serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
+    let Some(shard) = epix_blob::manifest::edx_shard_entry(&content, inner_path) else {
+        return Ok(0); // not a private/shard file
+    };
+    let key = node_key(state).await;
+    let fetcher = RuntimeEdxFetcher::new(state.clone(), key, make_choker());
+    fetcher.volunteer_hold_file(address, &shard, &store).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1919,6 +2100,7 @@ mod tests {
                 server_key,
                 None,
                 ControlHandles::detached(),
+                false,
             None,
         ));
         tokio::spawn(async move {
@@ -2202,6 +2384,183 @@ mod tests {
         assert_eq!(seek, movie[300_000..340_000], "re-fetched range is byte-exact");
     }
 
+    /// A ShardEntry (data-map) for `plaintext`'s convergent encryption: the
+    /// signed-content.json section a volunteer reads. `chunks` and `shards`
+    /// are parallel, so `csize` is each ciphertext's length.
+    fn shard_entry_from(
+        plaintext: &[u8],
+        enc: &epix_selfenc::Encrypted,
+    ) -> epix_blob::manifest::ShardEntry {
+        let chunks = enc
+            .chunks
+            .iter()
+            .zip(&enc.shards)
+            .map(|(c, (_addr, ct))| epix_blob::manifest::ShardChunk {
+                plain_hash: c.plain_hash,
+                cipher_addr: ObjId(c.cipher_addr),
+                len: c.len,
+                csize: ct.len() as u32,
+            })
+            .collect();
+        epix_blob::manifest::ShardEntry { size: plaintext.len() as u64, mode: 0, chunks }
+    }
+
+    /// Serve `store` over EDX on a fresh TCP port, advertising `caps::SHARDS`
+    /// (a volunteer that holds shards also serves them). Returns the address;
+    /// the backing state/task are leaked to outlive the test.
+    async fn serve_edx(store: Arc<Store>) -> std::net::SocketAddr {
+        let state = AppState::new("edx-seeder");
+        state.set_edx_store(store.clone()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sa = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state,
+            store,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            true,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        sa
+    }
+
+    /// A seeder holding the given ciphertext shards (Ns::Shard), served over
+    /// EDX. Returns its address.
+    async fn spawn_shard_seeder(shards: &[(epix_selfenc::Hash, Vec<u8>)]) -> std::net::SocketAddr {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        for (addr, ct) in shards {
+            store.insert_bytes(ObjId(*addr), Ns::Shard, ct, 1).unwrap();
+        }
+        std::mem::forget(dir);
+        serve_edx(store).await
+    }
+
+    /// Stand up a volunteer node (store + transport + the seeder as a peer for
+    /// `address`, with `address` registered so peers resolve) and set its
+    /// donated quota. Returns the volunteer state, its store, and the xite
+    /// address the peer is registered under.
+    async fn volunteer_node(seeder: std::net::SocketAddr, quota: u64) -> (Arc<AppState>, Arc<Store>, String) {
+        let state = AppState::new("volunteer");
+        let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        state
+            .add_xite(&addr, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .await;
+        std::mem::forget(site_dir);
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_dir.path()).unwrap());
+        std::mem::forget(store_dir);
+        state.set_edx_store(store.clone()).await;
+        state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        state.add_peers(&addr, [epix_core::PeerAddr::Ip(seeder)]).await;
+        state.config_set("volunteer_quota_bytes", serde_json::json!(quota)).await;
+        (state, store, addr)
+    }
+
+    /// The volunteer role, end to end: a node pulls the ciphertext shards it is
+    /// responsible for (from a data-map it could have read out of a verified
+    /// content.json), HOLDS them by address without ever decrypting, and then
+    /// serves one back to a fresh client - proving it holds+serves ciphertext
+    /// it cannot read.
+    #[tokio::test]
+    async fn a_volunteer_holds_and_serves_ciphertext_it_never_decrypts() {
+        let plaintext: Vec<u8> = (0..300_000usize).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+        let enc = epix_selfenc::encrypt_convergent(&plaintext, b"owner-salt");
+        let shard = shard_entry_from(&plaintext, &enc);
+        let seeder = spawn_shard_seeder(&enc.shards).await;
+
+        // Quota >= universe => responsible for every shard; budget never bites.
+        let (state_v, v_store, address) = volunteer_node(seeder, u64::MAX).await;
+        let fetcher = RuntimeEdxFetcher::new(state_v.clone(), epix_crypt::new_seed(), None);
+        let held = fetcher.volunteer_hold_file(&address, &shard, &v_store).await.unwrap();
+        assert_eq!(held, enc.shards.len(), "volunteer held every responsible shard");
+
+        // It holds the CIPHERTEXT (verified by address) and never the plaintext.
+        let now = now_secs();
+        for (addr, ct) in &enc.shards {
+            let id = ObjId(*addr);
+            assert!(v_store.is_complete(id).unwrap(), "shard {id} held complete");
+            assert_eq!(&v_store.read_bytes(id, now).unwrap(), ct, "held bytes are the ciphertext");
+        }
+        let plain_id = ObjId::of(&plaintext);
+        assert!(!v_store.is_complete(plain_id).unwrap(), "volunteer never decrypted to plaintext");
+        let total_ct: u64 = enc.shards.iter().map(|(_, ct)| ct.len() as u64).sum();
+        assert_eq!(v_store.ns_bytes(Ns::Shard).unwrap(), total_ct, "shard budget counts held ciphertext");
+
+        // HOLDS + SERVES: bring the volunteer up as a seeder and let a fresh
+        // client pull one shard back, bao-verified by its address.
+        let vol_addr = serve_edx(v_store.clone()).await;
+        let stream = TcpTransport.dial(&epix_core::PeerAddr::Ip(vol_addr)).await.unwrap();
+        let l = epix_edx::link::dial(stream).await.unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let cstore = Arc::new(Store::open(cdir.path()).unwrap());
+        let cctx = ServeCtx {
+            caps: caps::MESH,
+            now: || 0,
+            ..ServeCtx::new(cstore.clone(), Arc::new(NoProvider), epix_crypt::new_seed())
+        };
+        let ident = client_hello(&l.conn, &cctx, vec![], Some(l.handshake_hash)).await.unwrap();
+        assert!(ident.caps & caps::SHARDS != 0, "the volunteer advertises caps::SHARDS");
+
+        let (addr0, ct0) = &enc.shards[0];
+        let id0 = ObjId(*addr0);
+        let csize = ct0.len() as u64;
+        cstore.ensure_sparse(id0, Ns::Shard, csize, 1).unwrap();
+        let got =
+            epix_edx::fetch::fetch_ranges(&l.conn, &cstore, id0, csize, &[0..csize], 100, 2).await.unwrap();
+        assert!(got > 0);
+        assert!(cstore.is_complete(id0).unwrap(), "the ciphertext shard transferred");
+        assert_eq!(&cstore.read_bytes(id0, 3).unwrap(), ct0, "served shard is the exact ciphertext");
+    }
+
+    /// The donated byte budget bounds a volunteer: with a tiny universe every
+    /// shard is responsible, but a quota just one shard wide stops the pull
+    /// after the first shard instead of holding them all.
+    #[tokio::test]
+    async fn a_volunteer_stops_when_its_quota_is_reached() {
+        // >1 MiB plaintext -> several ~1 MiB ciphertext shards.
+        let plaintext: Vec<u8> = (0..3_500_000usize).map(|i| (i.wrapping_mul(13) % 251) as u8).collect();
+        let enc = epix_selfenc::encrypt_convergent(&plaintext, b"owner-salt");
+        assert!(enc.shards.len() >= 3, "want several shards, got {}", enc.shards.len());
+        let shard = shard_entry_from(&plaintext, &enc);
+        let seeder = spawn_shard_seeder(&enc.shards).await;
+
+        // Tiny universe => quota >= universe => responsible for everything, so
+        // only the byte budget limits the pull. Quota = one shard's worth.
+        std::env::set_var("EPIX_EDX_SHARD_UNIVERSE_BYTES", "1");
+        let quota = enc.shards[0].1.len() as u64;
+        let (state_v, v_store, address) = volunteer_node(seeder, quota).await;
+        let fetcher = RuntimeEdxFetcher::new(state_v.clone(), epix_crypt::new_seed(), None);
+        let held = fetcher.volunteer_hold_file(&address, &shard, &v_store).await.unwrap();
+        std::env::remove_var("EPIX_EDX_SHARD_UNIVERSE_BYTES");
+
+        assert_eq!(held, 1, "the budget gate stops the volunteer after one shard");
+        assert!(v_store.ns_bytes(Ns::Shard).unwrap() >= quota, "held about the donated quota");
+        let others_held =
+            enc.shards[1..].iter().filter(|(a, _)| v_store.is_complete(ObjId(*a)).unwrap()).count();
+        assert_eq!(others_held, 0, "no shard beyond the first was held");
+    }
+
+    /// Not volunteering (quota 0): the driver holds nothing even when it could.
+    #[tokio::test]
+    async fn quota_zero_volunteers_nothing() {
+        let plaintext: Vec<u8> = (0..200_000usize).map(|i| (i % 251) as u8).collect();
+        let enc = epix_selfenc::encrypt_convergent(&plaintext, b"owner-salt");
+        let shard = shard_entry_from(&plaintext, &enc);
+        let seeder = spawn_shard_seeder(&enc.shards).await;
+
+        let (state_v, v_store, address) = volunteer_node(seeder, 0).await;
+        let fetcher = RuntimeEdxFetcher::new(state_v.clone(), epix_crypt::new_seed(), None);
+        let held = fetcher.volunteer_hold_file(&address, &shard, &v_store).await.unwrap();
+        assert_eq!(held, 0, "quota 0 holds nothing");
+        assert_eq!(v_store.ns_bytes(Ns::Shard).unwrap(), 0, "nothing landed in the shard namespace");
+    }
+
     /// Social/forum content over EDX: a per-user file declared in a child
     /// content.json (as forums store each user's posts) is registered by the
     /// seeder and fetched + resolved by a client through the governing child
@@ -2253,6 +2612,7 @@ mod tests {
                 server_key,
                 None,
                 ControlHandles::detached(),
+                false,
             None,
         ));
         tokio::spawn(async move {
@@ -2410,6 +2770,7 @@ mod tests {
                 server_key,
                 None,
                 ControlHandles::detached(),
+                false,
             None,
         ));
         tokio::spawn(async move {
@@ -2526,6 +2887,7 @@ mod tests {
                 server_key,
                 None,
                 ControlHandles::detached(),
+                false,
             None,
         ));
         tokio::spawn(async move {
@@ -2670,6 +3032,7 @@ mod tests {
             epix_crypt::new_seed(),
             None,
             control,
+            false,
             None,
         ));
         tokio::spawn(async move {
@@ -2808,6 +3171,7 @@ mod tests {
             epix_crypt::new_seed(),
             None,
             ControlHandles::detached(),
+            false,
             Some(hook),
         ));
         tokio::spawn(async move {

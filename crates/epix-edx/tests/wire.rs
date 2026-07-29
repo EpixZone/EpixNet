@@ -172,6 +172,34 @@ async fn get_many_and_bitfield() {
 }
 
 #[tokio::test]
+async fn has_shards_returns_the_held_subset_as_a_packed_mask() {
+    let net = sim::SimNet::new();
+    let (server_store, _sg) = temp_store();
+
+    // Hold 3 of 10 probed objects (indices 0, 4, 9), the rest absent. The
+    // count is not a multiple of 8, so the top byte is partially used - the
+    // packing edge worth pinning.
+    let mut addrs = Vec::new();
+    for i in 0..10u8 {
+        let data = test_data(1000 + i as usize);
+        let id = ObjId::of(&data);
+        if i == 0 || i == 4 || i == 9 {
+            server_store.insert_bytes(id, Ns::Shard, &data, 1).unwrap();
+        }
+        addrs.push(id);
+    }
+    // An addr the server has never seen: must read as not held.
+    addrs.push(ObjId::of(b"never-seen"));
+
+    let conn = connect(net.clone(), server_store, ip(5)).await;
+    let held = fetch::fetch_has_shards(&conn, &addrs).await.unwrap();
+
+    let expect: Vec<bool> =
+        [true, false, false, false, true, false, false, false, false, true, false].to_vec();
+    assert_eq!(held, expect, "mask reflects exactly the held subset");
+}
+
+#[tokio::test]
 async fn hello_gate_rejects_pre_handshake_requests() {
     let net = sim::SimNet::new();
     let (server_store, _sg) = temp_store();

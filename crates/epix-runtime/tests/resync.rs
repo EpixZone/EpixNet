@@ -44,6 +44,7 @@ async fn spawn_edx_seeder(address: &str, src: XiteStorage) -> std::net::SocketAd
         epix_crypt::new_seed(),
         None,
         epix_runtime::edx::ControlHandles::detached(),
+        false,
         None,
     ));
     tokio::spawn(server.serve(listener));

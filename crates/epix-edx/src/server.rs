@@ -184,6 +184,18 @@ impl ServeCtx {
         self.caps |= caps::CONTROL;
         self
     }
+
+    /// Advertise `caps::SHARDS` when this node volunteers disk to hold
+    /// encrypted shards it cannot read. Serving availability/bytes of a
+    /// held shard needs no extra state (a shard is an ordinary
+    /// content-addressed object), so this only flips the advertised bit;
+    /// the actual holding is driven by the runtime's volunteer pull.
+    pub fn with_shards(mut self, on: bool) -> Self {
+        if on {
+            self.caps |= caps::SHARDS;
+        }
+        self
+    }
 }
 
 /// Build our Hello/HelloAck binding signature for this session.
@@ -392,6 +404,20 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
         Req::HaveRanges { .. } => {
             // Availability notification: consumed by the fetch scheduler
             // (see fetch.rs); as a server there is nothing to answer.
+        }
+        Req::HasShards { addrs } => {
+            // One packed bit per requested addr: set iff we hold it
+            // complete. Answered for anything held, independent of the
+            // volunteer responsibility predicate (responsibility governs
+            // only what we PULL, never what we serve of what we already
+            // have). Needs the store only - no control provider, no cap.
+            let mut bits = vec![0u8; addrs.len().div_ceil(8)];
+            for (i, a) in addrs.iter().enumerate() {
+                if ctx.store.is_complete(*a).unwrap_or(false) {
+                    bits[i / 8] |= 1 << (i % 8);
+                }
+            }
+            let _ = conn.respond(stream, Resp::ShardMask { bits }).await;
         }
         Req::Update { xite, inner_path, signed, inline, modified, diffs, sender_peers } => {
             let resp = match ctx
