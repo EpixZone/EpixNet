@@ -29,6 +29,23 @@ pub struct FieldMap {
     pub target: Option<String>,
 }
 
+/// Multiplier that scales a record's clock field to the MILLISECONDS the feed
+/// layer partitions on (`SEGMENT_INTERVAL_MS`).
+///
+/// Real apps do not all store milliseconds: an EpixPost record carries a
+/// `clock` that is a CRDT supersede counter and a `date_added` in SECONDS.
+/// Reading seconds as milliseconds would divide every record of a ~2.7 year
+/// span into the same day-interval, collapsing the whole feed into one
+/// segment and making the search skip-filter useless. So a descriptor
+/// declares its unit and the adapter scales here, once.
+pub fn clock_scale(unit: &str) -> Option<u64> {
+    match unit {
+        "ms" => Some(1),
+        "s" => Some(1_000),
+        _ => None,
+    }
+}
+
 /// How a descriptor derives the record's [`Kind`]. `default` names the
 /// non-reaction, non-tombstone kind ("post" or "comment"); a reaction feed
 /// also names the fields holding the reaction kind and the active flag.
@@ -53,6 +70,9 @@ pub struct FeedDescriptor {
     pub record_key: String,
     pub map: FieldMap,
     pub kind: KindSpec,
+    /// Multiplier from the record's clock field to milliseconds (see
+    /// [`clock_scale`]). 1 for a millisecond clock, 1000 for seconds.
+    pub clock_scale: u64,
     /// Record field whose `true` value marks a delete (default "deleted").
     pub deleted_field: String,
     /// Record field whose `true` value marks a cross-author moderation
@@ -107,6 +127,12 @@ impl FeedDescriptor {
                 .to_string(),
             files: obj.get("files")?.as_str()?.to_string(),
             record_key: obj.get("record_key")?.as_str()?.to_string(),
+            // Absent means milliseconds; an UNRECOGNISED unit returns None so
+            // a typo disables the feed instead of silently mis-scaling every
+            // clock (which would land the whole feed in one wrong interval).
+            clock_scale: clock_scale(
+                obj.get("clock_unit").and_then(|v| v.as_str()).unwrap_or("ms"),
+            )?,
             map,
             kind,
             deleted_field: common_field("deleted_field", "deleted"),
@@ -168,7 +194,10 @@ pub fn record_from_value(
     if clock_i < 0 {
         return Err(Skip::BadClock);
     }
-    let clock = clock_i as u64;
+    // Scale to milliseconds. checked_mul, not a bare `*`: a hostile or corrupt
+    // record could carry a clock near i64::MAX, and a wrapped product would
+    // land it in an arbitrary interval.
+    let clock = (clock_i as u64).checked_mul(desc.clock_scale).ok_or(Skip::BadClock)?;
 
     // A top-level item (target=null) attaches to nothing; its own id is the
     // target others reference. Otherwise read the named target field.
@@ -359,5 +388,61 @@ mod tests {
             "comment_id": "c1", "author": "epix1abc", "clock": 9, "post_id": "p9", "removed": true,
         });
         assert_eq!(record_from_value(&desc, &rec, Vec::new()).unwrap().kind, Kind::Tombstone);
+    }
+
+    /// The EpixPost descriptor against a REAL record shape from a live hub
+    /// (`data/users/<id>/posts.json`). Its `clock` is a CRDT supersede counter
+    /// and `date_added` is SECONDS, so this pins the seconds-to-ms scaling that
+    /// keeps day-partitioning meaningful.
+    #[test]
+    fn epixpost_seconds_clock_scales_to_milliseconds() {
+        let feeds = json!({
+            "posts": {
+                "files": "data/users/*/posts.json",
+                "record_key": "post",
+                "clock_unit": "s",
+                "map": { "id": "post_id", "author": "author",
+                         "clock": "date_added", "target": null },
+                "kind": { "default": "post" }
+            }
+        });
+        let desc = FeedDescriptor::parse("posts", &feeds["posts"], None)
+            .expect("the EpixPost descriptor must parse");
+        assert_eq!(desc.clock_scale, 1_000, "seconds scale to ms");
+
+        // Verbatim shape of a real post (body/meta trimmed).
+        let rec = json!({
+            "author": "epix1qp8ur7eqqj9ynh9ng2c5d8ng8mdtu3x763xp33",
+            "body": "Hello Epix!",
+            "clock": 1,
+            "date_added": 1_775_058_425_i64,
+            "deleted": false,
+            "post_id": 1_775_058_430_i64,
+            "supersedes": 0
+        });
+        let out = record_from_value(&desc, &rec, b"canonical".to_vec()).expect("converts");
+        assert_eq!(out.clock, 1_775_058_425_000, "seconds promoted to ms");
+        assert_eq!(out.id, "1775058430", "integer post_id stringifies");
+        assert_eq!(out.author, "epix1qp8ur7eqqj9ynh9ng2c5d8ng8mdtu3x763xp33");
+        // A top-level post attaches to nothing; the index keys it under its
+        // own id (see TargetIndex::add_segment).
+        assert_eq!(out.target, "", "a top-level post has no attach target");
+        assert_eq!(out.kind, Kind::Post);
+
+        // The scaled clock lands in the right DAY interval, which is the whole
+        // reason the unit matters: unscaled it would divide to 20.
+        const DAY_MS: u64 = 86_400_000;
+        assert_eq!(out.clock / DAY_MS, 20_544);
+        assert_eq!(1_775_058_425_u64 / DAY_MS, 20, "unscaled would collapse the feed");
+
+        // An unrecognised unit disables the feed rather than mis-scaling it.
+        let mut bad = feeds["posts"].clone();
+        bad["clock_unit"] = json!("minutes");
+        assert!(FeedDescriptor::parse("posts", &bad, None).is_none());
+
+        // Absent clock_unit still means milliseconds (existing descriptors).
+        let mut ms = feeds["posts"].clone();
+        ms.as_object_mut().unwrap().remove("clock_unit");
+        assert_eq!(FeedDescriptor::parse("posts", &ms, None).unwrap().clock_scale, 1);
     }
 }
