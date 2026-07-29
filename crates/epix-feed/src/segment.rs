@@ -111,8 +111,16 @@ impl Spine {
     }
 
     /// Whether `other` extends `self` (same prefix, then only appends) —
-    /// the monotone acceptance rule. A peer offering a spine that diverges
-    /// from ours on a shared prefix is rejected (a rollback attempt).
+    /// the append-only prefix check: `self` continues `base` link for link.
+    ///
+    /// NOT THE ACCEPTANCE RULE for feeds. Feed anti-rollback is RECORD-SET
+    /// MONOTONE (a checkpoint is valid iff its record set is a superset of
+    /// ours and our tombstones stay present), because segments are a pure
+    /// function of the records in a fixed clock interval: a legitimately
+    /// late-arriving OLD record seals a new EARLIER interval, which changes
+    /// the link prefix and makes this return false even though nothing was
+    /// rolled back. Use this only where segments are genuinely appended in
+    /// clock order; gate acceptance on the record set instead.
     pub fn is_extension_of(&self, base: &Spine) -> bool {
         if self.links.len() < base.links.len() {
             return false;

@@ -185,9 +185,16 @@ impl Checkpoint {
         ObjId::of(&m)
     }
 
-    /// Whether `self` validly extends `prev`: same boundary progression
-    /// and `self.history_root` was computed FROM `prev.history_root`. A
-    /// checkpoint that doesn't chain to its predecessor is a rollback.
+    /// Whether `self` validly extends `prev`: the boundary advanced and
+    /// `self.history_root` was computed FROM `prev.history_root`.
+    ///
+    /// NOT THE ACCEPTANCE RULE for feeds - it requires the boundary to
+    /// ADVANCE, and the feed boundary is the max record clock, so a
+    /// legitimately late-arriving OLD record leaves the boundary unchanged
+    /// and this returns false even though the record set only grew. Feed
+    /// anti-rollback is RECORD-SET MONOTONE: accept iff the record set is a
+    /// superset of ours and every tombstone we hold is still present.
+    /// Use this only for a strictly forward-advancing checkpoint chain.
     pub fn extends(&self, prev: &Checkpoint) -> bool {
         if self.boundary <= prev.boundary {
             return false;

@@ -9036,12 +9036,17 @@ impl AppState {
         if descriptors.is_empty() {
             return;
         }
+        // `now` is only the store insert timestamp; it never enters derivation
+        // (segmentation is a pure function of record clocks). Grace/live-tail is
+        // a caching policy: we could skip pinning segments whose interval ends
+        // within ~2 days of `now` to avoid churn, but that is a serving choice
+        // that touches no root, so for now we pin every sealed segment.
         let now = epix_core::now_ms();
         let store = self.edx_store().await;
         let mut derived = HashMap::new();
         for desc in descriptors {
             let records = self.gather_feed_records(address, &desc).await;
-            let artifacts = crate::feed::derive_feed(records, now);
+            let artifacts = crate::feed::derive_feed(records);
             // Cache the sealed segments as EDX objects (content-addressed by
             // their own BLAKE3 root); pin so they survive eviction. Losing one
             // is harmless - it recomputes from the records.
