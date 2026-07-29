@@ -2717,6 +2717,14 @@ impl AppState {
         if from.is_overlay() {
             got.push(from.clone());
         }
+        // Only absorb addresses that round-trip through the packed wire form.
+        // The retired msgpack PEX validated implicitly by unpacking each entry
+        // (a non-base32 onion or a wrong-length i2p/rns key was unrepresentable);
+        // EDX deserializes PeerAddr directly, so that filter has to be explicit
+        // or a peer could seed us - and everyone we gossip to - with junk
+        // addresses that burn a full dial timeout each. Same rule as
+        // `adopt_dialback`.
+        got.retain(|p| p.is_wellformed() && p.pack().is_some());
         self.add_peers(site, got).await;
 
         let mut reply = self.pex_peers(site, need, &exclude).await;
@@ -2743,6 +2751,10 @@ impl AppState {
                 reply.push(p);
             }
         }
+        // Never hand out an address we could not pack: the retired msgpack
+        // reply path dropped these when bucketing, and passing one on would
+        // spread a junk address through the swarm.
+        reply.retain(|p| p.pack().is_some());
         reply
     }
 
@@ -6342,6 +6354,12 @@ impl AppState {
             };
             self.set_peer_connected(address, peer, true).await;
             for p in found {
+                // Same wire-form gate as the serving side: a peer's PEX
+                // answer is untrusted input, and an unpackable address
+                // would cost a full dial timeout every selection pass.
+                if !p.is_wellformed() || p.pack().is_none() {
+                    continue;
+                }
                 if known.insert(p.to_string()) {
                     learned.push(p);
                 }
@@ -7917,7 +7935,13 @@ impl AppState {
     /// a bad hint only ever costs a poller one wasted (signature-verified)
     /// resync, and the store is bounded and evicts.
     pub async fn record_update_hint(&self, xite: &str, modified: i64) {
-        if xite.is_empty() {
+        // A xite address is ~42 chars; anything longer is not an address.
+        // The bound matters because the hint is recorded from a peer-supplied
+        // string BEFORE the update is authorized, and the hints are replayed
+        // verbatim in every `UpdatesSince` reply - a few huge strings would
+        // otherwise bloat that reply past the frame cap for everyone.
+        const MAX_XITE_LEN: usize = 128;
+        if xite.is_empty() || xite.len() > MAX_XITE_LEN {
             return;
         }
         if let Some(store) = self.prop_store.get() {

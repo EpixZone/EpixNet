@@ -642,3 +642,84 @@ async fn oversized_multirange_request_is_rejected() {
         other => panic!("expected LIMIT Err, got {other:?}"),
     }
 }
+
+/// A signed list far larger than one frame must arrive complete.
+///
+/// Regression: `SignedList` was packed into a single frame. Past the
+/// 64 KiB cap the encode failed inside the writer task, which tore down
+/// the WHOLE multiplexed connection, not just that stream - so a forum
+/// with a few thousand per-user content.json files became unsyncable
+/// from every peer at once. The reply is chunked now.
+#[tokio::test]
+async fn a_signed_list_larger_than_one_frame_survives() {
+    /// Enough entries to blow well past MAX_FRAME_LEN (~1071 was the
+    /// measured break point for this path length).
+    const N: usize = 5_000;
+
+    struct BigList;
+    #[async_trait::async_trait]
+    impl SignedProvider for BigList {
+        async fn get_signed(&self, _x: &str, _p: &str) -> Option<Vec<u8>> {
+            None
+        }
+        async fn list_signed(&self, _x: &str, _s: u64) -> Vec<(String, u64, u64)> {
+            (0..N)
+                .map(|i| (format!("data/users/user{i:06}/content.json"), 1_700_000_000 + i as u64, 4096))
+                .collect()
+        }
+        async fn xite_summary(&self, _x: &str) -> Option<(u64, u64, u64)> {
+            None
+        }
+        async fn apply_update(
+            &self,
+            _x: &str,
+            _p: &str,
+            _s: &[u8],
+            _i: &[(ObjId, Vec<u8>)],
+            _m: f64,
+            _d: &[(String, Vec<u8>)],
+            _sp: &[String],
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    let net = sim::SimNet::new();
+    let (store, _g) = temp_store();
+    let server_addr = ip(21);
+    let ctx = Arc::new(ServeCtx::new(store, Arc::new(BigList), SERVER_KEY.into()));
+    let mut inbox = net.listen(server_addr.clone());
+    tokio::spawn(async move {
+        while let Some((_from, stream)) = inbox.recv().await {
+            let (conn, incoming) = Conn::start(stream, false);
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                serve(conn, incoming, ctx, None).await;
+            });
+        }
+    });
+
+    let t = sim::SimTransport { net, local: ip(201) };
+    let stream = {
+        use epix_transport::Transport;
+        t.dial(&server_addr).await.unwrap()
+    };
+    let (conn, _in) = Conn::start(stream, true);
+    let (cstore, _cg) = temp_store();
+    let cctx = ServeCtx {
+        caps: caps::MESH,
+        now: || 0,
+        ..ServeCtx::new(cstore, Arc::new(BigList), CLIENT_KEY.into())
+    };
+    epix_edx::server::client_hello(&conn, &cctx, vec![], None).await.unwrap();
+
+    let entries = fetch::list_signed(&conn, "1Abc", 0).await.expect("oversize list must arrive");
+    assert_eq!(entries.len(), N, "every entry must survive chunking");
+    assert_eq!(entries[0].0, "data/users/user000000/content.json");
+    assert_eq!(entries[N - 1].0, format!("data/users/user{:06}/content.json", N - 1));
+
+    // The connection must still be usable: the whole point of the bug was
+    // that an oversize reply killed the link for every other stream.
+    let summary = fetch::fetch_signed(&conn, "1Abc", "content.json").await;
+    assert!(summary.is_err(), "provider has no signed content, but the link answered");
+}

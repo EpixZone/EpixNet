@@ -15,6 +15,7 @@
 //! these caps are the hard backstop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use epix_blob::store::Store;
 use epix_blob::ObjId;
@@ -34,6 +35,12 @@ pub const MAX_MANY_ITEMS: usize = 256;
 pub const MAX_MANY_ITEM_BYTES: u64 = 64 * 1024;
 /// Concurrent serve tasks per connection.
 pub const MAX_CONCURRENT_SERVES: usize = 8;
+/// How long a connection may sit after the link comes up before sending
+/// its `Hello`. Bounds the slot an authenticated-but-silent peer holds.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an established connection may sit idle (no request) before it
+/// is dropped and its inbound slot released.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A GetRange no larger than this is treated as first-paint (index.html +
 /// first bundles), exempt from choking up to the per-peer free budget.
 pub const FIRST_PAINT_OBJECT_BYTES: u64 = 1 << 20;
@@ -256,8 +263,11 @@ pub async fn serve(
     ctx: Arc<ServeCtx>,
     handshake_hash: Option<[u8; 32]>,
 ) -> Option<PeerIdentity> {
-    // Hello gate.
-    let first = incoming.recv().await?;
+    // Hello gate, bounded: a peer that completes the handshake and then
+    // never speaks would otherwise hold its inbound slot forever. EDX is
+    // the only inbound path now, so without this a few hundred stalled
+    // sockets exhaust MAX_INBOUND and the node goes deaf to new peers.
+    let first = tokio::time::timeout(HELLO_TIMEOUT, incoming.recv()).await.ok()??;
     let identity = match first.req {
         Req::Hello(hello) => {
             match check_identity(
@@ -313,8 +323,11 @@ pub async fn serve(
     }
     let identity = Arc::new(identity);
 
+    // Idle reaper: drop a connection that goes quiet, releasing its
+    // inbound slot. Long-lived links stay up as long as they keep making
+    // requests; a live-but-silent peer reconnects when it needs us.
     let serves = Arc::new(Semaphore::new(MAX_CONCURRENT_SERVES));
-    while let Some(inc) = incoming.recv().await {
+    while let Ok(Some(inc)) = tokio::time::timeout(IDLE_TIMEOUT, incoming.recv()).await {
         let Ok(permit) = serves.clone().acquire_owned().await else { break };
         let conn = conn.clone();
         let ctx = ctx.clone();
@@ -365,7 +378,7 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
         }
         Req::ListSigned { xite, since } => {
             let entries = ctx.provider.list_signed(&xite, since).await;
-            let _ = conn.respond(stream, Resp::SignedList { entries }).await;
+            serve_signed_list(conn, stream, entries).await;
         }
         Req::HasXite { xite } => {
             let resp = match ctx.provider.xite_summary(&xite).await {
@@ -394,16 +407,15 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
         // Control plane (caps::CONTROL). A content-only node (no control
         // provider) answers UNSUPPORTED so a mis-gated dialer fails fast
         // instead of hanging.
-        Req::UpdatesSince { after } => {
-            let resp = match &ctx.control {
-                Some(c) => {
-                    let (updates, head) = c.updates_since(after).await;
-                    Resp::Updates { updates, head }
-                }
-                None => unsupported(),
-            };
-            let _ = conn.respond(stream, resp).await;
-        }
+        Req::UpdatesSince { after } => match &ctx.control {
+            Some(c) => {
+                let (updates, head) = c.updates_since(after).await;
+                serve_updates(conn, stream, updates, head).await;
+            }
+            None => {
+                let _ = conn.respond(stream, unsupported()).await;
+            }
+        },
         Req::Pex { xite, need, peers } => {
             let resp = match &ctx.control {
                 Some(c) => Resp::Peers { peers: c.pex(&xite, need, &peers, &identity).await },
@@ -444,6 +456,83 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
 /// The reply for a control request on a node that doesn't serve control.
 fn unsupported() -> Resp {
     Resp::Err { code: err::UNSUPPORTED, msg: "control plane not served".into() }
+}
+
+/// Byte budget for one batched reply frame, leaving room for the frame
+/// header and postcard's length prefixes.
+const BATCH_BUDGET: usize = MAX_FRAME_LEN - 4096;
+
+/// Send `SignedList` across as many frames as it takes. A xite with
+/// thousands of per-user content.json files overflows a single frame, and
+/// an oversize frame fails to encode in the writer task, which tears down
+/// the WHOLE multiplexed connection (not just this stream). Chunking like
+/// `serve_many` keeps a big forum servable.
+async fn serve_signed_list(conn: Conn, stream: u64, entries: Vec<(String, u64, u64)>) {
+    let mut batch: Vec<(String, u64, u64)> = Vec::new();
+    let mut bytes = 0usize;
+    for e in entries {
+        // path bytes + two varints, generously rounded.
+        let cost = e.0.len() + 24;
+        if bytes + cost > BATCH_BUDGET && !batch.is_empty() {
+            let items = std::mem::take(&mut batch);
+            bytes = 0;
+            if conn
+                .send(Frame {
+                    stream,
+                    body: FrameBody::Resp { last: false, resp: Resp::SignedList { entries: items } },
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        bytes += cost;
+        batch.push(e);
+    }
+    let _ = conn
+        .send(Frame {
+            stream,
+            body: FrameBody::Resp { last: true, resp: Resp::SignedList { entries: batch } },
+        })
+        .await;
+}
+
+/// Send `Updates` across as many frames as it takes, for the same reason
+/// as [`serve_signed_list`]. `head` rides on the FINAL frame only: the
+/// cursor is only valid once the receiver has every hint before it, so a
+/// truncated poll must not advance it.
+async fn serve_updates(conn: Conn, stream: u64, updates: Vec<(String, i64)>, head: u64) {
+    let mut batch: Vec<(String, i64)> = Vec::new();
+    let mut bytes = 0usize;
+    for u in updates {
+        let cost = u.0.len() + 16;
+        if bytes + cost > BATCH_BUDGET && !batch.is_empty() {
+            let items = std::mem::take(&mut batch);
+            bytes = 0;
+            if conn
+                .send(Frame {
+                    stream,
+                    body: FrameBody::Resp {
+                        last: false,
+                        resp: Resp::Updates { updates: items, head: 0 },
+                    },
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        bytes += cost;
+        batch.push(u);
+    }
+    let _ = conn
+        .send(Frame {
+            stream,
+            body: FrameBody::Resp { last: true, resp: Resp::Updates { updates: batch, head } },
+        })
+        .await;
 }
 
 async fn serve_range(

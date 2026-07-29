@@ -162,15 +162,35 @@ pub async fn fetch_signed(conn: &Conn, xite: &str, inner_path: &str) -> std::io:
 }
 
 /// Signed files changed since `since`: (inner_path, modified, size).
+/// A big xite's list spans several frames (see `serve_signed_list`), so
+/// this drains the stream until the terminal frame instead of taking the
+/// first response.
 pub async fn list_signed(
     conn: &Conn,
     xite: &str,
     since: u64,
 ) -> std::io::Result<Vec<(String, u64, u64)>> {
-    match conn.request(Req::ListSigned { xite: xite.into(), since }).await? {
-        Resp::SignedList { entries } => Ok(entries),
-        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
-        other => Err(proto_err(format!("expected SignedList, got {other:?}"))),
+    let mut rx = conn.request_stream(Req::ListSigned { xite: xite.into(), since }).await?;
+    let mut out: Vec<(String, u64, u64)> = Vec::new();
+    loop {
+        match rx.recv().await {
+            Some(FrameBody::Resp { last, resp: Resp::SignedList { entries } }) => {
+                out.extend(entries);
+                if last {
+                    return Ok(out);
+                }
+            }
+            Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
+                return Err(remote_err(code, &msg))
+            }
+            Some(other) => return Err(proto_err(format!("expected SignedList, got {other:?}"))),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed mid-list",
+                ))
+            }
+        }
     }
 }
 
@@ -240,11 +260,31 @@ pub async fn fetch_bitfield(conn: &Conn, obj: ObjId) -> std::io::Result<(u64, Gr
 // single-response requests on the priority lane.
 
 /// Propagation hints after `after`: (xite, modified) pairs + new cursor.
+/// Spans frames on a busy relay (see `serve_updates`); `head` is taken
+/// from the terminal frame, so a truncated poll never advances the cursor
+/// past hints the caller did not receive.
 pub async fn updates_since(conn: &Conn, after: u64) -> std::io::Result<(Vec<(String, i64)>, u64)> {
-    match conn.request(Req::UpdatesSince { after }).await? {
-        Resp::Updates { updates, head } => Ok((updates, head)),
-        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
-        other => Err(proto_err(format!("expected Updates, got {other:?}"))),
+    let mut rx = conn.request_stream(Req::UpdatesSince { after }).await?;
+    let mut out: Vec<(String, i64)> = Vec::new();
+    loop {
+        match rx.recv().await {
+            Some(FrameBody::Resp { last, resp: Resp::Updates { updates, head } }) => {
+                out.extend(updates);
+                if last {
+                    return Ok((out, head));
+                }
+            }
+            Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
+                return Err(remote_err(code, &msg))
+            }
+            Some(other) => return Err(proto_err(format!("expected Updates, got {other:?}"))),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed mid-poll",
+                ))
+            }
+        }
     }
 }
 
