@@ -236,6 +236,59 @@ pub async fn fetch_bitfield(conn: &Conn, obj: ObjId) -> std::io::Result<(u64, Gr
     }
 }
 
+// --- Control plane (caps::CONTROL): successors to the legacy msgpack
+// control commands. All single-response requests on the priority lane.
+
+/// Propagation hints after `after`: (xite, modified) pairs + new cursor.
+pub async fn updates_since(conn: &Conn, after: u64) -> std::io::Result<(Vec<(String, i64)>, u64)> {
+    match conn.request(Req::UpdatesSince { after }).await? {
+        Resp::Updates { updates, head } => Ok((updates, head)),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected Updates, got {other:?}"))),
+    }
+}
+
+/// Peer exchange for `xite`: send what we know, get what we lack.
+pub async fn pex(
+    conn: &Conn,
+    xite: &str,
+    need: u32,
+    have: Vec<epix_core::PeerAddr>,
+) -> std::io::Result<Vec<epix_core::PeerAddr>> {
+    match conn.request(Req::Pex { xite: xite.into(), need, peers: have }).await? {
+        Resp::Peers { peers } => Ok(peers),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected Peers, got {other:?}"))),
+    }
+}
+
+/// The peer's working tracker set (Beacon gossip).
+pub async fn get_trackers(conn: &Conn) -> std::io::Result<Vec<String>> {
+    match conn.request(Req::GetTrackers).await? {
+        Resp::Trackers { trackers } => Ok(trackers),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected Trackers, got {other:?}"))),
+    }
+}
+
+/// One Kademlia RPC (payload encoded/decoded by epix-dht-net).
+pub async fn kad(conn: &Conn, payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    match conn.request(Req::Kad { payload }).await? {
+        Resp::Payload { bytes } => Ok(bytes),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected Payload, got {other:?}"))),
+    }
+}
+
+/// One tracker announce (payload encoded/decoded by epix-discovery).
+pub async fn announce(conn: &Conn, payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    match conn.request(Req::Announce { payload }).await? {
+        Resp::Payload { bytes } => Ok(bytes),
+        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        other => Err(proto_err(format!("expected Payload, got {other:?}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

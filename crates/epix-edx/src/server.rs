@@ -67,10 +67,46 @@ pub trait SignedProvider: Send + Sync + 'static {
     ) -> Result<bool, String>;
 }
 
+/// Control-plane access the server delegates to (the successors to the
+/// legacy msgpack control commands: propagation poll, PEX, tracker-set
+/// gossip, DHT RPC, tracker announce). Separate from [`SignedProvider`]
+/// because a pure content node (tests, embedded fetchers) serves content
+/// without any of this; `ServeCtx.control = None` answers these requests
+/// UNSUPPORTED and the node must not advertise `caps::CONTROL`.
+///
+/// `Kad`/`Announce` payloads are opaque here — their shape belongs to
+/// `epix-dht-net` / `epix-discovery`, mirroring how `Update::diffs` stays
+/// neutral in this crate.
+#[async_trait::async_trait]
+pub trait ControlProvider: Send + Sync + 'static {
+    /// Propagation hints recorded after `after`: (xite, modified) pairs
+    /// plus the new head cursor (`meshGetUpdates` successor).
+    async fn updates_since(&self, after: u64) -> (Vec<(String, i64)>, u64);
+    /// Peer exchange: connectable peers for `xite` the requester lacks
+    /// (its known set rides in `have`), capped at `need`. `from` is the
+    /// established identity of the requester (reputation / recording).
+    async fn pex(
+        &self,
+        xite: &str,
+        need: u32,
+        have: &[epix_core::PeerAddr],
+        from: &PeerIdentity,
+    ) -> Vec<epix_core::PeerAddr>;
+    /// The working tracker set (`epix://host:port`), Beacon gossip.
+    async fn trackers(&self) -> Vec<String>;
+    /// One Kademlia RPC (opaque payload owned by epix-dht-net).
+    async fn kad(&self, payload: &[u8], from: &PeerIdentity) -> Result<Vec<u8>, String>;
+    /// One tracker announce (opaque payload owned by epix-discovery).
+    async fn announce(&self, payload: &[u8], from: &PeerIdentity) -> Result<Vec<u8>, String>;
+}
+
 /// Everything a serve loop needs.
 pub struct ServeCtx {
     pub store: Arc<Store>,
     pub provider: Arc<dyn SignedProvider>,
+    /// Control-plane services (None = content-only node; control
+    /// requests answer UNSUPPORTED and `caps::CONTROL` must not be set).
+    pub control: Option<Arc<dyn ControlProvider>>,
     /// This node's identity key (hex) for Hello/HelloAck binding sigs.
     pub privatekey: String,
     /// Capability bits to advertise.
@@ -107,6 +143,7 @@ impl ServeCtx {
         Self {
             store,
             provider,
+            control: None,
             privatekey,
             caps: caps::MESH,
             now: now_unix,
@@ -118,6 +155,13 @@ impl ServeCtx {
     /// Attach the shared upload governor.
     pub fn with_choker(mut self, choker: Arc<Mutex<Choker>>) -> Self {
         self.choker = Some(choker);
+        self
+    }
+
+    /// Attach the control-plane services and advertise `caps::CONTROL`.
+    pub fn with_control(mut self, control: Arc<dyn ControlProvider>) -> Self {
+        self.control = Some(control);
+        self.caps |= caps::CONTROL;
         self
     }
 }
@@ -325,7 +369,59 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             };
             let _ = conn.respond(stream, resp).await;
         }
+        // Control plane (caps::CONTROL). A content-only node (no control
+        // provider) answers UNSUPPORTED so a mis-gated dialer fails fast
+        // instead of hanging.
+        Req::UpdatesSince { after } => {
+            let resp = match &ctx.control {
+                Some(c) => {
+                    let (updates, head) = c.updates_since(after).await;
+                    Resp::Updates { updates, head }
+                }
+                None => unsupported(),
+            };
+            let _ = conn.respond(stream, resp).await;
+        }
+        Req::Pex { xite, need, peers } => {
+            let resp = match &ctx.control {
+                Some(c) => Resp::Peers { peers: c.pex(&xite, need, &peers, &identity).await },
+                None => unsupported(),
+            };
+            let _ = conn.respond(stream, resp).await;
+        }
+        Req::GetTrackers => {
+            let resp = match &ctx.control {
+                Some(c) => Resp::Trackers { trackers: c.trackers().await },
+                None => unsupported(),
+            };
+            let _ = conn.respond(stream, resp).await;
+        }
+        Req::Kad { payload } => {
+            let resp = match &ctx.control {
+                Some(c) => match c.kad(&payload, &identity).await {
+                    Ok(bytes) => Resp::Payload { bytes },
+                    Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
+                },
+                None => unsupported(),
+            };
+            let _ = conn.respond(stream, resp).await;
+        }
+        Req::Announce { payload } => {
+            let resp = match &ctx.control {
+                Some(c) => match c.announce(&payload, &identity).await {
+                    Ok(bytes) => Resp::Payload { bytes },
+                    Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
+                },
+                None => unsupported(),
+            };
+            let _ = conn.respond(stream, resp).await;
+        }
     }
+}
+
+/// The reply for a control request on a node that doesn't serve control.
+fn unsupported() -> Resp {
+    Resp::Err { code: err::UNSUPPORTED, msg: "control plane not served".into() }
 }
 
 async fn serve_range(

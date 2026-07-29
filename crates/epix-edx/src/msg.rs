@@ -26,6 +26,12 @@ pub mod caps {
     pub const SHARDS: u32 = 1 << 0;
     /// Accepts `Update` pushes for xites it seeds.
     pub const MESH: u32 = 1 << 1;
+    /// Serves the full CONTROL plane over EDX (`UpdatesSince`, `Pex`,
+    /// `GetTrackers`, `Kad`, `Announce`) — i.e. a dialer never needs the
+    /// legacy msgpack connection to talk to this peer. Gates the
+    /// prefer-EDX path during the coexistence window: a peer that does
+    /// not advertise this bit still gets msgpack for control ops.
+    pub const CONTROL: u32 = 1 << 2;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,6 +113,29 @@ pub enum Req {
         sender_peers: Vec<String>,
     },
     // --- Stage 4+ appends only below this line (postcard indices!) ---
+    //
+    // CONTROL PLANE (gated by `caps::CONTROL`): the successors to the
+    // legacy msgpack control commands, so EDX is the only peer wire.
+    // Domain payloads that belong to another crate's protocol ride as
+    // opaque bytes (same neutrality rule as `Update::diffs`) — epix-edx
+    // must not depend on epix-dht / epix-discovery.
+    /// `meshGetUpdates` successor: store-and-forward propagation hints
+    /// recorded after the caller's cursor. Answered `Resp::Updates`.
+    UpdatesSince { after: u64 },
+    /// `pex` successor: peer exchange for one xite. `peers` are addresses
+    /// the caller already knows (so the answer excludes them); `need` caps
+    /// how many to return. Answered `Resp::Peers`.
+    Pex { xite: String, need: u32, peers: Vec<PeerAddr> },
+    /// `getTrackers` successor: the peer's working tracker set (Beacon
+    /// gossip). Answered `Resp::Trackers`.
+    GetTrackers,
+    /// `kad` successor: one Kademlia RPC, encoded by `epix-dht-net`.
+    /// Answered `Resp::Payload`.
+    Kad { payload: Vec<u8> },
+    /// `announce` successor: a tracker announce/answer, encoded by
+    /// `epix-discovery` (the tracker payload shape is its own protocol).
+    /// Answered `Resp::Payload`.
+    Announce { payload: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,6 +156,17 @@ pub enum Resp {
     Ok,
     Err { code: u16, msg: String },
     // --- append only (postcard indices!) ---
+    //
+    // CONTROL PLANE replies (see the matching `Req` variants).
+    /// Propagation hints after the caller's cursor, plus the new cursor.
+    Updates { updates: Vec<(String, i64)>, head: u64 },
+    /// Connectable peers the caller lacked, plus our own reachable
+    /// overlay self-addresses.
+    Peers { peers: Vec<PeerAddr> },
+    /// Working tracker set (`epix://host:port` strings).
+    Trackers { trackers: Vec<String> },
+    /// Opaque reply for `Kad`/`Announce`, decoded by the owning crate.
+    Payload { bytes: Vec<u8> },
 }
 
 /// Error codes for `Resp::Err`.
@@ -136,6 +176,8 @@ pub mod err {
     pub const BAD_REQUEST: u16 = 400;
     pub const LIMIT: u16 = 413;
     pub const INTERNAL: u16 = 500;
+    /// Control-plane request on a node without a control provider.
+    pub const UNSUPPORTED: u16 = 501;
 }
 
 /// One multiplexed frame. `stream` ids are chosen by the requester and
@@ -206,6 +248,46 @@ mod tests {
                     sender_peers: vec!["abc.onion:15441".into(), "1.2.3.4:15441".into()],
                 }),
             },
+            // Control plane.
+            Frame { stream: 5, body: FrameBody::Req(Req::UpdatesSince { after: 42 }) },
+            Frame {
+                stream: 6,
+                body: FrameBody::Req(Req::Pex {
+                    xite: "1Abc".into(),
+                    need: 10,
+                    peers: vec![PeerAddr::parse("1.2.3.4:26552").unwrap()],
+                }),
+            },
+            Frame { stream: 7, body: FrameBody::Req(Req::GetTrackers) },
+            Frame { stream: 8, body: FrameBody::Req(Req::Kad { payload: vec![1, 2, 3] }) },
+            Frame { stream: 9, body: FrameBody::Req(Req::Announce { payload: vec![4, 5] }) },
+            Frame {
+                stream: 10,
+                body: FrameBody::Resp {
+                    last: true,
+                    resp: Resp::Updates { updates: vec![("1Abc".into(), 1_700_000_000)], head: 7 },
+                },
+            },
+            Frame {
+                stream: 11,
+                body: FrameBody::Resp {
+                    last: true,
+                    resp: Resp::Peers {
+                        peers: vec![PeerAddr::parse("5.6.7.8:26552").unwrap()],
+                    },
+                },
+            },
+            Frame {
+                stream: 12,
+                body: FrameBody::Resp {
+                    last: true,
+                    resp: Resp::Trackers { trackers: vec!["epix://t.example:6969".into()] },
+                },
+            },
+            Frame {
+                stream: 13,
+                body: FrameBody::Resp { last: true, resp: Resp::Payload { bytes: vec![9] } },
+            },
         ];
         for f in &frames {
             assert_eq!(&round_trip(f), f);
@@ -247,6 +329,12 @@ mod tests {
                 signed: vec![], inline: vec![],
                 modified: 0.0, diffs: vec![], sender_peers: vec![],
             }, 8),
+            // Control plane (appended for the msgpack retirement).
+            (Req::UpdatesSince { after: 0 }, 9),
+            (Req::Pex { xite: String::new(), need: 0, peers: vec![] }, 10),
+            (Req::GetTrackers, 11),
+            (Req::Kad { payload: vec![] }, 12),
+            (Req::Announce { payload: vec![] }, 13),
         ];
         for (req, disc) in reqs {
             let bytes =
@@ -275,6 +363,11 @@ mod tests {
             (Resp::Many { items: vec![] }, 5),
             (Resp::Ok, 6),
             (Resp::Err { code: 0, msg: String::new() }, 7),
+            // Control plane (appended for the msgpack retirement).
+            (Resp::Updates { updates: vec![], head: 0 }, 8),
+            (Resp::Peers { peers: vec![] }, 9),
+            (Resp::Trackers { trackers: vec![] }, 10),
+            (Resp::Payload { bytes: vec![] }, 11),
         ];
         for (resp, disc) in resps {
             let bytes = postcard::to_stdvec(&Frame {
