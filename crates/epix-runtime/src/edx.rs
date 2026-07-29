@@ -4,7 +4,8 @@
 //! node (see [`enable_serving`]); without one there is nowhere to hold
 //! content, so such a node fetches but does not seed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use epix_blob::store::Store;
@@ -248,6 +249,75 @@ fn store_quota() -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(EDX_STORE_QUOTA_BYTES)
+}
+
+/// How far ahead of the play position a served range prefetches. A few
+/// seconds of typical media over the next window so sequential playback finds
+/// the bytes already in the store, small enough that a seek away wastes little.
+const READAHEAD_BYTES: u64 = 6 * 1024 * 1024;
+
+/// Files at least this large get a one-time head+tail warm-up on first touch.
+/// Browsers read an mp4 moov atom (often at EOF) for metadata before playback;
+/// warming the tail keeps that fetch from stalling the start. Gated by SIZE,
+/// not extension - the content type is not always known here, and size is the
+/// safe signal for "media-ish, worth warming".
+const MOOV_MIN_SIZE: u64 = 4 * 1024 * 1024;
+
+/// The tail span warmed for the moov metadata a browser reads before playback.
+const MOOV_TAIL_BYTES: u64 = 1_536 * 1024;
+
+/// The head span ensured on first touch (container/init metadata).
+const MOOV_HEAD_BYTES: u64 = 1024 * 1024;
+
+/// How long a serve's dialed peers stay reusable by its read-ahead. A fetch
+/// path that redials is correct, just slower, so a stale entry only costs a
+/// wasted attempt (read-ahead is silent on failure).
+const PEER_CACHE_TTL: u64 = 15;
+
+/// Cap on the per-file streaming hints (`anchor`/`warmed`) kept in memory.
+/// These are only optimizations - a coalescing hint and a one-time moov-warm
+/// gate - and a partially watched or tail-probed file leaves an entry that no
+/// EOF-completion ever clears, so on a long-lived seeder streaming many
+/// distinct files the maps would grow without bound. At the cap the map is
+/// cleared: at worst a few files re-anchor or re-warm once, which is idempotent
+/// (read-ahead and moov warm both skip already-present groups).
+const MAX_STREAMING_FILES: usize = 4096;
+
+/// Decide the read-ahead window after serving `served` bytes of a file of
+/// `size`, given `anchor` = the from-offset of the last window we scheduled
+/// for this (address, inner_path), or `None` if none yet. Returns the byte
+/// window to prefetch and the new anchor to store, or `None` when there is
+/// nothing to do: at/past EOF, or the play head has not advanced since the
+/// last window (coalesce - a paused video re-requesting the same range must
+/// not re-arm a prefetch).
+///
+/// Pure so the window/seek logic is unit-tested without any network. The
+/// window always begins at the byte right after what the user just got, so
+/// sequential playback slides it forward and a seek RE-ANCHORS it at the new
+/// position automatically - a stale far-ahead region is never prefetched.
+fn plan_readahead(served: &Range<u64>, size: u64, anchor: Option<u64>) -> Option<(Range<u64>, u64)> {
+    let from = served.end.min(size);
+    let to = from.saturating_add(READAHEAD_BYTES).min(size);
+    if from >= to {
+        return None; // at or past EOF - nothing ahead to warm
+    }
+    if anchor == Some(from) {
+        return None; // play head unmoved since the last window - coalesce
+    }
+    Some((from..to, from))
+}
+
+/// The head and tail spans to warm on first touch of a large file (the mp4
+/// moov metadata a browser reads, often at EOF, before playback). `None`
+/// below the size threshold. Both ranges are clamped to the file. Pure, so
+/// the threshold and clamping are unit-tested without any network.
+fn moov_spans(size: u64) -> Option<(Range<u64>, Range<u64>)> {
+    if size < MOOV_MIN_SIZE {
+        return None;
+    }
+    let head = 0..MOOV_HEAD_BYTES.min(size);
+    let tail = size.saturating_sub(MOOV_TAIL_BYTES)..size;
+    Some((head, tail))
 }
 
 /// True unless `var` is explicitly set to a falsey value (`0`/`false`);
@@ -689,12 +759,56 @@ struct RuntimeEdxFetcher {
     /// same cache. Built once via [`RuntimeEdxFetcher::new`] so no construction
     /// site (there are many, including tests) can forget to initialize it.
     control_pool: Arc<ControlPool>,
+    /// Streaming read-ahead bookkeeping, Arc-shared like the fetcher so every
+    /// clone sees the same in-flight/anchor/warmed state.
+    streaming: Arc<Mutex<Streaming>>,
+    /// A serve's dialed peers, briefly cached per object so its read-ahead
+    /// reuses the same links instead of redialing. The serve itself always
+    /// builds fresh peers (correctness); this only warms the background path.
+    peer_cache: Arc<Mutex<HashMap<ObjId, CachedPeers>>>,
+}
+
+/// Per-file streaming state guarding read-ahead against firing an unbounded
+/// task per browser Range request.
+#[derive(Default)]
+struct Streaming {
+    /// Per (address, inner_path): the from-offset of the last read-ahead
+    /// window scheduled. Equal offset means the play head has not moved, so we
+    /// coalesce; a different offset advances or re-anchors the window.
+    anchor: HashMap<(String, String), u64>,
+    /// Files with a read-ahead task in flight - at most one per file, so a
+    /// burst of Range requests cannot fan out into a burst of prefetches.
+    inflight: HashSet<(String, String)>,
+    /// Files whose one-time moov head/tail warm-up has been kicked off.
+    warmed: HashSet<(String, String)>,
+}
+
+/// A serve's dialed peers, kept for a short TTL so its read-ahead reuses them.
+struct CachedPeers {
+    handles: Vec<PeerHandle>,
+    node_pks: HashMap<String, Vec<u8>>,
+    /// `now_secs` when built, for the TTL check.
+    at: u64,
+}
+
+/// Clone a peer handle (its `Conn` is a cheap multiplexed clone). `PeerHandle`
+/// is not `Clone`, so the peer cache clones field-by-field to hand a serve's
+/// links to its background read-ahead.
+fn clone_handle(h: &PeerHandle) -> PeerHandle {
+    PeerHandle { conn: h.conn.clone(), class: h.class, bits: h.bits.clone(), label: h.label.clone() }
 }
 
 impl RuntimeEdxFetcher {
     /// Build a fetcher with an empty control-link cache.
     fn new(state: Arc<AppState>, privatekey: String, choker: Option<SharedChoker>) -> Self {
-        Self { state, privatekey, choker, control_pool: Arc::default() }
+        Self {
+            state,
+            privatekey,
+            choker,
+            control_pool: Arc::default(),
+            streaming: Arc::default(),
+            peer_cache: Arc::default(),
+        }
     }
 
     /// Dial `peer`, bring up an EDX link past the Hello gate, and return the
@@ -928,6 +1042,141 @@ impl RuntimeEdxFetcher {
         Ok((handles, node_pks))
     }
 
+    /// Cache a serve's freshly dialed peers so its read-ahead reuses the links.
+    fn cache_peers(&self, id: ObjId, handles: &[PeerHandle], node_pks: &HashMap<String, Vec<u8>>) {
+        let now = now_secs();
+        let mut cache = self.peer_cache.lock().expect("peer_cache");
+        // Drop entries past their TTL before inserting. The TTL is otherwise
+        // only consulted to decide reuse, never retention, so without this a
+        // served object whose id is never fetched again keeps its entry - and
+        // its cloned peer `Conn`s - alive for the process lifetime. Pruning
+        // here (the only growth path, hit on every store-miss serve) bounds the
+        // map to the objects served within one TTL window.
+        cache.retain(|_, c| now.saturating_sub(c.at) < PEER_CACHE_TTL);
+        cache.insert(
+            id,
+            CachedPeers {
+                handles: handles.iter().map(clone_handle).collect(),
+                node_pks: node_pks.clone(),
+                at: now,
+            },
+        );
+    }
+
+    /// Peers for `id`, reused from the short-lived cache when a serve dialed
+    /// them recently, else dialed fresh and cached. Used only by the background
+    /// read-ahead / moov warm-up so a seek and its prefetch share links; the
+    /// user-facing serve always builds fresh peers itself.
+    async fn peers_for(
+        &self,
+        address: &str,
+        id: ObjId,
+    ) -> Result<(Vec<PeerHandle>, HashMap<String, Vec<u8>>), String> {
+        let now = now_secs();
+        {
+            let cache = self.peer_cache.lock().expect("peer_cache");
+            if let Some(hit) = cache.get(&id) {
+                if !hit.handles.is_empty() && now.saturating_sub(hit.at) < PEER_CACHE_TTL {
+                    return Ok((hit.handles.iter().map(clone_handle).collect(), hit.node_pks.clone()));
+                }
+            }
+        }
+        let (handles, node_pks) = self.build_peers(address, id).await?;
+        self.cache_peers(id, &handles, &node_pks);
+        Ok((handles, node_pks))
+    }
+
+    /// On the FIRST touch of a large file, kick off a one-time background warm
+    /// of the moov head+tail so the browser's metadata tail-fetch (often at
+    /// EOF) does not stall playback. No-op below the size threshold or after
+    /// the first touch. Never blocks or errors into the serve.
+    fn maybe_warm_moov(&self, address: &str, inner_path: &str, id: ObjId, size: u64) {
+        let Some((head, tail)) = moov_spans(size) else { return };
+        let key = (address.to_string(), inner_path.to_string());
+        {
+            let mut s = self.streaming.lock().expect("streaming");
+            if s.warmed.len() >= MAX_STREAMING_FILES {
+                s.warmed.clear(); // bound memory; a cleared file re-warms once
+            }
+            if !s.warmed.insert(key.clone()) {
+                return; // already warmed this file
+            }
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            // Tail first (the moov metadata that gates playback), then the head.
+            this.run_readahead(&key.0, id, size, tail).await;
+            this.run_readahead(&key.0, id, size, head).await;
+        });
+    }
+
+    /// After serving a range, arm the background read-ahead of the NEXT window.
+    /// Plans + reserves under the lock: coalesces an unmoved play head and caps
+    /// to one in-flight task per file, so a browser's burst of Range requests
+    /// cannot fan out into a burst of prefetches. Backpressure is inherent -
+    /// a paused video issues no Range requests, so this stops being called and
+    /// prefetch quiesces after the current window with no separate mechanism.
+    fn maybe_spawn_readahead(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: ObjId,
+        size: u64,
+        served: Range<u64>,
+    ) {
+        let key = (address.to_string(), inner_path.to_string());
+        let window = {
+            let mut s = self.streaming.lock().expect("streaming");
+            let anchor = s.anchor.get(&key).copied();
+            let Some((window, new_anchor)) = plan_readahead(&served, size, anchor) else {
+                return;
+            };
+            if s.inflight.contains(&key) {
+                return; // a read-ahead is already running for this file
+            }
+            if s.anchor.len() >= MAX_STREAMING_FILES {
+                s.anchor.clear(); // bound memory; a cleared file re-anchors once
+            }
+            s.anchor.insert(key.clone(), new_anchor);
+            s.inflight.insert(key.clone());
+            window
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.run_readahead(&key.0, id, size, window).await;
+            this.streaming.lock().expect("streaming").inflight.remove(&key);
+        });
+    }
+
+    /// Warm the store with `window` of `id` at the BACKGROUND deadline (never
+    /// competing with the tight-deadline range the user is watching), skipping
+    /// groups already present. Silent on any failure: read-ahead only warms the
+    /// cache and must never surface an error to the range response.
+    async fn run_readahead(&self, address: &str, id: ObjId, size: u64, window: Range<u64>) {
+        let Some(store) = self.state.edx_store().await else { return };
+        let now = now_secs();
+        // Only the groups of the window the store is still missing, so a
+        // re-watch or an overlap with the served range does no work.
+        let want = epix_blob::bitfield::groups_for_bytes(&window);
+        let present = store.present_bits(id).unwrap_or_default();
+        let mut needed = epix_blob::bitfield::GroupBits::new();
+        for gap in present.gaps(&want) {
+            needed.add(gap);
+        }
+        if needed.is_empty() {
+            return; // already warm
+        }
+        if store.ensure_sparse(id, Ns::Plain, size, now).is_err() {
+            return;
+        }
+        let Ok((handles, node_pks)) = self.peers_for(address, id).await else { return };
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+            self.credit(&report, &node_pks, now);
+        }
+        let _ = store.enforce_quota(store_quota());
+    }
+
     /// Dial `peers` (up to `cap`) ONCE and keep the links, so a batch fetches
     /// every file over the same connections instead of redialing per file (the
     /// redial-per-file cost of calling `fetch_file` in a loop). Object-
@@ -1148,25 +1397,41 @@ impl EdxFetcher for RuntimeEdxFetcher {
         if end <= start {
             return Ok(Some(Vec::new()));
         }
+        let served = start..end;
+
+        // Warm the moov head/tail once on the first touch of a large file, so
+        // the browser's metadata tail-fetch does not stall the start. Pure
+        // background; failures never reach this response.
+        self.maybe_warm_moov(address, inner_path, id, size);
 
         // Serve straight from the store if the covering range is already
         // present; otherwise fetch just the covering chunk groups (a seek,
-        // never the whole file).
-        if let Ok(bytes) = store.read_range(id, start, end - start, now) {
-            return Ok(Some(bytes));
-        }
-        let (handles, node_pks) = self.build_peers(address, id).await?;
-        let groups = epix_blob::bitfield::groups_for_bytes(&(start..end));
-        let mut needed = epix_blob::bitfield::GroupBits::new();
-        needed.add(groups.start..groups.end);
-        let mut swarm = Swarm::new(store.clone(), id, size);
-        let report = swarm
-            .fetch(&needed, &handles, Deadline::tight(), now)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.credit(&report, &node_pks, now);
-        let bytes = store.read_range(id, start, end - start, now).map_err(|e| e.to_string())?;
-        let _ = store.enforce_quota(store_quota());
+        // never the whole file). This served range must stay byte-exact at the
+        // tight deadline - read-ahead below is a pure background addition.
+        let bytes = if let Ok(bytes) = store.read_range(id, start, end - start, now) {
+            bytes
+        } else {
+            let (handles, node_pks) = self.build_peers(address, id).await?;
+            // Warm the peer cache so the read-ahead reuses these dialed links.
+            self.cache_peers(id, &handles, &node_pks);
+            let groups = epix_blob::bitfield::groups_for_bytes(&served);
+            let mut needed = epix_blob::bitfield::GroupBits::new();
+            needed.add(groups.start..groups.end);
+            let mut swarm = Swarm::new(store.clone(), id, size);
+            let report = swarm
+                .fetch(&needed, &handles, Deadline::tight(), now)
+                .await
+                .map_err(|e| e.to_string())?;
+            self.credit(&report, &node_pks, now);
+            let bytes =
+                store.read_range(id, start, end - start, now).map_err(|e| e.to_string())?;
+            let _ = store.enforce_quota(store_quota());
+            bytes
+        };
+
+        // Arm the background read-ahead of the next window. Does not block this
+        // response and can never error into it.
+        self.maybe_spawn_readahead(address, inner_path, id, size, served);
         Ok(Some(bytes))
     }
 
@@ -1822,6 +2087,119 @@ mod tests {
         // Only the covering groups were fetched: the object is NOT complete.
         let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
         assert!(!a_store.is_complete(id).unwrap(), "a seek must not pull the whole file");
+    }
+
+    /// Read-ahead window/anchor logic, tested as a pure function (no network):
+    /// sequential playback advances the window, a seek re-anchors it, a paused
+    /// reader (same range re-requested) arms no new prefetch, and it caps at EOF.
+    #[test]
+    fn readahead_window_advances_and_reanchors() {
+        let size = 100 * 1024 * 1024;
+
+        // First touch: window starts right after the served range, anchored there.
+        let (w0, a0) = plan_readahead(&(0..1_000_000), size, None).unwrap();
+        assert_eq!(w0.start, 1_000_000);
+        assert_eq!(w0.end, 1_000_000 + READAHEAD_BYTES);
+        assert_eq!(a0, 1_000_000);
+
+        // Sequential playback: a later range slides the window forward.
+        let (w1, a1) = plan_readahead(&(1_000_000..2_000_000), size, Some(a0)).unwrap();
+        assert_eq!(w1.start, 2_000_000);
+        assert!(w1.start > w0.start, "window advanced with the play head");
+        assert_eq!(a1, 2_000_000);
+
+        // Paused: the SAME range is re-requested (browser re-issues). The play
+        // head has not moved, so no new prefetch is armed - this is the
+        // inherent backpressure, not a separate mechanism.
+        assert!(
+            plan_readahead(&(1_000_000..2_000_000), size, Some(a1)).is_none(),
+            "an unmoved play head coalesces to no new read-ahead"
+        );
+
+        // Seek far away: the window re-anchors at the new position, not the
+        // stale one just ahead of the old play head.
+        let (w2, a2) = plan_readahead(&(50_000_000..50_500_000), size, Some(a1)).unwrap();
+        assert_eq!(w2.start, 50_500_000, "seek re-anchored the window");
+        assert_eq!(a2, 50_500_000);
+
+        // Near EOF: the window is capped to the file, never past it.
+        let (w3, _) = plan_readahead(&(size - 100..size - 50), size, Some(0)).unwrap();
+        assert_eq!(w3.end, size, "window capped at EOF");
+        // Serving the exact tail leaves nothing ahead to warm.
+        assert!(plan_readahead(&(size - 10..size), size, None).is_none());
+    }
+
+    /// moov head/tail span selection: gated by size, and both spans clamp to
+    /// the file. Pure - no network.
+    #[test]
+    fn moov_spans_gate_on_size_and_clamp() {
+        // Below the threshold: no warm-up.
+        assert!(moov_spans(1024).is_none());
+        assert!(moov_spans(MOOV_MIN_SIZE - 1).is_none());
+
+        // At/above the threshold: a head from 0 and a tail ending at EOF.
+        let big = 20 * 1024 * 1024;
+        let (head, tail) = moov_spans(big).unwrap();
+        assert_eq!(head, 0..MOOV_HEAD_BYTES);
+        assert_eq!(tail, big - MOOV_TAIL_BYTES..big);
+        assert_eq!(tail.end, big, "tail reaches EOF where the moov atom lives");
+    }
+
+    /// End to end: a range fetch near the start of a file spawns a background
+    /// read-ahead that warms the rest of the store WITHOUT the caller waiting,
+    /// the served bytes are byte-exact regardless, and a re-fetch of an
+    /// already-warm range does no work (skips present groups). The seeder's
+    /// movie is 400 KB, below the read-ahead window, so the whole tail warms.
+    #[tokio::test]
+    async fn read_ahead_warms_the_store_after_a_range_serve() {
+        let (address, content_bytes, content, movie, addr, _pk) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content.clone()) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        state_a.set_edx_store(a_store.clone()).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+        std::mem::forget(a_dir);
+        std::mem::forget(a_store_dir);
+
+        // Serve a small range at the start. The bytes must be exactly right.
+        let (start, len) = (0u64, 20_000u64);
+        let served = match state_a.edx_fetch_range(&address, "movie.bin", start, len).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range fetch: {other:?}"),
+        };
+        assert_eq!(served, movie[..len as usize], "served range is byte-exact");
+
+        // The background read-ahead warms the rest of the file (window covers
+        // it since the movie is smaller than READAHEAD_BYTES). Poll for it -
+        // the serve did NOT wait on it.
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !a_store.is_complete(id).unwrap() {
+            assert!(std::time::Instant::now() < deadline, "read-ahead never warmed the store");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Whole file present: a re-fetch of any range is served from the store
+        // and is still byte-exact (read-ahead skipped the already-present groups).
+        let seek = match state_a.edx_fetch_range(&address, "movie.bin", 300_000, 40_000).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("re-fetch: {other:?}"),
+        };
+        assert_eq!(seek, movie[300_000..340_000], "re-fetched range is byte-exact");
     }
 
     /// Social/forum content over EDX: a per-user file declared in a child
