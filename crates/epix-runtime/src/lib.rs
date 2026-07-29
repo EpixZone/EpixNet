@@ -381,7 +381,18 @@ impl NodeRuntime {
     pub async fn shutdown(self) {
         self.shutdown.notify_waiters();
         for handle in self.handles {
-            let _ = handle.await;
+            // `notify_waiters` wakes only the loops parked on `notified()` at the
+            // instant it fires. A loop busy inside its tick body (e.g. the resync
+            // loop mid-fetch when its interval is short and the machine is loaded)
+            // misses that one-shot wakeup and, if its next tick is already due,
+            // hot-spins without ever re-parking to see it - so a plain
+            // `handle.await` here can block teardown forever. Give each loop a
+            // short grace window to wind down cleanly, then abort so shutdown
+            // always completes.
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(2), handle).await.is_err() {
+                abort.abort();
+            }
         }
     }
 }

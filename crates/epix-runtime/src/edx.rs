@@ -631,6 +631,46 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
     Some(es)
 }
 
+/// Per-peer cache of live EDX links for the short control RPCs (PEX, Kad,
+/// Announce, UpdatesSince, GetTrackers). A single DHT lookup or announce fans
+/// the same handful of contacts out many times; without reuse each redials a
+/// full Noise-XX handshake and holds an overlay stream for a whole request
+/// timeout. A pooled `Conn` is multiplexed, so concurrent control ops sharing
+/// one link are correct. The `Arc<ConnHandle>` is kept beside the `Conn` so
+/// the link's diagnostics row lives while it is pooled and so `note_cmd_sent`
+/// can annotate it; only the bulk fetch paths (which open and drain a session)
+/// still dial fresh - those are never pooled.
+#[derive(Default)]
+struct ControlPool {
+    conns: Mutex<HashMap<PeerAddr, (Conn, Arc<ConnHandle>)>>,
+}
+
+impl ControlPool {
+    /// A live pooled link for `peer`, or None. A closed one is dropped so the
+    /// caller redials (reuse-if-not-closed-else-redial, like `epix_edx::Pool`).
+    fn live(&self, peer: &PeerAddr) -> Option<(Conn, Arc<ConnHandle>)> {
+        let mut map = self.conns.lock().expect("control pool");
+        match map.get(peer) {
+            Some((c, reg)) if !c.is_closed() => Some((c.clone(), reg.clone())),
+            Some(_) => {
+                map.remove(peer);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn store(&self, peer: PeerAddr, conn: Conn, reg: Arc<ConnHandle>) {
+        self.conns.lock().expect("control pool").insert(peer, (conn, reg));
+    }
+
+    /// Drop a peer's cached link (a control op errored on it, so a possibly
+    /// dead link is not handed to the next caller).
+    fn evict(&self, peer: &PeerAddr) {
+        self.conns.lock().expect("control pool").remove(peer);
+    }
+}
+
 /// Fetches a file's bytes over the EDX verified-streaming path: dial the
 /// xite's connectable peers as EDX links, learn what each holds, run the
 /// swarm scheduler into the object store, then materialize the completed
@@ -644,9 +684,19 @@ struct RuntimeEdxFetcher {
     /// Shared upload governor; when present, peers that serve us are credited
     /// after each fetch so they earn faster service from us in return.
     choker: Option<SharedChoker>,
+    /// Reused links for the short control RPCs. Arc-shared because the fetcher
+    /// is Arc-shared and cloned per session, so every clone must pool into the
+    /// same cache. Built once via [`RuntimeEdxFetcher::new`] so no construction
+    /// site (there are many, including tests) can forget to initialize it.
+    control_pool: Arc<ControlPool>,
 }
 
 impl RuntimeEdxFetcher {
+    /// Build a fetcher with an empty control-link cache.
+    fn new(state: Arc<AppState>, privatekey: String, choker: Option<SharedChoker>) -> Self {
+        Self { state, privatekey, choker, control_pool: Arc::default() }
+    }
+
     /// Dial `peer`, bring up an EDX link past the Hello gate, and return the
     /// connection, the peer's authenticated identity, and the link's entry in
     /// the diagnostics connection registry.
@@ -706,21 +756,44 @@ impl RuntimeEdxFetcher {
         .map_err(|_| "EDX dial timed out".to_string())?
     }
 
-    /// Dial `peer` and run ONE control-plane request over the fresh link,
-    /// bounded like every other post-dial request. These are single
-    /// round trips (no session to reuse), so the link is dropped after.
-    /// Both an unreachable peer and a stalled request are `Err`: the caller
-    /// scores the peer and asks another.
-    async fn control<T, F, Fut>(&self, peer: &PeerAddr, f: F) -> Result<T, String>
+    /// A live EDX link to `peer` for a control RPC, reused from the cache when
+    /// one is still open or dialed and cached otherwise. Returns the multiplexed
+    /// `Conn` plus its registry row so the caller can annotate `last cmd sent`.
+    async fn control_link(&self, peer: &PeerAddr) -> Result<(Conn, Arc<ConnHandle>), String> {
+        if let Some(hit) = self.control_pool.live(peer) {
+            return Ok(hit);
+        }
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let (conn, _identity, reg) = self.dial(&transport, peer).await?;
+        self.control_pool.store(peer.clone(), conn.clone(), reg.clone());
+        Ok((conn, reg))
+    }
+
+    /// Run ONE control-plane request over a cached (or freshly dialed) link to
+    /// `peer`, bounded like every other post-dial request. `label` names the op
+    /// for the Stats page's `last cmd sent` column. Reusing the link across a
+    /// DHT lookup's many self-claims avoids a fresh Noise handshake per RPC; a
+    /// pooled `Conn` is multiplexed so concurrent ops on it are fine. Both an
+    /// unreachable peer and a stalled request are `Err`, and a dead-on-arrival
+    /// link is evicted so it is not reused: the caller scores the peer and asks
+    /// another.
+    async fn control<T, F, Fut>(&self, peer: &PeerAddr, label: &str, f: F) -> Result<T, String>
     where
         F: FnOnce(Conn) -> Fut,
         Fut: std::future::Future<Output = std::io::Result<T>>,
     {
-        let transport = self.state.transport().await.ok_or("no transport")?;
-        let (conn, _identity, _reg) = self.dial(&transport, peer).await?;
+        let (conn, reg) = self.control_link(peer).await?;
+        reg.note_cmd_sent(label, None);
         match tokio::time::timeout(EDX_FETCH_TIMEOUT, f(conn)).await {
-            Ok(r) => r.map_err(|e| e.to_string()),
-            Err(_) => Err("EDX control request timed out".into()),
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                self.control_pool.evict(peer);
+                Err(e.to_string())
+            }
+            Err(_) => {
+                self.control_pool.evict(peer);
+                Err("EDX control request timed out".into())
+            }
         }
     }
 
@@ -754,7 +827,8 @@ impl RuntimeEdxFetcher {
             let mut handles: Vec<PeerHandle> = Vec::new();
             let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
             for peer in &peers {
-                let Ok((conn, identity, _reg)) = self.dial(&transport, peer).await else { continue };
+                let Ok((conn, identity, reg)) = self.dial(&transport, peer).await else { continue };
+                reg.note_cmd_sent("GetBitfield", Some(address));
                 if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
                     .await
@@ -837,7 +911,8 @@ impl RuntimeEdxFetcher {
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for peer in peers {
-            let Ok((conn, identity, _reg)) = self.dial(&transport, &peer).await else { continue };
+            let Ok((conn, identity, reg)) = self.dial(&transport, &peer).await else { continue };
+            reg.note_cmd_sent("GetBitfield", Some(address));
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
                     .await
@@ -880,13 +955,14 @@ impl RuntimeEdxFetcher {
         while let Some(res) = join.join_next().await {
             let Ok((peer, r)) = res else { continue };
             match r {
-                Ok((conn, identity, _reg)) => {
+                Ok((conn, identity, reg)) => {
                     outcomes.push((peer.clone(), true));
                     out.push(SessionPeer {
                         conn,
                         class: Class::of_addr(&peer),
                         label: peer.to_string(),
                         node_pk: identity.node_pk,
+                        reg,
                     });
                 }
                 Err(_) => outcomes.push((peer, false)),
@@ -916,6 +992,7 @@ impl RuntimeEdxFetcher {
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for p in session {
+            p.reg.note_cmd_sent("GetBitfield", None);
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&p.conn, id))
                     .await
@@ -948,6 +1025,9 @@ struct SessionPeer {
     class: Class,
     label: String,
     node_pk: Vec<u8>,
+    /// The link's diagnostics row, kept so requests issued over this reused
+    /// link can stamp `last cmd sent` on it.
+    reg: Arc<ConnHandle>,
 }
 
 #[async_trait::async_trait]
@@ -1006,7 +1086,8 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // failure is Err (peer unreachable - score ConnectFail); a live peer
         // that simply does not serve this content answers with an error we
         // map to Ok(None) (score FileFail), so the caller tries another peer.
-        let (conn, _identity, _reg) = self.dial(&transport, &peer).await?;
+        let (conn, _identity, reg) = self.dial(&transport, &peer).await?;
+        reg.note_cmd_sent("GetSigned", Some(address));
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
             epix_edx::fetch::fetch_signed(&conn, address, inner_path),
@@ -1035,6 +1116,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         }
         for path in paths {
             for p in &session {
+                p.reg.note_cmd_sent("GetSigned", Some(address));
                 if let Ok(Ok(bytes)) = tokio::time::timeout(
                     EDX_FETCH_TIMEOUT,
                     epix_edx::fetch::fetch_signed(&p.conn, address, &path),
@@ -1104,8 +1186,9 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // after the link is up means it answered but refused (alive).
         let transport =
             self.state.transport().await.ok_or_else(|| EdxPushError::Unreachable("no transport".into()))?;
-        let (conn, _identity, _reg) =
+        let (conn, _identity, reg) =
             self.dial(&transport, &peer).await.map_err(EdxPushError::Unreachable)?;
+        reg.note_cmd_sent("Update", Some(address));
         // The link is up: from here a timeout is a slow-but-live peer, not an
         // unreachable one (the caller scores it Refused, not a backoff).
         progressed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1266,6 +1349,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
                 if want.is_empty() {
                     break;
                 }
+                peer.reg.note_cmd_sent("GetMany", Some(address));
                 for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
                     let _ = tokio::time::timeout(
                         EDX_FETCH_TIMEOUT,
@@ -1333,7 +1417,8 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // Same split as fetch_signed: Err = unreachable (score ConnectFail),
         // Ok(None) = alive but served no list, so try another peer.
         let transport = self.state.transport().await.ok_or("no transport")?;
-        let (conn, _identity, _reg) = self.dial(&transport, &peer).await?;
+        let (conn, _identity, reg) = self.dial(&transport, &peer).await?;
+        reg.note_cmd_sent("ListSigned", Some(address));
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
             epix_edx::fetch::list_signed(&conn, address, since),
@@ -1353,25 +1438,28 @@ impl EdxFetcher for RuntimeEdxFetcher {
         have: Vec<PeerAddr>,
     ) -> Result<Vec<PeerAddr>, String> {
         let address = address.to_string();
-        self.control(&peer, move |conn| async move {
+        self.control(&peer, "Pex", move |conn| async move {
             epix_edx::fetch::pex(&conn, &address, need, have).await
         })
         .await
     }
 
     async fn get_trackers(&self, peer: PeerAddr) -> Result<Vec<String>, String> {
-        self.control(&peer, |conn| async move { epix_edx::fetch::get_trackers(&conn).await }).await
+        self.control(&peer, "GetTrackers", |conn| async move {
+            epix_edx::fetch::get_trackers(&conn).await
+        })
+        .await
     }
 
     async fn kad(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-        self.control(&peer, move |conn| async move {
+        self.control(&peer, "Kad", move |conn| async move {
             epix_edx::fetch::kad(&conn, payload).await
         })
         .await
     }
 
     async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-        self.control(&peer, move |conn| async move {
+        self.control(&peer, "Announce", move |conn| async move {
             epix_edx::fetch::announce(&conn, payload).await
         })
         .await
@@ -1382,7 +1470,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         peer: PeerAddr,
         after: u64,
     ) -> Result<(Vec<(String, i64)>, u64), String> {
-        self.control(&peer, move |conn| async move {
+        self.control(&peer, "UpdatesSince", move |conn| async move {
             epix_edx::fetch::updates_since(&conn, after).await
         })
         .await
@@ -1464,8 +1552,7 @@ pub async fn enable_serving(
         }
     };
     state.set_edx_store(store.clone()).await;
-    let fetcher =
-        Arc::new(RuntimeEdxFetcher { state: state.clone(), privatekey, choker });
+    let fetcher = Arc::new(RuntimeEdxFetcher::new(state.clone(), privatekey, choker));
     state.set_edx_fetcher(fetcher.clone()).await;
     // Same object behind both seams: the warm pool needs only a ping, so it
     // takes the narrow one.
@@ -1635,11 +1722,11 @@ mod tests {
         let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
         state_a.set_edx_store(a_store).await;
         state_a
-            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                state: state_a.clone(),
-                privatekey: epix_crypt::new_seed(),
-                choker: None,
-            }))
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
@@ -1673,11 +1760,11 @@ mod tests {
         let a_store_dir = tempfile::tempdir().unwrap();
         state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
         state_a
-            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                state: state_a.clone(),
-                privatekey: epix_crypt::new_seed(),
-                choker: None,
-            }))
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
             .await;
 
         let want = vec![
@@ -1715,11 +1802,11 @@ mod tests {
         let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
         state_a.set_edx_store(a_store.clone()).await;
         state_a
-            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                state: state_a.clone(),
-                privatekey: epix_crypt::new_seed(),
-                choker: None,
-            }))
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
@@ -1811,11 +1898,11 @@ mod tests {
         let a_store_dir = tempfile::tempdir().unwrap();
         state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
         state_a
-            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                state: state_a.clone(),
-                privatekey: epix_crypt::new_seed(),
-                choker: None,
-            }))
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
@@ -1972,11 +2059,8 @@ mod tests {
         let a_store_dir = tempfile::tempdir().unwrap();
         state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
         std::mem::forget(a_store_dir);
-        let fetcher = RuntimeEdxFetcher {
-            state: state_a.clone(),
-            privatekey: epix_crypt::new_seed(),
-            choker: None,
-        };
+        let fetcher =
+            RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
 
         let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pushed = fetcher
@@ -2081,11 +2165,11 @@ mod tests {
         let a_store_dir = tempfile::tempdir().unwrap();
         state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
         state_a
-            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                state: state_a.clone(),
-                privatekey: epix_crypt::new_seed(),
-                choker: None,
-            }))
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
@@ -2117,11 +2201,11 @@ mod tests {
         // Reciprocity on: the fetcher holds the shared choker.
         let choker: SharedChoker = Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS)));
         state_a
-            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                state: state_a.clone(),
-                privatekey: epix_crypt::new_seed(),
-                choker: Some(choker.clone()),
-            }))
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                Some(choker.clone()),
+            )))
             .await;
 
         assert!(state_a.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
@@ -2142,11 +2226,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         state_a.set_edx_store(Arc::new(Store::open(dir.path()).unwrap())).await;
         std::mem::forget(dir);
-        let fetcher = RuntimeEdxFetcher {
-            state: state_a.clone(),
-            privatekey: epix_crypt::new_seed(),
-            choker: None,
-        };
+        let fetcher =
+            RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
         let peer = PeerAddr::Ip(addr);
 
         let entries = fetcher.list_signed(peer.clone(), &address, 0).await.unwrap().unwrap();
@@ -2223,11 +2304,8 @@ mod tests {
         let a_store_dir = tempfile::tempdir().unwrap();
         state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
         std::mem::forget(a_store_dir);
-        let fetcher = RuntimeEdxFetcher {
-            state: state_a.clone(),
-            privatekey: epix_crypt::new_seed(),
-            choker: None,
-        };
+        let fetcher =
+            RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
         let peer = PeerAddr::Ip(addr);
 
         // The handshake advertises the control plane and the release version.
@@ -2292,11 +2370,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         state.set_edx_store(Arc::new(Store::open(dir.path()).unwrap())).await;
         std::mem::forget(dir);
-        let fetcher = RuntimeEdxFetcher {
-            state: state.clone(),
-            privatekey: epix_crypt::new_seed(),
-            choker: None,
-        };
+        let fetcher = RuntimeEdxFetcher::new(state.clone(), epix_crypt::new_seed(), None);
         let peer = PeerAddr::Ip(addr);
 
         let link = fetcher.open_link(peer.clone()).await.expect("warm link");
@@ -2429,11 +2503,11 @@ mod tests {
             let sd = tempfile::tempdir().unwrap();
             state.set_edx_store(Arc::new(Store::open(sd.path()).unwrap())).await;
             state
-                .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-                    state: state.clone(),
-                    privatekey: epix_crypt::new_seed(),
-                    choker: None,
-                }))
+                .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                    state.clone(),
+                    epix_crypt::new_seed(),
+                    None,
+                )))
                 .await;
             state.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
             std::mem::forget(dir);
