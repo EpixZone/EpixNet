@@ -68,8 +68,9 @@ impl Rollup {
         self.map.get(item)
     }
 
-    /// Content-address the rollup blob (verifiable by re-derivation).
-    pub fn root(&self) -> ObjId {
+    /// Serialize to deterministic bytes, so the rollup blob can be
+    /// content-addressed and served as an EDX object (one blob paints a gallery).
+    pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"EDXROLL1");
         bytes.extend_from_slice(&(self.map.len() as u32).to_le_bytes());
@@ -88,7 +89,12 @@ impl Rollup {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
         }
-        ObjId::of(&bytes)
+        bytes
+    }
+
+    /// Content-address the rollup blob (verifiable by re-derivation).
+    pub fn root(&self) -> ObjId {
+        ObjId::of(&self.serialize())
     }
 }
 

@@ -9,6 +9,10 @@ epix-core = { path = "../epix-core" }
 epix-content = { path = "../epix-content" }
 epix-xite = { path = "../epix-xite" }
 epix-blob = { path = "../epix-blob" }
+# Deterministic feed organization (segments, checkpoints, index-by-target,
+# reaction counts, rollups). The node derives these read-only from the signed
+# OR-set records it already stores; see src/feed.rs.
+epix-feed = { path = "../epix-feed" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
 # The tracker announce types (`tracker_pc`), shared by the msgpack and EDX

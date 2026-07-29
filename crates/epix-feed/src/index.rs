@@ -62,9 +62,9 @@ impl TargetIndex {
         self.map.keys()
     }
 
-    /// Serialize to deterministic bytes and content-address them, so the
-    /// index blob itself is verifiable by re-derivation.
-    pub fn root(&self) -> ObjId {
+    /// Serialize to deterministic bytes, so the index blob itself can be
+    /// content-addressed and served as an EDX object (verified by re-derivation).
+    pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"EDXIDX1");
         bytes.extend_from_slice(&(self.map.len() as u32).to_le_bytes());
@@ -78,7 +78,12 @@ impl TargetIndex {
                 bytes.extend_from_slice(&l.len.to_le_bytes());
             }
         }
-        ObjId::of(&bytes)
+        bytes
+    }
+
+    /// The index blob's content address (BLAKE3 of [`Self::serialize`]).
+    pub fn root(&self) -> ObjId {
+        ObjId::of(&self.serialize())
     }
 }
 

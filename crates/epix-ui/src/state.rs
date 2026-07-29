@@ -668,6 +668,10 @@ pub struct AppState {
     /// in `serverInfo.ui_port` so the dashboard builds correct links.
     ui_port: RwLock<u16>,
     xites: RwLock<HashMap<String, ManagedXite>>,
+    /// Derived feed artifacts per `address -> feed name -> artifacts`. A pure,
+    /// recomputable read cache over the xite's signed OR-set records (see
+    /// [`crate::feed`]); never persisted, rebuilt on demand and on merge.
+    feed_cache: RwLock<HashMap<String, HashMap<String, crate::feed::FeedArtifacts>>>,
     user: RwLock<User>,
     user_path: Option<PathBuf>,
     nonce_counter: AtomicU64,
@@ -1248,6 +1252,7 @@ impl AppState {
             rev: RwLock::new("0".to_string()),
             ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
+            feed_cache: RwLock::new(HashMap::new()),
             user: RwLock::new(User::generate()),
             user_path: None,
             nonce_counter: AtomicU64::new(1),
@@ -1391,6 +1396,7 @@ impl AppState {
             rev: RwLock::new("0".to_string()),
             ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
+            feed_cache: RwLock::new(HashMap::new()),
             user: RwLock::new(user),
             user_path: Some(user_path),
             nonce_counter: AtomicU64::new(1),
@@ -8849,6 +8855,9 @@ impl AppState {
                 if after != before {
                     self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
                         .await;
+                    // New records landed: re-derive the feed cache off the merge
+                    // path (a no-op unless this xite declares feeds). Read-only.
+                    self.recompute_feeds(address).await;
                 }
             }
         }
@@ -8924,6 +8933,179 @@ impl AppState {
             let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
             self.fetch_and_merge_records(address, &mpath, &signers, None, peers).await;
         }
+    }
+
+    // ---- Feed engine (derived, read-only cache over the OR-set records) -----
+
+    /// The owner-signed feed descriptors declared in a xite's root content.json
+    /// `"feeds"` object. Empty when the xite declares none (the common case),
+    /// so the whole feed path is inert for a xite that never opts in.
+    pub async fn feed_descriptors(
+        &self,
+        address: &str,
+    ) -> Vec<epix_feed::adapter::FeedDescriptor> {
+        let Some(content) = self.content(address).await else {
+            return Vec::new();
+        };
+        let Some(feeds) = content.get("feeds").and_then(|v| v.as_object()) else {
+            return Vec::new();
+        };
+        let common = feeds.get("_common");
+        feeds
+            .iter()
+            .filter(|(name, _)| name.as_str() != "_common")
+            .filter_map(|(name, obj)| {
+                epix_feed::adapter::FeedDescriptor::parse(name, obj, common)
+            })
+            .collect()
+    }
+
+    /// Gather the VERIFIED records for one feed across its `files` glob. Reads
+    /// only: for every content.json unit, resolves the same authorized signer
+    /// set the merge path uses, re-verifies each record, and converts survivors
+    /// with the descriptor adapter. Never writes, never re-signs.
+    async fn gather_feed_records(
+        &self,
+        address: &str,
+        desc: &epix_feed::adapter::FeedDescriptor,
+    ) -> Vec<epix_feed::Record> {
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return Vec::new();
+        };
+        let Ok(view) = self.xite_view(address).await else {
+            return Vec::new();
+        };
+        let now = epix_core::now_ms();
+        let mut out = Vec::new();
+        for content_path in walk_content_json(storage.root()) {
+            let Ok(bytes) = storage.read(&content_path) else { continue };
+            let Ok(content) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            let merge_paths = epix_content::declared_merge_files(&content);
+            if merge_paths.is_empty() {
+                continue;
+            }
+            let dir =
+                content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+            // Only resolve signers once per unit, and only if a declared merge
+            // file actually matches this feed's glob.
+            let mut signers: Option<Vec<String>> = None;
+            for rel in merge_paths {
+                let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
+                if !crate::feed::glob_match(&desc.files, &mpath) {
+                    continue;
+                }
+                let Ok(cbytes) = storage.read(&mpath) else { continue };
+                let Ok(container) = serde_json::from_slice::<Value>(&cbytes) else { continue };
+                // Honour the descriptor's declared record_format (untrusted
+                // marker, but a mismatch means these aren't this feed's records).
+                let fmt = container.get("record_format").and_then(|v| v.as_str()).unwrap_or("");
+                if fmt != desc.record_format {
+                    continue;
+                }
+                let Some(records) = container.get(&desc.record_key).and_then(|v| v.as_array())
+                else {
+                    continue;
+                };
+                if signers.is_none() {
+                    let xid_map = Self::resolve_xid_map(&storage, &content_path).await;
+                    signers = Some(view.valid_signers_for(&content_path, &xid_map));
+                }
+                let signers_ref = signers.as_deref().unwrap_or(&[]);
+                for record in records {
+                    if epix_content::verify_record(record, signers_ref, now).is_err() {
+                        continue;
+                    }
+                    let canonical = epix_content::dumps_sorted(record).into_bytes();
+                    if let Ok(r) = epix_feed::adapter::record_from_value(desc, record, canonical) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Re-derive every feed for a xite and cache the artifacts, inserting the
+    /// sealed (immutable) segment blobs into the EDX object store so they serve
+    /// over the wire like any content-addressed object. Pure and additive: a
+    /// no-op for a xite that declares no feeds, and it never touches stored
+    /// records, signatures, merge files, or the sqlite db. Idempotent - an
+    /// unchanged sealed segment dedups on insert.
+    pub async fn recompute_feeds(&self, address: &str) {
+        let descriptors = self.feed_descriptors(address).await;
+        if descriptors.is_empty() {
+            return;
+        }
+        let now = epix_core::now_ms();
+        let store = self.edx_store().await;
+        let mut derived = HashMap::new();
+        for desc in descriptors {
+            let records = self.gather_feed_records(address, &desc).await;
+            let artifacts = crate::feed::derive_feed(records, now);
+            // Cache the sealed segments as EDX objects (content-addressed by
+            // their own BLAKE3 root); pin so they survive eviction. Losing one
+            // is harmless - it recomputes from the records.
+            if let Some(store) = &store {
+                let ts = now.max(0) as u64;
+                for seg in &artifacts.sealed {
+                    if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() {
+                        let _ = store.pin(seg.root);
+                    }
+                }
+            }
+            derived.insert(desc.name.clone(), artifacts);
+        }
+        self.feed_cache.write().await.insert(address.to_string(), derived);
+    }
+
+    /// The cached artifacts for one feed, recomputing on a cache miss so the
+    /// first query after boot still answers. Returns `None` only when the xite
+    /// declares no such feed.
+    async fn feed_artifacts(
+        &self,
+        address: &str,
+        feed: &str,
+    ) -> Option<crate::feed::FeedArtifacts> {
+        if let Some(a) =
+            self.feed_cache.read().await.get(address).and_then(|m| m.get(feed)).cloned()
+        {
+            return Some(a);
+        }
+        self.recompute_feeds(address).await;
+        self.feed_cache.read().await.get(address).and_then(|m| m.get(feed)).cloned()
+    }
+
+    /// `feedItemQuery`: the live records attached to `target` (a post's
+    /// comments, or the post itself), plus its reaction counts and the roots a
+    /// caller can re-derive to verify. Read-only.
+    pub async fn feed_item_query(
+        &self,
+        address: &str,
+        feed: &str,
+        target: &str,
+        limit: Option<usize>,
+        before_clock: Option<u64>,
+    ) -> Result<Value, String> {
+        let art = self
+            .feed_artifacts(address, feed)
+            .await
+            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+        Ok(crate::feed::item_query(&art, target, limit, before_clock))
+    }
+
+    /// `feedGalleryRollup`: per-item counts for a gallery landing page in one
+    /// blob. Read-only.
+    pub async fn feed_gallery_rollup(
+        &self,
+        address: &str,
+        feed: &str,
+        items: &[String],
+    ) -> Result<Value, String> {
+        let art = self
+            .feed_artifacts(address, feed)
+            .await
+            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+        Ok(crate::feed::gallery_rollup(&art, items))
     }
 
     /// Right after a content pull, fetch + merge the declared merge files for

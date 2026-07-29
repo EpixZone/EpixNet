@@ -553,6 +553,9 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalLimitStats),
         Arc::new(OptionalLimitSet),
         Arc::new(DbQuery),
+        // Derived feed engine (read-only; not admin-gated, like dbQuery).
+        Arc::new(FeedItemQuery),
+        Arc::new(FeedGalleryRollup),
         // xID identity resolution (the XidResolver plugin's WS API;
         // xidResolveName is registered with the chain commands above).
         Arc::new(XidResolve { cmd: "xidResolve" }),
@@ -1488,6 +1491,76 @@ impl WsCommand for DbQuery {
         };
         let rows = s.state.db_query(address, query, &params).await?;
         Ok(Value::Array(rows))
+    }
+}
+
+/// `feedItemQuery({feed, target, limit?, before_clock?})` - the live records
+/// attached to `target` (a post's comments, or the post itself) plus its
+/// reaction counts, from the derived feed cache. Read-only; not admin-gated, so
+/// a bound app page calls it directly like `dbQuery`. Merger-aware via the
+/// bound address.
+struct FeedItemQuery;
+#[async_trait]
+impl WsCommand for FeedItemQuery {
+    fn name(&self) -> &'static str {
+        "feedItemQuery"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let arg = |key: &str, idx: usize| -> Option<Value> {
+            p.get(key).cloned().or_else(|| p.as_array().and_then(|a| a.get(idx).cloned()))
+        };
+        let feed = arg("feed", 0)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("feedItemQuery: feed required")?;
+        let target = arg("target", 1)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("feedItemQuery: target required")?;
+        let limit = arg("limit", 2).and_then(|v| v.as_u64()).map(|n| n as usize);
+        let before_clock = arg("before_clock", 3).and_then(|v| v.as_u64());
+        s.state.feed_item_query(address, &feed, &target, limit, before_clock).await
+    }
+}
+
+/// Cap on caller-supplied `feedGalleryRollup` items. `gallery_rollup` is
+/// O(items * records), so an unbounded list against a large feed would peg the
+/// node (self-DoS from the bound page). A gallery landing page shows far fewer
+/// than this; beyond it is abuse, so reject rather than churn.
+const FEED_ROLLUP_MAX_ITEMS: usize = 500;
+
+/// `feedGalleryRollup({feed, items})` - per-item comment/reaction counts and
+/// newest-activity clock for a gallery landing page, in one blob. Read-only;
+/// not admin-gated.
+struct FeedGalleryRollup;
+#[async_trait]
+impl WsCommand for FeedGalleryRollup {
+    fn name(&self) -> &'static str {
+        "feedGalleryRollup"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let feed = p
+            .get("feed")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("feedGalleryRollup: feed required")?
+            .to_string();
+        let items_val = p
+            .get("items")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .ok_or("feedGalleryRollup: items required")?;
+        let items_arr = items_val
+            .as_array()
+            .ok_or("feedGalleryRollup: items must be an array")?;
+        if items_arr.len() > FEED_ROLLUP_MAX_ITEMS {
+            return Err(format!(
+                "feedGalleryRollup: too many items ({}, max {FEED_ROLLUP_MAX_ITEMS})",
+                items_arr.len()
+            ));
+        }
+        let items: Vec<String> =
+            items_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        s.state.feed_gallery_rollup(address, &feed, &items).await
     }
 }
 

@@ -12,6 +12,7 @@ pub mod benchmark;
 pub mod chart;
 pub mod command;
 pub mod conn_pool;
+pub mod feed;
 pub mod geoip;
 pub mod paths;
 pub mod state;

@@ -2506,6 +2506,7 @@ dependencies = [
  "epix-crypt",
  "epix-db",
  "epix-discovery",
+ "epix-feed",
  "epix-peer",
  "epix-propagation",
  "epix-protocol",

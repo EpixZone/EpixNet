@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapter;
 pub mod checkpoint;
 pub mod index;
 pub mod reactions;
