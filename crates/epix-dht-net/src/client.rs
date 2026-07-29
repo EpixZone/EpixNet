@@ -1,6 +1,7 @@
 //! Client side: an [`RpcClient`] that dials peers on demand and sends DHT RPCs
 //! over their `Connection`, pooling connections so a lookup reuses them.
 
+use crate::pc;
 use crate::wire::{decode_responder_id, decode_response, encode_request, KAD_CMD};
 use async_trait::async_trait;
 use epix_core::PeerAddr;
@@ -73,6 +74,38 @@ impl WireRpcClient {
                 Err(e.to_string())
             }
         }
+    }
+
+    /// EDX path: the same two RPCs as [`Self::send`] and [`Self::probe`], but
+    /// as raw postcard bytes. The caller ships them in a `Kad` message and
+    /// feeds the reply back here, so this side does no I/O and needs no pool.
+    pub fn edx_request(&self, req: &Request) -> Vec<u8> {
+        pc::encode_request(&self.me, req)
+    }
+
+    /// Decode a `send` reply. The responder id is dropped: `send` already
+    /// knows the contact it addressed.
+    pub fn edx_response(payload: &[u8]) -> Result<Response, String> {
+        pc::decode_response(payload)
+            .map(|(_, resp)| resp)
+            .ok_or_else(|| "malformed kad response".to_string())
+    }
+
+    /// Decode a probe reply: the responder's authentic contact (its stamped
+    /// id plus the address we dialed) and the contacts it shared. Unlike the
+    /// msgpack wire, the stamp is always there, so the contact is not optional.
+    pub fn edx_probe_reply(
+        addr: &PeerAddr,
+        payload: &[u8],
+    ) -> Result<(Contact, Vec<Contact>), String> {
+        let (id, resp) =
+            pc::decode_response(payload).ok_or_else(|| "malformed kad response".to_string())?;
+        let nodes = match resp {
+            Response::Nodes(nodes) => nodes,
+            Response::Peers { nodes, .. } => nodes,
+            _ => Vec::new(),
+        };
+        Ok((Contact::new(id, addr.clone()), nodes))
     }
 }
 

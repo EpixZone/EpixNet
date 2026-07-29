@@ -2214,7 +2214,9 @@ dependencies = [
  "epix-protocol",
  "epix-transport",
  "hex",
+ "postcard",
  "rmpv",
+ "serde",
  "tokio",
 ]
 
@@ -2226,8 +2228,10 @@ dependencies = [
  "epix-core",
  "epix-protocol",
  "epix-transport",
+ "postcard",
  "reqwest",
  "rmpv",
+ "serde",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",

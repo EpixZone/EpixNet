@@ -9,6 +9,10 @@ epix-core = { path = "../epix-core" }
 epix-protocol = { path = "../epix-protocol" }
 epix-transport = { path = "../epix-transport" }
 rmpv = "1"
+# default-features off: postcard's default heapless support drags the
+# unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
 sha1 = "0.11.0"
 sha2 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

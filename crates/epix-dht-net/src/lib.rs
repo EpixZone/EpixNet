@@ -6,6 +6,7 @@
 //! `epix-transport`, the same DHT works over TCP, Tor, and Reticulum mesh.
 
 mod client;
+pub mod pc;
 mod service;
 pub mod wire;
 

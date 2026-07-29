@@ -4,9 +4,14 @@
 //! an `announce` request over the ordinary EpixNet wire protocol (so it reuses
 //! [`epix_protocol::Connection`]). BitTorrent trackers, the mainline DHT, PEX,
 //! and local discovery will be added alongside it.
+//!
+//! [`tracker`] speaks the legacy msgpack announce; [`tracker_pc`] is the same
+//! announce in postcard form, carried as the opaque payload of the EDX
+//! `Announce` request. Both are live during the msgpack retirement.
 
 pub mod bittorrent;
 pub mod tracker;
+pub mod tracker_pc;
 
 pub use bittorrent::announce_bittorrent;
 
@@ -21,6 +26,7 @@ pub fn address_hash(address: &str) -> [u8; 32] {
 }
 
 pub use tracker::{announce, discover_via_epix_tracker, AnnounceParams, OnionSigner};
+pub use tracker_pc::{AnnounceReply, AnnounceReq, AnnounceResp, PeerBuckets};
 
 /// One announcer, whichever protocol it speaks. The announce set mixes both
 /// kinds: Epix trackers (nodes speaking the wire protocol's `announce`) and
