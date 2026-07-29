@@ -7,7 +7,6 @@ description = "Embeddable Epix node: resolve a .epix name, clone + verify the xi
 [dependencies]
 epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
-epix-protocol = { path = "../epix-protocol" }
 epix-xite = { path = "../epix-xite" }
 epix-content = { path = "../epix-content" }
 epix-worker = { path = "../epix-worker" }

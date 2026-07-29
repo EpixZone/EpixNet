@@ -5,30 +5,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use epix_blob::store::Store;
 use epix_blob::ObjId;
 use epix_core::PeerAddr;
-use epix_protocol::{vmap, PeerServer, RequestHandler};
+use epix_protocol::PeerServer;
 use epix_runtime::edx::edx_hook;
 use epix_runtime::{NodeRuntime, RuntimeConfig};
 use epix_transport::TcpTransport;
 use epix_ui::{AppState, XiteEntry};
 use epix_xite::XiteStorage;
-use rmpv::Value as Rmp;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, timeout};
-
-/// A seeder's msgpack side: file transfer moved to EDX, so it answers nothing
-/// here (the client fetches over the EDX hook installed below).
-struct NullHandler;
-#[async_trait]
-impl RequestHandler for NullHandler {
-    async fn handle(&self, _peer: &PeerAddr, _cmd: &str, _params: &Rmp) -> Rmp {
-        vmap(vec![("error", Rmp::from("msgpack file transfer retired"))])
-    }
-}
 
 /// A signed content.json for `address` at `modified`, listing `files`.
 fn signed_content(priv_hex: &str, address: &str, modified: f64, files: Value) -> Vec<u8> {
@@ -50,8 +38,14 @@ async fn spawn_edx_seeder(address: &str, src: XiteStorage) -> std::net::SocketAd
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = PeerServer::new(Arc::new(NullHandler))
-        .with_edx(edx_hook(state, store, epix_crypt::new_seed(), None));
+    let server = PeerServer::new(edx_hook(
+        state,
+        store,
+        epix_crypt::new_seed(),
+        None,
+        epix_runtime::edx::ControlHandles::detached(),
+        None,
+    ));
     tokio::spawn(server.serve(listener));
     addr
 }

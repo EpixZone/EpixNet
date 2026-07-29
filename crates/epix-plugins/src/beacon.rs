@@ -1,7 +1,7 @@
 //! Beacon - announcer discovery. Keeps the node's announcer (tracker) set
 //! alive without anyone shipping a list: the book starts from the built-in
 //! bootstrap defaults ([`epix_core::DEFAULT_TRACKERS`]), peers exchange their
-//! working announcers over the `getTrackers` wire request (EpixNet's
+//! working announcers over the EDX `GetTrackers` request (EpixNet's
 //! AnnounceShare), Beacon remembers them in `trackers.json` at the data root -
 //! the same file and schema the Python client uses, so an upgrade carries the
 //! list over (legacy `epix://` keys are re-spelled to the transport-explicit
@@ -26,7 +26,6 @@
 use epix_core::PeerAddr;
 use epix_plugin::Plugin;
 use epix_discovery::Tracker;
-use epix_protocol::Connection;
 use epix_ui::AppState;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -134,7 +133,6 @@ async fn run_cycle(state: &Arc<AppState>, book: &mut TrackerBook, path: &PathBuf
 /// entry accepted per peer, like EpixNet, so a single peer can't flood the
 /// book.
 async fn discover_from_peers(state: &Arc<AppState>, book: &mut TrackerBook) {
-    let Some(transport) = state.transport().await else { return };
     let mut peers: Vec<PeerAddr> = Vec::new();
     for address in state.xite_addresses().await {
         for p in state.connectable_peers(&address, 3).await {
@@ -147,21 +145,11 @@ async fn discover_from_peers(state: &Arc<AppState>, book: &mut TrackerBook) {
         }
     }
     for peer in peers.into_iter().take(DISCOVER_PEERS) {
-        let ask = async {
-            let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
-            conn.handshake().await.ok()?;
-            conn.get_trackers().await.ok()
-        };
-        let Ok(Some(reply)) = tokio::time::timeout(std::time::Duration::from_secs(10), ask).await
-        else {
-            continue;
-        };
-        let Some(list) = epix_protocol::vget(&reply, "trackers").and_then(|v| v.as_array()) else {
-            continue;
-        };
+        // The EDX control request already carries its own dial + request
+        // bounds, so this needs no outer timeout.
+        let Some(Ok(list)) = state.edx_get_trackers(peer).await else { continue };
         for entry in list {
-            let Some(s) = entry.as_str() else { continue };
-            if parse_tracker_line(s).is_some() && book.found(s) {
+            if parse_tracker_line(&entry).is_some() && book.found(&entry) {
                 break; // one new announcer per peer per pass
             }
         }

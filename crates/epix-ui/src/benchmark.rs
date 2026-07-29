@@ -1,7 +1,7 @@
 //! Benchmark - a diagnostics page that times the node's hot paths.
 //!
 //! Ports EpixNet's `Benchmark` plugin: it runs a fixed suite of micro-benchmarks
-//! (HD key derivation, sign/verify, msgpack pack/unpack, gzip pack/unpack, the
+//! (HD key derivation, sign/verify, postcard pack/unpack, gzip pack/unpack, the
 //! hash functions, randomness) and reports each one's time against a baseline as
 //! a multiplier with a fun title. Here the hot paths are the Rust ones, so the
 //! page doubles as a demonstration of the rewrite's speed.
@@ -27,8 +27,8 @@ pub fn run(filter: &str) -> String {
         Case { name: "hd_privatekey", num: 50, standard: 0.57 },
         Case { name: "sign", num: 20, standard: 0.46 },
         Case { name: "verify", num: 200, standard: 0.30 },
-        Case { name: "pack_msgpack", num: 100, standard: 0.35 },
-        Case { name: "unpack_msgpack", num: 100, standard: 0.35 },
+        Case { name: "pack_postcard", num: 100, standard: 0.35 },
+        Case { name: "unpack_postcard", num: 100, standard: 0.35 },
         Case { name: "pack_gz", num: 5, standard: 0.08 },
         Case { name: "unpack_gz", num: 20, standard: 0.28 },
         Case { name: "hash_sha256", num: 10, standard: 0.50 },
@@ -78,7 +78,7 @@ fn run_case(name: &str, num: u32) {
     // A 1 MiB buffer for the hash/compress cases.
     let blob: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
     let gz = gzip(&blob);
-    let packed = pack_msgpack(&blob);
+    let packed = pack_postcard(&blob);
 
     let mut sink: u64 = 0;
     for i in 0..num {
@@ -96,8 +96,8 @@ fn run_case(name: &str, num: u32) {
                     sink = sink.wrapping_add(1);
                 }
             }
-            "pack_msgpack" => sink = sink.wrapping_add(pack_msgpack(&blob).len() as u64),
-            "unpack_msgpack" => sink = sink.wrapping_add(unpack_msgpack(&packed) as u64),
+            "pack_postcard" => sink = sink.wrapping_add(pack_postcard(&blob).len() as u64),
+            "unpack_postcard" => sink = sink.wrapping_add(unpack_postcard(&packed) as u64),
             "pack_gz" => sink = sink.wrapping_add(gzip(&blob).len() as u64),
             "unpack_gz" => sink = sink.wrapping_add(gunzip(&gz).len() as u64),
             "hash_sha256" => sink = sink.wrapping_add(Sha256::digest(&blob)[0] as u64),
@@ -147,19 +147,14 @@ fn gunzip(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn pack_msgpack(data: &[u8]) -> Vec<u8> {
-    let val = rmpv::Value::Binary(data.to_vec());
-    let mut buf = Vec::new();
-    let _ = rmpv::encode::write_value(&mut buf, &val);
-    buf
+/// The peer wire's codec, so the page times what the node actually encodes
+/// with (the reference client's numbers here were msgpack).
+fn pack_postcard(data: &[u8]) -> Vec<u8> {
+    postcard::to_stdvec(data).unwrap_or_default()
 }
 
-fn unpack_msgpack(packed: &[u8]) -> usize {
-    let mut cur = std::io::Cursor::new(packed);
-    match rmpv::decode::read_value(&mut cur) {
-        Ok(rmpv::Value::Binary(b)) => b.len(),
-        _ => 0,
-    }
+fn unpack_postcard(packed: &[u8]) -> usize {
+    postcard::from_bytes::<Vec<u8>>(packed).map(|b| b.len()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -175,9 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn msgpack_roundtrips() {
+    fn postcard_roundtrips() {
         let data = b"hello benchmark";
-        assert_eq!(unpack_msgpack(&pack_msgpack(data)), data.len());
+        assert_eq!(unpack_postcard(&pack_postcard(data)), data.len());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! EDX wire protocol (replaces the msgpack xite command set).
+//! EDX wire protocol — the one peer protocol.
 //!
 //! One protocol over every overlay: frames are postcard-encoded with a
 //! small header and ≤64 KiB continuation frames, multiplexed yamux-style
@@ -26,10 +26,9 @@ pub mod sched;
 pub mod server;
 pub mod sim;
 
-/// First-byte magic for EDX framing. During the migration window the
-/// accept path sniffs this against a legacy msgpack map header (legacy
-/// first bytes are 0x80–0x8f, 0xde, or 0xdf — never ASCII 'E') to route a
-/// connection to the right protocol server.
+/// First-byte magic for EDX framing. The clearnet accept loop drops a
+/// connection whose first byte is not `MAGIC[0]` before spending anything
+/// on it — BT crawlers hit the announced fileserver port constantly.
 pub const MAGIC: [u8; 4] = *b"EDX1";
 
 /// Maximum payload bytes in one frame. Large verified ranges are split
@@ -42,13 +41,10 @@ pub const MAX_FRAME_LEN: usize = 64 * 1024;
 mod tests {
     use super::*;
 
-    /// The magic must never collide with a legacy msgpack first byte, or
-    /// the migration-window sniffing misroutes connections.
+    /// `epix_protocol`'s accept loop hardcodes this first byte rather than
+    /// depending on epix-edx for it; pin the two together.
     #[test]
-    fn magic_disjoint_from_msgpack() {
-        let first = MAGIC[0];
-        assert!(first != 0xde && first != 0xdf, "map16/map32 collision");
-        assert!(!(0x80..=0x8f).contains(&first), "fixmap collision");
-        assert_eq!(first, b'E');
+    fn magic_starts_with_e() {
+        assert_eq!(MAGIC[0], b'E');
     }
 }

@@ -26,11 +26,10 @@ pub mod caps {
     pub const SHARDS: u32 = 1 << 0;
     /// Accepts `Update` pushes for xites it seeds.
     pub const MESH: u32 = 1 << 1;
-    /// Serves the full CONTROL plane over EDX (`UpdatesSince`, `Pex`,
-    /// `GetTrackers`, `Kad`, `Announce`) — i.e. a dialer never needs the
-    /// legacy msgpack connection to talk to this peer. Gates the
-    /// prefer-EDX path during the coexistence window: a peer that does
-    /// not advertise this bit still gets msgpack for control ops.
+    /// Serves the full CONTROL plane (`UpdatesSince`, `Pex`,
+    /// `GetTrackers`, `Kad`, `Announce`). A content-only node (an
+    /// embedded fetcher, a test fixture) leaves this clear and answers
+    /// those requests UNSUPPORTED.
     pub const CONTROL: u32 = 1 << 2;
 }
 
@@ -47,9 +46,15 @@ pub struct Hello {
     pub binding_sig: Vec<u8>,
     /// Capability bitflags (`caps::*`).
     pub caps: u32,
-    /// Addresses this node can be dialed back on (the legacy handshake's
-    /// dial-back adoption pattern, carried over).
+    /// Addresses this node can be dialed back on: an inbound connection
+    /// arrives from an ephemeral port, so without this the receiver could
+    /// never dial the caller back.
     pub listen: Vec<PeerAddr>,
+    /// The node's release version (e.g. `0.3.9`) - it feeds the Stats
+    /// page's `client` column. Empty when the node advertises no version.
+    /// APPENDED: postcard encodes struct fields positionally, so new
+    /// fields go at the END of `Hello`/`HelloAck`, never in the middle.
+    pub version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -60,6 +65,8 @@ pub struct HelloAck {
     pub caps: u32,
     /// The dialer's address as this node observed it (dial-back info).
     pub observed: Option<PeerAddr>,
+    /// This node's release version (see [`Hello::version`]). Appended.
+    pub version: String,
 }
 
 /// One requested byte range of an object.
@@ -72,7 +79,7 @@ pub enum Req {
     /// Fetch a signed content.json (root or per-user) — the mutable
     /// entry point, verified by SIGNATURE on the receiving side.
     GetSigned { xite: String, inner_path: String },
-    /// `listModified` successor: signed files changed since `since`
+    /// Signed files changed since `since`
     /// (unix seconds) — how forum/social xites discover per-user changes.
     ListSigned { xite: String, since: u64 },
     /// Verified multi-range fetch: the heart of streaming/seek. Answered
@@ -114,22 +121,20 @@ pub enum Req {
     },
     // --- Stage 4+ appends only below this line (postcard indices!) ---
     //
-    // CONTROL PLANE (gated by `caps::CONTROL`): the successors to the
-    // legacy msgpack control commands, so EDX is the only peer wire.
-    // Domain payloads that belong to another crate's protocol ride as
+    // CONTROL PLANE (gated by `caps::CONTROL`). Domain payloads that belong to another crate's protocol ride as
     // opaque bytes (same neutrality rule as `Update::diffs`) — epix-edx
     // must not depend on epix-dht / epix-discovery.
-    /// `meshGetUpdates` successor: store-and-forward propagation hints
-    /// recorded after the caller's cursor. Answered `Resp::Updates`.
+    /// Store-and-forward propagation hints recorded after the caller's
+    /// cursor. Answered `Resp::Updates`.
     UpdatesSince { after: u64 },
-    /// `pex` successor: peer exchange for one xite. `peers` are addresses
+    /// Peer exchange for one xite. `peers` are addresses
     /// the caller already knows (so the answer excludes them); `need` caps
     /// how many to return. Answered `Resp::Peers`.
     Pex { xite: String, need: u32, peers: Vec<PeerAddr> },
-    /// `getTrackers` successor: the peer's working tracker set (Beacon
-    /// gossip). Answered `Resp::Trackers`.
+    /// The peer's working tracker set (Beacon gossip). Answered
+    /// `Resp::Trackers`.
     GetTrackers,
-    /// `kad` successor: one Kademlia RPC, encoded by `epix-dht-net`.
+    /// One Kademlia RPC, encoded by `epix-dht-net`.
     /// Answered `Resp::Payload`.
     Kad { payload: Vec<u8> },
     /// `announce` successor: a tracker announce/answer, encoded by
@@ -217,6 +222,31 @@ mod tests {
     fn frames_round_trip() {
         let frames = [
             Frame {
+                stream: 0,
+                body: FrameBody::Req(Req::Hello(Hello {
+                    net: NET_ID.into(),
+                    node_pk: vec![2; 33],
+                    binding_sig: vec![9; 64],
+                    caps: caps::MESH | caps::CONTROL,
+                    listen: vec![PeerAddr::parse("1.2.3.4:26552").unwrap()],
+                    version: "0.3.9".into(),
+                })),
+            },
+            Frame {
+                stream: 0,
+                body: FrameBody::Resp {
+                    last: true,
+                    resp: Resp::HelloAck(HelloAck {
+                        net: NET_ID.into(),
+                        node_pk: vec![3; 33],
+                        binding_sig: vec![],
+                        caps: caps::MESH,
+                        observed: Some(PeerAddr::parse("5.6.7.8:26552").unwrap()),
+                        version: "0.3.9".into(),
+                    }),
+                },
+            },
+            Frame {
                 stream: 1,
                 body: FrameBody::Req(Req::GetRange {
                     obj: ObjId([7; 32]),
@@ -302,7 +332,7 @@ mod tests {
         let probes: Vec<(Frame, u8)> = vec![
             (Frame { stream: 0, body: FrameBody::Req(Req::Hello(Hello {
                 net: String::new(), node_pk: vec![], binding_sig: vec![],
-                caps: 0, listen: vec![] })) }, 0),
+                caps: 0, listen: vec![], version: String::new() })) }, 0),
             (Frame { stream: 0, body: FrameBody::Resp { last: true, resp: Resp::Ok } }, 1),
             (Frame { stream: 0, body: FrameBody::Data { last: true, bytes: vec![] } }, 2),
             (Frame { stream: 0, body: FrameBody::Cancel }, 3),
@@ -329,7 +359,7 @@ mod tests {
                 signed: vec![], inline: vec![],
                 modified: 0.0, diffs: vec![], sender_peers: vec![],
             }, 8),
-            // Control plane (appended for the msgpack retirement).
+            // Control plane.
             (Req::UpdatesSince { after: 0 }, 9),
             (Req::Pex { xite: String::new(), need: 0, peers: vec![] }, 10),
             (Req::GetTrackers, 11),
@@ -353,6 +383,7 @@ mod tests {
                     binding_sig: vec![],
                     caps: 0,
                     observed: None,
+                    version: String::new(),
                 }),
                 0,
             ),
@@ -363,7 +394,7 @@ mod tests {
             (Resp::Many { items: vec![] }, 5),
             (Resp::Ok, 6),
             (Resp::Err { code: 0, msg: String::new() }, 7),
-            // Control plane (appended for the msgpack retirement).
+            // Control plane.
             (Resp::Updates { updates: vec![], head: 0 }, 8),
             (Resp::Peers { peers: vec![] }, 9),
             (Resp::Trackers { trackers: vec![] }, 10),
@@ -379,6 +410,34 @@ mod tests {
             // then the Resp discriminant.
             assert_eq!(bytes[3], disc, "Resp discriminant moved: {resp:?}");
         }
+
+        // Struct fields are positional too: `version` was APPENDED to the
+        // handshake structs, so it must encode LAST (len-prefixed string at
+        // the tail) - moving it would shift every field a peer parses.
+        let hello = Hello {
+            net: String::new(),
+            node_pk: vec![],
+            binding_sig: vec![],
+            caps: 0,
+            listen: vec![],
+            version: "1.2.3".into(),
+        };
+        assert!(
+            postcard::to_stdvec(&hello).unwrap().ends_with(b"\x051.2.3"),
+            "Hello::version must stay the last field"
+        );
+        let ack = HelloAck {
+            net: String::new(),
+            node_pk: vec![],
+            binding_sig: vec![],
+            caps: 0,
+            observed: None,
+            version: "1.2.3".into(),
+        };
+        assert!(
+            postcard::to_stdvec(&ack).unwrap().ends_with(b"\x051.2.3"),
+            "HelloAck::version must stay the last field"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Multiplexed connection + outbound pool.
 //!
-//! Ground truth from the plan: today's `epix-protocol::Connection` is
+//! Ground truth from the plan: the retired msgpack connection was
 //! `&mut self`, one request in flight, "keep reading" past non-matching
 //! ids, and there is no pool. EDX needs concurrent streams over one
 //! ordered `PeerStream` and a pool keyed by peer.
@@ -110,9 +110,18 @@ impl Conn {
             closed: std::sync::atomic::AtomicBool::new(false),
         });
 
-        spawn_writer(write_half, hi_rx, lo_rx, shared.clone());
-        // The reader answers Pings on the priority lane (Pong is control).
-        spawn_reader(read_half, shared.clone(), hi_tx.clone(), in_tx);
+        // Teardown signal: the writer owns `gone_tx` and the reader awaits
+        // `gone_rx`, so the reader unblocks the moment the writer stops (see
+        // spawn_reader). Without it a client's reader would sit in `read_frame`
+        // until the PEER closed, holding the socket - and its registry row -
+        // open long after the last `Conn` handle was dropped.
+        let (gone_tx, gone_rx) = mpsc::channel::<()>(1);
+        spawn_writer(write_half, hi_rx, lo_rx, shared.clone(), gone_tx);
+        // The reader answers Pings on the priority lane (Pong is control). It
+        // holds a WEAK sender: a strong clone would keep the writer's queue
+        // open forever, so the writer could never observe the last handle
+        // going away.
+        spawn_reader(read_half, shared.clone(), hi_tx.downgrade(), in_tx, gone_rx);
 
         (Conn { outbound: hi_tx, bulk: lo_tx, inner, shared }, in_rx)
     }
@@ -161,6 +170,37 @@ impl Conn {
             return Err(closed_err());
         }
         Ok(StreamRx { id: stream, rx })
+    }
+
+    /// Round-trip a frame-level Ping and return the measured RTT.
+    ///
+    /// Liveness + latency for a link the caller keeps warm. It rides the
+    /// priority lane and is answered by the peer's reader task, so it works
+    /// on any EDX link - no request handler, no capability, no store.
+    pub async fn ping(&self) -> std::io::Result<std::time::Duration> {
+        if self.is_closed() {
+            return Err(closed_err());
+        }
+        let stream = self.alloc_stream();
+        let (tx, mut rx) = mpsc::channel::<FrameBody>(1);
+        self.shared.waiters.lock().expect("waiters").insert(stream, tx);
+        let start = std::time::Instant::now();
+        // Same post-send close re-check as request_stream: a waiter inserted
+        // after the reader cleared the map would never be woken.
+        if self.outbound.send(Frame { stream, body: FrameBody::Ping }).await.is_err()
+            || self.is_closed()
+        {
+            self.shared.waiters.lock().expect("waiters").remove(&stream);
+            return Err(closed_err());
+        }
+        match rx.recv().await {
+            Some(FrameBody::Pong) => Ok(start.elapsed()),
+            Some(other) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected Pong, got {other:?}"),
+            )),
+            None => Err(closed_err()),
+        }
     }
 
     /// Answer an inbound request stream with a single response.
@@ -228,6 +268,8 @@ fn spawn_writer<W>(
     mut hi: mpsc::Receiver<Frame>,
     mut lo: mpsc::Receiver<Frame>,
     shared: Arc<Shared>,
+    // Dropped when this task ends, which is the reader's cue to stop.
+    gone: mpsc::Sender<()>,
 ) where
     W: AsyncWrite + Send + 'static,
 {
@@ -250,22 +292,31 @@ fn spawn_writer<W>(
         shared.closed.store(true, Ordering::Relaxed);
         // Wake every pending waiter (their rx sees the sender drop).
         shared.waiters.lock().expect("waiters").clear();
+        drop(gone);
     });
 }
 
 fn spawn_reader<R>(
     mut r: tokio::io::ReadHalf<R>,
     shared: Arc<Shared>,
-    outbound: mpsc::Sender<Frame>,
+    outbound: mpsc::WeakSender<Frame>,
     in_tx: mpsc::Sender<Incoming>,
+    mut gone: mpsc::Receiver<()>,
 ) where
     R: AsyncRead + Send + 'static,
 {
     tokio::spawn(async move {
         loop {
-            let frame = match frame::read_frame(&mut r).await {
-                Ok(f) => f,
-                Err(_) => break,
+            // Stop on either a dead socket or the writer winding down (the
+            // last `Conn` handle dropped). Reading past that would keep the
+            // read half - and so the whole stream - alive indefinitely.
+            let frame = tokio::select! {
+                biased;
+                _ = gone.recv() => break,
+                f = frame::read_frame(&mut r) => match f {
+                    Ok(f) => f,
+                    Err(_) => break,
+                },
             };
             match frame.body {
                 FrameBody::Req(req) => {
@@ -286,11 +337,24 @@ fn spawn_reader<R>(
                     cancelled.insert(frame.stream);
                 }
                 FrameBody::Ping => {
-                    let _ = outbound
-                        .send(Frame { stream: frame.stream, body: FrameBody::Pong })
-                        .await;
+                    if let Some(tx) = outbound.upgrade() {
+                        let _ =
+                            tx.send(Frame { stream: frame.stream, body: FrameBody::Pong }).await;
+                    }
                 }
-                FrameBody::Pong => {}
+                FrameBody::Pong => {
+                    // Deliver to the Ping that allocated this stream, so
+                    // `Conn::ping` can time the round trip. A Pong nobody
+                    // waits on (peer echo of an abandoned ping) is dropped.
+                    let tx = {
+                        let map = shared.waiters.lock().expect("waiters");
+                        map.get(&frame.stream).cloned()
+                    };
+                    if let Some(tx) = tx {
+                        let _ = tx.send(FrameBody::Pong).await;
+                        shared.waiters.lock().expect("waiters").remove(&frame.stream);
+                    }
+                }
                 body => {
                     // Response/data frame: route to the waiter, and drop
                     // the waiter when the terminal frame arrives.
@@ -483,6 +547,51 @@ mod tests {
         assert!(d.iter().all(|x| x % 2 == 1));
         assert!(ac.iter().all(|x| x % 2 == 0));
         assert!(d.iter().all(|x| !ac.contains(x)));
+    }
+
+    /// The warm pool's liveness probe: a Ping must come back as a Pong on the
+    /// same stream, without any request handler on the peer side (the reader
+    /// answers it). A dead link must error instead of hanging.
+    #[tokio::test]
+    async fn ping_round_trips_and_fails_on_a_dead_link() {
+        let (a, b) = tokio::io::duplex(1024);
+        let (client, _client_in) = Conn::start(a, true);
+        // No serve loop on the far side at all - just the connection tasks.
+        let (_server, _server_in) = Conn::start(b, false);
+        client.ping().await.expect("peer answered the ping");
+
+        let (a, b) = tokio::io::duplex(64);
+        let (client, _in) = Conn::start(a, true);
+        drop(b);
+        tokio::task::yield_now().await;
+        assert!(client.ping().await.is_err(), "a closed link must not hang the ping");
+    }
+
+    /// Dropping the last handle must tear the connection down on OUR side,
+    /// without waiting for the peer to close. The warm pool churns links every
+    /// cycle, and a reader left parked in `read_frame` would hold the socket
+    /// (and its Stats-page row) open for as long as the peer stayed quiet.
+    #[tokio::test]
+    async fn dropping_the_last_handle_closes_the_stream() {
+        let (a, b) = tokio::io::duplex(1024);
+        let (client, client_in) = Conn::start(a, true);
+        // The peer never closes; it just sits there holding its own half.
+        let (_server, _server_in) = Conn::start(b, false);
+        client.ping().await.expect("link is up");
+
+        drop(client);
+        drop(client_in);
+        // The far side sees EOF only if our halves were really dropped.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if _server.is_closed() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert_eq!(closed, Ok(true), "the peer saw the connection close");
     }
 
     #[tokio::test]

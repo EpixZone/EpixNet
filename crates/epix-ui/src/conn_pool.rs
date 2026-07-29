@@ -2,31 +2,51 @@
 //! (count, incoming/onion split, ping) reflect real live links instead of
 //! reading zero. Mirrors EpixNet keeping connections open in its
 //! ConnectionServer, but bounded to a handful of peers.
+//!
+//! The links themselves are EDX links, opened by the runtime through
+//! [`LinkOpener`]. epix-ui holds no transport or protocol code, so the pool
+//! only sees the two things it needs: a ping and a version string.
 
+use async_trait::async_trait;
 use epix_core::PeerAddr;
-use epix_protocol::{Connection, HandshakeInfo};
-use epix_transport::Transport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
 
-/// A live connection plus its last measured ping (ms, `-1` = not yet pinged).
+/// One live EDX link the pool keeps warm. Liveness and RTT only - content
+/// transfer runs on its own links through the `EdxFetcher`.
+#[async_trait]
+pub trait PeerLink: Send + Sync {
+    /// The peer's advertised client version, from its EDX Hello.
+    fn version(&self) -> &str;
+    /// Round-trip a frame-level Ping and return the RTT in ms. `Err` means the
+    /// link is dead and the pool should drop it.
+    async fn ping(&self) -> Result<i64, String>;
+}
+
+/// Opens warm links for the pool. The runtime installs one (it owns the EDX
+/// client and the transports); without it the pool simply stays empty.
+#[async_trait]
+pub trait LinkOpener: Send + Sync {
+    async fn open_link(&self, peer: PeerAddr) -> Result<Arc<dyn PeerLink>, String>;
+}
+
+/// A live link plus its last measured ping (ms, `-1` = not yet pinged).
 struct PeerConn {
-    conn: Arc<Mutex<Connection>>,
+    link: Arc<dyn PeerLink>,
     last_ping_ms: Arc<AtomicI64>,
-    /// The peer's handshake identity (version/rev/protocol/crypt), copied out
-    /// at connect time so the Stats page renders it without touching the
-    /// connection's mutex (the conn may be mid-request).
-    peer: Option<HandshakeInfo>,
+    /// The peer's client version, copied out at connect time so the Stats page
+    /// renders it without touching the link.
+    version: String,
 }
 
 /// One live pooled connection, as the Stats page lists it.
 pub struct ConnDetail {
     pub addr: PeerAddr,
     pub ping_ms: Option<i64>,
-    pub peer: Option<HandshakeInfo>,
+    pub version: String,
 }
 
 /// Aggregate connection stats for the chart/collector and status endpoints.
@@ -74,11 +94,11 @@ impl ConnectionPool {
         })
     }
 
-    /// Open connections to `peers` we are not already connected to, up to the
-    /// pool's cap. Clearnet + onion only (mesh peers are skipped here). Peers are
+    /// Open links to `peers` we are not already connected to, up to the pool's
+    /// cap. Clearnet + onion only (mesh peers are skipped here). Peers are
     /// dialed concurrently, so one slow/unreachable peer does not hold up the
     /// rest, and the pool lock is not held while dialing.
-    pub async fn ensure(&self, transport: Arc<dyn Transport>, peers: &[PeerAddr]) {
+    pub async fn ensure(&self, opener: Arc<dyn LinkOpener>, peers: &[PeerAddr]) {
         let (have, room) = {
             let conns = self.conns.lock().await;
             (conns.keys().cloned().collect::<Vec<_>>(), self.max.saturating_sub(conns.len()))
@@ -95,42 +115,28 @@ impl ConnectionPool {
             .collect();
         let mut set = tokio::task::JoinSet::new();
         for addr in to_dial {
-            let transport = transport.clone();
-            set.spawn(async move {
-                // Overlay-aware dial bound: a flat few-second deadline meant
-                // the warm pool could never hold an onion/i2p connection.
-                let conn = tokio::time::timeout(addr.connect_timeout(), async {
-                    let mut conn = Connection::connect(transport.as_ref(), &addr).await.ok()?;
-                    conn.handshake().await.ok()?;
-                    Some(conn)
-                })
-                .await
-                .ok()
-                .flatten();
-                conn.map(|conn| (addr, conn))
-            });
+            let opener = opener.clone();
+            // The opener applies its own overlay-aware dial bound, so an
+            // onion/i2p peer is not cut off by a clearnet-sized deadline.
+            set.spawn(async move { opener.open_link(addr.clone()).await.ok().map(|l| (addr, l)) });
         }
         while let Some(res) = set.join_next().await {
-            let Ok(Some((addr, conn))) = res else { continue };
+            let Ok(Some((addr, link))) = res else { continue };
             let mut conns = self.conns.lock().await;
             if conns.len() >= self.max || conns.contains_key(&addr) {
                 continue;
             }
-            let peer = conn.peer.clone();
+            let version = link.version().to_string();
             conns.insert(
                 addr,
-                PeerConn {
-                    conn: Arc::new(Mutex::new(conn)),
-                    last_ping_ms: Arc::new(AtomicI64::new(-1)),
-                    peer,
-                },
+                PeerConn { link, last_ping_ms: Arc::new(AtomicI64::new(-1)), version },
             );
         }
     }
 
-    /// One row per live connection: address, last ping, and the peer's
-    /// handshake identity - what the Stats page shows so an operator can see
-    /// which node versions the network runs (Phase 6 handshake surfacing).
+    /// One row per live connection: address, last ping, and the peer's client
+    /// version - what the Stats page shows so an operator can see which node
+    /// versions the network runs (Phase 6 handshake surfacing).
     pub async fn connection_details(&self) -> Vec<ConnDetail> {
         let conns = self.conns.lock().await;
         let mut out: Vec<ConnDetail> = conns
@@ -140,7 +146,7 @@ impl ConnectionPool {
                 ConnDetail {
                     addr: addr.clone(),
                     ping_ms: (v >= 0).then_some(v),
-                    peer: c.peer.clone(),
+                    version: c.version.clone(),
                 }
             })
             .collect();
@@ -152,27 +158,23 @@ impl ConnectionPool {
     /// Ping every held connection concurrently, updating each ping and dropping
     /// any that fail. The pool lock is not held while pinging.
     pub async fn ping_all(&self) {
-        let entries: Vec<(PeerAddr, Arc<Mutex<Connection>>, Arc<AtomicI64>)> = {
+        let entries: Vec<(PeerAddr, Arc<dyn PeerLink>, Arc<AtomicI64>)> = {
             let conns = self.conns.lock().await;
             conns
                 .iter()
-                .map(|(a, c)| (a.clone(), c.conn.clone(), c.last_ping_ms.clone()))
+                .map(|(a, c)| (a.clone(), c.link.clone(), c.last_ping_ms.clone()))
                 .collect()
         };
         let mut set = tokio::task::JoinSet::new();
-        for (addr, conn, last_ping) in entries {
+        for (addr, link, last_ping) in entries {
             set.spawn(async move {
-                let start = Instant::now();
-                let mut guard = conn.lock().await;
-                let ok = matches!(
-                    tokio::time::timeout(PING_TIMEOUT, guard.ping()).await,
-                    Ok(Ok(true))
-                );
-                drop(guard);
-                if ok {
-                    last_ping.store(start.elapsed().as_millis() as i64, Ordering::Relaxed);
+                match tokio::time::timeout(PING_TIMEOUT, link.ping()).await {
+                    Ok(Ok(ms)) => {
+                        last_ping.store(ms, Ordering::Relaxed);
+                        (addr, true)
+                    }
+                    _ => (addr, false),
                 }
-                (addr, ok)
             });
         }
         let mut dead = Vec::new();
@@ -203,89 +205,82 @@ impl ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epix_protocol::msg::{read_msg, send_msg, vget, vmap};
-    use epix_transport::TcpTransport;
-    use rmpv::Value as RVal;
-    use tokio::net::TcpListener;
 
-    /// A mock peer that answers handshake + ping, so the pool can connect to it.
-    async fn spawn_mock_peer() -> PeerAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut stream: epix_transport::PeerStream = Box::pin(sock);
-                    let mut buf = Vec::new();
-                    while let Ok(req) = read_msg(&mut stream, &mut buf).await {
-                        let cmd = vget(&req, "cmd").and_then(|v| v.as_str()).unwrap_or("");
-                        let req_id = vget(&req, "req_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let resp = match cmd {
-                            "handshake" => vmap(vec![
-                                ("cmd", RVal::from("response")),
-                                ("to", RVal::from(req_id)),
-                                ("version", RVal::from("0.9.9")),
-                                ("rev", RVal::from(4242i64)),
-                                ("protocol", RVal::from("v2")),
-                                ("peer_id", RVal::from("-Mock-000000000001")),
-                                ("crypt_supported", RVal::Array(vec![])),
-                            ]),
-                            "ping" => vmap(vec![
-                                ("cmd", RVal::from("response")),
-                                ("to", RVal::from(req_id)),
-                                ("body", RVal::from("Pong!")),
-                            ]),
-                            _ => vmap(vec![
-                                ("cmd", RVal::from("response")),
-                                ("to", RVal::from(req_id)),
-                                ("error", RVal::from("?")),
-                            ]),
-                        };
-                        if send_msg(&mut stream, &resp).await.is_err() {
-                            break;
-                        }
-                    }
-                });
+    /// A link that answers pings until `alive` is cleared.
+    struct MockLink {
+        version: String,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl PeerLink for MockLink {
+        fn version(&self) -> &str {
+            &self.version
+        }
+        async fn ping(&self) -> Result<i64, String> {
+            if self.alive.load(Ordering::Relaxed) {
+                Ok(7)
+            } else {
+                Err("link closed".into())
             }
-        });
-        PeerAddr::Ip(addr)
+        }
+    }
+
+    struct MockOpener {
+        alive: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LinkOpener for MockOpener {
+        async fn open_link(&self, peer: PeerAddr) -> Result<Arc<dyn PeerLink>, String> {
+            // Mesh peers must never reach the opener.
+            assert!(!matches!(peer, PeerAddr::Rns(_)), "mesh peers are skipped by the pool");
+            Ok(Arc::new(MockLink { version: "0.9.9".into(), alive: self.alive.clone() }))
+        }
+    }
+
+    fn opener() -> (Arc<dyn LinkOpener>, Arc<std::sync::atomic::AtomicBool>) {
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        (Arc::new(MockOpener { alive: alive.clone() }), alive)
     }
 
     #[tokio::test]
-    async fn pool_connects_pings_and_reports_stats() {
-        let peer = spawn_mock_peer().await;
+    async fn pool_connects_pings_and_reports_details() {
+        let peer = PeerAddr::parse("127.0.0.1:11111").unwrap();
         let pool = ConnectionPool::new(4);
-        let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+        let (opener, alive) = opener();
 
-        pool.ensure(transport.clone(), &[peer.clone()]).await;
-        assert_eq!(pool.len().await, 1, "connected to the mock peer");
+        pool.ensure(opener.clone(), &[peer.clone()]).await;
+        assert_eq!(pool.len().await, 1, "opened a link to the peer");
 
         pool.ping_all().await;
         assert_eq!(pool.len().await, 1);
-        assert!(pool.ping_for(&peer).await.is_some(), "ping recorded");
+        assert_eq!(pool.ping_for(&peer).await, Some(7), "ping recorded");
 
         // ensure is idempotent - no duplicate connection to the same peer.
-        pool.ensure(transport, &[peer.clone()]).await;
+        pool.ensure(opener, &[peer.clone()]).await;
         assert_eq!(pool.len().await, 1);
 
-        // The peer's handshake identity is retained for the Stats page.
+        // The peer's version is retained for the Stats page.
         let details = pool.connection_details().await;
         assert_eq!(details.len(), 1);
-        let hs = details[0].peer.as_ref().expect("handshake info retained");
-        assert_eq!(hs.version, "0.9.9");
-        assert_eq!(hs.rev, 4242);
-        assert_eq!(hs.protocol, "v2");
-        assert!(details[0].ping_ms.is_some(), "ping carried into the detail row");
+        assert_eq!(details[0].version, "0.9.9");
+        assert_eq!(details[0].ping_ms, Some(7));
+
+        // A link that stops answering is dropped from the pool.
+        alive.store(false, Ordering::Relaxed);
+        pool.ping_all().await;
+        assert!(pool.is_empty().await, "a dead link is evicted");
     }
 
     #[tokio::test]
     async fn pool_respects_the_cap_and_skips_mesh_peers() {
         let pool = ConnectionPool::new(1);
-        let p1 = spawn_mock_peer().await;
-        let p2 = spawn_mock_peer().await;
-        let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+        let (opener, _alive) = opener();
+        let p1 = PeerAddr::parse("127.0.0.1:11111").unwrap();
+        let p2 = PeerAddr::parse("127.0.0.1:11112").unwrap();
         // A mesh (Rns) peer is skipped; the cap of 1 is honoured.
-        pool.ensure(transport, &[PeerAddr::Rns([0u8; 16]), p1, p2]).await;
+        pool.ensure(opener, &[PeerAddr::Rns([0u8; 16]), p1, p2]).await;
         assert_eq!(pool.len().await, 1);
     }
 }

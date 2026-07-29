@@ -1,15 +1,11 @@
 //! Server side: answer inbound DHT RPCs against a local [`Node`].
 
 use crate::pc;
-use crate::wire::{decode_request, encode_response, KAD_CMD};
-use async_trait::async_trait;
 use epix_core::PeerAddr;
 use epix_dht::{Contact, Node, Request, Response};
-use epix_protocol::{vmap, RequestHandler};
-use rmpv::Value;
 use std::sync::Arc;
 
-/// A `RequestHandler` that serves `kad` RPCs from a shared DHT node.
+/// Serves inbound `Kad` RPCs from a shared DHT node.
 pub struct DhtService {
     node: Arc<Node>,
 }
@@ -19,8 +15,8 @@ impl DhtService {
         Self { node }
     }
 
-    /// The RPC itself, shared by both wires (msgpack and EDX): fix up what the
-    /// caller claimed about itself, then answer from the node.
+    /// The RPC itself: fix up what the caller claimed about itself, then
+    /// answer from the node.
     fn answer(&self, peer: &PeerAddr, mut from: Contact, mut req: Request) -> Response {
         from.addr = rewrite_claimed_addr(from.addr, peer);
         if let Request::Announce(key, claimed) = req {
@@ -29,8 +25,7 @@ impl DhtService {
         self.node.handle(from, req)
     }
 
-    /// EDX entry point: the postcard payload of a `Kad` message in, the
-    /// postcard reply out. Same logic as the msgpack [`RequestHandler`].
+    /// The postcard payload of a `Kad` message in, the postcard reply out.
     pub fn handle_edx(&self, peer: &PeerAddr, payload: &[u8]) -> Result<Vec<u8>, String> {
         let (from, req) = pc::decode_request(payload).ok_or("malformed kad request")?;
         let resp = self.answer(peer, from, req);
@@ -49,19 +44,6 @@ fn rewrite_claimed_addr(claimed: PeerAddr, conn: &PeerAddr) -> PeerAddr {
             PeerAddr::Ip(std::net::SocketAddr::new(conn_sock.ip(), claimed_sock.port()))
         }
         _ => claimed,
-    }
-}
-
-#[async_trait]
-impl RequestHandler for DhtService {
-    async fn handle(&self, peer: &PeerAddr, cmd: &str, params: &Value) -> Value {
-        if cmd != KAD_CMD {
-            return vmap(vec![("error", Value::from("unknown command"))]);
-        }
-        match decode_request(params) {
-            Some((from, req)) => encode_response(&self.answer(peer, from, req), &self.node.id),
-            None => vmap(vec![("error", Value::from("malformed kad request"))]),
-        }
     }
 }
 

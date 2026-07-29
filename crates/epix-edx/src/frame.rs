@@ -1,5 +1,4 @@
-//! Frame codec: `u32-LE length ‖ postcard(Frame)` over any byte stream,
-//! plus the accept-time protocol sniff for the migration window.
+//! Frame codec: `u32-LE length ‖ postcard(Frame)` over any byte stream.
 //!
 //! Payload chunks are capped at [`crate::MAX_FRAME_LEN`]; a whole frame
 //! (header + payload) may never exceed [`FRAME_HARD_CAP`]. The cap is
@@ -15,25 +14,6 @@ use crate::{MAGIC, MAX_FRAME_LEN};
 
 /// Absolute cap on an encoded frame: payload cap + header slack.
 pub const FRAME_HARD_CAP: usize = MAX_FRAME_LEN + 4096;
-
-/// Which protocol an incoming connection speaks (first-byte sniff).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sniff {
-    /// `E` of `EDX1`.
-    Edx,
-    /// A msgpack map header (fixmap 0x80-0x8f, map16 0xde, map32 0xdf):
-    /// every legacy EpixNet message starts with one.
-    Legacy,
-    Unknown,
-}
-
-pub fn sniff(first_byte: u8) -> Sniff {
-    match first_byte {
-        b'E' => Sniff::Edx,
-        0x80..=0x8f | 0xde | 0xdf => Sniff::Legacy,
-        _ => Sniff::Unknown,
-    }
-}
 
 /// Send the 4-byte magic (each side sends it once, before anything else).
 pub async fn write_magic<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
@@ -150,15 +130,6 @@ mod tests {
         a.write_all(&[1, 2, 3]).await.unwrap();
         drop(a);
         assert!(read_frame(&mut b).await.is_err());
-    }
-
-    #[test]
-    fn sniff_separates_protocols() {
-        assert_eq!(sniff(b'E'), Sniff::Edx);
-        for legacy in [0x80u8, 0x8f, 0xde, 0xdf] {
-            assert_eq!(sniff(legacy), Sniff::Legacy, "{legacy:#x}");
-        }
-        assert_eq!(sniff(0x00), Sniff::Unknown);
     }
 
     #[tokio::test]

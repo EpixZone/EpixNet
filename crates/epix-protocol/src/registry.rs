@@ -1,11 +1,9 @@
 //! Process-wide registry of live peer connections, for the diagnostics Stats
-//! page. Mirrors the Python client's `ConnectionServer.connections` list:
-//! every outbound [`crate::Connection`] and every inbound served stream
-//! registers itself while open, so the UI can show the real links (direction,
-//! bytes, last command, xites touched) instead of a synthetic count. Entries
-//! deregister on drop, so the snapshot is always the live truth.
+//! page. Every EDX link - outbound dial and inbound accept - registers itself
+//! while open, so the UI can show the real links (direction, bytes, last
+//! request, xites touched) instead of a synthetic count. Entries deregister on
+//! drop, so the snapshot is always the live truth.
 
-use crate::HandshakeInfo;
 use epix_core::PeerAddr;
 use epix_transport::PeerStream;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +19,31 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub enum Direction {
     In,
     Out,
+}
+
+/// What a peer's EDX Hello said about itself. Kept in the shape the Stats page
+/// renders; `rev`, `fileserver_port` and `crypt_supported` were msgpack
+/// handshake fields with no EDX equivalent and read 0/empty.
+#[derive(Debug, Clone)]
+pub struct HandshakeInfo {
+    pub version: String,
+    pub rev: i64,
+    pub protocol: String,
+    pub peer_id: String,
+    pub fileserver_port: u16,
+    pub crypt_supported: Vec<String>,
+}
+
+/// Process-wide wire traffic totals. Every peer byte flows through a
+/// [`CountingStream`], so these cover all protocol traffic - handshakes,
+/// control requests, file data - not just file payloads. The stats endpoint
+/// and the tray report them; they reset with the process.
+static WIRE_RECV: AtomicU64 = AtomicU64::new(0);
+static WIRE_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// `(received, sent)` wire bytes since this process started.
+pub fn wire_totals() -> (u64, u64) {
+    (WIRE_RECV.load(Ordering::Relaxed), WIRE_SENT.load(Ordering::Relaxed))
 }
 
 /// Live per-connection state. Updated from the hot read/write path, so every
@@ -54,11 +77,13 @@ impl ConnEntry {
 
     fn record_recv(&self, n: u64) {
         self.bytes_recv.fetch_add(n, Ordering::Relaxed);
+        WIRE_RECV.fetch_add(n, Ordering::Relaxed);
         self.touch();
     }
 
     fn record_sent(&self, n: u64) {
         self.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        WIRE_SENT.fetch_add(n, Ordering::Relaxed);
         self.touch();
     }
 
@@ -186,7 +211,27 @@ impl ConnHandle {
         Box::pin(CountingStream {
             inner: stream,
             entry: self.entry.clone(),
+            _hold: None,
         })
+    }
+
+    /// Like [`count_stream`], but the wrapped stream also OWNS this
+    /// registration: the entry disappears from the snapshot when the stream
+    /// is dropped. A `Connection` can hold its own handle for as long as it
+    /// lives; an EDX link cannot - it hands its stream to detached
+    /// reader/writer tasks and keeps only a cheap `Conn` clone - so the
+    /// stream is the only thing with the right lifetime. The returned handle
+    /// is for later annotation (`set_peer`, `set_ping_ms`) and may be dropped.
+    ///
+    /// [`count_stream`]: ConnHandle::count_stream
+    pub fn attach(self, stream: PeerStream) -> (Arc<ConnHandle>, PeerStream) {
+        let handle = Arc::new(self);
+        let counted = Box::pin(CountingStream {
+            inner: stream,
+            entry: handle.entry.clone(),
+            _hold: Some(handle.clone()),
+        });
+        (handle, counted)
     }
 }
 
@@ -245,6 +290,9 @@ pub fn totals() -> ConnTotals {
 struct CountingStream {
     inner: PeerStream,
     entry: Arc<ConnEntry>,
+    /// Set by [`ConnHandle::attach`]: keeps the registration listed for
+    /// exactly as long as the stream is alive.
+    _hold: Option<Arc<ConnHandle>>,
 }
 
 impl AsyncRead for CountingStream {

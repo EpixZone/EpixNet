@@ -1,8 +1,8 @@
 //! EDX serving glue: an `AppState`-backed [`SignedProvider`] and the
-//! accept-hook that plugs the EDX protocol server into the node's TCP
-//! accept loop via [`epix_protocol::PeerServer::with_edx`]. Installed only
-//! when an EDX object store is present on the node (see [`enable_serving`]);
-//! otherwise the node serves msgpack only, unchanged.
+//! accept-hooks that plug the EDX protocol server into every transport's
+//! accept loop. Installed only when an EDX object store is present on the
+//! node (see [`enable_serving`]); without one there is nowhere to hold
+//! content, so such a node fetches but does not seed.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,14 +11,125 @@ use epix_blob::store::Store;
 use epix_blob::{Ns, ObjId};
 use epix_core::PeerAddr;
 use epix_edx::choke::Choker;
-use epix_edx::conn::Conn;
+use epix_edx::conn::{Conn, Incoming};
+use epix_edx::msg::{Hello, Req};
 use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
-use epix_edx::server::{client_hello, serve, PeerIdentity, ServeCtx, SignedProvider};
+use epix_edx::server::{
+    client_hello, serve, ControlProvider, PeerIdentity, ServeCtx, SignedProvider,
+};
 use epix_edx::sim::Class;
-use epix_protocol::server::EdxHook;
+use epix_protocol::registry::{ConnHandle, Direction};
+use epix_protocol::server::{EdxHook, InboundHook};
+use epix_protocol::HandshakeInfo;
 use epix_transport::Transport;
+use epix_ui::conn_pool::{LinkOpener, PeerLink};
 use epix_ui::state::{EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, InboundUpdate};
 use epix_ui::AppState;
+
+/// The peer's EDX Hello, in the shape the diagnostics Stats page renders. Only
+/// `version` and the node key are real over EDX; `rev`, `fileserver_port` and
+/// the crypt list were msgpack handshake fields with no EDX equivalent, and
+/// `protocol` names the wire.
+fn handshake_info(version: &str, node_pk: &[u8]) -> HandshakeInfo {
+    HandshakeInfo {
+        version: version.to_string(),
+        rev: 0,
+        protocol: "edx".into(),
+        peer_id: hex::encode(node_pk),
+        fileserver_port: 0,
+        crypt_supported: Vec::new(),
+    }
+}
+
+/// How long an accepted peer gets to finish the EDX handshake (magic, then
+/// Noise on clearnet). The accept loop's reaper only covers the FIRST byte, so
+/// without this a connection that opens with `E` and then stalls holds a socket
+/// and a task forever - the same fd leak, one byte later.
+const ACCEPT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Queue depth for the inbound-request tap. Matches the depth `Conn` gives its
+/// own incoming channel, so the tap adds no extra buffering.
+const INBOUND_TAP_DEPTH: usize = 16;
+
+/// The request name shown in the Stats page's `last recv` column.
+fn req_kind(req: &Req) -> &'static str {
+    match req {
+        Req::Hello(_) => "Hello",
+        Req::GetSigned { .. } => "GetSigned",
+        Req::ListSigned { .. } => "ListSigned",
+        Req::GetRange { .. } => "GetRange",
+        Req::GetMany { .. } => "GetMany",
+        Req::GetBitfield { .. } => "GetBitfield",
+        Req::HasXite { .. } => "HasXite",
+        Req::HaveRanges { .. } => "HaveRanges",
+        Req::Update { .. } => "Update",
+        Req::UpdatesSince { .. } => "UpdatesSince",
+        Req::Pex { .. } => "Pex",
+        Req::GetTrackers => "GetTrackers",
+        Req::Kad { .. } => "Kad",
+        Req::Announce { .. } => "Announce",
+    }
+}
+
+/// The xite a request names, for the Stats page's per-connection xite list.
+/// Object requests carry a hash, not a xite, so they name none.
+fn req_xite(req: &Req) -> Option<&str> {
+    match req {
+        Req::GetSigned { xite, .. }
+        | Req::ListSigned { xite, .. }
+        | Req::HasXite { xite }
+        | Req::Update { xite, .. }
+        | Req::Pex { xite, .. } => Some(xite),
+        _ => None,
+    }
+}
+
+/// Tap the inbound request stream of an accepted link so the diagnostics Stats
+/// page shows it, then forward every request untouched to the serve loop.
+///
+/// The row is created inactive and only listed once the peer's Hello arrives:
+/// a scanner that opens with the EDX magic and then says nothing never appears.
+/// `on_inbound` fires on the same event - a peer that completed the Noise
+/// handshake and spoke EDX is real proof our clearnet port is reachable.
+fn tap_inbound(
+    reg: Arc<ConnHandle>,
+    mut incoming: tokio::sync::mpsc::Receiver<Incoming>,
+    source: PeerAddr,
+    on_inbound: Option<InboundHook>,
+) -> tokio::sync::mpsc::Receiver<Incoming> {
+    let (tx, rx) = tokio::sync::mpsc::channel(INBOUND_TAP_DEPTH);
+    tokio::spawn(async move {
+        while let Some(inc) = incoming.recv().await {
+            if let Req::Hello(hello) = &inc.req {
+                reg.activate();
+                reg.set_peer(handshake_info(&hello.version, &hello.node_pk));
+                adopt_dialback(&reg, hello);
+                if let Some(hook) = &on_inbound {
+                    hook(&source);
+                }
+            }
+            reg.note_cmd_recv(req_kind(&inc.req), req_xite(&inc.req));
+            if tx.send(inc).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// Show an inbound peer under the address it says we can dial it back on: the
+/// socket it reached us from is an ephemeral port (clearnet) or a blank
+/// placeholder (onion/i2p/mesh), neither of which is an identity. The claim is
+/// trusted the way PEX gossip is, but only when it is complete and
+/// wire-packable - `pack()` base32/length-validates onion and i2p hosts, so
+/// junk that could never round-trip peer exchange is never displayed.
+fn adopt_dialback(reg: &ConnHandle, hello: &Hello) {
+    if let Some(addr) =
+        hello.listen.iter().find(|a| a.is_wellformed() && a.pack().is_some())
+    {
+        reg.set_addr(addr.clone());
+    }
+}
 
 /// Byte-exact wire encoding of one file's diff actions. The EDX push must
 /// preserve arbitrary insert bytes: the retired msgpack encoder carried them
@@ -211,7 +322,7 @@ impl SignedProvider for AppStateProvider {
         // Gossip the hint: record (xite, modified) so peers polling us learn a
         // new version exists and catch up fast. Done before (and regardless of)
         // apply, so a node that only relays this site still hints it for
-        // others - the store-and-forward reach the retired msgpack announce had.
+        // others - the store-and-forward reach a publish flood needs.
         self.state.record_update_hint(xite, modified as i64).await;
 
         // `inline` is not consumed: nothing sends it yet, and inserting pushed
@@ -245,34 +356,138 @@ impl SignedProvider for AppStateProvider {
     }
 }
 
-/// Build the CLEARNET accept-hook: an EDX-sniffed TCP stream gets Noise-XX
-/// then the EDX serve loop, backed by `store` and the node's xite registry.
+/// The node-wide handles the control plane needs beyond the [`AppState`]:
+/// the DHT participant (`Kad`) and the store-and-forward propagation log
+/// (`UpdatesSince`). Built once in the runtime and shared by every
+/// transport's accept loop, so all of them serve the same DHT node and the
+/// same hint log.
+#[derive(Clone)]
+pub struct ControlHandles {
+    pub dht: Arc<epix_dht_net::DhtService>,
+    pub prop: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
+}
+
+impl ControlHandles {
+    /// Handles shared with nothing else: a private DHT node and an empty
+    /// hint log. For serving EDX without a [`crate::NodeRuntime`] (which
+    /// passes its own, so both the DHT loop and the accept loops work off
+    /// one routing table and one hint log).
+    pub fn detached() -> Self {
+        let id = epix_dht::NodeId::hash(epix_crypt::new_seed().as_bytes());
+        Self {
+            dht: Arc::new(epix_dht_net::DhtService::new(Arc::new(epix_dht::Node::new(id)))),
+            prop: Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new())),
+        }
+    }
+}
+
+/// Serves the EDX control plane (`UpdatesSince`, `Pex`, `GetTrackers`, `Kad`,
+/// `Announce`) for ONE connection.
+///
+/// It is per connection because every one of those handlers needs the
+/// requester's address, and the EDX `PeerIdentity` carries none: the DHT
+/// rewrites a NATed caller's claimed IP to the address the request actually
+/// came from, and the tracker registers announcers the same way. Taking that
+/// from the accept hook's `PeerAddr` (which is the socket/overlay address,
+/// not something the peer asserts) keeps that anti-spoofing property; the
+/// Hello's self-reported `listen` addresses could not.
+struct RuntimeControlProvider {
+    state: Arc<AppState>,
+    handles: ControlHandles,
+    /// Where this connection came from, as the accept loop saw it.
+    peer: PeerAddr,
+}
+
+#[async_trait::async_trait]
+impl ControlProvider for RuntimeControlProvider {
+    async fn updates_since(&self, after: u64) -> (Vec<(String, i64)>, u64) {
+        let (hints, head) = self.handles.prop.lock().await.since(after);
+        (hints.into_iter().map(|h| (h.xite, h.modified)).collect(), head)
+    }
+
+    async fn pex(
+        &self,
+        xite: &str,
+        need: u32,
+        have: &[PeerAddr],
+        _from: &PeerIdentity,
+    ) -> Vec<PeerAddr> {
+        self.state.pex_exchange(xite, need as usize, have.to_vec(), &self.peer).await
+    }
+
+    async fn trackers(&self) -> Vec<String> {
+        self.state.tracker_list().await
+    }
+
+    async fn kad(&self, payload: &[u8], _from: &PeerIdentity) -> Result<Vec<u8>, String> {
+        self.handles.dht.handle_edx(&self.peer, payload)
+    }
+
+    async fn announce(&self, payload: &[u8], _from: &PeerIdentity) -> Result<Vec<u8>, String> {
+        let req = epix_discovery::tracker_pc::decode_request(payload).map_err(|e| e.to_string())?;
+        let resp = self.state.announce_serve(&req, &self.peer).await;
+        epix_discovery::tracker_pc::encode_reply(&resp).map_err(|e| e.to_string())
+    }
+}
+
+/// Build the CLEARNET accept-hook: an accepted TCP stream gets Noise-XX then
+/// the EDX serve loop, backed by `store` and the node's xite registry.
 /// `privatekey` is this node's EDX identity key, used for the Hello channel
-/// binding.
+/// binding. `on_inbound` fires once per peer that completes the handshake.
 pub fn edx_hook(
     state: Arc<AppState>,
     store: Arc<Store>,
     privatekey: String,
     choker: Option<SharedChoker>,
+    control: ControlHandles,
+    on_inbound: Option<InboundHook>,
 ) -> EdxHook {
-    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state });
-    Arc::new(move |_peer: PeerAddr, stream| {
+    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state: state.clone() });
+    Arc::new(move |peer: PeerAddr, stream| {
         let store = store.clone();
         let provider = provider.clone();
         let privatekey = privatekey.clone();
         let choker = choker.clone();
+        let on_inbound = on_inbound.clone();
+        let control = control_provider(&state, &control, peer.clone());
         Box::pin(async move {
-            let l = match epix_edx::link::accept(stream).await {
-                Ok(l) => l,
-                Err(_) => return,
-            };
-            let mut ctx = ServeCtx::new(store, provider, privatekey);
+            let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(stream);
+            let handshake = tokio::time::timeout(
+                ACCEPT_HANDSHAKE_TIMEOUT,
+                epix_edx::link::accept(stream),
+            );
+            let Ok(Ok(l)) = handshake.await else { return };
+            let mut ctx = serve_ctx(store, provider, privatekey, control);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
-            serve(l.conn, l.incoming, Arc::new(ctx), Some(l.handshake_hash)).await;
+            let incoming = tap_inbound(reg, l.incoming, peer, on_inbound);
+            serve(l.conn, incoming, Arc::new(ctx), Some(l.handshake_hash)).await;
         })
     })
+}
+
+/// The per-connection control provider (see [`RuntimeControlProvider`]).
+fn control_provider(
+    state: &Arc<AppState>,
+    handles: &ControlHandles,
+    peer: PeerAddr,
+) -> Arc<dyn ControlProvider> {
+    Arc::new(RuntimeControlProvider { state: state.clone(), handles: handles.clone(), peer })
+}
+
+/// A serve context that answers the control plane too (so it advertises
+/// `caps::CONTROL`) and reports this node's release version in its Hello -
+/// which is what the Stats page's `client` column shows.
+fn serve_ctx(
+    store: Arc<Store>,
+    provider: Arc<dyn SignedProvider>,
+    privatekey: String,
+    control: Arc<dyn ControlProvider>,
+) -> ServeCtx {
+    ServeCtx::new(store, provider, privatekey)
+        .with_version(epix_protocol::self_advert_version())
+        .with_control(control)
 }
 
 /// Build the OVERLAY accept-hook (Tor/I2P/Reticulum): the transport already
@@ -282,22 +497,29 @@ pub fn edx_hook_overlay(
     store: Arc<Store>,
     privatekey: String,
     choker: Option<SharedChoker>,
+    control: ControlHandles,
 ) -> EdxHook {
-    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state });
-    Arc::new(move |_peer: PeerAddr, stream| {
+    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state: state.clone() });
+    Arc::new(move |peer: PeerAddr, stream| {
         let store = store.clone();
         let provider = provider.clone();
         let privatekey = privatekey.clone();
         let choker = choker.clone();
+        let control = control_provider(&state, &control, peer.clone());
         Box::pin(async move {
-            let (conn, incoming) = match epix_edx::link::accept_overlay(stream).await {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let mut ctx = ServeCtx::new(store, provider, privatekey);
+            let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(stream);
+            let handshake = tokio::time::timeout(
+                ACCEPT_HANDSHAKE_TIMEOUT,
+                epix_edx::link::accept_overlay(stream),
+            );
+            let Ok(Ok((conn, incoming))) = handshake.await else { return };
+            let mut ctx = serve_ctx(store, provider, privatekey, control);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
+            // No inbound hook on overlays: reaching us over Tor/I2P/mesh says
+            // nothing about whether our clearnet port is open.
+            let incoming = tap_inbound(reg, incoming, peer, None);
             serve(conn, incoming, Arc::new(ctx), None).await;
         })
     })
@@ -312,27 +534,48 @@ pub struct EdxServe {
     store: Arc<Store>,
     privatekey: String,
     choker: Option<SharedChoker>,
+    control: ControlHandles,
 }
 
 impl EdxServe {
     /// The clearnet (Noise) accept hook for [`epix_protocol::PeerServer`].
-    pub fn clearnet_hook(&self) -> EdxHook {
-        edx_hook(self.state.clone(), self.store.clone(), self.privatekey.clone(), self.choker.clone())
+    /// `on_inbound` fires per peer that completes the handshake, which is how
+    /// the node learns its fileserver port is open from the internet.
+    pub fn clearnet_hook(&self, on_inbound: Option<InboundHook>) -> EdxHook {
+        edx_hook(
+            self.state.clone(),
+            self.store.clone(),
+            self.privatekey.clone(),
+            self.choker.clone(),
+            self.control.clone(),
+            on_inbound,
+        )
     }
     /// The overlay (no-Noise) accept hook for Tor/I2P/Reticulum.
     pub fn overlay_hook(&self) -> EdxHook {
-        edx_hook_overlay(self.state.clone(), self.store.clone(), self.privatekey.clone(), self.choker.clone())
+        edx_hook_overlay(
+            self.state.clone(),
+            self.store.clone(),
+            self.privatekey.clone(),
+            self.choker.clone(),
+            self.control.clone(),
+        )
     }
 }
 
 /// Lazily-shared EDX serve context so every accept loop initializes the same
-/// store/key/choker exactly once regardless of which transport comes up first.
-pub type EdxServeCell = Arc<tokio::sync::Mutex<Option<EdxServe>>>;
+/// store/key/choker exactly once regardless of which transport comes up
+/// first, plus the control-plane handles they all serve from.
+#[derive(Clone)]
+pub struct EdxServeCell {
+    cell: Arc<tokio::sync::Mutex<Option<EdxServe>>>,
+    control: ControlHandles,
+}
 
 /// A fresh, uninitialized shared EDX serve cell (built in `start`, cloned
 /// into each transport's accept loop).
-pub fn new_serve_cell() -> EdxServeCell {
-    Arc::new(tokio::sync::Mutex::new(None))
+pub fn new_serve_cell(control: ControlHandles) -> EdxServeCell {
+    EdxServeCell { cell: Arc::new(tokio::sync::Mutex::new(None)), control }
 }
 
 /// This node's EDX identity key (hex), for the Hello channel binding.
@@ -369,7 +612,7 @@ pub async fn node_key(state: &Arc<AppState>) -> String {
 /// EDX is the transfer + propagation protocol now, so there is no on/off knob:
 /// a node that can serve, does. (Reciprocity and the store quota stay tunable.)
 pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Option<EdxServe> {
-    let mut guard = cell.lock().await;
+    let mut guard = cell.cell.lock().await;
     if let Some(es) = guard.as_ref() {
         return Some(es.clone());
     }
@@ -377,7 +620,13 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
     let key = node_key(state).await;
     let choker = make_choker();
     let store = enable_serving(state, &dir, key.clone(), choker.clone()).await?;
-    let es = EdxServe { state: state.clone(), store, privatekey: key, choker };
+    let es = EdxServe {
+        state: state.clone(),
+        store,
+        privatekey: key,
+        choker,
+        control: cell.control.clone(),
+    };
     *guard = Some(es.clone());
     Some(es)
 }
@@ -399,23 +648,42 @@ struct RuntimeEdxFetcher {
 
 impl RuntimeEdxFetcher {
     /// Dial `peer`, bring up an EDX link past the Hello gate, and return the
-    /// connection plus the peer's authenticated identity.
+    /// connection, the peer's authenticated identity, and the link's entry in
+    /// the diagnostics connection registry.
+    ///
+    /// The registry entry is owned by the wrapped stream (`ConnHandle::attach`),
+    /// so it lists while the link's reader/writer tasks live and deregisters
+    /// when they end - a `Conn` clone is too cheap to hang a lifetime off. The
+    /// returned handle is for annotating the row afterwards (ping); dropping it
+    /// changes nothing.
     async fn dial(
         &self,
         transport: &Arc<dyn Transport>,
         peer: &PeerAddr,
-    ) -> Result<(Conn, PeerIdentity), String> {
-        // A client context: client_hello only reads the key and caps; reuse
-        // the AppState provider (harmless) and the object store.
+    ) -> Result<(Conn, PeerIdentity, Arc<ConnHandle>), String> {
+        // A client context: client_hello only reads the key, caps and version;
+        // reuse the AppState provider (harmless) and the object store.
         let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        // Offer our dial-back addresses in the Hello. The socket the peer sees
+        // is our ephemeral source port, so without this an overlay-only or
+        // NATed node that only ever dials OUT can never be dialed back.
+        let listen: Vec<PeerAddr> = self
+            .state
+            .own_dialable_addresses()
+            .await
+            .iter()
+            .filter_map(|s| PeerAddr::parse(s).ok())
+            .collect();
         let provider: Arc<dyn SignedProvider> =
             Arc::new(AppStateProvider { state: self.state.clone() });
-        let ctx = ServeCtx::new(store, provider, self.privatekey.clone());
+        let ctx = ServeCtx::new(store, provider, self.privatekey.clone())
+            .with_version(epix_protocol::self_advert_version());
         // Bound the whole handshake: a peer that TCP-accepts then stalls the
-        // Noise / client_hello exchange must not hang the fetch forever (the
-        // msgpack path this replaced wrapped every dial in connect_timeout).
+        // Noise / client_hello exchange must not hang the fetch forever.
         tokio::time::timeout(peer.connect_timeout(), async {
             let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
+            let (reg, stream) =
+                ConnHandle::new(Direction::Out, peer.clone()).attach(stream);
             // Clearnet TCP needs Noise; overlays (Tor/I2P/Reticulum) already
             // encrypt, so they skip it and bind with no handshake hash.
             let (conn, hh) = if matches!(peer, PeerAddr::Ip(_)) {
@@ -426,11 +694,34 @@ impl RuntimeEdxFetcher {
                     epix_edx::link::dial_overlay(stream).await.map_err(|e| e.to_string())?;
                 (conn, None)
             };
-            let identity = client_hello(&conn, &ctx, vec![], hh).await.map_err(|e| e.to_string())?;
-            Ok::<_, String>((conn, identity))
+            let identity =
+                client_hello(&conn, &ctx, listen, hh).await.map_err(|e| e.to_string())?;
+            // List it only once the peer proved it speaks EDX, so a port scan
+            // or a half-open TCP connect never shows up on the Stats page.
+            reg.activate();
+            reg.set_peer(handshake_info(&identity.version, &identity.node_pk));
+            Ok::<_, String>((conn, identity, reg))
         })
         .await
         .map_err(|_| "EDX dial timed out".to_string())?
+    }
+
+    /// Dial `peer` and run ONE control-plane request over the fresh link,
+    /// bounded like every other post-dial request. These are single
+    /// round trips (no session to reuse), so the link is dropped after.
+    /// Both an unreachable peer and a stalled request are `Err`: the caller
+    /// scores the peer and asks another.
+    async fn control<T, F, Fut>(&self, peer: &PeerAddr, f: F) -> Result<T, String>
+    where
+        F: FnOnce(Conn) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<T>>,
+    {
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let (conn, _identity, _reg) = self.dial(&transport, peer).await?;
+        match tokio::time::timeout(EDX_FETCH_TIMEOUT, f(conn)).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err("EDX control request timed out".into()),
+        }
     }
 
     /// Fetch an encrypted-shard file: pull each content-addressed ciphertext
@@ -463,7 +754,7 @@ impl RuntimeEdxFetcher {
             let mut handles: Vec<PeerHandle> = Vec::new();
             let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
             for peer in &peers {
-                let Ok((conn, identity)) = self.dial(&transport, peer).await else { continue };
+                let Ok((conn, identity, _reg)) = self.dial(&transport, peer).await else { continue };
                 if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
                     .await
@@ -546,7 +837,7 @@ impl RuntimeEdxFetcher {
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for peer in peers {
-            let Ok((conn, identity)) = self.dial(&transport, &peer).await else { continue };
+            let Ok((conn, identity, _reg)) = self.dial(&transport, &peer).await else { continue };
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
                     .await
@@ -589,7 +880,7 @@ impl RuntimeEdxFetcher {
         while let Some(res) = join.join_next().await {
             let Ok((peer, r)) = res else { continue };
             match r {
-                Ok((conn, identity)) => {
+                Ok((conn, identity, _reg)) => {
                     outcomes.push((peer.clone(), true));
                     out.push(SessionPeer {
                         conn,
@@ -715,7 +1006,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // failure is Err (peer unreachable - score ConnectFail); a live peer
         // that simply does not serve this content answers with an error we
         // map to Ok(None) (score FileFail), so the caller tries another peer.
-        let (conn, _identity) = self.dial(&transport, &peer).await?;
+        let (conn, _identity, _reg) = self.dial(&transport, &peer).await?;
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
             epix_edx::fetch::fetch_signed(&conn, address, inner_path),
@@ -813,7 +1104,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // after the link is up means it answered but refused (alive).
         let transport =
             self.state.transport().await.ok_or_else(|| EdxPushError::Unreachable("no transport".into()))?;
-        let (conn, _identity) =
+        let (conn, _identity, _reg) =
             self.dial(&transport, &peer).await.map_err(EdxPushError::Unreachable)?;
         // The link is up: from here a timeout is a slow-but-live peer, not an
         // unreachable one (the caller scores it Refused, not a backoff).
@@ -858,7 +1149,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
     ) -> EdxBatch {
         let mut batch = EdxBatch { done: Vec::new(), missed: Vec::new(), bytes: 0 };
         let Some(store) = self.state.edx_store().await else {
-            // No store: every file falls back to the msgpack worker.
+            // No store: nothing can be fetched, so every file is missed.
             batch.missed = want.into_iter().map(|w| w.inner_path).collect();
             return batch;
         };
@@ -915,7 +1206,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
             pending.push(r);
         }
 
-        // Encrypted-shard files: no msgpack fallback exists (they are not in
+        // Encrypted-shard files: no other fetch path exists (they are not in
         // the plain files map), so fetch each over EDX or drop it.
         for path in shard_paths {
             let got = match content
@@ -1032,6 +1323,121 @@ impl EdxFetcher for RuntimeEdxFetcher {
         let _ = store.enforce_quota(store_quota());
         batch
     }
+
+    async fn list_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        since: u64,
+    ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+        // Same split as fetch_signed: Err = unreachable (score ConnectFail),
+        // Ok(None) = alive but served no list, so try another peer.
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let (conn, _identity, _reg) = self.dial(&transport, &peer).await?;
+        match tokio::time::timeout(
+            EDX_FETCH_TIMEOUT,
+            epix_edx::fetch::list_signed(&conn, address, since),
+        )
+        .await
+        {
+            Ok(Ok(entries)) => Ok(Some(entries)),
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
+    }
+
+    async fn pex(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        need: u32,
+        have: Vec<PeerAddr>,
+    ) -> Result<Vec<PeerAddr>, String> {
+        let address = address.to_string();
+        self.control(&peer, move |conn| async move {
+            epix_edx::fetch::pex(&conn, &address, need, have).await
+        })
+        .await
+    }
+
+    async fn get_trackers(&self, peer: PeerAddr) -> Result<Vec<String>, String> {
+        self.control(&peer, |conn| async move { epix_edx::fetch::get_trackers(&conn).await }).await
+    }
+
+    async fn kad(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.control(&peer, move |conn| async move {
+            epix_edx::fetch::kad(&conn, payload).await
+        })
+        .await
+    }
+
+    async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.control(&peer, move |conn| async move {
+            epix_edx::fetch::announce(&conn, payload).await
+        })
+        .await
+    }
+
+    async fn updates_since(
+        &self,
+        peer: PeerAddr,
+        after: u64,
+    ) -> Result<(Vec<(String, i64)>, u64), String> {
+        self.control(&peer, move |conn| async move {
+            epix_edx::fetch::updates_since(&conn, after).await
+        })
+        .await
+    }
+}
+
+/// One warm pooled link: the EDX connection, the version its Hello carried,
+/// and its row in the diagnostics registry (held so the row lives as long as
+/// the pool keeps the link, and so pings land on it).
+struct WarmLink {
+    conn: Conn,
+    version: String,
+    reg: Arc<ConnHandle>,
+}
+
+#[async_trait::async_trait]
+impl PeerLink for WarmLink {
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    async fn ping(&self) -> Result<i64, String> {
+        let rtt = self.conn.ping().await.map_err(|e| e.to_string())?;
+        let ms = rtt.as_millis() as i64;
+        self.reg.set_ping_ms(ms);
+        Ok(ms)
+    }
+}
+
+#[async_trait::async_trait]
+impl LinkOpener for RuntimeEdxFetcher {
+    async fn open_link(&self, peer: PeerAddr) -> Result<Arc<dyn PeerLink>, String> {
+        let transport = self.state.transport().await.ok_or("no transport")?;
+        let (conn, identity, reg) = self.dial(&transport, &peer).await?;
+        Ok(Arc::new(WarmLink { conn, version: identity.version, reg }))
+    }
+}
+
+/// Carries Kademlia RPCs over EDX for `epix-dht-net`, which owns the payload
+/// codec but no link. Installed on the DHT client at startup.
+pub struct EdxKadSender {
+    state: Arc<AppState>,
+}
+
+impl EdxKadSender {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl epix_dht_net::KadSender for EdxKadSender {
+    async fn send(&self, to: &PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.state.edx_kad(to.clone(), payload).await.unwrap_or_else(|| Err("no EDX fetcher".into()))
+    }
 }
 
 /// Open the EDX object store under `data_dir/edx-store` and install it plus
@@ -1058,13 +1464,12 @@ pub async fn enable_serving(
         }
     };
     state.set_edx_store(store.clone()).await;
-    state
-        .set_edx_fetcher(Arc::new(RuntimeEdxFetcher {
-            state: state.clone(),
-            privatekey,
-            choker,
-        }))
-        .await;
+    let fetcher =
+        Arc::new(RuntimeEdxFetcher { state: state.clone(), privatekey, choker });
+    state.set_edx_fetcher(fetcher.clone()).await;
+    // Same object behind both seams: the warm pool needs only a ping, so it
+    // takes the narrow one.
+    state.set_link_opener(fetcher).await;
     // Register any xites already loaded before the store was installed, so
     // serving does not depend on load order.
     let n = state.edx_register_all_loaded().await;
@@ -1156,9 +1561,14 @@ mod tests {
         let server_pk = epix_crypt::private_to_compressed_pubkey(&server_key).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
-        let server = epix_protocol::PeerServer::new(handler)
-            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key, None));
+        let server = epix_protocol::PeerServer::new(edx_hook(
+                state_b.clone(),
+                store_b.clone(),
+                server_key,
+                None,
+                ControlHandles::detached(),
+            None,
+        ));
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
         });
@@ -1372,9 +1782,14 @@ mod tests {
         let server_key = epix_crypt::new_seed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
-        let server = epix_protocol::PeerServer::new(handler)
-            .with_edx(edx_hook(state_b.clone(), store_b, server_key, None));
+        let server = epix_protocol::PeerServer::new(edx_hook(
+                state_b.clone(),
+                store_b,
+                server_key,
+                None,
+                ControlHandles::detached(),
+            None,
+        ));
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
         });
@@ -1524,9 +1939,14 @@ mod tests {
         let server_key = epix_crypt::new_seed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
-        let server = epix_protocol::PeerServer::new(handler)
-            .with_edx(edx_hook(state_b.clone(), store_b, server_key, None));
+        let server = epix_protocol::PeerServer::new(edx_hook(
+                state_b.clone(),
+                store_b,
+                server_key,
+                None,
+                ControlHandles::detached(),
+            None,
+        ));
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
         });
@@ -1638,9 +2058,14 @@ mod tests {
         let server_key = epix_crypt::new_seed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handler = Arc::new(epix_ui::fileserve::FileService::new(state_b.clone()));
-        let server = epix_protocol::PeerServer::new(handler)
-            .with_edx(edx_hook(state_b.clone(), store_b.clone(), server_key, None));
+        let server = epix_protocol::PeerServer::new(edx_hook(
+                state_b.clone(),
+                store_b.clone(),
+                server_key,
+                None,
+                ControlHandles::detached(),
+            None,
+        ));
         tokio::spawn(async move {
             let _ = server.serve(listener).await;
         });
@@ -1704,6 +2129,285 @@ mod tests {
         // The seeder earned reciprocity credit for the bytes it served us.
         let credit = choker.lock().unwrap().credit_of(&server_pk);
         assert!(credit > 0, "the serving peer should be credited, got {credit}");
+    }
+
+    /// `listModified` over EDX: a client asks one peer which signed files
+    /// changed since a cutoff, and a cutoff past the newest version reports
+    /// nothing (how a resync skips a peer with no news).
+    #[tokio::test]
+    async fn list_signed_reports_changed_content_json() {
+        let (address, _bytes, _content, _movie, addr, _pk) = spawn_seeder().await;
+        let state_a = AppState::new("node-a");
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(dir.path()).unwrap())).await;
+        std::mem::forget(dir);
+        let fetcher = RuntimeEdxFetcher {
+            state: state_a.clone(),
+            privatekey: epix_crypt::new_seed(),
+            choker: None,
+        };
+        let peer = PeerAddr::Ip(addr);
+
+        let entries = fetcher.list_signed(peer.clone(), &address, 0).await.unwrap().unwrap();
+        assert!(
+            entries.iter().any(|(path, modified, _)| path == "content.json" && *modified == 1000),
+            "list_signed entries {entries:?}"
+        );
+        let none = fetcher.list_signed(peer, &address, 2000).await.unwrap().unwrap();
+        assert!(none.is_empty(), "nothing changed after the newest version, got {none:?}");
+    }
+
+    /// The control plane end to end: a seeder that serves it answers a
+    /// client's PEX, tracker-set, DHT, tracker-announce and propagation-hint
+    /// requests - the five commands the msgpack wire used to carry - and its
+    /// Hello reports the node's release version (the Stats `client` column).
+    #[tokio::test]
+    async fn edx_serves_the_control_plane() {
+        use epix_discovery::tracker_pc;
+
+        // The version a peer must see, from the same advert the retired
+        // msgpack handshake read.
+        epix_protocol::set_self_advert(epix_protocol::SelfAdvert {
+            version: "9.9.9".into(),
+            ..Default::default()
+        });
+
+        // Seeder: a xite with a known peer, a tracker entry, a recorded
+        // propagation hint, and its own DHT node.
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        let state_b = AppState::new("node-b");
+        state_b
+            .add_xite(
+                &address,
+                XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None },
+            )
+            .await;
+        let known = PeerAddr::parse("9.9.9.9:26552").unwrap();
+        state_b.add_peers(&address, [known.clone()]).await;
+        let hash = [42u8; 32];
+        let tracked = PeerAddr::parse("7.7.7.7:26552").unwrap();
+        state_b.tracker_announce(&[hash], &tracked).await;
+
+        let prop = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
+        prop.lock().await.record("1HintedXite", 4242);
+        let dht_node = Arc::new(epix_dht::Node::new(epix_dht::NodeId::hash(b"seeder")));
+        let control = ControlHandles {
+            dht: Arc::new(epix_dht_net::DhtService::new(dht_node.clone())),
+            prop: prop.clone(),
+        };
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state_b.clone(),
+            store_b,
+            epix_crypt::new_seed(),
+            None,
+            control,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        // Client: no xites, just the EDX stack.
+        let state_a = AppState::new("node-a");
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        std::mem::forget(a_store_dir);
+        let fetcher = RuntimeEdxFetcher {
+            state: state_a.clone(),
+            privatekey: epix_crypt::new_seed(),
+            choker: None,
+        };
+        let peer = PeerAddr::Ip(addr);
+
+        // The handshake advertises the control plane and the release version.
+        let transport = state_a.transport().await.unwrap();
+        let (_conn, identity, _reg) = fetcher.dial(&transport, &peer).await.unwrap();
+        assert_eq!(identity.version, "9.9.9", "the HelloAck carries the node version");
+        assert!(identity.caps & caps::CONTROL != 0, "the seeder advertises CONTROL");
+
+        // PEX: we get the peer it knows of that xite.
+        let got = fetcher.pex(peer.clone(), &address, 5, Vec::new()).await.unwrap();
+        assert!(got.contains(&known), "pex reply {got:?}");
+
+        // Tracker gossip: a working set is served (empty on a bare node).
+        assert!(fetcher.get_trackers(peer.clone()).await.unwrap().is_empty());
+
+        // Kad: the seeder's DHT node answers the ping, stamped with its id.
+        let me = epix_dht::Contact::new(
+            epix_dht::NodeId::hash(b"client"),
+            PeerAddr::parse("1.2.3.4:26552").unwrap(),
+        );
+        let payload = epix_dht_net::pc::encode_request(&me, &epix_dht::Request::Ping);
+        let reply = fetcher.kad(peer.clone(), payload).await.unwrap();
+        let (id, resp) = epix_dht_net::pc::decode_response(&reply).unwrap();
+        assert_eq!(id, dht_node.id, "answered by the seeder's DHT node");
+        assert!(matches!(resp, epix_dht::Response::Pong));
+
+        // Announce: the tracker serves the peer it holds for that hash.
+        let req = tracker_pc::AnnounceReq {
+            hashes: vec![hash],
+            need_types: vec!["ipv4".into()],
+            need_num: 10,
+            ..Default::default()
+        };
+        let reply = fetcher
+            .announce(peer.clone(), tracker_pc::encode_request(&req).unwrap())
+            .await
+            .unwrap();
+        let resp = tracker_pc::decode_reply(&reply).unwrap();
+        assert_eq!(resp.error, "");
+        assert_eq!(resp.peers.len(), 1, "one bucket set per requested hash");
+        assert!(resp.peers[0].unpack().contains(&tracked), "announce reply {:?}", resp.peers[0]);
+
+        // UpdatesSince: the recorded hint comes back with the new cursor.
+        let (updates, head) = fetcher.updates_since(peer.clone(), 0).await.unwrap();
+        assert_eq!(head, 1);
+        assert_eq!(updates, vec![("1HintedXite".to_string(), 4242)]);
+    }
+
+    /// The warm pool's link: an EDX connection that answers a frame-level Ping
+    /// and reports the peer's version, and shows up on the diagnostics Stats
+    /// page (version/ping/bytes) the way the retired msgpack pool did.
+    #[tokio::test]
+    async fn warm_link_pings_and_lands_on_the_stats_page() {
+        epix_protocol::set_self_advert(epix_protocol::SelfAdvert {
+            version: "3.2.1".into(),
+            ..Default::default()
+        });
+        let (_address, _content_bytes, _content, _movie, addr, _pk) = spawn_seeder().await;
+
+        let state = AppState::new("client");
+        state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let dir = tempfile::tempdir().unwrap();
+        state.set_edx_store(Arc::new(Store::open(dir.path()).unwrap())).await;
+        std::mem::forget(dir);
+        let fetcher = RuntimeEdxFetcher {
+            state: state.clone(),
+            privatekey: epix_crypt::new_seed(),
+            choker: None,
+        };
+        let peer = PeerAddr::Ip(addr);
+
+        let link = fetcher.open_link(peer.clone()).await.expect("warm link");
+        assert_eq!(link.version(), "3.2.1", "the peer's Hello version reaches the pool");
+        let ms = link.ping().await.expect("the peer answered the ping");
+        assert!(ms >= 0);
+
+        let row = epix_protocol::registry::snapshot()
+            .into_iter()
+            .find(|s| s.addr == peer && s.peer.as_ref().is_some_and(|p| p.protocol == "edx"))
+            .expect("the EDX link is listed on the Stats page");
+        assert_eq!(row.peer.as_ref().unwrap().version, "3.2.1");
+        assert_eq!(row.ping_ms, Some(ms), "the ping is stamped on the row");
+        assert!(row.bytes_sent > 0 && row.bytes_recv > 0, "raw link bytes counted");
+
+        // Dropping the link ends its IO tasks, which delists the row.
+        drop(link);
+        let delisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !epix_protocol::registry::snapshot().iter().any(|s| s.addr == peer) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(delisted, Ok(true), "a dropped link leaves the Stats page");
+    }
+
+    /// The INBOUND half of the accept path: a peer that dials us and speaks
+    /// EDX lands on the Stats page with its Hello identity, its dial-back
+    /// address and the request it made - and fires the inbound hook, which is
+    /// how the node learns its fileserver port is open from the internet.
+    #[tokio::test]
+    async fn an_inbound_edx_peer_is_listed_and_confirms_the_port() {
+        epix_protocol::set_self_advert(epix_protocol::SelfAdvert {
+            version: "4.5.6".into(),
+            ..Default::default()
+        });
+
+        // Server: a bare EDX node with an inbound hook recording who reached it.
+        let state_b = AppState::new("node-b");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        std::mem::forget(store_dir);
+        let seen: Arc<Mutex<Vec<PeerAddr>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_hook = seen.clone();
+        let hook: InboundHook = Arc::new(move |peer: &PeerAddr| {
+            seen_hook.lock().expect("seen").push(peer.clone());
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state_b.clone(),
+            store_b,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            Some(hook),
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        // Client: dial, Hello with a dial-back address, then one real request.
+        let dialback = PeerAddr::parse("203.0.113.9:26552").unwrap();
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_dir.path()).unwrap());
+        std::mem::forget(a_dir);
+        let ctx = ServeCtx::new(
+            a_store,
+            Arc::new(AppStateProvider { state: state_a.clone() }),
+            epix_crypt::new_seed(),
+        )
+        .with_version("4.5.6".into());
+        let stream = TcpTransport.dial(&PeerAddr::Ip(addr)).await.unwrap();
+        let link = epix_edx::link::dial(stream).await.unwrap();
+        client_hello(&link.conn, &ctx, vec![dialback.clone()], Some(link.handshake_hash))
+            .await
+            .unwrap();
+        let _ = epix_edx::fetch::fetch_signed(&link.conn, "1NoSuchXite", "content.json").await;
+
+        // The row appears under the ADDRESS THE PEER SAID we can dial it back
+        // on, not the ephemeral socket it reached us from.
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let found = epix_protocol::registry::snapshot().into_iter().find(|s| {
+                    s.direction == Direction::In
+                        && s.addr == dialback
+                        && !s.last_cmd_recv.is_empty()
+                });
+                if let Some(row) = found {
+                    return row;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the inbound EDX peer is listed on the Stats page");
+        assert_eq!(row.peer.as_ref().expect("Hello identity").version, "4.5.6");
+        assert_eq!(row.last_cmd_recv, "GetSigned");
+        assert_eq!(row.xites, vec!["1NoSuchXite".to_string()]);
+        assert!(row.bytes_recv > 0 && row.bytes_sent > 0, "raw link bytes counted");
+
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            seen.iter().any(|p| matches!(p, PeerAddr::Ip(a) if a.ip().is_loopback())),
+            "the hook saw the SOURCE address that proved the port reachable, got {seen:?}"
+        );
     }
 
     /// Latency floor over loopback TCP (real internet adds RTT on top): time

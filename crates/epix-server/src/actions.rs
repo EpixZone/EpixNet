@@ -1,7 +1,7 @@
 //! Authoring + diagnostics CLI actions, the EpixNet `epixnet.py <action>`
 //! surface: siteCreate / siteSign / siteVerify / dbRebuild / dbQuery /
 //! importBundle work offline against the data dir; crypt* are pure key
-//! operations; peer* drive the wire protocol against a running node.
+//! operations; peerPing measures an EDX link's round-trip to a running node.
 //!
 //! Kept clap-free on purpose: the action name is the first argument, exactly
 //! like the Python CLI, and everything else stays positional.
@@ -29,7 +29,6 @@ pub fn is_action(name: &str) -> bool {
             | "cryptGetPrivatekey"
             | "cryptPrivatekeyToAddress"
             | "peerPing"
-            | "peerCmd"
     )
 }
 
@@ -306,29 +305,14 @@ async fn dispatch(
             Ok(())
         }
 
-        // --- peer diagnostics (wire protocol against a running node) -------
+        // --- peer diagnostics (an EDX link to a running node) --------------
         "peerPing" => {
             let [ip, port] = args else { return Err("usage: peerPing <ip> <port>".into()) };
-            let mut conn = connect(ip, port).await?;
+            let conn = connect(ip, port).await?;
             for _ in 0..5 {
-                let started = std::time::Instant::now();
-                conn.ping().await.map_err(|e| e.to_string())?;
-                println!("Response time: {:.3}ms", started.elapsed().as_secs_f64() * 1000.0);
+                let rtt = conn.ping().await.map_err(|e| e.to_string())?;
+                println!("Response time: {:.3}ms", rtt.as_secs_f64() * 1000.0);
             }
-            Ok(())
-        }
-        "peerCmd" => {
-            let [ip, port, cmd, rest @ ..] = args else {
-                return Err("usage: peerCmd <ip> <port> <cmd> [json-params]".into());
-            };
-            let params: serde_json::Value = match rest.first() {
-                Some(raw) => serde_json::from_str(raw).map_err(|e| format!("bad params: {e}"))?,
-                None => serde_json::json!({}),
-            };
-            let mut conn = connect(ip, port).await?;
-            let reply =
-                conn.request(cmd, json_to_rmpv(&params)).await.map_err(|e| e.to_string())?;
-            println!("{}", serde_json::to_string_pretty(&rmpv_to_json(&reply)).unwrap());
             Ok(())
         }
         _ => Err("unknown action".into()),
@@ -401,67 +385,17 @@ async fn open_state(data_root: &std::path::Path, version: &str) -> Arc<AppState>
     state
 }
 
-async fn connect(ip: &str, port: &str) -> Result<epix_protocol::Connection, String> {
+/// Bring up an EDX link to a clearnet peer: dial, exchange the magic, run the
+/// Noise handshake. No Hello is sent - a frame-level ping needs no identity,
+/// so this measures the link itself.
+async fn connect(ip: &str, port: &str) -> Result<epix_edx::conn::Conn, String> {
+    use epix_transport::Transport;
     let addr = epix_core::PeerAddr::parse(&format!("{ip}:{port}"))
         .map_err(|e| format!("bad peer address: {e}"))?;
-    let mut conn = epix_protocol::Connection::connect(&epix_transport::TcpTransport, &addr)
-        .await
-        .map_err(|e| e.to_string())?;
-    conn.handshake().await.map_err(|e| e.to_string())?;
-    Ok(conn)
-}
-
-fn json_to_rmpv(v: &serde_json::Value) -> rmpv::Value {
-    match v {
-        serde_json::Value::Null => rmpv::Value::Nil,
-        serde_json::Value::Bool(b) => rmpv::Value::from(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                rmpv::Value::from(i)
-            } else {
-                rmpv::Value::from(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => rmpv::Value::from(s.as_str()),
-        serde_json::Value::Array(items) => {
-            rmpv::Value::Array(items.iter().map(json_to_rmpv).collect())
-        }
-        serde_json::Value::Object(map) => rmpv::Value::Map(
-            map.iter().map(|(k, v)| (rmpv::Value::from(k.as_str()), json_to_rmpv(v))).collect(),
-        ),
-    }
-}
-
-fn rmpv_to_json(v: &rmpv::Value) -> serde_json::Value {
-    match v {
-        rmpv::Value::Nil => serde_json::Value::Null,
-        rmpv::Value::Boolean(b) => serde_json::json!(b),
-        rmpv::Value::Integer(i) => i
-            .as_i64()
-            .map(|n| serde_json::json!(n))
-            .unwrap_or_else(|| serde_json::json!(i.as_u64())),
-        rmpv::Value::F32(f) => serde_json::json!(f),
-        rmpv::Value::F64(f) => serde_json::json!(f),
-        rmpv::Value::String(s) => serde_json::json!(s.as_str().unwrap_or_default()),
-        rmpv::Value::Binary(b) => {
-            // Show small binaries as lossy text, large ones as a length note.
-            if b.len() <= 256 {
-                serde_json::json!(String::from_utf8_lossy(b))
-            } else {
-                serde_json::json!(format!("<{} bytes>", b.len()))
-            }
-        }
-        rmpv::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(rmpv_to_json).collect())
-        }
-        rmpv::Value::Map(pairs) => serde_json::Value::Object(
-            pairs
-                .iter()
-                .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), rmpv_to_json(v)))
-                .collect(),
-        ),
-        _ => serde_json::Value::Null,
-    }
+    let stream =
+        epix_transport::TcpTransport.dial(&addr).await.map_err(|e| e.to_string())?;
+    let link = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
+    Ok(link.conn)
 }
 
 #[cfg(test)]
@@ -505,13 +439,4 @@ mod tests {
         assert!(!a.is_empty());
     }
 
-    #[test]
-    fn json_rmpv_round_trip() {
-        let v = serde_json::json!({
-            "site": "epix1abc", "need": 5, "flag": true, "list": [1, "two", null],
-            "nested": { "f": 1.5 },
-        });
-        let back = rmpv_to_json(&json_to_rmpv(&v));
-        assert_eq!(back, v);
-    }
 }

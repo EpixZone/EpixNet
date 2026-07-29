@@ -2,7 +2,7 @@
 //!
 //! Reticulum moves data as discrete, encrypted packets over a [`Link`] (LoRa,
 //! BLE, packet radio, TCP, serial…). The EpixNet wire protocol, on the other
-//! hand, is a byte stream: msgpack messages framed over a [`PeerStream`]
+//! hand, is a byte stream: EDX frames over a [`PeerStream`]
 //! (`AsyncRead` + `AsyncWrite`). [`ReticulumStream`] is the adapter between the
 //! two - it presents a Reticulum `Link` as a byte stream, so the *entire*
 //! FileRequest command set (handshake, getFile, the DHT `kad` RPCs, …) runs

@@ -2211,11 +2211,8 @@ dependencies = [
  "async-trait",
  "epix-core",
  "epix-dht",
- "epix-protocol",
- "epix-transport",
  "hex",
  "postcard",
- "rmpv",
  "serde",
  "tokio",
 ]
@@ -2224,15 +2221,11 @@ dependencies = [
 name = "epix-discovery"
 version = "0.1.0"
 dependencies = [
- "epix-content",
+ "async-trait",
  "epix-core",
- "epix-protocol",
- "epix-transport",
  "postcard",
  "reqwest",
- "rmpv",
  "serde",
- "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "tokio",
@@ -2318,7 +2311,6 @@ dependencies = [
  "epix-core",
  "epix-plugin",
  "epix-plugins",
- "epix-protocol",
  "epix-runtime",
  "epix-transport",
  "epix-ui",
@@ -2356,7 +2348,6 @@ dependencies = [
  "epix-discovery",
  "epix-peer",
  "epix-plugin",
- "epix-protocol",
  "epix-ui",
  "epix-xite",
  "serde_json",
@@ -2368,14 +2359,6 @@ dependencies = [
 name = "epix-propagation"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "epix-core",
- "epix-protocol",
- "epix-reticulum",
- "epix-transport",
- "rand_core 0.6.4",
- "reticulum",
- "rmpv",
  "tokio",
 ]
 
@@ -2383,15 +2366,8 @@ dependencies = [
 name = "epix-protocol"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "epix-content",
  "epix-core",
- "epix-crypt",
  "epix-transport",
- "getrandom 0.4.3",
- "hex",
- "rmpv",
- "serde_json",
  "tokio",
 ]
 
@@ -2401,11 +2377,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "epix-core",
+ "epix-edx",
  "epix-protocol",
  "epix-transport",
  "rand_core 0.6.4",
  "reticulum",
- "rmpv",
  "tokio",
 ]
 
@@ -2434,8 +2410,9 @@ dependencies = [
  "epix-xite",
  "hex",
  "igd-next 0.17.1",
+ "postcard",
  "reqwest",
- "rmpv",
+ "serde",
  "serde_json",
  "socket2 0.6.5",
  "tempfile",
@@ -2468,13 +2445,12 @@ dependencies = [
  "epix-build",
  "epix-core",
  "epix-crypt",
+ "epix-edx",
  "epix-node",
- "epix-protocol",
  "epix-runtime",
  "epix-transport",
  "epix-ui",
  "libc",
- "rmpv",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2529,6 +2505,7 @@ dependencies = [
  "epix-core",
  "epix-crypt",
  "epix-db",
+ "epix-discovery",
  "epix-peer",
  "epix-propagation",
  "epix-protocol",
@@ -2544,8 +2521,8 @@ dependencies = [
  "include_dir",
  "libc",
  "maxminddb",
+ "postcard",
  "reqwest",
- "rmpv",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2577,10 +2554,8 @@ dependencies = [
  "epix-core",
  "epix-crypt",
  "epix-discovery",
- "epix-protocol",
  "epix-transport",
  "epix-xite",
- "rmpv",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2596,7 +2571,6 @@ dependencies = [
  "epix-crypt",
  "epix-discovery",
  "epix-selfenc",
- "epix-transport",
  "fancy-regex",
  "hex",
  "rmpv",
@@ -9657,15 +9631,6 @@ checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
 dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "version_check",
-]
-
-[[package]]
-name = "wire-spike"
-version = "0.1.0"
-dependencies = [
- "epix-crypt",
- "rmpv",
- "serde_json",
 ]
 
 [[package]]

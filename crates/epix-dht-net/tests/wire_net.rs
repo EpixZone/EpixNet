@@ -1,14 +1,54 @@
-//! Multiple DHT nodes over real TCP: each runs a PeerServer serving `kad` RPCs,
-//! and looks up via a dial-on-demand WireRpcClient. Announce on one node, find
-//! it from another - the whole DHT-over-connections path.
+//! Multiple DHT nodes talking to each other over the EDX `Kad` payload: each
+//! runs a `DhtService`, and looks up via a `WireRpcClient` whose `KadSender`
+//! routes payloads to the addressed node. Announce on one node, find it from
+//! another - the whole DHT-over-payloads path, encode and decode included.
+//!
+//! The real link underneath (dial, Noise, `Req::Kad`) is exercised end to end
+//! by `epix-runtime`'s `edx_serves_the_control_plane`; here the sender is
+//! in-process so the DHT logic can be tested without a transport stack.
 
+use async_trait::async_trait;
 use epix_core::PeerAddr;
 use epix_dht::{site_key, Contact, Node, NodeId};
-use epix_dht_net::{DhtService, WireRpcClient};
-use epix_protocol::PeerServer;
-use epix_transport::{TcpTransport, Transport};
-use std::sync::Arc;
-use tokio::net::TcpListener;
+use epix_dht_net::{DhtService, KadSender, WireRpcClient};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// The "network": every node's service, keyed by its address. `send` hands the
+/// payload to the addressed service, tagging the caller's address the way an
+/// accept loop would (so the source-IP rewrite is exercised).
+#[derive(Default)]
+struct Net {
+    services: Mutex<HashMap<String, Arc<DhtService>>>,
+}
+
+impl Net {
+    fn register(&self, addr: &PeerAddr, service: Arc<DhtService>) {
+        self.services.lock().unwrap().insert(addr.to_string(), service);
+    }
+}
+
+/// One node's view of the net: payloads it sends arrive tagged with its own
+/// address, which is what a served connection sees.
+struct NetSender {
+    net: Arc<Net>,
+    from: PeerAddr,
+}
+
+#[async_trait]
+impl KadSender for NetSender {
+    async fn send(&self, to: &PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        let svc = self
+            .net
+            .services
+            .lock()
+            .unwrap()
+            .get(&to.to_string())
+            .cloned()
+            .ok_or_else(|| format!("no node at {to}"))?;
+        svc.handle_edx(&self.from, &payload)
+    }
+}
 
 struct TestNode {
     contact: Contact,
@@ -16,28 +56,21 @@ struct TestNode {
     client: WireRpcClient,
 }
 
-async fn spawn_node(i: usize, transport: Arc<dyn Transport>) -> TestNode {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+fn spawn_node(i: usize, net: &Arc<Net>) -> TestNode {
+    let addr = PeerAddr::parse(&format!("127.0.0.1:{}", 30000 + i)).unwrap();
     let id = NodeId::hash(format!("node-{i}").as_bytes());
-    let contact = Contact::new(id, PeerAddr::Ip(addr));
+    let contact = Contact::new(id, addr.clone());
     let node = Arc::new(Node::new(id));
-
-    let service = Arc::new(DhtService::new(node.clone()));
-    tokio::spawn(PeerServer::new(service).serve(listener));
-
-    let client = WireRpcClient::new(contact.clone(), transport);
+    net.register(&addr, Arc::new(DhtService::new(node.clone())));
+    let sender = Arc::new(NetSender { net: net.clone(), from: addr });
+    let client = WireRpcClient::new(contact.clone(), sender);
     TestNode { contact, node, client }
 }
 
 #[tokio::test]
-async fn dht_announce_and_lookup_over_real_tcp() {
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-
-    let mut nodes = Vec::new();
-    for i in 0..6 {
-        nodes.push(spawn_node(i, transport.clone()).await);
-    }
+async fn dht_announce_and_lookup_over_the_kad_payload() {
+    let net = Arc::new(Net::default());
+    let nodes: Vec<TestNode> = (0..6).map(|i| spawn_node(i, &net)).collect();
 
     // Seed routing tables with each other's listen contacts (established net).
     let contacts: Vec<Contact> = nodes.iter().map(|n| n.contact.clone()).collect();
@@ -47,29 +80,25 @@ async fn dht_announce_and_lookup_over_real_tcp() {
         }
     }
 
-    // Node 4 announces (over the wire) that a host serves a rare xite.
+    // Node 4 announces that a host serves a rare xite.
     let key = site_key("epix1rarexite000000000000000000000000000");
     let host = PeerAddr::parse("203.0.113.9:26552").unwrap();
     nodes[4].node.announce(key, host.clone(), &nodes[4].client).await;
 
-    // Node 0 looks it up over the wire and finds the host.
+    // Node 0 looks it up and finds the host.
     let found = nodes[0].node.get_peers(key, &nodes[0].client).await;
-    assert!(found.contains(&host), "lookup over TCP returned {found:?}");
+    assert!(found.contains(&host), "lookup returned {found:?}");
 }
 
 /// Phase 4: overlay self-addresses (onion/i2p/rns) announced over a clearnet
-/// TCP connection pass through the serving side's rewrite untouched and come
-/// back from a wire lookup - the path that makes a Tor-only or I2P-only
-/// publisher discoverable by everyone else. A clearnet `0.0.0.0` claim on the
-/// same announce is rewritten to the connection's source IP, keeping the
-/// claimed port.
+/// link pass through the serving side's rewrite untouched and come back from a
+/// lookup - the path that makes a Tor-only or I2P-only publisher discoverable
+/// by everyone else. A clearnet `0.0.0.0` claim on the same announce is
+/// rewritten to the connection's source IP, keeping the claimed port.
 #[tokio::test]
 async fn overlay_self_addresses_round_trip_over_the_wire() {
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-    let mut nodes = Vec::new();
-    for i in 200..206 {
-        nodes.push(spawn_node(i, transport.clone()).await);
-    }
+    let net = Arc::new(Net::default());
+    let nodes: Vec<TestNode> = (200..206).map(|i| spawn_node(i, &net)).collect();
     let contacts: Vec<Contact> = nodes.iter().map(|n| n.contact.clone()).collect();
     for n in &nodes {
         for c in &contacts {
@@ -114,9 +143,9 @@ async fn cold_start_probe_bootstraps_and_finds_a_site_with_no_tracker() {
     // The rare-site scenario: A serves a xite, B knows A only by ADDRESS
     // (e.g. learned from another site's swarm) - no node id, no tracker,
     // empty routing tables on both sides.
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-    let a = spawn_node(100, transport.clone()).await;
-    let b = spawn_node(101, transport.clone()).await;
+    let net = Arc::new(Net::default());
+    let a = spawn_node(100, &net);
+    let b = spawn_node(101, &net);
 
     // A announces the site into its own store (its dht_loop does this).
     let key = site_key("epix1rarexite000000000000000000000000000");
@@ -125,8 +154,7 @@ async fn cold_start_probe_bootstraps_and_finds_a_site_with_no_tracker() {
 
     // B probes A's bare address: the reply is stamped with A's node id, so B
     // learns A's authentic contact without knowing it beforehand.
-    let (responder, shared) = b.client.probe(&a.contact.addr, b.node.id).await.unwrap();
-    let a_contact = responder.expect("probe reply carries the responder id");
+    let (a_contact, shared) = b.client.probe(&a.contact.addr, b.node.id).await.unwrap();
     assert_eq!(a_contact.id, a.contact.id);
     assert_eq!(a_contact.addr, a.contact.addr);
     for c in shared {

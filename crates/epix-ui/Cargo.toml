@@ -11,6 +11,9 @@ epix-xite = { path = "../epix-xite" }
 epix-blob = { path = "../epix-blob" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
+# The tracker announce types (`tracker_pc`), shared by the msgpack and EDX
+# announce handlers. Already an indirect dependency through epix-xite.
+epix-discovery = { path = "../epix-discovery" }
 epix-db = { path = "../epix-db" }
 epix-protocol = { path = "../epix-protocol" }
 epix-transport = { path = "../epix-transport" }
@@ -25,7 +28,6 @@ epix-bt = { path = "../epix-bt", optional = true }
 base64 = "0.22"
 sha2 = "0.11"
 hex = "0.4"
-rmpv = "1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = { version = "0.5", features = ["util", "make"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }
@@ -43,6 +45,9 @@ tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
 getrandom = { version = "0.4" }
 sha3 = { version = "0.12", optional = true }
+# default-features off: postcard's default heapless support drags the
+# unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"], optional = true }
 
 [features]
 # UiPassword: a cookie-session login gate over the whole UI. Off by default and
@@ -53,7 +58,7 @@ ui-password = []
 multiuser = []
 # Benchmark: a /Benchmark diagnostics page timing the node's crypto/hash/pack
 # hot paths (shows off the Rust perf win). Off by default.
-benchmark = ["dep:sha3"]
+benchmark = ["dep:sha3", "dep:postcard"]
 # BitTorrent bridge present in this build. Pulls in the `epix-bt` engine and
 # mounts the `/bt/stream` Range endpoint, and gates the `bittorrent` capability
 # bit in `serverInfo` so xites feature-detect it. Forwarded from `epix-node`'s

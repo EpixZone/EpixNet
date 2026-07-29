@@ -1,13 +1,11 @@
 //! `epix-discovery` - finding peers for a xite.
 //!
 //! The primary method on the live network is the **Epix tracker** (`epix://`):
-//! an `announce` request over the ordinary EpixNet wire protocol (so it reuses
-//! [`epix_protocol::Connection`]). BitTorrent trackers, the mainline DHT, PEX,
-//! and local discovery will be added alongside it.
+//! an `announce` carried by the EDX `Announce` request. BitTorrent trackers,
+//! the mainline DHT, PEX, and local discovery sit alongside it.
 //!
-//! [`tracker`] speaks the legacy msgpack announce; [`tracker_pc`] is the same
-//! announce in postcard form, carried as the opaque payload of the EDX
-//! `Announce` request. Both are live during the msgpack retirement.
+//! [`tracker_pc`] is the announce payload (postcard); [`tracker`] is the
+//! two-call challenge-sign flow over whatever link the caller injects.
 
 pub mod bittorrent;
 pub mod tracker;
@@ -25,7 +23,7 @@ pub fn address_hash(address: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-pub use tracker::{announce, discover_via_epix_tracker, AnnounceParams, OnionSigner};
+pub use tracker::{AnnounceParams, AnnounceSender, OnionSigner, discover_via_epix_tracker};
 pub use tracker_pc::{AnnounceReply, AnnounceReq, AnnounceResp, PeerBuckets};
 
 /// One announcer, whichever protocol it speaks. The announce set mixes both

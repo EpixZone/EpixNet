@@ -5,7 +5,7 @@
 //! just falls back to a normal file download, so this is a bandwidth
 //! optimization, never a correctness dependency.
 //!
-//! Wire form (msgpack, inside an `update`'s `diffs` map, `inner_path -> actions`):
+//! Neutral form (an `Update` push carries these per file, `inner_path -> actions`):
 //! - `["=", n]`  copy `n` bytes from the old file
 //! - `["-", n]`  skip `n` bytes of the old file
 //! - `["+", [line, …]]`  insert these lines (strings)

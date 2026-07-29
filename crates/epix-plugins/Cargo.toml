@@ -10,7 +10,6 @@ epix-discovery = { path = "../epix-discovery" }
 epix-ui = { path = "../epix-ui" }
 epix-plugin = { path = "../epix-plugin" }
 epix-peer = { path = "../epix-peer" }
-epix-protocol = { path = "../epix-protocol" }
 async-trait = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }

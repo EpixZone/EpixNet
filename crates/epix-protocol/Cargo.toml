@@ -2,19 +2,12 @@
 name = "epix-protocol"
 version = "0.1.0"
 edition = "2021"
-description = "EpixNet wire protocol: msgpack framing, handshake, and the FileRequest command set over a PeerStream."
+description = "Peer plumbing shared by every transport: the inbound accept loop, the live connection registry, and the node's dial-back self-advert."
 
 [dependencies]
 epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
-rmpv = "1"
 tokio = { version = "1", features = ["io-util", "net", "rt", "time", "sync"] }
-getrandom = "0.4"
-hex = "0.4"
-async-trait = "0.1"
 
 [dev-dependencies]
-epix-crypt = { path = "../epix-crypt" }
-epix-content = { path = "../epix-content" }
-serde_json = "1"
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time", "test-util"] }

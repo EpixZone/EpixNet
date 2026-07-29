@@ -1,7 +1,7 @@
 //! `epix-transport` - the byte-stream abstraction beneath the wire protocol.
 //!
 //! `epix-protocol`'s connection runs over a [`PeerStream`], so the same
-//! msgpack/FileRequest logic works over TCP today and Tor / Reticulum mesh
+//! EDX logic works over TCP today and Tor / Reticulum mesh
 //! later - each is just another [`Transport`] that yields a `PeerStream`.
 
 use async_trait::async_trait;
@@ -30,8 +30,8 @@ pub trait Transport: Send + Sync {
 /// Read the first byte of a stream to route on it, and return it alongside
 /// a stream that still yields that byte. Portable across every transport
 /// (no `TcpStream::peek`, which overlays lack): the byte is buffered and
-/// replayed, so whichever handler is chosen sees the untouched stream. Used
-/// by the accept-time EDX-vs-msgpack protocol sniff.
+/// replayed, so the EDX handshake sees the untouched stream. Used by the
+/// accept loop to drop a connection that does not open with the EDX magic.
 pub async fn peek_first_byte(mut stream: PeerStream) -> Result<(u8, PeerStream)> {
     use tokio::io::AsyncReadExt;
     let mut first = [0u8; 1];

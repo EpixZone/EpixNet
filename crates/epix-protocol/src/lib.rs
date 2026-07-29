@@ -1,16 +1,14 @@
-//! `epix-protocol` - the EpixNet wire protocol over a `PeerStream`.
+//! `epix-protocol` - the peer plumbing every transport shares.
 //!
-//! Provides the msgpack framing ([`msg`]) and a client [`Connection`] that
-//! performs the handshake and the FileRequest command set (`ping`, `getFile`,
-//! …). The same connection logic runs over any [`epix_transport::Transport`].
+//! EDX is the only peer protocol, so what is left here is what sits either
+//! side of it: the inbound accept loop ([`server`]), the live connection
+//! registry the Stats page reads ([`registry`]), and this node's dial-back
+//! self-advertisement ([`advert`]).
 
 pub mod advert;
-pub mod connection;
-pub mod msg;
 pub mod registry;
 pub mod server;
 
-pub use advert::{set_self_advert, update_self_advert, SelfAdvert};
-pub use connection::{Connection, FindHashIdsReply, HandshakeInfo, PexReply};
-pub use msg::{vget, vmap, wire_totals};
-pub use server::{serve_overlay_stream, serve_stream, EdxHook, InboundHook, PeerServer, RequestHandler};
+pub use advert::{self_advert_version, set_self_advert, update_self_advert, SelfAdvert};
+pub use registry::{wire_totals, HandshakeInfo};
+pub use server::{EdxHook, InboundHook, PeerServer};

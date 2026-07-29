@@ -1,36 +1,28 @@
 //! [`ReticulumServer`]: the mesh-side counterpart to `epix-protocol`'s
 //! `PeerServer`. Where `PeerServer` accepts TCP connections, this accepts
-//! inbound Reticulum links, wraps each as a [`ReticulumStream`], and runs the
-//! same request/response loop (`serve_stream`) over it. With both, a node can
-//! dial *and* be dialed over mesh - the wire protocol is fully bidirectional
-//! over Reticulum.
+//! inbound Reticulum links, wraps each as a [`ReticulumStream`], and hands it
+//! to the EDX serve hook. With both, a node can dial *and* be dialed over
+//! mesh - the wire protocol is fully bidirectional over Reticulum.
 
 use std::sync::Arc;
 
 use epix_core::PeerAddr;
-use epix_protocol::{serve_overlay_stream, EdxHook, RequestHandler};
+use epix_protocol::EdxHook;
 use reticulum::destination::link::LinkEvent;
 use reticulum::transport::Transport as RnsTransport;
 
 use crate::ReticulumStream;
 
-/// Serves the wire protocol over inbound Reticulum links.
+/// Serves EDX over inbound Reticulum links.
 pub struct ReticulumServer {
-    handler: Arc<dyn RequestHandler>,
-    version: String,
-    rev: i64,
-    edx: Option<EdxHook>,
+    edx: EdxHook,
 }
 
 impl ReticulumServer {
-    pub fn new(handler: Arc<dyn RequestHandler>) -> Self {
-        Self { handler, version: "EpixRS".into(), rev: 8192, edx: None }
-    }
-
-    /// Fork EDX-sniffed links to the (no-Noise overlay) EDX serve loop.
-    pub fn with_edx(mut self, edx: Option<EdxHook>) -> Self {
-        self.edx = edx;
-        self
+    /// `edx` must be the no-Noise OVERLAY hook: an RNS link is already
+    /// encrypted and endpoint-authenticated, so EDX skips Noise over it.
+    pub fn new(edx: EdxHook) -> Self {
+        Self { edx }
     }
 
     /// Accept inbound links on `transport` forever, serving each on its own
@@ -56,20 +48,14 @@ impl ReticulumServer {
                 stream_events,
             ));
 
-            let handler = self.handler.clone();
-            let version = self.version.clone();
-            let rev = self.rev;
             let edx = self.edx.clone();
             tokio::spawn(async move {
                 // The inbound link id (`ev.id`) is NOT the peer's dialable
                 // destination hash - it's an ephemeral per-link identifier the
                 // stream uses for I/O, not an address we could dial back. Serve
-                // under the all-zero sentinel (which `is_wellformed` rejects, so
-                // it never enters a peer table) and let the handshake replace it
-                // with the peer's advertised `rns` self-address. Mesh
-                // destinations aren't port-addressed; advertise 0.
-                serve_overlay_stream(edx, handler, PeerAddr::Rns([0u8; 16]), stream, &version, rev, 0)
-                    .await;
+                // under the all-zero sentinel, which `is_wellformed` rejects so
+                // it never enters a peer table.
+                edx(PeerAddr::Rns([0u8; 16]), stream).await;
             });
         }
     }

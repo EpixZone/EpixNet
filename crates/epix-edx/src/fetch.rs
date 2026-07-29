@@ -236,8 +236,8 @@ pub async fn fetch_bitfield(conn: &Conn, obj: ObjId) -> std::io::Result<(u64, Gr
     }
 }
 
-// --- Control plane (caps::CONTROL): successors to the legacy msgpack
-// control commands. All single-response requests on the priority lane.
+// --- Control plane (caps::CONTROL): the client helpers. All are
+// single-response requests on the priority lane.
 
 /// Propagation hints after `after`: (xite, modified) pairs + new cursor.
 pub async fn updates_since(conn: &Conn, after: u64) -> std::io::Result<(Vec<(String, i64)>, u64)> {

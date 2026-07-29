@@ -1,48 +1,27 @@
 //! The propagation poll makes a missed update appear without waiting for the
-//! full resync tick: a peer holds a store-and-forward hint (`meshGetUpdates`),
-//! the node polls it, learns its hosted xite advanced to a newer version, and
-//! resyncs over EDX - fetching the newer content.json + `b3` file even though
-//! `resync_interval` is effectively disabled here. This is the client half of
-//! `epix-propagation` driven by the running node.
+//! full resync tick: a peer holds a store-and-forward hint, the node polls it
+//! over EDX (`Req::UpdatesSince`), learns its hosted xite advanced to a newer
+//! version, and resyncs - fetching the newer content.json + `b3` file even
+//! though `resync_interval` is effectively disabled here. This is the client
+//! half of `epix-propagation` driven by the running node.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use epix_blob::store::Store;
 use epix_blob::ObjId;
 use epix_core::PeerAddr;
-use epix_propagation::{PropagationService, PropagationStore};
-use epix_protocol::{vmap, PeerServer, RequestHandler};
+use epix_propagation::PropagationStore;
+use epix_protocol::PeerServer;
 use epix_runtime::edx::edx_hook;
 use epix_runtime::{NodeRuntime, RuntimeConfig};
 use epix_transport::TcpTransport;
 use epix_ui::{AppState, XiteEntry};
 use epix_xite::XiteStorage;
-use rmpv::Value as Rmp;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
-
-/// A seeder that answers the propagation commands (`meshGetUpdates` /
-/// `meshAnnounceUpdate`, msgpack) and serves files over EDX (the hook). File
-/// transfer via `getFile` is retired.
-struct HintPeer {
-    prop: PropagationService,
-}
-
-#[async_trait]
-impl RequestHandler for HintPeer {
-    async fn handle(&self, peer: &PeerAddr, cmd: &str, params: &Rmp) -> Rmp {
-        match cmd {
-            epix_propagation::CMD_GET | epix_propagation::CMD_ANNOUNCE => {
-                self.prop.handle(peer, cmd, params).await
-            }
-            _ => vmap(vec![("error", Rmp::from("unknown command"))]),
-        }
-    }
-}
 
 /// A signed content.json for `address` at `modified`, listing `files`.
 fn signed_content(priv_hex: &str, address: &str, modified: f64, files: Value) -> Vec<u8> {
@@ -93,9 +72,20 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let peer_addr = listener.local_addr().unwrap();
-    let handler = Arc::new(HintPeer { prop: PropagationService::new(prop_store) });
-    let server = PeerServer::new(handler)
-        .with_edx(edx_hook(src_state, store, epix_crypt::new_seed(), None));
+    // The EDX control plane serves UpdatesSince from the very store the hint
+    // was recorded into.
+    let control = epix_runtime::edx::ControlHandles {
+        prop: prop_store,
+        ..epix_runtime::edx::ControlHandles::detached()
+    };
+    let server = PeerServer::new(edx_hook(
+        src_state,
+        store,
+        epix_crypt::new_seed(),
+        None,
+        control,
+        None,
+    ));
     tokio::spawn(server.serve(listener));
 
     // --- Client: older content.json (modified 100), file not present. A real

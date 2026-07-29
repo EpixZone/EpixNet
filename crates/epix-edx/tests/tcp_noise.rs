@@ -168,6 +168,7 @@ async fn spoofed_hello_is_rejected_over_real_tcp() {
         binding_sig: noise::sign_binding(&hh, CLIENT_KEY).unwrap(),
         caps: caps::MESH,
         listen: vec![],
+        version: String::new(),
     };
     match conn.request(Req::Hello(spoofed)).await {
         Ok(Resp::Err { .. }) => {}
@@ -206,6 +207,7 @@ async fn replayed_binding_from_another_session_is_rejected() {
         binding_sig: old_sig,
         caps: caps::MESH,
         listen: vec![],
+        version: String::new(),
     };
     match conn2.request(Req::Hello(replayed)).await {
         Ok(Resp::Err { .. }) => {}

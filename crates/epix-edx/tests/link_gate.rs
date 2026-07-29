@@ -1,21 +1,19 @@
 //! Stage 1 gate for the Phase C node integration: the assembled link
 //! helpers (magic + Noise + Conn::start) establish a working EDX link over
-//! a real TCP socket routed by the first-byte sniff, and the sniff leaves a
-//! legacy (msgpack) stream untouched so both protocols share one port.
+//! a real TCP socket, on both the Noise (clearnet) and no-Noise (overlay)
+//! variants.
 
 use std::sync::Arc;
 
 use epix_blob::store::Store;
 use epix_blob::{Ns, ObjId};
 use epix_core::PeerAddr;
-use epix_edx::frame::Sniff;
 use epix_edx::link;
 use epix_edx::msg::caps;
 use epix_edx::server::{serve, ServeCtx, SignedProvider};
 use epix_edx::fetch;
 use epix_transport::{TcpTransport, Transport};
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const SERVER_KEY: &str = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
@@ -56,10 +54,9 @@ impl SignedProvider for FixtureProvider {
     }
 }
 
-/// A TCP server that routes each accepted socket by the first-byte sniff,
-/// exactly as the node's serve fork will: EDX -> link::accept -> serve;
-/// anything else is recorded so the test can prove legacy is untouched.
-async fn spawn_sniffing_server(store: Arc<Store>) -> std::net::SocketAddr {
+/// A TCP server that brings EDX up on every accepted socket, exactly as the
+/// node's accept hook does.
+async fn spawn_edx_server(store: Arc<Store>) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let ctx = Arc::new(ServeCtx::new(store, Arc::new(FixtureProvider), SERVER_KEY.into()));
@@ -69,19 +66,8 @@ async fn spawn_sniffing_server(store: Arc<Store>) -> std::net::SocketAddr {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let _ = sock.set_nodelay(true);
-                let (kind, stream) = match link::read_sniff(Box::pin(sock)).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                match kind {
-                    Sniff::Edx => {
-                        let Ok(l) = link::accept(stream).await else { return };
-                        serve(l.conn, l.incoming, ctx, Some(l.handshake_hash)).await;
-                    }
-                    // The legacy msgpack server would take the rewound stream
-                    // here; this fixture just drops it.
-                    _ => {}
-                }
+                let Ok(l) = link::accept(Box::pin(sock)).await else { return };
+                serve(l.conn, l.incoming, ctx, Some(l.handshake_hash)).await;
             });
         }
     });
@@ -95,7 +81,7 @@ async fn assembled_link_streams_a_verified_range_over_tcp() {
     let id = ObjId::of(&data);
     server_store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
 
-    let addr = spawn_sniffing_server(server_store).await;
+    let addr = spawn_edx_server(server_store).await;
 
     // Dial through the assembled helper: magic, Noise, mux, all in one call.
     let stream = TcpTransport.dial(&PeerAddr::Ip(addr)).await.unwrap();
@@ -144,14 +130,9 @@ async fn overlay_link_no_noise_streams_a_verified_range() {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let _ = sock.set_nodelay(true);
-                let (kind, stream) = match link::read_sniff(Box::pin(sock)).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                if kind != Sniff::Edx {
+                let Ok((conn, incoming)) = link::accept_overlay(Box::pin(sock)).await else {
                     return;
-                }
-                let Ok((conn, incoming)) = link::accept_overlay(stream).await else { return };
+                };
                 // No handshake hash on overlay links.
                 serve(conn, incoming, ctx, None).await;
             });
@@ -175,24 +156,4 @@ async fn overlay_link_no_noise_streams_a_verified_range() {
         .await
         .unwrap();
     assert!(got > 0, "the no-Noise overlay link fetched and verified a range");
-}
-
-#[tokio::test]
-async fn sniff_routes_edx_and_preserves_a_legacy_first_byte() {
-    // EDX magic sniffs as Edx.
-    assert_eq!(epix_edx::frame::sniff(b'E'), Sniff::Edx);
-    // A msgpack fixmap header sniffs as Legacy and is NOT consumed: the
-    // rewound stream still yields it, so the legacy server sees a whole
-    // message. This is what lets both protocols share one accept port.
-    let (mut a, b) = tokio::io::duplex(64);
-    tokio::spawn(async move {
-        // A legacy peer's first message starts with a fixmap header (0x82)
-        // followed by its body bytes.
-        a.write_all(&[0x82, 0xAA, 0xBB, 0xCC]).await.unwrap();
-    });
-    let (kind, mut rewound) = link::read_sniff(Box::pin(b)).await.unwrap();
-    assert_eq!(kind, Sniff::Legacy, "0x82 is a msgpack fixmap header");
-    let mut seen = [0u8; 4];
-    rewound.read_exact(&mut seen).await.unwrap();
-    assert_eq!(seen, [0x82, 0xAA, 0xBB, 0xCC], "the routing byte is replayed, not swallowed");
 }

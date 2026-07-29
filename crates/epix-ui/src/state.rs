@@ -4,7 +4,6 @@
 use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{DialableNets, Peer, PeerCounts, Peers};
-use epix_protocol::Connection;
 use epix_transport::Transport;
 use epix_user::User;
 use epix_xite::{content_stats, FileEntry, Xite, XiteSettings, XiteStorage};
@@ -142,6 +141,64 @@ pub trait EdxFetcher: Send + Sync {
         peers: Vec<PeerAddr>,
         on_file: Option<EdxBatchProgress>,
     ) -> EdxBatch;
+
+    /// `listModified` over EDX (`Req::ListSigned`): the signed files of
+    /// `address` changed since `since` (unix seconds), as
+    /// `(inner_path, modified, size)`. Same error split as `fetch_signed`:
+    /// `Err` on dial/link failure (score the peer, try another), `Ok(None)`
+    /// when the peer is alive but served no list.
+    async fn list_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        since: u64,
+    ) -> Result<Option<Vec<(String, u64, u64)>>, String>;
+
+    /// Peer exchange over EDX (`Req::Pex`): send the peers we already know
+    /// of `address`, get back up to `need` we lack plus the peer's own
+    /// reachable overlay addresses.
+    async fn pex(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        need: u32,
+        have: Vec<PeerAddr>,
+    ) -> Result<Vec<PeerAddr>, String>;
+
+    /// The peer's working tracker set over EDX (`Req::GetTrackers`), the
+    /// Beacon gossip source.
+    async fn get_trackers(&self, peer: PeerAddr) -> Result<Vec<String>, String>;
+
+    /// One Kademlia RPC over EDX (`Req::Kad`). The payload is opaque here -
+    /// `epix-dht-net` owns both encode and decode.
+    async fn kad(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String>;
+
+    /// One tracker announce over EDX (`Req::Announce`). The payload is
+    /// opaque here - `epix-discovery` owns both encode and decode.
+    async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String>;
+
+    /// Store-and-forward hints after the `after` cursor over EDX
+    /// (`Req::UpdatesSince`): `(xite, modified)` pairs plus the peer's current
+    /// head, which the caller keeps as its next cursor.
+    async fn updates_since(
+        &self,
+        peer: PeerAddr,
+        after: u64,
+    ) -> Result<(Vec<(String, i64)>, u64), String>;
+}
+
+/// Carries tracker announces over EDX. `epix-discovery` owns the announce
+/// payload but no link, so it takes this seam; the fetcher is captured for the
+/// whole announce round rather than re-read per tracker.
+struct EdxAnnounceSender {
+    fetcher: Arc<dyn EdxFetcher>,
+}
+
+#[async_trait::async_trait]
+impl epix_discovery::AnnounceSender for EdxAnnounceSender {
+    async fn send(&self, tracker: &PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.fetcher.announce(tracker.clone(), payload).await
+    }
 }
 
 /// One file to fetch in a batch. `id`/`size`, when set, let a caller that has
@@ -640,6 +697,10 @@ pub struct AppState {
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
+    /// Opens the warm pool's EDX links, installed by the node alongside the
+    /// fetcher. Separate from `edx_fetcher` because the pool needs only a
+    /// ping, and a mock of one should not have to mock the other.
+    link_opener: RwLock<Option<Arc<dyn crate::conn_pool::LinkOpener>>>,
     /// Shared update-hint store (set once by the node). Every EDX update we
     /// receive records `(xite, modified)` here - the store-and-forward gossip
     /// that lets a published post reach the network in seconds: peers polling
@@ -1195,6 +1256,7 @@ impl AppState {
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
             edx_fetcher: RwLock::new(None),
+            link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
@@ -1337,6 +1399,7 @@ impl AppState {
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
             edx_fetcher: RwLock::new(None),
+            link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
@@ -1560,6 +1623,23 @@ impl AppState {
     /// The runtime-contributed trackers (beyond the configured/static list).
     pub async fn extra_trackers(&self) -> Vec<epix_xite::Tracker> {
         self.extra_trackers.read().await.clone()
+    }
+
+    /// The announcer list we hand to peers that ask (the AnnounceShare
+    /// exchange): our remembered plus Beacon-discovered trackers, deduped, in
+    /// their canonical `scheme://host:port` spelling so the receiver can parse
+    /// them straight back into a [`epix_xite::Tracker`].
+    ///
+    /// Codec-free so both wire protocols answer with the same list.
+    pub async fn tracker_list(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in self.shared_trackers().await.into_iter().chain(self.extra_trackers().await) {
+            let s = t.to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
     }
 
     /// Record the node's bootstrap tracker list (config or built-in defaults).
@@ -2598,6 +2678,74 @@ impl AppState {
             .collect()
     }
 
+    /// Max peers one PEX reply hands out, whatever the requester asks for.
+    const PEX_NEED_CAP: usize = 100;
+
+    /// Serve one peer exchange: absorb the peers `from` sent us (and `from`
+    /// itself when it reached us over an overlay), then answer with our
+    /// connectable peers they lack plus our own reachable overlay addresses.
+    ///
+    /// Codec-free so both wire protocols serve the same exchange. An unknown
+    /// xite yields no peers - the caller decides how to say so.
+    pub async fn pex_exchange(
+        &self,
+        site: &str,
+        need: usize,
+        got: Vec<PeerAddr>,
+        from: &PeerAddr,
+    ) -> Vec<PeerAddr> {
+        if !self.has_any_alias(site).await {
+            return Vec::new();
+        }
+        let need = need.min(Self::PEX_NEED_CAP);
+
+        // What they already have, so we never echo it back.
+        let mut exclude: std::collections::HashSet<String> =
+            got.iter().map(|p| p.to_string()).collect();
+        exclude.insert(from.to_string());
+
+        // Record the requester itself when it arrived over an overlay: the
+        // handshake rebinds an inbound onion/i2p/rns placeholder to the peer's
+        // advertised self-address, so an overlay publisher that PEXes us
+        // becomes a peer we can dial back at first contact instead of waiting
+        // for gossip to name it. A placeholder (no self-address advertised) is
+        // dropped by add_peers' well-formedness filter. A clearnet requester
+        // still arrives from an ephemeral port unless its handshake advertised
+        // a fileserver port; trackers cover clearnet self-advertising, so
+        // those are not recorded here.
+        let mut got = got;
+        if from.is_overlay() {
+            got.push(from.clone());
+        }
+        self.add_peers(site, got).await;
+
+        let mut reply = self.pex_peers(site, need, &exclude).await;
+
+        // Advertise our own reachable overlay addresses (onion + i2p + mesh)
+        // so peers can reach us over an anonymity network or mesh link and
+        // gossip us on. Clearnet self-advertising is left to trackers (they
+        // see our source IP:port).
+        let fs_port = self.fileserver_port().await;
+        let mut self_addrs: Vec<PeerAddr> = Vec::new();
+        if let Some(onion) = self.onion_address().await {
+            self_addrs.push(PeerAddr::Onion { host: onion, port: fs_port });
+        }
+        if let Some(i2p) = self.i2p_address().await {
+            self_addrs.push(PeerAddr::I2p { dest: i2p, port: fs_port });
+        }
+        if let Some(hex) = self.rns_address().await {
+            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
+                self_addrs.push(p);
+            }
+        }
+        for p in self_addrs {
+            if !exclude.contains(&p.to_string()) {
+                reply.push(p);
+            }
+        }
+        reply
+    }
+
     /// content.json files modified after `since` (ms), as `{inner_path:
     /// modified}` - the `listModified` reply, covering the root plus every
     /// include / per-user content.json on disk.
@@ -2976,7 +3124,11 @@ impl AppState {
         address: &str,
         trackers: &[epix_xite::Tracker],
     ) -> Vec<PeerAddr> {
-        let Some(transport) = self.transport.read().await.clone() else { return Vec::new() };
+        // Epix trackers are announced to over EDX; without the fetcher there is
+        // no link to carry the announce (and no peers to find).
+        let Some(fetcher) = self.edx_fetcher.read().await.clone() else { return Vec::new() };
+        let sender: Arc<dyn epix_discovery::AnnounceSender> =
+            Arc::new(EdxAnnounceSender { fetcher });
         let (tor_on, tor_st) = self.tor_status().await;
         // Trackers key peers by the signed content address, so a `.epix` alias
         // must announce under that (not the display name) to find the same
@@ -3002,13 +3154,13 @@ impl AppState {
                 skipped += 1;
                 continue;
             }
-            let transport = transport.clone();
+            let sender = sender.clone();
             let key = key.clone();
             let advert = advert.clone();
             set.spawn(async move {
                 let peers = tokio::time::timeout(
                     std::time::Duration::from_secs(20),
-                    epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
+                    epix_xite::announce(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
                 )
                 .await
                 .unwrap_or_default();
@@ -3904,6 +4056,93 @@ impl AppState {
         need: crate::tracker::NeedTypes,
     ) -> Vec<PeerAddr> {
         self.tracker.peer_list(hash, exclude, limit, now_secs(), need).await
+    }
+
+    /// Serve one tracker announce: record the announcer's addresses for every
+    /// hash it named, then answer with the peers we know for each hash, in
+    /// request order.
+    ///
+    /// Codec-free so both wire protocols serve the same tracker. The request
+    /// type comes from `epix-discovery` (already a dependency through
+    /// `epix-xite`), so no conversion struct sits in between.
+    pub async fn announce_serve(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+    ) -> epix_discovery::tracker_pc::AnnounceResp {
+        use epix_discovery::tracker_pc::{AnnounceResp, PeerBuckets};
+
+        let mut resp = AnnounceResp::default();
+        if !self.tracker_enabled().await {
+            resp.error = "Tracker disabled".into();
+            return resp;
+        }
+        if req.hashes.is_empty() {
+            return resp;
+        }
+        let need = crate::tracker::NeedTypes::from_list(&req.need_types);
+
+        // Record the announcer's addresses, collecting them so it never gets
+        // itself back in the results.
+        let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Clearnet: source IP + the port it announced, if it asked to be added.
+        if req.port != 0 {
+            if let PeerAddr::Ip(sa) = from {
+                let wants = if sa.is_ipv6() {
+                    req.add.iter().any(|t| t == "ipv6")
+                } else {
+                    req.add.iter().any(|t| t == "ipv4" || t == "ip4")
+                };
+                if wants {
+                    let mut a = *sa;
+                    a.set_port(req.port);
+                    let addr = PeerAddr::Ip(a);
+                    self.tracker_announce(&req.hashes, &addr).await;
+                    mine.insert(addr.to_string());
+                }
+            }
+        }
+        // If the announce arrived over i2p, the source destination is authoritative.
+        if let PeerAddr::I2p { dest, .. } = from {
+            if !dest.is_empty() {
+                self.tracker_announce(&req.hashes, from).await;
+                mine.insert(from.to_string());
+            }
+        }
+        // Onion / i2p self-addresses from the request. Parallel arrays map to
+        // hashes one-to-one; a single value applies to every hash. We register
+        // them on trust: this tracker issues no `onion_sign_this` challenge,
+        // so `resp.onion_sign_this` stays empty and the request's
+        // `onion_signs` are never needed.
+        for (list, is_onion) in [(&req.onions, true), (&req.i2p, false)] {
+            for (i, host) in list.iter().enumerate() {
+                if host.is_empty() {
+                    continue;
+                }
+                let addr = if is_onion {
+                    PeerAddr::Onion { host: host.clone(), port: req.port }
+                } else {
+                    PeerAddr::I2p { dest: host.clone(), port: req.port }
+                };
+                let hs: &[[u8; 32]] = if list.len() == req.hashes.len() {
+                    std::slice::from_ref(&req.hashes[i])
+                } else {
+                    &req.hashes
+                };
+                self.tracker_announce(hs, &addr).await;
+                mine.insert(addr.to_string());
+            }
+        }
+
+        // Reply: the peers we know for each hash, bucketed by type. `need_num`
+        // is what the requester would like; 30 per hash is what any requester
+        // gets.
+        let limit = (req.need_num as usize).min(30);
+        for h in &req.hashes {
+            let peers = self.tracker_peer_list(h, &mine, limit, need).await;
+            resp.peers.push(PeerBuckets::pack(&peers));
+        }
+        resp
     }
 
     /// Drop stale tracker peers (called from the announce loop).
@@ -6020,7 +6259,7 @@ impl AppState {
     /// membership onto each xite's peer `connected` flags. Called periodically
     /// by the runtime so connection stats stay live.
     pub async fn manage_connections(&self) {
-        let Some(transport) = self.transport.read().await.clone() else { return };
+        let Some(opener) = self.link_opener.read().await.clone() else { return };
         // Candidate peers across all served xites - best sources first
         // (tracker seeds, then connectable registry peers), skipping peers in
         // failure backoff and undialable networks. Feeding the pool the RAW
@@ -6037,7 +6276,7 @@ impl AppState {
                 }
             }
         }
-        self.conn_pool.ensure(transport, &candidates).await;
+        self.conn_pool.ensure(opener, &candidates).await;
         self.conn_pool.ping_all().await;
 
         // Mark peers we hold a live connection to as connected.
@@ -6067,85 +6306,42 @@ impl AppState {
     /// fold in any new ones. Trackers/DHT bootstrap discovery; PEX keeps it
     /// self-healing between announces (EpixNet runs this in its cleanup loop).
     /// Returns how many new peers were learned.
-    pub async fn run_pex(&self, address: &str, max_peers: usize, need: i64) -> usize {
-        let Some(transport) = self.transport.read().await.clone() else { return 0 };
+    pub async fn run_pex(&self, address: &str, max_peers: usize, need: u32) -> usize {
         let canonical = {
             let xites = self.xites.read().await;
             let Some(x) = self.resolve_xite(&xites, address) else { return 0 };
             canonical_address(x.content.as_ref(), address)
         };
-        // The peers we offer them (packed by type), and the set we already know.
+        // The peers we offer them, and the set we already know.
         let ours = self.connectable_peers(address, 10).await;
         let mut known: std::collections::HashSet<String> =
             ours.iter().map(|p| p.to_string()).collect();
-        let (mut ipv4, mut ipv6, mut onion, mut i2p) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut rns: Vec<Vec<u8>> = Vec::new();
-        for p in &ours {
-            if p.is_private() {
-                continue;
-            }
-            match (p.ip_type(), p.pack()) {
-                (epix_core::IpType::Ipv4, Some(b)) => ipv4.push(b),
-                (epix_core::IpType::Ipv6, Some(b)) => ipv6.push(b),
-                (epix_core::IpType::Onion, Some(b)) => onion.push(b),
-                (epix_core::IpType::I2p, Some(b)) => i2p.push(b),
-                (epix_core::IpType::Rns, Some(b)) => rns.push(b),
-                _ => {}
-            }
-        }
+        let mut have: Vec<PeerAddr> =
+            ours.iter().filter(|p| !p.is_private()).cloned().collect();
         // Advertise our own reachable overlay addresses so the peers we reach
         // add and gossip us (mirrors the server-side pex reply).
         let fs_port = self.fileserver_port().await;
         if let Some(host) = self.onion_address().await {
-            if let Some(b) = (PeerAddr::Onion { host, port: fs_port }).pack() {
-                onion.push(b);
-            }
+            have.push(PeerAddr::Onion { host, port: fs_port });
         }
         if let Some(dest) = self.i2p_address().await {
-            if let Some(b) = (PeerAddr::I2p { dest, port: fs_port }).pack() {
-                i2p.push(b);
-            }
+            have.push(PeerAddr::I2p { dest, port: fs_port });
         }
         if let Some(hex) = self.rns_address().await {
             if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
-                if let Some(b) = p.pack() {
-                    rns.push(b);
-                }
+                have.push(p);
             }
         }
 
         let mut learned: Vec<PeerAddr> = Vec::new();
         for peer in ours.iter().take(max_peers) {
-            // Overlay-aware bound: an onion/i2p peer can't finish a dial +
-            // PEX inside a clearnet-sized timeout.
-            let got = tokio::time::timeout(peer.connect_timeout(), async {
-                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
-                conn.handshake().await.ok()?;
-                conn.pex(
-                    &canonical,
-                    ipv4.clone(),
-                    ipv6.clone(),
-                    onion.clone(),
-                    i2p.clone(),
-                    rns.clone(),
-                    need,
-                )
-                .await
-                .ok()
-            })
-            .await;
-            let Ok(Some(reply)) = got else { continue };
+            let Some(Ok(found)) =
+                self.edx_pex(peer.clone(), &canonical, need, have.clone()).await
+            else {
+                continue;
+            };
             self.set_peer_connected(address, peer, true).await;
-            let unpacked = reply
-                .ipv4
-                .iter()
-                .chain(reply.ipv6.iter())
-                .filter_map(|b| PeerAddr::unpack_ip(b))
-                .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
-                .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)))
-                .chain(reply.rns.iter().filter_map(|b| PeerAddr::unpack_rns(b)));
-            for p in unpacked {
+            for p in found {
                 if known.insert(p.to_string()) {
                     learned.push(p);
                 }
@@ -7699,6 +7895,11 @@ impl AppState {
         *self.edx_fetcher.write().await = Some(fetcher);
     }
 
+    /// Install the warm pool's link opener (set by the node).
+    pub async fn set_link_opener(&self, opener: Arc<dyn crate::conn_pool::LinkOpener>) {
+        *self.link_opener.write().await = Some(opener);
+    }
+
     /// Install the shared update-hint store (the node's `PropagationStore`),
     /// so received EDX updates gossip a hint that pollers can catch up on.
     pub fn set_prop_store(
@@ -7788,6 +7989,68 @@ impl AppState {
     ) -> Option<Result<Option<Vec<u8>>, String>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
         Some(fetcher.fetch_range(address, inner_path, start, len).await)
+    }
+
+    /// `listModified` from one peer over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed; otherwise the fetcher's result.
+    pub async fn edx_list_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        since: u64,
+    ) -> Option<Result<Option<Vec<(String, u64, u64)>>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.list_signed(peer, address, since).await)
+    }
+
+    /// Peer exchange with one peer over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed.
+    pub async fn edx_pex(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        need: u32,
+        have: Vec<PeerAddr>,
+    ) -> Option<Result<Vec<PeerAddr>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.pex(peer, address, need, have).await)
+    }
+
+    /// A peer's tracker set over EDX via the installed fetcher (Beacon
+    /// gossip). `None` when no fetcher is installed.
+    pub async fn edx_get_trackers(&self, peer: PeerAddr) -> Option<Result<Vec<String>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.get_trackers(peer).await)
+    }
+
+    /// One Kademlia RPC over EDX via the installed fetcher (payload encoded
+    /// and decoded by `epix-dht-net`). `None` when no fetcher is installed.
+    pub async fn edx_kad(&self, peer: PeerAddr, payload: Vec<u8>) -> Option<Result<Vec<u8>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.kad(peer, payload).await)
+    }
+
+    /// One tracker announce over EDX via the installed fetcher (payload
+    /// encoded and decoded by `epix-discovery`). `None` when no fetcher is
+    /// installed.
+    pub async fn edx_announce(
+        &self,
+        peer: PeerAddr,
+        payload: Vec<u8>,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.announce(peer, payload).await)
+    }
+
+    /// Propagation hints after `after` over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed.
+    pub async fn edx_updates_since(
+        &self,
+        peer: PeerAddr,
+        after: u64,
+    ) -> Option<Result<(Vec<(String, i64)>, u64), String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.updates_since(peer, after).await)
     }
 
     /// The declared size of an EDX file from its signed content.json entry,
@@ -11431,6 +11694,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracker_list_is_canonical_and_deduped() {
+        let state = AppState::new("test");
+        state.config_set("shared_trackers", json!(["1.1.1.1:26959", "epix://2.2.2.2:26959"])).await;
+        state.set_extra_trackers(vec![
+            epix_xite::Tracker::Epix(PeerAddr::parse("2.2.2.2:26959").unwrap()),
+            epix_xite::Tracker::Epix(PeerAddr::parse("3.3.3.3:26959").unwrap()),
+        ])
+        .await;
+        // Every entry comes out in the transport-explicit spelling the
+        // receiver parses back, and the shared/extra overlap appears once.
+        assert_eq!(
+            state.tracker_list().await,
+            vec![
+                "tcp://1.1.1.1:26959".to_string(),
+                "tcp://2.2.2.2:26959".to_string(),
+                "tcp://3.3.3.3:26959".to_string(),
+            ]
+        );
+        for t in state.tracker_list().await {
+            assert!(epix_xite::Tracker::parse(&t).is_some(), "unparseable: {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_serve_answers_in_request_order() {
+        use epix_discovery::tracker_pc::AnnounceReq;
+
+        let state = AppState::new("test");
+        let (h1, h2) = ([1u8; 32], [2u8; 32]);
+        let announcer = PeerAddr::parse("8.8.8.8:1111").unwrap();
+        let req = |hashes: Vec<[u8; 32]>| AnnounceReq {
+            hashes,
+            port: 15441,
+            need_types: vec!["ipv4".into()],
+            need_num: 20,
+            add: vec!["ipv4".into()],
+            ..Default::default()
+        };
+        // One peer registers under h1 only.
+        state.announce_serve(&req(vec![h1]), &announcer).await;
+
+        // A second announcer asks about h2 then h1: one bucket set per hash,
+        // in the order asked.
+        let other = PeerAddr::parse("9.9.9.9:2222").unwrap();
+        let resp = state.announce_serve(&req(vec![h2, h1]), &other).await;
+        assert_eq!(resp.peers.len(), 2);
+        assert!(resp.error.is_empty());
+        assert!(resp.peers[0].ipv4.is_empty(), "nobody announced h2 yet");
+        assert_eq!(resp.peers[1].unpack(), vec![PeerAddr::parse("8.8.8.8:15441").unwrap()]);
+
+        // No hashes: nothing recorded, nothing returned.
+        assert!(state.announce_serve(&req(Vec::new()), &other).await.peers.is_empty());
+
+        // Disabled tracker reports the refusal instead of an empty list.
+        state.config_set("tracker", json!("disable")).await;
+        let resp = state.announce_serve(&req(vec![h1]), &other).await;
+        assert_eq!(resp.error, "Tracker disabled");
+        assert!(resp.peers.is_empty());
+    }
+
+    #[tokio::test]
     async fn tracker_back_off_after_repeated_errors() {
         let state = AppState::new("test");
         let tracker = epix_xite::Tracker::Epix(PeerAddr::parse("1.2.3.4:26959").unwrap());
@@ -12239,6 +12563,39 @@ mod tests {
                 _: Vec<PeerAddr>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
                 unreachable!()
             }
         }

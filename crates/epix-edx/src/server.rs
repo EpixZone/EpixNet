@@ -67,9 +67,9 @@ pub trait SignedProvider: Send + Sync + 'static {
     ) -> Result<bool, String>;
 }
 
-/// Control-plane access the server delegates to (the successors to the
-/// legacy msgpack control commands: propagation poll, PEX, tracker-set
-/// gossip, DHT RPC, tracker announce). Separate from [`SignedProvider`]
+/// Control-plane access the server delegates to: propagation poll, PEX,
+/// tracker-set gossip, DHT RPC, tracker announce. Separate from
+/// [`SignedProvider`]
 /// because a pure content node (tests, embedded fetchers) serves content
 /// without any of this; `ServeCtx.control = None` answers these requests
 /// UNSUPPORTED and the node must not advertise `caps::CONTROL`.
@@ -80,7 +80,7 @@ pub trait SignedProvider: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait ControlProvider: Send + Sync + 'static {
     /// Propagation hints recorded after `after`: (xite, modified) pairs
-    /// plus the new head cursor (`meshGetUpdates` successor).
+    /// plus the new head cursor.
     async fn updates_since(&self, after: u64) -> (Vec<(String, i64)>, u64);
     /// Peer exchange: connectable peers for `xite` the requester lacks
     /// (its known set rides in `have`), capped at `need`. `from` is the
@@ -109,6 +109,9 @@ pub struct ServeCtx {
     pub control: Option<Arc<dyn ControlProvider>>,
     /// This node's identity key (hex) for Hello/HelloAck binding sigs.
     pub privatekey: String,
+    /// The release version this node announces in Hello/HelloAck (the
+    /// Stats page's `client` column). Empty = unset.
+    pub version: String,
     /// Capability bits to advertise.
     pub caps: u32,
     /// Unix-seconds clock (injectable for tests).
@@ -128,6 +131,9 @@ pub struct PeerIdentity {
     pub node_pk: Vec<u8>,
     pub address: String,
     pub caps: u32,
+    /// The peer's self-reported release version (empty if it sent none).
+    /// Reporting only - nothing is gated on it.
+    pub version: String,
 }
 
 fn now_unix() -> u64 {
@@ -145,6 +151,7 @@ impl ServeCtx {
             provider,
             control: None,
             privatekey,
+            version: String::new(),
             caps: caps::MESH,
             now: now_unix,
             choker: None,
@@ -155,6 +162,12 @@ impl ServeCtx {
     /// Attach the shared upload governor.
     pub fn with_choker(mut self, choker: Arc<Mutex<Choker>>) -> Self {
         self.choker = Some(choker);
+        self
+    }
+
+    /// Announce this node's release version to peers (Hello/HelloAck).
+    pub fn with_version(mut self, version: String) -> Self {
+        self.version = version;
         self
     }
 
@@ -183,6 +196,7 @@ fn check_identity(
     node_pk: &[u8],
     sig: &[u8],
     peer_caps: u32,
+    version: String,
     handshake_hash: Option<&[u8; 32]>,
 ) -> Result<PeerIdentity, String> {
     if net != NET_ID {
@@ -195,7 +209,7 @@ fn check_identity(
             return Err(format!("channel binding failed for {address}"));
         }
     }
-    Ok(PeerIdentity { node_pk: node_pk.to_vec(), address, caps: peer_caps })
+    Ok(PeerIdentity { node_pk: node_pk.to_vec(), address, caps: peer_caps, version })
 }
 
 /// Client side of the handshake: send Hello, await + verify HelloAck.
@@ -212,12 +226,18 @@ pub async fn client_hello(
         binding_sig: binding_sig(&ctx.privatekey, handshake_hash.as_ref())?,
         caps: ctx.caps,
         listen,
+        version: ctx.version.clone(),
     };
     match conn.request(Req::Hello(hello)).await? {
-        Resp::HelloAck(ack) => {
-            check_identity(&ack.net, &ack.node_pk, &ack.binding_sig, ack.caps, handshake_hash.as_ref())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
-        }
+        Resp::HelloAck(ack) => check_identity(
+            &ack.net,
+            &ack.node_pk,
+            &ack.binding_sig,
+            ack.caps,
+            ack.version,
+            handshake_hash.as_ref(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)),
         Resp::Err { code, msg } => Err(std::io::Error::other(format!("hello refused {code}: {msg}"))),
         other => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -245,6 +265,7 @@ pub async fn serve(
                 &hello.node_pk,
                 &hello.binding_sig,
                 hello.caps,
+                hello.version,
                 handshake_hash.as_ref(),
             ) {
                 Ok(id) => {
@@ -258,6 +279,7 @@ pub async fn serve(
                             .ok()?,
                         caps: ctx.caps,
                         observed: None,
+                        version: ctx.version.clone(),
                     };
                     if conn.respond(first.stream, Resp::HelloAck(ack)).await.is_err() {
                         return None;
