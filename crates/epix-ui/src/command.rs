@@ -556,6 +556,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         // Derived feed engine (read-only; not admin-gated, like dbQuery).
         Arc::new(FeedItemQuery),
         Arc::new(FeedGalleryRollup),
+        Arc::new(FeedSegmentSearch),
         // xID identity resolution (the XidResolver plugin's WS API;
         // xidResolveName is registered with the chain commands above).
         Arc::new(XidResolve { cmd: "xidResolve" }),
@@ -1561,6 +1562,54 @@ impl WsCommand for FeedGalleryRollup {
         let items: Vec<String> =
             items_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
         s.state.feed_gallery_rollup(address, &feed, &items).await
+    }
+}
+
+/// Cap on `feedSegmentSearch` results and query terms. Each extra term is
+/// another filter probe per segment and another per-record term scan, so an
+/// unbounded term list is a self-DoS from the bound page.
+const FEED_SEARCH_MAX_HITS: usize = 200;
+const FEED_SEARCH_MAX_TERMS: usize = 16;
+
+/// `feedSegmentSearch({feed, terms, limit?})` - skip-filter search across the
+/// derived feed's sealed segments. Returns POINTERS (`segment_root`, `offset`,
+/// `len`, record address) that the caller fetches and verifies against the
+/// segment root; it never returns record bodies. Distinct from the legacy SQL
+/// newsfeed's `feedQuery`/`feedSearch`, which search the local site db.
+/// Read-only; not admin-gated, like `dbQuery`.
+struct FeedSegmentSearch;
+#[async_trait]
+impl WsCommand for FeedSegmentSearch {
+    fn name(&self) -> &'static str {
+        "feedSegmentSearch"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let arg = |key: &str, idx: usize| -> Option<Value> {
+            p.get(key).cloned().or_else(|| p.as_array().and_then(|a| a.get(idx).cloned()))
+        };
+        let feed = arg("feed", 0)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("feedSegmentSearch: feed required")?;
+        // `terms` takes a list or a single query string (split by the frozen
+        // tokenizer either way).
+        let terms_val = arg("terms", 1).ok_or("feedSegmentSearch: terms required")?;
+        let terms: Vec<String> = match &terms_val {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            _ => return Err("feedSegmentSearch: terms must be a string or array".into()),
+        };
+        if terms.len() > FEED_SEARCH_MAX_TERMS {
+            return Err(format!(
+                "feedSegmentSearch: too many terms ({}, max {FEED_SEARCH_MAX_TERMS})",
+                terms.len()
+            ));
+        }
+        let limit = arg("limit", 2)
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(FEED_SEARCH_MAX_HITS))
+            .unwrap_or(FEED_SEARCH_MAX_HITS);
+        s.state.feed_segment_search(address, &feed, &terms, limit).await
     }
 }
 

@@ -9052,9 +9052,20 @@ impl AppState {
             // is harmless - it recomputes from the records.
             if let Some(store) = &store {
                 let ts = now.max(0) as u64;
-                for seg in &artifacts.sealed {
+                for (i, seg) in artifacts.sealed.iter().enumerate() {
                     if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() {
                         let _ = store.pin(seg.root);
+                    }
+                    // The segment's search skip-filter, as a SIBLING object
+                    // keyed by the segment root (see `feed::skip_filter_id`):
+                    // a peer that wants to skip-scan our feed pulls the tiny
+                    // filter instead of the whole segment. Derived, so a failed
+                    // insert costs nothing - it rebuilds from the segment.
+                    if let Some(f) = artifacts.filters.get(i) {
+                        let id = crate::feed::skip_filter_id(seg.root);
+                        if store.insert_bytes(id, epix_blob::Ns::Plain, &f.to_bytes(), ts).is_ok() {
+                            let _ = store.pin(id);
+                        }
                     }
                 }
             }
@@ -9111,6 +9122,23 @@ impl AppState {
             .await
             .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
         Ok(crate::feed::gallery_rollup(&art, items))
+    }
+
+    /// `feedSegmentSearch`: XOR8 skip-filter search over the sealed feed
+    /// segments. Returns verifiable pointers (`segment_root` + byte extent), not
+    /// record bodies - the caller fetches and verifies. Read-only.
+    pub async fn feed_segment_search(
+        &self,
+        address: &str,
+        feed: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Value, String> {
+        let art = self
+            .feed_artifacts(address, feed)
+            .await
+            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+        Ok(crate::feed::segment_search(&art, terms, limit))
     }
 
     /// Right after a content pull, fetch + merge the declared merge files for
@@ -11041,6 +11069,87 @@ impl AppState {
             })
             .map(|f| (f.inner_path, f.size.max(0) as u64))
             .collect()
+    }
+
+    /// What a background completion pass would still fetch for `address` under
+    /// the owner's signed `distribution` policy (issue #340): the missing
+    /// declared files - required and optional - whose unit committed to
+    /// `retention:complete`, plus whether their total exceeds this xite's size
+    /// limit and so needs the user's consent.
+    ///
+    /// `retention:partial` paths are absent from the plan by construction:
+    /// those keep today's fetch-what-you-view behavior.
+    pub async fn retention_completion_plan(
+        &self,
+        address: &str,
+    ) -> epix_blob::policy::CompletionPlan {
+        let Some(content) = self.content(address).await else {
+            return Default::default();
+        };
+        let policy = epix_blob::policy::DistributionPolicy::from_content(&content);
+        let mut missing: Vec<(String, u64)> = Vec::new();
+        if let Ok(xite) = self.xite_view(address).await {
+            for f in xite.files_needed() {
+                missing.push((f.inner_path, f.size.max(0) as u64));
+            }
+        }
+        missing.extend(self.missing_optional_files(address, None).await);
+        let limit = self.size_limit_bytes(address).await.max(0) as u64;
+        policy.completion_plan(&missing, limit)
+    }
+
+    /// Finish a `retention:complete` unit in the BACKGROUND, after first paint.
+    ///
+    /// The three locked rules of issue #340 live here:
+    /// 1. STREAM-FIRST ALWAYS. This is spawned once the core set is on disk and
+    ///    the loading screen is gone, and it only ever fetches what is still
+    ///    missing, so a package unit can never block the first render on a full
+    ///    download.
+    /// 2. CONSENT-GATED, reusing the existing machinery. Under the xite's
+    ///    `size_limit` the unit completes quietly; over it we tap the same
+    ///    optional-download prompt a big optional file already raises
+    ///    ([`Self::prompt_optional_download`]), and skip until the user says
+    ///    yes. No new UX.
+    /// 3. Availability advertising is untouched: we keep advertising per-chunk
+    ///    partial ranges while completing, so the swarm self-completes.
+    ///    Complete-or-unavailable is an OUTPUT rule - a file only reaches the
+    ///    app after it verifies whole, which
+    ///    [`Self::edx_materialize_file`] already enforces - never a reason to
+    ///    hide availability.
+    pub fn spawn_retention_completion(self: &Arc<Self>, address: &str) {
+        let state = self.clone();
+        let address = address.to_string();
+        tokio::spawn(async move {
+            let plan = state.retention_completion_plan(&address).await;
+            if plan.paths.is_empty() {
+                return;
+            }
+            if plan.needs_consent && !state.optional_fetch_allowed(&address).await {
+                // Over the limit and no standing consent: ask through the
+                // familiar prompt (once per xite per session) and stop. The
+                // user accepting turns the toggle on, and the next pass - or
+                // the optional download it kicks off - completes the unit.
+                let biggest = plan.paths.first().cloned().unwrap_or_default();
+                state.prompt_optional_download(&address, &biggest, plan.bytes as i64);
+                return;
+            }
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "Completing {} retention:complete file(s) for {address} ({} bytes)",
+                        plan.paths.len(),
+                        plan.bytes
+                    ),
+                )
+                .await;
+            // Sequential and unhurried: this is background work behind an
+            // already-painted page, and `file_need` dedupes against any fetch
+            // the page itself started.
+            for path in plan.paths {
+                let _ = state.file_need(&address, &path).await;
+            }
+        });
     }
 
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
@@ -13003,6 +13112,83 @@ mod tests {
         // Unbinding the last connection stops delivery again.
         state.unregister_bound_conn(addr, 42);
         assert!(!state.has_bound_conn(addr));
+    }
+
+    /// A `retention:complete` package unit does NOT block first paint - the
+    /// completion set is computed as a background plan over what is still
+    /// missing - and it honours the xite's size limit through the same
+    /// optional-download consent the rest of the node uses.
+    #[tokio::test]
+    async fn package_unit_completes_after_first_paint_within_the_size_limit() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // First paint is already on disk; the rest of the package is not.
+        let shell: &[u8] = b"<html>shell</html>";
+        storage.write("index.html", shell).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": {
+                "default": {"unit": "package", "retention": "complete"},
+                "paths": { "data/feed/": {"unit": "feed", "retention": "partial"} }
+            },
+            "files": {
+                "index.html": { "size": shell.len(), "sha512": XiteStorage::hash_bytes(shell) },
+                "js/app.js": { "size": 2 * 1024 * 1024, "sha512": "aa" },
+            },
+            "files_optional": {
+                "data/feed/seg7.bin": { "size": 900 * 1024 * 1024, "sha512": "bb" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        // Default size limit (10 MB) covers the 2 MB remainder -> completes
+        // quietly. index.html verifies on disk, so first paint is NOT in the
+        // plan: streaming already delivered it, completion is only the rest.
+        let plan = state.retention_completion_plan(addr).await;
+        assert_eq!(plan.paths, vec!["js/app.js".to_string()], "only the missing complete-unit file");
+        assert!(!plan.paths.contains(&"index.html".to_string()), "first paint is not re-fetched");
+        assert!(
+            !plan.paths.contains(&"data/feed/seg7.bin".to_string()),
+            "retention:partial feed stays fetch-what-you-view"
+        );
+        assert_eq!(plan.bytes, 2 * 1024 * 1024);
+        assert!(!plan.needs_consent, "under the size limit -> completes quietly");
+
+        // Drop the limit below the remainder: the same plan now needs the
+        // existing optional-download consent, which this xite has not given.
+        state.set_size_limit(addr, 1).await;
+        let gated = state.retention_completion_plan(addr).await;
+        assert_eq!(gated.paths, vec!["js/app.js".to_string()]);
+        assert!(gated.needs_consent, "over the size limit -> consent gate");
+        assert!(!state.optional_fetch_allowed(addr).await, "no standing consent");
+
+        // Granting the standing consent (the familiar toggle) clears the gate.
+        assert!(state.set_autodownloadoptional(addr, true).await);
+        assert!(state.optional_fetch_allowed(addr).await);
+
+        // A xite declaring no distribution policy completes nothing at all.
+        let bare_dir = tempdir().unwrap();
+        let bare = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state
+            .add_xite(
+                bare,
+                XiteEntry {
+                    storage: XiteStorage::new(bare_dir.path()),
+                    content: Some(json!({
+                        "address": bare, "modified": 1.0,
+                        "files": { "big.bin": { "size": 99, "sha512": "cc" } }
+                    })),
+                },
+            )
+            .await;
+        assert!(
+            state.retention_completion_plan(bare).await.paths.is_empty(),
+            "no declared retention -> partial default, nothing to complete"
+        );
     }
 
     #[tokio::test]

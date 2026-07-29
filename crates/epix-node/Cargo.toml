@@ -9,6 +9,9 @@ epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
 epix-xite = { path = "../epix-xite" }
 epix-content = { path = "../epix-content" }
+# The owner-signed order/distribution policy parsed out of content.json; the
+# clone's user-content pass uses `order_policy.feed_order`.
+epix-blob = { path = "../epix-blob" }
 epix-worker = { path = "../epix-worker" }
 epix-ui = { path = "../epix-ui" }
 epix-chain = { path = "../epix-chain" }

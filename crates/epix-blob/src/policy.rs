@@ -43,6 +43,15 @@ impl FeedOrder {
             _ => None,
         }
     }
+
+    /// Whether a scheduler should pull the newest feed unit (segment, or the
+    /// newest-modified record file) first and page backward. Pinned-first and
+    /// custom have no scheduling signal of their own - the pinned/custom set is
+    /// resolved by the app after the records arrive - so they schedule
+    /// newest-first, which is what a reader sees first either way.
+    pub fn newest_first(self) -> bool {
+        !matches!(self, Self::OldestFirst)
+    }
 }
 
 /// The owner's order policy for a xite (from `content.json.order_policy`).
@@ -79,6 +88,50 @@ impl OrderPolicy {
     pub fn is_first_paint(&self, inner_path: &str) -> bool {
         self.first_paint.iter().any(|p| p == inner_path)
     }
+
+    /// Whether `inner_path` is a declared prefetch hint (fetched after first
+    /// paint, at the background deadline).
+    pub fn is_prefetch(&self, inner_path: &str) -> bool {
+        self.prefetch.iter().any(|p| p == inner_path)
+    }
+
+    /// Which fetch tier `inner_path` belongs to. First paint wins if a path is
+    /// (nonsensically) in both lists. An undeclared path lands in
+    /// [`FetchTier::Default`], so a xite with no `order_policy` puts every path
+    /// in one tier and the scheduler's existing ladder is unchanged.
+    ///
+    /// This orders OUR OWN fetching only. The policy is owner-signed, so it is
+    /// authentic, but "authentic" is not "trusted with someone else's
+    /// bandwidth": it must never be echoed into a serving priority we grant a
+    /// remote peer, or an owner could declare their whole xite first-paint and
+    /// take service from everyone else's.
+    pub fn tier(&self, inner_path: &str) -> FetchTier {
+        if self.is_first_paint(inner_path) {
+            FetchTier::FirstPaint
+        } else if self.is_prefetch(inner_path) {
+            FetchTier::Prefetch
+        } else {
+            FetchTier::Default
+        }
+    }
+
+    /// Whether the owner declared anything at all. Nothing declared → the
+    /// caller keeps its default ladder untouched.
+    pub fn is_empty(&self) -> bool {
+        self.first_paint.is_empty() && self.prefetch.is_empty() && self.feed_order.is_none()
+    }
+}
+
+/// The fetch order tiers an [`OrderPolicy`] sorts paths into. `Ord` is the
+/// scheduling order: first paint, then everything undeclared, then prefetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FetchTier {
+    /// The visible shell: fetched first, at the tightest deadline.
+    FirstPaint,
+    /// Undeclared - the existing default ladder.
+    Default,
+    /// Declared prefetch hints: after first paint, background deadline.
+    Prefetch,
 }
 
 /// How a path is distributed (issue #340's creator-chosen unit).
@@ -196,6 +249,43 @@ impl DistributionPolicy {
     pub fn wants_complete(&self, inner_path: &str) -> bool {
         self.resolve(inner_path).retention == Retention::Complete
     }
+
+    /// Plan the background completion pass for a xite: of `missing`
+    /// (inner_path, size) pairs, keep only the paths whose unit committed to
+    /// `retention:complete`, and report whether finishing them needs the
+    /// user's consent.
+    ///
+    /// This is what makes the retention COMMITMENT real, and it is deliberately
+    /// a plan rather than a fetch: completion happens in the BACKGROUND after
+    /// first paint, so a package unit can never block the first render on a
+    /// full download. `limit_bytes` is the xite's existing per-site size limit;
+    /// over it the caller taps the same optional-download prompt a big optional
+    /// file already raises, so there is no new consent UX.
+    pub fn completion_plan(&self, missing: &[(String, u64)], limit_bytes: u64) -> CompletionPlan {
+        let mut paths = Vec::new();
+        let mut bytes = 0u64;
+        for (path, size) in missing {
+            if self.wants_complete(path) {
+                paths.push(path.clone());
+                bytes = bytes.saturating_add(*size);
+            }
+        }
+        // Deterministic order so two nodes (and two test runs) plan alike.
+        paths.sort();
+        CompletionPlan { needs_consent: bytes > limit_bytes, paths, bytes }
+    }
+}
+
+/// What a background completion pass would fetch, and whether it needs consent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompletionPlan {
+    /// The still-missing paths belonging to `retention:complete` units.
+    pub paths: Vec<String>,
+    /// Their declared total size.
+    pub bytes: u64,
+    /// The total exceeds the xite's size limit, so the caller must have (or
+    /// ask for) the user's optional-download consent before finishing.
+    pub needs_consent: bool,
 }
 
 #[cfg(test)]
@@ -258,6 +348,73 @@ mod tests {
         assert_eq!(p.unit, DistributionUnit::Package);
         assert_eq!(p.retention, Retention::Partial, "default never ambushes a data cap");
         assert!(!d.wants_complete("anything"));
+    }
+
+    #[test]
+    fn tiers_reorder_declared_paths_and_default_when_absent() {
+        let content = json!({
+            "order_policy": {
+                "first_paint": ["index.html", "css/all.css"],
+                "prefetch": ["js/later.js"]
+            }
+        });
+        let p = OrderPolicy::from_content(&content);
+        // A scheduler sorts by tier; the declared shell goes first, the
+        // prefetch hint last, everything undeclared keeps its place between.
+        let mut paths = vec!["big.mp4", "js/later.js", "index.html", "data/x.json", "css/all.css"];
+        paths.sort_by_key(|p2| p.tier(p2));
+        assert_eq!(
+            paths,
+            vec!["index.html", "css/all.css", "big.mp4", "data/x.json", "js/later.js"],
+            "first paint first, prefetch last, undeclared order preserved"
+        );
+
+        // Nothing declared -> one tier, so a stable sort is a no-op and the
+        // caller's existing ladder survives untouched.
+        let none = OrderPolicy::from_content(&json!({}));
+        assert!(none.is_empty());
+        let mut same = vec!["b", "a", "c"];
+        same.sort_by_key(|p2| none.tier(p2));
+        assert_eq!(same, vec!["b", "a", "c"], "no policy -> no reorder");
+    }
+
+    #[test]
+    fn feed_order_schedules_newest_first_unless_oldest_declared() {
+        assert!(FeedOrder::NewestFirst.newest_first());
+        assert!(FeedOrder::PinnedFirst.newest_first(), "pinned resolves app-side; schedule newest");
+        assert!(FeedOrder::Custom.newest_first());
+        assert!(!FeedOrder::OldestFirst.newest_first());
+    }
+
+    #[test]
+    fn completion_plan_gates_on_the_size_limit() {
+        // A package shell committed to `complete`, a feed that stays partial.
+        let content = json!({
+            "distribution": {
+                "default": {"unit": "package", "retention": "complete"},
+                "paths": { "data/feed/": {"unit": "feed", "retention": "partial"} }
+            }
+        });
+        let d = DistributionPolicy::from_content(&content);
+        let missing = vec![
+            ("js/app.js".to_string(), 3_000_000u64),
+            ("img/hero.png".to_string(), 2_000_000),
+            ("data/feed/seg7".to_string(), 90_000_000), // partial: never completed
+        ];
+
+        // Under the limit: completes quietly, no prompt.
+        let quiet = d.completion_plan(&missing, 10_000_000);
+        assert_eq!(quiet.paths, vec!["img/hero.png", "js/app.js"], "only complete-retention paths");
+        assert_eq!(quiet.bytes, 5_000_000, "the partial feed is not counted");
+        assert!(!quiet.needs_consent);
+
+        // Over the limit: the familiar optional-download prompt gates it.
+        let gated = d.completion_plan(&missing, 1_000_000);
+        assert!(gated.needs_consent, "over the size limit -> consent required");
+
+        // No declared distribution -> nothing to complete at all.
+        let bare = DistributionPolicy::from_content(&json!({}));
+        assert!(bare.completion_plan(&missing, 0).paths.is_empty());
     }
 
     #[test]

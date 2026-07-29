@@ -13,6 +13,9 @@ epix-blob = { path = "../epix-blob" }
 # reaction counts, rollups). The node derives these read-only from the signed
 # OR-set records it already stores; see src/feed.rs.
 epix-feed = { path = "../epix-feed" }
+# Track 1 of in-xite search: the deterministic XOR8 skip-filter built over each
+# sealed feed segment's terms, plus the frozen tokenizer. See src/feed.rs.
+epix-search = { path = "../epix-search" }
 epix-user = { path = "../epix-user" }
 epix-peer = { path = "../epix-peer" }
 # The tracker announce types (`tracker_pc`), shared by the msgpack and EDX

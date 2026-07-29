@@ -928,6 +928,12 @@ async fn clone_xite_with_progress(
             serde_json::json!(["file_done", "index.html"]),
             serde_json::json!({ "peers": peer_count.max(1), "bad_files": 0, "tasks": 0 }),
         );
+        // First paint has happened, so NOW a `retention:complete` unit may
+        // finish itself in the background (issue #340). Spawned, never awaited:
+        // stream-first is the rule, completion never gates the render. Over the
+        // xite's size limit it taps the existing optional-download prompt
+        // instead of downloading.
+        state.spawn_retention_completion(address);
     }
 
     // Recursive content: user_contents sites (EpixTalk, EpixPost, ...) keep their
@@ -966,6 +972,11 @@ async fn sync_included_content(
     address: &str,
 ) -> (u64, Vec<String>) {
     use std::collections::HashSet;
+    // The owner's signed feed ordering directive, if any (see the sort below).
+    let feed_order = xite
+        .content
+        .as_ref()
+        .and_then(|c| epix_blob::policy::OrderPolicy::from_content(c).feed_order);
     // Enumerate content.json paths: the root's includes, plus everything a peer
     // advertises via listModified (this is how per-user content.json files -
     // never listed statically - are discovered).
@@ -1031,9 +1042,31 @@ async fn sync_included_content(
     if paths.is_empty() {
         return (0, Vec::new());
     }
+    // Feed order (owner-signed `order_policy.feed_order`) decides which user's
+    // records go down first. This is the one place a xite's feed records are
+    // actually FETCHED: the sealed feed segments in `epix-ui::feed` are derived
+    // locally from records already on disk, not pulled from peers, so there is
+    // no segment fetch path to drive yet. `modified` (from the peers'
+    // listModified) is the newest-activity signal available before any bytes
+    // arrive, so newest-first = the most recently updated user content.json
+    // first, then page backward. Applied BEFORE the parent-first sort, which is
+    // a stable sort, so verification order (parents before children) is
+    // untouched and this only reorders within a depth level. No policy, or
+    // `custom`/`pinned-first` (resolved app-side after the records land) →
+    // newest-first is what a reader sees first either way; `oldest-first`
+    // reverses it.
+    let mut ordered: Vec<(String, f64)> = paths.into_iter().collect();
+    if let Some(order) = feed_order {
+        ordered.sort_by(|a, b| {
+            if order.newest_first() {
+                b.1.total_cmp(&a.1)
+            } else {
+                a.1.total_cmp(&b.1)
+            }
+        });
+    }
     // Parent-first: shallower paths (data/users/content.json) before deeper
     // ones (data/users/mud.epix/content.json), so each verifies against its parent.
-    let mut ordered: Vec<(String, f64)> = paths.into_iter().collect();
     ordered.sort_by_key(|(p, _)| p.matches('/').count());
 
     // Pre-warm the xID resolver cache: resolve every user's linked signers
