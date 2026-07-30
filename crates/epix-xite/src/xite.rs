@@ -932,6 +932,26 @@ impl Xite {
         if declared.is_empty() {
             return (registered, skipped);
         }
+        for (hex, paths) in Self::collect_bundle_members(content) {
+            let Some(id) = epix_blob::ObjId::from_hex(&hex) else { continue };
+            if !declared.contains_key(&id) {
+                continue;
+            }
+            if self.register_bundle(store, id, paths, now) {
+                registered += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        (registered, skipped)
+    }
+
+    /// The members every bundle in `files` / `files_optional` claims, keyed by
+    /// the bundle id hex the entries name. The `(off, path)` pairs come out in
+    /// manifest order, not offset order - the caller sorts them.
+    fn collect_bundle_members(
+        content: &Value,
+    ) -> std::collections::BTreeMap<String, Vec<(u64, String)>> {
         // bundle id -> ordered (off, member path).
         let mut members: std::collections::BTreeMap<String, Vec<(u64, String)>> =
             std::collections::BTreeMap::new();
@@ -946,40 +966,44 @@ impl Xite {
                 }
             }
         }
-        for (hex, mut paths) in members {
-            let Some(id) = epix_blob::ObjId::from_hex(&hex) else { continue };
-            if !declared.contains_key(&id) {
-                continue;
-            }
-            paths.sort();
-            let mut bytes = Vec::new();
-            let mut ok = true;
-            for (off, path) in &paths {
-                if *off != bytes.len() as u64 {
-                    ok = false;
-                    break;
-                }
-                match self.storage.read(path) {
-                    Ok(b) => bytes.extend_from_slice(&b),
-                    Err(_) => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if ok && epix_blob::ObjId::of(&bytes) == id {
-                match store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, now) {
-                    Ok(_) => {
-                        let _ = store.pin(id); // own content: never evict
-                        registered += 1;
-                    }
-                    Err(_) => skipped += 1,
-                }
-            } else {
-                skipped += 1;
-            }
+        members
+    }
+
+    /// Rebuild one declared bundle from its members and insert it under `id`.
+    /// Returns whether it was registered - a gap in the members, an unreadable
+    /// member, or a rebuild that hashes to something else fails the bundle, so
+    /// it is never inserted under an id it does not match.
+    fn register_bundle(
+        &self,
+        store: &epix_blob::store::Store,
+        id: epix_blob::ObjId,
+        mut paths: Vec<(u64, String)>,
+        now: u64,
+    ) -> bool {
+        paths.sort();
+        let Some(bytes) = self.read_bundle_members(&paths) else { return false };
+        if epix_blob::ObjId::of(&bytes) != id {
+            return false;
         }
-        (registered, skipped)
+        if store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, now).is_err() {
+            return false;
+        }
+        let _ = store.pin(id); // own content: never evict
+        true
+    }
+
+    /// Concatenate a bundle's members, `paths` already in offset order. `None`
+    /// if a member's `off` does not continue the bytes collected so far or a
+    /// member cannot be read.
+    fn read_bundle_members(&self, paths: &[(u64, String)]) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for (off, path) in paths {
+            if *off != bytes.len() as u64 {
+                return None;
+            }
+            bytes.extend_from_slice(&self.storage.read(path).ok()?);
+        }
+        Some(bytes)
     }
 
     /// Encrypted shards: re-derive the ciphertext (deterministic from the

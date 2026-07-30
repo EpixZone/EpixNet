@@ -12,7 +12,7 @@
 //! uniquely fingerprints this session (both sides compute it, an
 //! attacker in the middle cannot produce a session with the same hash).
 //! Without proof of possession a peer could spoof a victim's node id to
-//! claim its reciprocity standing — `verify_binding` is what stops that.
+//! claim its reciprocity standing - `verify_binding` is what stops that.
 //!
 //! Transport records: `u16-LE length ‖ noise ciphertext`, stateless
 //! transport mode with per-direction implicit nonces (order = nonce), so
@@ -22,9 +22,9 @@ use std::io;
 use std::sync::Arc;
 
 use epix_transport::PeerStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// The one cipher suite EDX speaks. Fixed — negotiation is a downgrade
+/// The one cipher suite EDX speaks. Fixed - negotiation is a downgrade
 /// surface, and every node ships the same build.
 pub const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
@@ -70,7 +70,7 @@ pub struct Secured {
     pub stream: PeerStream,
     /// Uniquely fingerprints this session; what the binding signs.
     pub handshake_hash: [u8; 32],
-    /// The peer's Noise static public key (NOT its identity — identity
+    /// The peer's Noise static public key (NOT its identity - identity
     /// is the bound node key).
     pub remote_static: [u8; 32],
 }
@@ -150,8 +150,8 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
 
     // Pump tasks: user's plaintext duplex <-> encrypted records on inner.
     let (user, net) = tokio::io::duplex(256 * 1024);
-    let (mut net_read, mut net_write) = tokio::io::split(net);
-    let (mut inner_read, mut inner_write) = tokio::io::split(inner);
+    let (net_read, net_write) = tokio::io::split(net);
+    let (inner_read, inner_write) = tokio::io::split(inner);
 
     // Teardown signal, the same contract `Conn::start` uses for its own
     // reader/writer pair. The two pumps own the halves of the CALLER's stream -
@@ -162,10 +162,26 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
     // inbound pump. Without this the inbound pump parks in `read_exact` against
     // a peer that stays connected and silent, and the socket plus its registry
     // row leak for the life of the process even after the idle reaper fired.
-    let (gone_tx, mut gone_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let ts = transport.clone();
+    let (gone_tx, gone_rx) = tokio::sync::mpsc::channel::<()>(1);
+    spawn_outbound_pump(net_read, inner_write, transport.clone(), gone_tx);
+    spawn_inbound_pump(inner_read, net_write, transport, gone_rx);
+
+    Ok(Secured { stream: Box::pin(user), handshake_hash, remote_static })
+}
+
+/// Outbound pump: plaintext -> records, nonce = record index. Owns the write
+/// half of the caller's stream; ends when the user duplex closes, and its
+/// `gone_tx` drop is what releases the inbound pump (see [`secure`]).
+fn spawn_outbound_pump<R, W>(
+    mut net_read: R,
+    mut inner_write: W,
+    ts: Arc<snow::StatelessTransportState>,
+    gone_tx: tokio::sync::mpsc::Sender<()>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
-        // Outbound: plaintext -> records, nonce = record index.
         let mut plain = vec![0u8; RECORD_PLAINTEXT];
         let mut cipher = vec![0u8; RECORD_PLAINTEXT + 16];
         let mut nonce: u64 = 0;
@@ -199,9 +215,21 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
         let _ = inner_write.shutdown().await;
         drop(gone_tx);
     });
+}
+
+/// Inbound pump: records -> plaintext, nonce = record index. Any tamper fails
+/// the AEAD and tears the stream down. Owns the read half of the caller's
+/// stream; unblocked by the outbound pump dropping `gone_rx`'s sender.
+fn spawn_inbound_pump<R, W>(
+    mut inner_read: R,
+    mut net_write: W,
+    transport: Arc<snow::StatelessTransportState>,
+    mut gone_rx: tokio::sync::mpsc::Receiver<()>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
-        // Inbound: records -> plaintext, nonce = record index. Any
-        // tamper fails the AEAD and tears the stream down.
         let mut record = Vec::new();
         let mut plain = vec![0u8; RECORD_PLAINTEXT + 16];
         let mut nonce: u64 = 0;
@@ -235,8 +263,6 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
         }
         let _ = net_write.shutdown().await;
     });
-
-    Ok(Secured { stream: Box::pin(user), handshake_hash, remote_static })
 }
 
 #[cfg(test)]

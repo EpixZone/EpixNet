@@ -4141,49 +4141,81 @@ impl AppState {
         from: &PeerAddr,
     ) -> std::collections::HashSet<String> {
         let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Clearnet: source IP + the port it announced, if it asked to be added.
-        if req.port != 0 {
-            if let PeerAddr::Ip(sa) = from {
-                let wants = if sa.is_ipv6() {
-                    req.add.iter().any(|t| t == "ipv6")
-                } else {
-                    req.add.iter().any(|t| t == "ipv4" || t == "ip4")
-                };
-                if wants {
-                    let mut a = *sa;
-                    a.set_port(req.port);
-                    let addr = PeerAddr::Ip(a);
-                    self.tracker_announce(&req.hashes, &addr).await;
-                    mine.insert(addr.to_string());
-                }
-            }
+        self.register_clearnet_addr(req, from, &mut mine).await;
+        self.register_i2p_source_addr(req, from, &mut mine).await;
+        self.register_request_self_addrs(req, &mut mine).await;
+        mine
+    }
+
+    /// Clearnet: source IP + the port it announced, if it asked to be added.
+    async fn register_clearnet_addr(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+        mine: &mut std::collections::HashSet<String>,
+    ) {
+        if req.port == 0 {
+            return;
         }
-        // If the announce arrived over i2p, the source destination is authoritative.
-        if let PeerAddr::I2p { dest, .. } = from {
-            if !dest.is_empty() {
-                self.tracker_announce(&req.hashes, from).await;
-                mine.insert(from.to_string());
-            }
+        let PeerAddr::Ip(sa) = from else { return };
+        let wants = if sa.is_ipv6() {
+            req.add.iter().any(|t| t == "ipv6")
+        } else {
+            req.add.iter().any(|t| t == "ipv4" || t == "ip4")
+        };
+        if !wants {
+            return;
         }
-        // Onion / i2p self-addresses from the request. We register them on
-        // trust: this tracker issues no `onion_sign_this` challenge, so
-        // `resp.onion_sign_this` stays empty and the request's `onion_signs`
-        // are never needed.
+        let mut a = *sa;
+        a.set_port(req.port);
+        let addr = PeerAddr::Ip(a);
+        self.tracker_announce(&req.hashes, &addr).await;
+        mine.insert(addr.to_string());
+    }
+
+    /// If the announce arrived over i2p, the source destination is authoritative.
+    async fn register_i2p_source_addr(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+        mine: &mut std::collections::HashSet<String>,
+    ) {
+        let PeerAddr::I2p { dest, .. } = from else { return };
+        if dest.is_empty() {
+            return;
+        }
+        self.tracker_announce(&req.hashes, from).await;
+        mine.insert(from.to_string());
+    }
+
+    /// Onion / i2p self-addresses from the request. We register them on
+    /// trust: this tracker issues no `onion_sign_this` challenge, so
+    /// `resp.onion_sign_this` stays empty and the request's `onion_signs`
+    /// are never needed.
+    async fn register_request_self_addrs(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        mine: &mut std::collections::HashSet<String>,
+    ) {
         for (list, is_onion) in [(&req.onions, true), (&req.i2p, false)] {
             for (i, host) in list.iter().enumerate() {
                 if host.is_empty() {
                     continue;
                 }
-                let addr = if is_onion {
-                    PeerAddr::Onion { host: host.clone(), port: req.port }
-                } else {
-                    PeerAddr::I2p { dest: host.clone(), port: req.port }
-                };
+                let addr = Self::request_self_addr(host, is_onion, req.port);
                 self.tracker_announce(Self::hashes_for(list, i, &req.hashes), &addr).await;
                 mine.insert(addr.to_string());
             }
         }
-        mine
+    }
+
+    /// One entry of a request's onion or i2p self-address list, as a `PeerAddr`.
+    fn request_self_addr(host: &str, is_onion: bool, port: u16) -> PeerAddr {
+        if is_onion {
+            PeerAddr::Onion { host: host.to_string(), port }
+        } else {
+            PeerAddr::I2p { dest: host.to_string(), port }
+        }
     }
 
     /// The hashes one entry of a request's parallel array applies to: parallel
@@ -6367,22 +6399,7 @@ impl AppState {
         let ours = self.connectable_peers(address, 10).await;
         let mut known: std::collections::HashSet<String> =
             ours.iter().map(|p| p.to_string()).collect();
-        let mut have: Vec<PeerAddr> =
-            ours.iter().filter(|p| !p.is_private()).cloned().collect();
-        // Advertise our own reachable overlay addresses so the peers we reach
-        // add and gossip us (mirrors the server-side pex reply).
-        let fs_port = self.fileserver_port().await;
-        if let Some(host) = self.onion_address().await {
-            have.push(PeerAddr::Onion { host, port: fs_port });
-        }
-        if let Some(dest) = self.i2p_address().await {
-            have.push(PeerAddr::I2p { dest, port: fs_port });
-        }
-        if let Some(hex) = self.rns_address().await {
-            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
-                have.push(p);
-            }
-        }
+        let have = self.pex_have_addrs(&ours).await;
 
         let mut learned: Vec<PeerAddr> = Vec::new();
         for peer in ours.iter().take(max_peers) {
@@ -6409,6 +6426,27 @@ impl AppState {
             self.add_peers(address, learned).await;
         }
         count
+    }
+
+    /// The addresses a PEX exchange offers the peer: the public ones we already
+    /// know, plus our own reachable overlay addresses so the peers we reach
+    /// add and gossip us (mirrors the server-side pex reply).
+    async fn pex_have_addrs(&self, ours: &[PeerAddr]) -> Vec<PeerAddr> {
+        let mut have: Vec<PeerAddr> =
+            ours.iter().filter(|p| !p.is_private()).cloned().collect();
+        let fs_port = self.fileserver_port().await;
+        if let Some(host) = self.onion_address().await {
+            have.push(PeerAddr::Onion { host, port: fs_port });
+        }
+        if let Some(dest) = self.i2p_address().await {
+            have.push(PeerAddr::I2p { dest, port: fs_port });
+        }
+        if let Some(hex) = self.rns_address().await {
+            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
+                have.push(p);
+            }
+        }
+        have
     }
 
     /// Live connection stats (`connection`, `connection_in`, `connection_onion`,

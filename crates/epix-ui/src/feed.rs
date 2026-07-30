@@ -272,25 +272,7 @@ pub fn segment_search(art: &FeedArtifacts, terms: &[String], limit: usize) -> Va
             continue;
         }
         scanned += 1;
-        let extents = record_extents(seg);
-        for (r, (addr, offset, len)) in seg.records.iter().zip(extents) {
-            if hits.len() >= limit {
-                break;
-            }
-            let terms_of = record_terms(r);
-            if !query.iter().all(|t| terms_of.contains(t)) {
-                continue;
-            }
-            hits.push(json!({
-                "record": addr.to_string(),
-                "segment_root": seg.root.to_string(),
-                "offset": offset,
-                "len": len,
-                "id": r.id,
-                "target": r.target,
-                "clock": r.clock,
-            }));
-        }
+        collect_segment_hits(seg, &query, limit, &mut hits);
         if hits.len() >= limit {
             break;
         }
@@ -303,6 +285,37 @@ pub fn segment_search(art: &FeedArtifacts, terms: &[String], limit: usize) -> Va
         "segments_scanned": scanned,
         "spine_head": art.spine.head().to_string(),
     })
+}
+
+/// Append one candidate segment's matching records to `hits` as verifiable
+/// pointers, stopping once `hits` holds `limit` of them. A record matches when
+/// it contains EVERY query term (AND semantics); `query` is already tokenized
+/// and non-empty.
+fn collect_segment_hits(
+    seg: &Segment,
+    query: &[String],
+    limit: usize,
+    hits: &mut Vec<Value>,
+) {
+    let extents = record_extents(seg);
+    for (r, (addr, offset, len)) in seg.records.iter().zip(extents) {
+        if hits.len() >= limit {
+            break;
+        }
+        let terms_of = record_terms(r);
+        if !query.iter().all(|t| terms_of.contains(t)) {
+            continue;
+        }
+        hits.push(json!({
+            "record": addr.to_string(),
+            "segment_root": seg.root.to_string(),
+            "offset": offset,
+            "len": len,
+            "id": r.id,
+            "target": r.target,
+            "clock": r.clock,
+        }));
+    }
 }
 
 /// Shape a `feedItemQuery` response: the live records attached to `target`
