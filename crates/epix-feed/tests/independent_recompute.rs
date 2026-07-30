@@ -46,8 +46,10 @@ fn corpus() -> Vec<Record> {
     v.push(mk("ac0", "author", "post0", 6, Kind::Comment));
     v.push(mk("ac1", "author", "post0", 7, Kind::Comment));
     v.push(mk("ac0", "author", "post0", 56, Kind::Comment)); // edit of ac0
-    // A moderator tombstones one comment (victim id in the target).
-    v.push(mk("t0", "mod", "c0_1", 500, Kind::Tombstone));
+    // The moderated comment's tombstone. The adapter emits it with the
+    // victim id in the target and the item's own author, so one author
+    // cannot tombstone another author's item.
+    v.push(mk("c0_1", "u1", "c0_1", 500, Kind::Tombstone));
     v
 }
 
@@ -137,7 +139,7 @@ fn absolute_state_values_exercise_the_fixes() {
     // FIX 2/3 (edit): the edit of ac0 (same id) folds to a single winner.
     assert_eq!(ck.live.iter().filter(|r| r.id == "ac0").count(), 1);
     // Tombstone (victim id in target) drops the moderated comment.
-    assert!(ck.tombstones.contains("c0_1"));
+    assert!(ck.tombstones.contains(&("u1".to_string(), "c0_1".to_string())));
     assert!(!ck.live.iter().any(|r| r.id == "c0_1"));
 
     // FIX 1+3 (rollup): post0 counts only LIVE comment winners:

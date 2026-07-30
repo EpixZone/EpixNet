@@ -11,8 +11,11 @@
 //! by the node's ethsecp256k1 key over the Noise handshake hash, which
 //! uniquely fingerprints this session (both sides compute it, an
 //! attacker in the middle cannot produce a session with the same hash).
-//! Without proof of possession a peer could spoof a victim's node id to
-//! claim its reciprocity standing - `verify_binding` is what stops that.
+//! The payload also commits to the signer's [`Role`], so the two
+//! directions of the handshake sign different strings and neither can be
+//! reflected as the other. Without proof of possession a peer could spoof
+//! a victim's node id to claim its reciprocity standing -
+//! `verify_binding` is what stops that.
 //!
 //! Transport records: `u16-LE length ‖ noise ciphertext`, stateless
 //! transport mode with per-direction implicit nonces (order = nonce), so
@@ -39,30 +42,62 @@ const RECORD_PLAINTEXT: usize = 60_000;
 /// because the pump has no other wakeup source.
 const IDLE_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Domain-separated payload the node key signs to bind its identity to
-/// this session.
-pub fn binding_payload(handshake_hash: &[u8; 32]) -> String {
+/// Which side of the handshake made a binding signature. The signed
+/// payload commits to it, so an initiator's signature never verifies as a
+/// responder's. Without that separation both sides sign the same string,
+/// and a responder can echo the dialer's own `node_pk` plus its `Hello`
+/// signature back in the `HelloAck` and be accepted as that identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The dialing side, which signs its `Hello`.
+    Initiator,
+    /// The accepting side, which signs its `HelloAck`.
+    Responder,
+}
+
+impl Role {
+    fn tag(self) -> &'static str {
+        match self {
+            Role::Initiator => "initiator",
+            Role::Responder => "responder",
+        }
+    }
+}
+
+/// Domain-separated payload the node key signs to bind its identity AND
+/// its role to this session. The version is v2 because the role was added
+/// to the payload; both sides of the protocol upgrade together, so there
+/// is no v1 fallback.
+pub fn binding_payload(handshake_hash: &[u8; 32], role: Role) -> String {
     let mut hex = String::with_capacity(64);
     for b in handshake_hash {
         use std::fmt::Write;
         let _ = write!(hex, "{b:02x}");
     }
-    format!("epix-edx-binding-v1:{hex}")
+    format!("epix-edx-binding-v2:{}:{hex}", role.tag())
 }
 
-/// Sign the channel binding with the node's ethsecp256k1 key.
-pub fn sign_binding(handshake_hash: &[u8; 32], privatekey: &str) -> io::Result<Vec<u8>> {
-    epix_crypt::sign(&binding_payload(handshake_hash), privatekey)
+/// Sign the channel binding with the node's ethsecp256k1 key, in `role`.
+/// The dialer signs its `Hello` as [`Role::Initiator`], the accepting side
+/// signs its `HelloAck` as [`Role::Responder`].
+pub fn sign_binding(
+    handshake_hash: &[u8; 32],
+    privatekey: &str,
+    role: Role,
+) -> io::Result<Vec<u8>> {
+    epix_crypt::sign(&binding_payload(handshake_hash, role), privatekey)
         .map(String::into_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
-/// Verify a peer's binding signature against its claimed node key.
-/// A `Hello` whose signature fails this check is a spoofed identity.
-pub fn verify_binding(handshake_hash: &[u8; 32], node_pk: &[u8], sig: &[u8]) -> bool {
+/// Verify a peer's binding signature against its claimed node key, in the
+/// role that peer signed in. A `Hello` whose signature fails this check is
+/// a spoofed identity; a `HelloAck` carrying an initiator's signature is a
+/// reflection of the dialer's own identity and fails too.
+pub fn verify_binding(handshake_hash: &[u8; 32], node_pk: &[u8], sig: &[u8], role: Role) -> bool {
     let Ok(address) = epix_crypt::pubkey_to_address(node_pk) else { return false };
     let Ok(sig) = std::str::from_utf8(sig) else { return false };
-    epix_crypt::verify(&binding_payload(handshake_hash), &address, sig)
+    epix_crypt::verify(&binding_payload(handshake_hash, role), &address, sig)
 }
 
 /// A secured stream plus the session facts the handshake produced.
@@ -257,7 +292,13 @@ fn spawn_inbound_pump<R, W>(
             }
             let Ok(n) = transport.read_message(nonce, &record, &mut plain) else { break };
             nonce += 1;
-            if net_write.write_all(&plain[..n]).await.is_err() {
+            // Deadline on the write, for the same reason as the outbound
+            // pump's: this half of the duplex cannot be dropped on its own,
+            // so a consumer above that stops reading (the duplex fills and
+            // nothing drains it) parks this pump in write_all with no wakeup
+            // source, and the caller's stream plus its Stats row leak.
+            let wrote = tokio::time::timeout(IDLE_RECORD_TIMEOUT, net_write.write_all(&plain[..n]));
+            if !matches!(wrote.await, Ok(Ok(()))) {
                 break;
             }
         }
@@ -372,18 +413,45 @@ mod tests {
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let node_pk = epix_crypt::private_to_compressed_pubkey(priv_hex).unwrap();
 
-        let sig = sign_binding(&a.handshake_hash, priv_hex).unwrap();
+        let sig = sign_binding(&a.handshake_hash, priv_hex, Role::Initiator).unwrap();
         // The peer verifies with the SAME hash (it has its own copy).
-        assert!(verify_binding(&b.handshake_hash, &node_pk, &sig));
+        assert!(verify_binding(&b.handshake_hash, &node_pk, &sig, Role::Initiator));
 
         // A different session's signature does not transfer (spoofing a
         // node id across sessions fails).
         let (c, _d) = secured_pair().await;
-        assert!(!verify_binding(&c.handshake_hash, &node_pk, &sig));
+        assert!(!verify_binding(&c.handshake_hash, &node_pk, &sig, Role::Initiator));
 
         // A different key's signature fails against this node_pk.
         let other_priv = "2222222222222222222222222222222222222222222222222222222222222222";
-        let bad = sign_binding(&a.handshake_hash, other_priv).unwrap();
-        assert!(!verify_binding(&b.handshake_hash, &node_pk, &bad));
+        let bad = sign_binding(&a.handshake_hash, other_priv, Role::Initiator).unwrap();
+        assert!(!verify_binding(&b.handshake_hash, &node_pk, &bad, Role::Initiator));
+    }
+
+    /// A binding signed in one role must not verify in the other. Without
+    /// this the responder could echo the dialer's own node_pk and `Hello`
+    /// signature back in its `HelloAck` and be accepted as that identity.
+    #[tokio::test]
+    async fn a_binding_does_not_transfer_between_roles() {
+        let (a, b) = secured_pair().await;
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let node_pk = epix_crypt::private_to_compressed_pubkey(priv_hex).unwrap();
+
+        // What a dialer puts in its Hello: valid as an initiator, and the
+        // reflection back as a HelloAck must fail.
+        let hello_sig = sign_binding(&a.handshake_hash, priv_hex, Role::Initiator).unwrap();
+        assert!(verify_binding(&b.handshake_hash, &node_pk, &hello_sig, Role::Initiator));
+        assert!(
+            !verify_binding(&b.handshake_hash, &node_pk, &hello_sig, Role::Responder),
+            "an initiator's signature must not pass as a responder's"
+        );
+
+        // And the mirror: an acceptor's HelloAck signature is not a Hello.
+        let ack_sig = sign_binding(&a.handshake_hash, priv_hex, Role::Responder).unwrap();
+        assert!(verify_binding(&b.handshake_hash, &node_pk, &ack_sig, Role::Responder));
+        assert!(
+            !verify_binding(&b.handshake_hash, &node_pk, &ack_sig, Role::Initiator),
+            "a responder's signature must not pass as an initiator's"
+        );
     }
 }

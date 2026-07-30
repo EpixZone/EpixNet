@@ -35,6 +35,13 @@ pub const MAX_MANY_ITEMS: usize = 256;
 pub const MAX_MANY_ITEM_BYTES: u64 = 64 * 1024;
 /// Concurrent serve tasks per connection.
 pub const MAX_CONCURRENT_SERVES: usize = 8;
+/// Concurrent range-encode threads across the WHOLE process. The encode
+/// runs on tokio's blocking pool, which the node shares with store and
+/// database IO, and each thread can sit on the connection's send stall
+/// deadline waiting for its peer. Without this, enough slow peers starve
+/// every other blocking caller. Serving is bound by peer link speed, not
+/// by encode parallelism, so a small number is plenty.
+pub const MAX_ENCODE_THREADS: usize = 32;
 /// How long a connection may sit after the link comes up before sending
 /// its `Hello`. Bounds the slot an authenticated-but-silent peer holds.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -44,6 +51,10 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// A GetRange no larger than this is treated as first-paint (index.html +
 /// first bundles), exempt from choking up to the per-peer free budget.
 pub const FIRST_PAINT_OBJECT_BYTES: u64 = 1 << 20;
+
+/// The [`MAX_ENCODE_THREADS`] permits, shared by every connection.
+static ENCODE_SLOTS: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(MAX_ENCODE_THREADS));
 
 /// Signed-content access the server delegates to (the real node backs
 /// this with its xite registry; tests use a fixture). Async because the
@@ -198,18 +209,27 @@ impl ServeCtx {
     }
 }
 
-/// Build our Hello/HelloAck binding signature for this session.
-/// `handshake_hash` is Some on Noise links, None on overlay links (their
-/// transport already authenticates the endpoint).
-fn binding_sig(privatekey: &str, handshake_hash: Option<&[u8; 32]>) -> std::io::Result<Vec<u8>> {
+/// Build our Hello/HelloAck binding signature for this session. `role` is
+/// the side WE are: the dialer signs its `Hello` as the initiator, the
+/// acceptor its `HelloAck` as the responder, so neither signature can be
+/// reflected back as the other. `handshake_hash` is Some on Noise links,
+/// None on overlay links (their transport already authenticates the
+/// endpoint).
+fn binding_sig(
+    privatekey: &str,
+    handshake_hash: Option<&[u8; 32]>,
+    role: noise::Role,
+) -> std::io::Result<Vec<u8>> {
     match handshake_hash {
-        Some(h) => noise::sign_binding(h, privatekey),
+        Some(h) => noise::sign_binding(h, privatekey, role),
         None => Ok(Vec::new()),
     }
 }
 
-/// Validate a peer's Hello/HelloAck identity claims. Returns the
-/// established identity or an error string (which kills the connection).
+/// Validate a peer's Hello/HelloAck identity claims. `role` is the side
+/// the PEER is, so a responder that echoes the dialer's own node_pk and
+/// binding signature back fails the check. Returns the established
+/// identity or an error string (which kills the connection).
 fn check_identity(
     net: &str,
     node_pk: &[u8],
@@ -217,6 +237,7 @@ fn check_identity(
     peer_caps: u32,
     version: String,
     handshake_hash: Option<&[u8; 32]>,
+    role: noise::Role,
 ) -> Result<PeerIdentity, String> {
     if net != NET_ID {
         return Err(format!("wrong net {net:?}"));
@@ -224,7 +245,7 @@ fn check_identity(
     let address =
         epix_crypt::pubkey_to_address(node_pk).map_err(|e| format!("bad node_pk: {e}"))?;
     if let Some(hash) = handshake_hash {
-        if !noise::verify_binding(hash, node_pk, sig) {
+        if !noise::verify_binding(hash, node_pk, sig, role) {
             return Err(format!("channel binding failed for {address}"));
         }
     }
@@ -242,7 +263,7 @@ pub async fn client_hello(
         net: NET_ID.into(),
         node_pk: epix_crypt::private_to_compressed_pubkey(&ctx.privatekey)
             .map_err(std::io::Error::other)?,
-        binding_sig: binding_sig(&ctx.privatekey, handshake_hash.as_ref())?,
+        binding_sig: binding_sig(&ctx.privatekey, handshake_hash.as_ref(), noise::Role::Initiator)?,
         caps: ctx.caps,
         listen,
         version: ctx.version.clone(),
@@ -255,6 +276,7 @@ pub async fn client_hello(
             ack.caps,
             ack.version,
             handshake_hash.as_ref(),
+            noise::Role::Responder,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)),
         Resp::Err { code, msg } => Err(std::io::Error::other(format!("hello refused {code}: {msg}"))),
@@ -280,7 +302,11 @@ pub async fn serve(
     // the only inbound path now, so without this a few hundred stalled
     // sockets exhaust MAX_INBOUND and the node goes deaf to new peers.
     let first = tokio::time::timeout(HELLO_TIMEOUT, incoming.recv()).await.ok()??;
-    let identity = match first.req {
+    // Destructured whole: matching on `first.req` alone is a partial move, so
+    // the un-moved `_budget` would live as long as `serve` does and never
+    // refund the Hello's share of the connection's inbound byte budget.
+    let Incoming { stream: hello_stream, req: hello_req, _budget: hello_budget } = first;
+    let identity = match hello_req {
         Req::Hello(hello) => {
             match check_identity(
                 &hello.net,
@@ -289,6 +315,7 @@ pub async fn serve(
                 hello.caps,
                 hello.version,
                 handshake_hash.as_ref(),
+                noise::Role::Initiator,
             ) {
                 Ok(id) => {
                     let ack = HelloAck {
@@ -297,20 +324,24 @@ pub async fn serve(
                             Ok(pk) => pk,
                             Err(_) => return None,
                         },
-                        binding_sig: binding_sig(&ctx.privatekey, handshake_hash.as_ref())
-                            .ok()?,
+                        binding_sig: binding_sig(
+                            &ctx.privatekey,
+                            handshake_hash.as_ref(),
+                            noise::Role::Responder,
+                        )
+                        .ok()?,
                         caps: ctx.caps,
                         observed: None,
                         version: ctx.version.clone(),
                     };
-                    if conn.respond(first.stream, Resp::HelloAck(ack)).await.is_err() {
+                    if conn.respond(hello_stream, Resp::HelloAck(ack)).await.is_err() {
                         return None;
                     }
                     id
                 }
                 Err(e) => {
                     let _ = conn
-                        .respond(first.stream, Resp::Err { code: err::BAD_REQUEST, msg: e })
+                        .respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: e })
                         .await;
                     return None;
                 }
@@ -319,13 +350,15 @@ pub async fn serve(
         _ => {
             let _ = conn
                 .respond(
-                    first.stream,
+                    hello_stream,
                     Resp::Err { code: err::BAD_REQUEST, msg: "hello first".into() },
                 )
                 .await;
             return None;
         }
     };
+    // Answered: give the units back to the connection's inbound budget.
+    drop(hello_budget);
 
     // Register the peer with the governor (reachability from the link
     // type: overlay links have no handshake hash).
@@ -340,7 +373,29 @@ pub async fn serve(
     // requests; a live-but-silent peer reconnects when it needs us.
     let serves = Arc::new(Semaphore::new(MAX_CONCURRENT_SERVES));
     while let Ok(Some(inc)) = tokio::time::timeout(IDLE_TIMEOUT, incoming.recv()).await {
-        let Ok(permit) = serves.clone().acquire_owned().await else { break };
+        // Bounded too: with all MAX_CONCURRENT_SERVES permits held by slow
+        // serves, an unbounded wait here parks the loop off the timeout
+        // above, so the idle reaper could never fire for this connection.
+        // Running out of permits means the connection is BUSY, not idle, so
+        // the request is answered and the loop goes on: breaking here would
+        // shed the busiest connection and, worse, drop this request with no
+        // reply while `incoming` goes away under the in-flight serves, which
+        // black-holes everything the peer sends after it.
+        let slot = tokio::time::timeout(IDLE_TIMEOUT, serves.clone().acquire_owned()).await;
+        let permit = match slot {
+            Ok(Ok(p)) => p,
+            // The semaphore is ours and never closed; treat it as fatal.
+            Ok(Err(_)) => break,
+            Err(_) => {
+                let _ = conn
+                    .respond(
+                        inc.stream,
+                        Resp::Err { code: err::BUSY, msg: "serve slots busy".into() },
+                    )
+                    .await;
+                continue;
+            }
+        };
         let conn = conn.clone();
         let ctx = ctx.clone();
         let identity = identity.clone();
@@ -364,7 +419,7 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             serve_range(conn, ctx, identity, stream, obj, ranges, deadline_ms).await;
         }
         Req::GetMany { objs } => {
-            serve_many(conn, ctx, stream, objs).await;
+            serve_many(conn, ctx, identity, stream, objs).await;
         }
         Req::GetBitfield { obj } => {
             let resp = match ctx.store.info(obj).and_then(|info| {
@@ -382,11 +437,17 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             let _ = conn.respond(stream, resp).await;
         }
         Req::GetSigned { xite, inner_path } => {
-            let resp = match ctx.provider.get_signed(&xite, &inner_path).await {
-                Some(bytes) => Resp::Signed { bytes },
-                None => Resp::Err { code: err::NOT_FOUND, msg: format!("{xite}/{inner_path}") },
-            };
-            let _ = conn.respond(stream, resp).await;
+            match ctx.provider.get_signed(&xite, &inner_path).await {
+                Some(bytes) => serve_signed(conn, stream, bytes).await,
+                None => {
+                    let _ = conn
+                        .respond(
+                            stream,
+                            Resp::Err { code: err::NOT_FOUND, msg: format!("{xite}/{inner_path}") },
+                        )
+                        .await;
+                }
+            }
         }
         Req::ListSigned { xite, since } => {
             let entries = ctx.provider.list_signed(&xite, since).await;
@@ -451,7 +512,24 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
         }
         Req::GetTrackers => {
             let resp = match &ctx.control {
-                Some(c) => Resp::Trackers { trackers: c.trackers().await },
+                Some(c) => {
+                    // One unchunked frame, so the set has to fit in it: an
+                    // oversize frame fails to encode in the writer task and
+                    // tears down the WHOLE multiplexed connection. A truncated
+                    // tracker set still works (gossip brings the rest), so
+                    // degrade rather than fail.
+                    let mut trackers: Vec<String> = Vec::new();
+                    let mut bytes = 0usize;
+                    for t in c.trackers().await {
+                        // string bytes + its length varint, generously rounded.
+                        bytes += t.len() + 8;
+                        if bytes > BATCH_BUDGET {
+                            break;
+                        }
+                        trackers.push(t);
+                    }
+                    Resp::Trackers { trackers }
+                }
                 None => unsupported(),
             };
             let _ = conn.respond(stream, resp).await;
@@ -487,6 +565,40 @@ fn unsupported() -> Resp {
 /// Byte budget for one batched reply frame, leaving room for the frame
 /// header and postcard's length prefixes.
 const BATCH_BUDGET: usize = MAX_FRAME_LEN - 4096;
+
+/// Send `Signed` across as many frames as it takes. A large site's
+/// content.json is bigger than one frame, and an oversize frame fails to
+/// encode in the writer task, which tears down the WHOLE multiplexed
+/// connection (not just this stream); refusing it instead simply made such
+/// a xite unclonable. The client concatenates until the terminal frame
+/// (`fetch::fetch_signed`).
+async fn serve_signed(conn: Conn, stream: u64, bytes: Vec<u8>) {
+    let mut rest = &bytes[..];
+    while rest.len() > BATCH_BUDGET {
+        let (head, tail) = rest.split_at(BATCH_BUDGET);
+        rest = tail;
+        // A peer that gave up mid-body stops the rest of it.
+        if conn.take_cancelled(stream) {
+            return;
+        }
+        if conn
+            .send(Frame {
+                stream,
+                body: FrameBody::Resp { last: false, resp: Resp::Signed { bytes: head.to_vec() } },
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = conn
+        .send(Frame {
+            stream,
+            body: FrameBody::Resp { last: true, resp: Resp::Signed { bytes: rest.to_vec() } },
+        })
+        .await;
+}
 
 /// Send `SignedList` across as many frames as it takes. A xite with
 /// thousands of per-user content.json files overflows a single frame, and
@@ -581,12 +693,29 @@ async fn serve_range(
         return;
     }
 
+    // What actually goes on the wire, not what was asked for: the encoder
+    // rounds every range outward to a whole chunk group and adds proof
+    // bytes, so a 1-byte range costs a full group. Charging the requested
+    // size would let 64 one-byte ranges draw ~1 MiB while accounting for
+    // 64 bytes, which is the global cap and the foreground yield gone.
+    const GROUP: u64 = epix_blob::bitfield::GROUP_BYTES;
+    let charged: u64 = ranges
+        .iter()
+        .map(|&(s, e)| {
+            if e > s {
+                (e.div_ceil(GROUP) - s / GROUP).saturating_mul(GROUP)
+            } else {
+                0
+            }
+        })
+        .fold(0u64, u64::saturating_add);
+
     // A first-paint-sized object, or an explicitly tight-deadline request
     // (streaming seek), streams on the connection's priority lane so it
     // preempts a large background range; a patient bulk range (no deadline)
     // yields to it. This is the deadline tier the plan calls for, enforced
     // at the writer rather than only advertised to the peer.
-    let first_paint = total <= FIRST_PAINT_OBJECT_BYTES;
+    let first_paint = charged <= FIRST_PAINT_OBJECT_BYTES;
     let bulk = !first_paint && deadline_ms == 0;
 
     // Bulk governance: consult the choker. First-paint objects (index +
@@ -597,7 +726,7 @@ async fn serve_range(
         let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
         let decision = choker.lock().expect("choker").decide(
             &identity.node_pk,
-            total,
+            charged,
             first_paint,
             foreground,
             (ctx.now)(),
@@ -616,6 +745,16 @@ async fn serve_range(
     let byte_ranges: Vec<std::ops::Range<u64>> =
         ranges.iter().map(|(s, e)| *s..*e).collect();
 
+    // Take a process-wide encode slot before spending a blocking thread, so
+    // encodes can never dominate the pool the whole node shares (see
+    // ENCODE_SLOTS). Held for the encode's lifetime.
+    let Ok(_encode_slot) = ENCODE_SLOTS.acquire().await else {
+        let _ = conn
+            .respond(stream, Resp::Err { code: err::INTERNAL, msg: "encoder closed".into() })
+            .await;
+        return;
+    };
+
     // Encode on a blocking thread, streaming frames through the writer
     // adapter as they fill — bounded memory, cancellable between frames.
     let store = ctx.store.clone();
@@ -633,6 +772,14 @@ async fn serve_range(
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
             // Peer cancelled: nothing more to send.
         }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            // The lane is closed: there is nowhere to put an error frame.
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+            // The peer stopped draining its lane and `blocking_send`'s stall
+            // deadline fired. The queue is still full, so an error frame
+            // would only pile onto it.
+        }
         Ok(Err(e)) => {
             let code =
                 if e.kind() == std::io::ErrorKind::NotFound { err::NOT_FOUND } else { err::INTERNAL };
@@ -646,7 +793,19 @@ async fn serve_range(
     }
 }
 
-async fn serve_many(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, objs: Vec<ObjId>) {
+/// Per-item cost of a `Many` batch beyond the payload itself: a 32-byte
+/// ObjId (postcard writes `[u8; 32]` raw) plus the payload's length varint.
+/// Unbudgeted, a full 256-item batch overshoots the frame cap by more than
+/// the slack, and an oversize frame kills the whole connection.
+const MANY_ITEM_OVERHEAD: usize = 35;
+
+async fn serve_many(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    identity: Arc<PeerIdentity>,
+    stream: u64,
+    objs: Vec<ObjId>,
+) {
     if objs.len() > MAX_MANY_ITEMS {
         let _ = conn
             .respond(stream, Resp::Err { code: err::LIMIT, msg: "too many items".into() })
@@ -654,35 +813,136 @@ async fn serve_many(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, objs: Vec<ObjId
         return;
     }
     let now = (ctx.now)();
-    let mut batch: Vec<(ObjId, Vec<u8>)> = Vec::new();
-    let mut batch_bytes = 0usize;
-    for obj in objs {
-        let bytes = match ctx.store.info(obj) {
-            Ok(Some((size, true))) if size <= MAX_MANY_ITEM_BYTES => {
-                match ctx.store.read_bytes(obj, now) {
-                    Ok(b) => b,
-                    Err(_) => continue, // absent/corrupt: silently omitted, client refetches
+
+    // Size the reply before reading a byte of it, so it can be charged to
+    // the governor item by item. Without this a peer draws up to
+    // MAX_MANY_ITEMS * MAX_MANY_ITEM_BYTES per request with no accounting at
+    // all, which is the global cap, the foreground yield and reciprocity
+    // choking defeated by picking one request type.
+    //
+    // Off the handler task: `info` is synchronous store IO and a full batch
+    // is MAX_MANY_ITEMS of them, same reason serve_range encodes on a
+    // blocking thread.
+    let store = ctx.store.clone();
+    let mut servable: Vec<(ObjId, u64)> = match tokio::task::spawn_blocking(move || {
+        objs.into_iter()
+            .filter_map(|obj| match store.info(obj) {
+                Ok(Some((size, true))) if size <= MAX_MANY_ITEM_BYTES => Some((obj, size)),
+                _ => None,
+            })
+            .collect()
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(join_err) => {
+            let _ = conn
+                .respond(stream, Resp::Err { code: err::INTERNAL, msg: join_err.to_string() })
+                .await;
+            return;
+        }
+    };
+    let asked = servable.len();
+
+    // GetMany is cold sync of small whole blobs, so each item is charged as
+    // first-paint: a normal xite sync draws on the free budget and then
+    // falls through to the global cap and the unchoke set, exactly like a
+    // range serve past its free budget.
+    //
+    // Charged ITEM BY ITEM, not as one batch. A full batch is up to
+    // MAX_MANY_ITEMS * MAX_MANY_ITEM_BYTES (16 MiB) while the global cap is
+    // a per-SECOND budget of a few MB, so one decision for the whole batch
+    // throttles any large batch deterministically, for every peer, forever.
+    // The batch is cut where the governor stops admitting instead; the
+    // client sees the rest as missing and asks the next peer (fetch_many
+    // reports missing ids, and get_many_pass re-asks per peer).
+    let mut bulk = false;
+    if let Some(choker) = &ctx.choker {
+        let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
+        let mut c = choker.lock().expect("choker");
+        let mut admitted = 0usize;
+        for (_, size) in &servable {
+            match c.decide(&identity.node_pk, *size, true, foreground, now) {
+                ServeDecision::FirstPaint => {}
+                // Past the free budget this is ordinary bulk upload: it must
+                // not preempt governed ranges on the priority lane.
+                ServeDecision::Serve => bulk = true,
+                ServeDecision::Choked | ServeDecision::Throttled => break,
+            }
+            admitted += 1;
+        }
+        servable.truncate(admitted);
+    }
+    if servable.is_empty() && asked > 0 {
+        // Not one item fits right now. Say BUSY rather than send an empty
+        // batch, which would read as "we hold none of these".
+        let _ = conn.respond(stream, Resp::Err { code: err::BUSY, msg: "choked".into() }).await;
+        return;
+    }
+
+    // Take the same process-wide encode slot the range path takes. This
+    // blocking thread also parks on the peer's drain rate (blocking_send's
+    // stall deadline), so without the permit GetMany starves the shared
+    // blocking pool through a request type the cap did not cover.
+    let Ok(_encode_slot) = ENCODE_SLOTS.acquire().await else {
+        let _ = conn
+            .respond(stream, Resp::Err { code: err::INTERNAL, msg: "encoder closed".into() })
+            .await;
+        return;
+    };
+
+    // Read and frame on a blocking thread too: `read_bytes` is synchronous
+    // file IO, up to MAX_MANY_ITEMS times. Frames go out through the same
+    // blocking senders the range encoder uses, so backpressure and the send
+    // stall deadline still apply.
+    let store = ctx.store.clone();
+    let writer_conn = conn.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut batch: Vec<(ObjId, Vec<u8>)> = Vec::new();
+        let mut batch_bytes = 0usize;
+        for (obj, _) in servable {
+            let bytes = match store.read_bytes(obj, now) {
+                Ok(b) => b,
+                Err(_) => continue, // absent/corrupt: silently omitted, client refetches
+            };
+            let cost = bytes.len() + MANY_ITEM_OVERHEAD;
+            if batch_bytes + cost > BATCH_BUDGET && !batch.is_empty() {
+                let out = std::mem::take(&mut batch);
+                batch_bytes = 0;
+                let frame = Frame {
+                    stream,
+                    body: FrameBody::Resp { last: false, resp: Resp::Many { items: out } },
+                };
+                // Whole stream stays on one lane: mixing them would let the
+                // terminal frame overtake data the peer has not seen yet.
+                let sent = if bulk {
+                    writer_conn.blocking_send_bulk(frame)
+                } else {
+                    writer_conn.blocking_send(frame)
+                };
+                if sent.is_err() {
+                    return;
                 }
             }
-            _ => continue,
-        };
-        if batch_bytes + bytes.len() > MAX_FRAME_LEN - 4096 && !batch.is_empty() {
-            let out = std::mem::take(&mut batch);
-            batch_bytes = 0;
-            if conn
-                .send(Frame { stream, body: FrameBody::Resp { last: false, resp: Resp::Many { items: out } } })
-                .await
-                .is_err()
-            {
-                return;
-            }
+            batch_bytes += cost;
+            batch.push((obj, bytes));
         }
-        batch_bytes += bytes.len();
-        batch.push((obj, bytes));
+        let frame =
+            Frame { stream, body: FrameBody::Resp { last: true, resp: Resp::Many { items: batch } } };
+        let _ = if bulk {
+            writer_conn.blocking_send_bulk(frame)
+        } else {
+            writer_conn.blocking_send(frame)
+        };
+    })
+    .await;
+    if let Err(join_err) = res {
+        // The terminal frame never went out, so the peer's stream would hang
+        // on the reply that ends it.
+        let _ = conn
+            .respond(stream, Resp::Err { code: err::INTERNAL, msg: join_err.to_string() })
+            .await;
     }
-    let _ = conn
-        .send(Frame { stream, body: FrameBody::Resp { last: true, resp: Resp::Many { items: batch } } })
-        .await;
 }
 
 /// `io::Write` adapter that turns encoded slice bytes into ≤64 KiB Data
@@ -709,12 +969,15 @@ impl FrameSink {
         }
         let bytes = std::mem::take(&mut self.buf);
         let frame = Frame { stream: self.stream, body: FrameBody::Data { last, bytes } };
+        // The error is returned as-is so its KIND survives: `blocking_send`
+        // answers BrokenPipe for a closed lane and TimedOut when its stall
+        // deadline fires on a peer that stopped draining. Flattening both to
+        // BrokenPipe hid a stalled peer behind a closed connection.
         if self.bulk {
             self.conn.blocking_send_bulk(frame)
         } else {
             self.conn.blocking_send(frame)
         }
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "conn closed"))
     }
 
     /// Flush the tail and send the terminal frame.
@@ -740,5 +1003,347 @@ impl std::io::Write for FrameSink {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES};
+    use crate::frame;
+    use epix_blob::Ns;
+
+    const TEST_KEY: &str = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+
+    /// Signed-content provider that answers every path with one fixed body.
+    struct Fixture {
+        signed: Option<Vec<u8>>,
+        /// When set, `get_signed` never returns, so the serve it runs under
+        /// keeps its concurrency permit for good (the permit-starvation test).
+        block: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SignedProvider for Fixture {
+        async fn get_signed(&self, _xite: &str, _inner_path: &str) -> Option<Vec<u8>> {
+            if self.block {
+                std::future::pending::<()>().await;
+            }
+            self.signed.clone()
+        }
+        async fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
+            Vec::new()
+        }
+        async fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
+            None
+        }
+        async fn apply_update(
+            &self,
+            _xite: &str,
+            _inner_path: &str,
+            _signed: &[u8],
+            _inline: &[(ObjId, Vec<u8>)],
+            _modified: f64,
+            _diffs: &[(String, Vec<u8>)],
+            _sender_peers: &[String],
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    fn store_in(dir: &tempfile::TempDir) -> Arc<Store> {
+        Arc::new(Store::open(dir.path()).unwrap())
+    }
+
+    fn peer() -> Arc<PeerIdentity> {
+        Arc::new(PeerIdentity {
+            node_pk: vec![7u8; 33],
+            address: "test".into(),
+            caps: 0,
+            version: String::new(),
+        })
+    }
+
+    fn ctx_for(store: Arc<Store>, provider: Fixture) -> ServeCtx {
+        ServeCtx { now: || 0, ..ServeCtx::new(store, Arc::new(provider), TEST_KEY.into()) }
+    }
+
+    /// A server-side `Conn` plus the raw far end its frames land on.
+    fn wired() -> (Conn, mpsc::Receiver<Incoming>, tokio::io::DuplexStream) {
+        let (far, near) = tokio::io::duplex(1 << 20);
+        let (conn, incoming) = Conn::start(near, false);
+        (conn, incoming, far)
+    }
+
+    /// Next frame off the wire. The timeout only fires when a reply never
+    /// arrives at all, which is exactly how an unencodable frame reads.
+    async fn next_frame(far: &mut tokio::io::DuplexStream) -> Frame {
+        tokio::time::timeout(Duration::from_secs(5), frame::read_frame(far))
+            .await
+            .expect("a reply frame must arrive")
+            .expect("the reply frame decodes")
+    }
+
+    /// A full 256-item batch of near-budget blobs must stay inside the
+    /// frame cap. Budgeting only the payloads ignored 35 bytes of per-item
+    /// encoding overhead, so the reply overflowed, failed to encode in the
+    /// writer task, and took the WHOLE multiplexed connection down.
+    #[tokio::test]
+    async fn a_full_many_batch_stays_under_the_frame_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let mut ids = Vec::new();
+        for i in 0..MAX_MANY_ITEMS as u32 {
+            let data: Vec<u8> = (0..240u32).map(|j| (i + j) as u8).collect();
+            let id = ObjId::of(&data);
+            store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+            ids.push(id);
+        }
+        let ctx = Arc::new(ctx_for(store, Fixture { signed: None, block: false }));
+        let (conn, _incoming, mut far) = wired();
+        tokio::spawn(serve_many(conn, ctx, peer(), 4, ids));
+
+        let mut items = 0usize;
+        loop {
+            let frame = next_frame(&mut far).await;
+            assert!(frame::encode(&frame).is_ok(), "every reply frame must be encodable");
+            match frame.body {
+                FrameBody::Resp { last, resp: Resp::Many { items: got } } => {
+                    items += got.len();
+                    if last {
+                        break;
+                    }
+                }
+                other => panic!("expected Many, got {other:?}"),
+            }
+        }
+        assert_eq!(items, MAX_MANY_ITEMS, "every held item arrives");
+    }
+
+    /// GetMany is governed like any other serve. It used to consult the
+    /// choker at no point, so a peer that had served us nothing could draw
+    /// unmetered megabytes on the priority lane by picking one request type.
+    #[tokio::test]
+    async fn many_is_choked_once_the_free_budget_is_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let data = vec![9u8; 4096];
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+
+        let peer = peer();
+        let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
+        {
+            let mut c = choker.lock().unwrap();
+            // Competitors hold every unchoke slot...
+            for i in 20..26u8 {
+                c.note_peer(&[i; 33], Reach::Clearnet, 0);
+                c.credit_peer(&[i; 33], 1_000_000, 0);
+            }
+            // ...and our peer has already spent its whole free budget.
+            c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
+            assert_eq!(
+                c.decide(&peer.node_pk, FIRST_PAINT_FREE_BYTES, true, false, 0),
+                ServeDecision::FirstPaint
+            );
+        }
+        let ctx = Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
+        let (conn, _incoming, mut far) = wired();
+        tokio::spawn(serve_many(conn, ctx, peer, 6, vec![id]));
+
+        match next_frame(&mut far).await.body {
+            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
+                assert_eq!(code, err::BUSY, "a freeloader past its budget is choked")
+            }
+            other => panic!("expected BUSY, got {other:?}"),
+        }
+    }
+
+    /// The choker is charged what goes on the wire (whole chunk groups plus
+    /// proof), not the byte count the peer asked for. Charging the request
+    /// let 64 one-byte ranges draw ~1 MiB while accounting for 64 bytes,
+    /// which is the global cap and the foreground yield gone.
+    #[tokio::test]
+    async fn scattered_one_byte_ranges_are_charged_by_chunk_group() {
+        const GROUP: u64 = epix_blob::bitfield::GROUP_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let peer = peer();
+        let choker = Arc::new(Mutex::new(Choker::new(100_000)));
+        {
+            let mut c = choker.lock().unwrap();
+            // Sole peer, top contributor: never choked, only ever capped.
+            c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
+            c.credit_peer(&peer.node_pk, 1 << 30, 0);
+            c.decide(&peer.node_pk, FIRST_PAINT_FREE_BYTES, true, false, 0);
+        }
+        let ctx = Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
+
+        let ranges: Vec<(u64, u64)> =
+            (0..MAX_RANGES_PER_REQ as u64).map(|i| (i * GROUP, i * GROUP + 1)).collect();
+        let (conn, _incoming, mut far) = wired();
+        tokio::spawn(serve_range(conn, ctx.clone(), peer.clone(), 8, ObjId([3; 32]), ranges, 0));
+        match next_frame(&mut far).await.body {
+            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
+                assert_eq!(code, err::BUSY, "64 one-byte ranges cost 64 whole chunk groups")
+            }
+            other => panic!("expected BUSY, got {other:?}"),
+        }
+
+        // Control: one range of the same shape is a single group, which fits
+        // under the cap, so it passes the choker and fails on the store
+        // instead (the object was never inserted).
+        let (conn, _incoming2, mut far2) = wired();
+        tokio::spawn(serve_range(conn, ctx, peer, 10, ObjId([3; 32]), vec![(0, 1)], 0));
+        match next_frame(&mut far2).await.body {
+            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
+                assert_eq!(code, err::NOT_FOUND, "one group is under the cap, so it is served")
+            }
+            other => panic!("expected NOT_FOUND, got {other:?}"),
+        }
+    }
+
+    /// A signed body too large for one frame is chunked, not refused. An
+    /// oversize frame fails to encode inside the writer task and tears the
+    /// whole connection down, and refusing it instead made a big site's
+    /// content.json unclonable, so the reply streams like SignedList does.
+    #[tokio::test]
+    async fn an_oversize_signed_body_is_chunked_across_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let body: Vec<u8> =
+            (0..BATCH_BUDGET * 2 + 17).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+        let ctx = Arc::new(ctx_for(store, Fixture { signed: Some(body.clone()), block: false }));
+        let (conn, _incoming, mut far) = wired();
+        let inc = Incoming {
+            stream: 12,
+            req: Req::GetSigned { xite: "1Abc".into(), inner_path: "content.json".into() },
+            _budget: None,
+        };
+        tokio::spawn(handle(conn, ctx, peer(), inc));
+
+        let mut got: Vec<u8> = Vec::new();
+        let mut frames = 0usize;
+        loop {
+            let frame = next_frame(&mut far).await;
+            assert!(frame::encode(&frame).is_ok(), "every reply frame must be encodable");
+            match frame.body {
+                FrameBody::Resp { last, resp: Resp::Signed { bytes } } => {
+                    frames += 1;
+                    got.extend_from_slice(&bytes);
+                    if last {
+                        break;
+                    }
+                }
+                other => panic!("expected Signed, got {other:?}"),
+            }
+        }
+        assert!(frames > 1, "a body over one frame must span frames, got {frames}");
+        assert_eq!(got, body, "the frames reassemble byte-identically");
+    }
+
+    /// The batch is charged to the governor item by item, and cut where the
+    /// governor stops admitting. Charging the WHOLE batch in one decision
+    /// compared a request of up to 16 MiB against a per-second cap of a few
+    /// MB, so every sizeable batch was Throttled deterministically, for every
+    /// peer, and the small-file sync path never recovered.
+    #[tokio::test]
+    async fn a_batch_over_the_global_cap_is_cut_short_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let mut ids = Vec::new();
+        for i in 0..40u32 {
+            let data: Vec<u8> = (0..4096u32).map(|j| (i.wrapping_mul(7) + j) as u8).collect();
+            let id = ObjId::of(&data);
+            store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+            ids.push(id);
+        }
+
+        let peer = peer();
+        let choker = Arc::new(Mutex::new(Choker::new(100_000)));
+        {
+            let mut c = choker.lock().unwrap();
+            // Sole peer, so it holds an unchoke slot: this is about the byte
+            // cap, not reciprocity. Its free budget is spent up front so every
+            // item falls through to the cap.
+            c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
+            assert_eq!(
+                c.decide(&peer.node_pk, FIRST_PAINT_FREE_BYTES, true, false, 0),
+                ServeDecision::FirstPaint
+            );
+        }
+        let ctx =
+            Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
+        let (conn, _incoming, mut far) = wired();
+        tokio::spawn(serve_many(conn, ctx, peer, 14, ids));
+
+        let mut items = 0usize;
+        loop {
+            let frame = next_frame(&mut far).await;
+            assert!(frame::encode(&frame).is_ok(), "every reply frame must be encodable");
+            match frame.body {
+                FrameBody::Resp { last, resp: Resp::Many { items: got } } => {
+                    items += got.len();
+                    if last {
+                        break;
+                    }
+                }
+                other => panic!("expected Many, got {other:?}"),
+            }
+        }
+        // 100_000 / 4096 = 24 whole items fit this second's cap; the other 16
+        // come back missing and the client asks the next peer for them.
+        assert_eq!(items, 24, "the batch is served up to the cap, not refused whole");
+    }
+
+    /// A connection with every serve slot busy is answered BUSY and kept.
+    /// Breaking the loop instead dropped the waiting request with no reply at
+    /// all and let `incoming` go away under the in-flight serves, so every
+    /// later request the peer sent was silently black-holed.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_serve_queue_answers_busy_and_keeps_the_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        let ctx = Arc::new(ctx_for(store, Fixture { signed: None, block: true }));
+        let (conn, _incoming, mut far) = wired();
+        let (tx, rx) = mpsc::channel::<Incoming>(MAX_CONCURRENT_SERVES + 4);
+        tokio::spawn(serve(conn, rx, ctx, None));
+
+        let hello = Hello {
+            net: NET_ID.into(),
+            node_pk: epix_crypt::private_to_compressed_pubkey(TEST_KEY).unwrap(),
+            binding_sig: Vec::new(),
+            caps: 0,
+            listen: Vec::new(),
+            version: String::new(),
+        };
+        tx.send(Incoming { stream: 2, req: Req::Hello(hello), _budget: None }).await.unwrap();
+        match next_frame(&mut far).await.body {
+            FrameBody::Resp { resp: Resp::HelloAck(_), .. } => {}
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // Pin every serve slot on a handler that never returns, then ask for
+        // one more thing.
+        let get = || Req::GetSigned { xite: "1Abc".into(), inner_path: "content.json".into() };
+        for i in 0..MAX_CONCURRENT_SERVES as u64 {
+            tx.send(Incoming { stream: 4 + i, req: get(), _budget: None }).await.unwrap();
+        }
+        tx.send(Incoming { stream: 100, req: get(), _budget: None }).await.unwrap();
+
+        // The wait for a slot is bounded by IDLE_TIMEOUT, and virtual time
+        // jumps there because nothing else can make progress.
+        let frame = tokio::time::timeout(IDLE_TIMEOUT * 4, frame::read_frame(&mut far))
+            .await
+            .expect("the starved request must be answered")
+            .expect("the reply frame decodes");
+        assert_eq!(frame.stream, 100, "the answer is for the request that waited");
+        match frame.body {
+            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
+                assert_eq!(code, err::BUSY, "a full serve queue answers BUSY")
+            }
+            other => panic!("expected BUSY, got {other:?}"),
+        }
     }
 }

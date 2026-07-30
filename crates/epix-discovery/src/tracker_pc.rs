@@ -58,6 +58,16 @@ pub struct PeerBuckets {
     // --- append only (postcard fields are positional!) ---
 }
 
+/// A packed i2p entry: the 32-byte destination hash plus the LE port.
+const I2P_LEN: usize = 34;
+
+/// Whether a packed onion entry is one of the two real shapes: a v2 label
+/// (16 b32 chars, 10 bytes) or a v3 one (56 chars, 35 bytes), each plus the
+/// LE port.
+fn is_onion_len(len: usize) -> bool {
+    len == 12 || len == 37
+}
+
 impl PeerBuckets {
     /// Bucket and pack peers for a reply. Unpackable peers, and types the
     /// announce buckets don't carry (rns), are skipped.
@@ -68,9 +78,14 @@ impl PeerBuckets {
             match p.ip_type() {
                 IpType::Ipv4 => out.ipv4.push(packed),
                 IpType::Ipv6 => out.ipv6.push(packed),
-                IpType::Onion => out.onion.push(packed),
-                IpType::I2p => out.i2p.push(packed),
-                IpType::Rns => {}
+                IpType::Onion if is_onion_len(packed.len()) => out.onion.push(packed),
+                IpType::I2p if packed.len() == I2P_LEN => out.i2p.push(packed),
+                // A wrong-sized overlay entry is junk somebody announced:
+                // `PeerAddr::pack` puts no bound on an onion host, and one
+                // oversized entry makes the whole reply too big for the frame
+                // it rides in, which kills the connection instead of the
+                // entry.
+                IpType::Onion | IpType::I2p | IpType::Rns => {}
             }
         }
         out
@@ -82,7 +97,7 @@ impl PeerBuckets {
         for packed in self.ipv4.iter().chain(&self.ipv6) {
             peers.extend(PeerAddr::unpack_ip(packed));
         }
-        for packed in &self.onion {
+        for packed in self.onion.iter().filter(|p| is_onion_len(p.len())) {
             peers.extend(PeerAddr::unpack_onion(packed));
         }
         for packed in &self.i2p {
@@ -267,6 +282,29 @@ mod tests {
         assert!(parsed.peers.contains(&peers[0]));
         assert!(parsed.peers.contains(&peers[2]));
         assert!(parsed.onion_sign_this.is_none());
+    }
+
+    /// A tracker registers self-announced onion hosts on trust, and
+    /// `PeerAddr::pack` puts no bound on one, so an oversized entry would
+    /// otherwise ride into a reply that no frame can carry - which tears down
+    /// the honest announcer's whole connection instead of dropping the entry.
+    #[test]
+    fn oversized_overlay_entries_are_dropped_from_a_reply() {
+        let peers = vec![
+            PeerAddr::parse("127.0.0.1:11111").unwrap(),
+            PeerAddr::Onion { host: "aaaaaaaaaaaaaaaa".into(), port: 15441 },
+            PeerAddr::Onion { host: "a".repeat(10_000), port: 15441 },
+        ];
+        let buckets = PeerBuckets::pack(&peers);
+        assert_eq!(buckets.ipv4.len(), 1);
+        assert_eq!(buckets.onion.len(), 1, "only the real onion is packed");
+        let resp = AnnounceResp { peers: vec![buckets], ..Default::default() };
+        let reply = encode_reply(&resp).unwrap();
+        assert!(reply.len() < 1024, "reply of {} bytes", reply.len());
+
+        // A relayed bucket that already carries one is dropped on the way in.
+        let poisoned = PeerBuckets { onion: vec![vec![0xAB; 6250]], ..Default::default() };
+        assert!(poisoned.unpack().is_empty());
     }
 
     #[test]

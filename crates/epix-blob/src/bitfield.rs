@@ -27,6 +27,12 @@ const CHUNK_BYTES: u64 = GROUP_BYTES / CHUNKS_PER_GROUP;
 /// (2^26 groups = 1 TiB object) so unpacking can't allocate unboundedly.
 pub const MAX_GROUPS: u64 = 1 << 26;
 
+/// Safety cap on the number of alternating runs a wire bitfield may
+/// contain. The EDX frame cap already bounds this well below the limit
+/// (a run costs at least one varint byte), but decoding cost must stay
+/// bounded independently of whatever framing a caller used.
+pub const MAX_WIRE_RUNS: usize = 1 << 17;
+
 /// Which chunk groups of one object are present. Sorted, non-overlapping,
 /// non-adjacent ranges of group indices.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -95,6 +101,25 @@ impl GroupBits {
     pub fn add(&mut self, groups: Range<u64>) {
         if groups.start >= groups.end {
             return;
+        }
+        // Appending at or past the tail is the common case (bulk decode,
+        // sequential fetch); handle it in place instead of rebuilding.
+        match self.runs.last().map(|r| r.end) {
+            Some(tail_end) if groups.start == tail_end => {
+                if let Some(last) = self.runs.last_mut() {
+                    last.end = groups.end;
+                }
+                return;
+            }
+            Some(tail_end) if groups.start > tail_end => {
+                self.runs.push(groups);
+                return;
+            }
+            None => {
+                self.runs.push(groups);
+                return;
+            }
+            _ => {}
         }
         // Find all runs overlapping-or-adjacent and coalesce.
         let mut new = Vec::with_capacity(self.runs.len() + 1);
@@ -215,9 +240,13 @@ impl GroupBits {
         out
     }
 
-    /// Decode the wire form. Returns `None` on malformed input or if it
-    /// would exceed [`MAX_GROUPS`].
+    /// Decode the wire form. Returns `None` on malformed input, if it
+    /// would exceed [`MAX_GROUPS`], or if it has more than
+    /// [`MAX_WIRE_RUNS`] runs.
     pub fn from_wire(runs: &[u64]) -> Option<Self> {
+        if runs.len() > MAX_WIRE_RUNS {
+            return None;
+        }
         let mut s = Self::new();
         let mut cursor: u64 = 0;
         let mut present = true; // first run counts present groups
@@ -227,9 +256,16 @@ impl GroupBits {
                 return None;
             }
             if present && run > 0 {
-                // Runs arrive sorted, so plain push keeps the invariant —
-                // but go through add() to coalesce zero-length gaps.
-                s.add(cursor..end);
+                // Runs arrive sorted and the cursor only moves forward, so
+                // append; a zero-length absent run leaves this run adjacent
+                // to the previous one, which has to coalesce.
+                if s.runs.last().map(|r| r.end) == Some(cursor) {
+                    if let Some(last) = s.runs.last_mut() {
+                        last.end = end;
+                    }
+                } else {
+                    s.runs.push(cursor..end);
+                }
             }
             cursor = end;
             present = !present;
@@ -341,6 +377,42 @@ mod tests {
         assert_eq!(GroupBits::from_wire(&[u64::MAX, 2]), None);
         assert_eq!(GroupBits::from_wire(&[MAX_GROUPS + 1]), None);
         assert!(GroupBits::from_wire(&[MAX_GROUPS]).is_some());
+    }
+
+    #[test]
+    fn from_wire_handles_many_runs_and_caps_them() {
+        // A peer can pack tens of thousands of one-group runs into a
+        // single frame; decoding must stay linear.
+        let wire = vec![1u64; 60_000];
+        let b = GroupBits::from_wire(&wire).expect("in range");
+        assert_eq!(b.ranges().len(), 30_000);
+        assert_eq!(b.count(), 30_000);
+        assert_eq!(b.ranges()[0], 0..1);
+        assert_eq!(b.ranges()[29_999], 59_998..59_999);
+        assert_eq!(GroupBits::from_wire(&vec![0u64; MAX_WIRE_RUNS + 1]), None);
+    }
+
+    #[test]
+    fn from_wire_coalesces_zero_length_gaps() {
+        // present 2, absent 0, present 3 -> one run 0..5
+        assert_eq!(GroupBits::from_wire(&[2, 0, 3]), Some(bits(&[0..5])));
+        assert_eq!(GroupBits::from_wire(&[0, 2, 2, 0, 1]), Some(bits(&[2..5])));
+    }
+
+    #[test]
+    fn add_tail_fast_path_keeps_invariant() {
+        let mut b = GroupBits::new();
+        b.add(0..2);
+        b.add(2..4); // adjacent to the tail -> extend in place
+        assert_eq!(b.ranges(), &[0..4]);
+        b.add(6..8); // past the tail -> append
+        assert_eq!(b.ranges(), &[0..4, 6..8]);
+        b.add(4..6); // bridges both -> slow path
+        assert_eq!(b.ranges(), &[0..8]);
+        b.add(3..5); // fully inside -> no change
+        assert_eq!(b.ranges(), &[0..8]);
+        b.add(0..0); // empty -> no change
+        assert_eq!(b.ranges(), &[0..8]);
     }
 
     #[test]

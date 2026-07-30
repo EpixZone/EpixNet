@@ -53,6 +53,12 @@ const ACCEPT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// own incoming channel, so the tap adds no extra buffering.
 const INBOUND_TAP_DEPTH: usize = 16;
 
+/// The dial-back address an inbound OVERLAY link advertised in its Hello,
+/// written by the request tap and read by that connection's control provider.
+/// An overlay link is accepted under a blank placeholder address, so this is
+/// the only thing PEX can record the requester under.
+type DialbackSlot = Arc<Mutex<Option<PeerAddr>>>;
+
 /// The request name shown in the Stats page's `last recv` column.
 fn req_kind(req: &Req) -> &'static str {
     match req {
@@ -99,6 +105,7 @@ fn tap_inbound(
     mut incoming: tokio::sync::mpsc::Receiver<Incoming>,
     source: PeerAddr,
     on_inbound: Option<InboundHook>,
+    dialback: DialbackSlot,
 ) -> tokio::sync::mpsc::Receiver<Incoming> {
     let (tx, rx) = tokio::sync::mpsc::channel(INBOUND_TAP_DEPTH);
     tokio::spawn(async move {
@@ -106,7 +113,7 @@ fn tap_inbound(
             if let Req::Hello(hello) = &inc.req {
                 reg.activate();
                 reg.set_peer(handshake_info(&hello.version, &hello.node_pk));
-                adopt_dialback(&reg, hello);
+                adopt_dialback(&reg, hello, &source, &dialback);
                 if let Some(hook) = &on_inbound {
                     hook(&source);
                 }
@@ -126,11 +133,31 @@ fn tap_inbound(
 /// trusted the way PEX gossip is, but only when it is complete and
 /// wire-packable - `pack()` base32/length-validates onion and i2p hosts, so
 /// junk that could never round-trip peer exchange is never displayed.
-fn adopt_dialback(reg: &ConnHandle, hello: &Hello) {
+///
+/// The same claim also fills the connection's [`DialbackSlot`], but ONLY for an
+/// inbound overlay link accepted under a placeholder and only from a listen
+/// address of the SAME transport class. Without it a Tor/I2P-only seeder whose
+/// first contact is a `Req::Pex` can never be recorded as a peer: the
+/// placeholder it is served under is not an address. Clearnet keeps its
+/// socket-sourced address, which the peer asserts nothing about.
+fn adopt_dialback(
+    reg: &ConnHandle,
+    hello: &Hello,
+    source: &PeerAddr,
+    dialback: &DialbackSlot,
+) {
     if let Some(addr) =
         hello.listen.iter().find(|a| a.is_wellformed() && a.pack().is_some())
     {
         reg.set_addr(addr.clone());
+    }
+    if !source.is_overlay() || source.is_wellformed() {
+        return;
+    }
+    if let Some(addr) = hello.listen.iter().find(|a| {
+        a.scheme() == source.scheme() && a.is_wellformed() && a.pack().is_some()
+    }) {
+        *dialback.lock().expect("dialback") = Some(addr.clone());
     }
 }
 
@@ -253,6 +280,68 @@ fn store_quota() -> u64 {
         .unwrap_or(EDX_STORE_QUOTA_BYTES)
 }
 
+/// Drop a sparse record THIS call reserved when the fetch left it empty. The
+/// reserved size comes from the xite owner's content.json, so a record nobody
+/// ever filled is a phantom index row plus a sparse/.obao file pair. A record
+/// that already existed, or that took any groups, is kept.
+///
+/// Only ever called from [`ObjClaim::drop`], which guarantees no other fetch of
+/// the same object is still filling it.
+fn drop_if_unfilled(store: &Store, id: ObjId, fresh: bool) {
+    if !fresh {
+        return;
+    }
+    if store.present_bits(id).map(|b| b.is_empty()).unwrap_or(false) {
+        let _ = store.remove(id);
+    }
+}
+
+/// The in-flight claims on an object, by count, plus whether any claim was the
+/// one that created the record. An entry is erased when its count reaches zero,
+/// so the map is bounded by the number of concurrent fetches.
+type ObjClaims = Arc<Mutex<HashMap<ObjId, (usize, bool)>>>;
+
+/// A live claim on an object being filled, held for the whole fetch. While any
+/// claim on an id exists nobody removes that id's record; the LAST claim to go
+/// away removes it if the object is still empty and some claim created it.
+///
+/// Needed because fetches of one object overlap by design: `maybe_warm_moov`
+/// spawns a background read-ahead BEFORE the foreground range fetch of the same
+/// file, and a media element issues concurrent Range requests with no
+/// per-object serialization. Without the claim the first one to give up
+/// unlinked the sparse pair out from under the others, so an in-flight
+/// `write_slice` started failing and a range that would have succeeded 404'd.
+struct ObjClaim {
+    claims: ObjClaims,
+    store: Arc<Store>,
+    id: ObjId,
+}
+
+impl Drop for ObjClaim {
+    fn drop(&mut self) {
+        // A poisoned lock only means another fetch panicked: skipping the
+        // cleanup leaves one empty record behind, panicking here would abort.
+        let Ok(mut claims) = self.claims.lock() else { return };
+        let fresh = match claims.get_mut(&self.id) {
+            Some(slot) => {
+                slot.0 -= 1;
+                if slot.0 > 0 {
+                    return; // another fetch is still filling this object
+                }
+                slot.1
+            }
+            None => return,
+        };
+        claims.remove(&self.id);
+        // Removed while still holding the claims lock, which closes the window
+        // between `Store::remove` committing the record delete and unlinking
+        // the files: a fetch about to claim this object blocks here instead of
+        // slipping its `ensure_sparse` into that gap and having the files it
+        // just created deleted underneath it.
+        drop_if_unfilled(&self.store, self.id, fresh);
+    }
+}
+
 /// Assumed total network shard bytes, used to turn a volunteer's byte quota
 /// into a keyspace fraction for the responsibility predicate. Nothing on
 /// chain or in the DHT sources this in the foundation (discovery is
@@ -365,6 +454,42 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Cap on one signed body served over `GetSigned`. Deliberately the SAME value
+/// as the client's reassembly cap in `epix_edx::fetch`, so anything a peer will
+/// accept is something we will serve: a lower serve cap makes a xite whose
+/// content.json (or grow-only merge file) crossed it uncloneable over EDX, the
+/// exact failure `serve_signed`'s frame chunking exists to avoid. The read
+/// stops at the cap, so a file that grows under us is refused rather than read
+/// whole, and a peer still cannot name something huge and pick our allocation
+/// size.
+const MAX_SIGNED_BYTES: u64 = epix_edx::fetch::MAX_SIGNED_BYTES as u64;
+
+/// Bounds on a peer-supplied inner_path. One frame carries ~64 KB, and a path
+/// that is not a content.json goes on to the merge-file check, which walks the
+/// path one segment at a time doing a filesystem read per segment - quadratic
+/// in the path length. A real inner_path is a handful of short segments, so
+/// capping the shape here keeps that walk from being a remote CPU lever.
+const MAX_INNER_PATH_BYTES: usize = 1024;
+const MAX_INNER_PATH_SEGMENTS: usize = 16;
+
+/// True for a well-formed relative inner_path: no absolute path, no `..`, no
+/// empty or `.` segment, no backslash, and bounded in length and depth.
+/// `XiteStorage::path` rejects the same shapes; checking here keeps a crafted
+/// path from reaching the filesystem or the per-segment merge-file walk.
+fn safe_inner_path(inner_path: &str) -> bool {
+    !inner_path.is_empty()
+        && inner_path.len() <= MAX_INNER_PATH_BYTES
+        && !inner_path.contains('\\')
+        && inner_path.split('/').count() <= MAX_INNER_PATH_SEGMENTS
+        && inner_path.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// True for a signed manifest: the root content.json or a child
+/// `<dir>/content.json` (the segment form, so `evilcontent.json` is not one).
+fn is_content_json(inner_path: &str) -> bool {
+    inner_path == "content.json" || inner_path.ends_with("/content.json")
+}
+
 /// Backs epix-edx's signed-content requests with the node's live xite
 /// registry (raw content.json bytes, listModified, inbound update apply).
 struct AppStateProvider {
@@ -374,7 +499,37 @@ struct AppStateProvider {
 #[async_trait::async_trait]
 impl SignedProvider for AppStateProvider {
     async fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>> {
-        self.state.read_file(xite, inner_path).await
+        // Serve signed content only: a content.json, or a merge file the
+        // governing content.json declares (the record files a forum-style xite
+        // propagates this way). Without the gate a peer names ANY hosted file,
+        // so one request could point at a gigabyte of media and we would read
+        // it whole into memory - a remote allocation lever.
+        if !safe_inner_path(inner_path) {
+            return None;
+        }
+        if !is_content_json(inner_path)
+            && !self.state.is_declared_merge_file(xite, inner_path).await
+        {
+            return None;
+        }
+        let root = self.state.xite_root(xite).await?;
+        let path = epix_xite::XiteStorage::new(root).path(inner_path).ok()?;
+        // Bounded, and off the async worker: the body is small, but the read
+        // is a blocking syscall and must not run on a runtime thread.
+        tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+            use std::io::Read;
+            // One byte past the cap, so an oversize file is detected without
+            // ever allocating it.
+            let mut f = std::fs::File::open(&path).ok()?.take(MAX_SIGNED_BYTES + 1);
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).ok()?;
+            if buf.len() as u64 > MAX_SIGNED_BYTES {
+                return None; // past the cap: refuse instead of shipping it
+            }
+            Some(buf)
+        })
+        .await
+        .ok()?
     }
 
     async fn list_signed(&self, xite: &str, since: u64) -> Vec<(String, u64, u64)> {
@@ -424,6 +579,17 @@ impl SignedProvider for AppStateProvider {
         let diffs = decode_edx_diffs(diffs);
         let sender_peers: Vec<PeerAddr> =
             sender_peers.iter().filter_map(|s| PeerAddr::parse(s).ok()).take(5).collect();
+        // No `sender`: `SignedProvider` carries no per-connection address, and
+        // the only addresses we have are the publisher's declared ones, which
+        // go in as `sender_peers`. A push whose signed body did not fit one
+        // frame arrives EMPTY and is fetched back over GetSigned from those,
+        // so nothing is lost by leaving `sender` empty. Passing the first one
+        // as `sender` instead would put a peer-supplied, unverified address at
+        // the HEAD of the fetch peer list, ahead of the is-own-peer and
+        // dialable-network filters that `sender_peers` goes through - a peer
+        // could then name OUR address and have us dial ourselves for every
+        // file the push needs.
+        let sender = None;
         match self
             .state
             .apply_inbound_update(
@@ -431,7 +597,7 @@ impl SignedProvider for AppStateProvider {
                 inner_path,
                 Some(signed.to_vec()),
                 Some(modified),
-                None,
+                sender,
                 diffs,
                 sender_peers,
             )
@@ -484,13 +650,35 @@ struct RuntimeControlProvider {
     handles: ControlHandles,
     /// Where this connection came from, as the accept loop saw it.
     peer: PeerAddr,
+    /// Filled by the Hello tap for an inbound OVERLAY link, whose accept-time
+    /// `peer` is a blank placeholder (see [`adopt_dialback`]). Used only by
+    /// `pex`; `kad`/`announce` keep the socket-sourced address.
+    dialback: DialbackSlot,
 }
+
+/// Cap on the hints one `UpdatesSince` reply carries. The hint log holds up to
+/// 10k entries and any peer can fill it with a cheap `Req::Update`, so an
+/// uncapped reply lets a ~12-byte request pin megabytes per in-flight serve.
+/// The cursor pages: a poller stores the head it got and asks again next
+/// interval, so a lagging peer walks the log instead of pulling it whole.
+const MAX_UPDATES_PER_REPLY: usize = 512;
 
 #[async_trait::async_trait]
 impl ControlProvider for RuntimeControlProvider {
     async fn updates_since(&self, after: u64) -> (Vec<(String, i64)>, u64) {
         let (hints, head) = self.handles.prop.lock().await.since(after);
-        (hints.into_iter().map(|h| (h.xite, h.modified)).collect(), head)
+        // A truncated reply must report the seq of the last hint actually
+        // sent, or the poller would skip the rest forever. The log's seqs are
+        // contiguous and `head` is the newest entry's seq, so dropping N from
+        // the tail moves the reported head back by exactly N.
+        let dropped = hints.len().saturating_sub(MAX_UPDATES_PER_REPLY);
+        let head = head.saturating_sub(dropped as u64);
+        let out = hints
+            .into_iter()
+            .take(MAX_UPDATES_PER_REPLY)
+            .map(|h| (h.xite, h.modified))
+            .collect();
+        (out, head)
     }
 
     async fn pex(
@@ -500,7 +688,14 @@ impl ControlProvider for RuntimeControlProvider {
         have: &[PeerAddr],
         _from: &PeerIdentity,
     ) -> Vec<PeerAddr> {
-        self.state.pex_exchange(xite, need as usize, have.to_vec(), &self.peer).await
+        // An inbound overlay link's accept-time address is a placeholder that
+        // no peer table can hold; the Hello's advertised listen address is the
+        // only recordable identity it has.
+        let from = {
+            let slot = self.dialback.lock().expect("dialback");
+            slot.clone().unwrap_or_else(|| self.peer.clone())
+        };
+        self.state.pex_exchange(xite, need as usize, have.to_vec(), &from).await
     }
 
     async fn trackers(&self) -> Vec<String> {
@@ -538,7 +733,8 @@ pub fn edx_hook(
         let privatekey = privatekey.clone();
         let choker = choker.clone();
         let on_inbound = on_inbound.clone();
-        let control = control_provider(&state, &control, peer.clone());
+        let dialback: DialbackSlot = Arc::new(Mutex::new(None));
+        let control = control_provider(&state, &control, peer.clone(), dialback.clone());
         Box::pin(async move {
             let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(stream);
             let handshake = tokio::time::timeout(
@@ -550,7 +746,7 @@ pub fn edx_hook(
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
-            let incoming = tap_inbound(reg, l.incoming, peer, on_inbound);
+            let incoming = tap_inbound(reg, l.incoming, peer, on_inbound, dialback);
             serve(l.conn, incoming, Arc::new(ctx), Some(l.handshake_hash)).await;
         })
     })
@@ -561,8 +757,14 @@ fn control_provider(
     state: &Arc<AppState>,
     handles: &ControlHandles,
     peer: PeerAddr,
+    dialback: DialbackSlot,
 ) -> Arc<dyn ControlProvider> {
-    Arc::new(RuntimeControlProvider { state: state.clone(), handles: handles.clone(), peer })
+    Arc::new(RuntimeControlProvider {
+        state: state.clone(),
+        handles: handles.clone(),
+        peer,
+        dialback,
+    })
 }
 
 /// A serve context that answers the control plane too (so it advertises
@@ -597,7 +799,8 @@ pub fn edx_hook_overlay(
         let provider = provider.clone();
         let privatekey = privatekey.clone();
         let choker = choker.clone();
-        let control = control_provider(&state, &control, peer.clone());
+        let dialback: DialbackSlot = Arc::new(Mutex::new(None));
+        let control = control_provider(&state, &control, peer.clone(), dialback.clone());
         Box::pin(async move {
             let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(stream);
             let handshake = tokio::time::timeout(
@@ -611,7 +814,7 @@ pub fn edx_hook_overlay(
             }
             // No inbound hook on overlays: reaching us over Tor/I2P/mesh says
             // nothing about whether our clearnet port is open.
-            let incoming = tap_inbound(reg, incoming, peer, None);
+            let incoming = tap_inbound(reg, incoming, peer, None, dialback);
             serve(conn, incoming, Arc::new(ctx), None).await;
         })
     })
@@ -692,17 +895,41 @@ pub async fn node_key(state: &Arc<AppState>) -> String {
         }
     }
     let key = epix_crypt::new_seed();
-    match std::fs::write(&path, &key) {
-        Ok(()) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
-        Err(e) => state.log("WARN", format!("could not persist EDX node key: {e}")).await,
+    if let Err(e) = write_key_file(&path, &key) {
+        state.log("WARN", format!("could not persist EDX node key: {e}")).await;
     }
     key
+}
+
+/// Write the node key with owner-only permissions FROM CREATION. A
+/// write-then-chmod leaves this node's wire identity readable by every local
+/// user for the window in between, and permanently if the chmod fails.
+fn write_key_file(path: &std::path::Path, key: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    // `mode` only applies when the file is created, so an existing file (a
+    // leftover from a partial write) still needs the explicit chmod. Best
+    // effort: a data dir on a filesystem with no unix permissions
+    // (exFAT/FAT32/CIFS - a portable install, a USB data dir, a network home)
+    // fails this call, and failing the whole write there would leave the node
+    // with no persisted identity at all - a new wire identity, and lost
+    // reciprocity standing, on every restart - to fix permissions that
+    // filesystem cannot represent anyway. The create-time mode above is the
+    // real guarantee on a filesystem that has one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(key.as_bytes())?;
+    f.sync_all()
 }
 
 /// Get (initializing on first call) the shared EDX serve context. Returns None
@@ -819,6 +1046,9 @@ struct RuntimeEdxFetcher {
     /// reuses the same links instead of redialing. The serve itself always
     /// builds fresh peers (correctness); this only warms the background path.
     peer_cache: Arc<Mutex<HashMap<ObjId, CachedPeers>>>,
+    /// Objects with a fetch in flight (see [`ObjClaim`]). Arc-shared like the
+    /// rest so every clone of the fetcher sees the same claims.
+    claims: ObjClaims,
 }
 
 /// Per-file streaming state guarding read-ahead against firing an unbounded
@@ -861,7 +1091,35 @@ impl RuntimeEdxFetcher {
             control_pool: Arc::default(),
             streaming: Arc::default(),
             peer_cache: Arc::default(),
+            claims: Arc::default(),
         }
+    }
+
+    /// Claim `id` for the duration of this fetch and make sure its sparse
+    /// record exists. The claim is what makes the "drop the record again if
+    /// nothing lands" cleanup safe: it only runs once every concurrent fetch of
+    /// the same object is done (see [`ObjClaim`]). Callers hold the returned
+    /// guard until they are finished with the object.
+    fn claim_object(
+        &self,
+        store: &Arc<Store>,
+        id: ObjId,
+        ns: Ns,
+        size: u64,
+        now: u64,
+    ) -> std::io::Result<ObjClaim> {
+        let claim = {
+            let mut claims = self.claims.lock().expect("claims");
+            // Read under the lock: a removal by a departing claim also runs
+            // under it, so "did the record exist" cannot go stale here.
+            let fresh = !store.contains(id).unwrap_or(false);
+            let slot = claims.entry(id).or_insert((0, false));
+            slot.0 += 1;
+            slot.1 |= fresh;
+            ObjClaim { claims: self.claims.clone(), store: store.clone(), id }
+        };
+        store.ensure_sparse(id, ns, size, now)?;
+        Ok(claim)
     }
 
     /// Dial `peer`, bring up an EDX link past the Hello gate, and return the
@@ -976,6 +1234,17 @@ impl RuntimeEdxFetcher {
         shard: epix_blob::manifest::ShardEntry,
         store: &Arc<Store>,
     ) -> Result<bool, String> {
+        // Only salted-convergent (mode 0) shards are fetchable. A mode-1
+        // (random-key) shard is keyed by a per-file random key and
+        // `ShardEntry` carries no wrapped copy of it, so the salt is not the
+        // key material and every chunk would fail its AEAD tag. Refuse the
+        // file instead of decrypting with the wrong material.
+        if shard.mode != 0 {
+            return Err(format!(
+                "shard mode {} not supported (random-key shards need per-recipient key wrapping)",
+                shard.mode
+            ));
+        }
         let salt = epix_blob::manifest::edx_salt(content)
             .ok_or("no edx_salt (missing viewing material)")?;
         let now = now_secs();
@@ -990,7 +1259,6 @@ impl RuntimeEdxFetcher {
             if store.is_complete(id).unwrap_or(false) {
                 continue;
             }
-            store.ensure_sparse(id, Ns::Shard, csize, now).map_err(|e| e.to_string())?;
             let mut handles: Vec<PeerHandle> = Vec::new();
             let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
             for peer in &peers {
@@ -1008,14 +1276,20 @@ impl RuntimeEdxFetcher {
             if handles.is_empty() {
                 return Err(format!("no EDX peer holds shard {id}"));
             }
+            // Reserve only now that a holder is known, and drop the record
+            // again if nothing lands (same reason as `pull_shard_chunk`). The
+            // claim defers that drop until any concurrent fetch of the same
+            // shard is done, so it never unlinks a record still being filled.
+            let _claim =
+                self.claim_object(store, id, Ns::Shard, csize, now).map_err(|e| e.to_string())?;
             let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
             let mut swarm = Swarm::new(store.clone(), id, csize);
-            let report = swarm
-                .fetch(&needed, &handles, Deadline::background(), now)
-                .await
-                .map_err(|e| e.to_string())?;
+            let report = match swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+                Ok(report) => report,
+                Err(e) => return Err(e.to_string()),
+            };
             self.credit(&report, &node_pks, now);
-            if !store.is_complete(id).map_err(|e| e.to_string())? {
+            if !store.is_complete(id).unwrap_or(false) {
                 return Err(format!("shard {id} did not complete"));
             }
         }
@@ -1030,11 +1304,7 @@ impl RuntimeEdxFetcher {
                 len: c.len,
             })
             .collect();
-        let mode = if shard.mode == 1 {
-            epix_selfenc::Mode::RandomKey
-        } else {
-            epix_selfenc::Mode::SaltedConvergent
-        };
+        let mode = epix_selfenc::Mode::SaltedConvergent;
         let plaintext = epix_selfenc::decrypt(mode, &chunks, &salt, |addr| {
             store.read_bytes(epix_blob::ObjId(*addr), now).ok()
         })
@@ -1378,10 +1648,15 @@ impl RuntimeEdxFetcher {
         if needed.is_empty() {
             return; // already warm
         }
-        if store.ensure_sparse(id, Ns::Plain, size, now).is_err() {
-            return;
-        }
         let Ok((handles, node_pks)) = self.peers_for(address, id).await else { return };
+        // Reserve only once a holder is known: reserving before the dial lets
+        // an unobtainable owner-declared size sit in the store for bytes that
+        // never arrive. This runs concurrently with the serve of the same
+        // object by design, so the claim is what keeps either side from
+        // removing a record the other is still filling.
+        let Ok(_claim) = self.claim_object(&store, id, Ns::Plain, size, now) else {
+            return;
+        };
         let mut swarm = Swarm::new(store.clone(), id, size);
         if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
             self.credit(&report, &node_pks, now);
@@ -1570,9 +1845,6 @@ impl RuntimeEdxFetcher {
         if store.is_complete(id).unwrap_or(false) {
             return true;
         }
-        if store.ensure_sparse(id, Ns::Plain, size, now).is_err() {
-            return false;
-        }
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for p in session {
@@ -1593,6 +1865,11 @@ impl RuntimeEdxFetcher {
         if handles.is_empty() {
             return false;
         }
+        // Reserve only now that a session peer holds it, and drop the record
+        // again if nothing lands (see `ObjClaim`).
+        let Ok(_claim) = self.claim_object(store, id, Ns::Plain, size, now) else {
+            return false;
+        };
         let Ok(needed) = needed_groups(store, id, size) else { return false };
         let mut swarm = Swarm::new(store.clone(), id, size);
         if let Ok(report) = swarm.fetch(&needed, &handles, deadline, now).await {
@@ -1781,15 +2058,20 @@ impl EdxFetcher for RuntimeEdxFetcher {
         }
 
         let (handles, node_pks) = self.build_peers(address, id).await?;
-        store.ensure_sparse(id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
+        // Reserve the sparse record only now that a peer can serve it, and drop
+        // it again if nothing lands (see `ObjClaim`): a manifest entry a
+        // visitor touches once must not leave an index row and a sparse/.obao
+        // file pair behind forever.
+        let _claim =
+            self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
         let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
         let mut swarm = Swarm::new(store.clone(), id, size);
-        let report = swarm
-            .fetch(&needed, &handles, Deadline::background(), now)
-            .await
-            .map_err(|e| e.to_string())?;
+        let report = match swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+            Ok(report) => report,
+            Err(e) => return Err(e.to_string()),
+        };
         self.credit(&report, &node_pks, now);
-        if !store.is_complete(id).map_err(|e| e.to_string())? {
+        if !store.is_complete(id).unwrap_or(false) {
             return Err("fetch did not complete".into());
         }
 
@@ -1869,7 +2151,6 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return Ok(None);
         };
         let now = now_secs();
-        store.ensure_sparse(id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
         let end = start.saturating_add(len).min(size);
         if end <= start {
             return Ok(Some(Vec::new()));
@@ -1889,19 +2170,28 @@ impl EdxFetcher for RuntimeEdxFetcher {
             bytes
         } else {
             let (handles, node_pks) = self.build_peers(address, id).await?;
+            // Reserve the sparse record only now that a peer can serve it, and
+            // drop it again if nothing lands (same reason as pull_shard_chunk):
+            // reserving before the dial lets an owner-declared size sit in the
+            // store for bytes that never arrive. The claim holds that cleanup
+            // back while the moov warm-up spawned above, or a second concurrent
+            // Range request on the same media element, is still filling it.
+            let _claim =
+                self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
             // Warm the peer cache so the read-ahead reuses these dialed links.
             self.cache_peers(id, &handles, &node_pks);
             let groups = epix_blob::bitfield::groups_for_bytes(&served);
             let mut needed = epix_blob::bitfield::GroupBits::new();
             needed.add(groups.start..groups.end);
             let mut swarm = Swarm::new(store.clone(), id, size);
-            let report = swarm
-                .fetch(&needed, &handles, Deadline::tight(), now)
-                .await
-                .map_err(|e| e.to_string())?;
-            self.credit(&report, &node_pks, now);
-            let bytes =
-                store.read_range(id, start, end - start, now).map_err(|e| e.to_string())?;
+            let got = match swarm.fetch(&needed, &handles, Deadline::tight(), now).await {
+                Ok(report) => {
+                    self.credit(&report, &node_pks, now);
+                    store.read_range(id, start, end - start, now).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let bytes = got?;
             let _ = store.enforce_quota(store_quota());
             bytes
         };
@@ -2219,6 +2509,116 @@ mod tests {
         std::env::set_var("EPIX_EDX_KILLSWITCH_TEST", "1");
         assert!(env_on("EPIX_EDX_KILLSWITCH_TEST"), "1 stays on");
         std::env::remove_var("EPIX_EDX_KILLSWITCH_TEST");
+    }
+
+    /// GetSigned serves signed content only: the content.json files and the
+    /// merge files a xite declares. A peer naming a hosted media file, a
+    /// traversal path or an absolute path gets nothing, so it cannot pick the
+    /// size of the buffer we allocate for it.
+    #[tokio::test]
+    async fn get_signed_serves_only_signed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let content =
+            serde_json::to_vec(&serde_json::json!({ "files_merged": { "data/posts.json": {} } }))
+                .unwrap();
+        storage.write("content.json", &content).unwrap();
+        storage.write("data/users/alice/content.json", b"{}").unwrap();
+        storage.write("data/posts.json", b"[]").unwrap();
+        storage.write("movie.bin", &vec![7u8; 64 * 1024]).unwrap();
+        // Really on disk, so refusing it can only come from the segment-form
+        // check - not from an ENOENT that would refuse it either way.
+        storage.write("evilcontent.json", b"leak").unwrap();
+
+        let address = "1SignedPathTest";
+        let state = AppState::new("provider");
+        state
+            .add_xite(address, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let p = AppStateProvider { state };
+
+        assert_eq!(p.get_signed(address, "content.json").await, Some(content));
+        assert_eq!(
+            p.get_signed(address, "data/users/alice/content.json").await,
+            Some(b"{}".to_vec()),
+            "a child content.json is signed content too"
+        );
+        assert_eq!(
+            p.get_signed(address, "data/posts.json").await,
+            Some(b"[]".to_vec()),
+            "a declared merge file still propagates"
+        );
+        assert!(p.get_signed(address, "movie.bin").await.is_none(), "hosted media is not signed");
+        assert!(p.get_signed(address, "../content.json").await.is_none(), "no traversal");
+        assert!(p.get_signed(address, "/etc/passwd").await.is_none(), "no absolute path");
+        assert!(
+            p.get_signed(address, "evilcontent.json").await.is_none(),
+            "a file that merely ENDS in content.json is not signed content"
+        );
+    }
+
+    /// A peer-supplied inner_path is bounded in length AND depth before it can
+    /// reach the merge-file check, which walks the path one segment at a time
+    /// with a filesystem read per segment. One frame carries ~64 KB, so without
+    /// the bound a single request buys thousands of `open()` calls and
+    /// quadratic byte copying on a runtime worker.
+    #[test]
+    fn safe_inner_path_bounds_length_and_depth() {
+        assert!(safe_inner_path("content.json"));
+        assert!(safe_inner_path("data/users/alice/data.json"), "a real inner_path still passes");
+        assert!(
+            !safe_inner_path(&vec!["a"; MAX_INNER_PATH_SEGMENTS + 1].join("/")),
+            "one segment past the depth cap is refused"
+        );
+        assert!(
+            !safe_inner_path(&format!("{}/f.json", "x".repeat(MAX_INNER_PATH_BYTES))),
+            "past the byte cap is refused"
+        );
+        assert!(!safe_inner_path(&"a/".repeat(32_000)), "a frame-sized path is refused");
+        assert!(!safe_inner_path("../content.json"), "no traversal");
+        assert!(!safe_inner_path("/etc/passwd"), "no absolute path");
+    }
+
+    /// A signed body past the cap is refused instead of being read whole into
+    /// memory.
+    #[tokio::test]
+    async fn get_signed_refuses_a_body_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("content.json", &vec![b'x'; MAX_SIGNED_BYTES as usize + 1]).unwrap();
+
+        let address = "1CapTest";
+        let state = AppState::new("provider");
+        state
+            .add_xite(address, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let p = AppStateProvider { state };
+        assert!(p.get_signed(address, "content.json").await.is_none(), "over the cap: refused");
+    }
+
+    /// The serve cap must not sit below the client's reassembly cap (8 MiB in
+    /// `epix_edx::fetch`). A body between the two is something every peer would
+    /// accept and nobody would serve, so `edx_fetch_signed` fails on every peer
+    /// and the xite becomes uncloneable over EDX - the exact failure
+    /// `serve_signed`'s frame chunking exists to avoid.
+    #[tokio::test]
+    async fn get_signed_serves_a_body_the_client_would_still_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let body = vec![b'x'; 5 * 1024 * 1024];
+        storage.write("content.json", &body).unwrap();
+
+        let address = "1BigContentTest";
+        let state = AppState::new("provider");
+        state
+            .add_xite(address, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let p = AppStateProvider { state };
+        assert_eq!(
+            p.get_signed(address, "content.json").await.map(|b| b.len()),
+            Some(body.len()),
+            "a 5 MiB content.json is under the client's cap, so it must be servable"
+        );
     }
 
     /// Client-side no-op provider: `client_hello` only needs our key.
@@ -3582,7 +3982,7 @@ mod tests {
             let peer = peer.clone();
             async move {
                 let (conn, incoming) = epix_edx::link::accept_overlay(stream).await.unwrap();
-                let incoming = tap_inbound(reg, incoming, peer, None);
+                let incoming = tap_inbound(reg, incoming, peer, None, Arc::new(Mutex::new(None)));
                 serve(conn, incoming, Arc::new(ctx), None).await
             }
         });
@@ -3665,4 +4065,344 @@ mod tests {
         );
     }
 
+    /// A push whose signed content.json did not fit one frame arrives with an
+    /// EMPTY body and must be pulled back over GetSigned. The EDX
+    /// `SignedProvider` has no per-connection address, so the publisher's
+    /// declared dial-back address is the only sender the fetch-back can use;
+    /// without it every body-less push fails with "Can't download updated file".
+    #[tokio::test]
+    async fn a_body_less_update_is_fetched_back_from_the_publisher() {
+        use epix_ui::state::XiteEntry;
+
+        let site_pk = epix_crypt::new_seed();
+        let site_addr = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let user_pk = epix_crypt::new_seed();
+        let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let user_dir = format!("data/users/{user_addr}");
+        let child_path = format!("{user_dir}/content.json");
+
+        // The rules the pushed child verifies against, on both nodes.
+        let parent = serde_json::json!({
+            "address": site_addr,
+            "inner_path": "data/users/content.json",
+            "user_contents": {
+                "cert_signers": {},
+                "permissions": {},
+                "permission_rules": { ".*": { "max_size": 100000 } },
+            },
+        });
+        let parent_bytes = serde_json::to_vec(&parent).unwrap();
+        let data: &[u8] = br#"{ "posts": [] }"#;
+        let child = |modified: i64| {
+            let mut c = serde_json::json!({
+                "address": site_addr,
+                "inner_path": child_path,
+                "modified": modified,
+                "files": {
+                    "data.json": { "size": data.len(), "sha512": XiteStorage::hash_bytes(data) }
+                },
+            });
+            epix_content::sign(&mut c, &user_pk).unwrap();
+            serde_json::to_vec(&c).unwrap()
+        };
+
+        // Publisher P: an EDX server that serves v2 of the child over GetSigned.
+        let p_dir = tempfile::tempdir().unwrap();
+        let p_storage = XiteStorage::new(p_dir.path());
+        p_storage.write("data/users/content.json", &parent_bytes).unwrap();
+        p_storage.write(&child_path, &child(2000)).unwrap();
+        let state_p = AppState::new("publisher");
+        state_p
+            .add_xite(&site_addr, XiteEntry { storage: XiteStorage::new(p_dir.path()), content: None })
+            .await;
+        let p_store_dir = tempfile::tempdir().unwrap();
+        let p_store = Arc::new(Store::open(p_store_dir.path()).unwrap());
+        state_p.set_edx_store(p_store.clone()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p_addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state_p.clone(),
+            p_store,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            false,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        std::mem::forget(p_dir);
+        std::mem::forget(p_store_dir);
+
+        // Receiver R: holds v1 of the same child, and can dial P.
+        let r_dir = tempfile::tempdir().unwrap();
+        let r_storage = XiteStorage::new(r_dir.path());
+        r_storage.write("data/users/content.json", &parent_bytes).unwrap();
+        r_storage.write(&child_path, &child(1000)).unwrap();
+        r_storage.write(&format!("{user_dir}/data.json"), data).unwrap();
+        let root = serde_json::json!({ "address": site_addr, "modified": 1.0, "files": {} });
+        let state_r = AppState::new("receiver");
+        state_r
+            .add_xite(
+                &site_addr,
+                XiteEntry { storage: XiteStorage::new(r_dir.path()), content: Some(root) },
+            )
+            .await;
+        state_r.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let r_store_dir = tempfile::tempdir().unwrap();
+        state_r.set_edx_store(Arc::new(Store::open(r_store_dir.path()).unwrap())).await;
+        state_r
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_r.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
+            .await;
+        std::mem::forget(r_dir);
+        std::mem::forget(r_store_dir);
+
+        // The push carries no body, only the publisher's dial-back addresses.
+        // The FIRST one is dead (a bound-then-released port, so the dial is
+        // refused at once): a publisher declares every address it might be
+        // reachable at and only some of them work, so the refetch has to walk
+        // past a dead entry instead of trying the head of the list alone.
+        let dead = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let provider = AppStateProvider { state: state_r.clone() };
+        let applied = provider
+            .apply_update(
+                &site_addr,
+                &child_path,
+                &[],
+                &[],
+                2000.0,
+                &[],
+                &[PeerAddr::Ip(dead).to_string(), PeerAddr::Ip(p_addr).to_string()],
+            )
+            .await;
+        assert_eq!(applied, Ok(true), "the body-less push was fetched back and applied");
+    }
+
+    /// `UpdatesSince` must not hand a peer the whole hint log in one reply: the
+    /// log is peer-fillable, so the reply is capped and the cursor pages. The
+    /// reported head has to stop at the last hint actually sent, or the poller
+    /// would skip everything that was trimmed.
+    #[tokio::test]
+    async fn updates_since_caps_its_reply_and_pages_the_cursor() {
+        let prop = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
+        {
+            let mut store = prop.lock().await;
+            for i in 0..(MAX_UPDATES_PER_REPLY * 2) {
+                store.record(&format!("xite{i}"), i as i64);
+            }
+        }
+        let mut handles = ControlHandles::detached();
+        handles.prop = prop.clone();
+        let provider = RuntimeControlProvider {
+            state: AppState::new("node"),
+            handles,
+            peer: PeerAddr::parse("9.9.9.9:26552").unwrap(),
+            dialback: Arc::new(Mutex::new(None)),
+        };
+
+        let (first, head) = provider.updates_since(0).await;
+        assert_eq!(first.len(), MAX_UPDATES_PER_REPLY, "the reply is capped");
+        assert_eq!(first[0].0, "xite0");
+        assert_eq!(
+            first.last().unwrap().0,
+            format!("xite{}", MAX_UPDATES_PER_REPLY - 1),
+            "the cap trims the NEWEST entries, not the oldest"
+        );
+        assert_eq!(head, MAX_UPDATES_PER_REPLY as u64, "the cursor stops at the last hint sent");
+
+        // The poller re-asks from the head it got: nothing is skipped.
+        let (second, head2) = provider.updates_since(head).await;
+        assert_eq!(second.len(), MAX_UPDATES_PER_REPLY);
+        assert_eq!(second[0].0, format!("xite{}", MAX_UPDATES_PER_REPLY));
+        assert_eq!(head2, (MAX_UPDATES_PER_REPLY * 2) as u64, "the second page reaches the head");
+    }
+
+    /// An inbound overlay link is accepted under a blank placeholder address.
+    /// Its Hello's advertised onion address is the only identity PEX can record
+    /// it under, so a Tor-only seeder whose first contact is a Pex must still
+    /// land in the xite's peer table.
+    #[tokio::test]
+    async fn an_inbound_overlay_pex_records_the_requesters_advertised_address() {
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        let state_b = AppState::new("overlay-seeder");
+        state_b
+            .add_xite(
+                &address,
+                XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None },
+            )
+            .await;
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+
+        // Exactly what an inbound Tor link looks like to the accept loop.
+        let placeholder = PeerAddr::Onion { host: String::new(), port: 0 };
+        let advertised = PeerAddr::Onion { host: "a".repeat(56), port: 26552 };
+        assert!(advertised.pack().is_some(), "the advertised address is wire-packable");
+
+        let (srv_io, cli_io) = tokio::io::duplex(64 * 1024);
+        let hook = edx_hook_overlay(
+            state_b.clone(),
+            store_b,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            false,
+        );
+        tokio::spawn(hook(placeholder, Box::pin(srv_io)));
+
+        let (conn, _incoming) = epix_edx::link::dial_overlay(Box::pin(cli_io)).await.unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let cstore = Arc::new(Store::open(cdir.path()).unwrap());
+        std::mem::forget(cdir);
+        let cctx = ServeCtx::new(cstore, Arc::new(NoProvider), epix_crypt::new_seed());
+        client_hello(&conn, &cctx, vec![advertised.clone()], None).await.unwrap();
+
+        match conn
+            .request(Req::Pex { xite: address.clone(), need: 5, peers: Vec::new() })
+            .await
+            .unwrap()
+        {
+            epix_edx::msg::Resp::Peers { .. } => {}
+            other => panic!("expected Peers, got {other:?}"),
+        }
+
+        let known = state_b.pex_peers(&address, 10, &HashSet::new()).await;
+        assert!(
+            known.contains(&advertised),
+            "the overlay requester must be recorded under its advertised address, got {known:?}"
+        );
+    }
+
+    /// A range fetch that finds no holder must leave NO record behind: the size
+    /// is the xite owner's unvalidated claim, so a record nothing ever fills is
+    /// a phantom object the store carries forever.
+    #[tokio::test]
+    async fn a_range_fetch_with_no_holder_leaves_no_record() {
+        let (address, content_bytes, content, _movie, _addr, _pk) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: XiteStorage::new(a_dir.path()),
+                    content: Some(content.clone()),
+                },
+            )
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        state_a.set_edx_store(a_store.clone()).await;
+        std::mem::forget(a_dir);
+        std::mem::forget(a_store_dir);
+        let fetcher = RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
+
+        // No peer was ever added for this xite, so nothing can serve the range.
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        assert!(fetcher.fetch_range(&address, "movie.bin", 0, 50_000).await.is_err());
+        assert!(
+            !a_store.contains(id).unwrap(),
+            "a failed range fetch must not reserve the owner-declared size"
+        );
+    }
+
+    /// Mode-1 (random-key) shards are keyed by a per-file random key that the
+    /// manifest carries no copy of, so decrypting them with the public xite
+    /// salt could only fail. Refuse the file with a clear reason instead.
+    #[tokio::test]
+    async fn a_random_key_shard_is_refused_not_decrypted_with_the_salt() {
+        let state = AppState::new("node");
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        std::mem::forget(dir);
+        let fetcher = RuntimeEdxFetcher::new(state, epix_crypt::new_seed(), None);
+
+        let content = serde_json::json!({ "edx_salt": "00112233" });
+        let shard = epix_blob::manifest::ShardEntry { size: 10, mode: 1, chunks: Vec::new() };
+        let err = fetcher
+            .fetch_shard_file("1Xite", "private.txt", &content, shard, &store)
+            .await
+            .unwrap_err();
+        assert!(err.contains("mode 1"), "expected a mode refusal, got {err}");
+    }
+
+    /// The persisted EDX identity key is owner-only from the moment it exists:
+    /// a write-then-chmod leaves this node's wire identity readable by every
+    /// local user in between, and forever if the chmod fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_node_key_file_is_owner_only_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edx-node.key");
+        write_key_file(&path, "deadbeef").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "node key file mode");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "deadbeef");
+
+        // A leftover from a partial write is tightened too: the create-time
+        // mode only applies to a file we create, so the rewrite still chmods.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_key_file(&path, "cafebabe").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing key file is tightened, not left readable");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "cafebabe");
+    }
+
+    /// A fetch that gives up must not delete a record ANOTHER fetch of the same
+    /// object is still filling. The two overlap by design (the moov warm-up is
+    /// spawned before the foreground range fetch, and a media element issues
+    /// concurrent Range requests), and unlinking the sparse pair mid-flight
+    /// fails the other side's `write_slice` and 404s a range that would have
+    /// succeeded.
+    #[test]
+    fn a_claimed_object_is_not_dropped_while_another_fetch_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let fetcher = RuntimeEdxFetcher::new(AppState::new("node"), epix_crypt::new_seed(), None);
+        let id = ObjId([9u8; 32]);
+
+        // Two overlapping fetches of the same object; neither lands a group.
+        let background = fetcher.claim_object(&store, id, Ns::Plain, 4096, 1).unwrap();
+        let foreground = fetcher.claim_object(&store, id, Ns::Plain, 4096, 1).unwrap();
+        assert!(store.contains(id).unwrap(), "the record was reserved");
+
+        drop(foreground);
+        assert!(
+            store.contains(id).unwrap(),
+            "a fetch that gave up must leave the record for the one still filling it"
+        );
+
+        drop(background);
+        assert!(!store.contains(id).unwrap(), "the last claim to go drops the empty record");
+    }
+
+    /// The cleanup only drops a record THIS fetch reserved: a record that was
+    /// already there when the fetch started stays put.
+    #[test]
+    fn a_claim_never_drops_an_object_it_did_not_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let fetcher = RuntimeEdxFetcher::new(AppState::new("node"), epix_crypt::new_seed(), None);
+        let id = ObjId([8u8; 32]);
+
+        store.ensure_sparse(id, Ns::Plain, 4096, 1).unwrap();
+        drop(fetcher.claim_object(&store, id, Ns::Plain, 4096, 1).unwrap());
+        assert!(store.contains(id).unwrap(), "a pre-existing record is left alone");
+    }
 }

@@ -271,6 +271,24 @@ impl NodeRuntime {
             dht: Arc::new(epix_dht_net::DhtService::new(self.dht.clone())),
             prop: self.prop_store.clone(),
         });
+        // Bring the serve context up right away rather than waiting for an
+        // accept loop. The same call installs the outbound EDX fetcher, and
+        // every peer path goes through it: announce, fetch, publish and the DHT
+        // client. A download-only node (fileserver_port = None) runs no accept
+        // loop, so leaving the install to one would leave it with no peer I/O
+        // at all. Inbound serving stays gated on the port below; the cell keeps
+        // this idempotent for the seed/tor/i2p/mesh callers.
+        self.handles.push(tokio::spawn({
+            let cell = edx_cell.clone();
+            let state = self.state.clone();
+            async move {
+                if edx::ensure_edx_serve(&cell, &state).await.is_none() {
+                    state
+                        .log("INFO", "No EDX object store: peer transfers disabled".to_string())
+                        .await;
+                }
+            }
+        }));
         // Inbound file server: let peers pull our files (seeding), and try to
         // open that port through the home router with UPnP so it's reachable.
         #[cfg(feature = "inbound-seeding")]

@@ -19,11 +19,18 @@
 //! the server consults it before serving bulk and reports transfers back.
 //! Control-plane replies and first-paint bytes bypass it entirely.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Free first-paint budget per new peer (bytes) and its refill window.
 pub const FIRST_PAINT_FREE_BYTES: u64 = 4 << 20; // 4 MiB
 pub const FIRST_PAINT_WINDOW_SECS: u64 = 600; // per 10 min
+
+/// Ceiling on tracked peer accounts, and how long an account may sit
+/// idle before it is dropped. A peer mints a new node_pk for free by
+/// reconnecting, so the account table has to be bounded: without this a
+/// handshake flood grows it forever and makes every ranking slower.
+pub const MAX_TRACKED_PEERS: usize = 4096;
+pub const PEER_IDLE_EVICT_SECS: u64 = 24 * 3600;
 
 /// How many bulk peers we actively serve (unchoke) at once, and how many
 /// of those slots are reserved for overlay peers so a Tor-only swarm is
@@ -57,6 +64,8 @@ struct PeerAccount {
     free_spent: u64,
     /// Window start (unix secs) for the free budget.
     free_window_start: u64,
+    /// Last time we saw this peer (unix secs), for idle eviction.
+    last_seen: u64,
     reach: Reach,
 }
 
@@ -75,6 +84,13 @@ pub struct Choker {
     second_ts: u64,
     /// Set on mobile metered/low-battery: hard-stops all bulk uploads.
     paused: bool,
+    /// Cached unchoke set, the rotation epoch it was built for, and a
+    /// flag set when the ranking inputs changed. Building the set sorts
+    /// every account, so it runs once per rotation or state change
+    /// instead of once per served request.
+    unchoked: HashSet<Vec<u8>>,
+    unchoked_epoch: u64,
+    dirty: bool,
 }
 
 /// The decision for a single serve request.
@@ -99,25 +115,61 @@ impl Choker {
             second_bytes: 0,
             second_ts: 0,
             paused: false,
+            unchoked: HashSet::new(),
+            unchoked_epoch: 0,
+            dirty: true,
+        }
+    }
+
+    /// Get or create a peer's account and stamp it as seen now, making
+    /// room first if the table is at its cap.
+    fn touch(&mut self, node_pk: &[u8], now: u64) -> &mut PeerAccount {
+        if !self.peers.contains_key(node_pk) {
+            if self.peers.len() >= MAX_TRACKED_PEERS {
+                self.evict(now);
+            }
+            // A new (or evicted) account changes the ranking.
+            self.dirty = true;
+        }
+        let acct = self
+            .peers
+            .entry(node_pk.to_vec())
+            .or_insert_with(|| PeerAccount { free_window_start: now, ..Default::default() });
+        acct.last_seen = now;
+        acct
+    }
+
+    /// Make room for a new account: drop long-idle ones first, then, if
+    /// still at the cap, the least valuable (lowest contribution, oldest
+    /// seen). Identities minted to flood us never contribute, so they go
+    /// before any real peer does.
+    fn evict(&mut self, now: u64) {
+        self.peers.retain(|_, a| now.saturating_sub(a.last_seen) < PEER_IDLE_EVICT_SECS);
+        while self.peers.len() >= MAX_TRACKED_PEERS {
+            let worst = self
+                .peers
+                .iter()
+                .min_by(|a, b| {
+                    a.1.served_to_us.cmp(&b.1.served_to_us).then(a.1.last_seen.cmp(&b.1.last_seen))
+                })
+                .map(|(pk, _)| pk.clone());
+            let Some(worst) = worst else { break };
+            self.peers.remove(&worst);
         }
     }
 
     /// Register/refresh a peer's reachability and first-seen time.
     pub fn note_peer(&mut self, node_pk: &[u8], reach: Reach, now: u64) {
-        let acct = self.peers.entry(node_pk.to_vec()).or_insert_with(|| PeerAccount {
-            free_window_start: now,
-            ..Default::default()
-        });
+        let acct = self.touch(node_pk, now);
         acct.reach = reach;
+        self.dirty = true;
     }
 
     /// Record that a peer served US bytes (their reciprocity credit).
     pub fn credit_peer(&mut self, node_pk: &[u8], bytes: u64, now: u64) {
-        let acct = self.peers.entry(node_pk.to_vec()).or_insert_with(|| PeerAccount {
-            free_window_start: now,
-            ..Default::default()
-        });
+        let acct = self.touch(node_pk, now);
         acct.served_to_us += bytes;
+        self.dirty = true;
     }
 
     /// Mobile / battery / metered gate: pause or resume all bulk uploads.
@@ -143,10 +195,7 @@ impl Choker {
 
         // First-paint exemption (per-peer free budget, windowed).
         if first_paint {
-            let acct = self.peers.entry(node_pk.to_vec()).or_insert_with(|| PeerAccount {
-                free_window_start: now,
-                ..Default::default()
-            });
+            let acct = self.touch(node_pk, now);
             if now.saturating_sub(acct.free_window_start) >= FIRST_PAINT_WINDOW_SECS {
                 acct.free_window_start = now;
                 acct.free_spent = 0;
@@ -180,18 +229,32 @@ impl Choker {
         self.second_bytes += bytes;
         if let Some(acct) = self.peers.get_mut(node_pk) {
             acct.served_by_us += bytes;
+            acct.last_seen = now;
         }
         ServeDecision::Serve
     }
 
-    /// The current unchoke set: top contributors by reciprocity, plus
-    /// reserved overlay slots and one optimistic slot for a newcomer.
-    fn is_unchoked(&self, node_pk: &[u8], now: u64) -> bool {
-        let mut ranked: Vec<(&Vec<u8>, &PeerAccount)> = self.peers.iter().collect();
+    /// Is this peer in the current unchoke set? Answered from the cache;
+    /// the set is rebuilt only when the rotation epoch turns over or the
+    /// ranking inputs changed.
+    fn is_unchoked(&mut self, node_pk: &[u8], now: u64) -> bool {
+        let epoch = now / OPTIMISTIC_ROTATE_SECS;
+        if self.dirty || epoch != self.unchoked_epoch {
+            self.rebuild_unchoked(epoch);
+        }
+        self.unchoked.contains(node_pk)
+    }
+
+    /// The unchoke set for a rotation epoch: top contributors by
+    /// reciprocity, plus reserved overlay slots and one optimistic slot
+    /// for a newcomer.
+    fn rebuild_unchoked(&mut self, epoch: u64) {
+        let mut ranked: Vec<(&[u8], &PeerAccount)> =
+            self.peers.iter().map(|(pk, a)| (pk.as_slice(), a)).collect();
         // Highest contribution first.
         ranked.sort_by(|a, b| b.1.served_to_us.cmp(&a.1.served_to_us));
 
-        let mut unchoked: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+        let mut unchoked: HashSet<Vec<u8>> = HashSet::new();
         let mut overlay_slots = OVERLAY_RESERVED_SLOTS;
         let mut general_slots = UNCHOKE_SLOTS - OVERLAY_RESERVED_SLOTS;
 
@@ -200,7 +263,7 @@ impl Choker {
             if overlay_slots == 0 {
                 break;
             }
-            unchoked.insert(pk.as_slice());
+            unchoked.insert(pk.to_vec());
             overlay_slots -= 1;
         }
         // Fill general slots by contribution.
@@ -208,18 +271,20 @@ impl Choker {
             if general_slots == 0 {
                 break;
             }
-            if unchoked.insert(pk.as_slice()) {
+            if unchoked.insert(pk.to_vec()) {
                 general_slots -= 1;
             }
         }
         // Optimistic slot: rotates deterministically by time so a
         // newcomer with zero contribution still gets periodic service.
         if !ranked.is_empty() {
-            let rotate = (now / OPTIMISTIC_ROTATE_SECS) as usize % ranked.len();
-            unchoked.insert(ranked[rotate].0.as_slice());
+            let rotate = epoch as usize % ranked.len();
+            unchoked.insert(ranked[rotate].0.to_vec());
         }
 
-        unchoked.contains(node_pk)
+        self.unchoked = unchoked;
+        self.unchoked_epoch = epoch;
+        self.dirty = false;
     }
 
     /// Bytes served to a peer so far (bulk).
@@ -240,6 +305,14 @@ mod tests {
 
     fn pk(n: u8) -> Vec<u8> {
         vec![n; 33]
+    }
+
+    /// Distinct 33-byte keys for the eviction tests, where u8 is not
+    /// enough room.
+    fn pk_n(n: u32) -> Vec<u8> {
+        let mut v = vec![0u8; 33];
+        v[..4].copy_from_slice(&n.to_le_bytes());
+        v
     }
 
     #[test]
@@ -350,5 +423,65 @@ mod tests {
         assert_eq!(c.decide(&peer, 100, true, false, 1), ServeDecision::Throttled);
         c.set_paused(false);
         assert_eq!(c.decide(&peer, 100, true, false, 1), ServeDecision::FirstPaint);
+    }
+
+    #[test]
+    fn peer_accounts_are_capped_and_freeloaders_go_first() {
+        let mut c = Choker::new(1_000_000_000);
+        // A real contributor.
+        let good = pk_n(u32::MAX);
+        c.note_peer(&good, Reach::Clearnet, 0);
+        c.credit_peer(&good, 1_000_000, 0);
+        // More zero-contribution identities than the cap, as a peer
+        // cycling handshakes with fresh keys would mint.
+        for i in 0..(MAX_TRACKED_PEERS as u32 + 200) {
+            c.note_peer(&pk_n(i), Reach::Clearnet, 1);
+        }
+        assert!(c.peers.len() <= MAX_TRACKED_PEERS);
+        // The contributor is still accounted for: eviction takes the
+        // lowest credit first.
+        assert_eq!(c.credit_of(&good), 1_000_000);
+
+        // A day later, the next new peer sweeps the idle accounts, so the
+        // table drops well below the cap instead of staying pinned at it.
+        c.note_peer(&pk_n(u32::MAX - 1), Reach::Clearnet, PEER_IDLE_EVICT_SECS + 2);
+        assert!(c.peers.len() < MAX_TRACKED_PEERS);
+    }
+
+    #[test]
+    fn unchoke_cache_reflects_credit_within_the_same_rotation() {
+        let mut c = Choker::new(1_000_000_000);
+        for i in 0..6u8 {
+            let p = pk(i);
+            c.note_peer(&p, Reach::Clearnet, 0);
+            c.credit_peer(&p, 1_000_000, 0);
+        }
+        let late = pk(200);
+        c.note_peer(&late, Reach::Clearnet, 100);
+        // Zero contribution, every slot held, and not the optimistic pick
+        // at t=100 (rotation index 3 of 7 lands on a contributor).
+        assert_eq!(c.decide(&late, 100, false, false, 100), ServeDecision::Choked);
+        // A big credit inside the SAME rotation window takes effect at
+        // once: the cached set is invalidated, not held until the next one.
+        c.credit_peer(&late, 10_000_000, 100);
+        assert_eq!(c.decide(&late, 100, false, false, 100), ServeDecision::Serve);
+    }
+
+    #[test]
+    fn unchoke_cache_rotates_with_the_clock() {
+        let mut c = Choker::new(1_000_000_000);
+        for i in 0..6u8 {
+            let p = pk(i);
+            c.note_peer(&p, Reach::Clearnet, 0);
+            c.credit_peer(&p, (i as u64 + 1) * 1000, 0);
+        }
+        // pk(2) is outside the top 3 general slots, so it is served only
+        // in the rotation window where it holds the optimistic slot.
+        // ranked is pk5,pk4,pk3,pk2,pk1,pk0; index 3 is pk(2).
+        let held = c.decide(&pk(2), 100, false, false, 3 * OPTIMISTIC_ROTATE_SECS);
+        assert_eq!(held, ServeDecision::Serve);
+        // Next rotation the slot moves on, and the cached set moves with it.
+        let dropped = c.decide(&pk(2), 100, false, false, 4 * OPTIMISTIC_ROTATE_SECS);
+        assert_eq!(dropped, ServeDecision::Choked);
     }
 }

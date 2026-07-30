@@ -332,6 +332,25 @@ fn effective_enabled(name: &str, disabled: &[String], enabled: &[String]) -> boo
 /// How many warm peer connections the node keeps for live connection stats.
 const CONNECTION_POOL_MAX: usize = 8;
 
+/// How long after a feed segment's interval closes the node keeps treating it
+/// as churning. A record landing in an interval re-derives that interval's root
+/// (the root is a pure function of its record set), so pinning a still-churning
+/// segment would pin every superseded copy of it forever - eviction only ever
+/// reclaims refcount-0 objects. Segments inside this window are inserted
+/// unpinned, so superseded copies stay evictable and rebuild from the records.
+const FEED_PIN_GRACE_MS: u64 = 2 * crate::feed::SEGMENT_INTERVAL_MS;
+
+/// How many optional files one EDX bulk batch fetches before the pass re-checks
+/// the user's mandate. One batch is a single uncancellable await, so this bounds
+/// how long a toggled-off / paused / deleted xite keeps pulling bytes, while
+/// still dialing the seed peers once per batch rather than once per file.
+const EDX_BULK_OPTIONAL_CHUNK: usize = 32;
+
+/// How many of a body-less push's advertised publisher addresses are tried when
+/// fetching the content.json back. Each try costs one dial deadline, and the
+/// list comes from the pushing peer, so it cannot be walked in full.
+const PUSH_REFETCH_PEERS: usize = 4;
+
 /// Editable node config keys shown on the Config page:
 /// `(section, key, label, default, kind)`, grouped into the same sections
 /// EpixNet's Config page uses (Web Interface / Network / Performance / Epix
@@ -671,7 +690,10 @@ pub struct AppState {
     /// Derived feed artifacts per `address -> feed name -> artifacts`. A pure,
     /// recomputable read cache over the xite's signed OR-set records (see
     /// [`crate::feed`]); never persisted, rebuilt on demand and on merge.
-    feed_cache: RwLock<HashMap<String, HashMap<String, crate::feed::FeedArtifacts>>>,
+    /// Behind an `Arc` because the artifacts hold the whole feed (every record's
+    /// canonical bytes plus every sealed segment blob): a query must hand out a
+    /// handle, not a deep copy of the dataset.
+    feed_cache: RwLock<HashMap<String, HashMap<String, Arc<crate::feed::FeedArtifacts>>>>,
     user: RwLock<User>,
     user_path: Option<PathBuf>,
     nonce_counter: AtomicU64,
@@ -2732,8 +2754,10 @@ impl AppState {
         exclude.insert(from.to_string());
 
         // Record the requester itself when it arrived over an overlay: the
-        // handshake rebinds an inbound onion/i2p/rns placeholder to the peer's
-        // advertised self-address, so an overlay publisher that PEXes us
+        // handshake fills the connection's dialback slot with the peer's
+        // advertised listen address (`adopt_dialback` in epix-runtime's edx
+        // module), and the server passes that instead of the inbound
+        // onion/i2p/rns placeholder, so an overlay publisher that PEXes us
         // becomes a peer we can dial back at first contact instead of waiting
         // for gossip to name it. A placeholder (no self-address advertised) is
         // dropped by add_peers' well-formedness filter. A clearnet requester
@@ -4097,9 +4121,15 @@ impl AppState {
         self.tracker.peer_list(hash, exclude, limit, now_secs(), need).await
     }
 
+    /// Max hashes one announce reply answers for, whatever the request names.
+    /// A real client announces one hash at a time (see `epix-xite`'s
+    /// announcer), but a peer can pack thousands into a single small request,
+    /// and the bucket-set reply for all of them would not fit one frame.
+    const ANNOUNCE_HASH_CAP: usize = 64;
+
     /// Serve one tracker announce: record the announcer's addresses for every
     /// hash it named, then answer with the peers we know for each hash, in
-    /// request order.
+    /// request order (at most `ANNOUNCE_HASH_CAP` of them).
     ///
     /// Codec-free so both wire protocols serve the same tracker. The request
     /// type comes from `epix-discovery` (already a dependency through
@@ -4126,7 +4156,7 @@ impl AppState {
         // is what the requester would like; 30 per hash is what any requester
         // gets.
         let limit = (req.need_num as usize).min(30);
-        for h in &req.hashes {
+        for h in req.hashes.iter().take(Self::ANNOUNCE_HASH_CAP) {
             let peers = self.tracker_peer_list(h, &mine, limit, need).await;
             resp.peers.push(PeerBuckets::pack(&peers));
         }
@@ -4199,7 +4229,7 @@ impl AppState {
     ) {
         for (list, is_onion) in [(&req.onions, true), (&req.i2p, false)] {
             for (i, host) in list.iter().enumerate() {
-                if host.is_empty() {
+                if !Self::is_overlay_self_host(host, is_onion) {
                     continue;
                 }
                 let addr = Self::request_self_addr(host, is_onion, req.port);
@@ -4207,6 +4237,20 @@ impl AppState {
                 mine.insert(addr.to_string());
             }
         }
+    }
+
+    /// Whether an announce request's claimed onion / i2p self-address has the
+    /// shape of a real overlay host. Registered on trust, so the shape is the
+    /// only check there is: without it a peer fills the tracker db with
+    /// arbitrary strings, one row per hash it named, and we hand them back to
+    /// everyone who asks. Onion is a v2 (16 char) or v3 (56 char) b32 host
+    /// without the `.onion`; i2p is a 52 char b32 host, with or without the
+    /// `.b32` label the transport carries (never the `.i2p` suffix).
+    fn is_overlay_self_host(host: &str, is_onion: bool) -> bool {
+        let label = if is_onion { host } else { host.strip_suffix(".b32").unwrap_or(host) };
+        let len_ok =
+            if is_onion { label.len() == 16 || label.len() == 56 } else { label.len() == 52 };
+        len_ok && label.chars().all(|c| c.is_ascii_alphanumeric())
     }
 
     /// One entry of a request's onion or i2p self-address list, as a `PeerAddr`.
@@ -4518,10 +4562,11 @@ impl AppState {
     }
 
     /// EDX-first pass over a needed-file list: fetch what EDX can in one
-    /// dial-once session and return the leftovers (EDX-missed) as `FileEntry`s
-    /// for the msgpack worker. Counts the EDX bytes into the xite's transfer
-    /// total. When no EDX fetcher is installed (or no store), returns `needed`
-    /// unchanged so the caller runs the full worker list exactly as before.
+    /// dial-once session and return the leftovers (EDX-missed) as `FileEntry`s.
+    /// Counts the EDX bytes into the xite's transfer total. EDX is the only
+    /// transfer path now, so there is nothing to hand the leftovers to: callers
+    /// either drop the missed list (the next pass retries those files) or read
+    /// it only to see which files did arrive.
     /// `staged` carries a not-yet-committed content.json (resync) so its files
     /// resolve against the NEW `b3`, not the stale committed manifest. Made
     /// `pub` so the node's clone/included-content passes share one EDX-first
@@ -4546,7 +4591,7 @@ impl AppState {
             .collect();
         let total = needed.len();
         let Some(batch) = self.edx_fetch_files(key, want, peers, on_file).await else {
-            return needed; // no EDX fetcher: whole list to the worker
+            return needed; // no EDX fetcher: nothing could be fetched
         };
         if batch.bytes > 0 {
             self.add_transfer(key, batch.bytes, 0).await;
@@ -7235,10 +7280,20 @@ impl AppState {
         self.update_content(address, xite.content.clone()).await;
         // Register the just-loaded files into the EDX object store (no-op
         // when no store is installed), so EDX can serve and dedup them
-        // without a re-download.
+        // without a re-download. On the blocking pool: edx_register reads and
+        // BLAKE3-hashes every declared file, which is minutes of CPU for a
+        // multi-GB one and must not sit on a runtime worker.
         if let Some(store) = self.edx_store().await {
-            if let Err(e) = xite.edx_register(&store, now_secs().max(0) as u64) {
-                self.log("WARN", format!("edx_register {address}: {e}")).await;
+            let now = now_secs().max(0) as u64;
+            let result = tokio::task::spawn_blocking(move || xite.edx_register(&store, now)).await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    self.log("WARN", format!("edx_register {address}: {e}")).await;
+                }
+                Err(e) => {
+                    self.log("WARN", format!("edx_register {address}: task failed: {e}")).await;
+                }
             }
         }
         self.persist_sites().await;
@@ -8262,10 +8317,19 @@ impl AppState {
         if !(xite.load_content().unwrap_or(false) || xite.load_content_local()) {
             return None;
         }
-        match xite.edx_register(&store, now_secs().max(0) as u64) {
-            Ok(counts) => Some(counts),
-            Err(e) => {
+        // On the blocking pool: edx_register reads and BLAKE3-hashes every
+        // declared file (minutes for a multi-GB one), and the boot-time
+        // `edx_register_all_loaded` runs it for every xite back to back, so a
+        // runtime worker must not carry it.
+        let now = now_secs().max(0) as u64;
+        match tokio::task::spawn_blocking(move || xite.edx_register(&store, now)).await {
+            Ok(Ok(counts)) => Some(counts),
+            Ok(Err(e)) => {
                 self.log("WARN", format!("edx_register {address}: {e}")).await;
+                None
+            }
+            Err(e) => {
+                self.log("WARN", format!("edx_register {address}: task failed: {e}")).await;
                 None
             }
         }
@@ -9148,19 +9212,36 @@ impl AppState {
         }
         // `now` is only the store insert timestamp; it never enters derivation
         // (segmentation is a pure function of record clocks). Grace/live-tail is
-        // a caching policy: we could skip pinning segments whose interval ends
-        // within ~2 days of `now` to avoid churn, but that is a serving choice
-        // that touches no root, so for now we pin every sealed segment.
+        // a caching policy that touches no root: segments whose interval closed
+        // less than `FEED_PIN_GRACE_MS` ago are still churning, so they go in
+        // unpinned (see `pin_feed_objects`).
         let now = epix_core::now_ms();
         let store = self.edx_store().await;
+        // What the previous derivation pinned. A record landing in an already
+        // sealed interval re-derives that interval under a NEW root, so the old
+        // root must be unpinned or it stays on disk for the life of the node.
+        let previous: HashMap<String, Arc<crate::feed::FeedArtifacts>> =
+            self.feed_cache.read().await.get(address).cloned().unwrap_or_default();
         let mut derived = HashMap::new();
         for desc in descriptors {
             let records = self.gather_feed_records(address, &desc).await;
-            let artifacts = crate::feed::derive_feed(records);
+            // The fold is CPU-bound (dedup, canonical sort, segment + filter
+            // build over every record) and the merge path calls this on every
+            // inbound record, so run it on a blocking thread instead of
+            // stalling an async worker. A join failure (the pool shutting down
+            // mid-run) just skips this feed; the next merge re-derives it.
+            let Ok(artifacts) =
+                tokio::task::spawn_blocking(move || crate::feed::derive_feed(records)).await
+            else {
+                continue;
+            };
             if let Some(store) = &store {
                 Self::pin_feed_objects(store, &artifacts, now.max(0) as u64);
+                if let Some(old) = previous.get(&desc.name) {
+                    Self::unpin_superseded_feed_objects(store, old, &artifacts);
+                }
             }
-            derived.insert(desc.name.clone(), artifacts);
+            derived.insert(desc.name.clone(), Arc::new(artifacts));
         }
         self.feed_cache.write().await.insert(address.to_string(), derived);
     }
@@ -9168,24 +9249,67 @@ impl AppState {
     /// Cache the sealed segments as EDX objects (content-addressed by
     /// their own BLAKE3 root); pin so they survive eviction. Losing one
     /// is harmless - it recomputes from the records.
+    ///
+    /// Only segments whose interval closed more than `FEED_PIN_GRACE_MS` ago are
+    /// pinned. A segment still inside that window gains a record (and therefore
+    /// a new root) on every merge, and nothing un-pins the copy it replaces, so
+    /// pinning the live tail would keep every superseded version of the current
+    /// day on disk forever.
     fn pin_feed_objects(
         store: &epix_blob::store::Store,
         artifacts: &crate::feed::FeedArtifacts,
         ts: u64,
     ) {
         for (i, seg) in artifacts.sealed.iter().enumerate() {
-            if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() {
+            let settled = seg.boundary.saturating_add(FEED_PIN_GRACE_MS) <= ts;
+            if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() && settled
+            {
                 let _ = store.pin(seg.root);
             }
-            // The segment's search skip-filter, as a SIBLING object
-            // keyed by the segment root (see `feed::skip_filter_id`):
-            // a peer that wants to skip-scan our feed pulls the tiny
-            // filter instead of the whole segment. Derived, so a failed
-            // insert costs nothing - it rebuilds from the segment.
+            // The segment's search skip-filter, as a sibling object a peer that
+            // wants to skip-scan our feed pulls instead of the whole segment.
+            // Stored under the BLAKE3 of its own bytes, the only key
+            // `insert_bytes` accepts: it verifies the bytes against the id it
+            // is given, so an id derived from the segment root could never be
+            // inserted. Peers therefore need the root -> filter id mapping
+            // published alongside the spine. Derived, so a failed insert costs
+            // nothing - it rebuilds from the segment.
             if let Some(f) = artifacts.filters.get(i) {
-                let id = crate::feed::skip_filter_id(seg.root);
-                if store.insert_bytes(id, epix_blob::Ns::Plain, &f.to_bytes(), ts).is_ok() {
+                let bytes = f.to_bytes();
+                let id = epix_blob::ObjId::of(&bytes);
+                if store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, ts).is_ok() && settled {
                     let _ = store.pin(id);
+                }
+            }
+        }
+    }
+
+    /// Release the pins the previous derivation of this feed took on segments
+    /// (and their skip-filter siblings) that are no longer part of it. Without
+    /// this every re-sealed interval leaves a permanently pinned copy behind:
+    /// eviction and the quota only ever reclaim refcount-0 objects. The objects
+    /// are not deleted, only made evictable - they re-derive from the records.
+    fn unpin_superseded_feed_objects(
+        store: &epix_blob::store::Store,
+        old: &crate::feed::FeedArtifacts,
+        new: &crate::feed::FeedArtifacts,
+    ) {
+        let keep: std::collections::HashSet<epix_blob::ObjId> =
+            new.sealed.iter().map(|s| s.root).collect();
+        // Two segments can share filter bytes (an empty filter is the common
+        // case), so a superseded segment must not release a filter the new set
+        // still uses.
+        let keep_filters: std::collections::HashSet<epix_blob::ObjId> =
+            new.filters.iter().map(|f| epix_blob::ObjId::of(&f.to_bytes())).collect();
+        for (i, seg) in old.sealed.iter().enumerate() {
+            if keep.contains(&seg.root) {
+                continue;
+            }
+            let _ = store.ref_delta(seg.root, -1);
+            if let Some(f) = old.filters.get(i) {
+                let id = epix_blob::ObjId::of(&f.to_bytes());
+                if !keep_filters.contains(&id) {
+                    let _ = store.ref_delta(id, -1);
                 }
             }
         }
@@ -9198,11 +9322,17 @@ impl AppState {
         &self,
         address: &str,
         feed: &str,
-    ) -> Option<crate::feed::FeedArtifacts> {
+    ) -> Option<Arc<crate::feed::FeedArtifacts>> {
         if let Some(a) =
             self.feed_cache.read().await.get(address).and_then(|m| m.get(feed)).cloned()
         {
             return Some(a);
+        }
+        // Check the descriptors BEFORE recomputing: nothing is ever cached under
+        // an undeclared name, so a query naming one would miss forever and
+        // re-walk + re-verify the xite's whole record set on every call.
+        if !self.feed_descriptors(address).await.iter().any(|d| d.name == feed) {
+            return None;
         }
         self.recompute_feeds(address).await;
         self.feed_cache.read().await.get(address).and_then(|m| m.get(feed)).cloned()
@@ -9754,6 +9884,27 @@ impl AppState {
         });
     }
 
+    /// Fetch a signed `inner_path` back from one peer over EDX `GetSigned`,
+    /// bounded by that peer's dial deadline (an onion/i2p peer needs far more
+    /// than a flat clearnet one). `None` on any failure, so callers can just
+    /// try the next address.
+    async fn fetch_signed_from(
+        &self,
+        peer: &PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Option<Vec<u8>> {
+        match tokio::time::timeout(
+            peer.connect_timeout(),
+            self.edx_fetch_signed(peer.clone(), address, inner_path),
+        )
+        .await
+        {
+            Ok(Some(Ok(Some(bytes)))) => Some(bytes),
+            _ => None,
+        }
+    }
+
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
     /// command - the receive half of the publish round-trip). Mirrors EpixNet's
     /// `FileRequest.actionUpdate`: reject unknown/not-downloaded sites, skip
@@ -9763,7 +9914,8 @@ impl AppState {
     ///
     /// `body` is the pushed content.json (None/empty when the sender omitted it
     /// - EpixNet drops bodies over 1 MB - in which case it is fetched back from
-    /// `sender`). `modified_hint` is the pushed version, letting us short-
+    /// `sender`, falling back to the first few `sender_peers` if that address
+    /// is unreachable). `modified_hint` is the pushed version, letting us short-
     /// circuit without parsing. Returns whether the update was applied.
     pub async fn apply_inbound_update(
         self: &Arc<Self>,
@@ -9840,18 +9992,24 @@ impl AppState {
                 // Fetch the signed content.json back from the sender over EDX
                 // GetSigned. The sender may be an onion/i2p peer: use its dial
                 // deadline, not a flat clearnet one.
-                let fetched = match &sender {
-                    Some(s) => match tokio::time::timeout(
-                        s.connect_timeout(),
-                        self.edx_fetch_signed(s.clone(), site, inner_path),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(Some(bytes)))) => Some(bytes),
-                        _ => None,
-                    },
+                let mut fetched = match &sender {
+                    Some(s) => self.fetch_signed_from(s, site, inner_path).await,
                     None => None,
                 };
+                // No sender wire address (or it turned out to be unreachable):
+                // the push carries the publisher's own dialable addresses, so
+                // try those before losing the update. First success wins.
+                if fetched.is_none() {
+                    for sp in sender_peers.iter().take(PUSH_REFETCH_PEERS) {
+                        if sender.as_ref() == Some(sp) {
+                            continue; // already tried above
+                        }
+                        fetched = self.fetch_signed_from(sp, site, inner_path).await;
+                        if fetched.is_some() {
+                            break;
+                        }
+                    }
+                }
                 fetched.ok_or("File invalid update: Can't download updated file")?
             }
         };
@@ -10076,11 +10234,19 @@ impl AppState {
         }
         if self.transport.read().await.is_some() {
             let mut peers = self.connectable_peers(&key, 10).await;
+            let nets = self.dialable_networks().await;
             // Prefer fetching from the sender - it definitely has the files
             // it just announced - but only if its address is dialable (an
             // inbound-only peer, e.g. `ip:0`, would just waste a worker).
+            // Screened the same way the advertised addresses below are: the
+            // sender is caller-supplied, so a peer that names our own address
+            // or an undialable network must not get a worker slot either.
             if let Some(s) = sender {
-                if epix_peer::Peer::new(s.clone(), 0).is_connectable() && !peers.contains(&s) {
+                if nets.can_dial(&s)
+                    && epix_peer::Peer::new(s.clone(), 0).is_connectable()
+                    && !self.is_own_peer(&s).await
+                    && !peers.contains(&s)
+                {
                     peers.insert(0, s);
                 }
             }
@@ -10089,7 +10255,6 @@ impl AppState {
             // For a NAT'd publisher these are the only routes to the new
             // files. Own addresses are dropped (a lone seeder must not dial
             // itself) and so are networks we cannot dial right now.
-            let nets = self.dialable_networks().await;
             for sp in sender_peers.into_iter().rev() {
                 if nets.can_dial(&sp)
                     && epix_peer::Peer::new(sp.clone(), 0).is_connectable()
@@ -11055,8 +11220,15 @@ impl AppState {
         // retried files flip back to Pending/Active in place in the file list.
         let mut queue: Vec<(usize, &String, u64)> =
             todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
-        self.edx_bulk_optional_pass(address, &todo, &mut queue, &mut fetched, &mut bytes_done)
-            .await;
+        self.edx_bulk_optional_pass(
+            address,
+            directory,
+            &todo,
+            &mut queue,
+            &mut fetched,
+            &mut bytes_done,
+        )
+        .await;
         for round in 1..=ROUNDS {
             let (requeue, aborted) = self
                 .run_optional_round(address, directory, &queue, round, ROUNDS, &mut fetched, &mut bytes_done)
@@ -11099,9 +11271,16 @@ impl AppState {
     /// legacy site (no `b3`) resolves nothing and this returns at once, leaving
     /// the whole queue to the rounds. What it fetched is dropped from `queue`
     /// and added to the counters, so the rounds never re-try a done file.
+    ///
+    /// Batched in `EDX_BULK_OPTIONAL_CHUNK`-file chunks with the same mandate
+    /// check the msgpack rounds do between files: one `edx_fetch_files` call is
+    /// a single uncancellable await, so handing it the whole queue would let a
+    /// toggled-off, paused or deleted xite keep pulling multi-GB files to the
+    /// end of the list.
     async fn edx_bulk_optional_pass<'a>(
         &self,
         address: &str,
+        directory: Option<&str>,
         todo: &'a [(String, u64)],
         queue: &mut Vec<(usize, &'a String, u64)>,
         fetched: &mut usize,
@@ -11114,30 +11293,38 @@ impl AppState {
         if peers.is_empty() {
             return;
         }
-        let want: Vec<EdxWant> = todo
-            .iter()
-            .map(|(p, _)| EdxWant { inner_path: p.clone(), id: None, size: None })
-            .collect();
-        let Some(batch) = self.edx_fetch_files(address, want, peers, None).await else {
-            return;
-        };
-        if batch.bytes > 0 {
-            self.add_transfer(address, batch.bytes, 0).await;
-        }
-        let done: std::collections::HashSet<&str> = batch.done.iter().map(|s| s.as_str()).collect();
-        if done.is_empty() {
-            return;
-        }
-        for (idx, path, size) in queue.iter() {
-            if done.contains(path.as_str()) {
-                *fetched += 1;
-                *bytes_done += *size;
-                self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
-                self.push_site_info_file_done(address, path, None).await;
+        // Owned so the chunk loop does not borrow `queue`, which it mutates.
+        let paths: Vec<String> = todo.iter().map(|(p, _)| p.clone()).collect();
+        for chunk in paths.chunks(EDX_BULK_OPTIONAL_CHUNK) {
+            if !self.optional_pass_should_continue(address, directory).await {
+                return;
             }
+            let want: Vec<EdxWant> = chunk
+                .iter()
+                .map(|p| EdxWant { inner_path: p.clone(), id: None, size: None })
+                .collect();
+            let Some(batch) = self.edx_fetch_files(address, want, peers.clone(), None).await else {
+                return;
+            };
+            if batch.bytes > 0 {
+                self.add_transfer(address, batch.bytes, 0).await;
+            }
+            let done: std::collections::HashSet<&str> =
+                batch.done.iter().map(|s| s.as_str()).collect();
+            if done.is_empty() {
+                continue;
+            }
+            for (idx, path, size) in queue.iter() {
+                if done.contains(path.as_str()) {
+                    *fetched += 1;
+                    *bytes_done += *size;
+                    self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
+                    self.push_site_info_file_done(address, path, None).await;
+                }
+            }
+            self.bump_optional_progress(address, *fetched, 0, *bytes_done).await;
+            queue.retain(|(_, path, _)| !done.contains(path.as_str()));
         }
-        self.bump_optional_progress(address, *fetched, 0, *bytes_done).await;
-        queue.retain(|(_, path, _)| !done.contains(path.as_str()));
     }
 
     /// Seed the live progress snapshot the sidebar renders: every file starts
@@ -11324,11 +11511,12 @@ impl AppState {
     pub async fn remove_xite(&self, address: &str) -> bool {
         let mut roots = Vec::new();
         let mut removed_keys = Vec::new();
+        let canonical;
         {
             let mut xites = self.xites.write().await;
             // Canonical (signed content) address of the target, alias-aware.
             let Some(x) = self.resolve_xite(&xites, address) else { return false };
-            let canonical = canonical_address(x.content.as_ref(), address);
+            canonical = canonical_address(x.content.as_ref(), address);
             // Remove every serving key that shares this canonical address.
             let keys: Vec<String> = xites
                 .iter()
@@ -11355,6 +11543,15 @@ impl AppState {
         // stays deleted across restarts.
         for root in roots {
             let _ = std::fs::remove_dir_all(&root);
+        }
+        // The derived feed artifacts hold the whole record set in memory; a
+        // deleted site's copy would stay resident until restart.
+        {
+            let mut cache = self.feed_cache.write().await;
+            cache.remove(&canonical);
+            for key in &removed_keys {
+                cache.remove(key);
+            }
         }
         // EpixNet parity (`user.deleteSiteData`): forget the site's derived
         // auth identity, cert selection, and feed follows. Harmless to the
@@ -12231,6 +12428,71 @@ mod tests {
         assert!(resp.peers.is_empty());
     }
 
+    #[test]
+    fn overlay_self_host_shapes_are_screened() {
+        // v2 (16 char) and v3 (56 char) onion b32 hosts.
+        assert!(AppState::is_overlay_self_host("abcdefghij234567", true));
+        assert!(AppState::is_overlay_self_host(&"a".repeat(56), true));
+        // Anything else a peer could park in the tracker db.
+        assert!(!AppState::is_overlay_self_host("", true));
+        assert!(!AppState::is_overlay_self_host("tooshort", true));
+        assert!(!AppState::is_overlay_self_host(&"a".repeat(57), true));
+        assert!(!AppState::is_overlay_self_host(&format!("{}-", "a".repeat(15)), true));
+
+        // i2p: the 52 char b32 label, with or without the `.b32` the
+        // transport carries. Never the full `.i2p` host.
+        let b32 = "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa";
+        assert_eq!(b32.len(), 52);
+        assert!(AppState::is_overlay_self_host(b32, false));
+        assert!(AppState::is_overlay_self_host(&format!("{b32}.b32"), false));
+        assert!(!AppState::is_overlay_self_host(&format!("{b32}.i2p"), false));
+        assert!(!AppState::is_overlay_self_host("", false));
+        assert!(!AppState::is_overlay_self_host("abcdefghij234567", false));
+    }
+
+    #[tokio::test]
+    async fn announce_serve_caps_hashes_and_screens_claimed_overlay_addrs() {
+        use epix_discovery::tracker_pc::AnnounceReq;
+
+        let state = AppState::new("test");
+        let hashes: Vec<[u8; 32]> = (0..200u16)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..2].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        let onion = "a".repeat(56);
+        let req = AnnounceReq {
+            hashes: hashes.clone(),
+            port: 26959,
+            need_types: vec!["onion".into()],
+            need_num: 20,
+            add: vec!["onion".into()],
+            onions: vec![onion.clone(), "not a real onion".into()],
+            ..Default::default()
+        };
+        let announcer = PeerAddr::parse("8.8.8.8:1111").unwrap();
+        let resp = state.announce_serve(&req, &announcer).await;
+        // 200 hashes in one small request would build a reply that cannot be
+        // framed; only the cap is answered.
+        assert_eq!(resp.peers.len(), AppState::ANNOUNCE_HASH_CAP);
+        // Only the well-formed onion was stored, under each named hash - the
+        // junk claim never entered the db.
+        assert_eq!(state.tracker_stats().await, (hashes.len(), hashes.len()));
+
+        // And it is what we hand back to the next requester.
+        let ask = AnnounceReq {
+            hashes: vec![hashes[0]],
+            need_types: vec!["onion".into()],
+            need_num: 20,
+            ..Default::default()
+        };
+        let other = PeerAddr::parse("9.9.9.9:2222").unwrap();
+        let resp = state.announce_serve(&ask, &other).await;
+        assert_eq!(resp.peers[0].unpack(), vec![PeerAddr::Onion { host: onion, port: 26959 }]);
+    }
+
     #[tokio::test]
     async fn tracker_back_off_after_repeated_errors() {
         let state = AppState::new("test");
@@ -13097,6 +13359,152 @@ mod tests {
         assert!(matches!(run(2, peer.clone()).await, PushOutcome::Unreachable(_)));
         // Came up then timed out -> Refused (alive), NOT Unreachable.
         assert!(matches!(run(3, peer.clone()).await, PushOutcome::Refused(..)));
+    }
+
+    /// A body-less push (the publisher dropped a >1 MB content.json) with no
+    /// usable sender wire address must still be fetched back: the push carries
+    /// the publisher's own dialable addresses, and the first one that answers
+    /// wins. Without the fallback the update was simply lost.
+    #[tokio::test]
+    async fn bodyless_push_refetches_from_the_advertised_publisher_addrs() {
+        struct Refetch {
+            good: PeerAddr,
+            signed: Vec<u8>,
+            tried: Arc<std::sync::Mutex<Vec<PeerAddr>>>,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for Refetch {
+            async fn fetch_signed(
+                &self,
+                peer: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
+                self.tried.lock().unwrap().push(peer.clone());
+                if peer == self.good {
+                    Ok(Some(self.signed.clone()))
+                } else {
+                    Err("unreachable".into())
+                }
+            }
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+            ) -> HashMap<String, Vec<u8>> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+                _: Arc<Vec<u8>>,
+                _: f64,
+                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+                _: Arc<Vec<String>>,
+                _: Arc<AtomicBool>,
+            ) -> Result<(), EdxPushError> {
+                unreachable!()
+            }
+            async fn fetch_files(
+                &self,
+                _: &str,
+                _: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
+                unreachable!()
+            }
+        }
+
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let mut v1 = json!({ "address": address, "modified": 1000, "files": {} });
+        epix_content::sign(&mut v1, &privkey).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("content.json", &serde_json::to_vec(&v1).unwrap()).unwrap();
+        let state = AppState::new("test");
+        state.add_xite(&address, XiteEntry { storage, content: Some(v1) }).await;
+
+        let mut v2 = json!({ "address": address, "modified": 2000, "files": {} });
+        epix_content::sign(&mut v2, &privkey).unwrap();
+
+        let dead = PeerAddr::parse("10.0.0.1:26959").unwrap();
+        let good = PeerAddr::parse("10.0.0.2:26959").unwrap();
+        let tried = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_edx_fetcher(Arc::new(Refetch {
+                good: good.clone(),
+                signed: serde_json::to_vec(&v2).unwrap(),
+                tried: tried.clone(),
+            }))
+            .await;
+
+        // No body and no sender address: only the advertised addresses are left.
+        let applied = state
+            .apply_inbound_update(
+                &address,
+                "content.json",
+                None,
+                None,
+                None,
+                Default::default(),
+                vec![dead.clone(), good.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, InboundUpdate::Applied);
+        // Tried in order, stopping at the first that answered.
+        assert_eq!(*tried.lock().unwrap(), vec![dead, good]);
+        assert_eq!(state.content(&address).await.unwrap()["modified"].as_i64(), Some(2000));
     }
 
     /// A pushed user-content update whose data file arrives as a DIFF PATCH
@@ -15639,5 +16047,263 @@ mod tests {
         // (python tallies both via its file_optional table).
         let (num, size) = state.optional_help_add("epix1help", "data/users/A", "T").await.unwrap();
         assert_eq!((num, size), (2, 740));
+    }
+
+    /// A record landing in an already sealed interval re-derives that interval
+    /// under a NEW root, so pinning every derivation would keep every
+    /// superseded copy on disk forever (eviction only reclaims refcount-0).
+    /// Also pins the skip-filter sibling, which is keyed by the hash of its own
+    /// bytes because that is the only key `insert_bytes` accepts.
+    #[test]
+    fn feed_objects_pin_settled_segments_and_release_superseded_roots() {
+        let dir = tempdir().unwrap();
+        let store = epix_blob::store::Store::open(dir.path()).unwrap();
+        let rec = |id: &str, body: &str, clock: u64| epix_feed::Record {
+            canonical: json!({ "id": id, "body": body }).to_string().into_bytes(),
+            id: id.to_string(),
+            author: "epix1author".to_string(),
+            target: String::new(),
+            clock,
+            kind: epix_feed::Kind::Post,
+        };
+        // Well past both the interval and its pin grace, so the segment counts
+        // as settled and gets pinned.
+        let ts = 10 * crate::feed::SEGMENT_INTERVAL_MS;
+
+        let first = crate::feed::derive_feed(vec![rec("a", "alpha bravo", 1_000)]);
+        AppState::pin_feed_objects(&store, &first, ts);
+        let root = first.sealed[0].root;
+        let filter_id = epix_blob::ObjId::of(&first.filters[0].to_bytes());
+        assert!(store.contains(root).unwrap(), "the segment blob is stored");
+        assert!(store.contains(filter_id).unwrap(), "the skip-filter sibling is stored");
+        assert_eq!(store.ref_delta(root, 0).unwrap(), 1, "a settled segment is pinned");
+        assert_eq!(store.ref_delta(filter_id, 0).unwrap(), 1);
+
+        // A second record in the SAME interval re-seals it under a new root.
+        let second = crate::feed::derive_feed(vec![
+            rec("a", "alpha bravo", 1_000),
+            rec("b", "charlie delta", 2_000),
+        ]);
+        assert_ne!(second.sealed[0].root, root, "the interval re-sealed");
+        AppState::pin_feed_objects(&store, &second, ts);
+        AppState::unpin_superseded_feed_objects(&store, &first, &second);
+        assert_eq!(store.ref_delta(root, 0).unwrap(), 0, "the superseded root is evictable");
+        assert_eq!(store.ref_delta(filter_id, 0).unwrap(), 0);
+        assert_eq!(
+            store.ref_delta(second.sealed[0].root, 0).unwrap(),
+            1,
+            "the current root stays pinned"
+        );
+
+        // The live tail (an interval still inside the grace window) churns on
+        // every merge, so it goes in unpinned - superseded copies must stay
+        // evictable.
+        let live = crate::feed::derive_feed(vec![rec("c", "echo foxtrot", ts)]);
+        AppState::pin_feed_objects(&store, &live, ts);
+        assert!(store.contains(live.sealed[0].root).unwrap(), "still stored, just not pinned");
+        assert_eq!(store.ref_delta(live.sealed[0].root, 0).unwrap(), 0, "live tail is unpinned");
+    }
+
+    /// Nothing is ever cached under a feed name the descriptors do not declare,
+    /// so recomputing on that miss would re-walk and re-verify the xite's whole
+    /// record set on every call.
+    #[tokio::test]
+    async fn an_undeclared_feed_name_never_triggers_a_recompute() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1feed", XiteEntry {
+                storage: XiteStorage::new(dir.path()),
+                content: Some(json!({
+                    "address": "epix1feed",
+                    "modified": 1.0,
+                    "files": {},
+                    "feeds": {
+                        "posts": {
+                            "files": "data/users/*/posts.json",
+                            "record_key": "post",
+                            "map": { "id": "post_id", "author": "author", "clock": "date_added" },
+                            "kind": { "default": "post" },
+                        }
+                    },
+                })),
+            })
+            .await;
+
+        assert!(state.feed_artifacts("epix1feed", "nope").await.is_none());
+        assert!(state.feed_cache.read().await.is_empty(), "no derivation ran");
+
+        // A declared name still recomputes on the first query after boot.
+        assert!(state.feed_artifacts("epix1feed", "posts").await.is_some());
+        assert!(state.feed_cache.read().await.contains_key("epix1feed"));
+    }
+
+    /// One `edx_fetch_files` call is a single uncancellable await, so the bulk
+    /// optional pass must batch and re-check the user's mandate between batches
+    /// - otherwise toggling a 200 GB site off keeps pulling to the end of the
+    /// list.
+    #[tokio::test]
+    async fn the_edx_bulk_optional_pass_batches_and_stops_when_the_mandate_drops() {
+        /// Records the size of every batch it is handed; on the first one it
+        /// pauses the xite, which withdraws the pass's mandate.
+        struct ChunkFetcher {
+            batches: Arc<std::sync::Mutex<Vec<usize>>>,
+            pause_after_first: Arc<std::sync::Mutex<Option<Arc<AppState>>>>,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for ChunkFetcher {
+            async fn fetch_files(
+                &self,
+                address: &str,
+                want: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                let first = {
+                    let mut b = self.batches.lock().unwrap();
+                    b.push(want.len());
+                    b.len() == 1
+                };
+                // Cloned out of the lock: never await holding a std guard.
+                let state = self.pause_after_first.lock().unwrap().clone();
+                if let (true, Some(state)) = (first, state) {
+                    if let Some(x) = state.xites.write().await.get_mut(address) {
+                        x.settings.serving = false;
+                    }
+                }
+                EdxBatch { done: Vec::new(), missed: Vec::new(), bytes: 0 }
+            }
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+            ) -> HashMap<String, Vec<u8>> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+                _: Arc<Vec<u8>>,
+                _: f64,
+                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+                _: Arc<Vec<String>>,
+                _: Arc<AtomicBool>,
+            ) -> Result<(), EdxPushError> {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
+                unreachable!()
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1bulk", XiteEntry {
+                storage: XiteStorage::new(dir.path()),
+                content: Some(json!({ "address": "epix1bulk", "modified": 1.0, "files": {} })),
+            })
+            .await;
+        state.add_peers("epix1bulk", [PeerAddr::parse("1.2.3.4:26959").unwrap()]).await;
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pause_after_first = Arc::new(std::sync::Mutex::new(None));
+        state
+            .set_edx_fetcher(Arc::new(ChunkFetcher {
+                batches: batches.clone(),
+                pause_after_first: pause_after_first.clone(),
+            }))
+            .await;
+
+        // Three chunks' worth of optional files.
+        let todo: Vec<(String, u64)> =
+            (0..EDX_BULK_OPTIONAL_CHUNK * 2 + 5).map(|i| (format!("f{i}.bin"), 10)).collect();
+        let mut queue: Vec<(usize, &String, u64)> =
+            todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        let (mut fetched, mut bytes_done) = (0usize, 0u64);
+
+        // Mandate held throughout: every file is offered, in bounded batches.
+        state
+            .edx_bulk_optional_pass(
+                "epix1bulk",
+                None,
+                &todo,
+                &mut queue,
+                &mut fetched,
+                &mut bytes_done,
+            )
+            .await;
+        let sizes = batches.lock().unwrap().clone();
+        assert_eq!(sizes.len(), 3, "one batch per chunk");
+        assert!(sizes.iter().all(|n| *n <= EDX_BULK_OPTIONAL_CHUNK), "batches are bounded");
+        assert_eq!(sizes.iter().sum::<usize>(), todo.len(), "every file was offered");
+
+        // Mandate withdrawn during the first batch: the pass stops instead of
+        // running the remaining chunks.
+        batches.lock().unwrap().clear();
+        *pause_after_first.lock().unwrap() = Some(state.clone());
+        state
+            .edx_bulk_optional_pass(
+                "epix1bulk",
+                None,
+                &todo,
+                &mut queue,
+                &mut fetched,
+                &mut bytes_done,
+            )
+            .await;
+        assert_eq!(batches.lock().unwrap().len(), 1, "stopped after the batch in flight");
     }
 }

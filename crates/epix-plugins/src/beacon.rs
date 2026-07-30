@@ -41,6 +41,15 @@ const PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 
 const WORKING_LIMIT: usize = 5;
 /// How many peers to ask per discovery pass.
 const DISCOVER_PEERS: usize = 5;
+/// Total time one discovery pass may spend asking peers, well inside
+/// [`REFRESH`] so the rest of the cycle (the announce set, the i2p gating,
+/// the book) is never delayed past the next tick.
+const DISCOVER_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+/// Longest announcer entry accepted from anywhere (peer gossip, a published
+/// list, the book on disk). The longest real one is a v3 onion at 75 chars.
+/// Peer-gossiped entries are otherwise unbounded, and they end up in our own
+/// single-frame `GetTrackers` reply.
+const MAX_ENTRY_LEN: usize = 128;
 
 pub struct BeaconPlugin;
 
@@ -144,10 +153,17 @@ async fn discover_from_peers(state: &Arc<AppState>, book: &mut TrackerBook) {
             break;
         }
     }
+    // The EDX call bounds its own dial (45s on an overlay) and request (30s),
+    // but five of those in sequence outlast REFRESH, so the pass gets a
+    // deadline of its own. It is spent, not divided: a warm overlay dial still
+    // gets the time it needs, a stalled one just costs the peers behind it.
+    let started = std::time::Instant::now();
     for peer in peers.into_iter().take(DISCOVER_PEERS) {
-        // The EDX control request already carries its own dial + request
-        // bounds, so this needs no outer timeout.
-        let Some(Ok(list)) = state.edx_get_trackers(peer).await else { continue };
+        let Some(left) = DISCOVER_BUDGET.checked_sub(started.elapsed()) else { break };
+        let Ok(Some(Ok(list))) = tokio::time::timeout(left, state.edx_get_trackers(peer)).await
+        else {
+            continue;
+        };
         for entry in list {
             if parse_tracker_line(&entry).is_some() && book.found(&entry) {
                 break; // one new announcer per peer per pass
@@ -319,6 +335,9 @@ fn render_list(epix: &[String], bt: &[String]) -> String {
 /// unbracketed IPv6 hosts and stray spaces.
 fn parse_tracker_line(line: &str) -> Option<Tracker> {
     let s = line.trim();
+    if s.len() > MAX_ENTRY_LEN {
+        return None;
+    }
     if s.starts_with("udp://") || s.starts_with("http://") || s.starts_with("https://") {
         return Tracker::parse(s);
     }
@@ -650,6 +669,14 @@ mod tests {
             Some(Tracker::Epix(PeerAddr::I2p { .. }))
         ));
         assert!(parse_tracker_line("").is_none());
+        // A peer can gossip any string it likes. An oversized one would be
+        // stored in the book, re-announced, and handed back in our own
+        // single-frame tracker reply, which no peer could then decode.
+        let huge = format!("onion://{}.onion:15441", "a".repeat(60_000));
+        assert!(parse_tracker_line(&huge).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = TrackerBook::load(&dir.path().join("trackers.json"));
+        assert!(!book.found(&huge), "oversized entry never enters the book");
     }
 
     #[test]

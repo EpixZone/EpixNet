@@ -270,6 +270,15 @@ fn serialize_datamap(chunks: &[ChunkRef], mode: Mode) -> Vec<u8> {
     out
 }
 
+/// Whether a `body_len`-byte data-map body holds exactly `count` 68-byte
+/// entries. The product is taken in u64 because `count * 68` in usize wraps
+/// on 32-bit targets (count is attacker-supplied), which would let a short
+/// body pass and then over-allocate. A true result also bounds
+/// `count <= body_len / 68` on every width.
+fn body_len_matches(count: u32, body_len: usize) -> bool {
+    body_len as u64 == count as u64 * 68
+}
+
 fn deserialize_datamap(bytes: &[u8]) -> Result<(Vec<ChunkRef>, Mode), SelfEncError> {
     if bytes.len() < 5 {
         return Err(SelfEncError::MalformedDatamap);
@@ -279,11 +288,13 @@ fn deserialize_datamap(bytes: &[u8]) -> Result<(Vec<ChunkRef>, Mode), SelfEncErr
         1 => Mode::RandomKey,
         _ => return Err(SelfEncError::MalformedDatamap),
     };
-    let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
     let body = &bytes[5..];
-    if body.len() != count * 68 {
+    if !body_len_matches(count, body.len()) {
         return Err(SelfEncError::MalformedDatamap);
     }
+    // Bounded by the check above, so `i * 68` below stays inside `body`.
+    let count = count as usize;
     let mut chunks = Vec::with_capacity(count);
     for i in 0..count {
         let o = i * 68;
@@ -536,6 +547,69 @@ mod tests {
             let (got, got_mode) = open_datamap(sealed, &vk).unwrap();
             assert_eq!(&got, chunks);
             assert_eq!(got_mode, mode);
+        }
+    }
+
+    /// Regression for the data-map count overflow: the entry count is
+    /// attacker-influenced, so the body-length check must not wrap. On
+    /// 32-bit targets `count * 68` in usize wrapped for
+    /// count = 63_161_284 (68 * count = 2^32 + 16), letting a 16-byte body
+    /// pass and then asking for a ~4.3 GB allocation. The widened compare
+    /// rejects every mismatch on both widths.
+    #[test]
+    fn deserialize_rejects_bogus_count() {
+        let cases: [(u32, usize); 4] = [
+            // 68 * count == 2^32 + 16, the wrapping case.
+            (63_161_284, 16),
+            (u32::MAX, 68),
+            // Plain mismatches that must stay rejected.
+            (2, 68),
+            (0, 68),
+        ];
+        for (count, body_len) in cases {
+            assert!(
+                !body_len_matches(count, body_len),
+                "count {count} must not match a {body_len}-byte body"
+            );
+            let mut bytes = vec![0u8]; // mode = SaltedConvergent
+            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.resize(bytes.len() + body_len, 0);
+            assert_eq!(
+                deserialize_datamap(&bytes),
+                Err(SelfEncError::MalformedDatamap),
+                "count {count} with a {body_len}-byte body must be rejected"
+            );
+        }
+
+        // A well-formed data-map still parses.
+        let enc = encrypt_convergent(&data(CHUNK_SIZE + 3), b"salt");
+        let wire = serialize_datamap(&enc.chunks, enc.mode);
+        assert_eq!(deserialize_datamap(&wire).unwrap(), (enc.chunks, enc.mode));
+    }
+
+    /// The wrap the widened check exists to stop. On a 64-bit host the old
+    /// `count * 68` in usize happens to reject the same inputs, so
+    /// `deserialize_rejects_bogus_count` alone cannot show the difference
+    /// there. This pins it by modelling the 32-bit product directly, so the
+    /// divergence is asserted on every target CI builds.
+    #[test]
+    fn body_len_check_does_not_wrap_on_32_bit() {
+        // What `body.len() != count * 68` computed when usize is 32 bits.
+        fn matches_in_32_bit_usize(count: u32, body_len: usize) -> bool {
+            body_len as u32 == count.wrapping_mul(68)
+        }
+        // 68 * 63_161_284 == 2^32 + 16: the 32-bit product is 16, so the old
+        // check accepted a 16-byte body and then asked for ~4.3 GB.
+        assert!(
+            matches_in_32_bit_usize(63_161_284, 16),
+            "vector must be the one a 32-bit multiply mis-accepts"
+        );
+        assert!(!body_len_matches(63_161_284, 16), "the widened check must reject it");
+        // Honest lengths agree on both widths, so nothing legitimate is lost.
+        for count in [0u32, 1, 2, 100, 1000] {
+            let body_len = count as usize * 68;
+            assert!(body_len_matches(count, body_len), "count {count} must accept its own body");
+            assert!(matches_in_32_bit_usize(count, body_len));
         }
     }
 }

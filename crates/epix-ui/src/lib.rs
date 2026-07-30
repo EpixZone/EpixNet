@@ -2090,6 +2090,13 @@ async fn redirect_add(Path(address): Path<String>) -> Redirect {
     Redirect::temporary(&format!("/{address}/"))
 }
 
+/// Max bytes one Range response serves. A media element opens a file with
+/// `bytes=0-`; serving that literally would pull the whole object - over the
+/// network for a file we do not hold yet - into one response. A short 206 is
+/// valid: the player asks for the next window as it plays. Same window as
+/// epix-bt's streaming cap.
+const RANGE_MAX_CHUNK: u64 = 4 * 1024 * 1024;
+
 async fn serve_file(
     State(ctx): State<Ctx>,
     Path((address, mut path)): Path<(String, String)>,
@@ -2156,13 +2163,16 @@ async fn serve_file(
     // assets still serve as they land: only an already-running page asks for
     // them, and each request waits for its own file (EpixNet's needFile).
     let is_html = content_type(&path).starts_with("text/html");
-    // A Range request for a declared big file we haven't started downloading:
-    // it serves through the piecewise Range branch below (which creates the
-    // sparse file and pulls just the pieces the range needs), so neither the
-    // whole-file fetch gate nor the clone wait loop may swallow it.
+    // A Range request for a declared file we haven't started downloading: it
+    // serves through the Range branch below, which pulls only the bytes the
+    // range covers (EDX chunk groups for a `b3` entry, pieces for a legacy
+    // piecemap), so neither the whole-file fetch gate nor the clone wait loop
+    // may swallow it. An entry with neither is not range-fetchable and keeps
+    // the whole-file path.
     let range_bigfile = headers.get(header::RANGE).is_some()
         && !ctx.state.xite_file_exists(&address, &path).await
-        && ctx.state.bigfile_total(&address, &path).await.is_some();
+        && (ctx.state.bigfile_total(&address, &path).await.is_some()
+            || ctx.state.edx_resolve(&address, &path).await.is_some());
     // An asset request for a file we don't hold but whose content.json (root
     // or a child's - a per-user optional avatar, a merged site's lazy asset)
     // declares: fetch just that file from peers (EpixNet's `needFile`) instead
@@ -2280,7 +2290,10 @@ async fn serve_file(
         };
         if let (Some(total), Some((start, end))) = (total, parse_range(range)) {
             if start < total {
-                let end = end.unwrap_or(total - 1).min(total - 1);
+                let end = end
+                    .unwrap_or(total - 1)
+                    .min(total - 1)
+                    .min(start.saturating_add(RANGE_MAX_CHUNK - 1));
                 let len = (end - start + 1) as usize;
                 // EDX: fetch just this range over the verified path and serve it
                 // straight from the object store (media seek, no whole-file

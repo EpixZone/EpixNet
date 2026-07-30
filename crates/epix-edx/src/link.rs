@@ -61,6 +61,10 @@ pub async fn accept(stream: PeerStream) -> io::Result<Link> {
 /// the mux. There is no Noise channel binding, so serve/client_hello take
 /// `None` as the handshake hash; identity rests on the overlay endpoint plus
 /// the Hello node key, exactly as the plan describes for overlays.
+///
+/// Skipping Noise also skips its record deadlines, so the only I/O deadline
+/// an overlay link has is the one [`Conn`] applies to each frame write. A
+/// peer that stops reading its circuit is unwound by that and nothing else.
 pub async fn accept_overlay(stream: PeerStream) -> io::Result<(Conn, mpsc::Receiver<Incoming>)> {
     let mut stream = stream;
     frame::read_magic(&mut stream).await?;

@@ -128,10 +128,23 @@ mod tests {
     #[test]
     fn tombstoned_comment_is_not_counted() {
         let (items, mut records) = gallery();
-        // Moderate comment c1: the victim id lives in the tombstone's target.
-        records.push(test_record("t1", "mod", "c1", 20, Kind::Tombstone));
+        // Moderate comment c1. The tombstone has the shape the adapter
+        // emits: target = its own id, author = the item's author (a
+        // moderation tombstone keeps the original author too, only its
+        // signature comes from the moderator).
+        records.push(test_record("c1", "u1", "c1", 20, Kind::Tombstone));
         let roll = Rollup::compute(&items, &records);
         assert_eq!(roll.get("gif1").unwrap().comment_count, 1, "tombstoned comment excluded");
+    }
+
+    #[test]
+    fn another_authors_tombstone_does_not_drop_the_count() {
+        let (items, mut records) = gallery();
+        // Mallory self-signs a tombstone carrying u1's comment id. It only
+        // covers her own items, so u1's comment keeps counting.
+        records.push(test_record("c1", "mallory", "c1", 20, Kind::Tombstone));
+        let roll = Rollup::compute(&items, &records);
+        assert_eq!(roll.get("gif1").unwrap().comment_count, 2, "foreign tombstone ignored");
     }
 
     #[test]

@@ -80,30 +80,19 @@ pub struct FeedArtifacts {
     pub filters: Vec<Xor8>,
 }
 
-/// Domain separator for the skip-filter sibling object key. Part of the frozen
-/// format: changing it re-keys every filter on the network.
-const SKIP_FILTER_DOMAIN: &[u8] = b"epix-feed-skipfilter-v1";
-
-/// The EDX object id a segment's skip-filter is stored under: a SIBLING object
-/// keyed by the segment root, not a field folded into the segment itself.
-///
-/// Folding the filter into the segment root would be a stronger commitment (the
-/// owner's signature would then cover the filter), but it changes `Segment`'s
-/// byte format and therefore every segment root already derived, and it would
-/// make a filter-format revision a consensus break for the whole feed. A
-/// sibling object costs nothing in trust: the filter is only ever used to SKIP
-/// work, and every surviving candidate is fetched and verified against the
-/// segment root anyway, so a wrong or hostile filter can waste a fetch or hide
-/// a result but can never forge one. Any node re-derives the true filter from
-/// the segment bytes it already verified.
-pub fn skip_filter_id(segment_root: ObjId) -> ObjId {
-    let mut buf = Vec::with_capacity(SKIP_FILTER_DOMAIN.len() + 32);
-    buf.extend_from_slice(SKIP_FILTER_DOMAIN);
-    buf.extend_from_slice(&segment_root.0);
-    ObjId::of(&buf)
-}
-
 /// Build the deterministic XOR8 skip-filter over one sealed segment's terms.
+///
+/// The filter is a SIBLING object, not a field folded into the segment root.
+/// Folding it in would be a stronger commitment (the owner's signature would
+/// then cover the filter), but it changes `Segment`'s byte format and therefore
+/// every segment root already derived, and it would make a filter-format
+/// revision a break for the whole feed. A sibling object costs nothing in
+/// trust: the filter only ever SKIPS work, and every surviving candidate is
+/// fetched and verified against the segment root anyway, so a wrong or hostile
+/// filter can waste a fetch or hide a result but can never forge one. Any node
+/// re-derives the true filter from the segment bytes it already verified. The
+/// store keys it by the BLAKE3 of its own bytes like any other object (see
+/// `AppState::pin_feed_objects`).
 ///
 /// DETERMINISM: the input is the segment's canonical record bytes (already
 /// frozen by `seal`), the tokenizer is `epix_search::tokenize` (frozen v1:
@@ -235,6 +224,13 @@ pub fn segment_search(art: &FeedArtifacts, terms: &[String], limit: usize) -> Va
             terms.iter().flat_map(|t| epix_search::tokenize(t)).collect();
         t.sort();
         t.dedup();
+        // The command layer caps the number of query STRINGS (and the bytes of
+        // each), but the work here is per TOKEN and one string tokenizes into
+        // many, so cap the tokens where the cost actually lands. Truncating
+        // instead of erroring keeps AND-semantics sound: a subset of the terms
+        // matches a superset of the records, and every pointer we return is
+        // range-fetched and verified by the caller anyway.
+        t.truncate(crate::command::FEED_SEARCH_MAX_TERMS);
         t
     };
     let mut hits = Vec::new();
@@ -739,8 +735,26 @@ mod tests {
         }
     }
 
+    /// One query STRING tokenizes into as many terms as it holds words, so the
+    /// command layer's cap on the number of strings does not bound the per-term
+    /// work here. Regression: a single long string used to hand `segment_search`
+    /// an unbounded term list (a filter probe per term per segment, plus a term
+    /// scan per record).
     #[test]
-    fn skip_filters_are_deterministic_and_keyed_by_segment_root() {
+    fn one_long_query_string_is_capped_at_the_term_limit() {
+        let art = derive_feed(vec![comment_saying("c1", "p1", 1000, false, "banana")]);
+        let words: Vec<String> = (0..50).map(|i| format!("word{i:02}")).collect();
+        let resp = segment_search(&art, &[words.join(" ")], 50);
+        let terms = resp["terms"].as_array().unwrap();
+        assert_eq!(
+            terms.len(),
+            crate::command::FEED_SEARCH_MAX_TERMS,
+            "50 tokens in one string must be cut to the cap, got {terms:?}"
+        );
+    }
+
+    #[test]
+    fn skip_filters_are_deterministic_and_round_trip_their_stored_bytes() {
         // Any node rebuilds byte-identical filters from the same records, in
         // any delivery order - the Phase-G determinism requirement.
         let base = vec![
@@ -760,11 +774,11 @@ mod tests {
         let back = epix_search::xor8::Xor8::from_bytes(&a_bytes[0]).unwrap();
         assert!(back.contains(epix_search::term_hash("alpha")));
 
-        // The sibling key is a pure function of the segment root, and distinct
-        // from it (so it cannot collide with the segment object itself).
-        let root = a.sealed[0].root;
-        assert_eq!(skip_filter_id(root), skip_filter_id(root));
-        assert_ne!(skip_filter_id(root), root);
+        // The store keys the sibling by the BLAKE3 of its own bytes, so equal
+        // filter bytes land under one id and it never collides with the
+        // segment object itself.
+        assert_eq!(ObjId::of(&a_bytes[0]), ObjId::of(&b_bytes[0]));
+        assert_ne!(ObjId::of(&a_bytes[0]), a.sealed[0].root);
     }
 
     #[test]

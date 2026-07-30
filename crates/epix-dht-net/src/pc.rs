@@ -10,6 +10,26 @@ use epix_core::PeerAddr;
 use epix_dht::{Contact, NodeId, Request, Response};
 use serde::{Deserialize, Serialize};
 
+/// Longest onion host / i2p destination accepted from a peer. A v3 onion
+/// label is 56 chars and an i2p b32 label 52 (plus its `.b32` suffix), so
+/// anything longer is junk. Unbounded it would sit in the routing table or
+/// the peer store until restart and push our own honest replies past the EDX
+/// frame cap, which the writer cannot encode.
+pub(crate) const MAX_HOST_LEN: usize = 64;
+
+/// Whether a peer-claimed address may enter the routing table or the peer
+/// store: a complete, dialable shape, with a bounded overlay host.
+pub(crate) fn usable_addr(addr: &PeerAddr) -> bool {
+    if !addr.is_wellformed() {
+        return false;
+    }
+    match addr {
+        PeerAddr::Onion { host, .. } => host.len() <= MAX_HOST_LEN,
+        PeerAddr::I2p { dest, .. } => dest.len() <= MAX_HOST_LEN,
+        _ => true,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PcContact {
     id: [u8; 32],
@@ -68,8 +88,15 @@ fn contacts_out(nodes: &[Contact]) -> Vec<PcContact> {
     nodes.iter().map(PcContact::from).collect()
 }
 
+/// Contacts learned from a response go straight into the routing table, which
+/// never evicts, so a peer that answers with junk addresses poisons us for the
+/// life of the process. Same gate as the serve path, applied on the way in.
 fn contacts_in(nodes: Vec<PcContact>) -> Vec<Contact> {
-    nodes.into_iter().map(PcContact::into_contact).collect()
+    nodes
+        .into_iter()
+        .filter(|c| usable_addr(&c.addr))
+        .map(PcContact::into_contact)
+        .collect()
 }
 
 /// Encode a request (with the caller's contact) for an EDX `Kad` payload.
@@ -214,6 +241,30 @@ mod tests {
                 assert_eq!(peers, vec![p]);
                 assert_eq!(nodes, vec![c]);
             }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unusable_contact_in_a_response_is_dropped() {
+        // A response is the other way a contact reaches the routing table, and
+        // it skips the serve-path check entirely.
+        let good = Contact::new(NodeId::hash(b"good"), addr("198.51.100.4:26552"));
+        let huge = Contact::new(
+            NodeId::hash(b"huge"),
+            PeerAddr::Onion { host: "a".repeat(MAX_HOST_LEN + 1), port: 26552 },
+        );
+        let nodes = vec![huge, good.clone()];
+
+        match round_trip_resp(Response::Nodes(nodes.clone())).1 {
+            Response::Nodes(nodes) => assert_eq!(nodes, vec![good.clone()]),
+            other => panic!("got {other:?}"),
+        }
+
+        // The nodes list of a Peers answer is the same door.
+        let resp = Response::Peers { peers: vec![], nodes };
+        match round_trip_resp(resp).1 {
+            Response::Peers { nodes, .. } => assert_eq!(nodes, vec![good]),
             other => panic!("got {other:?}"),
         }
     }

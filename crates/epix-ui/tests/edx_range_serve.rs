@@ -1,0 +1,194 @@
+//! A Range request for a declared EDX file we do not hold yet must serve
+//! through the EDX seek path (only the bytes the range covers) instead of the
+//! whole-file `file_need` download, and one response never carries more than a
+//! single window.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use epix_core::PeerAddr;
+use epix_ui::state::{
+    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, XiteEntry,
+};
+use epix_ui::UiServer;
+use epix_xite::XiteStorage;
+use serde_json::json;
+use tower::ServiceExt;
+
+/// Serves ranges out of an in-memory body and counts whole-file fetches, so a
+/// test can tell the seek path from the whole-file download.
+struct RangeFetcher {
+    body: Vec<u8>,
+    whole_file_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl EdxFetcher for RangeFetcher {
+    async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+        self.whole_file_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(false)
+    }
+    async fn fetch_signed(
+        &self,
+        _: PeerAddr,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        unreachable!()
+    }
+    async fn fetch_signed_many(
+        &self,
+        _: &str,
+        _: Vec<String>,
+        _: Vec<PeerAddr>,
+    ) -> HashMap<String, Vec<u8>> {
+        unreachable!()
+    }
+    async fn fetch_range(
+        &self,
+        _: &str,
+        _: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let end = (start as usize).saturating_add(len as usize).min(self.body.len());
+        let start = (start as usize).min(end);
+        Ok(Some(self.body[start..end].to_vec()))
+    }
+    async fn push_update(
+        &self,
+        _: PeerAddr,
+        _: &str,
+        _: &str,
+        _: Arc<Vec<u8>>,
+        _: f64,
+        _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+        _: Arc<Vec<String>>,
+        _: Arc<AtomicBool>,
+    ) -> Result<(), EdxPushError> {
+        unreachable!()
+    }
+    async fn fetch_files(
+        &self,
+        _: &str,
+        _: Vec<EdxWant>,
+        _: Vec<PeerAddr>,
+        _: Option<EdxBatchProgress>,
+    ) -> EdxBatch {
+        unreachable!()
+    }
+    async fn list_signed(
+        &self,
+        _: PeerAddr,
+        _: &str,
+        _: u64,
+    ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+        unreachable!()
+    }
+    async fn pex(
+        &self,
+        _: PeerAddr,
+        _: &str,
+        _: u32,
+        _: Vec<PeerAddr>,
+    ) -> Result<Vec<PeerAddr>, String> {
+        unreachable!()
+    }
+    async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+        unreachable!()
+    }
+    async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+        unreachable!()
+    }
+    async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+        unreachable!()
+    }
+    async fn updates_since(
+        &self,
+        _: PeerAddr,
+        _: u64,
+    ) -> Result<(Vec<(String, i64)>, u64), String> {
+        unreachable!()
+    }
+}
+
+/// A registered xite declaring `media/movie.mp4` with `b3` + `size` (an EDX
+/// entry, no piecemap) that is NOT on disk, plus a fetcher that can serve its
+/// ranges. Returns the router and the whole-file fetch counter.
+async fn router_with_declared_edx_file(body: &[u8]) -> (axum::Router, Arc<AtomicUsize>) {
+    let state = AppState::new("range-test");
+    let dir = tempfile::tempdir().unwrap();
+    let id = epix_blob::ObjId::of(body);
+    state
+        .add_xite("1RangeTest", XiteEntry {
+            storage: XiteStorage::new(dir.path().join("site")),
+            content: Some(json!({
+                "address": "1RangeTest",
+                "files": {
+                    "media/movie.mp4": { "size": body.len(), "b3": id.to_string() }
+                },
+            })),
+        })
+        .await;
+    let whole_file_calls = Arc::new(AtomicUsize::new(0));
+    state
+        .set_edx_fetcher(Arc::new(RangeFetcher {
+            body: body.to_vec(),
+            whole_file_calls: whole_file_calls.clone(),
+        }))
+        .await;
+    std::mem::forget(dir);
+    (UiServer::new(state).router(), whole_file_calls)
+}
+
+fn get_range(uri: &str, range: &str) -> axum::extract::Request {
+    axum::extract::Request::builder()
+        .uri(uri)
+        .header("referer", "http://localhost/1RangeTest/")
+        .header("range", range)
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+/// `(status, content-range, body)` of a response.
+async fn parts(resp: axum::response::Response) -> (u16, String, Vec<u8>) {
+    let status = resp.status().as_u16();
+    let range = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 24).await.unwrap().to_vec();
+    (status, range, body)
+}
+
+#[tokio::test]
+async fn range_of_a_missing_edx_file_seeks_instead_of_downloading_the_whole_file() {
+    let body: Vec<u8> = (0..2048).map(|i| i as u8).collect();
+    let (router, whole_file_calls) = router_with_declared_edx_file(&body).await;
+    let resp =
+        router.oneshot(get_range("/1RangeTest/media/movie.mp4", "bytes=0-1023")).await.unwrap();
+    let (status, content_range, served) = parts(resp).await;
+    assert_eq!(status, 206);
+    assert_eq!(content_range, "bytes 0-1023/2048");
+    assert_eq!(served.as_slice(), &body[..1024]);
+    assert_eq!(
+        whole_file_calls.load(Ordering::SeqCst),
+        0,
+        "the range must not trigger a whole-file fetch"
+    );
+}
+
+#[tokio::test]
+async fn an_open_ended_range_serves_one_window_not_the_whole_file() {
+    let body: Vec<u8> = (0..5 * 1024 * 1024).map(|i| i as u8).collect();
+    let (router, whole_file_calls) = router_with_declared_edx_file(&body).await;
+    let resp = router.oneshot(get_range("/1RangeTest/media/movie.mp4", "bytes=0-")).await.unwrap();
+    let (status, content_range, served) = parts(resp).await;
+    assert_eq!(status, 206);
+    assert_eq!(served.len(), 4 * 1024 * 1024, "one window, not the whole 5 MiB file");
+    assert_eq!(content_range, format!("bytes 0-{}/{}", 4 * 1024 * 1024 - 1, body.len()));
+    assert_eq!(whole_file_calls.load(Ordering::SeqCst), 0);
+}

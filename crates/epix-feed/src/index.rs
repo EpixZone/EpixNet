@@ -35,20 +35,29 @@ impl TargetIndex {
     /// Fold one sealed segment's records into the index.
     pub fn add_segment(&mut self, seg: &Segment) {
         let extents = record_extents(seg);
+        let mut touched: Vec<String> = Vec::with_capacity(seg.records.len());
         for (r, (_addr, off, len)) in seg.records.iter().zip(extents) {
             // A comment/reaction indexes under its target; a top-level
             // post indexes under its own id so its detail page finds it.
             let key = if r.target.is_empty() { r.id.clone() } else { r.target.clone() };
-            self.map.entry(key).or_default().push(Loc {
+            self.map.entry(key.clone()).or_default().push(Loc {
                 segment_root: seg.root,
                 offset: off,
                 len,
             });
+            touched.push(key);
         }
-        // Keep each target's locations in a canonical order.
-        for locs in self.map.values_mut() {
-            locs.sort();
-            locs.dedup();
+        // Keep each target's locations in a canonical order. Only the
+        // targets this segment touched can be out of order; every other
+        // one was left canonical by the call that last touched it, so
+        // re-sorting the whole map would cost O(segments x targets).
+        touched.sort();
+        touched.dedup();
+        for key in &touched {
+            if let Some(locs) = self.map.get_mut(key) {
+                locs.sort();
+                locs.dedup();
+            }
         }
     }
 
@@ -123,6 +132,29 @@ mod tests {
             let slice = &seg.bytes[loc.offset as usize..loc.offset as usize + loc.len as usize];
             // The located bytes are a real record's canonical bytes.
             assert!(ObjId::of(slice).0 != [0u8; 32]);
+        }
+    }
+
+    #[test]
+    fn adding_a_second_segment_keeps_every_target_canonical() {
+        // add_segment re-sorts only the targets it touched, so a target
+        // carried over from an earlier segment must still come out sorted
+        // and deduped, whatever order the segments arrive in.
+        let early = seal(&records(), 3);
+        let late = seal(&records(), 100);
+        let mut a = TargetIndex::new();
+        a.add_segment(&early);
+        a.add_segment(&late);
+        let mut b = TargetIndex::new();
+        b.add_segment(&late);
+        b.add_segment(&early);
+        assert_eq!(a.root(), b.root(), "segment order must not change the index root");
+        for target in ["p1", "p2"] {
+            let locs = a.locations(target);
+            let mut canonical = locs.to_vec();
+            canonical.sort();
+            canonical.dedup();
+            assert_eq!(locs, canonical.as_slice(), "{target} locations must stay canonical");
         }
     }
 

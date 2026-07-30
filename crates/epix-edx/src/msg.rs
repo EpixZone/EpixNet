@@ -10,8 +10,8 @@
 //! the same stream id; everything else answers with a single `Resp`.
 //! `HaveRanges` is a notification (no response). Object bytes always
 //! travel as verified bao slices (`docs/edx-slice-format.md`) except
-//! `GetMany`, whose sub-4 KiB whole blobs are verified by whole-blob
-//! hash on arrival.
+//! `GetMany`, whose sub-64 KiB whole blobs (`server::MAX_MANY_ITEM_BYTES`)
+//! are verified by whole-blob hash on arrival.
 
 use epix_blob::ObjId;
 use epix_core::PeerAddr;

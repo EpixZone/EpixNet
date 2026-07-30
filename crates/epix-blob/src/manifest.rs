@@ -106,7 +106,16 @@ pub struct ShardEntry {
 /// The owner salt for salted-convergent shards (from `edx_salt`, hex).
 pub fn edx_salt(content: &Value) -> Option<Vec<u8>> {
     let hex = content.get("edx_salt")?.as_str()?;
-    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
+    // The value comes from a remote (owner-signed, but unvalidated)
+    // content.json: reject odd lengths here and use `get` below so a
+    // multi-byte char cannot slice off a char boundary.
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|p| u8::from_str_radix(p, 16).ok()))
+        .collect()
 }
 
 /// Read one file's encrypted-shard entry from `files_shard`.
@@ -486,6 +495,21 @@ mod tests {
         let ab = parent(&a, &b);
         let root = parent(&ab, &d); // odd leaf promoted, then paired
         ObjId(root).to_string()
+    }
+
+    #[test]
+    fn malformed_edx_salt_is_rejected() {
+        let salt = |s: &str| edx_salt(&json!({"edx_salt": s}));
+        assert_eq!(salt("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        // Odd length: the last pair would read past the end of the string.
+        assert_eq!(salt("abc"), None);
+        // Multi-byte chars: a byte range can land off a char boundary.
+        assert_eq!(salt("aa\u{20ac}b"), None);
+        assert_eq!(salt("\u{20ac}\u{20ac}"), None);
+        // Non-hex digits stay a parse failure, not a panic.
+        assert_eq!(salt("zz"), None);
+        assert_eq!(edx_salt(&json!({"edx_salt": 1})), None);
+        assert_eq!(edx_salt(&json!({})), None);
     }
 
     #[test]

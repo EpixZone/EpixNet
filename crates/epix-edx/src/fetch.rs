@@ -18,6 +18,27 @@ use epix_blob::{Ns, ObjId};
 use crate::conn::Conn;
 use crate::msg::{err, FrameBody, Req, Resp};
 
+// Client-side caps on a multi-frame reply. The peer decides when a stream
+// ends (`last: true`), so every drain loop needs its own budget or a peer
+// that never terminates grows our accumulator without bound. The honest
+// server fills each frame to BATCH_BUDGET before sending the next, so a
+// real reply hits its entry cap long before the frame cap.
+const MAX_LIST_ENTRIES: usize = 100_000;
+const MAX_UPDATE_HINTS: usize = 100_000;
+const MAX_REPLY_FRAMES: usize = 4096;
+/// Cap on a reassembled `GetSigned` body. Generous for a content.json (the
+/// biggest real ones are a couple of MiB) and finite, so a peer cannot
+/// stream unbounded bytes into our RAM on a request that has no other size
+/// hint. Public because the serving side caps its read at the same value:
+/// serving less than a client accepts makes such a xite uncloneable.
+pub const MAX_SIGNED_BYTES: usize = 8 << 20;
+
+/// How long one `GetRange` stream waits for its NEXT frame. A peer that
+/// answers once and then stalls would otherwise hold the stream open until
+/// the whole connection dies. The scheduler caps the total wait, so this
+/// only has to catch that, and stays generous.
+const RANGE_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn proto_err(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
 }
@@ -80,8 +101,26 @@ pub async fn fetch_ranges(
     let cap = (requested + requested / 50 + (1 << 20)).min(crate::server::MAX_BYTES_PER_REQ * 2);
     let mut slice = Vec::new();
     loop {
-        match rx.recv().await {
+        // Per-frame deadline: the byte cap only bounds a peer that keeps
+        // sending, not one that answers a frame and then goes quiet.
+        let next = match tokio::time::timeout(RANGE_FRAME_TIMEOUT, rx.recv()).await {
+            Ok(next) => next,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "peer stalled mid-slice",
+                ))
+            }
+        };
+        match next {
             Some(FrameBody::Data { last, bytes }) => {
+                // The byte cap is the only bound on this loop, so a frame
+                // that adds no bytes must not be allowed to repeat forever.
+                // FrameSink only emits a non-terminal frame once it is full
+                // (server.rs), so no honest server sends one.
+                if bytes.is_empty() && !last {
+                    return Err(proto_err("peer sent an empty non-terminal data frame"));
+                }
                 if slice.len() as u64 + bytes.len() as u64 > cap {
                     return Err(proto_err("peer sent more slice bytes than the request implies"));
                 }
@@ -150,14 +189,40 @@ pub async fn push_update(
 }
 
 /// Fetch a signed content.json (raw bytes — caller verifies signature).
+/// A big site's content.json does not fit one frame (see `serve_signed`),
+/// so this drains the stream until the terminal frame and concatenates,
+/// instead of taking the first response. Bounded by [`MAX_SIGNED_BYTES`]:
+/// the request carries no size hint, so without a cap a peer could stream
+/// bytes into our RAM for as long as it liked.
 pub async fn fetch_signed(conn: &Conn, xite: &str, inner_path: &str) -> std::io::Result<Vec<u8>> {
-    match conn
-        .request(Req::GetSigned { xite: xite.into(), inner_path: inner_path.into() })
-        .await?
-    {
-        Resp::Signed { bytes } => Ok(bytes),
-        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
-        other => Err(proto_err(format!("expected Signed, got {other:?}"))),
+    let mut rx = conn
+        .request_stream(Req::GetSigned { xite: xite.into(), inner_path: inner_path.into() })
+        .await?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut frames = 0usize;
+    loop {
+        match rx.recv().await {
+            Some(FrameBody::Resp { last, resp: Resp::Signed { bytes } }) => {
+                frames += 1;
+                if frames > MAX_REPLY_FRAMES || out.len() + bytes.len() > MAX_SIGNED_BYTES {
+                    return Err(proto_err("oversize Signed reply"));
+                }
+                out.extend_from_slice(&bytes);
+                if last {
+                    return Ok(out);
+                }
+            }
+            Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
+                return Err(remote_err(code, &msg))
+            }
+            Some(other) => return Err(proto_err(format!("expected Signed, got {other:?}"))),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "connection closed mid-signed",
+                ))
+            }
+        }
     }
 }
 
@@ -172,9 +237,14 @@ pub async fn list_signed(
 ) -> std::io::Result<Vec<(String, u64, u64)>> {
     let mut rx = conn.request_stream(Req::ListSigned { xite: xite.into(), since }).await?;
     let mut out: Vec<(String, u64, u64)> = Vec::new();
+    let mut frames = 0usize;
     loop {
         match rx.recv().await {
             Some(FrameBody::Resp { last, resp: Resp::SignedList { entries } }) => {
+                frames += 1;
+                if frames > MAX_REPLY_FRAMES || out.len() + entries.len() > MAX_LIST_ENTRIES {
+                    return Err(proto_err("oversize SignedList reply"));
+                }
                 out.extend(entries);
                 if last {
                     return Ok(out);
@@ -204,12 +274,40 @@ pub async fn fetch_many(
     now: u64,
 ) -> std::io::Result<(usize, Vec<ObjId>)> {
     let mut rx = conn.request_stream(Req::GetMany { objs: objs.to_vec() }).await?;
+    // Same contract as fetch_ranges: an abandoned or timed-out GetMany must
+    // tell the peer to stop encoding instead of leaving it streaming.
+    let mut guard = CancelOnAbandon { conn, stream: rx.id, armed: true };
+    let want: std::collections::HashSet<ObjId> = objs.iter().copied().collect();
+    // What an honest serve_many can send at most: one item per requested id,
+    // each at most MAX_MANY_ITEM_BYTES.
+    let cap = objs.len() as u64 * crate::server::MAX_MANY_ITEM_BYTES;
+    let mut received = 0u64;
+    let mut frames = 0usize;
     let mut got: std::collections::HashSet<ObjId> = std::collections::HashSet::new();
     let mut inserted = 0usize;
     loop {
         match rx.recv().await {
             Some(FrameBody::Resp { last, resp: Resp::Many { items } }) => {
+                frames += 1;
+                if frames > MAX_REPLY_FRAMES {
+                    return Err(proto_err(
+                        "peer sent more GetMany frames than the request implies",
+                    ));
+                }
                 for (id, bytes) in items {
+                    // Unrequested bytes count against the budget too, or a
+                    // peer could stream junk blobs at us for free.
+                    received += bytes.len() as u64;
+                    if received > cap {
+                        return Err(proto_err(
+                            "peer sent more GetMany bytes than the request implies",
+                        ));
+                    }
+                    // Never persist a blob we did not ask for: insert_bytes
+                    // only proves the bytes hash to `id`, not that we wanted it.
+                    if !want.contains(&id) {
+                        continue;
+                    }
                     // insert_bytes re-verifies BLAKE3(bytes) == id; a lying
                     // peer's blob fails here and is not counted.
                     let store = store.clone();
@@ -239,6 +337,8 @@ pub async fn fetch_many(
             }
         }
     }
+    // The stream ended on its own; there is nothing to cancel.
+    guard.armed = false;
     let missing = objs.iter().filter(|o| !got.contains(o)).copied().collect();
     Ok((inserted, missing))
 }
@@ -281,9 +381,14 @@ pub async fn fetch_has_shards(conn: &Conn, addrs: &[ObjId]) -> std::io::Result<V
 pub async fn updates_since(conn: &Conn, after: u64) -> std::io::Result<(Vec<(String, i64)>, u64)> {
     let mut rx = conn.request_stream(Req::UpdatesSince { after }).await?;
     let mut out: Vec<(String, i64)> = Vec::new();
+    let mut frames = 0usize;
     loop {
         match rx.recv().await {
             Some(FrameBody::Resp { last, resp: Resp::Updates { updates, head } }) => {
+                frames += 1;
+                if frames > MAX_REPLY_FRAMES || out.len() + updates.len() > MAX_UPDATE_HINTS {
+                    return Err(proto_err("oversize Updates reply"));
+                }
                 out.extend(updates);
                 if last {
                     return Ok((out, head));
@@ -455,5 +560,178 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!server.take_cancelled(stream), "a completed fetch must not cancel its stream");
+    }
+
+    /// An empty non-terminal Data frame adds no bytes, so the byte cap can
+    /// never trip on it: a peer could send them forever and keep the fetch
+    /// alive. The honest server never emits one, so it must be rejected.
+    #[tokio::test]
+    async fn an_empty_non_terminal_data_frame_is_rejected() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let inc = server_in.recv().await.expect("server received the GetRange");
+            let body = FrameBody::Data { last: false, bytes: vec![] };
+            for _ in 0..4 {
+                let frame = Frame { stream: inc.stream, body: body.clone() };
+                if srv.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let obj = ObjId::of(b"empty-frames");
+        let size = 1000u64;
+        store.ensure_sparse(obj, Ns::Plain, size, 1).unwrap();
+
+        let want = [0..size];
+        let err = fetch_ranges(&client, &store, obj, size, &want, 0, 1).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        drop(server);
+    }
+
+    /// A GetMany answer may only carry blobs we asked for. An unrequested
+    /// blob still hashes to its own id, so insert_bytes would accept it and
+    /// fsync attacker-chosen bytes into the slab.
+    #[tokio::test]
+    async fn fetch_many_ignores_blobs_it_did_not_request() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let wanted = test_data(1024);
+        let junk = test_data(2048);
+        let want_id = ObjId::of(&wanted);
+        let junk_id = ObjId::of(&junk);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let inc = server_in.recv().await.expect("server received the GetMany");
+            let _ = srv
+                .send(Frame {
+                    stream: inc.stream,
+                    body: FrameBody::Resp {
+                        last: true,
+                        resp: Resp::Many { items: vec![(want_id, wanted), (junk_id, junk)] },
+                    },
+                })
+                .await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let (inserted, missing) = fetch_many(&client, &store, &[want_id], 3).await.unwrap();
+        assert_eq!(inserted, 1, "only the requested blob counts");
+        assert!(missing.is_empty(), "the requested blob arrived");
+        assert!(store.contains(want_id).unwrap(), "the requested blob landed");
+        assert!(!store.contains(junk_id).unwrap(), "an unrequested blob must never be stored");
+        drop(server);
+    }
+
+    /// The peer decides when a streamed list ends, so a peer that never
+    /// sets `last` must not be able to grow our accumulator without bound.
+    #[tokio::test]
+    async fn an_endless_signed_list_is_cut_off() {
+        const PER_FRAME: usize = 10_000;
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let inc = server_in.recv().await.expect("server received the ListSigned");
+            // Just past MAX_LIST_ENTRIES, every frame non-terminal.
+            for _ in 0..(MAX_LIST_ENTRIES / PER_FRAME + 1) {
+                let entries: Vec<(String, u64, u64)> =
+                    (0..PER_FRAME).map(|_| (String::new(), 0, 0)).collect();
+                let frame = Frame {
+                    stream: inc.stream,
+                    body: FrameBody::Resp { last: false, resp: Resp::SignedList { entries } },
+                };
+                if srv.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let err = list_signed(&client, "1Abc", 0).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        drop(server);
+    }
+
+    /// A signed body larger than one frame arrives as several `Signed`
+    /// frames and must reassemble byte-identically (see `serve_signed`).
+    #[tokio::test]
+    async fn a_chunked_signed_body_reassembles() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let body = test_data(150_000);
+        let expect = body.clone();
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let inc = server_in.recv().await.expect("server received the GetSigned");
+            let mut off = 0usize;
+            while off < body.len() {
+                let end = (off + 60_000).min(body.len());
+                let last = end == body.len();
+                let frame = Frame {
+                    stream: inc.stream,
+                    body: FrameBody::Resp {
+                        last,
+                        resp: Resp::Signed { bytes: body[off..end].to_vec() },
+                    },
+                };
+                if srv.send(frame).await.is_err() {
+                    return;
+                }
+                off = end;
+            }
+        });
+
+        let got = fetch_signed(&client, "1Abc", "content.json").await.unwrap();
+        assert_eq!(got, expect, "every chunk survives reassembly");
+        drop(server);
+    }
+
+    /// The peer decides when a streamed body ends and `GetSigned` carries no
+    /// size hint, so a peer that never sets `last` must not be able to grow
+    /// our accumulator without bound.
+    #[tokio::test]
+    async fn an_endless_signed_body_is_cut_off() {
+        const PER_FRAME: usize = 60_000;
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let inc = server_in.recv().await.expect("server received the GetSigned");
+            // Just past MAX_SIGNED_BYTES, every frame non-terminal.
+            for _ in 0..(MAX_SIGNED_BYTES / PER_FRAME + 1) {
+                let frame = Frame {
+                    stream: inc.stream,
+                    body: FrameBody::Resp {
+                        last: false,
+                        resp: Resp::Signed { bytes: vec![0u8; PER_FRAME] },
+                    },
+                };
+                if srv.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let err = fetch_signed(&client, "1Abc", "content.json").await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        drop(server);
     }
 }

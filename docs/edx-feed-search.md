@@ -44,11 +44,27 @@ can only omit or waste a fetch, never inject a fake match.
   separator in v1 (a vendored normalization table is a future format
   bump, never a silent change).
 - **Term hash** (frozen): `BLAKE3(term)[..8]` little-endian → u64.
-- **Track 1 — XOR8 skip-filter**: per-segment committed xor filter (no
-  false negatives). Walk the spine, pull the tiny filters, skip segments
+- **Track 1 — XOR8 skip-filter**: per-segment xor filter (no false
+  negatives). Walk the spine, pull the tiny filters, skip segments
   rejecting all query terms, fetch+verify candidates. Seed schedule is
-  fixed (`xor8::SEEDS`) so the filter is deterministic and content-
-  addressable. ~0.39% false positive, ~9.84 bits/entry.
+  fixed (`xor8::SEEDS`), so the same segment always rebuilds the same
+  filter bytes on any node. ~0.39% false positive, ~9.84 bits/entry.
+  - *Addressing*: a filter is a SIBLING object, not a field folded into
+    the segment root, and it is content-addressed by the BLAKE3 of its
+    OWN bytes like every other blob. It cannot be keyed off the segment
+    root: the object store verifies the bytes it is given against the id
+    it is given, so only the content address ever inserts. That makes
+    `segment_root → filter_id` a real mapping someone has to publish next
+    to the spine/checkpoint before a peer can pull a filter for a segment
+    it has not already fetched.
+  - *Status*: that mapping is not published yet, so the skip-scan is
+    LOCAL-ONLY today. A node skips segments using filters it derived
+    itself from records it already holds; a remote peer has no way to
+    name the filter object. The trust story does not change when the
+    mapping ships: the filter is outside the owner's signature, but it
+    only ever SKIPS work, and every surviving candidate is fetched and
+    verified against the segment root, so a wrong or hostile filter can
+    waste a fetch or hide a result and never forge one.
 - **Track 2 — inverted index** (`EDXSHRD1` shards, `EDXMETA1` meta):
   `SHARD_COUNT = 256` shards, `term_hash % SHARD_COUNT`; each shard is a
   sorted `term_hash → [pointer]`. A query fetches the meta then one

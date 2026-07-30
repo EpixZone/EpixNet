@@ -27,10 +27,10 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::bitfield::{groups_for_bytes, GroupBits};
+use crate::bitfield::{groups_for_bytes, GroupBits, GROUP_BYTES};
 use crate::verified::{self, outboard_size, OutboardBytes};
 use crate::{Ns, ObjId};
 
@@ -39,6 +39,25 @@ const SLABS: TableDefinition<u32, &[u8]> = TableDefinition::new("slabs");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 const SCHEMA_VERSION: u64 = 1;
+
+/// Hard ceiling on a declared object size. [`Store::ensure_sparse`] takes
+/// the size from an untrusted publisher's manifest before any peer has
+/// proven the object exists, so the reservation it makes must be bounded.
+pub const MAX_OBJECT_BYTES: u64 = 64 << 30;
+
+/// Ceiling on the store's outstanding reservation: the sum, over sparse
+/// records, of the declared bytes no peer has sent yet.
+///
+/// The quota charges held bytes, never the declared size, so one bogus
+/// manifest entry cannot wipe the cache. But [`Store::ensure_sparse`]
+/// pre-sizes the file pair with `set_len`, and that is a free hole only on
+/// filesystems that support one: on NTFS the clusters are really allocated,
+/// so unfilled reservations consume disk the quota cannot see. Bounding
+/// them keeps "enforce_quota bounds total disk" true there too. The floor is
+/// [`MAX_OBJECT_BYTES`]: anything lower would reclaim a single legal
+/// max-size fetch while it is still running. Reclaim is LRU, so a
+/// reservation that is making progress is the last one considered.
+pub const MAX_RESERVED_BYTES: u64 = 2 * MAX_OBJECT_BYTES;
 
 /// Where an object's bytes live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,16 +80,56 @@ struct ObjRecord {
     last_access: u64,
 }
 
+/// Decode a present set we persisted ourselves. Unlike
+/// [`GroupBits::from_wire`] this applies no run cap: the runs come from our
+/// own `to_wire`, not from a peer, and a comb-shaped set on a multi-gigabyte
+/// object can legitimately hold more runs than the peer-facing decoder
+/// accepts. Capping here would silently empty the record, and the next
+/// `write_slice` would fold into that empty set and persist it, discarding
+/// every group the object holds.
+fn bits_from_local(wire: &[u64]) -> GroupBits {
+    let mut bits = GroupBits::new();
+    let mut cursor = 0u64;
+    let mut present = true; // the first run counts present groups
+    for &run in wire {
+        let end = cursor.saturating_add(run);
+        if present && run > 0 {
+            bits.add(cursor..end);
+        }
+        cursor = end;
+        present = !present;
+    }
+    bits
+}
+
 impl ObjRecord {
     fn bits(&self) -> GroupBits {
         match self.loc {
             Loc::Slab { .. } => GroupBits::complete(self.size),
-            Loc::Sparse => GroupBits::from_wire(&self.present).unwrap_or_default(),
+            Loc::Sparse => bits_from_local(&self.present),
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(self.loc, Loc::Slab { .. }) || self.bits().is_complete(self.size)
+    }
+
+    /// Bytes actually held on disk. The quota charges this and never
+    /// `size`: `size` is a declared value from an untrusted manifest, so
+    /// a record for an object nobody ever sent must charge nothing.
+    fn held(&self) -> u64 {
+        match self.loc {
+            Loc::Slab { .. } => self.size,
+            Loc::Sparse => {
+                let mut held = 0u64;
+                for r in self.bits().ranges() {
+                    let start = r.start.saturating_mul(GROUP_BYTES).min(self.size);
+                    let end = r.end.saturating_mul(GROUP_BYTES).min(self.size);
+                    held = held.saturating_add(end - start);
+                }
+                held
+            }
+        }
     }
 }
 
@@ -237,6 +296,56 @@ impl Store {
         txn.commit().map_err(db_err)
     }
 
+    /// Read-modify-write one record inside a single write transaction.
+    /// Callers that do slow IO (streaming a slice to a peer, decoding one)
+    /// must land their change this way: redb serializes write txns, so a
+    /// concurrent `present`/`refcount` update is folded in rather than
+    /// clobbered by the stale snapshot the caller started from.
+    fn update_record_with(
+        &self,
+        id: ObjId,
+        durability: Durability,
+        f: impl FnOnce(&mut ObjRecord),
+    ) -> io::Result<ObjRecord> {
+        let mut txn = self.db.begin_write().map_err(db_err)?;
+        txn.set_durability(durability).map_err(db_err)?;
+        let updated;
+        {
+            let mut table = txn.open_table(OBJECTS).map_err(db_err)?;
+            let mut rec: ObjRecord = match table.get(id.0.as_slice()).map_err(db_err)? {
+                Some(g) => dec(g.value())?,
+                None => {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, format!("object {id}")))
+                }
+            };
+            f(&mut rec);
+            table.insert(id.0.as_slice(), enc(&rec).as_slice()).map_err(db_err)?;
+            updated = rec;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(updated)
+    }
+
+    fn update_record(&self, id: ObjId, f: impl FnOnce(&mut ObjRecord)) -> io::Result<ObjRecord> {
+        self.update_record_with(id, Durability::Immediate, f)
+    }
+
+    /// Bump an object's LRU stamp. Non-durable on purpose: every read a
+    /// peer asks for touches, and an fsync per touch serializes the whole
+    /// store behind the disk. A stamp lost to a crash only costs eviction
+    /// ordering, and the next real write commits durably.
+    fn touch(&self, id: ObjId, now: u64) -> io::Result<()> {
+        let r = self.update_record_with(id, Durability::None, |rec| {
+            rec.last_access = rec.last_access.max(now);
+        });
+        match r {
+            Ok(_) => Ok(()),
+            // Evicted between the read and the touch: nothing to stamp.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     fn required(&self, id: ObjId) -> io::Result<ObjRecord> {
         self.get_record(id)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("object {id}")))
@@ -275,9 +384,10 @@ impl Store {
                 format!("bytes do not hash to {id}"),
             ));
         }
-        if let Some(mut rec) = self.get_record(id)? {
-            rec.last_access = rec.last_access.max(now);
-            self.put_record(id, &rec)?;
+        if let Some(rec) = self.get_record(id)? {
+            if rec.last_access < now {
+                self.touch(id, now)?;
+            }
             return Ok(false);
         }
 
@@ -345,9 +455,10 @@ impl Store {
         path: &std::path::Path,
         now: u64,
     ) -> io::Result<bool> {
-        if let Some(mut rec) = self.get_record(id)? {
-            rec.last_access = rec.last_access.max(now);
-            self.put_record(id, &rec)?;
+        if let Some(rec) = self.get_record(id)? {
+            if rec.last_access < now {
+                self.touch(id, now)?;
+            }
             return Ok(false);
         }
         let size = fs::metadata(path)?.len();
@@ -382,24 +493,41 @@ impl Store {
     /// Create the sparse file pair for an object we are about to fetch.
     /// Idempotent: an existing record (sparse or slab) is left alone.
     pub fn ensure_sparse(&self, id: ObjId, ns: Ns, size: u64, now: u64) -> io::Result<()> {
+        if size > MAX_OBJECT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("declared size {size} exceeds the {MAX_OBJECT_BYTES} byte object cap"),
+            ));
+        }
         if self.get_record(id)?.is_some() {
             return Ok(());
         }
-        let data = File::create(self.sparse_path(id))?;
-        data.set_len(size)?;
-        let obao = File::create(self.obao_path(id))?;
-        obao.set_len(outboard_size(size))?;
-        self.put_record(
-            id,
-            &ObjRecord {
-                size,
-                ns: ns_to_u8(ns),
-                loc: Loc::Sparse,
-                present: Vec::new(),
-                refcount: 0,
-                last_access: now,
-            },
-        )
+        // Never truncate: readahead and the foreground serve legitimately
+        // call this for the same brand-new object, and the racer that gets
+        // here second must not throw away bytes the first one has already
+        // verified into the file.
+        ensure_len(&self.sparse_path(id), size)?;
+        ensure_len(&self.obao_path(id), outboard_size(size))?;
+        // Claim the record with an insert-if-absent inside one write txn,
+        // for the same reason: a blind put would clobber the present set a
+        // racer committed between the check above and here.
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
+            let taken = objects.get(id.0.as_slice()).map_err(db_err)?.is_some();
+            if !taken {
+                let rec = ObjRecord {
+                    size,
+                    ns: ns_to_u8(ns),
+                    loc: Loc::Sparse,
+                    present: Vec::new(),
+                    refcount: 0,
+                    last_access: now,
+                };
+                objects.insert(id.0.as_slice(), enc(&rec).as_slice()).map_err(db_err)?;
+            }
+        }
+        txn.commit().map_err(db_err)
     }
 
     /// Decode a verified slice into a sparse object: data lands at its
@@ -412,7 +540,7 @@ impl Store {
         encoded: impl Read,
         now: u64,
     ) -> io::Result<()> {
-        let mut rec = self.required(id)?;
+        let rec = self.required(id)?;
         let Loc::Sparse = rec.loc else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "object is slab-complete"));
         };
@@ -430,13 +558,18 @@ impl Store {
         data.sync_data()?;
         obao.sync_data()?;
 
-        let mut bits = rec.bits();
-        for r in byte_ranges {
-            bits.add(groups_for_bytes(r));
-        }
-        rec.present = bits.to_wire();
-        rec.last_access = rec.last_access.max(now);
-        self.put_record(id, &rec)
+        // Fold the new groups into whatever the record holds NOW, not into
+        // the snapshot taken before the decode: another writer may have
+        // committed groups of the same object while this decode ran.
+        self.update_record(id, |cur| {
+            let mut bits = cur.bits();
+            for r in byte_ranges {
+                bits.add(groups_for_bytes(r));
+            }
+            cur.present = bits.to_wire();
+            cur.last_access = cur.last_access.max(now);
+        })?;
+        Ok(())
     }
 
     /// Serve a verified slice for the requested ranges. Fails with
@@ -449,7 +582,7 @@ impl Store {
         out: impl Write,
         now: u64,
     ) -> io::Result<()> {
-        let mut rec = self.required(id)?;
+        let rec = self.required(id)?;
         let bits = rec.bits();
         for r in byte_ranges {
             if !bits.contains_all(&groups_for_bytes(r)) {
@@ -477,14 +610,20 @@ impl Store {
                 verified::encode_slice(&bytes[..], &ob, byte_ranges, out)?;
             }
         }
-        rec.last_access = rec.last_access.max(now);
-        self.put_record(id, &rec)
+        // `out` is the peer's sink, so the encode above can park on peer
+        // backpressure for minutes. Only stamp the LRU here; writing the
+        // pre-encode snapshot back would revert everything the fetch path
+        // committed meanwhile.
+        if rec.last_access < now {
+            self.touch(id, now)?;
+        }
+        Ok(())
     }
 
     /// Read a COMPLETE object's bytes (verified for slab objects by the
     /// caller's own use; sparse completeness comes from verified writes).
     pub fn read_bytes(&self, id: ObjId, now: u64) -> io::Result<Vec<u8>> {
-        let mut rec = self.required(id)?;
+        let rec = self.required(id)?;
         if !rec.is_complete() {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("{id} incomplete")));
         }
@@ -504,8 +643,9 @@ impl Store {
             }
             Loc::Sparse => fs::read(self.sparse_path(id))?,
         };
-        rec.last_access = rec.last_access.max(now);
-        self.put_record(id, &rec)?;
+        if rec.last_access < now {
+            self.touch(id, now)?;
+        }
         Ok(bytes)
     }
 
@@ -515,7 +655,7 @@ impl Store {
     /// only the range from disk, so a media seek never materializes the whole
     /// file.
     pub fn read_range(&self, id: ObjId, start: u64, len: u64, now: u64) -> io::Result<Vec<u8>> {
-        let mut rec = self.required(id)?;
+        let rec = self.required(id)?;
         let end = start.saturating_add(len).min(rec.size);
         if start >= rec.size || end <= start {
             return Ok(Vec::new());
@@ -545,8 +685,9 @@ impl Store {
                 buf
             }
         };
-        rec.last_access = rec.last_access.max(now);
-        self.put_record(id, &rec)?;
+        if rec.last_access < now {
+            self.touch(id, now)?;
+        }
         Ok(bytes)
     }
 
@@ -560,9 +701,9 @@ impl Store {
     /// Bump / drop manifest references. An object with refcount 0 is
     /// eviction-eligible; eviction never touches refcounted objects.
     pub fn ref_delta(&self, id: ObjId, delta: i64) -> io::Result<u32> {
-        let mut rec = self.required(id)?;
-        rec.refcount = (rec.refcount as i64 + delta).max(0) as u32;
-        self.put_record(id, &rec)?;
+        let rec = self.update_record(id, |cur| {
+            cur.refcount = (cur.refcount as i64 + delta).max(0) as u32;
+        })?;
         Ok(rec.refcount)
     }
 
@@ -599,7 +740,55 @@ impl Store {
         Ok(())
     }
 
-    /// Total logical bytes of all stored objects (the quota basis).
+    /// Delete an object only if it is still unreferenced, deciding and
+    /// removing in one write transaction. Eviction snapshots its candidate
+    /// list minutes before it reaches a given object; redb serializes write
+    /// txns, so a `pin` committed after that snapshot is seen here and the
+    /// object is left alone. Returns the deleted record, `None` if the
+    /// object was pinned meanwhile or is already gone.
+    fn delete_if_unreferenced(&self, id: ObjId) -> io::Result<Option<ObjRecord>> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        let deleted: Option<ObjRecord>;
+        {
+            let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
+            let cur: Option<ObjRecord> = match objects.get(id.0.as_slice()).map_err(db_err)? {
+                Some(g) => Some(dec(g.value())?),
+                None => None,
+            };
+            match cur {
+                Some(rec) if rec.refcount == 0 => {
+                    objects.remove(id.0.as_slice()).map_err(db_err)?;
+                    if let Loc::Slab { slab, .. } = rec.loc {
+                        let mut slabs = txn.open_table(SLABS).map_err(db_err)?;
+                        let meta: Option<SlabMeta> = slabs
+                            .get(slab)
+                            .map_err(db_err)?
+                            .map(|g| dec::<SlabMeta>(g.value()))
+                            .transpose()?;
+                        if let Some(mut m) = meta {
+                            m.dead += rec.size;
+                            slabs.insert(slab, enc(&m).as_slice()).map_err(db_err)?;
+                        }
+                    }
+                    deleted = Some(rec);
+                }
+                _ => deleted = None,
+            }
+        }
+        txn.commit().map_err(db_err)?;
+        if let Some(rec) = &deleted {
+            if let Loc::Sparse = rec.loc {
+                let _ = fs::remove_file(self.sparse_path(id));
+                let _ = fs::remove_file(self.obao_path(id));
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Bytes actually held by all stored objects (the quota basis). A
+    /// record's declared `size` is not charged: it comes from an untrusted
+    /// manifest, so one bogus entry could otherwise blow the whole quota
+    /// and evict every other cached object.
     pub fn total_bytes(&self) -> io::Result<u64> {
         let txn = self.db.begin_read().map_err(db_err)?;
         let table = txn.open_table(OBJECTS).map_err(db_err)?;
@@ -607,14 +796,14 @@ impl Store {
         for row in table.iter().map_err(db_err)? {
             let (_, v) = row.map_err(db_err)?;
             let rec: ObjRecord = dec(v.value())?;
-            total = total.saturating_add(rec.size);
+            total = total.saturating_add(rec.held());
         }
         Ok(total)
     }
 
-    /// Total logical bytes of all held objects in one namespace. Used as a
-    /// volunteer's soft budget gate (stop pulling shards once `Ns::Shard`
-    /// reaches its donated quota). Reads only `(ns, size)` per record - no
+    /// Bytes actually held in one namespace. Used as a volunteer's soft
+    /// budget gate (stop pulling shards once `Ns::Shard` reaches its
+    /// donated quota). Reads only `(ns, size, present)` per record - no
     /// shard-to-xite association is ever consulted, preserving deniability.
     pub fn ns_bytes(&self, ns: Ns) -> io::Result<u64> {
         let want = ns_to_u8(ns);
@@ -625,7 +814,7 @@ impl Store {
             let (_, v) = row.map_err(db_err)?;
             let rec: ObjRecord = dec(v.value())?;
             if rec.ns == want {
-                total = total.saturating_add(rec.size);
+                total = total.saturating_add(rec.held());
             }
         }
         Ok(total)
@@ -635,30 +824,84 @@ impl Store {
     /// Idempotent: raises refcount to at least 1, never higher, so repeated
     /// registration across restarts does not inflate it.
     pub fn pin(&self, id: ObjId) -> io::Result<()> {
-        let mut rec = self.required(id)?;
-        if rec.refcount == 0 {
-            rec.refcount = 1;
-            self.put_record(id, &rec)?;
+        // Cheap pre-check so re-registering an already pinned object costs
+        // no write txn; the write itself re-checks under the txn.
+        if self.required(id)?.refcount != 0 {
+            return Ok(());
         }
+        self.update_record(id, |cur| {
+            if cur.refcount == 0 {
+                cur.refcount = 1;
+            }
+        })?;
         Ok(())
     }
 
     /// Enforce a byte quota: if the store exceeds `quota`, evict LRU
     /// refcount-0 (unpinned, i.e. cached-from-others) objects down to it.
-    /// Returns bytes freed. Pinned own content is never touched.
+    /// Also caps the outstanding reservation (see [`MAX_RESERVED_BYTES`]),
+    /// which the held-byte quota cannot see. Returns bytes freed. Pinned
+    /// own content is never touched.
     pub fn enforce_quota(&self, quota: u64) -> io::Result<u64> {
+        let mut freed = self.enforce_reservation_bound()?;
         let total = self.total_bytes()?;
-        if total <= quota {
+        if total > quota {
+            freed = freed.saturating_add(self.evict_lru(total - quota)?);
+        }
+        Ok(freed)
+    }
+
+    /// Reclaim LRU unreferenced sparse records until the store's outstanding
+    /// reservation is back under [`MAX_RESERVED_BYTES`]. Returns the held
+    /// bytes freed. A record only counts while it is short of its declared
+    /// size, so a completed object never keeps this pass busy, and the sort
+    /// is by `last_access`: a fetch that is still landing groups stamps
+    /// itself on every `write_slice`, so it is the last candidate reached.
+    fn enforce_reservation_bound(&self) -> io::Result<u64> {
+        let mut reserved = 0u64;
+        // (last_access, id, unfilled bytes) for the reclaimable ones.
+        let mut candidates: Vec<(u64, ObjId, u64)> = Vec::new();
+        {
+            let txn = self.db.begin_read().map_err(db_err)?;
+            let table = txn.open_table(OBJECTS).map_err(db_err)?;
+            for row in table.iter().map_err(db_err)? {
+                let (k, v) = row.map_err(db_err)?;
+                let rec: ObjRecord = dec(v.value())?;
+                let Loc::Sparse = rec.loc else { continue };
+                let unfilled = rec.size.saturating_sub(rec.held());
+                if unfilled == 0 {
+                    continue;
+                }
+                reserved = reserved.saturating_add(unfilled);
+                if rec.refcount == 0 {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(k.value());
+                    candidates.push((rec.last_access, ObjId(id), unfilled));
+                }
+            }
+        }
+        if reserved <= MAX_RESERVED_BYTES {
             return Ok(0);
         }
-        self.evict_lru(total - quota)
+        candidates.sort();
+        let mut freed = 0u64;
+        for (_, id, unfilled) in candidates {
+            if reserved <= MAX_RESERVED_BYTES {
+                break;
+            }
+            if let Some(rec) = self.delete_if_unreferenced(id)? {
+                reserved = reserved.saturating_sub(unfilled);
+                freed = freed.saturating_add(rec.held());
+            }
+        }
+        Ok(freed)
     }
 
     /// Evict least-recently-used refcount-0 objects until at least
     /// `bytes_needed` are freed (or candidates run out). Returns freed
     /// bytes. Sealed slabs past the dead threshold are compacted.
     pub fn evict_lru(&self, bytes_needed: u64) -> io::Result<u64> {
-        let mut candidates: Vec<(u64, ObjId, u64)> = Vec::new();
+        let mut candidates: Vec<(u64, ObjId)> = Vec::new();
         {
             let txn = self.db.begin_read().map_err(db_err)?;
             let table = txn.open_table(OBJECTS).map_err(db_err)?;
@@ -668,19 +911,20 @@ impl Store {
                 if rec.refcount == 0 {
                     let mut id = [0u8; 32];
                     id.copy_from_slice(k.value());
-                    candidates.push((rec.last_access, ObjId(id), rec.size));
+                    candidates.push((rec.last_access, ObjId(id)));
                 }
             }
         }
         candidates.sort();
         let mut freed = 0u64;
-        for (_, id, size) in candidates {
+        for (_, id) in candidates {
             if freed >= bytes_needed {
                 break;
             }
-            if let Some(rec) = self.get_record(id)? {
-                self.delete_object(id, &rec)?;
-                freed += size;
+            // Re-check refcount inside the delete txn: this loop is one
+            // committed txn per object, so a pin can land after the scan.
+            if let Some(rec) = self.delete_if_unreferenced(id)? {
+                freed += rec.held();
             }
         }
         self.compact_if_worthwhile()?;
@@ -727,8 +971,9 @@ impl Store {
             v
         };
 
-        for (id, mut rec) in live {
+        for (id, rec) in live {
             let Loc::Slab { off, .. } = rec.loc else { continue };
+            let was = Loc::Slab { slab: victim, off };
             let bytes = self.read_slab(victim, off, rec.size)?;
 
             let mut open = self.open_slab.lock().expect("slab lock");
@@ -747,8 +992,23 @@ impl Store {
             let txn = self.db.begin_write().map_err(db_err)?;
             {
                 let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
-                rec.loc = Loc::Slab { slab, off: new_off };
-                objects.insert(id.0.as_slice(), enc(&rec).as_slice()).map_err(db_err)?;
+                // Re-read the row inside the txn and rewrite only `loc`. The
+                // snapshot above was taken before a long run of reads and
+                // fsyncs, so a pin, a ref_delta or an eviction can have
+                // landed since; inserting the snapshot back would revert the
+                // refcount or resurrect an object eviction just removed.
+                let cur: Option<ObjRecord> = match objects.get(id.0.as_slice()).map_err(db_err)? {
+                    Some(g) => Some(dec(g.value())?),
+                    None => None,
+                };
+                let moved = match cur {
+                    Some(mut cur) if cur.loc == was => {
+                        cur.loc = Loc::Slab { slab, off: new_off };
+                        objects.insert(id.0.as_slice(), enc(&cur).as_slice()).map_err(db_err)?;
+                        true
+                    }
+                    _ => false,
+                };
                 let mut slabs = txn.open_table(SLABS).map_err(db_err)?;
                 let mut m: SlabMeta = slabs
                     .get(slab)
@@ -757,6 +1017,13 @@ impl Store {
                     .transpose()?
                     .unwrap_or_default();
                 m.len = new_len;
+                if !moved {
+                    // The bytes are already appended and the tracked len has
+                    // to cover them or the next insert is mis-addressed, but
+                    // nothing points at them: book them as dead so a later
+                    // compaction reclaims the space.
+                    m.dead = m.dead.saturating_add(bytes.len() as u64);
+                }
                 if m.len >= self.cfg.slab_seal_bytes {
                     m.sealed = true;
                     slabs.insert(slab + 1, enc(&SlabMeta::default()).as_slice()).map_err(db_err)?;
@@ -784,7 +1051,7 @@ impl Store {
     /// shrink the present set to what actually verifies (used after a
     /// crash or a failed serve — distrust, don't repair).
     pub fn revalidate(&self, id: ObjId) -> io::Result<GroupBits> {
-        let mut rec = self.required(id)?;
+        let rec = self.required(id)?;
         let Loc::Sparse = rec.loc else {
             return Ok(GroupBits::complete(rec.size));
         };
@@ -811,9 +1078,17 @@ impl Store {
                 }
             }
         }
-        rec.present = kept.to_wire();
-        self.put_record(id, &rec)?;
-        Ok(kept)
+        // Subtract only the groups that failed, so groups a concurrent
+        // write_slice added during the (slow) re-hash are not dropped.
+        let failed = kept.added_in(&claimed);
+        let updated = self.update_record(id, |cur| {
+            let mut bits = cur.bits();
+            for r in failed.ranges() {
+                bits.remove(r.clone());
+            }
+            cur.present = bits.to_wire();
+        })?;
+        Ok(updated.bits())
     }
 
     /// Total bytes of all indexed objects (present or claimed).
@@ -830,9 +1105,317 @@ impl Store {
     }
 }
 
+/// Create `path` if it is missing and grow it to `len`, never shrinking it.
+/// `File::create` would truncate, which is wrong for a file another task may
+/// already have written verified bytes into.
+fn ensure_len(path: &std::path::Path, len: u64) -> io::Result<()> {
+    let f = OpenOptions::new().create(true).write(true).truncate(false).open(path)?;
+    if f.metadata()?.len() < len {
+        f.set_len(len)?;
+    }
+    Ok(())
+}
+
 fn ns_to_u8(ns: Ns) -> u8 {
     match ns {
         Ns::Plain => 0,
         Ns::Shard => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_data(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
+    }
+
+    fn slice_for(data: &[u8], ranges: &[Range<u64>]) -> (ObjId, u64, Vec<u8>) {
+        let ob = OutboardBytes::from_slice(data);
+        let mut out = Vec::new();
+        verified::encode_slice(data, &ob, ranges, &mut out).unwrap();
+        (ob.root, ob.size, out)
+    }
+
+    /// A peer sink that commits store work the first time the encode writes
+    /// to it, standing in for a slow peer that lets the fetch path land more
+    /// groups (and a pin) while the serve is parked on backpressure.
+    struct Meddler<'a> {
+        store: &'a Store,
+        id: ObjId,
+        ranges: &'a [Range<u64>],
+        slice: &'a [u8],
+        fired: bool,
+    }
+
+    impl Write for Meddler<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.fired {
+                self.fired = true;
+                self.store.write_slice(self.id, self.ranges, self.slice, 9).unwrap();
+                self.store.pin(self.id).unwrap();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn serving_a_slice_does_not_revert_a_concurrent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let data = test_data(200_000);
+        let held = 0u64..16_384;
+        let later = 49_152u64..65_536;
+        let (id, size, held_slice) = slice_for(&data, &[held.clone()]);
+        let (_, _, later_slice) = slice_for(&data, &[later.clone()]);
+
+        store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+        store.write_slice(id, &[held.clone()], &held_slice[..], 2).unwrap();
+
+        let later_ranges = [later.clone()];
+        let mut sink =
+            Meddler { store: &store, id, ranges: &later_ranges, slice: &later_slice, fired: false };
+        store.encode_slice(id, &[held.clone()], &mut sink, 3).unwrap();
+        assert!(sink.fired, "the concurrent work must have run inside the encode");
+
+        let bits = store.present_bits(id).unwrap();
+        assert!(bits.contains_all(&groups_for_bytes(&held)), "served groups still present");
+        assert!(bits.contains_all(&groups_for_bytes(&later)), "groups landed during the serve");
+        assert_eq!(store.required(id).unwrap().refcount, 1, "pin taken during the serve");
+    }
+
+    #[test]
+    fn ensure_sparse_rejects_a_size_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let id = ObjId::of(b"declared-by-a-hostile-manifest");
+        let e = store.ensure_sparse(id, Ns::Plain, MAX_OBJECT_BYTES + 1, 1).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(!store.contains(id).unwrap(), "no record for a rejected reservation");
+        assert!(!dir.path().join("sparse").join(id.to_string()).exists());
+    }
+
+    #[test]
+    fn quota_charges_held_bytes_not_the_declared_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let real = test_data(40_000);
+        let real_id = ObjId::of(&real);
+        store.insert_bytes(real_id, Ns::Plain, &real, 1).unwrap();
+
+        // What a hostile manifest can create: a huge declared size with no
+        // peer having sent a byte. It must charge nothing, or enforcing the
+        // quota wipes every other cached object to make room for a phantom.
+        let phantom = ObjId::of(b"declared-but-never-sent");
+        store.ensure_sparse(phantom, Ns::Plain, 4 << 30, 2).unwrap();
+
+        assert_eq!(store.total_bytes().unwrap(), 40_000);
+        assert_eq!(store.ns_bytes(Ns::Plain).unwrap(), 40_000);
+        assert_eq!(store.enforce_quota(1 << 20).unwrap(), 0);
+        assert!(store.contains(real_id).unwrap(), "the real cached object survives");
+    }
+
+    #[test]
+    fn delete_if_unreferenced_leaves_a_pinned_object_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let data = test_data(1_000);
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+
+        // Stands in for a pin committed after the eviction scan snapshotted
+        // this object as unreferenced.
+        store.pin(id).unwrap();
+        assert!(store.delete_if_unreferenced(id).unwrap().is_none());
+        assert!(store.contains(id).unwrap(), "a pinned object is never deleted");
+
+        store.ref_delta(id, -1).unwrap();
+        assert!(store.delete_if_unreferenced(id).unwrap().is_some());
+        assert!(!store.contains(id).unwrap());
+    }
+
+    #[test]
+    fn compaction_does_not_revert_pins_taken_while_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Tiny slabs so slab 0 seals quickly and compaction has to move its
+        // objects into a later one.
+        let cfg = StoreConfig { slab_seal_bytes: 8 << 10, compact_dead_num: 128 };
+        let store = Store::open_with(dir.path(), cfg).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..40usize {
+            let data = test_data(400 + i);
+            let id = ObjId::of(&data);
+            store.insert_bytes(id, Ns::Plain, &data, i as u64 + 1).unwrap();
+            ids.push((id, data));
+        }
+        assert_ne!(store.open_slab.lock().unwrap().0, 0, "slab 0 must have sealed");
+        let victims: Vec<ObjId> = ids
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| matches!(store.required(*id).unwrap().loc, Loc::Slab { slab: 0, .. }))
+            .collect();
+        assert!(victims.len() > 4, "slab 0 holds several objects, got {}", victims.len());
+
+        // Stands in for register_entry (or the feed pinner) pinning the
+        // node's own content while a compaction pass that snapshotted those
+        // records is still fsyncing its way through them. Compaction commits
+        // one object per fsync, so the pins below land in the middle of it.
+        let moved = |id: ObjId| match store.required(id) {
+            Ok(r) => !matches!(r.loc, Loc::Slab { slab: 0, .. }),
+            Err(_) => false,
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Wait for the first move to commit: the snapshot is taken
+                // before it, so every pin below lands after the snapshot.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !victims.iter().any(|id| moved(*id)) {
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                for id in &victims {
+                    store.pin(*id).unwrap();
+                }
+            });
+            store.compact_slab(0).unwrap();
+        });
+
+        for id in &victims {
+            let rec = store.required(*id).unwrap();
+            assert_eq!(rec.refcount, 1, "compaction reverted the pin on {id}");
+            assert!(!matches!(rec.loc, Loc::Slab { slab: 0, .. }), "{id} still in the victim");
+        }
+        for (id, data) in &ids {
+            assert_eq!(&store.read_bytes(*id, 100).unwrap(), data, "object {id}");
+        }
+    }
+
+    #[test]
+    fn ensure_sparse_never_truncates_bytes_a_racer_already_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let data = test_data(200_000);
+        let held = 0u64..16_384;
+        let (id, size, slice) = slice_for(&data, &[held.clone()]);
+        store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+        store.write_slice(id, &[held.clone()], &slice[..], 2).unwrap();
+
+        let data_path = store.sparse_path(id);
+        let obao_path = store.obao_path(id);
+        let data_before = fs::read(&data_path).unwrap();
+        let obao_before = fs::read(&obao_path).unwrap();
+
+        // Readahead and the foreground serve legitimately call ensure_sparse
+        // for the same brand-new object. Stand in for the racer that passed
+        // the "no record yet" check and was descheduled across a network RTT:
+        // drop only the index row, leaving the files as the winner left them.
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(OBJECTS).unwrap();
+                t.remove(id.0.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        store.ensure_sparse(id, Ns::Plain, size, 3).unwrap();
+
+        assert_eq!(fs::read(&data_path).unwrap(), data_before, "verified bytes were truncated");
+        assert_eq!(fs::read(&obao_path).unwrap(), obao_before, "the outboard was truncated");
+    }
+
+    #[test]
+    fn a_local_present_set_with_many_runs_is_never_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // A comb-shaped present set: one group held, one absent. Ranges that
+        // split per holder can produce this on a multi-gigabyte object, and
+        // the wire form costs two entries per run, so it crosses the cap the
+        // peer-facing decoder applies. Locally persisted runs are our own
+        // writes, so decoding them must not fall back to an empty set: the
+        // next write_slice folds into whatever bits() returns and persists
+        // it, which would discard every group the object holds.
+        let mut bits = GroupBits::new();
+        let mut g = 0u64;
+        for _ in 0..(crate::bitfield::MAX_WIRE_RUNS / 2 + 1) {
+            bits.add(g..g + 1);
+            g += 2;
+        }
+        let wire = bits.to_wire();
+        assert!(wire.len() > crate::bitfield::MAX_WIRE_RUNS, "{} entries", wire.len());
+        assert_eq!(GroupBits::from_wire(&wire), None, "the peer decoder caps this");
+
+        let id = ObjId::of(b"comb-shaped-present-set");
+        let rec = ObjRecord {
+            size: g * GROUP_BYTES,
+            ns: ns_to_u8(Ns::Plain),
+            loc: Loc::Sparse,
+            present: wire,
+            refcount: 0,
+            last_access: 1,
+        };
+        store.put_record(id, &rec).unwrap();
+
+        assert_eq!(store.present_bits(id).unwrap(), bits, "local bits must round-trip uncapped");
+        assert_eq!(store.total_bytes().unwrap(), bits.count() * GROUP_BYTES);
+    }
+
+    #[test]
+    fn the_reservation_bound_reclaims_stalled_phantoms() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // What a hostile manifest plus a colluding seeder can create: objects
+        // declared at the size cap that are fed exactly one group each, so
+        // drop_if_unfilled (which only drops records with no groups at all)
+        // keeps them and the held-byte quota barely notices. The unfilled
+        // part is real disk wherever a set_len'd file is really allocated, so
+        // it has to be bounded on its own. Records are written directly here:
+        // the point is the accounting, not 256 GiB of files.
+        let mut ids = Vec::new();
+        for i in 0..4u8 {
+            let id = ObjId::of(&[b'p', i]);
+            store
+                .put_record(
+                    id,
+                    &ObjRecord {
+                        size: MAX_OBJECT_BYTES,
+                        ns: ns_to_u8(Ns::Plain),
+                        loc: Loc::Sparse,
+                        present: GroupBits::complete(GROUP_BYTES).to_wire(),
+                        refcount: 0,
+                        last_access: i as u64 + 1,
+                    },
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        let real = test_data(40_000);
+        let real_id = ObjId::of(&real);
+        store.insert_bytes(real_id, Ns::Plain, &real, 99).unwrap();
+
+        // Held bytes are nowhere near the quota, so the LRU pass alone would
+        // never run.
+        assert!(store.total_bytes().unwrap() < 1 << 20);
+        store.enforce_quota(8 << 30).unwrap();
+
+        let left = ids.iter().filter(|id| store.contains(**id).unwrap()).count() as u64;
+        assert!(left * MAX_OBJECT_BYTES <= MAX_RESERVED_BYTES, "{left} reservations left");
+        assert!(!store.contains(ids[0]).unwrap(), "the LRU phantom goes first");
+        assert!(store.contains(real_id).unwrap(), "the real cached object survives");
     }
 }

@@ -39,6 +39,11 @@ use crate::sim::Class;
 pub const K_TIMEOUT: u32 = 4;
 /// Max concurrent duplicate fetches of the same group set (endgame cap).
 pub const MAX_DUPLICATES: usize = 2;
+/// Share of a batch's hard budget the primary may hold before the
+/// duplicated race starts (1/N of `Deadline::max_wait`). A class prior
+/// that has grown past the whole budget would otherwise let the primary
+/// eat all of it, leaving the duplicates no time to answer.
+pub const PRIMARY_BUDGET_DIVISOR: u32 = 2;
 /// Groups per striped request (16 KiB * 64 = 1 MiB chunks of work).
 pub const GROUPS_PER_REQUEST: u64 = 64;
 
@@ -242,8 +247,31 @@ impl Swarm {
         // bytes that fail verification is deprioritized (picked last) so the
         // swarm routes around it instead of retrying it every round.
         let mut fails = vec![0u32; peers.len()];
+        // The peer set and their bitfields are fixed for this call, so the
+        // rarest-first order never changes: build it once and walk it with a
+        // cursor. Re-counting holders and re-sorting every remaining group
+        // each round made a whole-object fetch quadratic in object size (a
+        // 10 GB object is ~600k groups over ~1600 rounds).
+        let full_order = rarest_first_order(needed, peers);
+        let mut cursor = 0usize;
+        // Groups needed to fill one round's batches (see the take() below).
+        let window = peers.len().max(1) * 2 * GROUPS_PER_REQUEST as usize;
         while !remaining.is_empty() {
-            let order = rarest_first_order(&remaining, peers);
+            // Skip the fetched prefix. A group whose batch failed is still in
+            // `remaining`, so it holds the cursor and is retried this round,
+            // exactly as a full recompute would.
+            while cursor < full_order.len() && !remaining.contains(full_order[cursor]) {
+                cursor += 1;
+            }
+            let mut order = Vec::new();
+            for &g in &full_order[cursor..] {
+                if order.len() >= window {
+                    break;
+                }
+                if remaining.contains(g) {
+                    order.push(g);
+                }
+            }
             if order.is_empty() {
                 break; // no peer holds any remaining group
             }
@@ -352,7 +380,14 @@ impl Swarm {
         deadline: Deadline,
         now: u64,
     ) -> BatchOutcome {
-        let timeout = self.stats.timeout(peers[primary].class).min(deadline.max_wait);
+        // The primary gets its class timeout, but never more than a share of
+        // the batch's hard budget: whatever it leaves is all the duplicated
+        // race below can have, and a race with no time left is just wasted
+        // peer traffic.
+        let timeout = self
+            .stats
+            .timeout(peers[primary].class)
+            .min(deadline.max_wait / PRIMARY_BUDGET_DIVISOR);
         let ranges = [batch.clone()];
         let fetch_from = |i: usize| {
             fetch::fetch_ranges(
@@ -397,18 +432,27 @@ impl Swarm {
             .take(MAX_DUPLICATES)
             .collect();
 
-        if targets.is_empty() {
-            // No duplication possible. If the primary already errored there
-            // is nothing left to try; otherwise wait it out.
+        // What is left of the batch's hard cap. Everything below is bounded
+        // by it: a peer that accepts the GetRange and then sends nothing
+        // keeps `fetch_ranges` pending for as long as the connection lives,
+        // so an unbounded wait here would never return.
+        let left = deadline.max_wait.saturating_sub(start.elapsed());
+
+        if targets.is_empty() || left.is_zero() {
+            // Nothing to duplicate onto, or no budget for a duplicate to
+            // answer in. Issuing a fetch we would drop in the same tick only
+            // makes those peers start encoding and take a Cancel for nothing,
+            // so do not issue it. If the primary already errored there is
+            // nothing left to try; otherwise wait it out under what remains.
             if primary_errored {
                 return BatchOutcome::failed(0, Some(primary));
             }
-            return match primary_fut.await {
-                Ok(_) => {
+            return match tokio::time::timeout(left, &mut primary_fut).await {
+                Ok(Ok(_)) => {
                     let cls = peers[primary].class;
                     BatchOutcome::won(groups, peers[primary].label.clone(), 0, cls, start.elapsed())
                 }
-                Err(_) => BatchOutcome::failed(0, Some(primary)),
+                Ok(Err(_)) | Err(_) => BatchOutcome::failed(0, Some(primary)),
             };
         }
 
@@ -425,12 +469,16 @@ impl Swarm {
         }
 
         let dups = targets.len() as u64;
-        match select_first_ok(racers).await {
-            Some(winner) => {
+        // The race runs on what the primary left of the budget: silent-but-
+        // alive peers stay Pending forever, so without this the whole fetch
+        // parks. Dropping the racers on expiry fires their cancel-on-abandon
+        // guards, telling those peers to stop encoding.
+        match tokio::time::timeout(left, select_first_ok(racers)).await {
+            Ok(Some(winner)) => {
                 let cls = peers[winner].class;
                 BatchOutcome::won(groups, peers[winner].label.clone(), dups, cls, start.elapsed())
             }
-            None => BatchOutcome::failed(dups, Some(primary)),
+            Ok(None) | Err(_) => BatchOutcome::failed(dups, Some(primary)),
         }
     }
 }
@@ -495,21 +543,58 @@ impl Deadline {
 
 // --- tiny future combinators (avoid pulling futures-util) ---
 
+/// Poll every future concurrently, returning the outputs in input order.
+///
+/// A round's batches must be in flight AT THE SAME TIME: `race_batch` only
+/// sends its request when first polled, so awaiting the futures one after
+/// another would issue batch N+1 to its peer only once batch N finished,
+/// and the whole per-round striping across peers would run serially.
 async fn futures_join_all<F, T>(futs: Vec<F>) -> Vec<T>
 where
     F: std::future::Future<Output = T>,
 {
-    let mut out = Vec::with_capacity(futs.len());
-    // Sequentially await — the individual race_batch futures already
-    // spawn concurrency internally via timeout/select; joining them
-    // sequentially keeps ordering deterministic for tests while the
-    // real concurrency is inside each batch. For wide fan-out the caller
-    // batches per round.
-    let handles: Vec<_> = futs.into_iter().map(Box::pin).collect();
-    for h in handles {
-        out.push(h.await);
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct JoinAll<F: Future> {
+        /// Each slot is cleared once its future resolves.
+        futs: Vec<Option<Pin<Box<F>>>>,
+        out: Vec<Option<F::Output>>,
     }
-    out
+    // The futures are boxed, so nothing is pin-projected through Self.
+    impl<F: Future> Unpin for JoinAll<F> {}
+    impl<F: Future> Future for JoinAll<F> {
+        type Output = Vec<F::Output>;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let me = self.get_mut();
+            let mut pending = false;
+            for i in 0..me.futs.len() {
+                let ready = match me.futs[i].as_mut() {
+                    Some(f) => match f.as_mut().poll(cx) {
+                        Poll::Ready(v) => Some(v),
+                        Poll::Pending => {
+                            pending = true;
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(v) = ready {
+                    me.out[i] = Some(v);
+                    me.futs[i] = None;
+                }
+            }
+            if pending {
+                return Poll::Pending;
+            }
+            Poll::Ready(me.out.iter_mut().filter_map(Option::take).collect())
+        }
+    }
+
+    let mut out: Vec<Option<T>> = Vec::new();
+    out.resize_with(futs.len(), || None);
+    JoinAll { futs: futs.into_iter().map(|f| Some(Box::pin(f))).collect(), out }.await
 }
 
 /// Return the first `Ok(T)` among the futures, or None if all error.
@@ -662,5 +747,180 @@ mod tests {
         // Must return cleanly rather than panic.
         let report = swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
         assert_eq!(report.groups_fetched, 0, "dead-only swarm fetches nothing but must not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_gives_up_at_the_deadline() {
+        // A peer that takes the GetRange and then answers nothing, on a
+        // connection that stays open, leaves fetch_ranges pending for as
+        // long as the link lives. The batch must still give up at
+        // Deadline::max_wait rather than parking the fetch (and the task
+        // that awaits it) forever.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let peers = vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size),
+            label: "silent".into(),
+        }];
+
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let deadline = Deadline::tight();
+        let report =
+            tokio::time::timeout(deadline.max_wait * 3, swarm.fetch(&needed, &peers, deadline, 2))
+                .await
+                .expect("a silent peer must not hang the fetch")
+                .unwrap();
+        assert_eq!(report.groups_fetched, 0, "the silent peer served nothing");
+    }
+
+    /// A peer that answers every GetRange with the canonical whole-object
+    /// bao slice, so a duplicate racer can actually win its race.
+    fn serving_conn(data: &[u8]) -> Conn {
+        use crate::msg::{Frame, FrameBody, Req};
+        use epix_blob::verified::{encode_slice, OutboardBytes};
+
+        let ob = OutboardBytes::from_slice(data);
+        let ranges = vec![0..data.len() as u64];
+        let mut slice = Vec::new();
+        encode_slice(data, &ob, &ranges, &mut slice).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+        tokio::spawn(async move {
+            while let Some(inc) = server_in.recv().await {
+                if !matches!(inc.req, Req::GetRange { .. }) {
+                    continue;
+                }
+                let mut off = 0usize;
+                while off < slice.len() {
+                    let end = (off + 60_000).min(slice.len());
+                    let last = end == slice.len();
+                    let body = FrameBody::Data { last, bytes: slice[off..end].to_vec() };
+                    if server.send(Frame { stream: inc.stream, body }).await.is_err() {
+                        return;
+                    }
+                    off = end;
+                }
+            }
+        });
+        client
+    }
+
+    // Real (not paused) time: race_batch measures its budget with
+    // std::time::Instant, which tokio's virtual clock does not advance.
+    #[tokio::test]
+    async fn a_slow_primary_leaves_the_duplicate_time_to_win() {
+        // Once the class prior grows past the batch's hard cap, the primary's
+        // first wait used to swallow the WHOLE cap. The duplicated race was
+        // then issued with nothing left: both targets got a GetRange followed
+        // immediately by a Cancel, and the batch always failed. A share of
+        // the cap is reserved, so the duplicate still has time to answer.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+        store.ensure_sparse(id, epix_blob::Ns::Plain, size, 1).unwrap();
+
+        let peers = vec![
+            PeerHandle {
+                conn: dummy_conn(),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "silent".into(),
+            },
+            PeerHandle {
+                conn: serving_conn(&data),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "fast".into(),
+            },
+        ];
+
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        // Grow the clearnet prior until its timeout exceeds the cap below:
+        // that is the case the reserved share is for.
+        for _ in 0..20 {
+            swarm.stats.observe(Class::Clearnet, Duration::from_millis(300));
+        }
+        let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
+        assert!(swarm.stats.timeout(Class::Clearnet) > deadline.max_wait);
+
+        let groups = swarm.groups_of(&(0..size));
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
+        assert_eq!(outcome.duplicates, 1, "the stalled primary is duplicated onto the other peer");
+        assert_eq!(
+            outcome.winner_label.as_deref(),
+            Some("fast"),
+            "the duplicate must be issued with enough budget left to answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_no_budget_left_issues_no_duplicates() {
+        // With nothing left of the hard cap a duplicate could only be issued
+        // and dropped in the same poll - a GetRange followed straight by a
+        // Cancel, for a request that could never win. It must not be sent.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+        store.ensure_sparse(id, epix_blob::Ns::Plain, size, 1).unwrap();
+
+        let peers = vec![
+            PeerHandle {
+                conn: dummy_conn(),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "silent".into(),
+            },
+            PeerHandle {
+                conn: dummy_conn(),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "other".into(),
+            },
+        ];
+
+        let swarm = Swarm::new(store.clone(), id, size);
+        let deadline = Deadline { ms: 0, max_wait: Duration::ZERO };
+        let groups = swarm.groups_of(&(0..size));
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
+        assert_eq!(outcome.duplicates, 0, "no budget left means no duplicate is issued");
+        assert!(outcome.winner_label.is_none(), "nobody can win a zero-length race");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_all_polls_every_batch_concurrently() {
+        // Each future waits on the other's start signal, so both finish only
+        // if the join polls them together. Awaiting them in sequence (one
+        // batch fully done before the next is even issued) deadlocks here.
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel::<()>();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel::<()>();
+        let a = async move {
+            let _ = tx_a.send(());
+            rx_b.await.unwrap();
+            1u32
+        };
+        let b = async move {
+            let _ = tx_b.send(());
+            rx_a.await.unwrap();
+            2u32
+        };
+        let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = u32>>>> =
+            vec![Box::pin(a), Box::pin(b)];
+        let out = tokio::time::timeout(Duration::from_secs(5), futures_join_all(futs))
+            .await
+            .expect("a round's batches must make progress together");
+        assert_eq!(out, vec![1, 2], "outputs stay in input order");
     }
 }

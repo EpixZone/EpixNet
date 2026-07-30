@@ -165,7 +165,7 @@ async fn spoofed_hello_is_rejected_over_real_tcp() {
     let spoofed = Hello {
         net: epix_edx::msg::NET_ID.into(),
         node_pk: victim_pk,
-        binding_sig: noise::sign_binding(&hh, CLIENT_KEY).unwrap(),
+        binding_sig: noise::sign_binding(&hh, CLIENT_KEY, noise::Role::Initiator).unwrap(),
         caps: caps::MESH,
         listen: vec![],
         version: String::new(),
@@ -195,7 +195,7 @@ async fn replayed_binding_from_another_session_is_rejected() {
 
     // Capture a valid binding signature from session 1...
     let (_conn1, hh1) = dial_noise(addr).await;
-    let old_sig = noise::sign_binding(&hh1, CLIENT_KEY).unwrap();
+    let old_sig = noise::sign_binding(&hh1, CLIENT_KEY, noise::Role::Initiator).unwrap();
 
     // ...and replay it on session 2: the handshake hash differs, so the
     // signature no longer covers this session and must be refused.

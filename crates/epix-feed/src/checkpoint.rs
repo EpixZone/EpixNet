@@ -15,11 +15,11 @@
 //! segment. A checkpoint must extend its predecessor's history root
 //! (no rollback).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use epix_blob::ObjId;
 
-use crate::reactions::count;
 use crate::{canonical_order, Kind, Record};
 
 /// A deterministic feed state checkpoint at a boundary.
@@ -31,21 +31,32 @@ pub struct Checkpoint {
     pub live: Vec<Record>,
     /// target → reaction kind → count (the "balances").
     pub reaction_counts: BTreeMap<String, BTreeMap<String, u64>>,
-    /// Sticky tombstones: record ids that are deleted and cannot resurrect.
-    pub tombstones: BTreeSet<String>,
+    /// Sticky tombstones: the `(author, id)` items that are deleted and
+    /// cannot resurrect.
+    pub tombstones: BTreeSet<(String, String)>,
     /// Merkle root summarizing all history up to `boundary` (prev-linked).
     pub history_root: ObjId,
     /// This checkpoint's own content root.
     pub root: ObjId,
 }
 
-/// Which record ids are tombstoned. A tombstone is sticky: once present
-/// its target id can never come back, even via a higher-clock supersede.
-pub(crate) fn tombstoned_ids(records: &[Record]) -> BTreeSet<String> {
+/// Which `(author, id)` items are tombstoned. A tombstone is sticky: once
+/// present its target can never come back, even via a higher-clock
+/// supersede.
+///
+/// Keyed on the tombstone's author as well as its target, the same keying
+/// `Record::identity()` uses: verification authorizes a signer for a
+/// DIRECTORY, not over another author's item, so any authorized user could
+/// otherwise self-sign a tombstone carrying someone else's id and delete
+/// it everywhere. A legitimate cross-author moderation tombstone still
+/// matches its victim: `verify_record` requires such a record's `author`
+/// field to be the ORIGINAL author (only the signature comes from the
+/// moderator).
+pub(crate) fn tombstoned_ids(records: &[Record]) -> BTreeSet<(String, String)> {
     records
         .iter()
         .filter(|r| matches!(r.kind, Kind::Tombstone))
-        .map(|r| r.target.clone())
+        .map(|r| (r.author.clone(), r.target.clone()))
         .collect()
 }
 
@@ -54,14 +65,17 @@ pub(crate) fn tombstoned_ids(records: &[Record]) -> BTreeSet<String> {
 /// posts/comments by the same author survive and only a real edit (same
 /// id) supersedes. Reactions are represented by their counts, not
 /// individual live records.
-pub(crate) fn live_records(records: &[Record], tombstones: &BTreeSet<String>) -> Vec<Record> {
+pub(crate) fn live_records(
+    records: &[Record],
+    tombstones: &BTreeSet<(String, String)>,
+) -> Vec<Record> {
     let mut winners: BTreeMap<String, Record> = BTreeMap::new();
     for r in records {
         if matches!(r.kind, Kind::Reaction { .. } | Kind::Tombstone) {
             continue;
         }
-        // A tombstoned item (by its id) is dropped entirely.
-        if tombstones.contains(&r.id) {
+        // A tombstoned item (by its author AND id) is dropped entirely.
+        if tombstones.contains(&(r.author.clone(), r.id.clone())) {
             continue;
         }
         winners
@@ -83,30 +97,47 @@ impl Checkpoint {
     /// chained to `prev` (pass `ObjId([0;32])` for the genesis history
     /// root). Deterministic: same records + boundary + prev → same root.
     pub fn compute(records: &[Record], boundary: u64, prev_history: ObjId) -> Self {
-        let in_scope: Vec<Record> =
-            records.iter().filter(|r| r.clock <= boundary).cloned().collect();
+        // Borrow when every record is already in scope (the common case:
+        // the feed boundary is the max record clock), so a recompute does
+        // not deep clone the whole corpus and its canonical bytes.
+        let in_scope: Cow<'_, [Record]> = if records.iter().all(|r| r.clock <= boundary) {
+            Cow::Borrowed(records)
+        } else {
+            Cow::Owned(records.iter().filter(|r| r.clock <= boundary).cloned().collect())
+        };
 
         let tombstones = tombstoned_ids(&in_scope);
         let live = live_records(&in_scope, &tombstones);
 
-        // Reaction counts per target that has any reaction.
-        let mut targets: BTreeSet<String> = BTreeSet::new();
-        for r in &in_scope {
-            if matches!(r.kind, Kind::Reaction { .. }) {
-                targets.insert(r.target.clone());
+        // Reaction counts, folded in ONE pass: keep the highest-order_key
+        // record of each (author, target, kind) lineage, then tally the
+        // active winners per target. This is the same fold `reactions::count`
+        // does, so the counts and every root over them are unchanged;
+        // calling it once per target rescanned all records per target.
+        let mut winners: BTreeMap<String, &Record> = BTreeMap::new();
+        for r in in_scope.iter() {
+            if !matches!(r.kind, Kind::Reaction { .. }) {
+                continue;
             }
+            winners
+                .entry(r.lineage())
+                .and_modify(|cur| {
+                    if r.order_key() > cur.order_key() {
+                        *cur = r;
+                    }
+                })
+                .or_insert(r);
         }
         let mut reaction_counts: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
-        for t in targets {
-            let c = count(&in_scope, &t);
-            let mut kinds: BTreeMap<String, u64> = BTreeMap::new();
-            for (k, v) in c.by_kind {
-                if v > 0 {
-                    kinds.insert(k, v);
+        for r in winners.values() {
+            if let Kind::Reaction { kind, active } = &r.kind {
+                if *active {
+                    *reaction_counts
+                        .entry(r.target.clone())
+                        .or_default()
+                        .entry(kind.clone())
+                        .or_insert(0) += 1;
                 }
-            }
-            if !kinds.is_empty() {
-                reaction_counts.insert(t, kinds);
             }
         }
 
@@ -129,7 +160,7 @@ impl Checkpoint {
         boundary: u64,
         live: &[Record],
         reactions: &BTreeMap<String, BTreeMap<String, u64>>,
-        tombstones: &BTreeSet<String>,
+        tombstones: &BTreeSet<(String, String)>,
     ) -> ObjId {
         let mut m = Vec::new();
         m.extend_from_slice(b"EDXHIST1");
@@ -144,7 +175,7 @@ impl Checkpoint {
         history_root: &ObjId,
         live: &[Record],
         reactions: &BTreeMap<String, BTreeMap<String, u64>>,
-        tombstones: &BTreeSet<String>,
+        tombstones: &BTreeSet<(String, String)>,
     ) -> ObjId {
         let mut m = Vec::new();
         m.extend_from_slice(b"EDXCKPT1");
@@ -159,7 +190,7 @@ impl Checkpoint {
     fn state_digest(
         live: &[Record],
         reactions: &BTreeMap<String, BTreeMap<String, u64>>,
-        tombstones: &BTreeSet<String>,
+        tombstones: &BTreeSet<(String, String)>,
     ) -> ObjId {
         let mut m = Vec::new();
         m.extend_from_slice(&(live.len() as u32).to_le_bytes());
@@ -177,10 +208,14 @@ impl Checkpoint {
                 m.extend_from_slice(&v.to_le_bytes());
             }
         }
+        // Both halves length-prefixed, so two distinct (author, target)
+        // pairs cannot concatenate to the same bytes.
         m.extend_from_slice(&(tombstones.len() as u32).to_le_bytes());
-        for t in tombstones {
-            m.extend_from_slice(&(t.len() as u32).to_le_bytes());
-            m.extend_from_slice(t.as_bytes());
+        for (author, target) in tombstones {
+            m.extend_from_slice(&(author.len() as u32).to_le_bytes());
+            m.extend_from_slice(author.as_bytes());
+            m.extend_from_slice(&(target.len() as u32).to_le_bytes());
+            m.extend_from_slice(target.as_bytes());
         }
         ObjId::of(&m)
     }
@@ -253,6 +288,30 @@ mod tests {
     }
 
     #[test]
+    fn reaction_counts_match_the_per_target_fold() {
+        // The one-pass fold must agree with `reactions::count` target by
+        // target, or the checkpoint roots would shift.
+        let mut recs = records();
+        recs.push(test_record("l3", "u5", "p2", 6, Kind::Reaction { kind: "love".into(), active: true }));
+        recs.push(test_record("l3", "u5", "p2", 7, Kind::Reaction { kind: "love".into(), active: false }));
+        recs.push(test_record("l4", "u6", "p2", 8, Kind::Reaction { kind: "like".into(), active: true }));
+        let ck = Checkpoint::compute(&recs, 100, ObjId([0; 32]));
+        for t in ["p1", "p2"] {
+            let expected: BTreeMap<String, u64> = crate::reactions::count(&recs, t)
+                .by_kind
+                .into_iter()
+                .filter(|(_, v)| *v > 0)
+                .collect();
+            let got = ck.reaction_counts.get(t).cloned().unwrap_or_default();
+            assert_eq!(got, expected, "target {t}");
+        }
+        // p2 keeps only the like: the love was retracted, so no zero entry.
+        let p2 = ck.reaction_counts.get("p2").unwrap();
+        assert_eq!(p2.get("like"), Some(&1));
+        assert!(p2.get("love").is_none());
+    }
+
+    #[test]
     fn edit_supersedes_in_live_set() {
         let ck = Checkpoint::compute(&records(), 100, ObjId([0; 32]));
         // c1 appears once (the higher-clock edit won), plus the post = 2 live.
@@ -264,13 +323,33 @@ mod tests {
     #[test]
     fn tombstone_is_sticky_and_removes_the_item() {
         let mut recs = records();
-        // Moderator tombstones comment c1...
-        recs.push(test_record("t1", "mod", "c1", 20, Kind::Tombstone));
+        // A tombstone as the adapter emits one: target = its own id, author
+        // = the item's author. A moderation tombstone has this same shape,
+        // since verify_record makes a moderator sign a record whose `author`
+        // is still the original author.
+        recs.push(test_record("c1", "u2", "c1", 20, Kind::Tombstone));
         // ...and the author tries to resurrect it with a higher clock.
         recs.push(test_record("c1", "u2", "p1", 30, Kind::Comment));
         let ck = Checkpoint::compute(&recs, 100, ObjId([0; 32]));
-        assert!(ck.tombstones.contains("c1"));
+        assert!(ck.tombstones.contains(&("u2".to_string(), "c1".to_string())));
         assert!(!ck.live.iter().any(|r| r.id == "c1"), "tombstoned item cannot resurrect");
+    }
+
+    #[test]
+    fn a_tombstone_cannot_delete_another_authors_item() {
+        // Any authorized site user can self-sign a record in her OWN
+        // directory carrying someone else's id, so a tombstone must only
+        // remove its own author's item.
+        let mut recs = records();
+        recs.push(test_record("p1", "mallory", "p1", 40, Kind::Tombstone));
+        let ck = Checkpoint::compute(&recs, 100, ObjId([0; 32]));
+        assert!(
+            ck.live.iter().any(|r| r.id == "p1" && r.author == "u1"),
+            "u1's post must survive another author's tombstone",
+        );
+        // Mallory's tombstone is still recorded, scoped to her own items.
+        assert!(ck.tombstones.contains(&("mallory".to_string(), "p1".to_string())));
+        assert!(!ck.tombstones.contains(&("u1".to_string(), "p1".to_string())));
     }
 
     #[test]

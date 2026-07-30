@@ -20,12 +20,43 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::frame::{self};
 use crate::msg::{Frame, FrameBody, Req, Resp};
+
+/// Deadline on one frame write. A peer that stops reading (zero window, no
+/// FIN) parks the writer inside `write_all` forever, and the whole
+/// connection with it: both lanes fill, encode threads park in
+/// [`Conn::blocking_send`], and `gone` is never dropped, so the reader stays
+/// in `read_frame` and the socket - plus its registry row - leaks for the
+/// life of the process. Overlay links skip Noise entirely, so this is the
+/// only I/O deadline they have; on clearnet it backs up the Noise pumps,
+/// which is why it carries the same value as `noise::IDLE_RECORD_TIMEOUT`.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Deadline on a blocking send into a full lane. The blocking sender is a
+/// spawn_blocking encode thread, so once the lane is full it is held at the
+/// peer's download rate rather than the encode's; without a bound, slow or
+/// wedged peers pin tokio's blocking pool, which the whole process shares
+/// with store and database IO. A peer that has not drained 16 MiB of queued
+/// frames in this long is gone.
+const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a blocking sender parks between attempts on a full lane. It only
+/// ever sleeps when the lane is full, i.e. when we are already 256 frames
+/// ahead of the peer, so this costs nothing on a link that keeps up.
+const SEND_POLL: Duration = Duration::from_millis(100);
+
+/// Queued inbound bytes per connection, in KiB (the budget is a `Semaphore`
+/// and its permits are `u32`). The inbound channels are bounded in frame
+/// COUNT, and one request frame may be ~68 KiB, so without this a peer buys
+/// megabytes of resident memory per connection with a few hundred bytes of
+/// request. 1 MiB leaves room for a dozen max-size requests in flight.
+const INBOUND_QUEUE_UNITS: u32 = 1024;
 
 /// A streaming response: `Data`/`Resp` frames delivered in order until a
 /// frame with `last = true`. Carries the stream `id` it was allocated so
@@ -35,6 +66,8 @@ pub struct StreamRx {
     /// The allocated stream id (odd for the dialer, even for the acceptor).
     pub id: u64,
     rx: mpsc::Receiver<FrameBody>,
+    /// Held so `Drop` can unregister this stream's waiter.
+    shared: Arc<Shared>,
 }
 
 impl StreamRx {
@@ -42,6 +75,18 @@ impl StreamRx {
     /// (terminal frame delivered or the connection closed).
     pub async fn recv(&mut self) -> Option<FrameBody> {
         self.rx.recv().await
+    }
+}
+
+impl Drop for StreamRx {
+    /// The reader drops a waiter only when a TERMINAL frame arrives, so
+    /// every other ending - a caller that times out and drops its future, an
+    /// early return on an error frame, a peer that answers with
+    /// `last: false` - would otherwise leave an entry in `waiters` for the
+    /// life of the connection. Unlike `cancelled`, that map has no cap, and
+    /// pooled control links live for hours.
+    fn drop(&mut self) {
+        self.shared.waiters.lock().expect("waiters").remove(&self.id);
     }
 }
 
@@ -85,6 +130,11 @@ struct Shared {
 pub struct Incoming {
     pub stream: u64,
     pub req: Req,
+    /// This request's share of the connection's inbound byte budget. Held
+    /// for as long as the request is queued or being served, and refunded
+    /// when the server side drops it. `None` for a request that was never
+    /// charged (a test fixture built by hand).
+    pub(crate) _budget: Option<OwnedSemaphorePermit>,
 }
 
 impl Conn {
@@ -116,12 +166,13 @@ impl Conn {
         // until the PEER closed, holding the socket - and its registry row -
         // open long after the last `Conn` handle was dropped.
         let (gone_tx, gone_rx) = mpsc::channel::<()>(1);
+        let in_budget = Arc::new(Semaphore::new(INBOUND_QUEUE_UNITS as usize));
         spawn_writer(write_half, hi_rx, lo_rx, shared.clone(), gone_tx);
         // The reader answers Pings on the priority lane (Pong is control). It
         // holds a WEAK sender: a strong clone would keep the writer's queue
         // open forever, so the writer could never observe the last handle
         // going away.
-        spawn_reader(read_half, shared.clone(), hi_tx.downgrade(), in_tx, gone_rx);
+        spawn_reader(read_half, shared.clone(), hi_tx.downgrade(), in_tx, gone_rx, in_budget);
 
         (Conn { outbound: hi_tx, bulk: lo_tx, inner, shared }, in_rx)
     }
@@ -169,7 +220,7 @@ impl Conn {
             self.shared.waiters.lock().expect("waiters").remove(&stream);
             return Err(closed_err());
         }
-        Ok(StreamRx { id: stream, rx })
+        Ok(StreamRx { id: stream, rx, shared: self.shared.clone() })
     }
 
     /// Round-trip a frame-level Ping and return the measured RTT.
@@ -182,15 +233,17 @@ impl Conn {
             return Err(closed_err());
         }
         let stream = self.alloc_stream();
-        let (tx, mut rx) = mpsc::channel::<FrameBody>(1);
+        let (tx, rx) = mpsc::channel::<FrameBody>(1);
         self.shared.waiters.lock().expect("waiters").insert(stream, tx);
+        // Wrapped in a StreamRx purely for its Drop: a ping the caller
+        // abandons, or one a peer never answers, must not leave a waiter.
+        let mut rx = StreamRx { id: stream, rx, shared: self.shared.clone() };
         let start = std::time::Instant::now();
         // Same post-send close re-check as request_stream: a waiter inserted
         // after the reader cleared the map would never be woken.
         if self.outbound.send(Frame { stream, body: FrameBody::Ping }).await.is_err()
             || self.is_closed()
         {
-            self.shared.waiters.lock().expect("waiters").remove(&stream);
             return Err(closed_err());
         }
         match rx.recv().await {
@@ -215,9 +268,11 @@ impl Conn {
     }
 
     /// Blocking [`Self::send`] for spawn_blocking encode threads. Applies
-    /// the same queue backpressure, just synchronously.
+    /// the same queue backpressure, just synchronously, and gives up after
+    /// [`SEND_STALL_TIMEOUT`] so a peer that stops draining cannot hold an
+    /// OS thread from the shared blocking pool.
     pub fn blocking_send(&self, frame: Frame) -> std::io::Result<()> {
-        self.outbound.blocking_send(frame).map_err(|_| closed_err())
+        blocking_send_within(&self.outbound, frame, SEND_STALL_TIMEOUT)
     }
 
     /// Send one frame of a BULK (background range) response. It rides the
@@ -229,9 +284,10 @@ impl Conn {
         self.bulk.send(frame).await.map_err(|_| closed_err())
     }
 
-    /// Blocking [`Self::send_bulk`] for spawn_blocking encode threads.
+    /// Blocking [`Self::send_bulk`] for spawn_blocking encode threads. Same
+    /// stall deadline as [`Self::blocking_send`].
     pub fn blocking_send_bulk(&self, frame: Frame) -> std::io::Result<()> {
-        self.bulk.blocking_send(frame).map_err(|_| closed_err())
+        blocking_send_within(&self.bulk, frame, SEND_STALL_TIMEOUT)
     }
 
     /// Cancel an in-flight request stream (stops the peer's encode).
@@ -263,6 +319,43 @@ fn closed_err() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "connection closed")
 }
 
+/// What one inbound request costs against [`INBOUND_QUEUE_UNITS`], in KiB.
+/// Rounded up so every request costs at least one unit, and clamped to the
+/// whole budget: a request asking for more permits than the budget holds
+/// would never be granted.
+fn queue_units(req: &Req) -> u32 {
+    let bytes = postcard::experimental::serialized_size(req).unwrap_or(frame::FRAME_HARD_CAP);
+    (bytes / 1024 + 1).min(INBOUND_QUEUE_UNITS as usize) as u32
+}
+
+/// Queue `frame`, waiting at most `deadline` for lane room. Polls rather
+/// than parking on the channel because the caller is an OS thread from the
+/// blocking pool: `blocking_send` would hold it for as long as the peer
+/// takes to drain, which is unbounded. Only sleeps while the lane is full.
+fn blocking_send_within(
+    tx: &mpsc::Sender<Frame>,
+    mut frame: Frame,
+    deadline: Duration,
+) -> std::io::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        match tx.try_send(frame) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed_err()),
+            Err(mpsc::error::TrySendError::Full(f)) => {
+                if start.elapsed() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "peer is not draining the outbound queue",
+                    ));
+                }
+                frame = f;
+                std::thread::sleep(SEND_POLL);
+            }
+        }
+    }
+}
+
 fn spawn_writer<W>(
     mut w: tokio::io::WriteHalf<W>,
     mut hi: mpsc::Receiver<Frame>,
@@ -285,7 +378,10 @@ fn spawn_writer<W>(
                 Some(f) = lo.recv() => f,
                 else => break,
             };
-            if frame::write_frame(&mut w, &frame).await.is_err() {
+            if !matches!(
+                tokio::time::timeout(WRITE_STALL_TIMEOUT, frame::write_frame(&mut w, &frame)).await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -302,6 +398,7 @@ fn spawn_reader<R>(
     outbound: mpsc::WeakSender<Frame>,
     in_tx: mpsc::Sender<Incoming>,
     mut gone: mpsc::Receiver<()>,
+    in_budget: Arc<Semaphore>,
 ) where
     R: AsyncRead + Send + 'static,
 {
@@ -320,8 +417,27 @@ fn spawn_reader<R>(
             };
             match frame.body {
                 FrameBody::Req(req) => {
-                    // Inbound request: hand to the server side.
-                    if in_tx.send(Incoming { stream: frame.stream, req }).await.is_err() {
+                    // Inbound request: hand to the server side, but charge
+                    // its bytes to the connection's budget first. The queues
+                    // below are bounded in frame count, so without this a
+                    // peer can park megabytes of decoded requests per
+                    // connection for the cost of sending them. Waiting here
+                    // stops reading the socket, which is the backpressure we
+                    // want; the peer is never disconnected for it.
+                    let units = queue_units(&req);
+                    let permit = tokio::select! {
+                        biased;
+                        _ = gone.recv() => break,
+                        p = in_budget.clone().acquire_many_owned(units) => match p {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        },
+                    };
+                    if in_tx
+                        .send(Incoming { stream: frame.stream, req, _budget: Some(permit) })
+                        .await
+                        .is_err()
+                    {
                         // No server handler; ignore.
                     }
                 }
@@ -592,6 +708,117 @@ mod tests {
         })
         .await;
         assert_eq!(closed, Ok(true), "the peer saw the connection close");
+    }
+
+    /// Every stream that ends without a terminal frame - a dropped future, an
+    /// early return - must take its waiter entry with it, or a long-lived
+    /// pooled link grows a map that nothing ever prunes.
+    #[tokio::test]
+    async fn dropping_a_stream_rx_unregisters_its_waiter() {
+        let (a, b) = tokio::io::duplex(1024);
+        let (client, _in) = Conn::start(a, true);
+        // Connection tasks only on the far side, so nothing ever answers.
+        let (_server, _server_in) = Conn::start(b, false);
+
+        let rx = client.request_stream(Req::GetBitfield { obj: ObjId([1; 32]) }).await.unwrap();
+        assert_eq!(client.shared.waiters.lock().expect("waiters").len(), 1);
+        drop(rx);
+        assert!(client.shared.waiters.lock().expect("waiters").is_empty());
+    }
+
+    /// `request` returns on the FIRST Resp whether or not it is terminal, so a
+    /// peer answering every control RPC with `last: false` looked healthy to
+    /// the pool while leaking one waiter per call.
+    #[tokio::test]
+    async fn a_non_terminal_resp_leaves_no_waiter_behind() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+        tokio::spawn(async move {
+            while let Some(inc) = server_in.recv().await {
+                let _ = server
+                    .send(Frame {
+                        stream: inc.stream,
+                        body: FrameBody::Resp { last: false, resp: Resp::Ok },
+                    })
+                    .await;
+            }
+        });
+
+        let resp = client.request(Req::GetTrackers).await.unwrap();
+        assert_eq!(resp, Resp::Ok);
+        assert!(client.shared.waiters.lock().expect("waiters").is_empty());
+    }
+
+    /// A peer that stops reading produces no error and no FIN, so before the
+    /// write deadline the writer parked in `write_all` for good: the lanes
+    /// stayed full, `gone` was never dropped, and the reader held the socket
+    /// (and its registry row) for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_cannot_wedge_the_writer_forever() {
+        let (a, b) = tokio::io::duplex(64);
+        let (conn, _in) = Conn::start(a, true);
+        // The peer keeps its half open and never reads a byte.
+        let _peer = b;
+        let body = FrameBody::Data { last: false, bytes: vec![0u8; 4096] };
+        conn.send(Frame { stream: 1, body }).await.unwrap();
+
+        for _ in 0..1000 {
+            if conn.is_closed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(conn.is_closed(), "the write deadline must tear a wedged link down");
+    }
+
+    /// The blocking senders run on spawn_blocking threads from a pool the
+    /// whole process shares, so waiting on a lane the peer never drains has
+    /// to be bounded.
+    #[test]
+    fn a_blocking_send_gives_up_on_a_lane_that_never_drains() {
+        let (tx, rx) = mpsc::channel::<Frame>(1);
+        let mk = || Frame { stream: 1, body: FrameBody::Data { last: false, bytes: vec![0u8; 8] } };
+        let deadline = Duration::from_millis(50);
+
+        blocking_send_within(&tx, mk(), deadline).expect("the first frame fits");
+        let err = blocking_send_within(&tx, mk(), deadline).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        drop(rx);
+        let err = blocking_send_within(&tx, mk(), deadline).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// The inbound channels are bounded in frame COUNT, and one request frame
+    /// can be ~68 KiB, so the byte budget is what keeps a peer from parking
+    /// megabytes per connection by pipelining large requests.
+    #[tokio::test(start_paused = true)]
+    async fn inbound_requests_are_bounded_by_bytes_not_frame_count() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = Conn::start(a, true);
+        let (_server, mut server_in) = Conn::start(b, false);
+
+        // ~64 KiB each: the 64-slot inbound channel would take all 40, the
+        // 1 MiB budget takes about 15.
+        for _ in 0..40 {
+            client.request_stream(Req::Kad { payload: vec![7u8; 64 * 1024] }).await.unwrap();
+        }
+        // Paused time only advances once every task has parked, so by the
+        // time this returns the reader has queued all it is allowed to.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut queued = Vec::new();
+        while let Ok(inc) = server_in.try_recv() {
+            queued.push(inc);
+        }
+        assert!(!queued.is_empty(), "the budget must admit requests");
+        assert!(queued.len() <= 16, "budget exceeded: {} requests queued", queued.len());
+
+        // Serving them refunds the budget, so the rest arrive.
+        drop(queued);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(server_in.try_recv().is_ok(), "the budget is refunded as requests are consumed");
     }
 
     #[tokio::test]
