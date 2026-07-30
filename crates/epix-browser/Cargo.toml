@@ -36,7 +36,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # best-effort - the launcher falls back to no-tray when the host can't show one.
 tray-icon = "0.24"
 muda = "0.19"
-tao = "0.35"
+tao = "0.36"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows: register the native-messaging host via the registry; console
