@@ -1,0 +1,17 @@
+name: "EpixNet CodeQL config"
+
+# Test code is not shipped, and a test that needs a FIXED key or salt is not a
+# leaked secret - it is the only way the test can assert anything. Known-answer
+# tests pin a salt on purpose, and negative tests pin a deliberately wrong one.
+# Scanning these produced 24 critical "hard-coded cryptographic value" alerts
+# with no production reachability.
+#
+# This covers integration tests and benchmarks, which live in their own files.
+# Unit tests inside a `#[cfg(test)]` module share a file with the production
+# code around them, so they cannot be excluded by path without losing real
+# coverage of that file; those alerts are dismissed individually as
+# "used in tests" instead.
+paths-ignore:
+  - "**/tests/**"
+  - "**/benches/**"
+  - "**/examples/**"
