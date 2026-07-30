@@ -1,7 +1,8 @@
 //! Authoring + diagnostics CLI actions, the EpixNet `epixnet.py <action>`
 //! surface: siteCreate / siteSign / siteVerify / dbRebuild / dbQuery /
 //! importBundle work offline against the data dir; crypt* are pure key
-//! operations; peerPing measures an EDX link's round-trip to a running node.
+//! operations; peerPing measures an EDX link's round-trip to a running node;
+//! siteCmd runs any WS command against a running node's admin socket.
 //!
 //! Kept clap-free on purpose: the action name is the first argument, exactly
 //! like the Python CLI, and everything else stays positional.
@@ -29,6 +30,7 @@ pub fn is_action(name: &str) -> bool {
             | "cryptGetPrivatekey"
             | "cryptPrivatekeyToAddress"
             | "peerPing"
+            | "siteCmd"
     )
 }
 
@@ -303,6 +305,33 @@ async fn dispatch(
                 epix_crypt::privatekey_to_address(privatekey).map_err(|e| e.to_string())?
             );
             Ok(())
+        }
+
+        // --- run any WS command against a running node, bound to one xite ---
+        // Per-site commands (feedItemQuery, feedSegmentSearch, dbQuery, ...)
+        // read their target from the CONNECTION, not from params, so they are
+        // unreachable without a bound xite. The admin socket binds one from the
+        // request's `xite` key; this exposes that from the shell.
+        "siteCmd" => {
+            let (address, cmd, params_raw) = match args {
+                [a, c] => (a, c, "{}"),
+                [a, c, p] => (a, c, p.as_str()),
+                _ => return Err("usage: siteCmd <address> <command> [json-params]".into()),
+            };
+            let params: serde_json::Value = serde_json::from_str(params_raw)
+                .map_err(|e| format!("params must be JSON: {e}"))?;
+            match admin_call(data_root, cmd, Some(address), params).await? {
+                Some(reply) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&reply).unwrap_or_else(|_| reply.to_string())
+                    );
+                    Ok(())
+                }
+                // Unlike the site-admin actions there is no offline equivalent:
+                // these commands read live node state.
+                None => Err("node is not running (no admin socket)".into()),
+            }
         }
 
         // --- peer diagnostics (an EDX link to a running node) --------------

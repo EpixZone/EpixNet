@@ -284,6 +284,11 @@ async fn handle_admin_text(ctx: &Ctx, text: &str) -> String {
         return json!({ "error": "missing cmd" }).to_string();
     }
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    // An unregistered command dispatches to `null` so a xite page mid-load
+    // survives it. An operator typing at a socket wants the typo reported.
+    if !ctx.registry.has(cmd) && cmd != "as" {
+        return json!({ "error": format!("unknown command: {cmd}") }).to_string();
+    }
     let xite = req.get("xite").and_then(|v| v.as_str()).map(str::to_string);
     let session = WsSession::new_trusted(ctx.state.clone(), xite);
     // A high id keeps the wrapper-elevation path happy too; `trusted` already

@@ -2020,12 +2020,9 @@ impl WsCommand for SitePublish {
             // re-gossips on commit and the periodic sync covers the rest,
             // while the remaining dials of the batch finish in the
             // background. A peer count here would just be dial plumbing.
-            s.state.push_notification_to(
-                s.id,
-                "done",
-                "Changes published. They will spread through the network.",
-                5000,
-            );
+            // No "it will spread" note either - the progress line that lands
+            // just before this already says it reached the network.
+            s.state.push_notification_to(s.id, "done", "Changes published.", 5000);
         } else {
             s.state.push_notification_to(
                 s.id,
@@ -3883,6 +3880,19 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    /// The admin socket rejects a command `has()` does not know, so an operator
+    /// typo is reported instead of dispatching to `null`. `as` is the one live
+    /// command handled inside `dispatch` rather than through the registry, so
+    /// that guard has to except it by name - this pins the coupling.
+    #[test]
+    fn registry_knows_its_commands_and_as_is_not_one_of_them() {
+        let r = CommandRegistry::with_defaults();
+        assert!(r.has("siteInfo"));
+        assert!(r.has("feedSegmentSearch"));
+        assert!(!r.has("notARealCommand"));
+        assert!(!r.has("as"), "`as` is dispatched specially; the admin guard must except it");
+    }
 
     #[tokio::test]
     async fn aes_decrypt_handles_single_and_batch_forms() {
