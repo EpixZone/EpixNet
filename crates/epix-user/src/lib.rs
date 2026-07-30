@@ -220,18 +220,23 @@ impl User {
         Ok(())
     }
 
-    /// Save the xite's own private key (from recovery or user input).
+    /// Save the xite's own private key (from recovery or user input). An empty
+    /// key clears it - that is what the sidebar's "forget private key" sends,
+    /// and storing `Some("")` would leave the xite still claiming to hold one.
     pub fn set_site_privatekey(&mut self, address: &str, privatekey: &str) -> Result<(), String> {
         self.site_data(address)?;
         if let Some(site) = self.sites.get_mut(address) {
-            site.privatekey = Some(privatekey.to_string());
+            site.privatekey =
+                if privatekey.is_empty() { None } else { Some(privatekey.to_string()) };
         }
         Ok(())
     }
 
-    /// The saved xite private key, if any.
+    /// The saved xite private key, if any. An empty stored value is no key -
+    /// users.json written before `set_site_privatekey` cleared properly can
+    /// still hold `""`, and every caller would otherwise try to sign with it.
     pub fn site_privatekey(&self, address: &str) -> Option<String> {
-        self.sites.get(address).and_then(|s| s.privatekey.clone())
+        self.sites.get(address).and_then(|s| s.privatekey.clone()).filter(|k| !k.is_empty())
     }
 
     // --- Certs --------------------------------------------------------------

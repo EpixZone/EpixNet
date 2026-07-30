@@ -70,7 +70,11 @@ pub fn verify_all(content: &Value) -> Vec<(String, bool)> {
 /// Returns the base64 signature. (Multisig / `signers_sign` live a layer up.)
 pub fn sign(content: &mut Value, privatekey: &str) -> Result<String> {
     let data = signed_data(content);
-    let address = epix_crypt::privatekey_to_address(privatekey).map_err(Error::Crypt)?;
+    // Signing a user content.json comes here with a key the user typed, so the
+    // failure is user-facing. The base58check/curve detail underneath says
+    // nothing actionable - the key simply cannot be used.
+    let address = epix_crypt::privatekey_to_address(privatekey)
+        .map_err(|_| Error::Crypt("that is not a valid private key".into()))?;
     let sig = epix_crypt::sign(&data, privatekey).map_err(Error::Crypt)?;
     if let Value::Object(map) = content {
         map.remove("sign");

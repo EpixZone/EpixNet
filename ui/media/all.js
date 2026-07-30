@@ -961,10 +961,23 @@ if (window.getComputedStyle(document.body).transform) {
 
 
 (function () {
-  var Wrapper, origin, proto, ws_url,
+  var Wrapper, cmdError, origin, proto, ws_url,
     bind = function (fn, me) { return function () { return fn.apply(me, arguments); }; },
     indexOf = [].indexOf || function (item) { for (var i = 0, l = this.length; i < l; i++) { if (i in this && this[i] === item) return i; } return -1; },
     slice = [].slice;
+
+  // A failed command comes back as a result of {error: "..."} (a top-level
+  // `error` is dropped by callback-mode ws.cmd), so that is where the reason
+  // lives. Anything else unexpected is still worth showing verbatim.
+  cmdError = function (res) {
+    if (res && res.error) {
+      return res.error;
+    }
+    if (typeof res === "string") {
+      return res;
+    }
+    return "unknown error";
+  };
 
   Wrapper = (function () {
     function Wrapper(ws_url) {
@@ -1988,26 +2001,32 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.siteSign = function (inner_path, cb) {
+      var onSigned;
+      // Shared by both branches below. A key that is malformed, or valid but
+      // for a different xite, fails server-side; without a notification here
+      // the prompt just closes and nothing at all tells the user why.
+      onSigned = (function (_this) {
+        return function (res) {
+          if (res === "ok") {
+            if (typeof cb === "function") {
+              cb(true);
+            }
+          } else {
+            _this.notifications.add("sign", "error", "Signing " + inner_path + " failed: " + cmdError(res));
+            if (typeof cb === "function") {
+              cb(false);
+            }
+          }
+          return _this.infopanel.elem.find(".button").removeClass("loading");
+        };
+      })(this);
       if (this.site_info.privatekey) {
         this.infopanel.elem.find(".button").addClass("loading");
         return this.ws.cmd("siteSign", {
           privatekey: "stored",
           inner_path: inner_path,
           update_changed_files: true
-        }, (function (_this) {
-          return function (res) {
-            if (res === "ok") {
-              if (typeof cb === "function") {
-                cb(true);
-              }
-            } else {
-              if (typeof cb === "function") {
-                cb(false);
-              }
-            }
-            return _this.infopanel.elem.find(".button").removeClass("loading");
-          };
-        })(this));
+        }, onSigned);
       } else {
         return this.displayPrompt("Enter your private key:", "password", "Sign", "", (function (_this) {
           return function (privatekey) {
@@ -2016,18 +2035,7 @@ if (window.getComputedStyle(document.body).transform) {
               privatekey: privatekey,
               inner_path: inner_path,
               update_changed_files: true
-            }, function (res) {
-              if (res === "ok") {
-                if (typeof cb === "function") {
-                  cb(true);
-                }
-              } else {
-                if (typeof cb === "function") {
-                  cb(false);
-                }
-              }
-              return _this.infopanel.elem.find(".button").removeClass("loading");
-            });
+            }, onSigned);
           };
         })(this));
       }

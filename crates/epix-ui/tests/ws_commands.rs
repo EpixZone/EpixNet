@@ -336,3 +336,46 @@ async fn permission_add_merger_rebuilds_db_and_pushes_site_info() {
         .expect("permissionAdd pushes setSiteInfo");
     assert_eq!(pushed.target.as_deref(), Some(merger));
 }
+
+/// A private key is checked when it is SAVED, not later when it is used. A
+/// malformed key, or a valid key belonging to another xite, can never sign this
+/// one - storing it just moves the failure to signing time, where the wrapper
+/// used to swallow it. An empty key forgets the saved one and must not persist
+/// as `""`, which would leave the xite still reporting `privatekey: true`.
+#[tokio::test]
+async fn set_site_privatekey_rejects_a_key_that_cannot_sign_the_xite() {
+    let (state, _root, address, privkey) = state_with_site().await;
+    let registry = CommandRegistry::with_defaults();
+    let session = WsSession::new(state.clone(), Some(address.clone()));
+
+    let malformed = registry
+        .dispatch(&session, "userSetSitePrivatekey", &json!(["not-a-private-key"]), WRAPPER_ID)
+        .await
+        .unwrap_err();
+    assert!(malformed.contains("not a valid private key"), "{malformed}");
+
+    let foreign = epix_crypt::new_seed();
+    let wrong_xite = registry
+        .dispatch(&session, "userSetSitePrivatekey", &json!([foreign]), WRAPPER_ID)
+        .await
+        .unwrap_err();
+    assert!(wrong_xite.contains("not to this xite"), "{wrong_xite}");
+
+    // Neither refusal disturbed the key that was already saved.
+    assert_eq!(state.site_privatekey(&address).await.as_deref(), Some(privkey.as_str()));
+
+    // The xite's own key is accepted; an empty one clears it.
+    registry
+        .dispatch(&session, "userSetSitePrivatekey", &json!([privkey]), WRAPPER_ID)
+        .await
+        .unwrap();
+    registry
+        .dispatch(&session, "userSetSitePrivatekey", &json!([""]), WRAPPER_ID)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.site_privatekey(&address).await,
+        None,
+        "an empty key must clear the saved one, not store \"\""
+    );
+}

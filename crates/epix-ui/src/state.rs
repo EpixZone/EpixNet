@@ -8485,10 +8485,35 @@ impl AppState {
     }
 
     /// Save a xite's private key directly (`userSetSitePrivatekey`), marking it
-    /// owned.
+    /// owned. An empty key clears the saved one instead ("forget private key").
+    ///
+    /// The key is checked here, not at signing time: a key that is malformed,
+    /// or valid but for a different xite, can never sign this one (`Xite::sign`
+    /// requires the signer to be the xite address), so accepting it would only
+    /// store a key that fails later - after marking the xite owned and telling
+    /// the user it was saved.
     pub async fn set_site_privatekey(&self, address: &str, privatekey: &str) -> Result<(), String> {
+        if !privatekey.is_empty() {
+            let signer = epix_crypt::privatekey_to_address(privatekey)
+                .map_err(|_| "That is not a valid private key".to_string())?;
+            if signer != address {
+                return Err(format!(
+                    "That private key belongs to {signer}, not to this xite ({address})"
+                ));
+            }
+        }
         self.user.write().await.set_site_privatekey(address, privatekey)?;
-        self.set_owned(address, true).await;
+        // Persist it - `recover_privatekey` saves, this path never did, so a key
+        // added from the sidebar was silently lost on restart.
+        self.save_user().await;
+        if privatekey.is_empty() {
+            // Forgetting a key says nothing about ownership (a xite whose key
+            // is recoverable from the master seed is still owned), so only
+            // re-render rather than going through set_owned.
+            self.push_site_info(address).await;
+        } else {
+            self.set_owned(address, true).await;
+        }
         Ok(())
     }
 

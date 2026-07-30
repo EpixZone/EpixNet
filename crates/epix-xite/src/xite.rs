@@ -632,8 +632,11 @@ impl Xite {
     /// The key must own the xite (its address must equal the xite address),
     /// otherwise the resulting signature wouldn't verify.
     pub fn sign(&mut self, privatekey: &str, modified: f64) -> Result<()> {
-        let signer =
-            epix_crypt::privatekey_to_address(privatekey).map_err(Error::Crypt)?;
+        // The underlying failure is a base58check/curve detail (checksum byte
+        // arrays and the like). This message reaches the user as a notification,
+        // and there is nothing actionable in the detail: the key is unusable.
+        let signer = epix_crypt::privatekey_to_address(privatekey)
+            .map_err(|_| Error::Crypt("that is not a valid private key".into()))?;
         if signer != self.address.as_str() {
             return Err(Error::Crypt(format!(
                 "private key address {signer} does not own xite {}",
