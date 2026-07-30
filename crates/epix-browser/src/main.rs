@@ -879,7 +879,11 @@ fn install_ca_certutil(profile: &Path, pem: &str) -> Result<(), String> {
         .output()
         .map_err(|e| format!("run certutil: {e}"))?;
     if !out.status.success() {
-        return Err(format!("certutil -A failed: {}", String::from_utf8_lossy(&out.stderr)));
+        // Only the exit status. certutil's stderr is an external tool's output
+        // about a key store, and this string is printed to the console and
+        // reaches the user's logs; the status is what the fallback decision
+        // needs, and the caller already says which mechanism failed.
+        return Err(format!("certutil -A failed ({})", out.status));
     }
     Ok(())
 }
