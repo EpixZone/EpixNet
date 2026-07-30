@@ -465,6 +465,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "true",
         "bool",
     ),
+    (
+        "Optional Files",
+        "full_retention",
+        "Keep a full copy of every xite you visit (downloads everything, not just what you view)",
+        "false",
+        "bool",
+    ),
     // --- Storage. `data_dir` is special: the value is the live data root and
     // the setting persists to `epixnet.conf` (see `AppState::set_data_dir`),
     // not config.json - config.json lives inside the directory it would name.
@@ -7634,6 +7641,12 @@ impl AppState {
             .entry(address.to_string())
             .or_default()
             .insert(conn_id);
+        // A viewer just arrived: let the retry loop re-examine this xite on
+        // its next tick instead of waiting out the backoff. The retention
+        // prompt only fires with a viewer bound, so without this a xite
+        // parked at the slow interval would miss every short visit and its
+        // over-budget completion could never ask for consent.
+        self.mark_optional_dirty(address);
         self.pending_prompts.lock().unwrap().remove(address).unwrap_or_default()
     }
 
@@ -10687,6 +10700,51 @@ impl AppState {
         });
     }
 
+    /// The retention pass hit the consent gate: ask ONCE per xite per session
+    /// (sharing the [`Self::prompt_optional_download`] once-per-session set),
+    /// stating the ACTUAL scope - how many files, how many bytes, and on whose
+    /// behalf: the reader's global full-retention setting or the xite's own
+    /// declared policy. The single-file prompt would misstate all three here.
+    /// Accepting grants the same per-xite optional-download consent the file
+    /// prompt grants, then re-runs the retention pass, which now completes
+    /// the whole plan.
+    async fn prompt_retention_completion(self: &Arc<Self>, address: &str, files: usize, bytes: u64) {
+        // Never burn the once-per-session slot without a viewer. The retry
+        // loop reaches an over-budget xite at boot long before any wrapper
+        // binds; a prompt raised then buffers unseen, `confirm` times out to
+        // false, and the consumed slot would silence BOTH this prompt and
+        // the page's own optional prompt for the whole session (they share
+        // the set). No viewer -> skip quietly; a later pass re-offers while
+        // the page is actually open.
+        if !self.has_bound_conn(address) {
+            return;
+        }
+        if !self.optional_prompts.lock().unwrap().insert(address.to_string()) {
+            return;
+        }
+        let reader = self.config_bool("full_retention", false).await;
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        let body = if reader {
+            format!(
+                "Your \"Keep a full copy of every xite\" setting wants to download \
+                 the rest of this xite: {files} file(s) ({mb:.1} MB), more than its \
+                 current size limit allows.<br>\
+                 Enable optional file downloads for this xite? (Turning the \
+                 setting off in Config stops these requests.)"
+            )
+        } else {
+            format!(
+                "This xite asks to be kept complete: {files} file(s) ({mb:.1} MB) \
+                 still missing, more than its current size limit allows.<br>\
+                 Enable optional file downloads for this xite?"
+            )
+        };
+        if self.confirm(address, &body, "Download").await {
+            self.set_download_optional(address, true, false).await;
+            self.spawn_retention_completion(address);
+        }
+    }
+
     /// Background-fetch missing optional files with a completion notification -
     /// the websocket commands behind the sidebar toggle and `optionalHelp`
     /// return immediately while this runs.
@@ -10762,6 +10820,62 @@ impl AppState {
             .collect()
     }
 
+    /// The xites the reader's global `full_retention` setting watches: every
+    /// serving, non-own xite WITHOUT its own whole-site optional promise
+    /// (those are already covered by [`Self::optional_retry_flagged`]; a xite
+    /// with only directory-scoped `optionalHelp` commitments still needs the
+    /// full-retention pass for the rest of its files). This is what makes
+    /// "keep a full copy of every xite you visit" hold for xites visited
+    /// BEFORE the setting was turned on, and what heals a full copy as the
+    /// owner publishes new versions - the clone-time pass alone covers
+    /// neither. Empty when the setting is off.
+    async fn full_retention_watch(&self) -> Vec<String> {
+        if !self.config_bool("full_retention", false).await {
+            return Vec::new();
+        }
+        let xites = self.xites.read().await;
+        let mut watch: Vec<String> = xites
+            .iter()
+            .filter(|(_, x)| {
+                x.settings.serving
+                    && !x.settings.own
+                    && !(x.settings.download_optional || x.settings.autodownloadoptional)
+            })
+            .map(|(a, _)| a.clone())
+            .collect();
+        watch.sort();
+        watch
+    }
+
+    /// One full-retention candidate per retry tick: pace it like the optional
+    /// candidates, and when its plan still has work, run the CONSENT-GATED
+    /// retention pass - never the raw optional pass. The global setting
+    /// widens WHAT completes; the per-xite size budget (and its prompt) still
+    /// decides quietly-vs-ask.
+    async fn retry_retention_candidate(
+        self: &Arc<Self>,
+        addr: &str,
+        schedule: &mut HashMap<String, (u32, i64)>,
+    ) {
+        let key = format!("full:{addr}");
+        let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
+        if next_at > now_secs() {
+            return;
+        }
+        let plan = self.retention_completion_plan(addr).await;
+        if plan.paths.is_empty() {
+            // Full copy on disk: park on the slow re-verify interval (a
+            // dirty mark bypasses it the tick after new content lands).
+            schedule.insert(key, (0, now_secs() + 600));
+            return;
+        }
+        // Pace BEFORE spawning, like the optional candidates: `file_need`
+        // dedupes per file, so an overlapping pass is wasteful, not harmful.
+        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        schedule.insert(key, (fails + 1, now_secs() + delay));
+        self.spawn_retention_completion(addr);
+    }
+
     /// Whether any file within a retry scope is still missing on disk.
     async fn optional_scope_missing(&self, address: &str, dirs: &Option<Vec<String>>) -> bool {
         match dirs {
@@ -10812,11 +10926,19 @@ impl AppState {
             loop {
                 // Dirty addresses bypass their delay this tick.
                 for addr in state.optional_dirty.lock().unwrap().drain() {
+                    schedule.remove(&format!("full:{addr}"));
                     schedule.remove(&addr);
                 }
                 let flagged = state.optional_retry_flagged().await;
                 for (addr, dirs) in &flagged {
                     state.retry_optional_candidate(addr, dirs, &mut schedule).await;
+                }
+                // The reader's global full-retention promise rides the same
+                // loop: xites without their own optional promise get the
+                // consent-gated retention pass.
+                let full_watch = state.full_retention_watch().await;
+                for addr in &full_watch {
+                    state.retry_retention_candidate(addr, &mut schedule).await;
                 }
                 // Registered xites whose CORE files never completed - an
                 // interrupted or failed clone (the seeder was offline when
@@ -10839,7 +10961,10 @@ impl AppState {
                 // watched sets - drop its schedule entries.
                 schedule.retain(|k, _| match k.strip_prefix("core:") {
                     Some(a) => core_watch.iter().any(|w| w == a),
-                    None => flagged.iter().any(|(a, _)| a == k),
+                    None => match k.strip_prefix("full:") {
+                        Some(a) => full_watch.iter().any(|w| w == a),
+                        None => flagged.iter().any(|(a, _)| a == k),
+                    },
                 });
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
@@ -11397,28 +11522,101 @@ impl AppState {
     /// What a background completion pass would still fetch for `address` under
     /// the owner's signed `distribution` policy (issue #340): the missing
     /// declared files - required and optional - whose unit committed to
-    /// `retention:complete`, plus whether their total exceeds this xite's size
-    /// limit and so needs the user's consent.
+    /// `retention:complete`, plus whether fetching them would push the xite
+    /// past its size limit and so needs the user's consent.
     ///
     /// `retention:partial` paths are absent from the plan by construction:
-    /// those keep today's fetch-what-you-view behavior.
+    /// those keep today's fetch-what-you-view behavior. The exception is the
+    /// global `full_retention` setting: a reader who turned it on replicates
+    /// every xite fully, so the plan covers ALL missing declared files
+    /// regardless of the owner's carve-outs. Retention is a floor, not a
+    /// ceiling - holding more than the owner asked for breaks no commitment -
+    /// and the size-limit consent gate applies unchanged.
     pub async fn retention_completion_plan(
         &self,
         address: &str,
     ) -> epix_blob::policy::CompletionPlan {
-        let Some(content) = self.content(address).await else {
+        let reader = self.config_bool("full_retention", false).await;
+        self.retention_completion_plan_as(address, reader).await
+    }
+
+    /// [`Self::retention_completion_plan`] with the reader-override decision
+    /// made by the CALLER. A pass that later re-checks its mandate must
+    /// classify itself with the SAME snapshot the plan was built from - two
+    /// separate config reads let a mid-build toggle produce a site-sized
+    /// override plan whose pass believes it is owner-driven and so never
+    /// stops when the setting goes off.
+    async fn retention_completion_plan_as(
+        &self,
+        address: &str,
+        reader: bool,
+    ) -> epix_blob::policy::CompletionPlan {
+        let Some((storage, content, stats)) = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| {
+                (x.storage.clone(), x.content.clone(), x.settings.cache.optional_stats.clone())
+            })
+        else {
             return Default::default();
         };
-        let policy = epix_blob::policy::DistributionPolicy::from_content(&content);
+        let Some(content) = content else {
+            return Default::default();
+        };
+        let policy = if reader {
+            epix_blob::policy::DistributionPolicy::complete_everything()
+        } else {
+            epix_blob::policy::DistributionPolicy::from_content(&content)
+        };
+
+        // One SIZE-ONLY inventory of every declared file - required and
+        // optional, root and child units alike. `missing` and `present` come
+        // from the SAME walk, so a held byte the walk can see is always
+        // charged against the budget (settings stats are root-only and reset
+        // on every root update, which silently dropped child-unit bytes; an
+        // optional-only walk missed the child units' required per-user data,
+        // the dominant bytes on a hub). No hashing here - this runs from the
+        // background retry tick, and hashing every declared file of every
+        // watched xite each pass reads and SHA512s entire sites forever
+        // (corruption is still caught at serve/verify/resync time).
         let mut missing: Vec<(String, u64)> = Vec::new();
-        if let Ok(xite) = self.xite_view(address).await {
-            for f in xite.files_needed() {
-                missing.push((f.inner_path, f.size.max(0) as u64));
+        let mut present: u64 = 0;
+        // Required files: present = exists at the declared size. A required
+        // bigfile counts as present at full sparse size - piece-level
+        // completion belongs to the bigfile machinery, and (unlike optional
+        // files) there is no completion stamp to consult, so counting it
+        // missing would re-plan it forever.
+        for f in declared_files_under(&storage, Some(&content), "files") {
+            let size = f.size.max(0) as u64;
+            let at_size = storage
+                .path(&f.inner_path)
+                .ok()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as i64 == f.size)
+                .unwrap_or(false);
+            if at_size {
+                present = present.saturating_add(size);
+            } else {
+                missing.push((f.inner_path, size));
             }
         }
-        missing.extend(self.missing_optional_files(address, None).await);
+        for f in declared_files_under(&storage, Some(&content), "files_optional") {
+            let size = f.size.max(0) as u64;
+            if optional_file_present(&storage, &stats, &f.inner_path, f.size, f.bigfile) {
+                present = present.saturating_add(size);
+            } else {
+                missing.push((f.inner_path, size));
+            }
+        }
+
+        // The consent budget charges what is ALREADY held against the xite's
+        // size limit, so completion can never quietly overshoot the cap: the
+        // gate compares the size AFTER completing (present + planned) with
+        // the limit, not the increment alone.
         let limit = self.size_limit_bytes(address).await.max(0) as u64;
-        policy.completion_plan(&missing, limit)
+        policy.completion_plan(&missing, limit.saturating_sub(present))
     }
 
     /// Finish a `retention:complete` unit in the BACKGROUND, after first paint.
@@ -11428,11 +11626,12 @@ impl AppState {
     ///    the loading screen is gone, and it only ever fetches what is still
     ///    missing, so a package unit can never block the first render on a full
     ///    download.
-    /// 2. CONSENT-GATED, reusing the existing machinery. Under the xite's
-    ///    `size_limit` the unit completes quietly; over it we tap the same
-    ///    optional-download prompt a big optional file already raises
-    ///    ([`Self::prompt_optional_download`]), and skip until the user says
-    ///    yes. No new UX.
+    /// 2. CONSENT-GATED, reusing the existing machinery. While the xite stays
+    ///    within its `size_limit` (bytes already held count against it) the
+    ///    unit completes quietly; over it we ask through the same wrapper
+    ///    confirm flow, worded for the ACTUAL scope
+    ///    ([`Self::prompt_retention_completion`]), and skip until the user
+    ///    says yes.
     /// 3. Availability advertising is untouched: we keep advertising per-chunk
     ///    partial ranges while completing, so the swarm self-completes.
     ///    Complete-or-unavailable is an OUTPUT rule - a file only reaches the
@@ -11443,17 +11642,21 @@ impl AppState {
         let state = self.clone();
         let address = address.to_string();
         tokio::spawn(async move {
-            let plan = state.retention_completion_plan(&address).await;
+            // One snapshot of the override decides BOTH the plan's scope and
+            // the pass's mandate class - see retention_completion_plan_as.
+            let reader = state.config_bool("full_retention", false).await;
+            let plan = state.retention_completion_plan_as(&address, reader).await;
             if plan.paths.is_empty() {
                 return;
             }
             if plan.needs_consent && !state.optional_fetch_allowed(&address).await {
-                // Over the limit and no standing consent: ask through the
-                // familiar prompt (once per xite per session) and stop. The
-                // user accepting turns the toggle on, and the next pass - or
-                // the optional download it kicks off - completes the unit.
-                let biggest = plan.paths.first().cloned().unwrap_or_default();
-                state.prompt_optional_download(&address, &biggest, plan.bytes as i64);
+                // Over the budget and no standing consent: ask once per xite
+                // per session, scoped to what would ACTUALLY happen (file
+                // count, total bytes, and on whose behalf), and stop.
+                // Accepting re-runs this pass with the consent in place.
+                state
+                    .prompt_retention_completion(&address, plan.paths.len(), plan.bytes)
+                    .await;
                 return;
             }
             state
@@ -11466,13 +11669,65 @@ impl AppState {
                     ),
                 )
                 .await;
-            // Sequential and unhurried: this is background work behind an
-            // already-painted page, and `file_need` dedupes against any fetch
-            // the page itself started.
-            for path in plan.paths {
-                let _ = state.file_need(&address, &path).await;
-            }
+            state.run_retention_pass(&address, plan.paths, reader, plan.needs_consent).await;
         });
+    }
+
+    /// The body of a retention pass: fetch each planned path while the
+    /// mandate holds. Sequential and unhurried - this is background work
+    /// behind an already-painted page, and `file_need` dedupes against any
+    /// fetch the page itself started. The mandate is re-checked between
+    /// files: a plan can be site-sized, and pausing the xite or withdrawing
+    /// the setting/consent must stop it HERE, not only block the next pass.
+    /// Returns how many paths were attempted (a withdrawal stops the walk).
+    async fn run_retention_pass(
+        self: &Arc<Self>,
+        address: &str,
+        paths: Vec<String>,
+        reader: bool,
+        consented: bool,
+    ) -> usize {
+        let mut attempted = 0usize;
+        for path in paths {
+            if !self.retention_pass_should_continue(address, reader, consented).await {
+                break;
+            }
+            attempted += 1;
+            let _ = self.file_need(address, &path).await;
+        }
+        attempted
+    }
+
+    /// Whether an in-flight retention pass still has its mandate: the xite is
+    /// still served here (pause/delete withdraws it), the global setting - for
+    /// a reader-driven pass - is still on, and the optional-download consent,
+    /// when the plan needed it, still stands. The bulk optional pass keeps the
+    /// same promise through `optional_pass_should_continue`; without this a
+    /// site-sized pass would keep downloading for hours after the user said
+    /// stop.
+    async fn retention_pass_should_continue(
+        &self,
+        address: &str,
+        reader_driven: bool,
+        consented: bool,
+    ) -> bool {
+        let serving = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.serving)
+            .unwrap_or(false);
+        if !serving {
+            return false;
+        }
+        if reader_driven && !self.config_bool("full_retention", false).await {
+            return false;
+        }
+        if consented && !self.optional_fetch_allowed(address).await {
+            return false;
+        }
+        true
     }
 
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
@@ -12126,6 +12381,19 @@ struct DeclaredOptional {
 /// directory. Root-only readers (`Xite::optional_files`) miss the per-user
 /// files entirely, which left a hub's Files-tab list empty.
 fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Vec<DeclaredOptional> {
+    declared_files_under(storage, content, "files_optional")
+}
+
+/// Every file the root content.json and the child content.json units ON DISK
+/// declare under `key` (`"files"` or `"files_optional"`), child paths
+/// prefixed with their unit's directory. The retention inventory needs BOTH
+/// keys: on user-content hubs the dominant bytes are the child units'
+/// required `files` (per-user data), which no optional-only walk sees.
+fn declared_files_under(
+    storage: &XiteStorage,
+    content: Option<&Value>,
+    key: &str,
+) -> Vec<DeclaredOptional> {
     let mut out = Vec::new();
     let mut scan = |files: Option<&Value>, dir: &str| {
         let Some(files) = files.and_then(|f| f.as_object()) else { return };
@@ -12144,7 +12412,7 @@ fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Ve
             });
         }
     };
-    scan(content.and_then(|c| c.get("files_optional")), "");
+    scan(content.and_then(|c| c.get(key)), "");
     for child in storage.list_files() {
         if !child.ends_with("/content.json") || child == "content.json" {
             continue;
@@ -12152,7 +12420,7 @@ fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Ve
         let Ok(bytes) = storage.read(&child) else { continue };
         let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { continue };
         let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        scan(json.get("files_optional"), dir);
+        scan(json.get(key), dir);
     }
     out
 }
@@ -13689,9 +13957,10 @@ mod tests {
         state.config_set("autodownloadoptional_default", Value::from("false")).await;
         state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
 
-        // Default size limit (10 MB) covers the 2 MB remainder -> completes
-        // quietly. index.html verifies on disk, so first paint is NOT in the
-        // plan: streaming already delivered it, completion is only the rest.
+        // The default size limit (DEFAULT_SIZE_LIMIT_MB = 1000 MB) covers the
+        // 2 MB remainder -> completes quietly. index.html verifies on disk, so
+        // first paint is NOT in the plan: streaming already delivered it,
+        // completion is only the rest.
         let plan = state.retention_completion_plan(addr).await;
         assert_eq!(plan.paths, vec!["js/app.js".to_string()], "only the missing complete-unit file");
         assert!(!plan.paths.contains(&"index.html".to_string()), "first paint is not re-fetched");
@@ -13733,6 +14002,367 @@ mod tests {
             state.retention_completion_plan(bare).await.paths.is_empty(),
             "no declared retention -> partial default, nothing to complete"
         );
+    }
+
+    /// The global `full_retention` setting makes a reader replicate every xite
+    /// fully: the plan covers ALL missing declared files, including the
+    /// owner's `retention:partial` carve-outs and xites that declared no
+    /// distribution policy at all. The size-limit consent gate is unchanged -
+    /// the override widens what completes, not who decides.
+    #[tokio::test]
+    async fn full_retention_setting_plans_every_missing_path() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": {
+                "default": {"unit": "package", "retention": "complete"},
+                "paths": { "data/feed/": {"unit": "feed", "retention": "partial"} }
+            },
+            "files": {
+                "js/app.js": { "size": 2 * 1024 * 1024, "sha512": "aa" },
+            },
+            "files_optional": {
+                "data/feed/seg7.bin": { "size": 3 * 1024 * 1024, "sha512": "bb" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        // Owner policy alone: the partial feed stays out of the plan.
+        let owner = state.retention_completion_plan(addr).await;
+        assert_eq!(owner.paths, vec!["js/app.js".to_string()]);
+
+        // Override on: the feed carve-out is planned too, well under the
+        // default limit (DEFAULT_SIZE_LIMIT_MB = 1000 MB) -> still quiet.
+        state.config_set("full_retention", Value::from("true")).await;
+        let full = state.retention_completion_plan(addr).await;
+        assert_eq!(
+            full.paths,
+            vec!["data/feed/seg7.bin".to_string(), "js/app.js".to_string()],
+            "every missing declared file is planned"
+        );
+        assert_eq!(full.bytes, 5 * 1024 * 1024);
+        assert!(!full.needs_consent, "under the size limit -> completes quietly");
+
+        // The consent gate still holds when the plan outgrows the limit.
+        state.set_size_limit(addr, 1).await;
+        assert!(state.retention_completion_plan(addr).await.needs_consent);
+
+        // A bare xite (no distribution declared) is also fully replicated.
+        let bare_dir = tempdir().unwrap();
+        let bare = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state
+            .add_xite(
+                bare,
+                XiteEntry {
+                    storage: XiteStorage::new(bare_dir.path()),
+                    content: Some(json!({
+                        "address": bare, "modified": 1.0,
+                        "files": { "big.bin": { "size": 99, "sha512": "cc" } }
+                    })),
+                },
+            )
+            .await;
+        assert_eq!(
+            state.retention_completion_plan(bare).await.paths,
+            vec!["big.bin".to_string()],
+            "undeclared xites are fully replicated under the override"
+        );
+
+        // Off again: back to the owner's declaration.
+        state.config_set("full_retention", Value::from("false")).await;
+        assert_eq!(state.retention_completion_plan(addr).await.paths, vec!["js/app.js".to_string()]);
+    }
+
+    /// The schema default for `full_retention` must be OFF. The Config page
+    /// renders an unset bool from this schema row and persists every bool on
+    /// any save, so a drifted default would silently enroll fresh installs in
+    /// whole-network replication. `config_bool` call sites must mirror it
+    /// (their doc says so); this pins the schema side.
+    #[test]
+    fn full_retention_schema_default_is_off() {
+        let row = CONFIG_SCHEMA
+            .iter()
+            .find(|(_, key, ..)| *key == "full_retention")
+            .expect("full_retention must be in CONFIG_SCHEMA");
+        assert_eq!(row.3, "false", "full replication must be opt-in");
+        assert_eq!(row.4, "bool");
+    }
+
+    /// The consent gate charges bytes ALREADY held against the size limit:
+    /// a plan that fits the limit on its own but would push the xite past it
+    /// must prompt. Regression: the gate used to compare only the increment,
+    /// so a xite could quietly grow to nearly twice its consented cap.
+    #[tokio::test]
+    async fn completion_consent_counts_bytes_already_on_disk() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // 700 KB already on disk (verifies against its declared hash), 500 KB
+        // missing, and a 1 MB size limit: the missing 500 KB fits the limit
+        // alone but not on top of what is held.
+        let held = vec![0xEEu8; 700 * 1024];
+        storage.write("held.bin", &held).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": { "default": {"unit": "package", "retention": "complete"} },
+            "files": {
+                "held.bin": { "size": held.len(), "sha512": XiteStorage::hash_bytes(&held) },
+                "missing.bin": { "size": 500 * 1024, "sha512": "aa" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_size_limit(addr, 1).await;
+
+        let plan = state.retention_completion_plan(addr).await;
+        assert_eq!(plan.paths, vec!["missing.bin".to_string()]);
+        assert_eq!(plan.bytes, 500 * 1024);
+        assert!(
+            plan.needs_consent,
+            "500 KB fits 1 MB alone, but not on top of the 700 KB already held"
+        );
+
+        // With room for both (2 MB limit), it completes quietly again.
+        state.set_size_limit(addr, 2).await;
+        assert!(!state.retention_completion_plan(addr).await.needs_consent);
+    }
+
+    /// `full_retention_watch` is the set the retry loop drives the global
+    /// promise over: serving, not own, and no whole-site optional promise of
+    /// its own. A directory-scoped optionalHelp commitment does NOT exclude a
+    /// xite - the rest of its files still need the retention pass. Empty when
+    /// the setting is off.
+    #[tokio::test]
+    async fn full_retention_watch_covers_only_unpromised_xites() {
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let dir = tempdir().unwrap();
+            let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+            let content = json!({ "address": addr, "modified": 1.0, "files": {} });
+            state
+                .add_xite(
+                    &addr,
+                    XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) },
+                )
+                .await;
+            addrs.push(addr);
+        }
+        {
+            let mut xites = state.xites.write().await;
+            // [0] plain -> watched. [1] has its own whole-site promise.
+            xites.get_mut(&addrs[1]).unwrap().settings.download_optional = true;
+            // [2] own xite. [3] dir-scoped help only -> still watched.
+            xites.get_mut(&addrs[2]).unwrap().settings.own = true;
+            xites
+                .get_mut(&addrs[3])
+                .unwrap()
+                .settings
+                .optional_help
+                .insert("data/media/".to_string(), Value::from("help"));
+        }
+
+        assert!(
+            state.full_retention_watch().await.is_empty(),
+            "setting off -> nothing watched"
+        );
+
+        state.config_set("full_retention", Value::from("true")).await;
+        let mut expected = vec![addrs[0].clone(), addrs[3].clone()];
+        expected.sort();
+        assert_eq!(state.full_retention_watch().await, expected);
+    }
+
+    /// Bytes held in CHILD content.json units count against the consent
+    /// budget. Regression: `present` used to come from the settings stats,
+    /// which are root-only and reset on every root update, so a hub xite
+    /// (per-user child units holding most bytes) fell back to the
+    /// increment-only comparison and quietly overshot its size limit.
+    #[tokio::test]
+    async fn completion_consent_counts_child_unit_bytes() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // A child unit declares 700 KB of optional media, present on disk.
+        let media = vec![0xEEu8; 700 * 1024];
+        storage.write("data/users/u1/big.bin", &media).unwrap();
+        let child = json!({
+            "files_optional": { "big.bin": { "size": media.len(), "sha512": "dd" } }
+        });
+        storage
+            .write("data/users/u1/content.json", child.to_string().as_bytes())
+            .unwrap();
+        // The root declares 500 KB still missing; the limit is 1 MB.
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": { "default": {"unit": "package", "retention": "complete"} },
+            "files": { "missing.bin": { "size": 500 * 1024, "sha512": "aa" } },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_size_limit(addr, 1).await;
+
+        let plan = state.retention_completion_plan(addr).await;
+        assert_eq!(plan.paths, vec!["missing.bin".to_string()]);
+        assert!(
+            plan.needs_consent,
+            "500 KB fits 1 MB alone, but not on top of 700 KB held in a child unit"
+        );
+        // The budget does not depend on the root-only settings stats: zeroing
+        // them (what a root update used to do to the old arithmetic) changes
+        // nothing, because present bytes come from the declared-file walk.
+        {
+            let mut xites = state.xites.write().await;
+            let settings = &mut xites.get_mut(addr).unwrap().settings;
+            settings.size = 0;
+            settings.size_optional = 0;
+        }
+        assert!(state.retention_completion_plan(addr).await.needs_consent);
+    }
+
+    /// Child-unit REQUIRED `files` (per-user data.json - the dominant bytes
+    /// on a hub xite) take part in the inventory on both sides: held ones are
+    /// charged against the consent budget, and missing ones are planned under
+    /// the override. Regression: the optional-only child walk saw neither, so
+    /// a hub could quietly overshoot its cap and "keep a full copy" silently
+    /// skipped user content.
+    #[tokio::test]
+    async fn child_required_files_are_charged_and_planned() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // One child unit holds 700 KB of required user data on disk; another
+        // declares 300 KB that is absent.
+        let held = vec![0xEEu8; 700 * 1024];
+        storage.write("data/users/u1/data.json", &held).unwrap();
+        let child_held = json!({ "files": { "data.json": { "size": held.len(), "sha512": "dd" } } });
+        storage.write("data/users/u1/content.json", child_held.to_string().as_bytes()).unwrap();
+        let child_missing =
+            json!({ "files": { "data.json": { "size": 300 * 1024, "sha512": "ee" } } });
+        storage.write("data/users/u2/content.json", child_missing.to_string().as_bytes()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": { "default": {"unit": "package", "retention": "complete"} },
+            "files": { "missing.bin": { "size": 500 * 1024, "sha512": "aa" } },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_size_limit(addr, 1).await;
+
+        let plan = state.retention_completion_plan(addr).await;
+        // Both missing files are planned - including the child-required one.
+        assert_eq!(
+            plan.paths,
+            vec!["data/users/u2/data.json".to_string(), "missing.bin".to_string()],
+            "child-required user data is part of the plan"
+        );
+        // And the held child bytes are charged: 800 KB planned fits 1 MB
+        // alone, but not on top of the 700 KB held in the child unit.
+        assert!(plan.needs_consent, "held child-required bytes count against the budget");
+    }
+
+    /// The retention prompt never burns its once-per-session slot without a
+    /// viewer: at boot the retry loop reaches an over-budget xite before any
+    /// wrapper binds, and a slot consumed by an unseen, timed-out confirm
+    /// would silence both this prompt and the page's own optional prompt for
+    /// the session.
+    #[tokio::test(start_paused = true)]
+    async fn retention_prompt_needs_a_viewer_to_consume_the_slot() {
+        let state = AppState::new("test");
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state.prompt_retention_completion(addr, 3, 5 * 1024 * 1024).await;
+        assert!(
+            !state.optional_prompts.lock().unwrap().contains(addr.as_str()),
+            "no viewer -> slot untouched, a later pass may still ask"
+        );
+
+        // With a wrapper bound, the prompt fires and consumes the slot (the
+        // unanswered confirm times out under paused time; consumption is the
+        // once-per-session contract).
+        state.register_bound_conn(addr, 42);
+        state.prompt_retention_completion(addr, 3, 5 * 1024 * 1024).await;
+        assert!(state.optional_prompts.lock().unwrap().contains(addr.as_str()));
+    }
+
+    /// An in-flight retention pass loses its mandate when the xite stops
+    /// serving, when a reader-driven pass's global setting is turned off, or
+    /// when needed consent is withdrawn - checked between files so a
+    /// site-sized pass stops mid-way, mirroring the bulk optional pass.
+    #[tokio::test]
+    async fn retention_pass_mandate_follows_serving_setting_and_consent() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": addr, "modified": 1.0, "files": {} })),
+                },
+            )
+            .await;
+
+        // Unknown xite -> no mandate.
+        assert!(!state.retention_pass_should_continue("unknown", false, false).await);
+        // Served, no further conditions -> mandate holds.
+        assert!(state.retention_pass_should_continue(addr, false, false).await);
+        // Reader-driven while the global setting is off -> stops.
+        assert!(!state.retention_pass_should_continue(addr, true, false).await);
+        state.config_set("full_retention", Value::from("true")).await;
+        assert!(state.retention_pass_should_continue(addr, true, false).await);
+        // A consented plan stops once consent is withdrawn.
+        assert!(!state.retention_pass_should_continue(addr, true, true).await);
+        assert!(state.set_download_optional(addr, true, false).await);
+        assert!(state.retention_pass_should_continue(addr, true, true).await);
+        // Pausing withdraws every mandate.
+        assert!(state.set_serving(addr, false).await);
+        assert!(!state.retention_pass_should_continue(addr, false, false).await);
+    }
+
+    /// The pass BODY consults the mandate between files - not just the
+    /// predicate in isolation. A pass whose mandate is gone attempts nothing;
+    /// one whose mandate holds attempts every path (fetch failures do not
+    /// stop the walk).
+    #[tokio::test]
+    async fn retention_pass_body_stops_when_the_mandate_is_withdrawn() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": addr, "modified": 1.0, "files": {} })),
+                },
+            )
+            .await;
+        let paths = vec!["a.bin".to_string(), "b.bin".to_string()];
+
+        // Mandate holds: both paths are attempted (the fetches fail - no
+        // peers - but failure must not stop the walk).
+        assert_eq!(state.run_retention_pass(addr, paths.clone(), false, false).await, 2);
+        // Reader-driven pass with the setting off: nothing is attempted.
+        assert_eq!(state.run_retention_pass(addr, paths.clone(), true, false).await, 0);
+        // Paused xite: nothing is attempted.
+        assert!(state.set_serving(addr, false).await);
+        assert_eq!(state.run_retention_pass(addr, paths, false, false).await, 0);
     }
 
     #[tokio::test]

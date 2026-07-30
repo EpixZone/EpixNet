@@ -227,6 +227,22 @@ impl DistributionPolicy {
         Self { rules, default }
     }
 
+    /// The reader-side override: every path resolves to `package`/`complete`,
+    /// regardless of what the owner declared. Backs the global "keep a full
+    /// copy of every xite" setting - retention is a floor, not a ceiling, so
+    /// a READER choosing to hold more than the owner asked for breaks no
+    /// commitment. Consent is unchanged: the caller still gates an over-limit
+    /// plan on the same optional-download prompt.
+    pub fn complete_everything() -> Self {
+        Self {
+            rules: Vec::new(),
+            default: Some(PathPolicy {
+                unit: DistributionUnit::Package,
+                retention: Retention::Complete,
+            }),
+        }
+    }
+
     /// The policy governing `inner_path` (longest declared prefix wins;
     /// else the default; else package/partial — stream-first, seed what
     /// you viewed, the universal safe behavior).
@@ -258,9 +274,11 @@ impl DistributionPolicy {
     /// This is what makes the retention COMMITMENT real, and it is deliberately
     /// a plan rather than a fetch: completion happens in the BACKGROUND after
     /// first paint, so a package unit can never block the first render on a
-    /// full download. `limit_bytes` is the xite's existing per-site size limit;
-    /// over it the caller taps the same optional-download prompt a big optional
-    /// file already raises, so there is no new consent UX.
+    /// full download. `limit_bytes` is the byte budget the plan may consume
+    /// without asking - the caller passes what REMAINS of the xite's size
+    /// limit after the bytes already held, so completing can never quietly
+    /// overshoot the cap. Over it, the caller asks through the existing
+    /// consent prompt; there is no new consent UX.
     pub fn completion_plan(&self, missing: &[(String, u64)], limit_bytes: u64) -> CompletionPlan {
         let mut paths = Vec::new();
         let mut bytes = 0u64;
@@ -415,6 +433,25 @@ mod tests {
         // No declared distribution -> nothing to complete at all.
         let bare = DistributionPolicy::from_content(&json!({}));
         assert!(bare.completion_plan(&missing, 0).paths.is_empty());
+    }
+
+    #[test]
+    fn complete_everything_overrides_owner_carveouts_but_not_consent() {
+        // The reader override plans EVERY missing path: the owner's partial
+        // feed carve-out and even a xite that declared nothing.
+        let d = DistributionPolicy::complete_everything();
+        let missing = vec![
+            ("js/app.js".to_string(), 3_000_000u64),
+            ("data/feed/seg7".to_string(), 90_000_000),
+        ];
+        let plan = d.completion_plan(&missing, 100_000_000);
+        assert_eq!(plan.paths, vec!["data/feed/seg7", "js/app.js"], "every path planned");
+        assert_eq!(plan.bytes, 93_000_000);
+        assert!(!plan.needs_consent, "under the limit -> quiet");
+
+        // The size-limit consent gate is scope-independent: the override
+        // widens WHAT completes, never WHO decides.
+        assert!(d.completion_plan(&missing, 1_000_000).needs_consent);
     }
 
     #[test]
