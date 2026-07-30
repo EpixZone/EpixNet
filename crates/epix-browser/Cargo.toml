@@ -19,7 +19,7 @@ rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 # Decode the persisted CA cert PEM back to DER (rcgen emits PEM but can't re-parse).
-base64 = "0.22"
+base64 = "0.23"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
 tower = { version = "0.5", features = ["util"] }
@@ -36,7 +36,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # best-effort - the launcher falls back to no-tray when the host can't show one.
 tray-icon = "0.24"
 muda = "0.19"
-tao = "0.35"
+tao = "0.36"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows: register the native-messaging host via the registry; console

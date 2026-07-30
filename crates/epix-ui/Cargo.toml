@@ -32,7 +32,7 @@ epix-chain = { path = "../epix-chain" }
 # by the `bittorrent` feature, so the iOS build (which never enables it) has no
 # BT code. See crates/epix-bt.
 epix-bt = { path = "../epix-bt", optional = true }
-base64 = "0.22"
+base64 = "0.23"
 sha2 = "0.11"
 hex = "0.4"
 axum = { version = "0.8", features = ["ws", "multipart"] }
