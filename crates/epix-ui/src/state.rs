@@ -4120,9 +4120,26 @@ impl AppState {
             return resp;
         }
         let need = crate::tracker::NeedTypes::from_list(&req.need_types);
+        let mine = self.register_announcer_addrs(req, from).await;
 
-        // Record the announcer's addresses, collecting them so it never gets
-        // itself back in the results.
+        // Reply: the peers we know for each hash, bucketed by type. `need_num`
+        // is what the requester would like; 30 per hash is what any requester
+        // gets.
+        let limit = (req.need_num as usize).min(30);
+        for h in &req.hashes {
+            let peers = self.tracker_peer_list(h, &mine, limit, need).await;
+            resp.peers.push(PeerBuckets::pack(&peers));
+        }
+        resp
+    }
+
+    /// Record the announcer's addresses for every hash it named, returning them
+    /// so it never gets itself back in the results.
+    async fn register_announcer_addrs(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+    ) -> std::collections::HashSet<String> {
         let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Clearnet: source IP + the port it announced, if it asked to be added.
         if req.port != 0 {
@@ -4148,11 +4165,10 @@ impl AppState {
                 mine.insert(from.to_string());
             }
         }
-        // Onion / i2p self-addresses from the request. Parallel arrays map to
-        // hashes one-to-one; a single value applies to every hash. We register
-        // them on trust: this tracker issues no `onion_sign_this` challenge,
-        // so `resp.onion_sign_this` stays empty and the request's
-        // `onion_signs` are never needed.
+        // Onion / i2p self-addresses from the request. We register them on
+        // trust: this tracker issues no `onion_sign_this` challenge, so
+        // `resp.onion_sign_this` stays empty and the request's `onion_signs`
+        // are never needed.
         for (list, is_onion) in [(&req.onions, true), (&req.i2p, false)] {
             for (i, host) in list.iter().enumerate() {
                 if host.is_empty() {
@@ -4163,25 +4179,21 @@ impl AppState {
                 } else {
                     PeerAddr::I2p { dest: host.clone(), port: req.port }
                 };
-                let hs: &[[u8; 32]] = if list.len() == req.hashes.len() {
-                    std::slice::from_ref(&req.hashes[i])
-                } else {
-                    &req.hashes
-                };
-                self.tracker_announce(hs, &addr).await;
+                self.tracker_announce(Self::hashes_for(list, i, &req.hashes), &addr).await;
                 mine.insert(addr.to_string());
             }
         }
+        mine
+    }
 
-        // Reply: the peers we know for each hash, bucketed by type. `need_num`
-        // is what the requester would like; 30 per hash is what any requester
-        // gets.
-        let limit = (req.need_num as usize).min(30);
-        for h in &req.hashes {
-            let peers = self.tracker_peer_list(h, &mine, limit, need).await;
-            resp.peers.push(PeerBuckets::pack(&peers));
+    /// The hashes one entry of a request's parallel array applies to: parallel
+    /// arrays map to hashes one-to-one; a single value applies to every hash.
+    fn hashes_for<'a>(list: &[String], i: usize, hashes: &'a [[u8; 32]]) -> &'a [[u8; 32]] {
+        if list.len() == hashes.len() {
+            std::slice::from_ref(&hashes[i])
+        } else {
+            hashes
         }
-        resp
     }
 
     /// Drop stale tracker peers (called from the announce loop).
@@ -8141,43 +8153,43 @@ impl AppState {
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
         storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
-        // Optional-file bookkeeping: mirror fetch_file_from_peers so an
-        // EDX-fetched optional file advertises in our hashfield (peers can
-        // discover we hold it), counts toward optional_downloaded, and stamps
-        // its finished time. Without this an optional file fetched over EDX
-        // lands on disk invisible to the swarm - it never seeds. A required
-        // file, or one not declared here, does none of this (optional=false).
-        // Idempotent: the first-completion stamp gates the once-only counter,
-        // and add_hash is a set, so a re-materialize (resync, refetch) is safe.
         if let Some((entry, _dir, optional)) = self.declared_entry(address, inner_path).await {
             if optional {
-                let sha512 =
-                    entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let size = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
-                if let Some(x) = self.xites.write().await.get_mut(address) {
-                    let first = {
-                        let stat = x
-                            .settings
-                            .cache
-                            .optional_stats
-                            .entry(inner_path.to_string())
-                            .or_default();
-                        let first = stat.time_downloaded == 0;
-                        if first {
-                            stat.time_downloaded = now_secs() as i64;
-                        }
-                        first
-                    };
-                    if !sha512.is_empty() {
-                        x.hashfield.add_hash(&sha512);
-                    }
-                    if first {
-                        x.settings.optional_downloaded += size;
-                    }
-                }
+                self.note_optional_materialized(address, inner_path, &entry).await;
             }
         }
         Ok(())
+    }
+
+    /// Optional-file bookkeeping: mirror fetch_file_from_peers so an
+    /// EDX-fetched optional file advertises in our hashfield (peers can
+    /// discover we hold it), counts toward optional_downloaded, and stamps
+    /// its finished time. Without this an optional file fetched over EDX
+    /// lands on disk invisible to the swarm - it never seeds. A required
+    /// file, or one not declared here, does none of this (the caller only
+    /// calls this for optional=true). Idempotent by construction: the
+    /// first-completion stamp gates the once-only counter, and add_hash is a
+    /// set, so a re-materialize (resync, refetch) is safe.
+    async fn note_optional_materialized(&self, address: &str, inner_path: &str, entry: &Value) {
+        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let size = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            let first = {
+                let stat =
+                    x.settings.cache.optional_stats.entry(inner_path.to_string()).or_default();
+                let first = stat.time_downloaded == 0;
+                if first {
+                    stat.time_downloaded = now_secs() as i64;
+                }
+                first
+            };
+            if !sha512.is_empty() {
+                x.hashfield.add_hash(&sha512);
+            }
+            if first {
+                x.settings.optional_downloaded += size;
+            }
+        }
     }
 
     /// Register every currently-loaded xite's files into the EDX store, so a
@@ -9005,49 +9017,84 @@ impl AppState {
         for content_path in walk_content_json(storage.root()) {
             let Ok(bytes) = storage.read(&content_path) else { continue };
             let Ok(content) = serde_json::from_slice::<Value>(&bytes) else { continue };
-            let merge_paths = epix_content::declared_merge_files(&content);
-            if merge_paths.is_empty() {
-                continue;
-            }
             let dir =
                 content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
             // Only resolve signers once per unit, and only if a declared merge
             // file actually matches this feed's glob.
             let mut signers: Option<Vec<String>> = None;
-            for rel in merge_paths {
-                let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
-                if !crate::feed::glob_match(&desc.files, &mpath) {
-                    continue;
-                }
-                let Ok(cbytes) = storage.read(&mpath) else { continue };
-                let Ok(container) = serde_json::from_slice::<Value>(&cbytes) else { continue };
-                // Honour the descriptor's declared record_format (untrusted
-                // marker, but a mismatch means these aren't this feed's records).
-                let fmt = container.get("record_format").and_then(|v| v.as_str()).unwrap_or("");
-                if fmt != desc.record_format {
-                    continue;
-                }
-                let Some(records) = container.get(&desc.record_key).and_then(|v| v.as_array())
-                else {
-                    continue;
-                };
-                if signers.is_none() {
-                    let xid_map = Self::resolve_xid_map(&storage, &content_path).await;
-                    signers = Some(view.valid_signers_for(&content_path, &xid_map));
-                }
-                let signers_ref = signers.as_deref().unwrap_or(&[]);
-                for record in records {
-                    if epix_content::verify_record(record, signers_ref, now).is_err() {
-                        continue;
-                    }
-                    let canonical = epix_content::dumps_sorted(record).into_bytes();
-                    if let Ok(r) = epix_feed::adapter::record_from_value(desc, record, canonical) {
-                        out.push(r);
-                    }
-                }
+            for mpath in Self::matching_merge_paths(&content, dir, desc) {
+                self.feed_records_from_merge_file(
+                    &storage,
+                    &view,
+                    desc,
+                    &content_path,
+                    &mpath,
+                    &mut signers,
+                    now,
+                    &mut out,
+                )
+                .await;
             }
         }
         out
+    }
+
+    /// Append the VERIFIED records one merge file contributes to `desc`. Each
+    /// record is verified against the authorized signer set of the unit that
+    /// declared the merge file, and `signers` is that unit's cache: it is
+    /// resolved here at most once per unit, and only once a merge file got as
+    /// far as holding records for this feed (resolving the xid map is not free).
+    #[allow(clippy::too_many_arguments)]
+    async fn feed_records_from_merge_file(
+        &self,
+        storage: &XiteStorage,
+        view: &Xite,
+        desc: &epix_feed::adapter::FeedDescriptor,
+        content_path: &str,
+        mpath: &str,
+        signers: &mut Option<Vec<String>>,
+        now: i64,
+        out: &mut Vec<epix_feed::Record>,
+    ) {
+        let Ok(cbytes) = storage.read(mpath) else { return };
+        let Ok(container) = serde_json::from_slice::<Value>(&cbytes) else { return };
+        // Honour the descriptor's declared record_format (untrusted
+        // marker, but a mismatch means these aren't this feed's records).
+        let fmt = container.get("record_format").and_then(|v| v.as_str()).unwrap_or("");
+        if fmt != desc.record_format {
+            return;
+        }
+        let Some(records) = container.get(&desc.record_key).and_then(|v| v.as_array()) else {
+            return;
+        };
+        if signers.is_none() {
+            let xid_map = Self::resolve_xid_map(storage, content_path).await;
+            *signers = Some(view.valid_signers_for(content_path, &xid_map));
+        }
+        let signers_ref = signers.as_deref().unwrap_or(&[]);
+        for record in records {
+            if epix_content::verify_record(record, signers_ref, now).is_err() {
+                continue;
+            }
+            let canonical = epix_content::dumps_sorted(record).into_bytes();
+            if let Ok(r) = epix_feed::adapter::record_from_value(desc, record, canonical) {
+                out.push(r);
+            }
+        }
+    }
+
+    /// The merge files one content.json unit declares that belong to `desc`, as
+    /// full inner paths (`dir` is the unit's directory, empty at the root).
+    fn matching_merge_paths(
+        content: &Value,
+        dir: &str,
+        desc: &epix_feed::adapter::FeedDescriptor,
+    ) -> Vec<String> {
+        epix_content::declared_merge_files(content)
+            .into_iter()
+            .map(|rel| if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") })
+            .filter(|mpath| crate::feed::glob_match(&desc.files, mpath))
+            .collect()
     }
 
     /// Re-derive every feed for a xite and cache the artifacts, inserting the
@@ -9072,31 +9119,38 @@ impl AppState {
         for desc in descriptors {
             let records = self.gather_feed_records(address, &desc).await;
             let artifacts = crate::feed::derive_feed(records);
-            // Cache the sealed segments as EDX objects (content-addressed by
-            // their own BLAKE3 root); pin so they survive eviction. Losing one
-            // is harmless - it recomputes from the records.
             if let Some(store) = &store {
-                let ts = now.max(0) as u64;
-                for (i, seg) in artifacts.sealed.iter().enumerate() {
-                    if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() {
-                        let _ = store.pin(seg.root);
-                    }
-                    // The segment's search skip-filter, as a SIBLING object
-                    // keyed by the segment root (see `feed::skip_filter_id`):
-                    // a peer that wants to skip-scan our feed pulls the tiny
-                    // filter instead of the whole segment. Derived, so a failed
-                    // insert costs nothing - it rebuilds from the segment.
-                    if let Some(f) = artifacts.filters.get(i) {
-                        let id = crate::feed::skip_filter_id(seg.root);
-                        if store.insert_bytes(id, epix_blob::Ns::Plain, &f.to_bytes(), ts).is_ok() {
-                            let _ = store.pin(id);
-                        }
-                    }
-                }
+                Self::pin_feed_objects(store, &artifacts, now.max(0) as u64);
             }
             derived.insert(desc.name.clone(), artifacts);
         }
         self.feed_cache.write().await.insert(address.to_string(), derived);
+    }
+
+    /// Cache the sealed segments as EDX objects (content-addressed by
+    /// their own BLAKE3 root); pin so they survive eviction. Losing one
+    /// is harmless - it recomputes from the records.
+    fn pin_feed_objects(
+        store: &epix_blob::store::Store,
+        artifacts: &crate::feed::FeedArtifacts,
+        ts: u64,
+    ) {
+        for (i, seg) in artifacts.sealed.iter().enumerate() {
+            if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() {
+                let _ = store.pin(seg.root);
+            }
+            // The segment's search skip-filter, as a SIBLING object
+            // keyed by the segment root (see `feed::skip_filter_id`):
+            // a peer that wants to skip-scan our feed pulls the tiny
+            // filter instead of the whole segment. Derived, so a failed
+            // insert costs nothing - it rebuilds from the segment.
+            if let Some(f) = artifacts.filters.get(i) {
+                let id = crate::feed::skip_filter_id(seg.root);
+                if store.insert_bytes(id, epix_blob::Ns::Plain, &f.to_bytes(), ts).is_ok() {
+                    let _ = store.pin(id);
+                }
+            }
+        }
     }
 
     /// The cached artifacts for one feed, recomputing on a cache miss so the
@@ -10944,30 +10998,7 @@ impl AppState {
         let total = todo.len();
         self.log("INFO", format!("Downloading {total} optional file(s) for {address}")).await;
         self.set_worker_stats(address, total, 1, total).await;
-        // Seed the live progress snapshot the sidebar renders: every file starts
-        // Pending, and the overall bar is sized by the sum of declared bytes.
-        let bytes_total: u64 = todo.iter().map(|(_, s)| *s).sum();
-        self.set_optional_progress(
-            address,
-            Some(OptionalProgress {
-                total_files: total,
-                done_files: 0,
-                failed_files: 0,
-                bytes_total,
-                bytes_done: 0,
-                current: String::new(),
-                status: String::new(),
-                files: todo
-                    .iter()
-                    .map(|(path, size)| OptionalProgressFile {
-                        path: path.clone(),
-                        size: *size,
-                        state: OptFileState::Pending,
-                    })
-                    .collect(),
-            }),
-        )
-        .await;
+        self.seed_optional_progress(address, &todo).await;
         self.push_site_info(address).await;
         // A cold registry (right after a restart) has no peers to try yet -
         // announce NOW instead of failing the whole pass and telling the user
@@ -10986,42 +11017,8 @@ impl AppState {
         // retried files flip back to Pending/Active in place in the file list.
         let mut queue: Vec<(usize, &String, u64)> =
             todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
-        // EDX-first bulk pass: dial the seed peers ONCE and pull every optional
-        // file the verified-streaming path can serve, then the msgpack rounds
-        // below mop up only what EDX missed. Per-file bookkeeping (hashfield
-        // advertise, optional_downloaded, finished stamp) happens in
-        // edx_materialize_file, so an EDX-fetched optional file seeds just like
-        // a msgpack-fetched one. A legacy site (no `b3`) resolves nothing and
-        // this returns at once, leaving the whole queue to the rounds.
-        if !queue.is_empty() {
-            let peers = self.fetch_candidate_peers(address, 20).await;
-            if !peers.is_empty() {
-                let want: Vec<EdxWant> = todo
-                    .iter()
-                    .map(|(p, _)| EdxWant { inner_path: p.clone(), id: None, size: None })
-                    .collect();
-                if let Some(batch) = self.edx_fetch_files(address, want, peers, None).await {
-                    if batch.bytes > 0 {
-                        self.add_transfer(address, batch.bytes, 0).await;
-                    }
-                    let done: std::collections::HashSet<&str> =
-                        batch.done.iter().map(|s| s.as_str()).collect();
-                    if !done.is_empty() {
-                        for (idx, path, size) in &queue {
-                            if done.contains(path.as_str()) {
-                                fetched += 1;
-                                bytes_done += *size;
-                                self.mark_optional_file(address, *idx, OptFileState::Done, "")
-                                    .await;
-                                self.push_site_info_file_done(address, path, None).await;
-                            }
-                        }
-                        self.bump_optional_progress(address, fetched, 0, bytes_done).await;
-                        queue.retain(|(_, path, _)| !done.contains(path.as_str()));
-                    }
-                }
-            }
-        }
+        self.edx_bulk_optional_pass(address, &todo, &mut queue, &mut fetched, &mut bytes_done)
+            .await;
         for round in 1..=ROUNDS {
             let (requeue, aborted) = self
                 .run_optional_round(address, directory, &queue, round, ROUNDS, &mut fetched, &mut bytes_done)
@@ -11054,6 +11051,82 @@ impl AppState {
         )
         .await;
         (fetched, failed)
+    }
+
+    /// EDX-first bulk pass: dial the seed peers ONCE and pull every optional
+    /// file the verified-streaming path can serve, then the msgpack rounds
+    /// mop up only what EDX missed. Per-file bookkeeping (hashfield advertise,
+    /// optional_downloaded, finished stamp) happens in edx_materialize_file, so
+    /// an EDX-fetched optional file seeds just like a msgpack-fetched one. A
+    /// legacy site (no `b3`) resolves nothing and this returns at once, leaving
+    /// the whole queue to the rounds. What it fetched is dropped from `queue`
+    /// and added to the counters, so the rounds never re-try a done file.
+    async fn edx_bulk_optional_pass<'a>(
+        &self,
+        address: &str,
+        todo: &'a [(String, u64)],
+        queue: &mut Vec<(usize, &'a String, u64)>,
+        fetched: &mut usize,
+        bytes_done: &mut u64,
+    ) {
+        if queue.is_empty() {
+            return;
+        }
+        let peers = self.fetch_candidate_peers(address, 20).await;
+        if peers.is_empty() {
+            return;
+        }
+        let want: Vec<EdxWant> = todo
+            .iter()
+            .map(|(p, _)| EdxWant { inner_path: p.clone(), id: None, size: None })
+            .collect();
+        let Some(batch) = self.edx_fetch_files(address, want, peers, None).await else {
+            return;
+        };
+        if batch.bytes > 0 {
+            self.add_transfer(address, batch.bytes, 0).await;
+        }
+        let done: std::collections::HashSet<&str> = batch.done.iter().map(|s| s.as_str()).collect();
+        if done.is_empty() {
+            return;
+        }
+        for (idx, path, size) in queue.iter() {
+            if done.contains(path.as_str()) {
+                *fetched += 1;
+                *bytes_done += *size;
+                self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
+                self.push_site_info_file_done(address, path, None).await;
+            }
+        }
+        self.bump_optional_progress(address, *fetched, 0, *bytes_done).await;
+        queue.retain(|(_, path, _)| !done.contains(path.as_str()));
+    }
+
+    /// Seed the live progress snapshot the sidebar renders: every file starts
+    /// Pending, and the overall bar is sized by the sum of declared bytes.
+    async fn seed_optional_progress(&self, address: &str, todo: &[(String, u64)]) {
+        let bytes_total: u64 = todo.iter().map(|(_, s)| *s).sum();
+        self.set_optional_progress(
+            address,
+            Some(OptionalProgress {
+                total_files: todo.len(),
+                done_files: 0,
+                failed_files: 0,
+                bytes_total,
+                bytes_done: 0,
+                current: String::new(),
+                status: String::new(),
+                files: todo
+                    .iter()
+                    .map(|(path, size)| OptionalProgressFile {
+                        path: path.clone(),
+                        size: *size,
+                        state: OptFileState::Pending,
+                    })
+                    .collect(),
+            }),
+        )
+        .await;
     }
 
     /// The declared optional files not present on disk, as site-relative inner
