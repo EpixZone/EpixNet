@@ -408,12 +408,10 @@ fn glob_inner(pat: &[u8], path: &[u8]) -> bool {
     let mut star_crosses = false;
     while s < path.len() {
         if p < pat.len() && pat[p] == b'*' {
-            let crosses = p + 1 < pat.len() && pat[p + 1] == b'*';
-            let skip = if crosses { 2 } else { 1 };
+            star_crosses = crosses_segments(pat, p);
             star_p = Some(p);
-            star_crosses = crosses;
             star_s = s;
-            p += skip;
+            p += star_width(star_crosses);
         } else if p < pat.len() && (pat[p] == path[s]) {
             p += 1;
             s += 1;
@@ -425,15 +423,31 @@ fn glob_inner(pat: &[u8], path: &[u8]) -> bool {
             }
             star_s += 1;
             s = star_s;
-            p = if star_crosses { sp + 2 } else { sp + 1 };
+            p = sp + star_width(star_crosses);
         } else {
             return false;
         }
     }
+    skip_trailing_stars(pat, p) == pat.len()
+}
+
+/// True when the wildcard at `p` is a `**` (matches across `/` segments).
+fn crosses_segments(pat: &[u8], p: usize) -> bool {
+    p + 1 < pat.len() && pat[p + 1] == b'*'
+}
+
+/// Pattern bytes a wildcard occupies: 2 for `**`, 1 for `*`.
+fn star_width(crosses: bool) -> usize {
+    if crosses { 2 } else { 1 }
+}
+
+/// Advance past a run of trailing wildcards: with the path exhausted,
+/// any remaining `*`/`**` matches the empty remainder.
+fn skip_trailing_stars(pat: &[u8], mut p: usize) -> usize {
     while p < pat.len() && pat[p] == b'*' {
-        p += if p + 1 < pat.len() && pat[p + 1] == b'*' { 2 } else { 1 };
+        p += star_width(crosses_segments(pat, p));
     }
-    p == pat.len()
+    p
 }
 
 #[cfg(test)]

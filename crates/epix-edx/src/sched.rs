@@ -196,6 +196,32 @@ fn split_by_holder(groups: &[u64], peers: &[PeerHandle], size: u64) -> Vec<std::
     out
 }
 
+/// One round's slice of the precomputed rarest-first order: advance
+/// `cursor` past the already-fetched prefix, then collect up to `window`
+/// still-remaining groups. A group whose batch failed is still in
+/// `remaining`, so it holds the cursor and is retried next round, exactly
+/// as a full recompute would.
+fn round_window(
+    full_order: &[u64],
+    cursor: &mut usize,
+    remaining: &GroupBits,
+    window: usize,
+) -> Vec<u64> {
+    while *cursor < full_order.len() && !remaining.contains(full_order[*cursor]) {
+        *cursor += 1;
+    }
+    let mut order = Vec::new();
+    for &g in &full_order[*cursor..] {
+        if order.len() >= window {
+            break;
+        }
+        if remaining.contains(g) {
+            order.push(g);
+        }
+    }
+    order
+}
+
 /// The fetch driver for one object across a peer set.
 pub struct Swarm {
     store: Arc<Store>,
@@ -254,96 +280,108 @@ impl Swarm {
         // 10 GB object is ~600k groups over ~1600 rounds).
         let full_order = rarest_first_order(needed, peers);
         let mut cursor = 0usize;
-        // Groups needed to fill one round's batches (see the take() below).
+        // Groups needed to fill one round's batches (see the take() in
+        // assign_round_batches).
         let window = peers.len().max(1) * 2 * GROUPS_PER_REQUEST as usize;
         while !remaining.is_empty() {
-            // Skip the fetched prefix. A group whose batch failed is still in
-            // `remaining`, so it holds the cursor and is retried this round,
-            // exactly as a full recompute would.
-            while cursor < full_order.len() && !remaining.contains(full_order[cursor]) {
-                cursor += 1;
-            }
-            let mut order = Vec::new();
-            for &g in &full_order[cursor..] {
-                if order.len() >= window {
-                    break;
-                }
-                if remaining.contains(g) {
-                    order.push(g);
-                }
-            }
+            let order = round_window(&full_order, &mut cursor, &remaining, window);
             if order.is_empty() {
                 break; // no peer holds any remaining group
             }
             let batches = batch_into_ranges(&order, self.size);
-
-            // Assign concurrent batches across peers so work STRIPES
-            // instead of piling onto the single fastest peer: each batch
-            // goes to the least-loaded eligible peer this round, ties
-            // broken by class RTT (so fast peers still get more, but slow
-            // peers are used in parallel rather than idled).
-            let mut load = vec![0u32; peers.len()];
             let mut tasks = Vec::new();
-            for batch in batches.into_iter().take(peers.len().max(1) * 2) {
-                let bgroups = self.groups_of(&batch);
-                match self.pick_peer(&bgroups, peers, &load, &fails) {
-                    Some(idx) => {
-                        load[idx] += 1;
-                        report.requests_issued += 1;
-                        tasks.push(self.race_batch(batch, bgroups, idx, peers, deadline, now));
-                    }
-                    None => {
-                        // A merged batch can straddle groups held by DISJOINT
-                        // peers (equal holder COUNTS don't mean the same
-                        // holder SET), so no single peer holds all of it.
-                        // Split into maximal sub-batches each fully held by
-                        // some peer instead of skipping it — skipping would
-                        // strand groups that ARE available and leave the
-                        // object stuck incomplete.
-                        for sub in split_by_holder(&bgroups, peers, self.size) {
-                            let sgroups = self.groups_of(&sub);
-                            let Some(idx) = self.pick_peer(&sgroups, peers, &load, &fails) else {
-                                continue;
-                            };
-                            load[idx] += 1;
-                            report.requests_issued += 1;
-                            tasks.push(self.race_batch(sub, sgroups, idx, peers, deadline, now));
-                        }
-                    }
-                }
+            for (batch, groups, idx) in self.assign_round_batches(batches, peers, &fails) {
+                report.requests_issued += 1;
+                tasks.push(self.race_batch(batch, groups, idx, peers, deadline, now));
             }
             if tasks.is_empty() {
                 break;
             }
             let results = futures_join_all(tasks).await;
-            let mut progressed = false;
-            for outcome in results {
-                report.duplicates_issued += outcome.duplicates;
-                // Fold the winner's measured latency into the class prior, so
-                // the next round's timeout/duplication uses real RTT.
-                if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
-                    self.stats.observe(cls, el);
-                }
-                // Deprioritize a peer that failed this batch next round.
-                if let Some(p) = outcome.failed_peer {
-                    if let Some(f) = fails.get_mut(p) {
-                        *f = f.saturating_add(1);
-                    }
-                }
-                let Some(label) = outcome.winner_label else { continue };
-                for g in &outcome.groups {
-                    remaining.remove(*g..*g + 1);
-                    report.groups_fetched += 1;
-                    progressed = true;
-                }
-                *report.by_peer.entry(label).or_default() += outcome.groups.len() as u64;
-            }
-            if !progressed {
+            if !self.apply_round_results(results, &mut remaining, &mut fails, &mut report) {
                 break; // a full round made no progress; give up
             }
         }
 
         Ok(report)
+    }
+
+    /// Assign one round's batches to peers so work STRIPES instead of
+    /// piling onto the single fastest peer: each batch goes to the
+    /// least-loaded eligible peer this round, ties broken by class RTT
+    /// (so fast peers still get more, but slow peers are used in
+    /// parallel rather than idled). Returns the requests to issue as
+    /// (byte range, group indices, peer index).
+    fn assign_round_batches(
+        &self,
+        batches: Vec<std::ops::Range<u64>>,
+        peers: &[PeerHandle],
+        fails: &[u32],
+    ) -> Vec<(std::ops::Range<u64>, Vec<u64>, usize)> {
+        let mut load = vec![0u32; peers.len()];
+        let mut out = Vec::new();
+        for batch in batches.into_iter().take(peers.len().max(1) * 2) {
+            let bgroups = self.groups_of(&batch);
+            match self.pick_peer(&bgroups, peers, &load, fails) {
+                Some(idx) => {
+                    load[idx] += 1;
+                    out.push((batch, bgroups, idx));
+                }
+                None => {
+                    // A merged batch can straddle groups held by DISJOINT
+                    // peers (equal holder COUNTS don't mean the same
+                    // holder SET), so no single peer holds all of it.
+                    // Split into maximal sub-batches each fully held by
+                    // some peer instead of skipping it — skipping would
+                    // strand groups that ARE available and leave the
+                    // object stuck incomplete.
+                    for sub in split_by_holder(&bgroups, peers, self.size) {
+                        let sgroups = self.groups_of(&sub);
+                        let Some(idx) = self.pick_peer(&sgroups, peers, &load, fails) else {
+                            continue;
+                        };
+                        load[idx] += 1;
+                        out.push((sub, sgroups, idx));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold one round's batch outcomes into the running state: the class
+    /// RTT priors, the per-peer failure counts, the remaining bitfield
+    /// and the report. Returns whether any group landed this round.
+    fn apply_round_results(
+        &mut self,
+        results: Vec<BatchOutcome>,
+        remaining: &mut GroupBits,
+        fails: &mut [u32],
+        report: &mut FetchReport,
+    ) -> bool {
+        let mut progressed = false;
+        for outcome in results {
+            report.duplicates_issued += outcome.duplicates;
+            // Fold the winner's measured latency into the class prior, so
+            // the next round's timeout/duplication uses real RTT.
+            if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
+                self.stats.observe(cls, el);
+            }
+            // Deprioritize a peer that failed this batch next round.
+            if let Some(p) = outcome.failed_peer {
+                if let Some(f) = fails.get_mut(p) {
+                    *f = f.saturating_add(1);
+                }
+            }
+            let Some(label) = outcome.winner_label else { continue };
+            for g in &outcome.groups {
+                remaining.remove(*g..*g + 1);
+                report.groups_fetched += 1;
+                progressed = true;
+            }
+            *report.by_peer.entry(label).or_default() += outcome.groups.len() as u64;
+        }
+        progressed
     }
 
     fn groups_of(&self, batch: &std::ops::Range<u64>) -> Vec<u64> {

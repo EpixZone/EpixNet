@@ -264,6 +264,47 @@ pub async fn list_signed(
     }
 }
 
+/// Verify and insert one GetMany frame's items. Charges every item's bytes
+/// against the reply budget (`received`/`cap`), skips ids we did not ask
+/// for, and hash-verifies each kept blob on insert. Returns how many blobs
+/// were inserted; their ids are added to `got`.
+async fn store_many_items(
+    store: &Arc<Store>,
+    want: &std::collections::HashSet<ObjId>,
+    items: Vec<(ObjId, Vec<u8>)>,
+    now: u64,
+    received: &mut u64,
+    cap: u64,
+    got: &mut std::collections::HashSet<ObjId>,
+) -> std::io::Result<usize> {
+    let mut inserted = 0usize;
+    for (id, bytes) in items {
+        // Unrequested bytes count against the budget too, or a
+        // peer could stream junk blobs at us for free.
+        *received += bytes.len() as u64;
+        if *received > cap {
+            return Err(proto_err("peer sent more GetMany bytes than the request implies"));
+        }
+        // Never persist a blob we did not ask for: insert_bytes
+        // only proves the bytes hash to `id`, not that we wanted it.
+        if !want.contains(&id) {
+            continue;
+        }
+        // insert_bytes re-verifies BLAKE3(bytes) == id; a lying
+        // peer's blob fails here and is not counted.
+        let store = store.clone();
+        let ok =
+            tokio::task::spawn_blocking(move || store.insert_bytes(id, Ns::Plain, &bytes, now))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if ok.is_ok() {
+            got.insert(id);
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
+}
+
 /// Fetch many small whole blobs in one round trip; each is hash-verified
 /// on insert. Returns (inserted, missing) — missing ids simply weren't
 /// in the response (the peer doesn't have them; try elsewhere).
@@ -294,33 +335,9 @@ pub async fn fetch_many(
                         "peer sent more GetMany frames than the request implies",
                     ));
                 }
-                for (id, bytes) in items {
-                    // Unrequested bytes count against the budget too, or a
-                    // peer could stream junk blobs at us for free.
-                    received += bytes.len() as u64;
-                    if received > cap {
-                        return Err(proto_err(
-                            "peer sent more GetMany bytes than the request implies",
-                        ));
-                    }
-                    // Never persist a blob we did not ask for: insert_bytes
-                    // only proves the bytes hash to `id`, not that we wanted it.
-                    if !want.contains(&id) {
-                        continue;
-                    }
-                    // insert_bytes re-verifies BLAKE3(bytes) == id; a lying
-                    // peer's blob fails here and is not counted.
-                    let store = store.clone();
-                    let ok = tokio::task::spawn_blocking(move || {
-                        store.insert_bytes(id, Ns::Plain, &bytes, now)
-                    })
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    if ok.is_ok() {
-                        got.insert(id);
-                        inserted += 1;
-                    }
-                }
+                inserted +=
+                    store_many_items(store, &want, items, now, &mut received, cap, &mut got)
+                        .await?;
                 if last {
                     break;
                 }

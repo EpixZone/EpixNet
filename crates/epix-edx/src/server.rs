@@ -422,63 +422,24 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
             serve_many(conn, ctx, identity, stream, objs).await;
         }
         Req::GetBitfield { obj } => {
-            let resp = match ctx.store.info(obj).and_then(|info| {
-                Ok(match info {
-                    Some((size, _)) => {
-                        let bits = ctx.store.present_bits(obj)?;
-                        Resp::Bitfield { size, runs: bits.to_wire() }
-                    }
-                    None => Resp::Err { code: err::NOT_FOUND, msg: format!("{obj}") },
-                })
-            }) {
-                Ok(r) => r,
-                Err(e) => Resp::Err { code: err::INTERNAL, msg: e.to_string() },
-            };
-            let _ = conn.respond(stream, resp).await;
+            serve_bitfield(conn, ctx, stream, obj).await;
         }
         Req::GetSigned { xite, inner_path } => {
-            match ctx.provider.get_signed(&xite, &inner_path).await {
-                Some(bytes) => serve_signed(conn, stream, bytes).await,
-                None => {
-                    let _ = conn
-                        .respond(
-                            stream,
-                            Resp::Err { code: err::NOT_FOUND, msg: format!("{xite}/{inner_path}") },
-                        )
-                        .await;
-                }
-            }
+            serve_get_signed(conn, ctx, stream, xite, inner_path).await;
         }
         Req::ListSigned { xite, since } => {
             let entries = ctx.provider.list_signed(&xite, since).await;
             serve_signed_list(conn, stream, entries).await;
         }
         Req::HasXite { xite } => {
-            let resp = match ctx.provider.xite_summary(&xite).await {
-                Some((signed_files, newest_modified, held_bytes)) => {
-                    Resp::XiteSummary { signed_files, newest_modified, held_bytes }
-                }
-                None => Resp::Err { code: err::NOT_FOUND, msg: xite },
-            };
-            let _ = conn.respond(stream, resp).await;
+            serve_xite_summary(conn, ctx, stream, xite).await;
         }
         Req::HaveRanges { .. } => {
             // Availability notification: consumed by the fetch scheduler
             // (see fetch.rs); as a server there is nothing to answer.
         }
         Req::HasShards { addrs } => {
-            // One packed bit per requested addr: set iff we hold it
-            // complete. Answered for anything held, independent of the
-            // volunteer responsibility predicate (responsibility governs
-            // only what we PULL, never what we serve of what we already
-            // have). Needs the store only - no control provider, no cap.
-            let mut bits = vec![0u8; addrs.len().div_ceil(8)];
-            for (i, a) in addrs.iter().enumerate() {
-                if ctx.store.is_complete(*a).unwrap_or(false) {
-                    bits[i / 8] |= 1 << (i % 8);
-                }
-            }
-            let _ = conn.respond(stream, Resp::ShardMask { bits }).await;
+            serve_shard_mask(conn, ctx, stream, addrs).await;
         }
         Req::Update { xite, inner_path, signed, inline, modified, diffs, sender_peers } => {
             let resp = match ctx
@@ -494,65 +455,20 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
         // Control plane (caps::CONTROL). A content-only node (no control
         // provider) answers UNSUPPORTED so a mis-gated dialer fails fast
         // instead of hanging.
-        Req::UpdatesSince { after } => match &ctx.control {
-            Some(c) => {
-                let (updates, head) = c.updates_since(after).await;
-                serve_updates(conn, stream, updates, head).await;
-            }
-            None => {
-                let _ = conn.respond(stream, unsupported()).await;
-            }
-        },
+        Req::UpdatesSince { after } => {
+            serve_updates_since(conn, ctx, stream, after).await;
+        }
         Req::Pex { xite, need, peers } => {
-            let resp = match &ctx.control {
-                Some(c) => Resp::Peers { peers: c.pex(&xite, need, &peers, &identity).await },
-                None => unsupported(),
-            };
-            let _ = conn.respond(stream, resp).await;
+            serve_pex(conn, ctx, identity, stream, xite, need, peers).await;
         }
         Req::GetTrackers => {
-            let resp = match &ctx.control {
-                Some(c) => {
-                    // One unchunked frame, so the set has to fit in it: an
-                    // oversize frame fails to encode in the writer task and
-                    // tears down the WHOLE multiplexed connection. A truncated
-                    // tracker set still works (gossip brings the rest), so
-                    // degrade rather than fail.
-                    let mut trackers: Vec<String> = Vec::new();
-                    let mut bytes = 0usize;
-                    for t in c.trackers().await {
-                        // string bytes + its length varint, generously rounded.
-                        bytes += t.len() + 8;
-                        if bytes > BATCH_BUDGET {
-                            break;
-                        }
-                        trackers.push(t);
-                    }
-                    Resp::Trackers { trackers }
-                }
-                None => unsupported(),
-            };
-            let _ = conn.respond(stream, resp).await;
+            serve_trackers(conn, ctx, stream).await;
         }
         Req::Kad { payload } => {
-            let resp = match &ctx.control {
-                Some(c) => match c.kad(&payload, &identity).await {
-                    Ok(bytes) => Resp::Payload { bytes },
-                    Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
-                },
-                None => unsupported(),
-            };
-            let _ = conn.respond(stream, resp).await;
+            serve_kad(conn, ctx, identity, stream, payload).await;
         }
         Req::Announce { payload } => {
-            let resp = match &ctx.control {
-                Some(c) => match c.announce(&payload, &identity).await {
-                    Ok(bytes) => Resp::Payload { bytes },
-                    Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
-                },
-                None => unsupported(),
-            };
-            let _ = conn.respond(stream, resp).await;
+            serve_announce(conn, ctx, identity, stream, payload).await;
         }
     }
 }
@@ -565,6 +481,166 @@ fn unsupported() -> Resp {
 /// Byte budget for one batched reply frame, leaving room for the frame
 /// header and postcard's length prefixes.
 const BATCH_BUDGET: usize = MAX_FRAME_LEN - 4096;
+
+/// Answer `GetBitfield`: the object's size plus its present-group runs.
+async fn serve_bitfield(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, obj: ObjId) {
+    let resp = match ctx.store.info(obj).and_then(|info| {
+        Ok(match info {
+            Some((size, _)) => {
+                let bits = ctx.store.present_bits(obj)?;
+                Resp::Bitfield { size, runs: bits.to_wire() }
+            }
+            None => Resp::Err { code: err::NOT_FOUND, msg: format!("{obj}") },
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => Resp::Err { code: err::INTERNAL, msg: e.to_string() },
+    };
+    let _ = conn.respond(stream, resp).await;
+}
+
+/// Answer `GetSigned`: stream the signed body, or NOT_FOUND.
+async fn serve_get_signed(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    stream: u64,
+    xite: String,
+    inner_path: String,
+) {
+    match ctx.provider.get_signed(&xite, &inner_path).await {
+        Some(bytes) => serve_signed(conn, stream, bytes).await,
+        None => {
+            let _ = conn
+                .respond(
+                    stream,
+                    Resp::Err { code: err::NOT_FOUND, msg: format!("{xite}/{inner_path}") },
+                )
+                .await;
+        }
+    }
+}
+
+/// Answer `HasXite` with the provider's summary, or NOT_FOUND.
+async fn serve_xite_summary(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, xite: String) {
+    let resp = match ctx.provider.xite_summary(&xite).await {
+        Some((signed_files, newest_modified, held_bytes)) => {
+            Resp::XiteSummary { signed_files, newest_modified, held_bytes }
+        }
+        None => Resp::Err { code: err::NOT_FOUND, msg: xite },
+    };
+    let _ = conn.respond(stream, resp).await;
+}
+
+/// Answer `HasShards`: one packed bit per requested addr, set iff we hold
+/// it complete. Answered for anything held, independent of the volunteer
+/// responsibility predicate (responsibility governs only what we PULL,
+/// never what we serve of what we already have). Needs the store only -
+/// no control provider, no cap.
+async fn serve_shard_mask(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, addrs: Vec<ObjId>) {
+    let mut bits = vec![0u8; addrs.len().div_ceil(8)];
+    for (i, a) in addrs.iter().enumerate() {
+        if ctx.store.is_complete(*a).unwrap_or(false) {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+    }
+    let _ = conn.respond(stream, Resp::ShardMask { bits }).await;
+}
+
+/// Answer `UpdatesSince` from the control provider, or UNSUPPORTED on a
+/// content-only node.
+async fn serve_updates_since(conn: Conn, ctx: Arc<ServeCtx>, stream: u64, after: u64) {
+    match &ctx.control {
+        Some(c) => {
+            let (updates, head) = c.updates_since(after).await;
+            serve_updates(conn, stream, updates, head).await;
+        }
+        None => {
+            let _ = conn.respond(stream, unsupported()).await;
+        }
+    }
+}
+
+/// Answer `Pex` from the control provider, or UNSUPPORTED.
+async fn serve_pex(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    identity: Arc<PeerIdentity>,
+    stream: u64,
+    xite: String,
+    need: u32,
+    peers: Vec<epix_core::PeerAddr>,
+) {
+    let resp = match &ctx.control {
+        Some(c) => Resp::Peers { peers: c.pex(&xite, need, &peers, &identity).await },
+        None => unsupported(),
+    };
+    let _ = conn.respond(stream, resp).await;
+}
+
+/// Answer `GetTrackers` with as much of the working set as fits one
+/// frame, or UNSUPPORTED.
+async fn serve_trackers(conn: Conn, ctx: Arc<ServeCtx>, stream: u64) {
+    let resp = match &ctx.control {
+        Some(c) => {
+            // One unchunked frame, so the set has to fit in it: an
+            // oversize frame fails to encode in the writer task and
+            // tears down the WHOLE multiplexed connection. A truncated
+            // tracker set still works (gossip brings the rest), so
+            // degrade rather than fail.
+            let mut trackers: Vec<String> = Vec::new();
+            let mut bytes = 0usize;
+            for t in c.trackers().await {
+                // string bytes + its length varint, generously rounded.
+                bytes += t.len() + 8;
+                if bytes > BATCH_BUDGET {
+                    break;
+                }
+                trackers.push(t);
+            }
+            Resp::Trackers { trackers }
+        }
+        None => unsupported(),
+    };
+    let _ = conn.respond(stream, resp).await;
+}
+
+/// Answer `Kad`: one Kademlia RPC through the control provider, or
+/// UNSUPPORTED.
+async fn serve_kad(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    identity: Arc<PeerIdentity>,
+    stream: u64,
+    payload: Vec<u8>,
+) {
+    let resp = match &ctx.control {
+        Some(c) => match c.kad(&payload, &identity).await {
+            Ok(bytes) => Resp::Payload { bytes },
+            Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
+        },
+        None => unsupported(),
+    };
+    let _ = conn.respond(stream, resp).await;
+}
+
+/// Answer `Announce`: one tracker announce through the control provider,
+/// or UNSUPPORTED.
+async fn serve_announce(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    identity: Arc<PeerIdentity>,
+    stream: u64,
+    payload: Vec<u8>,
+) {
+    let resp = match &ctx.control {
+        Some(c) => match c.announce(&payload, &identity).await {
+            Ok(bytes) => Resp::Payload { bytes },
+            Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
+        },
+        None => unsupported(),
+    };
+    let _ = conn.respond(stream, resp).await;
+}
 
 /// Send `Signed` across as many frames as it takes. A large site's
 /// content.json is bigger than one frame, and an oversize frame fails to
@@ -819,60 +895,12 @@ async fn serve_many(
     // MAX_MANY_ITEMS * MAX_MANY_ITEM_BYTES per request with no accounting at
     // all, which is the global cap, the foreground yield and reciprocity
     // choking defeated by picking one request type.
-    //
-    // Off the handler task: `info` is synchronous store IO and a full batch
-    // is MAX_MANY_ITEMS of them, same reason serve_range encodes on a
-    // blocking thread.
-    let store = ctx.store.clone();
-    let mut servable: Vec<(ObjId, u64)> = match tokio::task::spawn_blocking(move || {
-        objs.into_iter()
-            .filter_map(|obj| match store.info(obj) {
-                Ok(Some((size, true))) if size <= MAX_MANY_ITEM_BYTES => Some((obj, size)),
-                _ => None,
-            })
-            .collect()
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(join_err) => {
-            let _ = conn
-                .respond(stream, Resp::Err { code: err::INTERNAL, msg: join_err.to_string() })
-                .await;
-            return;
-        }
+    let Some(mut servable) = many_servable(&conn, ctx.store.clone(), stream, objs).await else {
+        return;
     };
     let asked = servable.len();
 
-    // GetMany is cold sync of small whole blobs, so each item is charged as
-    // first-paint: a normal xite sync draws on the free budget and then
-    // falls through to the global cap and the unchoke set, exactly like a
-    // range serve past its free budget.
-    //
-    // Charged ITEM BY ITEM, not as one batch. A full batch is up to
-    // MAX_MANY_ITEMS * MAX_MANY_ITEM_BYTES (16 MiB) while the global cap is
-    // a per-SECOND budget of a few MB, so one decision for the whole batch
-    // throttles any large batch deterministically, for every peer, forever.
-    // The batch is cut where the governor stops admitting instead; the
-    // client sees the rest as missing and asks the next peer (fetch_many
-    // reports missing ids, and get_many_pass re-asks per peer).
-    let mut bulk = false;
-    if let Some(choker) = &ctx.choker {
-        let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
-        let mut c = choker.lock().expect("choker");
-        let mut admitted = 0usize;
-        for (_, size) in &servable {
-            match c.decide(&identity.node_pk, *size, true, foreground, now) {
-                ServeDecision::FirstPaint => {}
-                // Past the free budget this is ordinary bulk upload: it must
-                // not preempt governed ranges on the priority lane.
-                ServeDecision::Serve => bulk = true,
-                ServeDecision::Choked | ServeDecision::Throttled => break,
-            }
-            admitted += 1;
-        }
-        servable.truncate(admitted);
-    }
+    let bulk = admit_many(&ctx, &identity, &mut servable, now);
     if servable.is_empty() && asked > 0 {
         // Not one item fits right now. Say BUSY rather than send an empty
         // batch, which would read as "we hold none of these".
@@ -898,42 +926,7 @@ async fn serve_many(
     let store = ctx.store.clone();
     let writer_conn = conn.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let mut batch: Vec<(ObjId, Vec<u8>)> = Vec::new();
-        let mut batch_bytes = 0usize;
-        for (obj, _) in servable {
-            let bytes = match store.read_bytes(obj, now) {
-                Ok(b) => b,
-                Err(_) => continue, // absent/corrupt: silently omitted, client refetches
-            };
-            let cost = bytes.len() + MANY_ITEM_OVERHEAD;
-            if batch_bytes + cost > BATCH_BUDGET && !batch.is_empty() {
-                let out = std::mem::take(&mut batch);
-                batch_bytes = 0;
-                let frame = Frame {
-                    stream,
-                    body: FrameBody::Resp { last: false, resp: Resp::Many { items: out } },
-                };
-                // Whole stream stays on one lane: mixing them would let the
-                // terminal frame overtake data the peer has not seen yet.
-                let sent = if bulk {
-                    writer_conn.blocking_send_bulk(frame)
-                } else {
-                    writer_conn.blocking_send(frame)
-                };
-                if sent.is_err() {
-                    return;
-                }
-            }
-            batch_bytes += cost;
-            batch.push((obj, bytes));
-        }
-        let frame =
-            Frame { stream, body: FrameBody::Resp { last: true, resp: Resp::Many { items: batch } } };
-        let _ = if bulk {
-            writer_conn.blocking_send_bulk(frame)
-        } else {
-            writer_conn.blocking_send(frame)
-        };
+        read_and_frame_many(&store, &writer_conn, stream, servable, now, bulk)
     })
     .await;
     if let Err(join_err) = res {
@@ -942,6 +935,131 @@ async fn serve_many(
         let _ = conn
             .respond(stream, Resp::Err { code: err::INTERNAL, msg: join_err.to_string() })
             .await;
+    }
+}
+
+/// The `GetMany` sizing pass: which of `objs` the store can serve whole
+/// (present, complete, within the per-item cap), with sizes, in request
+/// order. Runs off the handler task because `info` is synchronous store IO
+/// and a full batch is MAX_MANY_ITEMS of them, same reason serve_range
+/// encodes on a blocking thread. On a join failure it answers the stream
+/// INTERNAL and returns None, so the caller must only return, not reply.
+async fn many_servable(
+    conn: &Conn,
+    store: Arc<Store>,
+    stream: u64,
+    objs: Vec<ObjId>,
+) -> Option<Vec<(ObjId, u64)>> {
+    let sized = tokio::task::spawn_blocking(move || {
+        objs.into_iter()
+            .filter_map(|obj| match store.info(obj) {
+                Ok(Some((size, true))) if size <= MAX_MANY_ITEM_BYTES => Some((obj, size)),
+                _ => None,
+            })
+            .collect()
+    })
+    .await;
+    match sized {
+        Ok(v) => Some(v),
+        Err(join_err) => {
+            let _ = conn
+                .respond(stream, Resp::Err { code: err::INTERNAL, msg: join_err.to_string() })
+                .await;
+            None
+        }
+    }
+}
+
+/// The `GetMany` admission pass. GetMany is cold sync of small whole
+/// blobs, so each item is charged as first-paint: a normal xite sync draws
+/// on the free budget and then falls through to the global cap and the
+/// unchoke set, exactly like a range serve past its free budget.
+///
+/// Charged ITEM BY ITEM, not as one batch. A full batch is up to
+/// MAX_MANY_ITEMS * MAX_MANY_ITEM_BYTES (16 MiB) while the global cap is
+/// a per-SECOND budget of a few MB, so one decision for the whole batch
+/// throttles any large batch deterministically, for every peer, forever.
+/// The batch is cut where the governor stops admitting instead; the
+/// client sees the rest as missing and asks the next peer (fetch_many
+/// reports missing ids, and get_many_pass re-asks per peer).
+///
+/// Truncates `servable` to the admitted prefix (untouched without a
+/// choker) and returns true when any admitted item drew past the free
+/// budget, which routes the reply onto the bulk lane. Synchronous, so the
+/// choker guard is never held across an await.
+fn admit_many(
+    ctx: &ServeCtx,
+    identity: &PeerIdentity,
+    servable: &mut Vec<(ObjId, u64)>,
+    now: u64,
+) -> bool {
+    let mut bulk = false;
+    if let Some(choker) = &ctx.choker {
+        let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
+        let mut c = choker.lock().expect("choker");
+        let mut admitted = 0usize;
+        for (_, size) in servable.iter() {
+            match c.decide(&identity.node_pk, *size, true, foreground, now) {
+                ServeDecision::FirstPaint => {}
+                // Past the free budget this is ordinary bulk upload: it must
+                // not preempt governed ranges on the priority lane.
+                ServeDecision::Serve => bulk = true,
+                ServeDecision::Choked | ServeDecision::Throttled => break,
+            }
+            admitted += 1;
+        }
+        servable.truncate(admitted);
+    }
+    bulk
+}
+
+/// The `GetMany` read+frame stage, run on a blocking thread: read each
+/// admitted item, pack items into frames under BATCH_BUDGET, and send
+/// every frame of the stream on the one lane `bulk` picked (mixing them
+/// would let the terminal frame overtake data the peer has not seen yet).
+/// An unreadable item is silently omitted (the client refetches); the
+/// terminal frame goes out unless a send fails first.
+fn read_and_frame_many(
+    store: &Store,
+    conn: &Conn,
+    stream: u64,
+    servable: Vec<(ObjId, u64)>,
+    now: u64,
+    bulk: bool,
+) {
+    let mut batch: Vec<(ObjId, Vec<u8>)> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for (obj, _) in servable {
+        let bytes = match store.read_bytes(obj, now) {
+            Ok(b) => b,
+            Err(_) => continue, // absent/corrupt: silently omitted, client refetches
+        };
+        let cost = bytes.len() + MANY_ITEM_OVERHEAD;
+        if batch_bytes + cost > BATCH_BUDGET && !batch.is_empty() {
+            let out = std::mem::take(&mut batch);
+            batch_bytes = 0;
+            let frame = Frame {
+                stream,
+                body: FrameBody::Resp { last: false, resp: Resp::Many { items: out } },
+            };
+            if send_on_lane(conn, frame, bulk).is_err() {
+                return;
+            }
+        }
+        batch_bytes += cost;
+        batch.push((obj, bytes));
+    }
+    let frame =
+        Frame { stream, body: FrameBody::Resp { last: true, resp: Resp::Many { items: batch } } };
+    let _ = send_on_lane(conn, frame, bulk);
+}
+
+/// Blocking-send one frame on the connection's bulk or priority lane.
+fn send_on_lane(conn: &Conn, frame: Frame, bulk: bool) -> std::io::Result<()> {
+    if bulk {
+        conn.blocking_send_bulk(frame)
+    } else {
+        conn.blocking_send(frame)
     }
 }
 

@@ -108,23 +108,40 @@ impl Xor8 {
     fn try_build(keys: &[u64], seed: u64, block_length: u32, capacity: usize) -> Option<Vec<u8>> {
         // Peeling: find an ordering where each key can be assigned to a
         // slot no other remaining key touches.
-        let mut sets: Vec<(u64, u32)> = vec![(0, 0); capacity]; // (xor of hashes, count)
         let hashed: Vec<u64> = keys.iter().map(|k| mix(*k, seed)).collect();
-
         let temp = Self { seed, block_length, fingerprints: Vec::new(), match_all: false };
+        let mut sets = temp.slot_sets(&hashed, capacity);
+        let stack = temp.peel(&hashed, &mut sets);
+        if stack.len() != keys.len() {
+            return None; // did not fully peel; try the next seed
+        }
+        Some(temp.assign_fingerprints(&hashed, &stack, capacity))
+    }
+
+    /// Construction phase 1: xor-accumulate each key's index into its
+    /// three slots. Each entry is (xor of key indices, key count).
+    fn slot_sets(&self, hashed: &[u64], capacity: usize) -> Vec<(u64, u32)> {
+        let mut sets: Vec<(u64, u32)> = vec![(0, 0); capacity];
         for (i, &h) in hashed.iter().enumerate() {
-            let hs = temp.subhashes(h);
+            let hs = self.subhashes(h);
             for slot in [hs.h0, hs.h1, hs.h2] {
                 let e = &mut sets[slot as usize];
                 e.0 ^= i as u64;
                 e.1 += 1;
             }
         }
+        sets
+    }
 
+    /// Construction phase 2: repeatedly pop a slot holding exactly one
+    /// key, record that (key index, slot) pair, and remove the key from
+    /// its other slots. Returns the peel-order stack; peeling succeeded
+    /// only if the stack covers every key (the caller checks).
+    fn peel(&self, hashed: &[u64], sets: &mut [(u64, u32)]) -> Vec<(usize, u32)> {
         // Queue of slots with exactly one key.
         let mut queue: Vec<u32> =
-            (0..capacity as u32).filter(|&s| sets[s as usize].1 == 1).collect();
-        let mut stack: Vec<(usize, u32)> = Vec::with_capacity(keys.len());
+            (0..sets.len() as u32).filter(|&s| sets[s as usize].1 == 1).collect();
+        let mut stack: Vec<(usize, u32)> = Vec::with_capacity(hashed.len());
 
         while let Some(slot) = queue.pop() {
             if sets[slot as usize].1 != 1 {
@@ -132,7 +149,7 @@ impl Xor8 {
             }
             let key_idx = sets[slot as usize].0 as usize;
             stack.push((key_idx, slot));
-            let hs = temp.subhashes(hashed[key_idx]);
+            let hs = self.subhashes(hashed[key_idx]);
             for s in [hs.h0, hs.h1, hs.h2] {
                 let e = &mut sets[s as usize];
                 e.0 ^= key_idx as u64;
@@ -142,23 +159,28 @@ impl Xor8 {
                 }
             }
         }
+        stack
+    }
 
-        if stack.len() != keys.len() {
-            return None; // did not fully peel; try the next seed
-        }
-
-        // Assign fingerprints in reverse peel order.
+    /// Construction phase 3: assign fingerprints in reverse peel order,
+    /// so each key's three slots xor to its fingerprint.
+    fn assign_fingerprints(
+        &self,
+        hashed: &[u64],
+        stack: &[(usize, u32)],
+        capacity: usize,
+    ) -> Vec<u8> {
         let mut fp = vec![0u8; capacity];
         for &(key_idx, slot) in stack.iter().rev() {
             let h = hashed[key_idx];
-            let hs = temp.subhashes(h);
+            let hs = self.subhashes(h);
             let f = fingerprint(h)
                 ^ (if slot == hs.h0 { 0 } else { fp[hs.h0 as usize] })
                 ^ (if slot == hs.h1 { 0 } else { fp[hs.h1 as usize] })
                 ^ (if slot == hs.h2 { 0 } else { fp[hs.h2 as usize] });
             fp[slot as usize] = f;
         }
-        Some(fp)
+        fp
     }
 
     /// Membership query. Never a false NEGATIVE: if `key` was in the built

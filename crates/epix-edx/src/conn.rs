@@ -415,85 +415,113 @@ fn spawn_reader<R>(
                     Err(_) => break,
                 },
             };
-            match frame.body {
-                FrameBody::Req(req) => {
-                    // Inbound request: hand to the server side, but charge
-                    // its bytes to the connection's budget first. The queues
-                    // below are bounded in frame count, so without this a
-                    // peer can park megabytes of decoded requests per
-                    // connection for the cost of sending them. Waiting here
-                    // stops reading the socket, which is the backpressure we
-                    // want; the peer is never disconnected for it.
-                    let units = queue_units(&req);
-                    let permit = tokio::select! {
-                        biased;
-                        _ = gone.recv() => break,
-                        p = in_budget.clone().acquire_many_owned(units) => match p {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        },
-                    };
-                    if in_tx
-                        .send(Incoming { stream: frame.stream, req, _budget: Some(permit) })
-                        .await
-                        .is_err()
-                    {
-                        // No server handler; ignore.
-                    }
-                }
-                FrameBody::Cancel => {
-                    // Peer aborted a stream: drop any local waiter for it
-                    // and flag it for serve tasks streaming on that id.
-                    shared.waiters.lock().expect("waiters").remove(&frame.stream);
-                    let mut cancelled = shared.cancelled.lock().expect("cancelled");
-                    // Bounded: a peer spamming Cancels can't grow this set.
-                    if cancelled.len() > 4096 {
-                        cancelled.clear();
-                    }
-                    cancelled.insert(frame.stream);
-                }
-                FrameBody::Ping => {
-                    if let Some(tx) = outbound.upgrade() {
-                        let _ =
-                            tx.send(Frame { stream: frame.stream, body: FrameBody::Pong }).await;
-                    }
-                }
-                FrameBody::Pong => {
-                    // Deliver to the Ping that allocated this stream, so
-                    // `Conn::ping` can time the round trip. A Pong nobody
-                    // waits on (peer echo of an abandoned ping) is dropped.
-                    let tx = {
-                        let map = shared.waiters.lock().expect("waiters");
-                        map.get(&frame.stream).cloned()
-                    };
-                    if let Some(tx) = tx {
-                        let _ = tx.send(FrameBody::Pong).await;
-                        shared.waiters.lock().expect("waiters").remove(&frame.stream);
-                    }
-                }
-                body => {
-                    // Response/data frame: route to the waiter, and drop
-                    // the waiter when the terminal frame arrives.
-                    let last = matches!(
-                        &body,
-                        FrameBody::Resp { last: true, .. } | FrameBody::Data { last: true, .. }
-                    );
-                    let tx = {
-                        let map = shared.waiters.lock().expect("waiters");
-                        map.get(&frame.stream).cloned()
-                    };
-                    if let Some(tx) = tx {
-                        let _ = tx.send(body).await;
-                        if last {
-                            shared.waiters.lock().expect("waiters").remove(&frame.stream);
-                        }
-                    }
-                }
+            if !route_frame(frame, &shared, &outbound, &in_tx, &mut gone, &in_budget).await {
+                break;
             }
         }
+        // On EVERY exit path: mark closed, then wake every pending waiter
+        // (their rx sees the sender drop). A request that raced the teardown
+        // would otherwise await a response that can never arrive.
         shared.closed.store(true, Ordering::Relaxed);
         shared.waiters.lock().expect("waiters").clear();
     });
+}
+
+/// Route one inbound frame by kind. Returns false when the reader should
+/// stop (teardown signalled while waiting for inbound budget).
+async fn route_frame(
+    frame: Frame,
+    shared: &Shared,
+    outbound: &mpsc::WeakSender<Frame>,
+    in_tx: &mpsc::Sender<Incoming>,
+    gone: &mut mpsc::Receiver<()>,
+    in_budget: &Arc<Semaphore>,
+) -> bool {
+    match frame.body {
+        FrameBody::Req(req) => {
+            return admit_request(frame.stream, req, in_tx, gone, in_budget).await;
+        }
+        FrameBody::Cancel => {
+            // Peer aborted a stream: drop any local waiter for it
+            // and flag it for serve tasks streaming on that id.
+            shared.waiters.lock().expect("waiters").remove(&frame.stream);
+            let mut cancelled = shared.cancelled.lock().expect("cancelled");
+            // Bounded: a peer spamming Cancels can't grow this set.
+            if cancelled.len() > 4096 {
+                cancelled.clear();
+            }
+            cancelled.insert(frame.stream);
+        }
+        FrameBody::Ping => {
+            if let Some(tx) = outbound.upgrade() {
+                let _ = tx.send(Frame { stream: frame.stream, body: FrameBody::Pong }).await;
+            }
+        }
+        FrameBody::Pong => deliver_pong(shared, frame.stream).await,
+        body => deliver_response(shared, frame.stream, body).await,
+    }
+    true
+}
+
+/// Inbound request: hand to the server side, but charge its bytes to the
+/// connection's budget first. The inbound queues are bounded in frame
+/// count, so without this a peer can park megabytes of decoded requests
+/// per connection for the cost of sending them. Waiting here stops reading
+/// the socket, which is the backpressure we want; the peer is never
+/// disconnected for it. Returns false when the reader should stop.
+async fn admit_request(
+    stream: u64,
+    req: Req,
+    in_tx: &mpsc::Sender<Incoming>,
+    gone: &mut mpsc::Receiver<()>,
+    in_budget: &Arc<Semaphore>,
+) -> bool {
+    let units = queue_units(&req);
+    let permit = tokio::select! {
+        biased;
+        _ = gone.recv() => return false,
+        p = in_budget.clone().acquire_many_owned(units) => match p {
+            Ok(p) => p,
+            Err(_) => return false,
+        },
+    };
+    if in_tx.send(Incoming { stream, req, _budget: Some(permit) }).await.is_err() {
+        // No server handler; ignore.
+    }
+    true
+}
+
+/// Deliver a Pong to the Ping that allocated this stream, so `Conn::ping`
+/// can time the round trip. A Pong nobody waits on (peer echo of an
+/// abandoned ping) is dropped.
+async fn deliver_pong(shared: &Shared, stream: u64) {
+    let tx = {
+        let map = shared.waiters.lock().expect("waiters");
+        map.get(&stream).cloned()
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(FrameBody::Pong).await;
+        shared.waiters.lock().expect("waiters").remove(&stream);
+    }
+}
+
+/// Response/data frame: route to the waiter, and drop the waiter when the
+/// terminal frame arrives.
+async fn deliver_response(shared: &Shared, stream: u64, body: FrameBody) {
+    let last = matches!(
+        &body,
+        FrameBody::Resp { last: true, .. } | FrameBody::Data { last: true, .. }
+    );
+    let tx = {
+        let map = shared.waiters.lock().expect("waiters");
+        map.get(&stream).cloned()
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(body).await;
+        if last {
+            shared.waiters.lock().expect("waiters").remove(&stream);
+        }
+    }
 }
 
 /// Outbound connection pool keyed by a caller-chosen key (normally the

@@ -806,15 +806,25 @@ impl Xite {
     fn stamp_edx_manifest(
         &self,
         content: &mut Value,
-        mut hashed_bytes: std::collections::BTreeMap<String, Vec<u8>>,
+        hashed_bytes: std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<()> {
         let prev_bundles = self
             .content
             .as_ref()
             .map(epix_blob::manifest::prev_memberships)
             .unwrap_or_default();
+        let roots = Self::edx_file_roots(content);
+        let bundleable = self.edx_bundle_inputs(content, hashed_bytes)?;
+        let assignment = epix_blob::bundle::assign(&bundleable, &prev_bundles);
+        epix_blob::manifest::apply_edx(content, &roots, &assignment);
+        Ok(())
+    }
+
+    /// The declared b3 root of every entry in `files` and `files_optional`,
+    /// keyed by path. An entry without a usable `b3` is left out (pre-EDX or
+    /// malformed), which is what `apply_edx` treats as "leave untouched".
+    fn edx_file_roots(content: &Value) -> std::collections::BTreeMap<String, epix_blob::ObjId> {
         let mut roots = std::collections::BTreeMap::new();
-        let mut bundleable = std::collections::BTreeMap::new();
         for key in ["files", "files_optional"] {
             let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
             for (path, e) in entries {
@@ -823,23 +833,41 @@ impl Xite {
                 {
                     roots.insert(path.clone(), id);
                 }
-                // Only required files bundle: optional files must stay
-                // individually fetchable on demand.
-                if key == "files" {
-                    let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
-                    if epix_blob::bundle::is_bundleable(size) {
-                        let bytes = match hashed_bytes.remove(path) {
-                            Some(bytes) => bytes,
-                            None => self.storage.read(path)?,
-                        };
-                        bundleable.insert(path.clone(), bytes);
-                    }
-                }
             }
         }
-        let assignment = epix_blob::bundle::assign(&bundleable, &prev_bundles);
-        epix_blob::manifest::apply_edx(content, &roots, &assignment);
-        Ok(())
+        roots
+    }
+
+    /// The bytes the bundle packer works from: the small required files, in
+    /// path order. Only `files` is scanned - optional files must stay
+    /// individually fetchable on demand, so they never bundle.
+    ///
+    /// Bytes come from `hashed_bytes` (what this sign already read and declared
+    /// a b3 for), so a file rewritten between the hash pass and here cannot
+    /// make the bundle disagree with the manifest. Falling back to a read is
+    /// for entries carried in from a previous manifest, which this sign did not
+    /// re-hash.
+    fn edx_bundle_inputs(
+        &self,
+        content: &Value,
+        mut hashed_bytes: std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut bundleable = std::collections::BTreeMap::new();
+        let Some(entries) = content.get("files").and_then(Value::as_object) else {
+            return Ok(bundleable);
+        };
+        for (path, e) in entries {
+            let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
+            if !epix_blob::bundle::is_bundleable(size) {
+                continue;
+            }
+            let bytes = match hashed_bytes.remove(path) {
+                Some(bytes) => bytes,
+                None => self.storage.read(path)?,
+            };
+            bundleable.insert(path.clone(), bytes);
+        }
+        Ok(bundleable)
     }
 
     /// The owner salt for salted-convergent shards, read from `edx_salt` or

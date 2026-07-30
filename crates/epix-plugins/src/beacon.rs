@@ -354,17 +354,7 @@ fn parse_tracker_line(line: &str) -> Option<Tracker> {
     }
     // i2p is kept (parsed into PeerAddr::I2p); whether it's announced to is
     // gated on the I2P config at announce-set build time (run_cycle).
-    let addr = if let Ok(addr) = PeerAddr::parse(&rest) {
-        addr
-    } else {
-        // A bare IPv6 host: the last colon separates the port; bracket the rest.
-        let (host, port) = rest.rsplit_once(':')?;
-        if host.contains(':') && !host.starts_with('[') {
-            PeerAddr::parse(&format!("[{host}]:{port}")).ok()?
-        } else {
-            return None;
-        }
-    };
+    let addr = parse_announcer_addr(&rest)?;
     // A declared transport must agree with what the host form actually is.
     if let Some(sch) = scheme {
         if sch != "epix" && sch != addr.scheme() {
@@ -382,6 +372,22 @@ fn parse_tracker_line(line: &str) -> Option<Tracker> {
         return None;
     }
     Some(Tracker::Epix(addr))
+}
+
+/// Parse the host part of an Epix announcer entry (the scheme already split
+/// off) into a [`PeerAddr`], tolerating a published quirk: a bare IPv6 host
+/// written without brackets.
+fn parse_announcer_addr(rest: &str) -> Option<PeerAddr> {
+    if let Ok(addr) = PeerAddr::parse(rest) {
+        return Some(addr);
+    }
+    // A bare IPv6 host: the last colon separates the port; bracket the rest.
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.contains(':') && !host.starts_with('[') {
+        PeerAddr::parse(&format!("[{host}]:{port}")).ok()
+    } else {
+        None
+    }
 }
 
 /// True for an IP no one can dial as a shared announcer: a mesh overlay we
