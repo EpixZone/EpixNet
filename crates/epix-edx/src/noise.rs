@@ -31,6 +31,14 @@ pub const PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Max plaintext per noise record (65535 - 16 tag, rounded down).
 const RECORD_PLAINTEXT: usize = 60_000;
 
+/// How long the inbound pump waits for the next record before giving the
+/// socket up. Deliberately well past the server's 300s idle reaper: a link the
+/// reaper already dropped must not be kept alive by this, and a link still in
+/// use must not be cut by it. This is the backstop for a transport that goes
+/// quiet without ever sending FIN, where the `gone` signal alone cannot help
+/// because the pump has no other wakeup source.
+const IDLE_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Domain-separated payload the node key signs to bind its identity to
 /// this session.
 pub fn binding_payload(handshake_hash: &[u8; 32]) -> String {
@@ -145,6 +153,16 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
     let (mut net_read, mut net_write) = tokio::io::split(net);
     let (mut inner_read, mut inner_write) = tokio::io::split(inner);
 
+    // Teardown signal, the same contract `Conn::start` uses for its own
+    // reader/writer pair. The two pumps own the halves of the CALLER's stream -
+    // which on the node is the registry's counting stream, holding both the
+    // socket and the connection's Stats row - so nothing above this tunnel can
+    // free them. The outbound pump ends when the user duplex closes (that is
+    // all the EDX layer above holds), and dropping `gone_tx` then unblocks the
+    // inbound pump. Without this the inbound pump parks in `read_exact` against
+    // a peer that stays connected and silent, and the socket plus its registry
+    // row leak for the life of the process even after the idle reaper fired.
+    let (gone_tx, mut gone_rx) = tokio::sync::mpsc::channel::<()>(1);
     let ts = transport.clone();
     tokio::spawn(async move {
         // Outbound: plaintext -> records, nonce = record index.
@@ -159,14 +177,27 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
             let Ok(clen) = ts.write_message(nonce, &plain[..n], &mut cipher) else { break };
             nonce += 1;
             let len_prefix = (clen as u16).to_le_bytes();
-            if inner_write.write_all(&len_prefix).await.is_err()
-                || inner_write.write_all(&cipher[..clen]).await.is_err()
-                || inner_write.flush().await.is_err()
-            {
+            // Deadline on the write, not just the read. A peer that stops
+            // draining (full send buffer, zero window) parks this pump in
+            // write_all, and a parked outbound pump is worse than a parked
+            // inbound one: it holds its half of the caller's stream AND never
+            // reaches the `gone_tx` drop below, so the inbound pump cannot be
+            // released either and both the socket and the Stats row leak for
+            // good. Bounded here so a wedged peer costs one deadline, not a fd.
+            let sent = tokio::time::timeout(IDLE_RECORD_TIMEOUT, async {
+                inner_write.write_all(&len_prefix).await?;
+                inner_write.write_all(&cipher[..clen]).await?;
+                inner_write.flush().await
+            });
+            if !matches!(sent.await, Ok(Ok(()))) {
                 break;
             }
         }
+        // Both of these matter to teardown: the shutdown is the FIN the peer
+        // sees, and dropping the sender is what unblocks the inbound pump so it
+        // releases the other half of the caller's stream.
         let _ = inner_write.shutdown().await;
+        drop(gone_tx);
     });
     tokio::spawn(async move {
         // Inbound: records -> plaintext, nonce = record index. Any
@@ -176,11 +207,24 @@ async fn secure(mut inner: PeerStream, initiator: bool) -> io::Result<Secured> {
         let mut nonce: u64 = 0;
         loop {
             let mut len = [0u8; 2];
-            if inner_read.read_exact(&mut len).await.is_err() {
+            // Stop on a dead socket, on the tunnel above winding down, or on a
+            // transport that has gone quiet without ever sending FIN (a
+            // half-dead flow, a stalled circuit). The last case is why there is
+            // a deadline and not just the `gone` signal: a peer can hold the
+            // socket open with no wakeup source at all.
+            let read_len = tokio::time::timeout(IDLE_RECORD_TIMEOUT, inner_read.read_exact(&mut len));
+            let stop = tokio::select! {
+                biased;
+                _ = gone_rx.recv() => true,
+                r = read_len => !matches!(r, Ok(Ok(_))),
+            };
+            if stop {
                 break;
             }
             record.resize(u16::from_le_bytes(len) as usize, 0);
-            if inner_read.read_exact(&mut record).await.is_err() {
+            let read_body =
+                tokio::time::timeout(IDLE_RECORD_TIMEOUT, inner_read.read_exact(&mut record));
+            if !matches!(read_body.await, Ok(Ok(_))) {
                 break;
             }
             let Ok(n) = transport.read_message(nonce, &record, &mut plain) else { break };

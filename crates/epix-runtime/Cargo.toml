@@ -71,4 +71,5 @@ bittorrent = ["dep:epix-bt"]
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+# test-util: the idle-reaper tests walk virtual time past a 300s timeout.
+tokio = { version = "1", features = ["full", "test-util"] }

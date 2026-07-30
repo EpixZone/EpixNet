@@ -744,26 +744,47 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
 /// still dial fresh - those are never pooled.
 #[derive(Default)]
 struct ControlPool {
-    conns: Mutex<HashMap<PeerAddr, (Conn, Arc<ConnHandle>)>>,
+    conns: Mutex<HashMap<PeerAddr, PooledLink>>,
 }
+
+/// One pooled link, plus when it was last handed out. The instant is what
+/// bounds how long a link nobody uses is kept alive. It is a tokio instant
+/// rather than a std one so the sweep can be driven by virtual time in tests.
+struct PooledLink {
+    conn: Conn,
+    reg: Arc<ConnHandle>,
+    last_used: tokio::time::Instant,
+}
+
+/// How long a pooled control link may sit unused before it is dropped. A pooled
+/// `Conn` keeps its socket open, so an entry nobody touches makes this node the
+/// peer that never sends FIN: the far end's own idle reaper cannot free its
+/// socket either, and both sides carry a permanent diagnostics row. Short
+/// control RPCs are seconds apart when active, so re-dialing after a quiet
+/// stretch costs one handshake.
+const CONTROL_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl ControlPool {
     /// A live pooled link for `peer`, or None. A closed one is dropped so the
     /// caller redials (reuse-if-not-closed-else-redial, like `epix_edx::Pool`).
+    /// Every call also sweeps links that have gone idle, which is what keeps the
+    /// pool from pinning sockets (and their Stats rows) open forever.
     fn live(&self, peer: &PeerAddr) -> Option<(Conn, Arc<ConnHandle>)> {
         let mut map = self.conns.lock().expect("control pool");
-        match map.get(peer) {
-            Some((c, reg)) if !c.is_closed() => Some((c.clone(), reg.clone())),
-            Some(_) => {
-                map.remove(peer);
-                None
-            }
-            None => None,
-        }
+        let now = tokio::time::Instant::now();
+        map.retain(|_, l| {
+            !l.conn.is_closed() && now.saturating_duration_since(l.last_used) < CONTROL_POOL_IDLE
+        });
+        let link = map.get_mut(peer)?;
+        link.last_used = now;
+        Some((link.conn.clone(), link.reg.clone()))
     }
 
     fn store(&self, peer: PeerAddr, conn: Conn, reg: Arc<ConnHandle>) {
-        self.conns.lock().expect("control pool").insert(peer, (conn, reg));
+        self.conns
+            .lock()
+            .expect("control pool")
+            .insert(peer, PooledLink { conn, reg, last_used: tokio::time::Instant::now() });
     }
 
     /// Drop a peer's cached link (a control op errored on it, so a possibly
@@ -1095,55 +1116,91 @@ impl RuntimeEdxFetcher {
             if store.ns_bytes(Ns::Shard).map_err(|e| e.to_string())? >= quota {
                 break;
             }
-            let id = c.cipher_addr;
-            let csize = c.csize as u64;
-
-            // Dial the xite's peers and learn who holds this ciphertext
-            // object, then stripe it in. Same swarm path as a normal fetch -
-            // a shard is an ordinary content-addressed object - minus the
-            // decrypt tail.
-            let mut handles: Vec<PeerHandle> = Vec::new();
-            let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
-            for peer in &peers {
-                let Ok((conn, identity, reg)) = self.dial(&transport, peer).await else { continue };
-                reg.note_cmd_sent("GetBitfield", Some(address));
-                if let Ok(Ok((_sz, bits))) = tokio::time::timeout(
-                    EDX_FETCH_TIMEOUT,
-                    epix_edx::fetch::fetch_bitfield(&conn, id),
-                )
-                .await
-                {
-                    let label = peer.to_string();
-                    node_pks.insert(label.clone(), identity.node_pk);
-                    handles.push(PeerHandle { conn, class: Class::of_addr(peer), bits, label });
-                }
-            }
-            if handles.is_empty() {
-                continue; // no peer holds this shard now; try the next one
-            }
-            // Reserve the sparse record only now that a peer can serve it.
-            // Creating it earlier let an unobtainable (or attacker-declared)
-            // shard count its full claimed `csize` toward the shard budget and
-            // global quota with bytes never actually held, tripping the budget
-            // gate early and evicting legitimately held objects.
-            store.ensure_sparse(id, Ns::Shard, csize, now).map_err(|e| e.to_string())?;
-            let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
-            let mut swarm = Swarm::new(store.clone(), id, csize);
-            if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
-                self.credit(&report, &node_pks, now);
-            }
-            if store.is_complete(id).unwrap_or(false) {
+            if self.pull_shard_chunk(address, store, c, &transport, &peers, now).await? {
                 held += 1;
-            } else {
-                // Stalled or failed pull: drop the record so its claimed size
-                // does not linger as a phantom in the budget and quota.
-                let _ = store.remove(id);
             }
         }
         // Held shards are unpinned (refcount 0), so keep total disk bounded
         // by the global quota alongside the browse cache.
         let _ = store.enforce_quota(store_quota());
         Ok(held)
+    }
+
+    /// HOLD one ciphertext shard chunk: find a holder among `peers`, stripe the
+    /// object in, and report whether it landed complete. A chunk nobody
+    /// reachable holds is skipped, not an error.
+    ///
+    /// The sparse record is reserved only AFTER a holder is found: an
+    /// `ensure_sparse` before the dial lets an unobtainable (or
+    /// attacker-declared) `csize` charge the shard budget for bytes never held.
+    /// A pull that then stalls removes the record again, for the same reason.
+    async fn pull_shard_chunk(
+        &self,
+        address: &str,
+        store: &Arc<Store>,
+        chunk: &epix_blob::manifest::ShardChunk,
+        transport: &Arc<dyn Transport>,
+        peers: &[PeerAddr],
+        now: u64,
+    ) -> Result<bool, String> {
+        let id = chunk.cipher_addr;
+        let csize = chunk.csize as u64;
+
+        // Dial the xite's peers and learn who holds this ciphertext
+        // object, then stripe it in. Same swarm path as a normal fetch -
+        // a shard is an ordinary content-addressed object - minus the
+        // decrypt tail.
+        let (handles, node_pks) = self.dial_bitfield_handles(address, transport, peers, id).await;
+        if handles.is_empty() {
+            return Ok(false); // no peer holds this shard now; try the next one
+        }
+        // Reserve the sparse record only now that a peer can serve it.
+        // Creating it earlier let an unobtainable (or attacker-declared)
+        // shard count its full claimed `csize` toward the shard budget and
+        // global quota with bytes never actually held, tripping the budget
+        // gate early and evicting legitimately held objects.
+        store.ensure_sparse(id, Ns::Shard, csize, now).map_err(|e| e.to_string())?;
+        let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
+        let mut swarm = Swarm::new(store.clone(), id, csize);
+        if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+            self.credit(&report, &node_pks, now);
+        }
+        if store.is_complete(id).unwrap_or(false) {
+            Ok(true)
+        } else {
+            // Stalled or failed pull: drop the record so its claimed size
+            // does not linger as a phantom in the budget and quota.
+            let _ = store.remove(id);
+            Ok(false)
+        }
+    }
+
+    /// Dial each of `peers` and ask what it holds of `id` (one GetBitfield per
+    /// peer), returning a [`PeerHandle`] per peer that answered plus each
+    /// label's authenticated node key, for crediting. An empty handle list
+    /// means no reachable peer holds the object right now.
+    async fn dial_bitfield_handles(
+        &self,
+        address: &str,
+        transport: &Arc<dyn Transport>,
+        peers: &[PeerAddr],
+        id: ObjId,
+    ) -> (Vec<PeerHandle>, HashMap<String, Vec<u8>>) {
+        let mut handles: Vec<PeerHandle> = Vec::new();
+        let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
+        for peer in peers {
+            let Ok((conn, identity, reg)) = self.dial(transport, peer).await else { continue };
+            reg.note_cmd_sent("GetBitfield", Some(address));
+            if let Ok(Ok((_sz, bits))) =
+                tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
+                    .await
+            {
+                let label = peer.to_string();
+                node_pks.insert(label.clone(), identity.node_pk);
+                handles.push(PeerHandle { conn, class: Class::of_addr(peer), bits, label });
+            }
+        }
+        (handles, node_pks)
     }
 
     /// Credit each peer that delivered groups in `report` for the bytes it
@@ -1401,45 +1458,9 @@ impl RuntimeEdxFetcher {
         let (small, mut remaining): (Vec<Res>, Vec<Res>) =
             files.into_iter().partition(|r| r.size > 0 && r.size <= cap);
         if !small.is_empty() {
-            // Unique ids only (two paths can share identical bytes -> one id).
-            let mut ids: Vec<ObjId> = small.iter().map(|r| r.id).collect();
-            ids.sort();
-            ids.dedup();
-            for peer in session {
-                let want: Vec<ObjId> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| !store.is_complete(*id).unwrap_or(false))
-                    .collect();
-                if want.is_empty() {
-                    break;
-                }
-                peer.reg.note_cmd_sent("GetMany", Some(address));
-                for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
-                    let _ = tokio::time::timeout(
-                        EDX_FETCH_TIMEOUT,
-                        epix_edx::fetch::fetch_many(&peer.conn, store, chunk, now),
-                    )
-                    .await;
-                }
-            }
-            // Materialize every small file the store now holds; the rest join
-            // the swarm pass (a peer that lacked it may still hold its chunks).
-            for r in small {
-                if store.is_complete(r.id).unwrap_or(false) {
-                    if let Ok(bytes) = store.read_bytes(r.id, now) {
-                        if self.state.edx_materialize_file(address, &r.path, &bytes).await.is_ok() {
-                            batch.bytes += bytes.len() as u64;
-                            if let Some(cb) = on_file {
-                                cb(&r.path, bytes.len() as u64);
-                            }
-                            batch.done.push(r.path);
-                            continue;
-                        }
-                    }
-                }
-                remaining.push(r);
-            }
+            let lacking =
+                self.get_many_pass(address, store, session, small, on_file, batch, now).await;
+            remaining.extend(lacking);
         }
 
         // Swarm pass: large files, plus any small file GetMany could not land.
@@ -1447,29 +1468,91 @@ impl RuntimeEdxFetcher {
             let complete =
                 self.fetch_one_over_session(store, r.id, r.size, session, deadline, now).await;
             let done = complete
-                && match store.read_bytes(r.id, now) {
-                    Ok(bytes) => {
-                        let ok =
-                            self.state.edx_materialize_file(address, &r.path, &bytes).await.is_ok();
-                        if ok {
-                            batch.bytes += bytes.len() as u64;
-                            if let Some(cb) = on_file {
-                                cb(&r.path, bytes.len() as u64);
-                            }
-                        }
-                        ok
-                    }
-                    Err(_) => false,
-                };
-            if done {
-                batch.done.push(r.path);
-            } else {
+                && self.materialize_into_batch(address, &r, store, on_file, batch, now).await;
+            if !done {
                 // This EDX-eligible file went to the msgpack worker (the 1b
                 // gate); counted once per distinct file across all retries.
                 epix_ui::state::note_edx_fallback_path(address, &r.path);
                 batch.missed.push(r.path);
             }
         }
+    }
+
+    /// Run the GetMany round trips for one tier's small files over the open
+    /// session, then materialize everything they landed. Each session peer is
+    /// asked only for the ids the store still lacks, so a later peer does no
+    /// work an earlier one already did. Returns the files the store STILL
+    /// lacks (plus any whose materialize failed), for the swarm pass.
+    #[allow(clippy::too_many_arguments)]
+    async fn get_many_pass(
+        &self,
+        address: &str,
+        store: &Arc<Store>,
+        session: &[SessionPeer],
+        small: Vec<Res>,
+        on_file: &Option<EdxBatchProgress>,
+        batch: &mut EdxBatch,
+        now: u64,
+    ) -> Vec<Res> {
+        // Unique ids only (two paths can share identical bytes -> one id).
+        let mut ids: Vec<ObjId> = small.iter().map(|r| r.id).collect();
+        ids.sort();
+        ids.dedup();
+        for peer in session {
+            let want: Vec<ObjId> = ids
+                .iter()
+                .copied()
+                .filter(|id| !store.is_complete(*id).unwrap_or(false))
+                .collect();
+            if want.is_empty() {
+                break;
+            }
+            peer.reg.note_cmd_sent("GetMany", Some(address));
+            for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
+                let _ = tokio::time::timeout(
+                    EDX_FETCH_TIMEOUT,
+                    epix_edx::fetch::fetch_many(&peer.conn, store, chunk, now),
+                )
+                .await;
+            }
+        }
+        // Materialize every small file the store now holds; the rest join
+        // the swarm pass (a peer that lacked it may still hold its chunks).
+        let mut lacking = Vec::new();
+        for r in small {
+            if store.is_complete(r.id).unwrap_or(false)
+                && self.materialize_into_batch(address, &r, store, on_file, batch, now).await
+            {
+                continue;
+            }
+            lacking.push(r);
+        }
+        lacking
+    }
+
+    /// Materialize one object the store holds complete into the xite and count
+    /// it into `batch` (bytes, progress callback, then `done`). Returns whether
+    /// it landed; on a read or materialize failure nothing is counted, so the
+    /// caller is free to send the file down another path.
+    async fn materialize_into_batch(
+        &self,
+        address: &str,
+        r: &Res,
+        store: &Arc<Store>,
+        on_file: &Option<EdxBatchProgress>,
+        batch: &mut EdxBatch,
+        now: u64,
+    ) -> bool {
+        let Ok(bytes) = store.read_bytes(r.id, now) else { return false };
+        if self.state.edx_materialize_file(address, &r.path, &bytes).await.is_err() {
+            return false;
+        }
+        batch.bytes += bytes.len() as u64;
+        if let Some(cb) = on_file {
+            cb(&r.path, bytes.len() as u64);
+        }
+        batch.done.push(r.path.clone());
+        true
     }
 
     /// Fetch one object over an already-open session (reused links): learn
@@ -1516,6 +1599,139 @@ impl RuntimeEdxFetcher {
             self.credit(&report, &node_pks, now);
         }
         store.is_complete(id).unwrap_or(false)
+    }
+
+    /// Resolve each want to an object id + size; split off shard files, and
+    /// send anything with no EDX entry straight to the fallback. Returns the
+    /// plain files and the shard paths, each in want order; the unresolvable
+    /// ones are pushed onto `batch.missed` here.
+    ///
+    /// A helper of the [`EdxFetcher::fetch_files`] batch below (a trait impl
+    /// cannot hold private methods, so its helpers live here).
+    async fn resolve_wants(
+        &self,
+        address: &str,
+        want: Vec<EdxWant>,
+        content: &Option<serde_json::Value>,
+        batch: &mut EdxBatch,
+    ) -> (Vec<Res>, Vec<String>) {
+        let mut plain: Vec<Res> = Vec::new();
+        let mut shard_paths: Vec<String> = Vec::new();
+        for w in want {
+            if content
+                .as_ref()
+                .is_some_and(|c| epix_blob::manifest::edx_shard_entry(c, &w.inner_path).is_some())
+            {
+                shard_paths.push(w.inner_path);
+                continue;
+            }
+            let resolved = match (w.id, w.size) {
+                (Some(id), Some(size)) => Some((id, size)),
+                _ => self.resolve(address, &w.inner_path).await.ok().flatten(),
+            };
+            match resolved {
+                Some((id, size)) => plain.push(Res { path: w.inner_path, id, size }),
+                None => batch.missed.push(w.inner_path),
+            }
+        }
+        (plain, shard_paths)
+    }
+
+    /// Materialize anything already complete in the store (no network).
+    /// Returns the files still to fetch, in want order.
+    async fn drain_locally_complete(
+        &self,
+        address: &str,
+        store: &Arc<Store>,
+        plain: Vec<Res>,
+        on_file: &Option<EdxBatchProgress>,
+        batch: &mut EdxBatch,
+        now: u64,
+    ) -> Vec<Res> {
+        let mut pending: Vec<Res> = Vec::new();
+        for r in plain {
+            if store.is_complete(r.id).unwrap_or(false)
+                && self.materialize_into_batch(address, &r, store, on_file, batch, now).await
+            {
+                continue;
+            }
+            pending.push(r);
+        }
+        pending
+    }
+
+    /// Encrypted-shard files: no other fetch path exists (they are not in
+    /// the plain files map), so fetch each over EDX or drop it. A landed shard
+    /// file reports 0 bytes of progress and adds nothing to `batch.bytes` - the
+    /// shard path materializes the plaintext itself, out of sight of the batch.
+    async fn fetch_shard_paths(
+        &self,
+        address: &str,
+        content: &Option<serde_json::Value>,
+        paths: Vec<String>,
+        store: &Arc<Store>,
+        on_file: &Option<EdxBatchProgress>,
+        batch: &mut EdxBatch,
+    ) {
+        for path in paths {
+            let got = match content
+                .as_ref()
+                .and_then(|c| epix_blob::manifest::edx_shard_entry(c, &path).map(|s| (c, s)))
+            {
+                Some((c, shard)) => {
+                    matches!(self.fetch_shard_file(address, &path, c, shard, store).await, Ok(true))
+                }
+                None => false,
+            };
+            if got {
+                if let Some(cb) = on_file {
+                    cb(&path, 0);
+                }
+                batch.done.push(path);
+            } else {
+                batch.missed.push(path);
+            }
+        }
+    }
+
+    /// The owner's signed load order (content.json `order_policy`) decides
+    /// which files go down first: the declared first-paint shell, then
+    /// everything undeclared in the default ladder, then prefetch hints.
+    /// Each tier runs its own complete GetMany+swarm pass before the next
+    /// one starts, so a large first-paint file still beats a small prefetch
+    /// file (a single sorted pass would not - GetMany batches all the small
+    /// files ahead of every large one). A xite that declares nothing has one
+    /// tier, so its fetch order is byte-for-byte what it is today.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_tiers(
+        &self,
+        address: &str,
+        store: &Arc<Store>,
+        session: &[SessionPeer],
+        mut pending: Vec<Res>,
+        content: &Option<serde_json::Value>,
+        on_file: &Option<EdxBatchProgress>,
+        batch: &mut EdxBatch,
+        now: u64,
+    ) {
+        let policy = content.as_ref().map(OrderPolicy::from_content).unwrap_or_default();
+        for tier in [FetchTier::FirstPaint, FetchTier::Default, FetchTier::Prefetch] {
+            let (in_tier, rest): (Vec<Res>, Vec<Res>) =
+                pending.into_iter().partition(|r| policy.tier(&r.path) == tier);
+            pending = rest;
+            if in_tier.is_empty() {
+                continue;
+            }
+            // First paint races slow peers (tight); everything else is patient.
+            // The deadline is advisory to the peer AND our local wait cap, so it
+            // only ever reorders OUR fetching - it is not a serving priority we
+            // grant anyone, which is why an owner cannot use it to take service.
+            let deadline = match tier {
+                FetchTier::FirstPaint => Deadline::tight(),
+                _ => Deadline::background(),
+            };
+            self.fetch_tier(address, store, session, in_tier, deadline, on_file, batch, now).await;
+        }
     }
 }
 
@@ -1770,67 +1986,10 @@ impl EdxFetcher for RuntimeEdxFetcher {
             .await
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
 
-        // Resolve each want to an object id + size; split off shard files, and
-        // send anything with no EDX entry straight to the fallback.
-        let mut plain: Vec<Res> = Vec::new();
-        let mut shard_paths: Vec<String> = Vec::new();
-        for w in want {
-            if content
-                .as_ref()
-                .is_some_and(|c| epix_blob::manifest::edx_shard_entry(c, &w.inner_path).is_some())
-            {
-                shard_paths.push(w.inner_path);
-                continue;
-            }
-            let resolved = match (w.id, w.size) {
-                (Some(id), Some(size)) => Some((id, size)),
-                _ => self.resolve(address, &w.inner_path).await.ok().flatten(),
-            };
-            match resolved {
-                Some((id, size)) => plain.push(Res { path: w.inner_path, id, size }),
-                None => batch.missed.push(w.inner_path),
-            }
-        }
-
-        // Materialize anything already complete in the store (no network).
-        let mut pending: Vec<Res> = Vec::new();
-        for r in plain {
-            if store.is_complete(r.id).unwrap_or(false) {
-                if let Ok(bytes) = store.read_bytes(r.id, now) {
-                    if self.state.edx_materialize_file(address, &r.path, &bytes).await.is_ok() {
-                        batch.bytes += bytes.len() as u64;
-                        if let Some(cb) = &on_file {
-                            cb(&r.path, bytes.len() as u64);
-                        }
-                        batch.done.push(r.path);
-                        continue;
-                    }
-                }
-            }
-            pending.push(r);
-        }
-
-        // Encrypted-shard files: no other fetch path exists (they are not in
-        // the plain files map), so fetch each over EDX or drop it.
-        for path in shard_paths {
-            let got = match content
-                .as_ref()
-                .and_then(|c| epix_blob::manifest::edx_shard_entry(c, &path).map(|s| (c, s)))
-            {
-                Some((c, shard)) => {
-                    matches!(self.fetch_shard_file(address, &path, c, shard, &store).await, Ok(true))
-                }
-                None => false,
-            };
-            if got {
-                if let Some(cb) = &on_file {
-                    cb(&path, 0);
-                }
-                batch.done.push(path);
-            } else {
-                batch.missed.push(path);
-            }
-        }
+        let (plain, shard_paths) = self.resolve_wants(address, want, &content, &mut batch).await;
+        let pending =
+            self.drain_locally_complete(address, &store, plain, &on_file, &mut batch, now).await;
+        self.fetch_shard_paths(address, &content, shard_paths, &store, &on_file, &mut batch).await;
 
         if pending.is_empty() {
             return batch;
@@ -1848,33 +2007,8 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return batch;
         }
 
-        // The owner's signed load order (content.json `order_policy`) decides
-        // which files go down first: the declared first-paint shell, then
-        // everything undeclared in the default ladder, then prefetch hints.
-        // Each tier runs its own complete GetMany+swarm pass before the next
-        // one starts, so a large first-paint file still beats a small prefetch
-        // file (a single sorted pass would not - GetMany batches all the small
-        // files ahead of every large one). A xite that declares nothing has one
-        // tier, so its fetch order is byte-for-byte what it is today.
-        let policy = content.as_ref().map(OrderPolicy::from_content).unwrap_or_default();
-        for tier in [FetchTier::FirstPaint, FetchTier::Default, FetchTier::Prefetch] {
-            let (in_tier, rest): (Vec<Res>, Vec<Res>) =
-                pending.into_iter().partition(|r| policy.tier(&r.path) == tier);
-            pending = rest;
-            if in_tier.is_empty() {
-                continue;
-            }
-            // First paint races slow peers (tight); everything else is patient.
-            // The deadline is advisory to the peer AND our local wait cap, so it
-            // only ever reorders OUR fetching - it is not a serving priority we
-            // grant anyone, which is why an owner cannot use it to take service.
-            let deadline = match tier {
-                FetchTier::FirstPaint => Deadline::tight(),
-                _ => Deadline::background(),
-            };
-            self.fetch_tier(address, &store, &session, in_tier, deadline, &on_file, &mut batch, now)
-                .await;
-        }
+        self.fetch_tiers(address, &store, &session, pending, &content, &on_file, &mut batch, now)
+            .await;
         let _ = store.enforce_quota(store_quota());
         batch
     }
@@ -3422,4 +3556,113 @@ mod tests {
         // Sanity: the loopback floor is comfortably under the clearnet target.
         assert!(first_paint.as_millis() < 2500, "first paint floor {first_paint:?}");
     }
+
+    /// The production topology exactly: ConnHandle::attach + tap_inbound +
+    /// serve, with a peer that Hellos then goes silent while holding the
+    /// socket open. The registry row must disappear once the idle reaper
+    /// fires; a row that outlives IDLE_TIMEOUT is the /Stats leak.
+    #[tokio::test(start_paused = true)]
+    async fn idle_inbound_link_delists_from_the_registry() {
+        let peer = PeerAddr::parse("198.51.100.7:26552").unwrap();
+        let (srv_io, cli_io) = tokio::io::duplex(64 * 1024);
+
+        let state = AppState::new("reap-test");
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        std::mem::forget(dir);
+        let ctx = ServeCtx::new(
+            store,
+            Arc::new(AppStateProvider { state: state.clone() }),
+            epix_crypt::new_seed(),
+        );
+
+        // Exactly what edx_hook_overlay does.
+        let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(Box::pin(srv_io));
+        let server = tokio::spawn({
+            let peer = peer.clone();
+            async move {
+                let (conn, incoming) = epix_edx::link::accept_overlay(stream).await.unwrap();
+                let incoming = tap_inbound(reg, incoming, peer, None);
+                serve(conn, incoming, Arc::new(ctx), None).await
+            }
+        });
+
+        // Client: Hello, then silence, holding the link open.
+        let (conn, _in) = epix_edx::link::dial_overlay(Box::pin(cli_io)).await.unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let cstore = Arc::new(Store::open(cdir.path()).unwrap());
+        std::mem::forget(cdir);
+        let cctx = ServeCtx::new(
+            cstore,
+            Arc::new(AppStateProvider { state: AppState::new("client") }),
+            epix_crypt::new_seed(),
+        );
+        client_hello(&conn, &cctx, vec![], None).await.unwrap();
+
+        // The row is listed while the link is live.
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if epix_protocol::registry::snapshot().iter().any(|s| s.addr == peer) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(listed.is_ok(), "the inbound link should be listed after Hello");
+
+        // Walk past IDLE_TIMEOUT with the peer silent but still connected.
+        tokio::time::sleep(epix_edx::server::IDLE_TIMEOUT + std::time::Duration::from_secs(30))
+            .await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(60), server).await.is_ok(),
+            "serve() never returned after IDLE_TIMEOUT"
+        );
+
+        // Give the writer/reader/tap tasks a chance to wind down.
+        for _ in 0..500 {
+            tokio::task::yield_now().await;
+            if !epix_protocol::registry::snapshot().iter().any(|s| s.addr == peer) {
+                return;
+            }
+        }
+        let rows: Vec<_> = epix_protocol::registry::snapshot()
+            .into_iter()
+            .filter(|s| s.addr == peer)
+            .map(|s| format!("id={} idle={}s open={}s", s.id, s.idle_secs, s.opened_secs))
+            .collect();
+        panic!("reaped link is STILL listed on /Stats: {rows:?}");
+    }
+
+
+    /// A pooled control link that nobody uses must be dropped, not held for the
+    /// life of the process. A pooled Conn keeps its socket open, so a stale
+    /// entry makes this node the peer that never sends FIN: the far end's idle
+    /// reaper cannot free its socket either, and the Arc<ConnHandle> parked
+    /// beside the Conn keeps a row on /Stats that no longer has traffic.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_pooled_control_link_is_swept() {
+        let peer = PeerAddr::parse("198.51.100.11:26552").unwrap();
+        let (a, _b) = tokio::io::duplex(4096);
+        let (reg, stream) = ConnHandle::new(Direction::Out, peer.clone()).attach(Box::pin(a));
+        let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
+
+        let pool = ControlPool::default();
+        pool.store(peer.clone(), conn, reg);
+        assert!(pool.live(&peer).is_some(), "a fresh pooled link is reused");
+
+        // Still fresh: a sweep must not cut a link that is being used.
+        tokio::time::advance(CONTROL_POOL_IDLE / 2).await;
+        assert!(pool.live(&peer).is_some(), "a link used within the window survives");
+
+        // `live` above refreshed last_used, so the window restarts from there.
+        tokio::time::advance(CONTROL_POOL_IDLE + std::time::Duration::from_secs(1)).await;
+        assert!(pool.live(&peer).is_none(), "an idle pooled link is swept");
+        assert!(
+            pool.conns.lock().expect("control pool").is_empty(),
+            "the sweep must DROP the entry, not just decline to hand it out: the Conn and the \
+             Arc<ConnHandle> it holds are what keep the socket and the Stats row alive"
+        );
+    }
+
 }
