@@ -243,19 +243,39 @@ impl UiServer {
                     // A data dir on a network share (SMB/NFS) cannot host a
                     // unix socket; without this fallback every live CLI
                     // command (siteCmd, live sitePublish) silently dies. Bind
-                    // under the temp dir instead and leave the actual path in
-                    // admin.sock.path for the CLI to follow.
+                    // under a per-user directory instead and leave the actual
+                    // path in admin.sock.path for the CLI to follow.
                     //
-                    // The temp dir is shared between users, and this socket is
-                    // full node admin, so the socket goes in a private 0700
+                    // This socket is full node admin, so it never goes in the
+                    // shared system temp dir: the base is XDG_RUNTIME_DIR
+                    // (per-user, 0700 by spec) or the user's home cache. On
+                    // top of that the socket sits in a private 0700
                     // subdirectory whose ownership is proven, not assumed:
                     // set_permissions on a directory another user owns fails,
                     // so a squatted path is refused instead of bound next to.
                     use std::hash::{Hash, Hasher};
                     use std::os::unix::fs::DirBuilderExt;
+                    let base = std::env::var_os("XDG_RUNTIME_DIR")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME")
+                                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                        });
+                    let Some(base) = base else {
+                        ctx.state
+                            .log(
+                                "WARNING",
+                                format!(
+                                    "admin socket {path:?}: {e}; no XDG_RUNTIME_DIR or HOME for a fallback"
+                                ),
+                            )
+                            .await;
+                        return;
+                    };
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     path.hash(&mut h);
-                    let dir = std::env::temp_dir().join(format!("epix-admin-{:016x}", h.finish()));
+                    let dir = base.join(format!("epix-admin-{:016x}", h.finish()));
+                    let _ = std::fs::create_dir_all(&base);
                     let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
                     let meta = std::fs::symlink_metadata(&dir);
                     let owned = meta.map(|m| m.is_dir()).unwrap_or(false)
