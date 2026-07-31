@@ -2305,8 +2305,22 @@ impl AppState {
                 // one PREFETCHES the entire optional set, so defaulting it on
                 // meant opening a multi-GB xite silently pulled all of it over
                 // Tor. Fetch on demand; seed what that leaves behind.
-                let auto_default =
-                    self.config_bool("autodownloadoptional_default", false).await;
+                //
+                // A xite can opt its visitors out of prefetch-by-default with
+                // `"autodownloadoptional_default": false` in its content.json
+                // (a multi-GB media library has no business prefetching even
+                // on nodes whose operator turned the node default on). Author
+                // intent can only LOWER the default, never raise it: a
+                // hostile manifest must not be able to make every visitor
+                // bulk-download its optional set.
+                let author_allows = entry
+                    .content
+                    .as_ref()
+                    .and_then(|c| c.get("autodownloadoptional_default"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let auto_default = author_allows
+                    && self.config_bool("autodownloadoptional_default", false).await;
                 settings.autodownloadoptional = auto_default;
                 settings.download_optional =
                     auto_default || self.config_bool("download_optional_default", true).await;
@@ -14897,6 +14911,49 @@ mod tests {
             let s = &xites.get("1New").unwrap().settings;
             assert!(s.download_optional, "prefetch implies download");
             assert!(s.autodownloadoptional);
+        }
+
+        // The xite's own content.json can opt visitors OUT of prefetch even
+        // when the node default is on.
+        let optout = json!({
+            "address": "1New", "modified": 1.0, "files": {},
+            "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
+            "autodownloadoptional_default": false,
+        });
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state.config_set("autodownloadoptional_default", Value::from("true")).await;
+        state
+            .add_xite(
+                "1New",
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(optout) },
+            )
+            .await;
+        {
+            let xites = state.xites.read().await;
+            let s = &xites.get("1New").unwrap().settings;
+            assert!(!s.autodownloadoptional, "author opt-out beats the node default");
+        }
+
+        // The author key can only lower the default: `true` in content.json
+        // must NOT switch prefetch on against a node default of off.
+        let optin = json!({
+            "address": "1New", "modified": 1.0, "files": {},
+            "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
+            "autodownloadoptional_default": true,
+        });
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state
+            .add_xite(
+                "1New",
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(optin) },
+            )
+            .await;
+        {
+            let xites = state.xites.read().await;
+            let s = &xites.get("1New").unwrap().settings;
+            assert!(!s.autodownloadoptional, "author cannot force prefetch on");
         }
     }
 
