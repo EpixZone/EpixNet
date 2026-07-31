@@ -1,5 +1,5 @@
-//! Multi-peer fetch scheduler: deadline + rarest-first striping with
-//! per-transport-class latency priors and duplicate-on-timeout.
+//! Multi-peer fetch scheduler: a sliding window of rarest-first batches
+//! with progress-based (stall-only) failure and duplication.
 //!
 //! The driver ([`Swarm`]) fetches an object's missing chunk groups from
 //! many peers at once — torrent-style striping — so a hot object comes
@@ -10,20 +10,28 @@
 //! - **rarest-first**: groups held by the fewest peers are scheduled
 //!   first, so the swarm keeps every piece alive instead of everyone
 //!   grabbing the common prefix.
-//! - **per-transport-class EWMA**: clearnet, I2P and Tor differ 10-30x,
-//!   so a global timeout is wrong. Each class carries its own smoothed
-//!   RTT; a request that overruns `k * class_rtt` is DUPLICATED to an
-//!   equal-or-lower-latency class (never a slower one — that just adds
-//!   load), duplicates capped so a stall can't fan out unboundedly.
+//! - **sliding window**: up to [`PIPELINE_DEPTH`] batches stay in flight
+//!   per healthy peer, each slot refilled the moment its batch completes.
+//!   There is no round barrier for one slow batch to hold up.
+//! - **stall-only failure/duplication**: a batch fails (or is raced onto
+//!   another peer) only when NO new bytes arrive for a transport-aware
+//!   stall window — an onion circuit moving 1 MiB at 100 KB/s is slow,
+//!   not dead, and must never be cut down by an elapsed-time deadline.
+//!   Duplicates go to equal-or-lower-latency classes only and are capped,
+//!   so a stall can't fan out unboundedly.
+//! - **durable progress**: a failed batch keeps the groups its streamed
+//!   prefix already verified into the store (`Store::write_slice_partial`)
+//!   and only the remainder is rescheduled.
 //! - **deadline tiers**: tight for streaming/first-paint, loose for
-//!   background; tighter deadlines are scheduled first.
+//!   background; the tier bounds a batch's absolute wait.
 //!
 //! This module owns the DECISION logic (what to ask which peer, when to
 //! duplicate) and drives it via the fetch client; the choker
 //! (`choke.rs`) governs the upload side.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epix_blob::bitfield::{group_count, GroupBits};
@@ -34,21 +42,41 @@ use crate::conn::Conn;
 use crate::fetch;
 use crate::sim::Class;
 
-/// Timeout multiplier: a request slower than `K_TIMEOUT * class_rtt` is
-/// eligible for duplication.
-pub const K_TIMEOUT: u32 = 4;
 /// Max concurrent duplicate fetches of the same group set (endgame cap).
 pub const MAX_DUPLICATES: usize = 2;
-/// Share of a batch's hard budget the primary may hold before the
-/// duplicated race starts (1/N of `Deadline::max_wait`). A class prior
-/// that has grown past the whole budget would otherwise let the primary
-/// eat all of it, leaving the duplicates no time to answer.
+/// Share of a batch's budget the primary's stall window may cover (1/N of
+/// the cap). A stall detected only near the cap would leave the duplicated
+/// race no time to answer.
 pub const PRIMARY_BUDGET_DIVISOR: u32 = 2;
 /// Groups per striped request (16 KiB * 64 = 1 MiB chunks of work).
 pub const GROUPS_PER_REQUEST: u64 = 64;
+/// A clearnet transfer with no new bytes for this long is stalled.
+pub const STALL_CLEARNET: Duration = Duration::from_secs(4);
+/// Overlay stall window: an onion/I2P circuit legitimately pauses for
+/// seconds where the same clearnet silence means trouble.
+pub const STALL_OVERLAY: Duration = Duration::from_secs(12);
+/// Absolute per-batch cap, progress or not: the backstop against a peer
+/// that trickles a byte a second forever.
+pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(90);
+/// Batches kept in flight per healthy peer by the sliding window.
+pub const PIPELINE_DEPTH: u32 = 2;
+/// Consecutive failed batches before a peer is exhausted (dropped from
+/// scheduling for the rest of the fetch); a delivered batch resets it.
+pub const PEER_FAIL_LIMIT: u32 = 3;
+
+/// The no-new-bytes window after which a transfer to `class` counts as
+/// stalled (the trigger for duplication and, with nowhere to duplicate,
+/// for failing the batch).
+pub fn stall_timeout(class: Class) -> Duration {
+    match class {
+        Class::Clearnet => STALL_CLEARNET,
+        Class::I2p | Class::Tor => STALL_OVERLAY,
+    }
+}
 
 /// Smoothed per-class round-trip prior. Starts at the class's nominal
 /// RTT and converges toward observed request latencies (EWMA, alpha 1/4).
+/// Feeds duplicate-target ordering (`faster_or_equal`) and peer picking.
 #[derive(Clone, Debug)]
 pub struct ClassStats {
     rtt: HashMap<Class, Duration>,
@@ -76,11 +104,6 @@ impl ClassStats {
         // EWMA: new = 3/4 prior + 1/4 sample.
         let next = (prior * 3 + sample) / 4;
         self.rtt.insert(class, next);
-    }
-
-    /// The timeout after which a request to `class` may be duplicated.
-    pub fn timeout(&self, class: Class) -> Duration {
-        self.rtt(class) * K_TIMEOUT
     }
 
     /// Classes at equal-or-lower latency than `class` (valid duplication
@@ -196,15 +219,17 @@ fn split_by_holder(groups: &[u64], peers: &[PeerHandle], size: u64) -> Vec<std::
     out
 }
 
-/// One round's slice of the precomputed rarest-first order: advance
-/// `cursor` past the already-fetched prefix, then collect up to `window`
-/// still-remaining groups. A group whose batch failed is still in
-/// `remaining`, so it holds the cursor and is retried next round, exactly
-/// as a full recompute would.
-fn round_window(
+/// The next `window` unassigned groups of the precomputed rarest-first
+/// order: advance `cursor` past the already-fetched prefix, then collect
+/// still-remaining groups not already assigned to an in-flight batch. A
+/// group whose batch failed is still in `remaining` and no longer in
+/// `inflight`, so it holds the cursor and is rescheduled, exactly as a
+/// full recompute would.
+fn next_unassigned(
     full_order: &[u64],
     cursor: &mut usize,
     remaining: &GroupBits,
+    inflight: &GroupBits,
     window: usize,
 ) -> Vec<u64> {
     while *cursor < full_order.len() && !remaining.contains(full_order[*cursor]) {
@@ -215,7 +240,7 @@ fn round_window(
         if order.len() >= window {
             break;
         }
-        if remaining.contains(g) {
+        if remaining.contains(g) && !inflight.contains(g) {
             order.push(g);
         }
     }
@@ -227,7 +252,9 @@ pub struct Swarm {
     store: Arc<Store>,
     obj: ObjId,
     size: u64,
-    stats: ClassStats,
+    /// Interior-mutable: the in-flight batch futures borrow the swarm
+    /// shared while completed outcomes fold their latencies back in.
+    stats: Mutex<ClassStats>,
 }
 
 /// What a completed fetch produced (for metrics/tests).
@@ -240,22 +267,185 @@ pub struct FetchReport {
     pub by_peer: HashMap<String, u64>,
 }
 
-impl Swarm {
-    pub fn new(store: Arc<Store>, obj: ObjId, size: u64) -> Self {
-        Self { store, obj, size, stats: ClassStats::default() }
+/// An in-flight batch: boxed so the sliding window can hold a heterogenous
+/// set and drop completed slots one at a time.
+type BatchFut<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = BatchOutcome> + Send + 'a>>;
+
+/// The sliding window's bookkeeping for one [`Swarm::fetch`]: the per-peer
+/// pipeline load and failure counts, the groups an in-flight batch already
+/// covers, and the batch futures themselves. There is no round barrier —
+/// each completed batch frees its slot and [`Window::refill`] tops the
+/// window back up.
+struct Window<'a> {
+    /// Batches in flight per peer.
+    load: Vec<u32>,
+    /// Consecutive per-peer failures: a failing peer is picked last and,
+    /// past PEER_FAIL_LIMIT, exhausted (never picked again), so the swarm
+    /// routes around it instead of retrying it forever. This is also what
+    /// terminates the fetch when nothing is obtainable.
+    fails: Vec<u32>,
+    /// Groups an in-flight batch is already covering.
+    inflight: GroupBits,
+    /// Boxed so the window can hold a heterogenous set and drop completed
+    /// slots one at a time.
+    futs: Vec<BatchFut<'a>>,
+}
+
+impl<'a> Window<'a> {
+    fn new(peers: usize) -> Self {
+        Self {
+            load: vec![0u32; peers],
+            fails: vec![0u32; peers],
+            inflight: GroupBits::new(),
+            futs: Vec::new(),
+        }
     }
 
-    pub fn stats(&self) -> &ClassStats {
-        &self.stats
+    /// Free pipeline slots across the peers still worth scheduling.
+    fn free_slots(&self) -> usize {
+        self.load
+            .iter()
+            .zip(self.fails.iter())
+            .filter(|(_, f)| **f < PEER_FAIL_LIMIT)
+            .map(|(l, _)| PIPELINE_DEPTH.saturating_sub(*l) as usize)
+            .sum()
+    }
+
+    /// Book one batch onto peer `idx`: take its pipeline slot, reserve its
+    /// groups and push the racing future.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule(
+        &mut self,
+        swarm: &'a Swarm,
+        batch: std::ops::Range<u64>,
+        groups: Vec<u64>,
+        idx: usize,
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) {
+        self.load[idx] += 1;
+        for &g in &groups {
+            self.inflight.add(g..g + 1);
+        }
+        report.requests_issued += 1;
+        self.futs.push(Box::pin(swarm.race_batch(batch, groups, idx, peers, deadline, now)));
+    }
+
+    /// Assign one batch to a peer that holds all of it, else split it by
+    /// holder. Returns whether anything was scheduled.
+    fn assign(
+        &mut self,
+        swarm: &'a Swarm,
+        batch: std::ops::Range<u64>,
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) -> bool {
+        let bgroups = swarm.groups_of(&batch);
+        match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails) {
+            Some(idx) => {
+                self.schedule(swarm, batch, bgroups, idx, peers, deadline, now, report);
+                true
+            }
+            None => self.assign_split(swarm, &bgroups, peers, deadline, now, report),
+        }
+    }
+
+    /// A merged batch can straddle groups held by DISJOINT peers (equal
+    /// holder COUNTS don't mean the same holder SET), so no single peer
+    /// holds all of it. Split into maximal sub-batches each fully held by
+    /// some peer instead of skipping it — skipping would strand groups that
+    /// ARE available and leave the object stuck.
+    fn assign_split(
+        &mut self,
+        swarm: &'a Swarm,
+        bgroups: &[u64],
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) -> bool {
+        let mut assigned = false;
+        for sub in split_by_holder(bgroups, peers, swarm.size) {
+            let sgroups = swarm.groups_of(&sub);
+            let Some(idx) = swarm.pick_peer(&sgroups, peers, &self.load, &self.fails) else {
+                continue;
+            };
+            self.schedule(swarm, sub, sgroups, idx, peers, deadline, now, report);
+            assigned = true;
+        }
+        assigned
+    }
+
+    /// Fill every free slot with the next unassigned batches, until the
+    /// window is full or nothing in this slice is schedulable.
+    #[allow(clippy::too_many_arguments)]
+    fn refill(
+        &mut self,
+        swarm: &'a Swarm,
+        full_order: &[u64],
+        cursor: &mut usize,
+        remaining: &GroupBits,
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) {
+        loop {
+            let free = self.free_slots();
+            if free == 0 {
+                break;
+            }
+            let order = next_unassigned(
+                full_order,
+                cursor,
+                remaining,
+                &self.inflight,
+                free * GROUPS_PER_REQUEST as usize,
+            );
+            if order.is_empty() {
+                break;
+            }
+            let mut assigned = false;
+            for batch in batch_into_ranges(&order, swarm.size) {
+                assigned |= self.assign(swarm, batch, peers, deadline, now, report);
+            }
+            if !assigned {
+                break; // nothing schedulable in this window slice
+            }
+        }
+    }
+
+    /// Give a completed batch's pipeline slot and group reservations back.
+    fn release(&mut self, outcome: &BatchOutcome) {
+        self.load[outcome.primary] = self.load[outcome.primary].saturating_sub(1);
+        for &g in &outcome.groups {
+            self.inflight.remove(g..g + 1);
+        }
+    }
+}
+
+impl Swarm {
+    pub fn new(store: Arc<Store>, obj: ObjId, size: u64) -> Self {
+        Self { store, obj, size, stats: Mutex::new(ClassStats::default()) }
+    }
+
+    pub fn stats(&self) -> ClassStats {
+        self.stats.lock().expect("stats").clone()
     }
 
     /// Fetch every group in `needed` from the peer set, striping
-    /// rarest-first and duplicating stalled requests onto faster-or-equal
-    /// peers. Returns when all needed groups are present locally or no
-    /// peer can supply a remaining group.
+    /// rarest-first through a sliding window and duplicating stalled
+    /// batches onto faster-or-equal peers. Returns when all needed groups
+    /// are present locally or no schedulable peer can supply a remaining
+    /// group.
     ///
-    /// `deadline` scales the timeout: a tight (streaming) deadline shrinks
-    /// the duplicate trigger so a slow peer is raced sooner.
+    /// `deadline` bounds a batch's absolute wait: a tight (streaming)
+    /// deadline caps how long one batch may hold its groups.
     pub async fn fetch(
         &mut self,
         needed: &GroupBits,
@@ -269,119 +459,74 @@ impl Swarm {
         // Ensure the sparse object exists before writing slices.
         self.store.ensure_sparse(self.obj, epix_blob::Ns::Plain, self.size, now)?;
 
-        // Per-peer failure counts across rounds: a peer that errors or serves
-        // bytes that fail verification is deprioritized (picked last) so the
-        // swarm routes around it instead of retrying it every round.
-        let mut fails = vec![0u32; peers.len()];
         // The peer set and their bitfields are fixed for this call, so the
         // rarest-first order never changes: build it once and walk it with a
         // cursor. Re-counting holders and re-sorting every remaining group
-        // each round made a whole-object fetch quadratic in object size (a
-        // 10 GB object is ~600k groups over ~1600 rounds).
+        // on each refill made a whole-object fetch quadratic in object size
+        // (a 10 GB object is ~600k groups).
         let full_order = rarest_first_order(needed, peers);
         let mut cursor = 0usize;
-        // Groups needed to fill one round's batches (see the take() in
-        // assign_round_batches).
-        let window = peers.len().max(1) * 2 * GROUPS_PER_REQUEST as usize;
-        while !remaining.is_empty() {
-            let order = round_window(&full_order, &mut cursor, &remaining, window);
-            if order.is_empty() {
-                break; // no peer holds any remaining group
-            }
-            let batches = batch_into_ranges(&order, self.size);
-            let mut tasks = Vec::new();
-            for (batch, groups, idx) in self.assign_round_batches(batches, peers, &fails) {
-                report.requests_issued += 1;
-                tasks.push(self.race_batch(batch, groups, idx, peers, deadline, now));
-            }
-            if tasks.is_empty() {
-                break;
-            }
-            let results = futures_join_all(tasks).await;
-            if !self.apply_round_results(results, &mut remaining, &mut fails, &mut report) {
-                break; // a full round made no progress; give up
+        let this = &*self;
+        let mut window = Window::new(peers.len());
+        loop {
+            window.refill(
+                this,
+                &full_order,
+                &mut cursor,
+                &remaining,
+                peers,
+                deadline,
+                now,
+                &mut report,
+            );
+            let Some(outcome) = next_ready(&mut window.futs).await else {
+                break; // nothing in flight and nothing left to assign
+            };
+            window.release(&outcome);
+            this.apply_outcome(outcome, &mut remaining, &mut window.fails, &mut report);
+            if remaining.is_empty() {
+                break; // done; dropping `flight` cancels leftover duplicates
             }
         }
 
         Ok(report)
     }
 
-    /// Assign one round's batches to peers so work STRIPES instead of
-    /// piling onto the single fastest peer: each batch goes to the
-    /// least-loaded eligible peer this round, ties broken by class RTT
-    /// (so fast peers still get more, but slow peers are used in
-    /// parallel rather than idled). Returns the requests to issue as
-    /// (byte range, group indices, peer index).
-    fn assign_round_batches(
+    /// Fold one batch outcome into the running state: the class RTT
+    /// priors, the per-peer failure counts, the remaining bitfield and the
+    /// report. Landed groups count whether the batch won or failed partway.
+    fn apply_outcome(
         &self,
-        batches: Vec<std::ops::Range<u64>>,
-        peers: &[PeerHandle],
-        fails: &[u32],
-    ) -> Vec<(std::ops::Range<u64>, Vec<u64>, usize)> {
-        let mut load = vec![0u32; peers.len()];
-        let mut out = Vec::new();
-        for batch in batches.into_iter().take(peers.len().max(1) * 2) {
-            let bgroups = self.groups_of(&batch);
-            match self.pick_peer(&bgroups, peers, &load, fails) {
-                Some(idx) => {
-                    load[idx] += 1;
-                    out.push((batch, bgroups, idx));
-                }
-                None => {
-                    // A merged batch can straddle groups held by DISJOINT
-                    // peers (equal holder COUNTS don't mean the same
-                    // holder SET), so no single peer holds all of it.
-                    // Split into maximal sub-batches each fully held by
-                    // some peer instead of skipping it — skipping would
-                    // strand groups that ARE available and leave the
-                    // object stuck incomplete.
-                    for sub in split_by_holder(&bgroups, peers, self.size) {
-                        let sgroups = self.groups_of(&sub);
-                        let Some(idx) = self.pick_peer(&sgroups, peers, &load, fails) else {
-                            continue;
-                        };
-                        load[idx] += 1;
-                        out.push((sub, sgroups, idx));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Fold one round's batch outcomes into the running state: the class
-    /// RTT priors, the per-peer failure counts, the remaining bitfield
-    /// and the report. Returns whether any group landed this round.
-    fn apply_round_results(
-        &mut self,
-        results: Vec<BatchOutcome>,
+        outcome: BatchOutcome,
         remaining: &mut GroupBits,
         fails: &mut [u32],
         report: &mut FetchReport,
-    ) -> bool {
-        let mut progressed = false;
-        for outcome in results {
-            report.duplicates_issued += outcome.duplicates;
-            // Fold the winner's measured latency into the class prior, so
-            // the next round's timeout/duplication uses real RTT.
-            if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
-                self.stats.observe(cls, el);
-            }
-            // Deprioritize a peer that failed this batch next round.
-            if let Some(p) = outcome.failed_peer {
-                if let Some(f) = fails.get_mut(p) {
-                    *f = f.saturating_add(1);
-                }
-            }
-            let Some(label) = outcome.winner_label else { continue };
-            for g in &outcome.groups {
-                remaining.remove(*g..*g + 1);
-                report.groups_fetched += 1;
-                progressed = true;
-            }
-            *report.by_peer.entry(label).or_default() += outcome.groups.len() as u64;
+    ) {
+        report.duplicates_issued += outcome.duplicates;
+        // Fold the winner's measured latency into the class prior, so
+        // duplicate-target ordering uses real RTT.
+        if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
+            self.stats.lock().expect("stats").observe(cls, el);
         }
-        progressed
+        // Count a failed batch against its peer; a peer that delivered is
+        // healthy again, so one bad batch cannot bury it forever.
+        if let Some(p) = outcome.failed_peer {
+            if let Some(f) = fails.get_mut(p) {
+                *f = f.saturating_add(1);
+            }
+        }
+        if let Some(w) = outcome.winner {
+            if let Some(f) = fails.get_mut(w) {
+                *f = 0;
+            }
+        }
+        for g in &outcome.landed {
+            remaining.remove(*g..*g + 1);
+            report.groups_fetched += 1;
+        }
+        if let Some(label) = outcome.winner_label {
+            *report.by_peer.entry(label).or_default() += outcome.landed.len() as u64;
+        }
     }
 
     fn groups_of(&self, batch: &std::ops::Range<u64>) -> Vec<u64> {
@@ -390,25 +535,53 @@ impl Swarm {
         gr.collect()
     }
 
-    /// Least-loaded peer this round that holds every group in `groups`,
-    /// ties broken by class RTT (fast peers preferred). Spreads
-    /// concurrent batches so a multi-peer swarm actually stripes.
+    /// Least-loaded peer with a free pipeline slot that holds every group
+    /// in `groups`, ties broken by prior failures then class RTT (fast
+    /// peers preferred). A peer past PEER_FAIL_LIMIT consecutive failures
+    /// is exhausted and never picked.
     fn pick_peer(&self, groups: &[u64], peers: &[PeerHandle], load: &[u32], fails: &[u32]) -> Option<usize> {
+        let stats = self.stats.lock().expect("stats");
         peers
             .iter()
             .enumerate()
-            .filter(|(_, p)| groups.iter().all(|g| p.bits.contains(*g)))
-            // Fewest prior failures first, then least-loaded, then fastest
-            // class: a peer that failed verification or errored is used only
-            // when no healthier peer holds the groups.
-            .min_by_key(|(i, p)| (fails[*i], load[*i], self.stats.rtt(p.class)))
+            .filter(|(i, p)| {
+                fails[*i] < PEER_FAIL_LIMIT
+                    && load[*i] < PIPELINE_DEPTH
+                    && groups.iter().all(|g| p.bits.contains(*g))
+            })
+            .min_by_key(|(i, p)| (fails[*i], load[*i], stats.rtt(p.class)))
             .map(|(i, _)| i)
     }
 
-    /// Fetch `batch` from peer `primary`; if it overruns the class
-    /// timeout, duplicate to up to MAX_DUPLICATES faster-or-equal peers
-    /// that also hold the groups. First success wins; the object store's
-    /// idempotent verified writes make a late duplicate harmless.
+    /// A failed batch's outcome. The groups whose streamed prefix already
+    /// verified into the store (`Store::write_slice_partial`) are reported
+    /// as landed so they are not refetched; a commit still finishing on the
+    /// decode thread is missed here and simply refetched — wasteful once,
+    /// never wrong (verified writes are idempotent).
+    fn batch_failed(&self, groups: Vec<u64>, primary: usize, duplicates: u64) -> BatchOutcome {
+        let present = self.store.present_bits(self.obj).unwrap_or_default();
+        let landed = groups.iter().copied().filter(|g| present.contains(*g)).collect();
+        BatchOutcome {
+            groups,
+            landed,
+            primary,
+            winner: None,
+            winner_label: None,
+            duplicates,
+            winner_class: None,
+            elapsed: None,
+            failed_peer: Some(primary),
+        }
+    }
+
+    /// Fetch `batch` from peer `primary`, progress-based: the primary is
+    /// duplicated onto up to MAX_DUPLICATES faster-or-equal peers only when
+    /// it STALLS (no new bytes for its class's stall window), never merely
+    /// for being slow; the batch fails only when nobody moves bytes for a
+    /// stall window or the absolute cap runs out. First success wins; the
+    /// object store's idempotent verified writes make a late duplicate
+    /// harmless, and a failed batch keeps the groups its streamed prefix
+    /// landed.
     async fn race_batch(
         &self,
         batch: std::ops::Range<u64>,
@@ -418,17 +591,17 @@ impl Swarm {
         deadline: Deadline,
         now: u64,
     ) -> BatchOutcome {
-        // The primary gets its class timeout, but never more than a share of
-        // the batch's hard budget: whatever it leaves is all the duplicated
-        // race below can have, and a race with no time left is just wasted
-        // peer traffic.
-        let timeout = self
-            .stats
-            .timeout(peers[primary].class)
-            .min(deadline.max_wait / PRIMARY_BUDGET_DIVISOR);
+        let cap = deadline.max_wait.min(MAX_BATCH_WAIT);
+        // The stall window is capped to a share of the batch budget: a
+        // stall detected only near the cap would leave the duplicated race
+        // below no time to answer.
+        let stall = stall_timeout(peers[primary].class).min(cap / PRIMARY_BUDGET_DIVISOR);
+        // Arc: the fetches' incremental disk commits bump it from the
+        // blocking pool, so committing counts as liveness too.
+        let progress = Arc::new(AtomicU64::new(0));
         let ranges = [batch.clone()];
         let fetch_from = |i: usize| {
-            fetch::fetch_ranges(
+            fetch::fetch_ranges_observed(
                 &peers[i].conn,
                 &self.store,
                 self.obj,
@@ -436,28 +609,41 @@ impl Swarm {
                 &ranges,
                 deadline.ms,
                 now,
+                &progress,
             )
         };
 
         let start = std::time::Instant::now();
-        let primary_fut = fetch_from(primary);
-        tokio::pin!(primary_fut);
+        let mut primary_fut = Box::pin(fetch_from(primary));
 
-        // Race the primary against its timeout. Record whether it already
-        // COMPLETED with an error: a completed async fn must never be
-        // polled again (that panics "async fn resumed after completion"),
-        // so a fast primary error must not fall through to a re-await.
-        let primary_errored = match tokio::time::timeout(timeout, &mut primary_fut).await {
-            Ok(Ok(_)) => {
-                let cls = peers[primary].class;
-                return BatchOutcome::won(groups, peers[primary].label.clone(), 0, cls, start.elapsed());
+        // Run the primary until it finishes, stalls, or eats the whole cap.
+        // Record whether it already COMPLETED with an error: a completed
+        // async fn must never be polled again (that panics "async fn
+        // resumed after completion"), so a fast primary error must not fall
+        // through to a re-await.
+        let primary_errored = tokio::select! {
+            res = &mut primary_fut => match res {
+                Ok(_) => {
+                    let cls = peers[primary].class;
+                    return BatchOutcome::won(
+                        groups, primary, primary, peers[primary].label.clone(), 0, cls, start.elapsed(),
+                    );
+                }
+                Err(_) => true,
+            },
+            _ = stalled(&progress, stall) => false,
+            _ = tokio::time::sleep(cap) => {
+                // Absolute cap with the primary mid-flight: abandon it (the
+                // cancel-on-abandon guard stops the peer; the streamed
+                // prefix stays committed) and fail the batch.
+                drop(primary_fut);
+                return self.batch_failed(groups, primary, 0);
             }
-            Ok(Err(_)) => true,  // primary finished with an error
-            Err(_) => false,     // primary still running, just slow
         };
 
         // Duplicate onto faster-or-equal peers holding the groups.
-        let ok_classes = self.stats.faster_or_equal(peers[primary].class);
+        let ok_classes =
+            self.stats.lock().expect("stats").faster_or_equal(peers[primary].class);
         let targets: Vec<usize> = peers
             .iter()
             .enumerate()
@@ -470,28 +656,20 @@ impl Swarm {
             .take(MAX_DUPLICATES)
             .collect();
 
-        // What is left of the batch's hard cap. Everything below is bounded
-        // by it: a peer that accepts the GetRange and then sends nothing
-        // keeps `fetch_ranges` pending for as long as the connection lives,
-        // so an unbounded wait here would never return.
-        let left = deadline.max_wait.saturating_sub(start.elapsed());
+        // What is left of the batch's hard cap; the race below is bounded
+        // by it, so a peer that accepts the GetRange and then sends nothing
+        // cannot park the batch forever.
+        let left = cap.saturating_sub(start.elapsed());
 
         if targets.is_empty() || left.is_zero() {
-            // Nothing to duplicate onto, or no budget for a duplicate to
-            // answer in. Issuing a fetch we would drop in the same tick only
-            // makes those peers start encoding and take a Cancel for nothing,
-            // so do not issue it. If the primary already errored there is
-            // nothing left to try; otherwise wait it out under what remains.
-            if primary_errored {
-                return BatchOutcome::failed(0, Some(primary));
-            }
-            return match tokio::time::timeout(left, &mut primary_fut).await {
-                Ok(Ok(_)) => {
-                    let cls = peers[primary].class;
-                    BatchOutcome::won(groups, peers[primary].label.clone(), 0, cls, start.elapsed())
-                }
-                Ok(Err(_)) | Err(_) => BatchOutcome::failed(0, Some(primary)),
-            };
+            // Nowhere to duplicate onto, or no budget left for a racer to
+            // answer in. The primary is stalled (or already errored): the
+            // stall window IS the failure criterion, so give up now instead
+            // of holding the batch — and the groups it strands — to the
+            // cap. Dropping the primary cancels its stream; whatever its
+            // prefix landed stays and the remainder is rescheduled.
+            drop(primary_fut);
+            return self.batch_failed(groups, primary, 0);
         }
 
         type BoxFut<'a> =
@@ -507,54 +685,88 @@ impl Swarm {
         }
 
         let dups = targets.len() as u64;
-        // The race runs on what the primary left of the budget: silent-but-
-        // alive peers stay Pending forever, so without this the whole fetch
-        // parks. Dropping the racers on expiry fires their cancel-on-abandon
-        // guards, telling those peers to stop encoding.
-        match tokio::time::timeout(left, select_first_ok(racers)).await {
-            Ok(Some(winner)) => {
-                let cls = peers[winner].class;
-                BatchOutcome::won(groups, peers[winner].label.clone(), dups, cls, start.elapsed())
+        // Every racer bumps the same progress counter, so the race fails
+        // early only when NONE of them moves bytes for the widest stall
+        // window among the classes racing.
+        let race_stall = targets
+            .iter()
+            .map(|&t| stall_timeout(peers[t].class))
+            .chain((!primary_errored).then(|| stall_timeout(peers[primary].class)))
+            .max()
+            .unwrap_or(stall);
+        let winner = tokio::select! {
+            w = select_first_ok(racers) => w,
+            _ = stalled(&progress, race_stall) => None,
+            _ = tokio::time::sleep(left) => None,
+        };
+        match winner {
+            Some(w) => {
+                let cls = peers[w].class;
+                let mut out = BatchOutcome::won(
+                    groups, primary, w, peers[w].label.clone(), dups, cls, start.elapsed(),
+                );
+                // A rescue is a strike against the primary: it stalled (or
+                // errored) its way into this race and somebody else had to
+                // deliver its batch. Without the strike its fail count
+                // never moves, pick_peer keeps assigning it, and every one
+                // of its batches eats a stall window plus a duplicate —
+                // PEER_FAIL_LIMIT exhaustion would never engage against a
+                // peer that accepts requests but sends nothing.
+                if w != primary {
+                    out.failed_peer = Some(primary);
+                }
+                out
             }
-            Ok(None) | Err(_) => BatchOutcome::failed(dups, Some(primary)),
+            None => self.batch_failed(groups, primary, dups),
         }
     }
 }
 
-/// The result of racing one batch: which groups landed (empty on
-/// failure), the winning peer's label, how many duplicates fired, and the
-/// winner's class + measured request latency (fed back into the per-class
-/// EWMA so duplicate-on-timeout uses real RTT, not just the static prior).
+/// The result of racing one batch: which groups were assigned and which
+/// actually landed in the store, the winning peer, how many duplicates
+/// fired, and the winner's class + measured request latency (fed back into
+/// the per-class EWMA).
 struct BatchOutcome {
+    /// The groups the batch was assigned (in-flight bookkeeping).
     groups: Vec<u64>,
+    /// The groups whose verified bytes reached the store: all of `groups`
+    /// on a win, the committed prefix on a partial failure.
+    landed: Vec<u64>,
+    /// The peer the batch was assigned to (whose window slot it held).
+    primary: usize,
+    /// The peer that delivered, for the fail-count reset.
+    winner: Option<usize>,
     winner_label: Option<String>,
     duplicates: u64,
     winner_class: Option<Class>,
     elapsed: Option<Duration>,
-    /// The peer index that failed this batch (a network error or, worse,
-    /// bytes that failed verification), so later rounds deprioritize it.
+    /// The peer index that failed this batch (a stall, a network error or,
+    /// worse, bytes that failed verification), so scheduling deprioritizes
+    /// and eventually exhausts it.
     failed_peer: Option<usize>,
 }
 
 impl BatchOutcome {
-    fn won(groups: Vec<u64>, label: String, duplicates: u64, class: Class, elapsed: Duration) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn won(
+        groups: Vec<u64>,
+        primary: usize,
+        winner: usize,
+        label: String,
+        duplicates: u64,
+        class: Class,
+        elapsed: Duration,
+    ) -> Self {
         Self {
+            landed: groups.clone(),
             groups,
+            primary,
+            winner: Some(winner),
             winner_label: Some(label),
             duplicates,
             winner_class: Some(class),
             elapsed: Some(elapsed),
             failed_peer: None,
-        }
-    }
-    fn failed(duplicates: u64, failed_peer: Option<usize>) -> Self {
-        Self {
-            groups: Vec::new(),
-            winner_label: None,
-            duplicates,
-            winner_class: None,
-            elapsed: None,
-            failed_peer,
         }
     }
 }
@@ -569,9 +781,13 @@ pub struct Deadline {
 }
 
 impl Deadline {
-    /// First-paint / streaming: race slow peers quickly.
+    /// First-paint / streaming. Failure is stall-based, so the cap only
+    /// backstops a batch that keeps trickling: generous enough that a
+    /// 1 MiB batch over a 100-250 KB/s onion circuit finishes instead of
+    /// dying on an elapsed-time cliff (the HTTP path serves whatever
+    /// contiguous prefix landed rather than blocking on the whole window).
     pub fn tight() -> Self {
-        Self { ms: 250, max_wait: Duration::from_secs(10) }
+        Self { ms: 250, max_wait: Duration::from_secs(60) }
     }
     /// Background bulk: patient.
     pub fn background() -> Self {
@@ -581,58 +797,42 @@ impl Deadline {
 
 // --- tiny future combinators (avoid pulling futures-util) ---
 
-/// Poll every future concurrently, returning the outputs in input order.
-///
-/// A round's batches must be in flight AT THE SAME TIME: `race_batch` only
-/// sends its request when first polled, so awaiting the futures one after
-/// another would issue batch N+1 to its peer only once batch N finished,
-/// and the whole per-round striping across peers would run serially.
-async fn futures_join_all<F, T>(futs: Vec<F>) -> Vec<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    use std::future::Future;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    struct JoinAll<F: Future> {
-        /// Each slot is cleared once its future resolves.
-        futs: Vec<Option<Pin<Box<F>>>>,
-        out: Vec<Option<F::Output>>,
-    }
-    // The futures are boxed, so nothing is pin-projected through Self.
-    impl<F: Future> Unpin for JoinAll<F> {}
-    impl<F: Future> Future for JoinAll<F> {
-        type Output = Vec<F::Output>;
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let me = self.get_mut();
-            let mut pending = false;
-            for i in 0..me.futs.len() {
-                let ready = match me.futs[i].as_mut() {
-                    Some(f) => match f.as_mut().poll(cx) {
-                        Poll::Ready(v) => Some(v),
-                        Poll::Pending => {
-                            pending = true;
-                            None
-                        }
-                    },
-                    None => None,
-                };
-                if let Some(v) = ready {
-                    me.out[i] = Some(v);
-                    me.futs[i] = None;
-                }
-            }
-            if pending {
-                return Poll::Pending;
-            }
-            Poll::Ready(me.out.iter_mut().filter_map(Option::take).collect())
+/// Resolves when `progress` stops advancing for `stall` (checked at that
+/// granularity, so detection lags at most one extra window). A zero stall
+/// resolves immediately.
+async fn stalled(progress: &AtomicU64, stall: Duration) {
+    let mut last = progress.load(Ordering::Relaxed);
+    loop {
+        tokio::time::sleep(stall).await;
+        let cur = progress.load(Ordering::Relaxed);
+        if cur == last {
+            return;
         }
+        last = cur;
     }
+}
 
-    let mut out: Vec<Option<T>> = Vec::new();
-    out.resize_with(futs.len(), || None);
-    JoinAll { futs: futs.into_iter().map(|f| Some(Box::pin(f))).collect(), out }.await
+/// Wait for the FIRST of the in-flight futures to complete, remove it and
+/// return its output; `None` if the set is empty. Every future is polled
+/// concurrently — `race_batch` only sends its request when first polled,
+/// so awaiting them one after another would serialize the window.
+async fn next_ready<'a, T>(
+    futs: &mut Vec<std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>>,
+) -> Option<T> {
+    use std::task::Poll;
+    if futs.is_empty() {
+        return None;
+    }
+    std::future::poll_fn(|cx| {
+        for i in 0..futs.len() {
+            if let Poll::Ready(v) = futs[i].as_mut().poll(cx) {
+                drop(futs.remove(i));
+                return Poll::Ready(Some(v));
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Return the first `Ok(T)` among the futures, or None if all error.
@@ -743,6 +943,24 @@ mod tests {
         assert!(ranges.len() >= 3, "a run longer than a request must split");
     }
 
+    #[test]
+    fn next_unassigned_skips_inflight_but_reschedules_failed() {
+        let full_order: Vec<u64> = (0..6).collect();
+        let mut remaining = GroupBits::new();
+        remaining.add(1..6); // group 0 already fetched
+        let mut inflight = GroupBits::new();
+        inflight.add(2..4); // groups 2,3 assigned to an in-flight batch
+        let mut cursor = 0usize;
+        let order = next_unassigned(&full_order, &mut cursor, &remaining, &inflight, 10);
+        assert_eq!(order, vec![1, 4, 5], "in-flight groups are not double-assigned");
+        // The failed batch returns its groups to the pool (still remaining,
+        // no longer inflight): the cursor did not skip past them.
+        inflight.remove(2..4);
+        let mut cursor2 = cursor;
+        let order2 = next_unassigned(&full_order, &mut cursor2, &remaining, &inflight, 10);
+        assert!(order2.contains(&2) && order2.contains(&3), "failed groups reschedule");
+    }
+
     fn dummy_conn() -> Conn {
         let (a, _b) = tokio::io::duplex(64);
         std::mem::forget(_b);
@@ -751,7 +969,7 @@ mod tests {
     }
 
     /// A connection whose peer end is gone: any fetch errors almost
-    /// immediately (BrokenPipe), well before the class timeout.
+    /// immediately (BrokenPipe), well before any stall window.
     fn dead_conn() -> Conn {
         let (a, b) = tokio::io::duplex(64);
         let (c, _in) = Conn::start(a, true);
@@ -761,8 +979,8 @@ mod tests {
 
     #[tokio::test]
     async fn race_batch_survives_a_fast_primary_error() {
-        // A primary peer that errors BEFORE the class timeout (here a dead
-        // connection) hits race_batch's Ok(Err(_)) arm. The completed fetch
+        // A primary peer that errors BEFORE any stall (here a dead
+        // connection) hits race_batch's Err arm. The completed fetch
         // future must never be polled again — doing so panics ("async fn
         // resumed after completion"). With no other peer the batch must
         // fail cleanly instead of panicking.
@@ -788,12 +1006,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_silent_peer_gives_up_at_the_deadline() {
+    async fn a_silent_peer_fails_at_the_stall_window_not_the_cap() {
         // A peer that takes the GetRange and then answers nothing, on a
         // connection that stays open, leaves fetch_ranges pending for as
-        // long as the link lives. The batch must still give up at
-        // Deadline::max_wait rather than parking the fetch (and the task
-        // that awaits it) forever.
+        // long as the link lives. The batch must fail once the stall
+        // window passes with no bytes — long before the absolute cap — and
+        // the peer must be exhausted after PEER_FAIL_LIMIT retries instead
+        // of parking the fetch forever.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let data = vec![7u8; 40_000];
@@ -810,12 +1029,18 @@ mod tests {
         let mut swarm = Swarm::new(store.clone(), id, size);
         let needed = needed_groups(&store, id, size).unwrap();
         let deadline = Deadline::tight();
+        let start = tokio::time::Instant::now();
         let report =
             tokio::time::timeout(deadline.max_wait * 3, swarm.fetch(&needed, &peers, deadline, 2))
                 .await
                 .expect("a silent peer must not hang the fetch")
                 .unwrap();
         assert_eq!(report.groups_fetched, 0, "the silent peer served nothing");
+        // PEER_FAIL_LIMIT retries, each one stall window: well under the cap.
+        assert!(
+            start.elapsed() < deadline.max_wait,
+            "stall-based failure must not wait out the absolute cap"
+        );
     }
 
     /// A peer that answers every GetRange with the canonical whole-object
@@ -852,15 +1077,88 @@ mod tests {
         client
     }
 
+    /// Like [`serving_conn`], but the slice trickles: small frames with
+    /// `gap` between them. Slow, but never stalled.
+    fn trickle_conn(data: &[u8], gap: Duration) -> Conn {
+        use crate::msg::{Frame, FrameBody, Req};
+        use epix_blob::verified::{encode_slice, OutboardBytes};
+
+        let ob = OutboardBytes::from_slice(data);
+        let ranges = vec![0..data.len() as u64];
+        let mut slice = Vec::new();
+        encode_slice(data, &ob, &ranges, &mut slice).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+        tokio::spawn(async move {
+            while let Some(inc) = server_in.recv().await {
+                if !matches!(inc.req, Req::GetRange { .. }) {
+                    continue;
+                }
+                let mut off = 0usize;
+                while off < slice.len() {
+                    let end = (off + 20_000).min(slice.len());
+                    let last = end == slice.len();
+                    let body = FrameBody::Data { last, bytes: slice[off..end].to_vec() };
+                    if server.send(Frame { stream: inc.stream, body }).await.is_err() {
+                        return;
+                    }
+                    off = end;
+                    if !last {
+                        tokio::time::sleep(gap).await;
+                    }
+                }
+            }
+        });
+        client
+    }
+
+    // Real time: the trickle gaps are small and the decode runs on a real
+    // blocking thread, which tokio's paused clock does not wait for.
+    #[tokio::test]
+    async fn a_slow_but_moving_primary_is_not_duplicated() {
+        // The primary trickles the slice with 100ms gaps: bytes keep
+        // arriving inside every stall window, so it is slow, not stalled.
+        // Elapsed-time duplication would have raced it onto the fast peer;
+        // stall-only duplication must let it finish alone.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 300_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+        store.ensure_sparse(id, epix_blob::Ns::Plain, size, 1).unwrap();
+
+        let peers = vec![
+            PeerHandle {
+                conn: trickle_conn(&data, Duration::from_millis(100)),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "trickle".into(),
+            },
+            PeerHandle {
+                conn: serving_conn(&data),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "fast".into(),
+            },
+        ];
+
+        let swarm = Swarm::new(store.clone(), id, size);
+        let groups = swarm.groups_of(&(0..size));
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, Deadline::background(), 2).await;
+        assert_eq!(outcome.duplicates, 0, "a moving transfer is never raced");
+        assert_eq!(outcome.winner_label.as_deref(), Some("trickle"));
+    }
+
     // Real (not paused) time: race_batch measures its budget with
     // std::time::Instant, which tokio's virtual clock does not advance.
     #[tokio::test]
-    async fn a_slow_primary_leaves_the_duplicate_time_to_win() {
-        // Once the class prior grows past the batch's hard cap, the primary's
-        // first wait used to swallow the WHOLE cap. The duplicated race was
-        // then issued with nothing left: both targets got a GetRange followed
-        // immediately by a Cancel, and the batch always failed. A share of
-        // the cap is reserved, so the duplicate still has time to answer.
+    async fn a_stalled_primary_is_raced_and_the_duplicate_can_win() {
+        // The primary goes silent after taking the request: once its stall
+        // window (capped to a share of the batch budget) passes with no
+        // bytes, the batch is duplicated onto the serving peer, which must
+        // still have budget left to answer in.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let data = vec![7u8; 40_000];
@@ -883,15 +1181,8 @@ mod tests {
             },
         ];
 
-        let mut swarm = Swarm::new(store.clone(), id, size);
-        // Grow the clearnet prior until its timeout exceeds the cap below:
-        // that is the case the reserved share is for.
-        for _ in 0..20 {
-            swarm.stats.observe(Class::Clearnet, Duration::from_millis(300));
-        }
+        let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
-        assert!(swarm.stats.timeout(Class::Clearnet) > deadline.max_wait);
-
         let groups = swarm.groups_of(&(0..size));
         let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
         assert_eq!(outcome.duplicates, 1, "the stalled primary is duplicated onto the other peer");
@@ -899,6 +1190,12 @@ mod tests {
             outcome.winner_label.as_deref(),
             Some("fast"),
             "the duplicate must be issued with enough budget left to answer"
+        );
+        assert_eq!(
+            outcome.failed_peer,
+            Some(0),
+            "a rescued batch still counts against the stalled primary, or a dead-but-accepting \
+             peer is never exhausted"
         );
     }
 
@@ -938,10 +1235,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn join_all_polls_every_batch_concurrently() {
-        // Each future waits on the other's start signal, so both finish only
-        // if the join polls them together. Awaiting them in sequence (one
-        // batch fully done before the next is even issued) deadlocks here.
+    async fn in_flight_batches_poll_together_and_complete_one_at_a_time() {
+        // Each future waits on the other's start signal, so both finish
+        // only if the window polls them together (awaiting them in sequence
+        // deadlocks here) — and next_ready hands them back one by one as
+        // they land, which is what lets the refill scheduler top the window
+        // up without a round barrier.
         let (tx_a, rx_a) = tokio::sync::oneshot::channel::<()>();
         let (tx_b, rx_b) = tokio::sync::oneshot::channel::<()>();
         let a = async move {
@@ -954,11 +1253,113 @@ mod tests {
             rx_a.await.unwrap();
             2u32
         };
-        let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = u32>>>> =
+        let mut flight: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = u32> + Send>>> =
             vec![Box::pin(a), Box::pin(b)];
-        let out = tokio::time::timeout(Duration::from_secs(5), futures_join_all(futs))
+        let first = tokio::time::timeout(Duration::from_secs(5), next_ready(&mut flight))
             .await
-            .expect("a round's batches must make progress together");
-        assert_eq!(out, vec![1, 2], "outputs stay in input order");
+            .expect("in-flight batches must make progress together")
+            .expect("one batch completed");
+        assert_eq!(flight.len(), 1, "the other batch is still in flight");
+        let second = next_ready(&mut flight).await.expect("the second batch completes");
+        assert!(flight.is_empty());
+        assert_ne!(first, second);
+        assert!(next_ready(&mut flight).await.is_none(), "an empty window yields None");
+    }
+
+    /// A peer that serves each GetRange for ITS requested ranges, one
+    /// request at a time with `delay` before each serve, logging request
+    /// arrival ("start") and serve completion ("end") instants. Arrivals
+    /// are logged the moment the request comes off the wire, so the log
+    /// shows when the CLIENT issued it, not when the worker got to it.
+    fn sequential_serving_conn(
+        data: Vec<u8>,
+        delay: Duration,
+        log: Arc<std::sync::Mutex<Vec<(&'static str, std::time::Instant)>>>,
+    ) -> Conn {
+        use crate::msg::{Frame, FrameBody, Req};
+        use epix_blob::verified::{encode_slice, OutboardBytes};
+
+        let ob = OutboardBytes::from_slice(&data);
+        let (a, b) = tokio::io::duplex(1 << 22);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::unbounded_channel();
+        let arrival_log = log.clone();
+        tokio::spawn(async move {
+            while let Some(inc) = server_in.recv().await {
+                if !matches!(inc.req, Req::GetRange { .. }) {
+                    continue;
+                }
+                arrival_log.lock().unwrap().push(("start", std::time::Instant::now()));
+                if work_tx.send(inc).is_err() {
+                    return;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(inc) = work_rx.recv().await {
+                let Req::GetRange { ranges, .. } = inc.req else { continue };
+                tokio::time::sleep(delay).await;
+                let byte_ranges: Vec<std::ops::Range<u64>> =
+                    ranges.iter().map(|&(s, e)| s..e).collect();
+                let mut slice = Vec::new();
+                encode_slice(&data[..], &ob, &byte_ranges, &mut slice).unwrap();
+                let mut off = 0usize;
+                while off < slice.len() {
+                    let end = (off + 60_000).min(slice.len());
+                    let last = end == slice.len();
+                    let body = FrameBody::Data { last, bytes: slice[off..end].to_vec() };
+                    if server.send(Frame { stream: inc.stream, body }).await.is_err() {
+                        return;
+                    }
+                    off = end;
+                }
+                log.lock().unwrap().push(("end", std::time::Instant::now()));
+            }
+        });
+        client
+    }
+
+    // Real time: the interleaving is measured with wall-clock instants
+    // across a real blocking decode.
+    #[tokio::test]
+    async fn the_window_refills_before_the_round_drains() {
+        // One peer, PIPELINE_DEPTH slots, a 3-batch object served one
+        // request at a time: the THIRD batch must be issued as soon as the
+        // first completes, while the second is still being served. A round
+        // barrier would only issue it after the whole round drained.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let batch_bytes = GROUPS_PER_REQUEST * epix_blob::bitfield::GROUP_BYTES;
+        let data = vec![7u8; (batch_bytes * 3) as usize];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        // A wide serve delay: the assertion below compares wall-clock
+        // instants across real decode work, and the suite runs many tests
+        // in parallel, so the refill gap must dwarf scheduling noise.
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peers = vec![PeerHandle {
+            conn: sequential_serving_conn(data, Duration::from_secs(1), log.clone()),
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size),
+            label: "seq".into(),
+        }];
+
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        store.ensure_sparse(id, epix_blob::Ns::Plain, size, 1).unwrap();
+        let needed = needed_groups(&store, id, size).unwrap();
+        let report = swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+        assert!(store.is_complete(id).unwrap(), "object completed");
+        assert_eq!(report.requests_issued, 3, "three batches were issued");
+
+        let log = log.lock().unwrap();
+        let starts: Vec<_> = log.iter().filter(|(k, _)| *k == "start").map(|(_, t)| *t).collect();
+        let ends: Vec<_> = log.iter().filter(|(k, _)| *k == "end").map(|(_, t)| *t).collect();
+        assert_eq!(starts.len(), 3);
+        assert!(
+            starts[2] < ends[1],
+            "the third batch must be issued while the second is still being served"
+        );
     }
 }

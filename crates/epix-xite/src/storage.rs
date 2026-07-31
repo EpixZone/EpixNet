@@ -100,12 +100,28 @@ impl XiteStorage {
         hex::encode(&digest[..32])
     }
 
-    /// True if the stored file exists and matches `expected_sha512`.
+    /// True if the stored file exists and matches `expected_sha512`. Reads
+    /// and hashes the whole file - the correctness check for verify
+    /// commands and bad-file re-checks. Display paths (the Files tab, the
+    /// startup hashfield scan) use [`Self::present_at_size`] instead so one
+    /// render never re-hashes gigabytes.
     pub fn verify(&self, inner_path: &str, expected_sha512: &str) -> bool {
         match self.read(inner_path) {
             Ok(bytes) => Self::hash_bytes(&bytes) == expected_sha512,
             Err(_) => false,
         }
+    }
+
+    /// True if the stored file exists at exactly `size` bytes: one stat, no
+    /// read. The cheap presence check for display/inventory paths; a torn
+    /// file at the right size is caught by the download path's hash verify
+    /// and the explicit verify commands, not here.
+    pub fn present_at_size(&self, inner_path: &str, size: u64) -> bool {
+        self.path(inner_path)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.is_file() && m.len() == size)
+            .unwrap_or(false)
     }
 
     /// Every file under the root as an `inner_path` (relative, forward slashes).
@@ -146,6 +162,17 @@ mod tests {
         let h = XiteStorage::hash_bytes(b"");
         assert_eq!(&h[..16], "cf83e1357eefb8bd");
         assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn present_at_size_stats_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = XiteStorage::new(dir.path());
+        s.write("f.bin", b"abcd").unwrap();
+        assert!(s.present_at_size("f.bin", 4));
+        assert!(!s.present_at_size("f.bin", 5), "wrong size is not present");
+        assert!(!s.present_at_size("missing.bin", 4));
+        assert!(!s.present_at_size("../escape", 4), "unsafe paths refuse");
     }
 
     #[test]

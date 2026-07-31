@@ -12,6 +12,7 @@
 
 use epix_core::PeerAddr;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 
 /// Which peer networks this node can currently DIAL. Computed by the host
@@ -48,6 +49,37 @@ impl DialableNets {
     }
 }
 
+/// Cooldown before the health prober re-checks a benched peer: ~30s doubling
+/// per consecutive failure to a ~10-minute cap, plus deterministic jitter
+/// (a hash of address + attempt, up to a quarter of the base) so peers
+/// benched together do not re-probe in lockstep. Deliberately capped far
+/// below the dial backoff's hour: the prober's whole point is spotting a
+/// recovered peer within minutes.
+pub fn probe_cooldown_secs(addr: &PeerAddr, failures: u32) -> i64 {
+    let shift = failures.saturating_sub(1).min(5);
+    let base = (30i64 << shift).min(600);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    addr.to_string().hash(&mut h);
+    failures.hash(&mut h);
+    base + (h.finish() % (base as u64 / 4 + 1)) as i64
+}
+
+/// A benched peer whose probe cooldown has expired - what the background
+/// health prober re-checks.
+#[derive(Debug, Clone)]
+pub struct ProbeCandidate {
+    pub addr: PeerAddr,
+    /// Consecutive failures so far (dial failures plus failed probes).
+    pub failures: u32,
+    /// How long the peer has been benched (seconds since the streak began).
+    pub benched_secs: i64,
+    /// When the probe cooldown expired. Callers merging candidates across
+    /// registries order by this (most overdue first): it is the fair-queue
+    /// key - a served peer's stamp advances, a waiting peer's does not - so
+    /// no candidate is starved when the prober is oversubscribed.
+    pub probe_after: i64,
+}
+
 /// One known peer of a xite.
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -64,6 +96,21 @@ pub struct Peer {
     /// after failures). In-memory only - never serialized or sent to peers,
     /// so it is wire-safe.
     pub retry_after: i64,
+    /// Unix time before which the health prober skips the peer. Its own
+    /// cooldown, separate from `retry_after`: probes cap at ~10min (see
+    /// [`probe_cooldown_secs`]) while the dial backoff grows to an hour, so
+    /// a recovered peer is spotted quickly without the streaming path ever
+    /// redialing it. In-memory only, like `retry_after`.
+    pub probe_after: i64,
+    /// Unix time the current failure streak began (0 = not benched).
+    /// In-memory only, like `retry_after`.
+    pub benched_since: i64,
+    /// Consecutive failed health probes since the last dial failure. Kept
+    /// apart from `connection_errors` on purpose: probes run on their own
+    /// clock (minutes, not fetch demand), so folding them into the dial
+    /// streak would manufacture eviction-grade error counts and reputation
+    /// docks for a peer no fetch ever asked for. In-memory only.
+    pub probe_failures: u32,
     /// Whether we currently hold a live connection to the peer.
     pub connected: bool,
     pub bytes_recv: u64,
@@ -79,6 +126,9 @@ impl Peer {
             time_response: 0,
             connection_errors: 0,
             retry_after: 0,
+            probe_after: 0,
+            benched_since: 0,
+            probe_failures: 0,
             connected: false,
             bytes_recv: 0,
             bytes_sent: 0,
@@ -97,18 +147,67 @@ impl Peer {
         self.time_response = now;
         self.connection_errors = 0;
         self.retry_after = 0;
+        self.probe_after = 0;
+        self.benched_since = 0;
+        self.probe_failures = 0;
         self.reputation += 1;
+    }
+
+    /// The whole consecutive-failure streak: dial failures plus the probes
+    /// that failed since. Drives the probe cooldown, so the interval keeps
+    /// growing whichever path records the failure.
+    fn failure_streak(&self) -> u32 {
+        self.connection_errors.saturating_add(self.probe_failures)
     }
 
     /// A dial or handshake failed/timed out: back the peer off exponentially
     /// (EpixNet-style `min(3600, 15 << errors)` seconds) so selection stops
-    /// burning time on it every pass, and dock its reputation.
+    /// burning time on it every pass, and dock its reputation. Also stamps the
+    /// probe cooldown, so the health prober never re-checks the peer more than
+    /// once per interval regardless of who recorded the failure.
     pub fn note_connect_fail(&mut self, now: i64) {
         self.connected = false;
         self.connection_errors += 1;
         self.reputation -= 1;
         let shift = self.connection_errors.min(8);
         self.retry_after = now + (15i64 << shift).min(3600);
+        // `== 0`, not "first error": a peer restored from disk mid-streak
+        // has errors > 0 with no stamp yet, and must not keep a zero stamp
+        // (which reads as a bench as old as the epoch) forever.
+        if self.benched_since == 0 {
+            self.benched_since = now;
+        }
+        self.probe_after = now + probe_cooldown_secs(&self.addr, self.failure_streak());
+    }
+
+    /// A health probe's dial + Ping answered: lift the dial backoff so
+    /// selection may retry the peer at once, and re-arm the probe cooldown.
+    /// Deliberately NOT [`Self::note_connect_ok`]: a ping is strictly weaker
+    /// evidence than the fetch-level failures that bench a peer (a zombie
+    /// handshakes fine but never serves), so the error streak, reputation and
+    /// response stamp are left for a real fetch to clear - resetting them
+    /// here pinned the backoff at its first rung and resurrected
+    /// ping-alive-but-fetch-dead peers every cooldown.
+    pub fn note_probe_ok(&mut self, now: i64) {
+        self.retry_after = 0;
+        self.probe_failures = 0;
+        self.probe_after = now + probe_cooldown_secs(&self.addr, self.connection_errors);
+    }
+
+    /// A health probe went unanswered: keep the peer benched (the dial
+    /// backoff re-arms so selection stays away) and grow the probe cooldown.
+    /// The dial streak and reputation are NOT touched - probes run every few
+    /// minutes with zero fetch demand, so counting them as connection errors
+    /// would walk any benched peer to the eviction threshold and deep
+    /// negative reputation far faster than the dial path ever could.
+    pub fn note_probe_fail(&mut self, now: i64) {
+        self.probe_failures = self.probe_failures.saturating_add(1);
+        let streak = self.failure_streak();
+        self.retry_after = now + (15i64 << streak.min(8)).min(3600);
+        self.probe_after = now + probe_cooldown_secs(&self.addr, streak);
+        if self.benched_since == 0 {
+            self.benched_since = now;
+        }
     }
 
     /// A file downloaded from the peer and verified: the strongest positive
@@ -223,6 +322,25 @@ impl Peers {
             if connected {
                 peer.time_response = now;
                 peer.connection_errors = 0;
+            }
+        }
+    }
+
+    /// Reconcile every peer's live-connection flag against the addresses the
+    /// caller actually holds links to: members are marked connected (as
+    /// [`Self::set_connected`] would), everyone else is cleared. The clearing
+    /// half is the point - individual connect notes only ever SET the flag,
+    /// nothing marks a dropped link disconnected, and one stale `connected`
+    /// in an idle registry permanently hid the peer from the health prober's
+    /// any-registry exclusion.
+    pub fn sync_connected(&mut self, live: &std::collections::HashSet<String>, now: i64) {
+        for peer in self.map.values_mut() {
+            if live.contains(&peer.addr.to_string()) {
+                peer.connected = true;
+                peer.time_response = now;
+                peer.connection_errors = 0;
+            } else {
+                peer.connected = false;
             }
         }
     }
@@ -350,6 +468,41 @@ impl Peers {
             out.push(rest[(offset + i) % rest.len()].addr.clone());
         }
         out
+    }
+
+    /// Benched peers due for a health probe: a failure streak, not connected,
+    /// connectable, on a dialable network, and past their probe cooldown
+    /// ([`probe_cooldown_secs`]). Most overdue first, capped at `limit`.
+    /// Healthy peers (no streak) and in-use peers never appear, so a probe
+    /// can never land on a peer the streaming path is happily using, and the
+    /// cooldown gate bounds probe frequency per peer.
+    pub fn probe_candidates(
+        &self,
+        nets: DialableNets,
+        now: i64,
+        limit: usize,
+    ) -> Vec<ProbeCandidate> {
+        let mut due: Vec<&Peer> = self
+            .map
+            .values()
+            .filter(|p| {
+                !p.connected
+                    && p.connection_errors > 0
+                    && p.is_connectable()
+                    && nets.can_dial(&p.addr)
+                    && p.probe_after <= now
+            })
+            .collect();
+        due.sort_by_key(|p| p.probe_after);
+        due.into_iter()
+            .take(limit)
+            .map(|p| ProbeCandidate {
+                addr: p.addr.clone(),
+                failures: p.failure_streak(),
+                benched_secs: (now - p.benched_since).max(0),
+                probe_after: p.probe_after,
+            })
+            .collect()
     }
 
     pub fn counts(&self) -> PeerCounts {
@@ -509,6 +662,173 @@ mod tests {
         all_down.get_mut(&ip("3.3.3.3:15441")).unwrap().note_connect_fail(100);
         let got = all_down.connectable_dialable(10, DialableNets::all(), 101);
         assert_eq!(got, vec![ip("3.3.3.3:15441")], "never starve the caller");
+    }
+
+    #[test]
+    fn probe_cooldown_doubles_to_a_cap_with_deterministic_jitter() {
+        let addr = ip("5.5.5.5:15441");
+        // Base ~30s doubling per failure, capped at 600s; jitter adds at most
+        // a quarter of the base on top.
+        for (failures, base) in [(1, 30), (2, 60), (3, 120), (4, 240), (5, 480), (6, 600), (20, 600)]
+        {
+            let cd = probe_cooldown_secs(&addr, failures);
+            assert!(
+                cd >= base && cd <= base + base / 4,
+                "failures={failures}: {cd} outside [{base}, {}]",
+                base + base / 4
+            );
+            assert_eq!(cd, probe_cooldown_secs(&addr, failures), "jitter is deterministic");
+        }
+        // The jitter source is the address + attempt, so two peers benched at
+        // the same instant still spread out (for at least one attempt count).
+        let other = ip("6.6.6.6:15441");
+        assert!(
+            (1..=6).any(|n| probe_cooldown_secs(&addr, n) != probe_cooldown_secs(&other, n)),
+            "different addresses never de-synchronized"
+        );
+    }
+
+    #[test]
+    fn probe_candidates_wait_out_the_cooldown_then_come_due() {
+        let mut peers = Peers::new();
+        let down = ip("1.1.1.1:15441");
+        peers.add(down.clone(), 0);
+        peers.add(ip("2.2.2.2:15441"), 0);
+        peers.get_mut(&down).unwrap().note_connect_fail(100);
+
+        // Inside the cooldown: nothing to probe (never more than once per
+        // interval).
+        assert!(peers.probe_candidates(DialableNets::all(), 101, 10).is_empty());
+
+        // Past it: due, reporting the streak and bench age. The healthy
+        // 2.2.2.2 (no failures) is never a candidate.
+        let cd = probe_cooldown_secs(&down, 1);
+        let due = peers.probe_candidates(DialableNets::all(), 100 + cd, 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].addr, down);
+        assert_eq!(due[0].failures, 1);
+        assert_eq!(due[0].benched_secs, cd);
+    }
+
+    #[test]
+    fn failed_probes_grow_the_cooldown_and_a_success_reinstates() {
+        let mut peers = Peers::new();
+        let down = ip("1.1.1.1:15441");
+        peers.add(down.clone(), 0);
+
+        // Each failed probe advances the cooldown exponentially (up to the
+        // cap) - the peer is due only after the grown interval, never sooner.
+        let mut now = 100;
+        for attempt in 1..=8u32 {
+            peers.get_mut(&down).unwrap().note_connect_fail(now);
+            let cd = probe_cooldown_secs(&down, attempt);
+            assert!(
+                peers.probe_candidates(DialableNets::all(), now + cd - 1, 10).is_empty(),
+                "attempt {attempt}: probed before its cooldown"
+            );
+            let due = peers.probe_candidates(DialableNets::all(), now + cd, 10);
+            assert_eq!(due.len(), 1, "attempt {attempt}");
+            now += cd;
+        }
+        // Streak of 8, but the interval stays at the ~10min cap (+ jitter).
+        assert!(probe_cooldown_secs(&down, 8) <= 750, "cap holds (600s + 25% jitter)");
+        assert_eq!(
+            peers.get(&down).unwrap().benched_since,
+            100,
+            "the streak start survives re-benching"
+        );
+
+        // The peer answers a probe: backoff cleared, selection returns it
+        // immediately, and it is no longer a probe candidate.
+        peers.get_mut(&down).unwrap().note_connect_ok(now);
+        assert!(peers
+            .connectable_dialable(10, DialableNets::all(), now + 1)
+            .contains(&down));
+        peers.set_connected(&down, false, now);
+        assert!(peers.probe_candidates(DialableNets::all(), now + 3600, 10).is_empty());
+    }
+
+    #[test]
+    fn probe_outcomes_leave_the_dial_streak_and_reputation_alone() {
+        let mut peers = Peers::new();
+        let down = ip("1.1.1.1:15441");
+        peers.add(down.clone(), 0);
+        let p = peers.get_mut(&down).unwrap();
+        p.note_connect_fail(100);
+        let rep = p.reputation;
+
+        // Failed probes: the cooldown and dial backoff grow, but the error
+        // streak and reputation stay - probes run with zero fetch demand and
+        // must not manufacture eviction streaks or deep negative rank.
+        p.note_probe_fail(200);
+        p.note_probe_fail(400);
+        assert_eq!(p.connection_errors, 1);
+        assert_eq!(p.probe_failures, 2);
+        assert_eq!(p.reputation, rep);
+        assert!(p.retry_after > 400, "selection stays away while probes fail");
+        assert!(p.probe_after > 400);
+
+        // An answered probe lifts the dial backoff only: selectable again,
+        // but the streak waits for a real fetch - a ping cannot prove the
+        // peer serves data, and clearing the streak here resurrected
+        // handshake-only zombies every cooldown.
+        p.note_probe_ok(500);
+        assert_eq!(p.retry_after, 0);
+        assert_eq!(p.probe_failures, 0);
+        assert_eq!(p.connection_errors, 1);
+        assert_eq!(p.reputation, rep);
+        assert!(p.probe_after > 500, "not immediately re-probed");
+
+        // The real fetch success is what fully heals it.
+        p.note_connect_ok(600);
+        assert_eq!(p.connection_errors, 0);
+        assert_eq!(p.benched_since, 0);
+    }
+
+    #[test]
+    fn sync_connected_marks_members_and_clears_the_rest() {
+        let mut peers = Peers::new();
+        peers.add(ip("1.1.1.1:15441"), 0);
+        peers.add(ip("2.2.2.2:15441"), 0);
+        // 2.2.2.2 connected once; the link is long gone but the flag stuck.
+        peers.get_mut(&ip("2.2.2.2:15441")).unwrap().note_connect_ok(50);
+
+        let live: std::collections::HashSet<String> =
+            [ip("1.1.1.1:15441").to_string()].into();
+        peers.sync_connected(&live, 100);
+        let held = peers.get(&ip("1.1.1.1:15441")).unwrap();
+        assert!(held.connected);
+        assert_eq!(held.time_response, 100);
+        assert!(
+            !peers.get(&ip("2.2.2.2:15441")).unwrap().connected,
+            "a dropped link's flag is cleared"
+        );
+    }
+
+    #[test]
+    fn healthy_connected_and_undialable_peers_are_never_probed() {
+        let mut peers = Peers::new();
+        // Healthy: no failure streak.
+        peers.add(ip("1.1.1.1:15441"), 0);
+        // Benched but currently connected (in use): a probe would be a second
+        // link into a peer the streaming path already holds.
+        peers.add(ip("2.2.2.2:15441"), 0);
+        let p = peers.get_mut(&ip("2.2.2.2:15441")).unwrap();
+        p.note_connect_fail(0);
+        p.connected = true;
+        // Benched onion peer on a node that cannot dial onion.
+        peers.add(ip("expyuzz4wqqyqhjn.onion:15441"), 0);
+        peers.get_mut(&ip("expyuzz4wqqyqhjn.onion:15441")).unwrap().note_connect_fail(0);
+        // Benched inbound-only peer (port 0): not connectable, nothing to probe.
+        peers.add(ip("3.3.3.3:0"), 0);
+        peers.get_mut(&ip("3.3.3.3:0")).unwrap().note_connect_fail(0);
+
+        assert!(peers.probe_candidates(clearnet_only(), 100_000, 10).is_empty());
+
+        // With Tor dialable the benched onion peer is the one candidate.
+        let due = peers.probe_candidates(DialableNets::all(), 100_000, 10);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].addr, ip("expyuzz4wqqyqhjn.onion:15441"));
     }
 
     #[test]

@@ -48,9 +48,12 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an established connection may sit idle (no request) before it
 /// is dropped and its inbound slot released.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-/// A GetRange no larger than this is treated as first-paint (index.html +
-/// first bundles), exempt from choking up to the per-peer free budget.
-pub const FIRST_PAINT_OBJECT_BYTES: u64 = 1 << 20;
+/// A GetRange for an OBJECT no larger than this is treated as first-paint
+/// (index.html, bundles, small assets), exempt from choking up to the
+/// per-peer free budget. Keyed on the object's total size, not the request
+/// size: a scheduler batch out of a multi-GB video is bulk even when the
+/// batch itself is small, so media transfers never burn the free budget.
+pub const FIRST_PAINT_OBJECT_BYTES: u64 = 4 << 20;
 
 /// The [`MAX_ENCODE_THREADS`] permits, shared by every connection.
 static ENCODE_SLOTS: std::sync::LazyLock<Semaphore> =
@@ -118,6 +121,11 @@ pub trait ControlProvider: Send + Sync + 'static {
     async fn announce(&self, payload: &[u8], from: &PeerIdentity) -> Result<Vec<u8>, String>;
 }
 
+/// Upload-accounting callback: (object served, bytes that went on the
+/// wire). Fired from serve paths after the bytes were actually sent, off
+/// the async runtime (blocking threads included), so it must not block.
+pub type ServedHook = Arc<dyn Fn(ObjId, u64) + Send + Sync>;
+
 /// Everything a serve loop needs.
 pub struct ServeCtx {
     pub store: Arc<Store>,
@@ -141,6 +149,9 @@ pub struct ServeCtx {
     /// Whether the user's own foreground traffic is currently active
     /// (drives the LEDBAT yield). A real node updates this live.
     pub foreground: Arc<std::sync::atomic::AtomicBool>,
+    /// Called with (object, bytes) after a serve actually sent data, so
+    /// the node can credit its upload counters. None = no accounting.
+    pub on_served: Option<ServedHook>,
 }
 
 /// The peer identity a completed handshake established.
@@ -174,12 +185,19 @@ impl ServeCtx {
             now: now_unix,
             choker: None,
             foreground: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            on_served: None,
         }
     }
 
     /// Attach the shared upload governor.
     pub fn with_choker(mut self, choker: Arc<Mutex<Choker>>) -> Self {
         self.choker = Some(choker);
+        self
+    }
+
+    /// Attach the upload-accounting hook (fired after bytes are served).
+    pub fn with_on_served(mut self, hook: ServedHook) -> Self {
+        self.on_served = Some(hook);
         self
     }
 
@@ -786,12 +804,18 @@ async fn serve_range(
         })
         .fold(0u64, u64::saturating_add);
 
-    // A first-paint-sized object, or an explicitly tight-deadline request
+    // A first-paint-sized OBJECT, or an explicitly tight-deadline request
     // (streaming seek), streams on the connection's priority lane so it
     // preempts a large background range; a patient bulk range (no deadline)
     // yields to it. This is the deadline tier the plan calls for, enforced
-    // at the writer rather than only advertised to the peer.
-    let first_paint = charged <= FIRST_PAINT_OBJECT_BYTES;
+    // at the writer rather than only advertised to the peer. Classified by
+    // the object's TOTAL size (one store stat), not the request size: a
+    // small batch out of a huge video is bulk, not first-paint, so media
+    // never drains the free budget meant for page assets. An unknown
+    // object falls back to the request size (it fails NOT_FOUND below
+    // anyway).
+    let obj_size = ctx.store.info(obj).ok().flatten().map(|(size, _)| size);
+    let first_paint = obj_size.unwrap_or(charged) <= FIRST_PAINT_OBJECT_BYTES;
     let bulk = !first_paint && deadline_ms == 0;
 
     // Bulk governance: consult the choker. First-paint objects (index +
@@ -844,7 +868,13 @@ async fn serve_range(
     .await;
 
     match res {
-        Ok(Ok(())) => {} // FrameSink sent the terminal frame.
+        Ok(Ok(())) => {
+            // FrameSink sent the terminal frame: the whole range went out,
+            // so credit what was put on the wire (the charged bytes).
+            if let Some(hook) = &ctx.on_served {
+                hook(obj, charged);
+            }
+        }
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
             // Peer cancelled: nothing more to send.
         }
@@ -925,8 +955,9 @@ async fn serve_many(
     // stall deadline still apply.
     let store = ctx.store.clone();
     let writer_conn = conn.clone();
+    let on_served = ctx.on_served.clone();
     let res = tokio::task::spawn_blocking(move || {
-        read_and_frame_many(&store, &writer_conn, stream, servable, now, bulk)
+        read_and_frame_many(&store, &writer_conn, stream, servable, now, bulk, on_served)
     })
     .await;
     if let Err(join_err) = res {
@@ -1018,7 +1049,8 @@ fn admit_many(
 /// every frame of the stream on the one lane `bulk` picked (mixing them
 /// would let the terminal frame overtake data the peer has not seen yet).
 /// An unreadable item is silently omitted (the client refetches); the
-/// terminal frame goes out unless a send fails first.
+/// terminal frame goes out unless a send fails first. `on_served` is
+/// credited per item, after the frame carrying it was actually sent.
 fn read_and_frame_many(
     store: &Store,
     conn: &Conn,
@@ -1026,7 +1058,18 @@ fn read_and_frame_many(
     servable: Vec<(ObjId, u64)>,
     now: u64,
     bulk: bool,
+    on_served: Option<ServedHook>,
 ) {
+    let sizes = |items: &[(ObjId, Vec<u8>)]| -> Vec<(ObjId, u64)> {
+        items.iter().map(|(obj, bytes)| (*obj, bytes.len() as u64)).collect()
+    };
+    let credit = |items: Vec<(ObjId, u64)>| {
+        if let Some(hook) = &on_served {
+            for (obj, bytes) in items {
+                hook(obj, bytes);
+            }
+        }
+    };
     let mut batch: Vec<(ObjId, Vec<u8>)> = Vec::new();
     let mut batch_bytes = 0usize;
     for (obj, _) in servable {
@@ -1038,6 +1081,7 @@ fn read_and_frame_many(
         if batch_bytes + cost > BATCH_BUDGET && !batch.is_empty() {
             let out = std::mem::take(&mut batch);
             batch_bytes = 0;
+            let served = sizes(&out);
             let frame = Frame {
                 stream,
                 body: FrameBody::Resp { last: false, resp: Resp::Many { items: out } },
@@ -1045,13 +1089,17 @@ fn read_and_frame_many(
             if send_on_lane(conn, frame, bulk).is_err() {
                 return;
             }
+            credit(served);
         }
         batch_bytes += cost;
         batch.push((obj, bytes));
     }
+    let served = sizes(&batch);
     let frame =
         Frame { stream, body: FrameBody::Resp { last: true, resp: Resp::Many { items: batch } } };
-    let _ = send_on_lane(conn, frame, bulk);
+    if send_on_lane(conn, frame, bulk).is_ok() {
+        credit(served);
+    }
 }
 
 /// Blocking-send one frame on the connection's bulk or priority lane.
@@ -1127,7 +1175,7 @@ impl std::io::Write for FrameSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES};
+    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES, UNCHOKE_SLOTS};
     use crate::frame;
     use epix_blob::Ns;
 
@@ -1250,11 +1298,13 @@ mod tests {
         store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
 
         let peer = peer();
-        let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
+        // Cap above the free budget: this test spends the whole budget in
+        // one call and is about the choke, not the governor.
+        let choker = Arc::new(Mutex::new(Choker::new(1 << 40)));
         {
             let mut c = choker.lock().unwrap();
             // Competitors hold every unchoke slot...
-            for i in 20..26u8 {
+            for i in 20..(20 + UNCHOKE_SLOTS as u8 + 4) {
                 c.note_peer(&[i; 33], Reach::Clearnet, 0);
                 c.credit_peer(&[i; 33], 1_000_000, 0);
             }
@@ -1322,6 +1372,59 @@ mod tests {
         }
     }
 
+    /// First-paint classification keys on the OBJECT's total size, not the
+    /// request's: a small scheduler batch out of a multi-MB video is bulk,
+    /// so it neither burns the free budget nor slips past the choke, while
+    /// the same peer's small page assets still serve exempt.
+    #[tokio::test]
+    async fn classification_keys_on_object_size_not_request_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        // A "video": bigger than the first-paint object cutoff.
+        let big = vec![5u8; FIRST_PAINT_OBJECT_BYTES as usize + 1];
+        let big_id = ObjId::of(&big);
+        store.insert_bytes(big_id, Ns::Plain, &big, 1).unwrap();
+        // A page asset: small.
+        let small = vec![6u8; 2048];
+        let small_id = ObjId::of(&small);
+        store.insert_bytes(small_id, Ns::Plain, &small, 1).unwrap();
+
+        let peer = peer();
+        let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
+        {
+            let mut c = choker.lock().unwrap();
+            // More competing contributors than unchoke slots, so the fresh
+            // peer holds no bulk slot (and is not the optimistic pick at
+            // t=0, which goes to a contributor).
+            for i in 100..(100 + UNCHOKE_SLOTS as u8 + 4) {
+                c.note_peer(&[i; 33], Reach::Clearnet, 0);
+                c.credit_peer(&[i; 33], 1_000_000, 0);
+            }
+            c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
+        }
+        let ctx =
+            Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
+
+        // A small range of the BIG object is bulk: the choked peer waits.
+        let (conn, _incoming, mut far) = wired();
+        tokio::spawn(serve_range(conn, ctx.clone(), peer.clone(), 4, big_id, vec![(0, 1024)], 0));
+        match next_frame(&mut far).await.body {
+            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
+                assert_eq!(code, err::BUSY, "a batch out of a big object is bulk")
+            }
+            other => panic!("expected BUSY, got {other:?}"),
+        }
+
+        // The SAME choked peer's request for a small object is first-paint:
+        // served off the (untouched) free budget.
+        let (conn, _incoming2, mut far2) = wired();
+        tokio::spawn(serve_range(conn, ctx, peer, 6, small_id, vec![(0, 2048)], 0));
+        match next_frame(&mut far2).await.body {
+            FrameBody::Data { .. } => {}
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
     /// A signed body too large for one frame is chunked, not refused. An
     /// oversize frame fails to encode inside the writer task and tears the
     /// whole connection down, and refusing it instead made a big site's
@@ -1383,13 +1486,9 @@ mod tests {
         {
             let mut c = choker.lock().unwrap();
             // Sole peer, so it holds an unchoke slot: this is about the byte
-            // cap, not reciprocity. Its free budget is spent up front so every
-            // item falls through to the cap.
+            // cap, not reciprocity. Free-budget bytes count against the cap
+            // like everything else, so the cap alone cuts the batch.
             c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
-            assert_eq!(
-                c.decide(&peer.node_pk, FIRST_PAINT_FREE_BYTES, true, false, 0),
-                ServeDecision::FirstPaint
-            );
         }
         let ctx =
             Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));

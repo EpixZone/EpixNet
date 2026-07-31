@@ -923,6 +923,30 @@ impl Xite {
         Ok((registered, skipped))
     }
 
+    /// Every `(object id, inner_path)` pair this xite's manifests declare
+    /// with a `b3` (root + child units), plus its declared bundles mapped
+    /// to an empty inner_path — a bundle spans many files, so serving one
+    /// credits the xite without a per-file counter. The reverse map upload
+    /// accounting resolves a served object through.
+    pub fn edx_object_paths(&self) -> Vec<(epix_blob::ObjId, String)> {
+        let mut out = Vec::new();
+        let Some(content) = &self.content else { return out };
+        collect_object_paths(content, "", &mut out);
+        for id in epix_blob::manifest::bundles(content).keys() {
+            out.push((*id, String::new()));
+        }
+        for cj in self.storage.list_files() {
+            if cj == "content.json" || !cj.ends_with("/content.json") {
+                continue;
+            }
+            let dir = &cj[..cj.len() - "content.json".len()]; // trailing '/'
+            let Ok(bytes) = self.storage.read(&cj) else { continue };
+            let Ok(child) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            collect_object_paths(&child, dir, &mut out);
+        }
+        out
+    }
+
     /// Register the per-file objects one content.json unit declares (`files`
     /// and `files_optional`), each declared path prefixed with `dir_prefix`
     /// (empty for the root unit, the child unit's dir - trailing '/' included -
@@ -1252,6 +1276,26 @@ impl Xite {
     }
 }
 
+/// Collect one content.json unit's `(b3 object id, inner_path)` pairs from
+/// `files` + `files_optional`, each path prefixed with `dir_prefix` (empty
+/// for the root, the child's dir — trailing '/' included — for a child).
+fn collect_object_paths(
+    content: &Value,
+    dir_prefix: &str,
+    out: &mut Vec<(epix_blob::ObjId, String)>,
+) {
+    for key in ["files", "files_optional"] {
+        let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+        for (rel, e) in entries {
+            let Some(id) = e.get("b3").and_then(Value::as_str).and_then(epix_blob::ObjId::from_hex)
+            else {
+                continue; // pre-EDX entry: never served by object id
+            };
+            out.push((id, format!("{dir_prefix}{rel}")));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,6 +1305,49 @@ mod tests {
     fn signed(mut content: Value, privkey: &str) -> Vec<u8> {
         epix_content::sign(&mut content, privkey).unwrap();
         serde_json::to_vec(&content).unwrap()
+    }
+
+    /// The upload-accounting reverse map covers everything served by object
+    /// id: root + child unit files (child paths dir-prefixed), bundles with
+    /// an empty inner_path; a pre-EDX entry (no b3) has no object to map.
+    #[test]
+    fn edx_object_paths_maps_declared_objects() {
+        let site = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "data/users/alice/content.json",
+                &serde_json::to_vec(&json!({
+                    "files": { "avatar.png": { "size": 3, "b3": epix_blob::ObjId::of(b"png").to_string() } }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut xite = Xite::new(Address::parse(site).unwrap(), storage);
+        let bundle_hex = epix_blob::ObjId::of(b"bundle").to_string();
+        xite.content = Some(json!({
+            "files": {
+                "index.html": { "size": 4, "b3": epix_blob::ObjId::of(b"html").to_string() },
+                "legacy.bin": { "size": 2 }, // pre-EDX: no b3, not mapped
+            },
+            "files_optional": {
+                "movie.bin": { "size": 5, "b3": epix_blob::ObjId::of(b"movie").to_string() },
+            },
+            "bundles": { &bundle_hex: { "size": 9 } },
+        }));
+
+        let paths: std::collections::HashMap<_, _> =
+            xite.edx_object_paths().into_iter().collect();
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[&epix_blob::ObjId::of(b"html")], "index.html");
+        assert_eq!(paths[&epix_blob::ObjId::of(b"movie")], "movie.bin");
+        assert_eq!(
+            paths[&epix_blob::ObjId::of(b"png")],
+            "data/users/alice/avatar.png",
+            "child unit paths carry their directory prefix"
+        );
+        assert_eq!(paths[&epix_blob::ObjId::of(b"bundle")], "", "bundles credit the xite only");
     }
 
     #[test]

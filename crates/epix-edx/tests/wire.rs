@@ -353,23 +353,24 @@ async fn governed_server_chokes_bulk_but_serves_first_paint() {
     let net = sim::SimNet::new();
     let (server_store, _sg) = temp_store();
 
-    // A first-paint-sized object (<= 1 MiB) and a bulk object (> 1 MiB).
+    // A first-paint-sized object and a bulk one (over the object cutoff).
     let small = test_data(500_000);
-    let big = test_data(4_000_000);
+    let big = test_data(5_000_000);
     let small_id = ObjId::of(&small);
     let big_id = ObjId::of(&big);
     server_store.insert_bytes(small_id, Ns::Plain, &small, 1).unwrap();
     server_store.insert_bytes(big_id, Ns::Plain, &big, 1).unwrap();
 
     // Governed server: choker with slots filled by phantom high
-    // contributors so our client (zero contribution) is choked for bulk.
-    // The client reaches us over the sim link (no Noise) => Reach::Overlay,
-    // so the phantom competitors are overlay too — otherwise the client
-    // would grab the reserved overlay slot and never be choked.
+    // contributors (more than the unchoke slots) so our client (zero
+    // contribution) is choked for bulk. The client reaches us over the sim
+    // link (no Noise) => Reach::Overlay, so the phantom competitors are
+    // overlay too — otherwise the client would grab a reserved overlay
+    // slot and never be choked.
     let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
     {
         let mut c = choker.lock().unwrap();
-        for i in 20..26u8 {
+        for i in 20..(20 + epix_edx::choke::UNCHOKE_SLOTS as u8 + 4) {
             c.note_peer(&[i; 33], Reach::Overlay, 0);
             c.credit_peer(&[i; 33], 1_000_000, 0);
         }

@@ -17,9 +17,12 @@ use serde_json::json;
 use tower::ServiceExt;
 
 /// Serves ranges out of an in-memory body and counts whole-file fetches, so a
-/// test can tell the seek path from the whole-file download.
+/// test can tell the seek path from the whole-file download. With `cap` set it
+/// returns at most that many bytes per range - a fetch that could only land a
+/// contiguous prefix of the window.
 struct RangeFetcher {
     body: Vec<u8>,
+    cap: Option<usize>,
     whole_file_calls: Arc<AtomicUsize>,
 }
 
@@ -52,7 +55,8 @@ impl EdxFetcher for RangeFetcher {
         start: u64,
         len: u64,
     ) -> Result<Option<Vec<u8>>, String> {
-        let end = (start as usize).saturating_add(len as usize).min(self.body.len());
+        let len = self.cap.map_or(len as usize, |c| (len as usize).min(c));
+        let end = (start as usize).saturating_add(len).min(self.body.len());
         let start = (start as usize).min(end);
         Ok(Some(self.body[start..end].to_vec()))
     }
@@ -117,6 +121,19 @@ impl EdxFetcher for RangeFetcher {
 /// entry, no piecemap) that is NOT on disk, plus a fetcher that can serve its
 /// ranges. Returns the router and the whole-file fetch counter.
 async fn router_with_declared_edx_file(body: &[u8]) -> (axum::Router, Arc<AtomicUsize>) {
+    router_with_edx_fetcher(body, None).await
+}
+
+/// [`router_with_declared_edx_file`], but the fetcher lands at most `cap`
+/// bytes per range (a partial fetch over a slow overlay).
+async fn router_with_partial_edx_file(body: &[u8], cap: usize) -> (axum::Router, Arc<AtomicUsize>) {
+    router_with_edx_fetcher(body, Some(cap)).await
+}
+
+async fn router_with_edx_fetcher(
+    body: &[u8],
+    cap: Option<usize>,
+) -> (axum::Router, Arc<AtomicUsize>) {
     let state = AppState::new("range-test");
     let dir = tempfile::tempdir().unwrap();
     let id = epix_blob::ObjId::of(body);
@@ -135,6 +152,7 @@ async fn router_with_declared_edx_file(body: &[u8]) -> (axum::Router, Arc<Atomic
     state
         .set_edx_fetcher(Arc::new(RangeFetcher {
             body: body.to_vec(),
+            cap,
             whole_file_calls: whole_file_calls.clone(),
         }))
         .await;
@@ -179,6 +197,23 @@ async fn range_of_a_missing_edx_file_seeks_instead_of_downloading_the_whole_file
         0,
         "the range must not trigger a whole-file fetch"
     );
+}
+
+#[tokio::test]
+async fn a_partial_fetch_serves_the_prefix_as_a_shorter_206() {
+    // The fetch could only land the first 1024 bytes of the requested
+    // window (overlay peers mid-transfer): the response must be a SHORTER
+    // 206 whose Content-Range matches what is actually served - the
+    // browser re-requests the remainder - never a 404 for bytes we hold.
+    let body: Vec<u8> = (0..4096).map(|i| i as u8).collect();
+    let (router, whole_file_calls) = router_with_partial_edx_file(&body, 1024).await;
+    let resp =
+        router.oneshot(get_range("/1RangeTest/media/movie.mp4", "bytes=0-4095")).await.unwrap();
+    let (status, content_range, served) = parts(resp).await;
+    assert_eq!(status, 206);
+    assert_eq!(content_range, "bytes 0-1023/4096");
+    assert_eq!(served.as_slice(), &body[..1024]);
+    assert_eq!(whole_file_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

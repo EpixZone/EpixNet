@@ -99,7 +99,11 @@ pub trait EdxFetcher: Send + Sync {
 
     /// Fetch just the byte range `[start, start+len)` of `inner_path` over
     /// EDX and return the verified bytes, without materializing the whole
-    /// file (media seek). `Ok(None)` when the file has no EDX entry.
+    /// file (media seek). May return FEWER than `len` bytes: when only a
+    /// contiguous prefix of the window could be fetched, that prefix is
+    /// returned (the HTTP layer serves it as a shorter 206 and the browser
+    /// re-requests the rest). `Ok(None)` when the file has no EDX entry;
+    /// `Err` when not even the first byte of the range is available.
     async fn fetch_range(
         &self,
         address: &str,
@@ -380,9 +384,9 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Network",
         "tor",
-        "Tor (Always routes all peer traffic through Tor; restart EpixNet to apply)",
+        "Tor (Always private routes all peer traffic over Tor/I2P only; restart EpixNet to apply)",
         "enable",
-        "select:Disable=disable|Enable=enable|Always=always",
+        "select:Disable=disable|Enable=enable|Always private (Tor/I2P only)=always",
     ),
     // Active only in a bridges-enabled build (Snowflake linked); otherwise shown
     // disabled with a coming-soon note, as before.
@@ -734,6 +738,12 @@ pub struct AppState {
     /// unchanged; a loaded xite's local files are registered into it on
     /// load so EDX can serve and dedup them (see [`Self::edx_register_xite`]).
     edx_store: RwLock<Option<Arc<epix_blob::store::Store>>>,
+    /// Reverse map of registered EDX objects: object id -> (xite address,
+    /// inner_path), rebuilt per xite on (re-)register. The serve-side
+    /// upload hook resolves the object it just served through this to
+    /// credit the right xite's counters. A std lock because the hook is
+    /// synchronous (it fires from blocking serve threads).
+    edx_paths: std::sync::RwLock<HashMap<epix_blob::ObjId, (String, String)>>,
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
@@ -750,6 +760,12 @@ pub struct AppState {
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
+    /// Per-(tracker, xite) announce backoff (`(tracker, xite) -> (num_error,
+    /// time_request)`). Scoped to the pair on purpose: the dashboard tally
+    /// above stays global, but one peerless xite must not back a healthy
+    /// tracker off for every other xite (with >6 xites the old global counter
+    /// let only one random xite per pass reach each tracker).
+    tracker_backoff: RwLock<HashMap<(String, String), (i64, i64)>>,
     /// Permissions the user has explicitly granted per xite (`address -> [perm]`),
     /// e.g. ADMIN or `Merger:<type>`. A xite gets no permission until it requests
     /// one and the user approves the grant prompt; persisted so a grant survives
@@ -920,6 +936,11 @@ pub struct AppState {
     /// folded into every announce alongside the configured ones. Replaced
     /// wholesale on each refresh - not persisted, the plugin's book is.
     extra_trackers: RwLock<Vec<epix_xite::Tracker>>,
+    /// The WORKING subset of the runtime-contributed trackers (the Beacon
+    /// book's recent successes), the only Beacon entries [`Self::tracker_list`]
+    /// gossips to peers - handing out the whole book (dead entries included)
+    /// is how every node's trackers.json used to fill with garbage.
+    gossip_trackers: RwLock<Vec<epix_xite::Tracker>>,
     /// The node's bootstrap tracker list (config or built-in defaults), set
     /// once at startup so state-initiated announces (`ensure_optional_peers`)
     /// can use the FULL tracker set even before the Beacon's first refresh
@@ -1134,6 +1155,18 @@ async fn push_update_to_peer(
     }
 }
 
+/// How recent an announce success must be for a tracker to count as working
+/// (and be gossiped to peers) - EpixNet's one-hour "working" window.
+const TRACKER_WORKING_SECS: i64 = 3600;
+
+/// A shared (AnnounceShare) tracker is evicted after this many CONSECUTIVE
+/// failed announces (the counter resets on success) ...
+const SHARED_TRACKER_ERROR_LIMIT: i64 = 10;
+
+/// ... but only once this run has been trying it this long without a single
+/// success - a tracker that is merely down during our boot hour survives.
+const SHARED_TRACKER_DEAD_SECS: i64 = 6 * 3600;
+
 /// The per-announcer stats key: the tracker's canonical form - Epix
 /// announcers by their real transport (`tcp://…`, `onion://…`, `i2p://…` -
 /// the dashboard pill shows the actual protocol), BitTorrent trackers by
@@ -1143,17 +1176,25 @@ fn tracker_stat_key(tracker: &epix_xite::Tracker) -> String {
     tracker.to_string()
 }
 
-/// Whether the Tor state makes `tracker` unusable this pass. Tor Always
+/// Whether the overlay state makes `tracker` unusable this pass. Tor Always
 /// routes every peer dial through Tor - but BitTorrent announces do their own
 /// networking (UDP cannot ride Tor at all, and a direct HTTP announce would
 /// leak the real IP), so they are skipped outright in that mode; Epix
 /// announcers keep working over the (Tor-routed) transport. Symmetrically,
-/// onion announcers are unreachable without Tor, so they are skipped while it
-/// is off rather than piling up failures.
-fn tracker_tor_gated(tracker: &epix_xite::Tracker, tor_on: bool, tor_status: &str) -> bool {
+/// onion announcers are unreachable without Tor and i2p announcers without a
+/// ready I2P transport, so they are skipped while their overlay is off rather
+/// than piling up failures (an i2p bootstrap entry used to be dialed - and
+/// scored dead - even on nodes with I2P disabled).
+fn tracker_gated(
+    tracker: &epix_xite::Tracker,
+    tor_on: bool,
+    tor_status: &str,
+    i2p_on: bool,
+) -> bool {
     match tracker {
         epix_xite::Tracker::Bt(_) => tor_on && tor_status == "Always",
         epix_xite::Tracker::Epix(PeerAddr::Onion { .. }) => !tor_on,
+        epix_xite::Tracker::Epix(PeerAddr::I2p { .. }) => !i2p_on,
         epix_xite::Tracker::Epix(_) => false,
     }
 }
@@ -1296,10 +1337,12 @@ impl AppState {
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
+            edx_paths: std::sync::RwLock::new(HashMap::new()),
             edx_fetcher: RwLock::new(None),
             link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
+            tracker_backoff: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
             chart: Arc::new(crate::chart::ChartDb::memory().expect("in-memory chart db")),
@@ -1349,6 +1392,7 @@ impl AppState {
             sites_path: None,
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
+            gossip_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
@@ -1440,10 +1484,12 @@ impl AppState {
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
+            edx_paths: std::sync::RwLock::new(HashMap::new()),
             edx_fetcher: RwLock::new(None),
             link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
+            tracker_backoff: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
             chart: Arc::new(chart),
@@ -1495,6 +1541,7 @@ impl AppState {
             data_root: Some(data_root),
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
+            gossip_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
@@ -1681,21 +1728,67 @@ impl AppState {
         self.extra_trackers.read().await.clone()
     }
 
+    /// Replace the gossip set: the Beacon book's WORKING announcers (recent
+    /// success), the only book entries [`Self::tracker_list`] hands to peers.
+    pub async fn set_gossip_trackers(&self, trackers: Vec<epix_xite::Tracker>) {
+        *self.gossip_trackers.write().await = trackers;
+    }
+
     /// The announcer list we hand to peers that ask (the AnnounceShare
-    /// exchange): our remembered plus Beacon-discovered trackers, deduped, in
-    /// their canonical `scheme://host:port` spelling so the receiver can parse
-    /// them straight back into a [`epix_xite::Tracker`].
+    /// exchange), in the canonical `scheme://host:port` spelling the receiver
+    /// can parse straight back into a [`epix_xite::Tracker`]. Only announcers
+    /// KNOWN to work are served - our own tracker address first (the one
+    /// first-hand fact we hold), then the Beacon working set, then shared
+    /// trackers with a recent announce success. Gossiping the whole book,
+    /// dead entries included, is how every node's trackers.json used to fill
+    /// with garbage (the Python AnnounceSharePlugin served working ones only).
     ///
     /// Codec-free so both wire protocols answer with the same list.
     pub async fn tracker_list(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for t in self.shared_trackers().await.into_iter().chain(self.extra_trackers().await) {
-            let s = t.to_string();
+        let mut push = |s: String| {
             if !out.contains(&s) {
                 out.push(s);
             }
+        };
+        for t in self.own_tracker_addresses().await {
+            push(t.to_string());
+        }
+        for t in self.gossip_trackers.read().await.iter() {
+            push(t.to_string());
+        }
+        let shared = self.shared_trackers().await;
+        let cutoff = now_secs() as i64 - TRACKER_WORKING_SECS;
+        let stats = self.tracker_stats.read().await;
+        for t in shared {
+            let recent = stats
+                .get(&tracker_stat_key(&t))
+                .and_then(|v| v.get("time_success"))
+                .and_then(|v| v.as_i64())
+                .map(|ts| ts >= cutoff)
+                .unwrap_or(false);
+            if recent {
+                push(t.to_string());
+            }
         }
         out
+    }
+
+    /// Our own announcer addresses, when we ARE one: the tracker is enabled
+    /// and other nodes can dial us (open clearnet port, or an onion/i2p
+    /// service). Served first in [`Self::tracker_list`] so peers learn a
+    /// peer-tracker address first-hand - the Python client registered itself
+    /// (`my: true`) after a successful port check; without this, peer-tracker
+    /// addresses only ever propagate second-hand.
+    pub async fn own_tracker_addresses(&self) -> Vec<epix_xite::Tracker> {
+        if !self.tracker_enabled().await {
+            return Vec::new();
+        }
+        self.own_dialable_addresses()
+            .await
+            .iter()
+            .filter_map(|s| epix_xite::Tracker::parse(s))
+            .collect()
     }
 
     /// Record the node's bootstrap tracker list (config or built-in defaults).
@@ -1712,6 +1805,11 @@ impl AppState {
     /// Beacon-discovered tracker is otherwise invisible to on-demand clones,
     /// which is how an onion-only xite ends up "No peers found" even though a
     /// shared tracker knows its peer.
+    ///
+    /// Entries whose overlay is down (an onion announcer without Tor, an i2p
+    /// bootstrap entry without I2P) are skipped and marked `gated` so the
+    /// dashboard denominator can exclude them - previously an i2p bootstrap
+    /// entry was dialed (and permanently scored dead) even with I2P off.
     pub async fn all_trackers(
         &self,
         bootstrap: &[epix_xite::Tracker],
@@ -1722,7 +1820,17 @@ impl AppState {
                 all.push(t);
             }
         }
-        all
+        let (tor_on, tor_st) = self.tor_status().await;
+        let i2p_on = self.dialable_networks().await.i2p;
+        let mut usable = Vec::with_capacity(all.len());
+        for t in all {
+            if tracker_gated(&t, tor_on, &tor_st, i2p_on) {
+                self.mark_tracker_gated(&t).await;
+            } else {
+                usable.push(t);
+            }
+        }
+        usable
     }
 
     /// The signal fired when the runtime-contributed tracker set changes.
@@ -1748,6 +1856,50 @@ impl AppState {
         if !list.iter().any(|t| t == tracker) {
             list.push(tracker.to_string());
             self.config_set("shared_trackers", json!(list)).await;
+        }
+    }
+
+    /// Drop `tracker` from the persisted shared list once it has been dead
+    /// for a long time: a solid failure streak, and this run has been trying
+    /// it for hours without one success. Without an eviction path the list
+    /// only ever grew, and its corpses were re-announced (and re-gossiped)
+    /// forever. Called on each failed announce; consecutive-failure counting
+    /// (num_error resets on success) keeps a merely flaky tracker safe.
+    async fn evict_shared_tracker_if_dead(&self, tracker: &epix_xite::Tracker) {
+        let key = tracker_stat_key(tracker);
+        let dead = {
+            let stats = self.tracker_stats.read().await;
+            let Some(entry) = stats.get(&key) else { return };
+            let get = |k: &str| entry.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+            let now = now_secs() as i64;
+            get("num_error") >= SHARED_TRACKER_ERROR_LIMIT
+                && now - get("time_success") > SHARED_TRACKER_DEAD_SECS
+                && now - get("time_first_request") > SHARED_TRACKER_DEAD_SECS
+        };
+        if !dead {
+            return;
+        }
+        let canonical = tracker.to_string();
+        let list: Vec<String> = self
+            .config_get("shared_trackers")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        // Match any spelling of the same tracker (`epix://` legacies parse to
+        // the same canonical form the stats are keyed by).
+        let kept: Vec<String> = list
+            .iter()
+            .filter(|t| {
+                epix_xite::Tracker::parse(t).map(|p| p.to_string() != canonical).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if kept.len() != list.len() {
+            self.config_set("shared_trackers", json!(kept)).await;
+            self.log("INFO", format!("Dropped dead shared tracker {canonical}")).await;
         }
     }
 
@@ -2356,8 +2508,11 @@ impl AppState {
         // the sidebar's "Downloaded" figure heals itself instead of trusting
         // a stale sites.json. (Piecewise-partial bigfiles re-count on their
         // next fetch pass; whole files are the common case.)
-        let (hashfield, optional_on_disk, optional_declared) =
-            compute_optional_state(&entry.storage, entry.content.as_ref());
+        let (hashfield, optional_on_disk, optional_declared) = compute_optional_state(
+            &entry.storage,
+            entry.content.as_ref(),
+            &settings.cache.optional_stats,
+        );
         let mut settings = settings;
         settings.optional_downloaded = optional_on_disk;
         // Include per-user (child content.json) optional files in the total -
@@ -3081,6 +3236,15 @@ impl AppState {
                                     as u32;
                             peer.time_response =
                                 o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
+                            // The bench stamps are in-memory only, so a peer
+                            // restored mid-streak has none: without this its
+                            // bench age reads as the whole epoch. The restore
+                            // is the bench start we know; the probe cooldown
+                            // stays expired (a restart is a natural moment to
+                            // re-check a benched peer).
+                            if peer.connection_errors > 0 {
+                                peer.benched_since = now;
+                            }
                         }
                         Some(peer)
                     })
@@ -3236,16 +3400,18 @@ impl AppState {
                 .unwrap_or_else(|| address.to_string())
         };
         let advert = std::sync::Arc::new(self.self_advert().await);
+        let i2p_on = self.dialable_networks().await.i2p;
         // Announce to every tracker concurrently: with a Beacon-sized list
         // (dozens, some dead), serial announces would stretch one pass across
         // many timeouts and the dashboard's per-tracker stats would trickle in.
         let mut set = tokio::task::JoinSet::new();
         let mut skipped = 0;
         for tracker in trackers.iter().cloned() {
-            if tracker_tor_gated(&tracker, tor_on, &tor_st) {
+            if tracker_gated(&tracker, tor_on, &tor_st, i2p_on) {
+                self.mark_tracker_gated(&tracker).await;
                 continue;
             }
-            if self.tracker_backed_off(&tracker).await {
+            if self.tracker_backed_off(&tracker, &key).await {
                 skipped += 1;
                 continue;
             }
@@ -3257,16 +3423,17 @@ impl AppState {
                 // tracker dial (HSDir fetch + rendezvous) or an exit-circuit
                 // build routinely exceeds 20s, and announces run concurrently
                 // so a longer timeout does not stretch the pass.
-                let peers = tokio::time::timeout(
+                let started = std::time::Instant::now();
+                let result = tokio::time::timeout(
                     std::time::Duration::from_secs(75),
                     epix_xite::announce(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
                 )
                 .await
-                .unwrap_or_default();
-                (tracker, peers)
+                .unwrap_or_else(|_| Err("announce timed out".into()));
+                (tracker, result, started.elapsed())
             });
         }
-        let all = self.absorb_announce_results(set).await;
+        let all = self.absorb_announce_results(set, &key).await;
         self.add_peers(address, all.clone()).await;
         let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
         self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
@@ -3281,68 +3448,142 @@ impl AppState {
     /// de-duplicated union of discovered peers.
     async fn absorb_announce_results(
         &self,
-        mut set: tokio::task::JoinSet<(epix_xite::Tracker, Vec<PeerAddr>)>,
+        mut set: tokio::task::JoinSet<(
+            epix_xite::Tracker,
+            Result<Vec<PeerAddr>, String>,
+            std::time::Duration,
+        )>,
+        xite_key: &str,
     ) -> Vec<PeerAddr> {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
-            let Ok((tracker, peers)) = res else { continue };
-            self.record_tracker(&tracker, peers.len()).await;
-            // AnnounceShare: remember a tracker that answered, so it is
-            // reused (and shared) across restarts - while the plugin is on.
-            if !peers.is_empty() && self.plugin_enabled("AnnounceShare").await {
-                self.add_shared_tracker(&tracker.to_string()).await;
-            }
-            for p in peers {
-                if !all.contains(&p) {
-                    all.push(p);
+            let Ok((tracker, result, latency)) = res else { continue };
+            self.record_tracker(&tracker, &result, latency).await;
+            self.record_tracker_backoff(&tracker, xite_key, result.is_ok()).await;
+            match result {
+                Ok(peers) => {
+                    // AnnounceShare: remember a tracker that answered - even
+                    // with zero peers; small peer-trackers usually know nobody
+                    // for a given xite - so it is reused (and shared) across
+                    // restarts, while the plugin is on.
+                    if self.plugin_enabled("AnnounceShare").await {
+                        self.add_shared_tracker(&tracker.to_string()).await;
+                    }
+                    for p in peers {
+                        if !all.contains(&p) {
+                            all.push(p);
+                        }
+                    }
                 }
+                Err(_) => self.evict_shared_tracker_if_dead(&tracker).await,
             }
         }
         all
     }
 
-    /// Record a completed announce to `tracker` (found `num_added` peers). An
-    /// announce that returned no peers counts as an error, not a success, so
-    /// the dashboard's working-tracker count and Beacon's health check reflect
-    /// which announcers actually answer (a dead onion/IPv6 entry shouldn't read
-    /// as working just because it was tried).
-    async fn record_tracker(&self, tracker: &epix_xite::Tracker, num_added: usize) {
+    /// Record a completed announce to `tracker`. Reachability, not peer count,
+    /// is the verdict: any answer - INCLUDING zero peers - is a success (every
+    /// node is a tracker, and a small peer-tracker almost always answers a
+    /// given xite with nobody; scoring that as broken kept the peer-tracker
+    /// mesh from ever bootstrapping). Only a failed announce is an error.
+    async fn record_tracker(
+        &self,
+        tracker: &epix_xite::Tracker,
+        result: &Result<Vec<PeerAddr>, String>,
+        latency: std::time::Duration,
+    ) {
         // Key (and show) Epix announcers by their real transport, not a
         // blanket `epix://` - `tcp://1.2.3.4:15441`, `onion://…`, `i2p://…` -
         // so the dashboard's tracker pill reflects the actual protocol.
         // BitTorrent trackers are keyed by their announce URL.
         let key = tracker_stat_key(tracker);
+        let now = now_secs();
         let mut stats = self.tracker_stats.write().await;
         let entry = stats.entry(key).or_insert_with(|| {
-            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0 })
+            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now })
         });
         let obj = entry.as_object_mut().expect("tracker stat object");
         let bump = |o: &mut serde_json::Map<String, Value>, k: &str, by: i64| {
             let v = o.get(k).and_then(|v| v.as_i64()).unwrap_or(0) + by;
             o.insert(k.to_string(), json!(v));
         };
-        obj.insert("time_request".into(), json!(now_secs()));
+        obj.insert("time_request".into(), json!(now));
         bump(obj, "num_request", 1);
-        bump(obj, "num_added", num_added as i64);
-        if num_added > 0 {
-            obj.insert("status".into(), json!("announced"));
-            bump(obj, "num_success", 1);
+        // The eviction grace (`evict_shared_tracker_if_dead`) counts from
+        // the first REAL request. An entry first created while its overlay
+        // was gated (`mark_tracker_gated`) has no time_first_request, which
+        // would read as 0 and void the six-hour guard - a tracker gated at
+        // boot could then be evicted minutes after its overlay came up.
+        if obj.get("time_first_request").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+            obj.insert("time_first_request".into(), json!(now));
+        }
+        match result {
+            Ok(peers) => {
+                obj.insert("status".into(), json!("announced"));
+                obj.insert("time_success".into(), json!(now));
+                obj.insert("latency".into(), json!(latency.as_secs_f64()));
+                bump(obj, "num_success", 1);
+                bump(obj, "num_added", peers.len() as i64);
+                // Consecutive-failure count, so one success revives a tracker.
+                obj.insert("num_error".into(), json!(0));
+            }
+            Err(e) => {
+                obj.insert("status".into(), json!("error"));
+                obj.insert("last_error".into(), json!(e));
+                obj.insert("time_last_error".into(), json!(now));
+                bump(obj, "num_error", 1);
+            }
+        }
+    }
+
+    /// Track the per-(tracker, xite) failure streak behind
+    /// [`Self::tracker_backed_off`]. A success clears the pair outright.
+    async fn record_tracker_backoff(&self, tracker: &epix_xite::Tracker, xite_key: &str, ok: bool) {
+        let pair = (tracker_stat_key(tracker), xite_key.to_string());
+        let now = now_secs();
+        let mut backoff = self.tracker_backoff.write().await;
+        if ok {
+            backoff.remove(&pair);
         } else {
-            obj.insert("status".into(), json!("error"));
-            bump(obj, "num_error", 1);
+            let entry = backoff.entry(pair).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = now;
+        }
+        // A success only removes its own pair, so entries whose tracker was
+        // evicted (or whose xite was removed) are never announced again and
+        // would sit here for the process lifetime. A pair still in rotation
+        // refreshes its stamp at least every backoff window (<= 30 min);
+        // anything a day stale is such an orphan and can no longer influence
+        // tracker_backed_off either way.
+        const STALE_SECS: i64 = 24 * 3600;
+        backoff.retain(|_, &mut (_, tried)| now - tried < STALE_SECS);
+    }
+
+    /// Mark a tracker skipped because its overlay is down (Tor off for an
+    /// onion announcer, no I2P transport for an i2p one) so the dashboard can
+    /// exclude it from the working-tracker denominator instead of counting it
+    /// against us. Counters are left alone - it was not tried.
+    async fn mark_tracker_gated(&self, tracker: &epix_xite::Tracker) {
+        let key = tracker_stat_key(tracker);
+        let mut stats = self.tracker_stats.write().await;
+        let entry = stats.entry(key).or_insert_with(|| {
+            json!({ "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0 })
+        });
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("status".into(), json!("gated"));
         }
     }
 
     /// EpixNet's tracker back-off (`SiteAnnouncer.announce`): skip a tracker
-    /// that has failed more than 5 times and was tried within the last
-    /// `60 * min(30, num_error)` seconds, so a reliably-dead tracker is not
-    /// hammered every pass. `force` (a manual `siteAnnounce`) bypasses it.
-    async fn tracker_backed_off(&self, tracker: &epix_xite::Tracker) -> bool {
-        let key = tracker_stat_key(tracker);
-        let stats = self.tracker_stats.read().await;
-        let Some(entry) = stats.get(&key) else { return false };
-        let num_error = entry.get("num_error").and_then(|v| v.as_i64()).unwrap_or(0);
-        let time_request = entry.get("time_request").and_then(|v| v.as_i64()).unwrap_or(0);
+    /// that has failed this xite's announce more than 5 times in a row and was
+    /// tried within the last `60 * min(30, num_error)` seconds, so a
+    /// reliably-dead tracker is not hammered every pass. Scoped to the
+    /// (tracker, xite) pair: the announce loop walks xites sequentially, and a
+    /// global window let only one random xite per pass reach each tracker.
+    async fn tracker_backed_off(&self, tracker: &epix_xite::Tracker, xite_key: &str) -> bool {
+        let pair = (tracker_stat_key(tracker), xite_key.to_string());
+        let backoff = self.tracker_backoff.read().await;
+        let Some(&(num_error, time_request)) = backoff.get(&pair) else { return false };
         if num_error <= 5 {
             return false;
         }
@@ -3351,8 +3592,21 @@ impl AppState {
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
+    /// Overlay-gated entries (skipped, never tried - Tor/I2P down) are
+    /// excluded: the shipped dashboard counts every entry in its ratio
+    /// denominator and only "announced" in the numerator, so including
+    /// them turns a healthy 4/4 pill into a 4/9 warning over trackers
+    /// that were simply not usable this pass.
     pub async fn announcer_stats(&self) -> Value {
-        Value::Object(self.tracker_stats.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        Value::Object(
+            self.tracker_stats
+                .read()
+                .await
+                .iter()
+                .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) != Some("gated"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
     }
 
     /// Mark a peer connected/disconnected for a xite.
@@ -3375,11 +3629,13 @@ impl AppState {
         }
     }
 
-    /// [`Self::record_transfer`] for serving a file to a peer, also counting
+    /// [`Self::add_transfer`] for serving a file to a peer, also counting
     /// the per-optional-file upload bytes behind the dashboard Files tab's
-    /// ratio dots (EpixNet's `file_optional.uploaded`).
-    pub async fn record_upload(&self, address: &str, peer: &PeerAddr, inner_path: &str, sent: u64) {
-        self.record_transfer(address, peer, 0, sent).await;
+    /// ratio dots (EpixNet's `file_optional.uploaded`). No per-peer
+    /// attribution: the EDX serve site that calls this knows the peer only
+    /// by its node_pk, not by a `PeerAddr` the peer table could hold.
+    pub async fn record_upload(&self, address: &str, inner_path: &str, sent: u64) {
+        self.add_transfer(address, 0, sent).await;
         if let Some((_, true)) = self.file_info_any(address, inner_path).await {
             if let Some(x) = self.xites.write().await.get_mut(address) {
                 x.settings
@@ -5035,6 +5291,71 @@ impl AppState {
         self.apply_peer_outcomes(address, outcomes).await;
     }
 
+    /// Benched peers across every served xite whose probe cooldown has
+    /// expired - what the background health prober re-checks, deduped by
+    /// address (one probe covers every xite that benched the peer). A peer
+    /// currently connected in ANY registry is excluded: the prober only
+    /// rehabilitates unreachable peers, it never opens a second link into one
+    /// the streaming path is using. Most overdue first, capped at `limit`:
+    /// the cooldown stamp is the fair-queue key (a probed peer's stamp
+    /// advances, a waiting peer's stays put), so when more peers are due
+    /// than the prober can serve, every one of them still gets a turn -
+    /// a static priority like bench age handed both slots to the oldest
+    /// corpses forever and never reached a newly benched peer.
+    pub async fn probe_candidates(&self, limit: usize) -> Vec<epix_peer::ProbeCandidate> {
+        let nets = self.dialable_networks().await;
+        let now = now_secs();
+        let xites = self.xites.read().await;
+        let connected: std::collections::HashSet<String> = xites
+            .values()
+            .flat_map(|x| x.peers.peers().filter(|p| p.connected).map(|p| p.key()))
+            .collect();
+        let mut merged: HashMap<String, epix_peer::ProbeCandidate> = HashMap::new();
+        for x in xites.values() {
+            for c in x.peers.probe_candidates(nets, now, usize::MAX) {
+                let key = c.addr.to_string();
+                if connected.contains(&key) {
+                    continue;
+                }
+                // Keep the most-overdue view of an address seen by several
+                // xites, so the sort below ranks it fairly.
+                let e = merged.entry(key).or_insert_with(|| c.clone());
+                if c.probe_after < e.probe_after {
+                    *e = c;
+                }
+            }
+        }
+        let mut out: Vec<epix_peer::ProbeCandidate> = merged.into_values().collect();
+        out.sort_by_key(|c| c.probe_after);
+        out.truncate(limit);
+        out
+    }
+
+    /// Fold one health-probe result into every xite registry that knows the
+    /// peer. Success lifts the dial backoff (note_probe_ok), so
+    /// [`Self::connectable_peers`] returns the peer again immediately and the
+    /// next session revalidation can pick it up - the error streak itself is
+    /// left for a real fetch to clear, because a ping cannot prove the peer
+    /// serves data. Failure advances the probe cooldown, but only where the
+    /// peer was already benched - the prober rehabilitates, it never
+    /// introduces failures into a registry that considers the peer healthy,
+    /// and it never touches a `connected` flag (a live link established
+    /// during the probe's flight stays claimed by whoever holds it).
+    pub async fn note_probe_outcome(&self, addr: &PeerAddr, ok: bool) {
+        let now = now_secs();
+        for x in self.xites.write().await.values_mut() {
+            let Some(p) = x.peers.get_mut(addr) else { continue };
+            if p.connection_errors == 0 {
+                continue;
+            }
+            if ok {
+                p.note_probe_ok(now);
+            } else if !p.connected {
+                p.note_probe_fail(now);
+            }
+        }
+    }
+
     /// A deduplicated set of connectable peers across all served xites, for the
     /// propagation poll. Every node runs the propagation service and its update
     /// log is global (not per-xite), so one poll per peer covers every xite we
@@ -5899,7 +6220,16 @@ impl AppState {
         let mut out: Vec<Value> = declared_optional_files(&xite.storage, xite.content.as_ref())
             .into_iter()
             .filter_map(|f| {
-                let is_downloaded = xite.storage.verify(&f.inner_path, &f.sha512);
+                // Presence by stat, never by hash: one Files-tab render over
+                // a media xite must not re-read gigabytes. A corrupt file at
+                // the right size is the verify command's job to flag.
+                let is_downloaded = optional_file_present(
+                    &xite.storage,
+                    &stats,
+                    &f.inner_path,
+                    f.size,
+                    f.bigfile,
+                );
                 if only_downloaded && !is_downloaded {
                     return None;
                 }
@@ -5982,7 +6312,8 @@ impl AppState {
             "inner_path": f.inner_path,
             "size": f.size,
             "sha512": f.sha512,
-            "is_downloaded": storage.verify(inner_path, &f.sha512),
+            // Stat, not hash: display info, same reasoning as the list.
+            "is_downloaded": f.size >= 0 && storage.present_at_size(inner_path, f.size as u64),
             "is_pinned": is_pinned,
         }))
     }
@@ -6585,14 +6916,17 @@ impl AppState {
         self.conn_pool.ensure(opener, &candidates).await;
         self.conn_pool.ping_all().await;
 
-        // Mark peers we hold a live connection to as connected.
-        let connected = self.conn_pool.connected_addrs().await;
+        // Reconcile the registries' `connected` flags with the pool BOTH
+        // ways: members marked, everyone else cleared. Set-only marking left
+        // the flag sticky after a link dropped, and one stale `connected` in
+        // an idle registry suppressed health probes of the peer forever.
+        let connected: std::collections::HashSet<String> =
+            self.conn_pool.connected_addrs().await.iter().map(|a| a.to_string()).collect();
         let addresses: Vec<String> = {
             let mut xites = self.xites.write().await;
+            let now = now_secs();
             for x in xites.values_mut() {
-                for addr in &connected {
-                    x.peers.set_connected(addr, true, now_secs());
-                }
+                x.peers.sync_connected(&connected, now);
             }
             xites.keys().cloned().collect()
         };
@@ -7463,9 +7797,13 @@ impl AppState {
         // multi-GB one and must not sit on a runtime worker.
         if let Some(store) = self.edx_store().await {
             let now = now_secs().max(0) as u64;
-            let result = tokio::task::spawn_blocking(move || xite.edx_register(&store, now)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let paths = xite.edx_object_paths();
+                xite.edx_register(&store, now).map(|counts| (counts, paths))
+            })
+            .await;
             match result {
-                Ok(Ok(_)) => {}
+                Ok(Ok((_, paths))) => self.set_edx_object_paths(address, paths),
                 Ok(Err(e)) => {
                     self.log("WARN", format!("edx_register {address}: {e}")).await;
                 }
@@ -8234,6 +8572,12 @@ impl AppState {
         *self.link_opener.write().await = Some(opener);
     }
 
+    /// The installed link opener, for callers outside the warm pool (the
+    /// runtime's health prober) that need a one-off liveness link.
+    pub async fn link_opener(&self) -> Option<Arc<dyn crate::conn_pool::LinkOpener>> {
+        self.link_opener.read().await.clone()
+    }
+
     /// Install the shared update-hint store (the node's `PropagationStore`),
     /// so received EDX updates gossip a hint that pollers can catch up on.
     pub fn set_prop_store(
@@ -8506,8 +8850,15 @@ impl AppState {
         // `edx_register_all_loaded` runs it for every xite back to back, so a
         // runtime worker must not carry it.
         let now = now_secs().max(0) as u64;
-        match tokio::task::spawn_blocking(move || xite.edx_register(&store, now)).await {
-            Ok(Ok(counts)) => Some(counts),
+        let task = tokio::task::spawn_blocking(move || {
+            let paths = xite.edx_object_paths();
+            xite.edx_register(&store, now).map(|counts| (counts, paths))
+        });
+        match task.await {
+            Ok(Ok((counts, paths))) => {
+                self.set_edx_object_paths(address, paths);
+                Some(counts)
+            }
             Ok(Err(e)) => {
                 self.log("WARN", format!("edx_register {address}: {e}")).await;
                 None
@@ -8516,6 +8867,24 @@ impl AppState {
                 self.log("WARN", format!("edx_register {address}: task failed: {e}")).await;
                 None
             }
+        }
+    }
+
+    /// Resolve a served EDX object back to its `(xite address, inner_path)`
+    /// for upload accounting (an empty inner_path means a bundle: credit
+    /// the xite, no per-file counter). Synchronous so the serve-side hook
+    /// can call it from blocking threads.
+    pub fn edx_object_path(&self, obj: &epix_blob::ObjId) -> Option<(String, String)> {
+        self.edx_paths.read().expect("edx_paths").get(obj).cloned()
+    }
+
+    /// Replace `address`'s entries in the object -> path reverse map, so a
+    /// re-register (new sign, changed files) keeps it fresh.
+    fn set_edx_object_paths(&self, address: &str, paths: Vec<(epix_blob::ObjId, String)>) {
+        let mut map = self.edx_paths.write().expect("edx_paths");
+        map.retain(|_, (a, _)| a != address);
+        for (id, inner_path) in paths {
+            map.insert(id, (address.to_string(), inner_path));
         }
     }
 
@@ -12578,7 +12947,8 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 /// address when known (so a site served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
 /// Build the optional-file hashfield from what's present on disk: for each
-/// `files_optional` entry we actually hold (hash-verified), record its hash id.
+/// `files_optional` entry we actually hold (present at its declared size),
+/// record its hash id.
 /// Everything optional already on disk: the hashfield to advertise
 /// (getHashfield/findHashIds) and the byte total behind the sidebar's
 /// "Downloaded" figure. Covers the root's `files_optional` AND every stored
@@ -12656,12 +13026,7 @@ fn optional_file_present(
     size: i64,
     bigfile: bool,
 ) -> bool {
-    let at_size = storage
-        .path(path)
-        .ok()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len() as i64 == size)
-        .unwrap_or(false);
+    let at_size = size >= 0 && storage.present_at_size(path, size as u64);
     if bigfile {
         at_size && stats.get(path).map(|s| s.time_downloaded > 0).unwrap_or(false)
     } else {
@@ -12690,6 +13055,7 @@ fn optional_fetch_status(got: u64, file_size: u64, peers: usize, suffix: &str) -
 fn compute_optional_state(
     storage: &XiteStorage,
     content: Option<&Value>,
+    stats: &HashMap<String, epix_xite::OptionalFileStat>,
 ) -> (epix_xite::Hashfield, i64, i64) {
     let mut hf = epix_xite::Hashfield::new();
     let mut bytes = 0i64;
@@ -12705,7 +13071,11 @@ fn compute_optional_state(
             let path = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
             let size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
             declared += size;
-            if storage.verify(&path, sha512) {
+            // Presence by stat (plus the bigfile completion stamp), never by
+            // hash: this runs for every xite at every startup, and re-hashing
+            // a media xite's gigabytes each boot pinned the disk for minutes.
+            let bigfile = info.get("piecemap").is_some();
+            if optional_file_present(storage, stats, &path, size, bigfile) {
                 hf.add_hash(sha512);
                 bytes += size;
             }
@@ -12853,23 +13223,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_list_is_canonical_and_deduped() {
+    async fn tracker_list_gossips_only_working_trackers() {
         let state = AppState::new("test");
-        state.config_set("shared_trackers", json!(["1.1.1.1:26959", "epix://2.2.2.2:26959"])).await;
-        state.set_extra_trackers(vec![
-            epix_xite::Tracker::Epix(PeerAddr::parse("2.2.2.2:26959").unwrap()),
-            epix_xite::Tracker::Epix(PeerAddr::parse("3.3.3.3:26959").unwrap()),
-        ])
-        .await;
-        // Every entry comes out in the transport-explicit spelling the
-        // receiver parses back, and the shared/extra overlap appears once.
+        let mk = |s: &str| epix_xite::Tracker::Epix(PeerAddr::parse(s).unwrap());
+        // Shared list: one tracker with a recent announce success (legacy
+        // spelling, to prove canonicalization), one never confirmed.
+        state.config_set("shared_trackers", json!(["epix://1.1.1.1:26959", "2.2.2.2:26959"])).await;
+        let ok: Result<Vec<PeerAddr>, String> = Ok(Vec::new());
+        state.record_tracker(&mk("1.1.1.1:26959"), &ok, std::time::Duration::from_millis(5)).await;
+        // Beacon contributes its full announce set (extra) and its verified
+        // working subset (gossip) - only the latter is served to peers;
+        // handing out the whole book is how trackers.json filled with junk.
+        state.set_extra_trackers(vec![mk("3.3.3.3:26959"), mk("4.4.4.4:26959")]).await;
+        state.set_gossip_trackers(vec![mk("3.3.3.3:26959"), mk("1.1.1.1:26959")]).await;
         assert_eq!(
             state.tracker_list().await,
-            vec![
-                "tcp://1.1.1.1:26959".to_string(),
-                "tcp://2.2.2.2:26959".to_string(),
-                "tcp://3.3.3.3:26959".to_string(),
-            ]
+            vec!["tcp://3.3.3.3:26959".to_string(), "tcp://1.1.1.1:26959".to_string()],
+            "working set + recently-successful shared, canonical and deduped"
         );
         for t in state.tracker_list().await {
             assert!(epix_xite::Tracker::parse(&t).is_some(), "unparseable: {t}");
@@ -12979,29 +13349,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_back_off_after_repeated_errors() {
+    async fn tracker_back_off_is_per_xite_and_resets_on_success() {
         let state = AppState::new("test");
         let tracker = epix_xite::Tracker::Epix(PeerAddr::parse("1.2.3.4:26959").unwrap());
+        let failed: Result<Vec<PeerAddr>, String> = Err("dial failed".into());
         // Fresh tracker: never backed off.
-        assert!(!state.tracker_backed_off(&tracker).await);
-        // Six failed announces (num_added == 0 records an error).
+        assert!(!state.tracker_backed_off(&tracker, "xite1").await);
+        // Six failed announces for xite1.
         for _ in 0..6 {
-            state.record_tracker(&tracker, 0).await;
+            state.record_tracker(&tracker, &failed, std::time::Duration::ZERO).await;
+            state.record_tracker_backoff(&tracker, "xite1", false).await;
         }
-        // >5 errors and just tried -> backed off this round.
-        assert!(state.tracker_backed_off(&tracker).await);
-        // A success resets the error count, so it is tried again.
-        state.record_tracker(&tracker, 3).await;
-        // num_error is still 6 in the running total, but a fresh look uses the
-        // recorded time; force the stat's time_request into the past to prove
-        // the window, not the count alone, gates it.
+        // >5 errors and just tried -> backed off this round...
+        assert!(state.tracker_backed_off(&tracker, "xite1").await);
+        // ...for xite1 only: another xite's announce still reaches the
+        // tracker (the old global window let only one random xite per pass
+        // through once more than 6 xites were served).
+        assert!(
+            !state.tracker_backed_off(&tracker, "xite2").await,
+            "one xite's failures must not back the tracker off for every other xite"
+        );
+        // A success resets the error count and clears the backoff, so the
+        // tracker is tried again right away.
+        let ok: Result<Vec<PeerAddr>, String> = Ok(Vec::new());
+        state.record_tracker(&tracker, &ok, std::time::Duration::from_millis(10)).await;
+        state.record_tracker_backoff(&tracker, "xite1", true).await;
+        assert!(!state.tracker_backed_off(&tracker, "xite1").await, "success clears the backoff");
+        let stats = state.tracker_stats.read().await;
+        let entry = stats.get(&tracker_stat_key(&tracker)).unwrap();
+        assert_eq!(entry["num_error"], 0, "a success resets the error count");
+        assert_eq!(entry["num_success"], 1);
+        assert_eq!(entry["status"], "announced");
+    }
+
+    #[tokio::test]
+    async fn a_zero_peer_answer_is_a_success_not_an_error() {
+        let state = AppState::new("test");
+        let tracker = epix_xite::Tracker::Epix(PeerAddr::parse("9.9.9.9:26959").unwrap());
+        // The tracker answered - it just knows no peers for this xite, the
+        // normal case for the small peer-trackers every node runs. Scoring
+        // this as an error kept the peer-tracker mesh from bootstrapping.
+        let ok: Result<Vec<PeerAddr>, String> = Ok(Vec::new());
+        state.record_tracker(&tracker, &ok, std::time::Duration::from_millis(120)).await;
+        let stats = state.tracker_stats.read().await;
+        let entry = stats.get(&tracker_stat_key(&tracker)).unwrap();
+        assert_eq!(entry["status"], "announced");
+        assert_eq!(entry["num_success"], 1);
+        assert_eq!(entry["num_error"], 0);
+        assert_eq!(entry["num_added"], 0);
+        assert!(entry["time_success"].as_i64().unwrap() > 0);
+        assert!(entry["latency"].as_f64().unwrap() > 0.0, "round-trip recorded");
+    }
+
+    #[tokio::test]
+    async fn gated_trackers_are_skipped_and_marked() {
+        let state = AppState::new("test");
+        let tcp = epix_xite::Tracker::parse("tcp://1.2.3.4:15441").unwrap();
+        let onion =
+            epix_xite::Tracker::parse(&format!("onion://{}.onion:15441", "a".repeat(56))).unwrap();
+        let i2p =
+            epix_xite::Tracker::parse(&format!("i2p://{}.b32.i2p:15441", "b".repeat(52))).unwrap();
+        let bootstrap = vec![tcp.clone(), onion.clone(), i2p.clone()];
+        // Tor off and no I2P transport: the overlay bootstrap entries are
+        // unusable this pass - skipped, not dialed into permanent failures.
+        assert_eq!(state.all_trackers(&bootstrap).await, vec![tcp.clone()]);
         {
-            let mut stats = state.tracker_stats.write().await;
-            let key = tracker_stat_key(&tracker);
-            let e = stats.get_mut(&key).unwrap().as_object_mut().unwrap();
-            e.insert("time_request".into(), json!(0));
+            let stats = state.tracker_stats.read().await;
+            for t in [&onion, &i2p] {
+                let entry = stats.get(&tracker_stat_key(t)).unwrap();
+                assert_eq!(entry["status"], "gated", "marked for the dashboard denominator");
+                assert_eq!(entry["num_request"], 0, "a gated tracker was never tried");
+            }
+            assert!(stats.get(&tracker_stat_key(&tcp)).is_none(), "usable entries not marked");
         }
-        assert!(!state.tracker_backed_off(&tracker).await, "old enough to retry");
+        // The dashboard payload excludes gated entries: its pill counts
+        // every entry in the denominator, so shipping them would turn a
+        // healthy ratio into a warning over trackers that were never tried.
+        assert!(
+            state.announcer_stats().await.as_object().unwrap().is_empty(),
+            "gated entries never reach the dashboard"
+        );
+        // Tor comes up: the onion entry is usable again; i2p stays gated.
+        state.set_tor_status(true, "OK").await;
+        let usable = state.all_trackers(&bootstrap).await;
+        assert!(usable.contains(&onion));
+        assert!(!usable.contains(&i2p));
+    }
+
+    /// A shared tracker whose stats entry was first created while GATED
+    /// (overlay down at boot) keeps the six-hour eviction grace once the
+    /// overlay comes up: the first real announce stamps
+    /// time_first_request, so a flaky-bootstrap failure burst minutes
+    /// later cannot evict it. Without the stamp the grace guard read a
+    /// missing field as 0 and was trivially satisfied.
+    #[tokio::test]
+    async fn a_boot_gated_shared_tracker_keeps_its_eviction_grace() {
+        let state = AppState::new("test");
+        let onion = epix_xite::Tracker::parse(&format!("onion://{}.onion:15441", "c".repeat(56)))
+            .unwrap();
+        state.config_set("shared_trackers", json!([onion.to_string()])).await;
+        // Tor off at boot: the announce pass gates the tracker, creating
+        // its stats entry without any request having been made.
+        state.mark_tracker_gated(&onion).await;
+        // Tor comes up, circuits still flaky: failures past the error
+        // limit within the first minutes.
+        let failed: Result<Vec<PeerAddr>, String> = Err("circuit collapsed".into());
+        for _ in 0..(SHARED_TRACKER_ERROR_LIMIT + 2) {
+            state.record_tracker(&onion, &failed, std::time::Duration::ZERO).await;
+            state.evict_shared_tracker_if_dead(&onion).await;
+        }
+        let kept: Vec<String> = state
+            .config_get("shared_trackers")
+            .await
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![onion.to_string()],
+            "the grace holds: no eviction minutes after the first real try"
+        );
     }
 
     #[tokio::test]
@@ -13337,6 +13806,84 @@ mod tests {
         // and the worker marked it connected (it never did before).
         assert_eq!(state.connectable_peers(addr, 10).await, vec![good]);
         assert_eq!(state.peer_counts(addr).await.connected, 1);
+    }
+
+    #[tokio::test]
+    async fn probe_candidates_dedupe_across_xites_and_a_probe_success_reinstates() {
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let xite_a = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let xite_b = "epix1talkanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let state = AppState::new("test");
+        state
+            .add_xite(xite_a, XiteEntry { storage: XiteStorage::new(dir_a.path()), content: None })
+            .await;
+        state
+            .add_xite(xite_b, XiteEntry { storage: XiteStorage::new(dir_b.path()), content: None })
+            .await;
+        let down = PeerAddr::parse("1.1.1.1:15441").unwrap();
+        let healthy = PeerAddr::parse("2.2.2.2:15441").unwrap();
+        let busy = PeerAddr::parse("3.3.3.3:15441").unwrap();
+        state.add_peers(xite_a, [down.clone(), healthy.clone(), busy.clone()]).await;
+        state.add_peers(xite_b, [down.clone(), busy.clone()]).await;
+
+        // `down` failed a dial in BOTH xites; `busy` failed in B but holds a
+        // live connection in A (a streaming session is using it).
+        state.note_edx_dials(xite_a, vec![(down.clone(), false), (busy.clone(), false)]).await;
+        state.note_edx_dials(xite_b, vec![(down.clone(), false), (busy.clone(), false)]).await;
+        {
+            let mut xites = state.xites.write().await;
+            xites.get_mut(xite_a).unwrap().peers.get_mut(&busy).unwrap().connected = true;
+        }
+
+        // Inside the probe cooldown nothing is due.
+        assert!(state.probe_candidates(10).await.is_empty());
+
+        // Expire the cooldowns (the state API runs on the wall clock, so the
+        // test rewinds the stamps instead of sleeping ~30s).
+        for x in state.xites.write().await.values_mut() {
+            for a in [&down, &busy] {
+                if let Some(p) = x.peers.get_mut(a) {
+                    p.probe_after = 0;
+                }
+            }
+        }
+
+        // One candidate: `down`, listed once despite being benched in two
+        // xites. `healthy` has no failure streak and `busy` is in use.
+        let due = state.probe_candidates(10).await;
+        assert_eq!(due.len(), 1, "{due:?}");
+        assert_eq!(due[0].addr, down);
+        assert_eq!(due[0].failures, 1);
+
+        // While benched, selection skips `down` in both xites.
+        assert!(!state.connectable_peers(xite_a, 10).await.contains(&down));
+
+        // A failed probe re-arms the cooldown in both registries WITHOUT
+        // growing the dial streak: probes run on their own clock, so counting
+        // them as connection errors would walk an unlucky peer to the
+        // eviction threshold with zero fetch demand.
+        state.note_probe_outcome(&down, false).await;
+        {
+            let xites = state.xites.read().await;
+            for x in [xite_a, xite_b] {
+                let p = xites.get(x).unwrap().peers.get(&down).unwrap();
+                assert_eq!(p.connection_errors, 1, "{x}: probe failures stay off the dial streak");
+                assert_eq!(p.probe_failures, 1, "{x}");
+                assert!(p.probe_after > now_secs(), "{x}: cooldown must be re-armed");
+            }
+        }
+        assert!(state.probe_candidates(10).await.is_empty(), "re-benched, not due again");
+
+        // ...and the peer answering a probe reinstates it everywhere, visible
+        // through connectable_peers immediately. The streak itself waits for
+        // a real fetch (a ping cannot prove the peer serves data).
+        state.note_probe_outcome(&down, true).await;
+        assert!(state.connectable_peers(xite_a, 10).await.contains(&down));
+        assert!(state.connectable_peers(xite_b, 10).await.contains(&down));
+        assert!(state.probe_candidates(10).await.is_empty(), "cooldown re-armed, not due again");
+        // The probe link was dropped after the ping: no phantom connection.
+        assert_eq!(state.peer_counts(xite_a).await.connected, 1, "only `busy` is connected");
     }
 
     #[tokio::test]
@@ -14710,6 +15257,40 @@ mod tests {
             state.optional_file_list(addr, "all", "size", 1).await.unwrap().len(),
             1
         );
+    }
+
+    /// The Files tab checks presence by stat (exists at the declared
+    /// size), never by hashing contents - one render over a media xite
+    /// must not re-read gigabytes. Proven by a file whose bytes do NOT
+    /// match the declared sha512: a hashing check would call it missing.
+    #[tokio::test]
+    async fn optional_file_list_stats_files_instead_of_hashing_them() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        // Right size, wrong content for the declared hash.
+        storage.write("movie.bin", b"xxxx").unwrap();
+        // Present but at the wrong size.
+        storage.write("short.bin", b"yy").unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0, "files": {},
+            "files_optional": {
+                "movie.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"AAAA") },
+                "short.bin": { "size": 8, "sha512": XiteStorage::hash_bytes(b"yy") },
+                "absent.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"zzzz") },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        let list = state.optional_file_list(addr, "all", "", 0).await.unwrap();
+        let by_path = |p: &str| list.iter().find(|f| f["inner_path"] == p).unwrap().clone();
+        assert_eq!(
+            by_path("movie.bin")["is_downloaded"], true,
+            "present at the declared size lists as downloaded - contents are never read"
+        );
+        assert_eq!(by_path("short.bin")["is_downloaded"], false, "wrong size = missing");
+        assert_eq!(by_path("absent.bin")["is_downloaded"], false, "absent = missing");
     }
 
     /// The bulk optional download behind "Download and help distribute all

@@ -43,12 +43,14 @@ async fn main() {
                 epix_discovery::announce_bittorrent(&url, DASHBOARD, 26552),
             )
             .await
+            .unwrap_or_else(|_| Err("timed out".into()))
             .unwrap_or_default();
             let second = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 epix_discovery::announce_bittorrent(&url, DASHBOARD, 26553),
             )
             .await
+            .unwrap_or_else(|_| Err("timed out".into()))
             .unwrap_or_default();
             (url, first, second)
         });
