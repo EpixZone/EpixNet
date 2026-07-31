@@ -1,0 +1,10 @@
+[package]
+name = "epix-selfenc"
+version = "0.1.0"
+edition = "2021"
+description = "Clean-room convergent self-encryption for EDX shards: salted-convergent and random-key envelope modes over BLAKE3 key derivation + ChaCha20-Poly1305. See PROVENANCE.md."
+
+[dependencies]
+blake3 = "=1.8.5"
+chacha20poly1305 = "=0.10.1"
+getrandom = "=0.2.17"

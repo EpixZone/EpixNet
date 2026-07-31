@@ -6,7 +6,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # edx: long-lived EDX protocol branch — every push must build and test
+    # green so the branch stays bisectable.
+    branches: [main, edx]
   pull_request:
     branches: [main]
 
@@ -41,6 +43,20 @@ jobs:
       # change that compiles but breaks byte-compatibility is caught too.
       - name: Test crypto byte-compatibility
         run: cargo test -p epix-crypt --locked
+      # The EDX gates: frozen slice format golden vectors, store crash-reopen,
+      # wire protocol over sim and real TCP+Noise, self-encryption KATs, the
+      # disk-audit and independent-recompute gates. These are the proofs the
+      # edx branch rests on, so they run on every push.
+      - name: Test EDX crates
+        run: cargo test -p epix-blob -p epix-selfenc -p epix-edx -p epix-feed -p epix-search -p epix-xite -p epix-content --locked
+      # The crates that consume EDX: the node runtime (resync, propagation), the
+      # UI server and its WS commands, the DHT-over-payloads path, and EDX over
+      # the Reticulum mesh. Their suites were compiled by the build step but
+      # never run, so regressions they guard could land green. Every test here
+      # binds loopback only. The 310s idle-reaper test in epix-runtime is
+      # #[ignore]d and stays skipped.
+      - name: Test EDX runtime, UI and wire crates
+        run: cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --locked
 
   mobile-profiles:
     name: Mobile feature profiles

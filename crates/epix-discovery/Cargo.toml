@@ -2,19 +2,19 @@
 name = "epix-discovery"
 version = "0.1.0"
 edition = "2021"
-description = "Peer discovery for EpixNet: Epix tracker (epix://) announce over the wire protocol. BitTorrent trackers / DHT / PEX land here too."
+description = "Peer discovery for EpixNet: Epix tracker (epix://) announce over EDX. BitTorrent trackers / DHT / PEX land here too."
 
 [dependencies]
 epix-core = { path = "../epix-core" }
-epix-protocol = { path = "../epix-protocol" }
-epix-transport = { path = "../epix-transport" }
-rmpv = "1"
+async-trait = "0.1"
+# default-features off: postcard's default heapless support drags the
+# unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
 sha1 = "0.11.0"
 sha2 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["net", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "time"] }
-epix-content = { path = "../epix-content" }
-serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

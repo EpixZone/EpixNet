@@ -16,6 +16,6 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 tokio = { version = "1", features = ["sync", "rt", "io-util", "macros", "time"] }
 
 [dev-dependencies]
+epix-edx = { path = "../epix-edx" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-rmpv = "1"
 tokio = { version = "1", features = ["full"] }

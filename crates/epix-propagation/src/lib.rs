@@ -8,9 +8,9 @@
 //! propagation relay is untrusted and cannot forge an update; it can only hint
 //! that one exists.
 //!
-//! It's transport-agnostic: the service is a [`RequestHandler`] and the client
-//! calls go over a [`Connection`], so this runs unchanged over TCP and over the
-//! Reticulum mesh (an offline peer on a mesh backhaul pulls the same way).
+//! It's transport-agnostic: the store is codec-free and the EDX control plane
+//! (`UpdatesSince`) carries it, so this runs unchanged over TCP, Tor, I2P and
+//! the Reticulum mesh (an offline peer on a mesh backhaul pulls the same way).
 //!
 //! Sync uses a monotonic **sequence cursor** rather than wall-clock time: each
 //! stored notification gets a seq, a peer remembers the `head` it last saw, and
@@ -19,16 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use epix_core::{PeerAddr, Result};
-use epix_protocol::{vget, vmap, Connection, RequestHandler};
-use rmpv::Value;
 use tokio::sync::Mutex;
-
-/// Wire command: announce that a xite was updated.
-pub const CMD_ANNOUNCE: &str = "meshAnnounceUpdate";
-/// Wire command: pull notifications after a cursor.
-pub const CMD_GET: &str = "meshGetUpdates";
 
 /// Default number of recent notifications a node retains.
 pub const DEFAULT_CAPACITY: usize = 10_000;
@@ -107,122 +98,42 @@ impl PropagationStore {
     }
 }
 
-/// The propagation-node role: answers `meshAnnounceUpdate` / `meshGetUpdates`
-/// against a shared [`PropagationStore`]. Plug it into a `PeerServer`
-/// (TCP) or `ReticulumServer` (mesh) like any other handler.
+/// A [`PropagationStore`] shared between the EDX control plane and the node's
+/// update-apply path. One book, many readers.
+pub type SharedStore = Arc<Mutex<PropagationStore>>;
+
+/// The propagation-node role: the read/write pair over a shared
+/// [`PropagationStore`], codec-free, so the EDX control plane
+/// (`Req::UpdatesSince`) and the node's own update-apply path serve the same
+/// book without either owning an encoding.
 pub struct PropagationService {
-    store: Arc<Mutex<PropagationStore>>,
+    store: SharedStore,
 }
 
 impl PropagationService {
-    pub fn new(store: Arc<Mutex<PropagationStore>>) -> Self {
+    pub fn new(store: SharedStore) -> Self {
         Self { store }
     }
-}
 
-#[async_trait]
-impl RequestHandler for PropagationService {
-    async fn handle(&self, _peer: &PeerAddr, cmd: &str, params: &Value) -> Value {
-        match cmd {
-            CMD_ANNOUNCE => {
-                let xite = vget(params, "xite").and_then(|v| v.as_str()).unwrap_or("");
-                let modified = vget(params, "modified").and_then(|v| v.as_i64()).unwrap_or(0);
-                if xite.is_empty() {
-                    return vmap(vec![("error", Value::from("missing xite"))]);
-                }
-                let seq = self.store.lock().await.record(xite, modified);
-                vmap(vec![("ok", Value::from(true)), ("seq", Value::from(seq))])
-            }
-            CMD_GET => {
-                let after = vget(params, "after").and_then(|v| v.as_u64()).unwrap_or(0);
-                let (updates, head) = self.store.lock().await.since(after);
-                let arr = updates
-                    .into_iter()
-                    .map(|n| {
-                        vmap(vec![
-                            ("xite", Value::from(n.xite)),
-                            ("modified", Value::from(n.modified)),
-                        ])
-                    })
-                    .collect();
-                vmap(vec![("updates", Value::Array(arr)), ("head", Value::from(head))])
-            }
-            _ => vmap(vec![("error", Value::from("unknown command"))]),
+    /// The shared store, for a caller that needs the handle itself (e.g. to
+    /// hand the same book to another wire).
+    pub fn store(&self) -> &SharedStore {
+        &self.store
+    }
+
+    /// Notifications after the `after` cursor (exclusive) plus the current
+    /// `head` - what `Req::UpdatesSince` answers.
+    pub async fn updates_since(&self, after: u64) -> (Vec<Notification>, u64) {
+        self.store.lock().await.since(after)
+    }
+
+    /// Record an update hint. Returns the seq it is stored under, or `None`
+    /// when `xite` is empty (there is nothing to key the hint on).
+    pub async fn record(&self, xite: &str, modified: i64) -> Option<u64> {
+        if xite.is_empty() {
+            return None;
         }
-    }
-}
-
-/// Announce a xite update to a propagation node over `conn`. Returns the seq the
-/// node stored it under.
-pub async fn announce_update(conn: &mut Connection, xite: &str, modified: i64) -> Result<u64> {
-    let resp = conn
-        .request(
-            CMD_ANNOUNCE,
-            vmap(vec![
-                ("xite", Value::from(xite)),
-                ("modified", Value::from(modified)),
-            ]),
-        )
-        .await?;
-    Ok(vget(&resp, "seq").and_then(|v| v.as_u64()).unwrap_or(0))
-}
-
-/// Pull notifications after the `after` cursor from a propagation node. Returns
-/// the new notifications and the node's current `head` (persist it as the next
-/// `after`).
-pub async fn fetch_updates(
-    conn: &mut Connection,
-    after: u64,
-) -> Result<(Vec<Notification>, u64)> {
-    let resp = conn
-        .request(CMD_GET, vmap(vec![("after", Value::from(after))]))
-        .await?;
-    let head = vget(&resp, "head").and_then(|v| v.as_u64()).unwrap_or(after);
-    let updates = vget(&resp, "updates")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|u| {
-                    Some(Notification {
-                        xite: vget(u, "xite")?.as_str()?.to_string(),
-                        modified: vget(u, "modified").and_then(|v| v.as_i64()).unwrap_or(0),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok((updates, head))
-}
-
-/// Client-side propagation: remembers the pull cursor for one propagation node
-/// so each [`poll`](PropagationClient::poll) returns only what's new since last
-/// time. The node runtime holds one of these per propagation peer and drives it
-/// on connect / on a timer.
-#[derive(Debug, Default)]
-pub struct PropagationClient {
-    cursor: u64,
-}
-
-impl PropagationClient {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The cursor to resume from (persist across restarts to avoid re-pulling).
-    pub fn cursor(&self) -> u64 {
-        self.cursor
-    }
-
-    /// Resume from a previously persisted cursor.
-    pub fn with_cursor(cursor: u64) -> Self {
-        Self { cursor }
-    }
-
-    /// Pull notifications newer than the cursor and advance it.
-    pub async fn poll(&mut self, conn: &mut Connection) -> Result<Vec<Notification>> {
-        let (updates, head) = fetch_updates(conn, self.cursor).await?;
-        self.cursor = head;
-        Ok(updates)
+        Some(self.store.lock().await.record(xite, modified))
     }
 }
 
@@ -275,6 +186,40 @@ mod tests {
 
         let (ups, _) = s.since(3);
         assert!(ups.is_empty());
+    }
+
+    /// The service is a thin async shell over the store: what it reads back
+    /// must be exactly what the store holds, at every cursor, and a rejected
+    /// announce must not burn a seq.
+    #[tokio::test]
+    async fn the_service_reads_and_writes_the_same_book() {
+        let svc = PropagationService::new(Arc::new(Mutex::new(PropagationStore::new())));
+
+        // Empty store: no updates, head 0.
+        assert_eq!(svc.updates_since(0).await, (vec![], 0));
+
+        assert_eq!(svc.record("a.epix", 1).await, Some(1));
+        assert_eq!(svc.record("a.epix", 1).await, Some(1), "idempotent per (xite, modified)");
+        assert_eq!(svc.record("a.epix", 2).await, Some(2));
+        assert_eq!(svc.record("b.epix", 1).await, Some(3));
+
+        for after in 0..=4 {
+            let via_service = svc.updates_since(after).await;
+            let via_store = svc.store().lock().await.since(after);
+            assert_eq!(via_service, via_store, "after={after}");
+        }
+
+        // Head advances with every record; nothing newer past it.
+        let (ups, head) = svc.updates_since(0).await;
+        assert_eq!(head, 3);
+        assert_eq!(ups.len(), 3);
+        let (ups, head) = svc.updates_since(2).await;
+        assert_eq!((ups, head), (vec![Notification { xite: "b.epix".into(), modified: 1 }], 3));
+        assert_eq!(svc.updates_since(3).await, (vec![], 3), "nothing newer, head unchanged");
+
+        // An empty xite has nothing to key the hint on.
+        assert_eq!(svc.record("", 1).await, None);
+        assert_eq!(svc.updates_since(0).await.1, 3, "a rejected announce burns no seq");
     }
 
     #[test]

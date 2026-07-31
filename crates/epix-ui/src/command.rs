@@ -553,6 +553,10 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalLimitStats),
         Arc::new(OptionalLimitSet),
         Arc::new(DbQuery),
+        // Derived feed engine (read-only; not admin-gated, like dbQuery).
+        Arc::new(FeedItemQuery),
+        Arc::new(FeedGalleryRollup),
+        Arc::new(FeedSegmentSearch),
         // xID identity resolution (the XidResolver plugin's WS API;
         // xidResolveName is registered with the chain commands above).
         Arc::new(XidResolve { cmd: "xidResolve" }),
@@ -1491,6 +1495,158 @@ impl WsCommand for DbQuery {
     }
 }
 
+/// Cap on `feedItemQuery` records. `item_query` serializes every live record
+/// attached to the target into one response, so an uncapped call against a
+/// heavily commented post would peg the node (self-DoS from the bound page),
+/// the same reason the sibling feed commands cap. Callers that want older
+/// records page with `before_clock`.
+const FEED_ITEM_MAX_RECORDS: usize = 500;
+
+/// Clamp a caller-supplied `feedItemQuery` limit, defaulting to the cap when it
+/// is absent or not a number.
+fn feed_item_limit(v: Option<&Value>) -> usize {
+    v.and_then(|v| v.as_u64())
+        .map(|n| (n as usize).min(FEED_ITEM_MAX_RECORDS))
+        .unwrap_or(FEED_ITEM_MAX_RECORDS)
+}
+
+/// `feedItemQuery({feed, target, limit?, before_clock?})` - the live records
+/// attached to `target` (a post's comments, or the post itself) plus its
+/// reaction counts, from the derived feed cache. Read-only; not admin-gated, so
+/// a bound app page calls it directly like `dbQuery`. Merger-aware via the
+/// bound address.
+struct FeedItemQuery;
+#[async_trait]
+impl WsCommand for FeedItemQuery {
+    fn name(&self) -> &'static str {
+        "feedItemQuery"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let arg = |key: &str, idx: usize| -> Option<Value> {
+            p.get(key).cloned().or_else(|| p.as_array().and_then(|a| a.get(idx).cloned()))
+        };
+        let feed = arg("feed", 0)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("feedItemQuery: feed required")?;
+        let target = arg("target", 1)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("feedItemQuery: target required")?;
+        let limit = feed_item_limit(arg("limit", 2).as_ref());
+        let before_clock = arg("before_clock", 3).and_then(|v| v.as_u64());
+        s.state.feed_item_query(address, &feed, &target, Some(limit), before_clock).await
+    }
+}
+
+/// Cap on caller-supplied `feedGalleryRollup` items. `gallery_rollup` is
+/// O(items * records), so an unbounded list against a large feed would peg the
+/// node (self-DoS from the bound page). A gallery landing page shows far fewer
+/// than this; beyond it is abuse, so reject rather than churn.
+const FEED_ROLLUP_MAX_ITEMS: usize = 500;
+
+/// `feedGalleryRollup({feed, items})` - per-item comment/reaction counts and
+/// newest-activity clock for a gallery landing page, in one blob. Read-only;
+/// not admin-gated.
+struct FeedGalleryRollup;
+#[async_trait]
+impl WsCommand for FeedGalleryRollup {
+    fn name(&self) -> &'static str {
+        "feedGalleryRollup"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let feed = p
+            .get("feed")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(|v| v.as_str())
+            .ok_or("feedGalleryRollup: feed required")?
+            .to_string();
+        let items_val = p
+            .get("items")
+            .or_else(|| p.as_array().and_then(|a| a.get(1)))
+            .ok_or("feedGalleryRollup: items required")?;
+        let items_arr = items_val
+            .as_array()
+            .ok_or("feedGalleryRollup: items must be an array")?;
+        if items_arr.len() > FEED_ROLLUP_MAX_ITEMS {
+            return Err(format!(
+                "feedGalleryRollup: too many items ({}, max {FEED_ROLLUP_MAX_ITEMS})",
+                items_arr.len()
+            ));
+        }
+        let items: Vec<String> =
+            items_arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
+        s.state.feed_gallery_rollup(address, &feed, &items).await
+    }
+}
+
+/// Cap on `feedSegmentSearch` results and query terms. Each extra term is
+/// another filter probe per segment and another per-record term scan, so an
+/// unbounded term list is a self-DoS from the bound page.
+const FEED_SEARCH_MAX_HITS: usize = 200;
+pub(crate) const FEED_SEARCH_MAX_TERMS: usize = 16;
+
+/// Cap on the bytes of any one term string. The term count alone does not bound
+/// the work: `segment_search` runs the frozen tokenizer over each string, so one
+/// multi-megabyte string expands into as many query tokens as it holds words and
+/// reopens the very self-DoS the count cap exists to close.
+const FEED_SEARCH_MAX_TERM_BYTES: usize = 256;
+
+/// Parse the caller-supplied `terms` argument (a list or a single query string)
+/// and hold it to both caps.
+fn feed_search_terms(v: &Value) -> Result<Vec<String>, String> {
+    let terms: Vec<String> = match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => return Err("feedSegmentSearch: terms must be a string or array".into()),
+    };
+    if terms.len() > FEED_SEARCH_MAX_TERMS {
+        return Err(format!(
+            "feedSegmentSearch: too many terms ({}, max {FEED_SEARCH_MAX_TERMS})",
+            terms.len()
+        ));
+    }
+    if let Some(t) = terms.iter().find(|t| t.len() > FEED_SEARCH_MAX_TERM_BYTES) {
+        return Err(format!(
+            "feedSegmentSearch: term too long ({} bytes, max {FEED_SEARCH_MAX_TERM_BYTES})",
+            t.len()
+        ));
+    }
+    Ok(terms)
+}
+
+/// `feedSegmentSearch({feed, terms, limit?})` - skip-filter search across the
+/// derived feed's sealed segments. Returns POINTERS (`segment_root`, `offset`,
+/// `len`, record address) that the caller fetches and verifies against the
+/// segment root; it never returns record bodies. Distinct from the legacy SQL
+/// newsfeed's `feedQuery`/`feedSearch`, which search the local site db.
+/// Read-only; not admin-gated, like `dbQuery`.
+struct FeedSegmentSearch;
+#[async_trait]
+impl WsCommand for FeedSegmentSearch {
+    fn name(&self) -> &'static str {
+        "feedSegmentSearch"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?;
+        let arg = |key: &str, idx: usize| -> Option<Value> {
+            p.get(key).cloned().or_else(|| p.as_array().and_then(|a| a.get(idx).cloned()))
+        };
+        let feed = arg("feed", 0)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .ok_or("feedSegmentSearch: feed required")?;
+        // `terms` takes a list or a single query string (split by the frozen
+        // tokenizer either way).
+        let terms_val = arg("terms", 1).ok_or("feedSegmentSearch: terms required")?;
+        let terms = feed_search_terms(&terms_val)?;
+        let limit = arg("limit", 2)
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(FEED_SEARCH_MAX_HITS))
+            .unwrap_or(FEED_SEARCH_MAX_HITS);
+        s.state.feed_segment_search(address, &feed, &terms, limit).await
+    }
+}
+
 // ---- xID resolution --------------------------------------------------------
 
 /// The plugin's response shape: `{name, tld, owner, active, revoked_at,
@@ -1787,7 +1943,21 @@ impl WsCommand for SiteUpdate {
                 let state = state.clone();
                 let address = address.clone();
                 async move {
-                    let ok = state.resync_xite(&address).await.is_ok();
+                    // Report the real outcome. `is_ok()` alone was true even
+                    // when the pass reached no peer at all, so the row showed
+                    // a successful update for a resync that fetched nothing -
+                    // the "I clicked Update and it says it worked but the xite
+                    // is still stale" complaint. resync_xite now errors when
+                    // nobody answered, which surfaces here as a failed update.
+                    let ok = match state.resync_xite(&address).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            state
+                                .log("INFO", format!("Update of {address} failed: {e}"))
+                                .await;
+                            false
+                        }
+                    };
                     // Root files alone miss a user_contents site's actual data
                     // (topics and posts live in per-user files) - sync those
                     // too, like the periodic resync cycle does.
@@ -1898,12 +2068,9 @@ impl WsCommand for SitePublish {
             // re-gossips on commit and the periodic sync covers the rest,
             // while the remaining dials of the batch finish in the
             // background. A peer count here would just be dial plumbing.
-            s.state.push_notification_to(
-                s.id,
-                "done",
-                "Changes published. They will spread through the network.",
-                5000,
-            );
+            // No "it will spread" note either - the progress line that lands
+            // just before this already says it reached the network.
+            s.state.push_notification_to(s.id, "done", "Changes published.", 5000);
         } else {
             s.state.push_notification_to(
                 s.id,
@@ -3761,6 +3928,56 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    /// The admin socket rejects a command `has()` does not know, so an operator
+    /// typo is reported instead of dispatching to `null`. `as` is the one live
+    /// command handled inside `dispatch` rather than through the registry, so
+    /// that guard has to except it by name - this pins the coupling.
+    #[test]
+    fn registry_knows_its_commands_and_as_is_not_one_of_them() {
+        let r = CommandRegistry::with_defaults();
+        assert!(r.has("siteInfo"));
+        assert!(r.has("feedSegmentSearch"));
+        assert!(!r.has("notARealCommand"));
+        assert!(!r.has("as"), "`as` is dispatched specially; the admin guard must except it");
+    }
+
+    /// The term-count cap alone is vacuous for the single-string form (one
+    /// element however long), and `segment_search` tokenizes each string into a
+    /// query token per word. The byte bound is what actually holds the query
+    /// down, so both caps are pinned here.
+    #[test]
+    fn feed_search_terms_holds_count_and_byte_caps() {
+        assert_eq!(feed_search_terms(&json!("hello world")).unwrap(), vec!["hello world"]);
+        let two = feed_search_terms(&json!(["hello", "world"])).unwrap();
+        assert_eq!(two, vec!["hello", "world"]);
+
+        let many: Vec<String> =
+            (0..=FEED_SEARCH_MAX_TERMS).map(|i| format!("term{i}")).collect();
+        let err = feed_search_terms(&json!(many)).unwrap_err();
+        assert!(err.contains("too many terms"), "{err}");
+
+        // One huge string: the count cap sees a single element, the byte cap
+        // rejects it.
+        let huge = "word ".repeat(FEED_SEARCH_MAX_TERM_BYTES);
+        let err = feed_search_terms(&json!(huge.as_str())).unwrap_err();
+        assert!(err.contains("term too long"), "{err}");
+        let err = feed_search_terms(&json!([huge.as_str()])).unwrap_err();
+        assert!(err.contains("term too long"), "{err}");
+
+        let err = feed_search_terms(&json!(7)).unwrap_err();
+        assert!(err.contains("must be a string or array"), "{err}");
+    }
+
+    /// An absent `feedItemQuery` limit used to mean "every live record attached
+    /// to the target"; it now clamps to the cap, and so does an oversized one.
+    #[test]
+    fn feed_item_limit_defaults_and_clamps() {
+        assert_eq!(feed_item_limit(None), FEED_ITEM_MAX_RECORDS);
+        assert_eq!(feed_item_limit(Some(&json!(10))), 10);
+        assert_eq!(feed_item_limit(Some(&json!(1_000_000))), FEED_ITEM_MAX_RECORDS);
+        assert_eq!(feed_item_limit(Some(&json!("all"))), FEED_ITEM_MAX_RECORDS);
+    }
 
     #[tokio::test]
     async fn aes_decrypt_handles_single_and_batch_forms() {

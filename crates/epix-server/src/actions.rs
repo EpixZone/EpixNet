@@ -1,7 +1,8 @@
 //! Authoring + diagnostics CLI actions, the EpixNet `epixnet.py <action>`
 //! surface: siteCreate / siteSign / siteVerify / dbRebuild / dbQuery /
 //! importBundle work offline against the data dir; crypt* are pure key
-//! operations; peer* drive the wire protocol against a running node.
+//! operations; peerPing measures an EDX link's round-trip to a running node;
+//! siteCmd runs any WS command against a running node's admin socket.
 //!
 //! Kept clap-free on purpose: the action name is the first argument, exactly
 //! like the Python CLI, and everything else stays positional.
@@ -29,8 +30,7 @@ pub fn is_action(name: &str) -> bool {
             | "cryptGetPrivatekey"
             | "cryptPrivatekeyToAddress"
             | "peerPing"
-            | "peerGetFile"
-            | "peerCmd"
+            | "siteCmd"
     )
 }
 
@@ -70,6 +70,16 @@ async fn dispatch(
             };
             let privatekey = rest.first().filter(|k| !k.is_empty()).cloned();
             let inner_path = rest.get(1).cloned().unwrap_or_else(|| "content.json".to_string());
+            // Live path first, like sitePublish: a running node must do the
+            // signing itself so its EDX store registers the new bundles - an
+            // offline sign next to a running node leaves the store on the old
+            // version and peers get "file(s) not yet available" until restart.
+            let live_params =
+                serde_json::json!({ "inner_path": inner_path, "privatekey": privatekey });
+            if admin_call(data_root, "siteSign", Some(address), live_params).await?.is_some() {
+                println!("{inner_path} signed via the running node [live]");
+                return Ok(());
+            }
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
                 return Err(format!("Site not found: {address}"));
@@ -95,6 +105,20 @@ async fn dispatch(
                 return Err("usage: sitePublish <address> [inner_path]".into());
             };
             let inner_path = rest.first().cloned().unwrap_or_else(|| "content.json".to_string());
+            // Live path first: if a node is running it holds the single-writer
+            // EDX store lock (an offline publish could not open it anyway) and
+            // already has a warm swarm, so route the publish to it over the
+            // admin socket. `sign:false` - the CLI signs via `siteSign`, so this
+            // publishes the already-signed content.json as-is (CLI semantics).
+            let live_params =
+                serde_json::json!({ "inner_path": inner_path, "sign": false });
+            if let Some(_reply) =
+                admin_call(data_root, "sitePublish", Some(address), live_params).await?
+            {
+                println!("{inner_path} published via the running node [live]");
+                return Ok(());
+            }
+            // Offline path: no node running, so this command drives the publish.
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
                 return Err(format!("Site not found: {address}"));
@@ -104,6 +128,24 @@ async fn dispatch(
             // skips them here - they pull the version from the swarm on their
             // next sync instead.
             state.set_transport(std::sync::Arc::new(epix_transport::TcpTransport)).await;
+            // EDX is the sole publish transport, and its fetcher is what
+            // `publish()` pushes over. The long-running node installs it during
+            // fileserver boot (ensure_edx_serve); this one-shot command boots no
+            // fileserver, so we must open the object store + fetcher ourselves,
+            // or publish() fails with "publishing requires EDX (it is disabled)".
+            // No choker: an offline publish needs no reciprocity accounting.
+            if let Some(dir) = state.data_root_path() {
+                let node_key = epix_runtime::edx::node_key(&state).await;
+                if epix_runtime::edx::enable_serving(&state, &dir, node_key, None)
+                    .await
+                    .is_none()
+                {
+                    return Err(
+                        "could not open the EDX store (is another node instance running?)"
+                            .into(),
+                    );
+                }
+            }
             let content_path = state.content_inner_path(address, &inner_path).await;
             let published = state.publish(address, &content_path, None, true).await?;
             if published == 0 {
@@ -188,7 +230,7 @@ async fn dispatch(
                 "siteDelete" => ("siteDelete", serde_json::json!({ "address": address })),
                 _ => ("siteAdd", serde_json::json!({ "address": address })),
             };
-            match admin_call(data_root, live_cmd, params).await? {
+            match admin_call(data_root, live_cmd, None, params).await? {
                 Some(reply) => match action {
                     "siteList" => {
                         let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
@@ -275,39 +317,41 @@ async fn dispatch(
             Ok(())
         }
 
-        // --- peer diagnostics (wire protocol against a running node) -------
+        // --- run any WS command against a running node, bound to one xite ---
+        // Per-site commands (feedItemQuery, feedSegmentSearch, dbQuery, ...)
+        // read their target from the CONNECTION, not from params, so they are
+        // unreachable without a bound xite. The admin socket binds one from the
+        // request's `xite` key; this exposes that from the shell.
+        "siteCmd" => {
+            let (address, cmd, params_raw) = match args {
+                [a, c] => (a, c, "{}"),
+                [a, c, p] => (a, c, p.as_str()),
+                _ => return Err("usage: siteCmd <address> <command> [json-params]".into()),
+            };
+            let params: serde_json::Value = serde_json::from_str(params_raw)
+                .map_err(|e| format!("params must be JSON: {e}"))?;
+            match admin_call(data_root, cmd, Some(address), params).await? {
+                Some(reply) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&reply).unwrap_or_else(|_| reply.to_string())
+                    );
+                    Ok(())
+                }
+                // Unlike the site-admin actions there is no offline equivalent:
+                // these commands read live node state.
+                None => Err("node is not running (no admin socket)".into()),
+            }
+        }
+
+        // --- peer diagnostics (an EDX link to a running node) --------------
         "peerPing" => {
             let [ip, port] = args else { return Err("usage: peerPing <ip> <port>".into()) };
-            let mut conn = connect(ip, port).await?;
+            let conn = connect(ip, port).await?;
             for _ in 0..5 {
-                let started = std::time::Instant::now();
-                conn.ping().await.map_err(|e| e.to_string())?;
-                println!("Response time: {:.3}ms", started.elapsed().as_secs_f64() * 1000.0);
+                let rtt = conn.ping().await.map_err(|e| e.to_string())?;
+                println!("Response time: {:.3}ms", rtt.as_secs_f64() * 1000.0);
             }
-            Ok(())
-        }
-        "peerGetFile" => {
-            let [ip, port, site, inner_path] = args else {
-                return Err("usage: peerGetFile <ip> <port> <site> <inner_path>".into());
-            };
-            let mut conn = connect(ip, port).await?;
-            let bytes = conn.get_file(site, inner_path).await.map_err(|e| e.to_string())?;
-            use std::io::Write;
-            std::io::stdout().write_all(&bytes).map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        "peerCmd" => {
-            let [ip, port, cmd, rest @ ..] = args else {
-                return Err("usage: peerCmd <ip> <port> <cmd> [json-params]".into());
-            };
-            let params: serde_json::Value = match rest.first() {
-                Some(raw) => serde_json::from_str(raw).map_err(|e| format!("bad params: {e}"))?,
-                None => serde_json::json!({}),
-            };
-            let mut conn = connect(ip, port).await?;
-            let reply =
-                conn.request(cmd, json_to_rmpv(&params)).await.map_err(|e| e.to_string())?;
-            println!("{}", serde_json::to_string_pretty(&rmpv_to_json(&reply)).unwrap());
             Ok(())
         }
         _ => Err("unknown action".into()),
@@ -326,24 +370,46 @@ async fn dispatch(
 async fn admin_call(
     _data_root: &std::path::Path,
     _cmd: &str,
+    _xite: Option<&str>,
     _params: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, String> {
     Ok(None)
 }
 
+/// `xite` binds the trusted session to a site, needed by commands that resolve
+/// their target from the connection (e.g. `sitePublish`); pass `None` for
+/// commands that carry the address in `params` (siteList/siteDelete/...).
 #[cfg(unix)]
 async fn admin_call(
     data_root: &std::path::Path,
     cmd: &str,
+    xite: Option<&str>,
     params: serde_json::Value,
 ) -> Result<Option<serde_json::Value>, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let path = data_root.join("admin.sock");
     let mut stream = match tokio::net::UnixStream::connect(&path).await {
         Ok(s) => s,
-        Err(_) => return Ok(None), // node not running -> offline path
+        Err(_) => {
+            // A node whose data dir cannot host unix sockets (network share)
+            // binds in the temp dir and records where in admin.sock.path.
+            let redirected = std::fs::read_to_string(data_root.join("admin.sock.path"))
+                .ok()
+                .map(|p| p.trim().to_string());
+            match redirected {
+                Some(p) => match tokio::net::UnixStream::connect(&p).await {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None), // node not running -> offline path
+                },
+                None => return Ok(None),
+            }
+        }
     };
-    let req = serde_json::json!({ "cmd": cmd, "params": params }).to_string();
+    let mut req_obj = serde_json::json!({ "cmd": cmd, "params": params });
+    if let Some(x) = xite {
+        req_obj["xite"] = serde_json::Value::String(x.to_string());
+    }
+    let req = req_obj.to_string();
     stream.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
     stream.write_all(b"\n").await.map_err(|e| e.to_string())?;
     stream.flush().await.map_err(|e| e.to_string())?;
@@ -371,67 +437,17 @@ async fn open_state(data_root: &std::path::Path, version: &str) -> Arc<AppState>
     state
 }
 
-async fn connect(ip: &str, port: &str) -> Result<epix_protocol::Connection, String> {
+/// Bring up an EDX link to a clearnet peer: dial, exchange the magic, run the
+/// Noise handshake. No Hello is sent - a frame-level ping needs no identity,
+/// so this measures the link itself.
+async fn connect(ip: &str, port: &str) -> Result<epix_edx::conn::Conn, String> {
+    use epix_transport::Transport;
     let addr = epix_core::PeerAddr::parse(&format!("{ip}:{port}"))
         .map_err(|e| format!("bad peer address: {e}"))?;
-    let mut conn = epix_protocol::Connection::connect(&epix_transport::TcpTransport, &addr)
-        .await
-        .map_err(|e| e.to_string())?;
-    conn.handshake().await.map_err(|e| e.to_string())?;
-    Ok(conn)
-}
-
-fn json_to_rmpv(v: &serde_json::Value) -> rmpv::Value {
-    match v {
-        serde_json::Value::Null => rmpv::Value::Nil,
-        serde_json::Value::Bool(b) => rmpv::Value::from(*b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                rmpv::Value::from(i)
-            } else {
-                rmpv::Value::from(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::String(s) => rmpv::Value::from(s.as_str()),
-        serde_json::Value::Array(items) => {
-            rmpv::Value::Array(items.iter().map(json_to_rmpv).collect())
-        }
-        serde_json::Value::Object(map) => rmpv::Value::Map(
-            map.iter().map(|(k, v)| (rmpv::Value::from(k.as_str()), json_to_rmpv(v))).collect(),
-        ),
-    }
-}
-
-fn rmpv_to_json(v: &rmpv::Value) -> serde_json::Value {
-    match v {
-        rmpv::Value::Nil => serde_json::Value::Null,
-        rmpv::Value::Boolean(b) => serde_json::json!(b),
-        rmpv::Value::Integer(i) => i
-            .as_i64()
-            .map(|n| serde_json::json!(n))
-            .unwrap_or_else(|| serde_json::json!(i.as_u64())),
-        rmpv::Value::F32(f) => serde_json::json!(f),
-        rmpv::Value::F64(f) => serde_json::json!(f),
-        rmpv::Value::String(s) => serde_json::json!(s.as_str().unwrap_or_default()),
-        rmpv::Value::Binary(b) => {
-            // Show small binaries as lossy text, large ones as a length note.
-            if b.len() <= 256 {
-                serde_json::json!(String::from_utf8_lossy(b))
-            } else {
-                serde_json::json!(format!("<{} bytes>", b.len()))
-            }
-        }
-        rmpv::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(rmpv_to_json).collect())
-        }
-        rmpv::Value::Map(pairs) => serde_json::Value::Object(
-            pairs
-                .iter()
-                .map(|(k, v)| (k.as_str().unwrap_or_default().to_string(), rmpv_to_json(v)))
-                .collect(),
-        ),
-        _ => serde_json::Value::Null,
-    }
+    let stream =
+        epix_transport::TcpTransport.dial(&addr).await.map_err(|e| e.to_string())?;
+    let link = epix_edx::link::dial(stream).await.map_err(|e| e.to_string())?;
+    Ok(link.conn)
 }
 
 #[cfg(test)]
@@ -475,13 +491,4 @@ mod tests {
         assert!(!a.is_empty());
     }
 
-    #[test]
-    fn json_rmpv_round_trip() {
-        let v = serde_json::json!({
-            "site": "epix1abc", "need": 5, "flag": true, "list": [1, "two", null],
-            "nested": { "f": 1.5 },
-        });
-        let back = rmpv_to_json(&json_to_rmpv(&v));
-        assert_eq!(back, v);
-    }
 }

@@ -15,4 +15,7 @@ paths = [
   '''.*/examples/.*''',
   '''.*_test\.rs''',
   '''target/.*''',
+  # Prose docs, never secrets: the generic-api-key rule false-positives on
+  # high-entropy technical wording (cipher names near the word "key").
+  '''.*\.md''',
 ]

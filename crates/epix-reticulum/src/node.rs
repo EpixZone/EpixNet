@@ -25,7 +25,6 @@ use tokio::sync::Mutex;
 
 use crate::{ReticulumServer, ReticulumTransport};
 use epix_core::PeerAddr;
-use epix_protocol::RequestHandler;
 
 /// How the node joins the mesh.
 #[derive(Debug, Clone, Default)]
@@ -125,9 +124,10 @@ impl MeshNode {
         })
     }
 
-    /// Serve the wire protocol to peers that link to us (the mesh-side
-    /// `PeerServer`). Runs forever; spawn it.
-    pub async fn serve(&self, handler: Arc<dyn RequestHandler>) {
-        ReticulumServer::new(handler).serve(self.transport.clone()).await;
+    /// Serve EDX to peers that link to us (the mesh-side `PeerServer`). Runs
+    /// forever; spawn it. `edx` must be the no-Noise overlay hook - an RNS
+    /// link already encrypts.
+    pub async fn serve(&self, edx: epix_protocol::EdxHook) {
+        ReticulumServer::new(edx).serve(self.transport.clone()).await;
     }
 }

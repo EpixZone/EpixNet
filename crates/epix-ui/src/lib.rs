@@ -12,7 +12,7 @@ pub mod benchmark;
 pub mod chart;
 pub mod command;
 pub mod conn_pool;
-pub mod fileserve;
+pub mod feed;
 pub mod geoip;
 pub mod paths;
 pub mod state;
@@ -233,11 +233,94 @@ impl UiServer {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file(&path); // a stale socket from a crash
-            let listener = match tokio::net::UnixListener::bind(&path) {
-                Ok(l) => l,
+            let pointer = path.with_extension("sock.path");
+            let (listener, path) = match tokio::net::UnixListener::bind(&path) {
+                Ok(l) => {
+                    let _ = std::fs::remove_file(&pointer);
+                    (l, path)
+                }
                 Err(e) => {
-                    ctx.state.log("WARNING", format!("admin socket {path:?}: {e}")).await;
-                    return;
+                    // A data dir on a network share (SMB/NFS) cannot host a
+                    // unix socket; without this fallback every live CLI
+                    // command (siteCmd, live sitePublish) silently dies. Bind
+                    // under a per-user directory instead and leave the actual
+                    // path in admin.sock.path for the CLI to follow.
+                    //
+                    // This socket is full node admin, so it never goes in the
+                    // shared system temp dir: the base is XDG_RUNTIME_DIR
+                    // (per-user, 0700 by spec) or the user's home cache. On
+                    // top of that the socket sits in a private 0700
+                    // subdirectory whose ownership is proven, not assumed:
+                    // set_permissions on a directory another user owns fails,
+                    // so a squatted path is refused instead of bound next to.
+                    use std::hash::{Hash, Hasher};
+                    use std::os::unix::fs::DirBuilderExt;
+                    let base = std::env::var_os("XDG_RUNTIME_DIR")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            std::env::var_os("HOME")
+                                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                        });
+                    let Some(base) = base else {
+                        ctx.state
+                            .log(
+                                "WARNING",
+                                format!(
+                                    "admin socket {path:?}: {e}; no XDG_RUNTIME_DIR or HOME for a fallback"
+                                ),
+                            )
+                            .await;
+                        return;
+                    };
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    path.hash(&mut h);
+                    let dir = base.join(format!("epix-admin-{:016x}", h.finish()));
+                    let _ = std::fs::create_dir_all(&base);
+                    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+                    let meta = std::fs::symlink_metadata(&dir);
+                    let owned = meta.map(|m| m.is_dir()).unwrap_or(false)
+                        && std::fs::set_permissions(
+                            &dir,
+                            std::fs::Permissions::from_mode(0o700),
+                        )
+                        .is_ok();
+                    if !owned {
+                        ctx.state
+                            .log(
+                                "WARNING",
+                                format!(
+                                    "admin socket {path:?}: {e}; fallback dir {dir:?} is not a directory this user owns"
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
+                    let fb = dir.join("admin.sock");
+                    let _ = std::fs::remove_file(&fb);
+                    match tokio::net::UnixListener::bind(&fb) {
+                        Ok(l) => {
+                            let _ = std::fs::write(&pointer, fb.to_string_lossy().as_bytes());
+                            ctx.state
+                                .log(
+                                    "INFO",
+                                    format!(
+                                        "admin socket {path:?}: {e}; listening on {} instead",
+                                        fb.display()
+                                    ),
+                                )
+                                .await;
+                            (l, fb)
+                        }
+                        Err(e2) => {
+                            ctx.state
+                                .log(
+                                    "WARNING",
+                                    format!("admin socket {path:?}: {e}; fallback {fb:?}: {e2}"),
+                                )
+                                .await;
+                            return;
+                        }
+                    }
                 }
             };
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -284,6 +367,11 @@ async fn handle_admin_text(ctx: &Ctx, text: &str) -> String {
         return json!({ "error": "missing cmd" }).to_string();
     }
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    // An unregistered command dispatches to `null` so a xite page mid-load
+    // survives it. An operator typing at a socket wants the typo reported.
+    if !ctx.registry.has(cmd) && cmd != "as" {
+        return json!({ "error": format!("unknown command: {cmd}") }).to_string();
+    }
     let xite = req.get("xite").and_then(|v| v.as_str()).map(str::to_string);
     let session = WsSession::new_trusted(ctx.state.clone(), xite);
     // A high id keeps the wrapper-elevation path happy too; `trusted` already
@@ -2085,6 +2173,13 @@ async fn redirect_add(Path(address): Path<String>) -> Redirect {
     Redirect::temporary(&format!("/{address}/"))
 }
 
+/// Max bytes one Range response serves. A media element opens a file with
+/// `bytes=0-`; serving that literally would pull the whole object - over the
+/// network for a file we do not hold yet - into one response. A short 206 is
+/// valid: the player asks for the next window as it plays. Same window as
+/// epix-bt's streaming cap.
+const RANGE_MAX_CHUNK: u64 = 4 * 1024 * 1024;
+
 async fn serve_file(
     State(ctx): State<Ctx>,
     Path((address, mut path)): Path<(String, String)>,
@@ -2151,13 +2246,16 @@ async fn serve_file(
     // assets still serve as they land: only an already-running page asks for
     // them, and each request waits for its own file (EpixNet's needFile).
     let is_html = content_type(&path).starts_with("text/html");
-    // A Range request for a declared big file we haven't started downloading:
-    // it serves through the piecewise Range branch below (which creates the
-    // sparse file and pulls just the pieces the range needs), so neither the
-    // whole-file fetch gate nor the clone wait loop may swallow it.
+    // A Range request for a declared file we haven't started downloading: it
+    // serves through the Range branch below, which pulls only the bytes the
+    // range covers (EDX chunk groups for a `b3` entry, pieces for a legacy
+    // piecemap), so neither the whole-file fetch gate nor the clone wait loop
+    // may swallow it. An entry with neither is not range-fetchable and keeps
+    // the whole-file path.
     let range_bigfile = headers.get(header::RANGE).is_some()
         && !ctx.state.xite_file_exists(&address, &path).await
-        && ctx.state.bigfile_total(&address, &path).await.is_some();
+        && (ctx.state.bigfile_total(&address, &path).await.is_some()
+            || ctx.state.edx_resolve(&address, &path).await.is_some());
     // An asset request for a file we don't hold but whose content.json (root
     // or a child's - a per-user optional avatar, a merged site's lazy asset)
     // declares: fetch just that file from peers (EpixNet's `needFile`) instead
@@ -2176,8 +2274,18 @@ async fn serve_file(
                 return (StatusCode::NOT_FOUND, "optional file (downloads disabled)")
                     .into_response();
             }
+            // Overlay-aware wait. A multi-MB asset pulled over Tor moves at a
+            // fraction of clearnet speed - a 2.5MB image measures 25-45s - so
+            // the clearnet 45s expired mid-transfer and the browser rendered a
+            // broken image even though the file landed moments later. Mirrors
+            // PeerAddr::file_timeout's clearnet/overlay split.
+            let need_deadline = if epix_core::route_all_via_overlay() {
+                std::time::Duration::from_secs(180)
+            } else {
+                std::time::Duration::from_secs(45)
+            };
             let need = ctx.state.file_need(&address, &path);
-            match tokio::time::timeout(std::time::Duration::from_secs(45), need).await {
+            match tokio::time::timeout(need_deadline, need).await {
                 Ok(Ok(true)) => {} // on disk now - the normal Range/read path serves it
                 _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
             }
@@ -2266,14 +2374,35 @@ async fn serve_file(
         }
         let total = match on_disk {
             Some(total) => Some(total),
-            None => ctx.state.bigfile_total(&address, &path).await,
+            None => match ctx.state.bigfile_total(&address, &path).await {
+                Some(t) => Some(t),
+                // An EDX file that has never been touched has no piecemap and
+                // no sparse file; its total comes from the signed manifest.
+                None => ctx.state.edx_size(&address, &path).await,
+            },
         };
         if let (Some(total), Some((start, end))) = (total, parse_range(range)) {
             if start < total {
-                let end = end.unwrap_or(total - 1).min(total - 1);
+                let end = end
+                    .unwrap_or(total - 1)
+                    .min(total - 1)
+                    .min(start.saturating_add(RANGE_MAX_CHUNK - 1));
                 let len = (end - start + 1) as usize;
-                // Big file: pull only the pieces this range needs (no-op otherwise).
-                let _ = ctx.state.bigfile_fetch_range(&address, &path, start, len as u64).await;
+                // EDX: fetch just this range over the verified path and serve it
+                // straight from the object store (media seek, no whole-file
+                // download). Falls through to the legacy path on miss/error.
+                if let Some(Ok(Some(bytes))) =
+                    ctx.state.edx_fetch_range(&address, &path, start, len as u64).await
+                {
+                    let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
+                    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                        h.insert(header::CONTENT_RANGE, v);
+                    }
+                    return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
+                }
+                // EDX range missed: serve the covering bytes if they are already
+                // on disk (a legacy file present locally); otherwise this range
+                // is unavailable (msgpack range fetch retired).
                 if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
                     let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
                     if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {

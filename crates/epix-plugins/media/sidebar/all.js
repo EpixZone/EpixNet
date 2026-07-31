@@ -847,6 +847,12 @@ window.initScrollable = function () {
         return function(e) {
           _this.wrapper.displayPrompt("Enter your private key:", "password", "Save", "", function(privatekey) {
             return _this.wrapper.ws.cmd("userSetSitePrivatekey", [privatekey], function(res) {
+              // The key is validated server-side (malformed, or belongs to
+              // another xite). Reporting "saved" regardless is how a bad key
+              // used to get stored and only fail later, at signing time.
+              if (res !== "ok") {
+                return _this.wrapper.notifications.add("privatekey", "error", "Private key not saved: " + (res && res.error ? res.error : "unknown error"));
+              }
               return _this.wrapper.notifications.add("privatekey", "done", "Private key saved for site signing", 5000);
             });
           });
@@ -1046,7 +1052,9 @@ window.initScrollable = function () {
           if (res === "ok") {
             return _this.wrapper.displayProgress("sign", inner_path + " signed!", 100);
           } else {
-            return _this.wrapper.displayProgress("sign", "Error signing " + inner_path, -1);
+            // Say why - "Error signing x" alone leaves a bad key, a missing
+            // key, or a permission failure looking identical.
+            return _this.wrapper.displayProgress("sign", "Error signing " + inner_path + ": " + (res && res.error ? res.error : "unknown error"), -1);
           }
         };
       })(this));

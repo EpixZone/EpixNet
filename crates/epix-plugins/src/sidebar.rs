@@ -349,10 +349,10 @@ fn render_sidebar(
               <li class='color-black'><span>Total optional:</span><b>{opt_mb:.2}MB</b></li>\
              </ul>\
              {progress}\
-             <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-downloadoptional' {dl_checked}/>\
-              <div class='checkbox-skin'></div> Download optional files</label>\
-             <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-autodownloadoptional' {opt_checked}/>\
-              <div class='checkbox-skin'></div> Help distribute all files</label></li>",
+             <label class='checkbox' title='Lets this xite fetch an optional file when you open it. You share whatever you have downloaded either way.'><input type='checkbox' class='checkbox' id='checkbox-downloadoptional' {dl_checked}/>\
+              <div class='checkbox-skin'></div> Download files I open</label>\
+             <label class='checkbox' title='Downloads every optional file, including ones you never open. Not needed to seed - you already share what you have.'><input type='checkbox' class='checkbox' id='checkbox-autodownloadoptional' {opt_checked}/>\
+              <div class='checkbox-skin'></div> Pre-download everything</label></li>",
             dl_w = pct(opt_dl_mb, opt_mb),
             progress = render_optional_progress(&info["optional_progress"]),
             dl_checked = if download_optional { "checked='checked'" } else { "" },

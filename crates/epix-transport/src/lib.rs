@@ -1,7 +1,7 @@
 //! `epix-transport` - the byte-stream abstraction beneath the wire protocol.
 //!
 //! `epix-protocol`'s connection runs over a [`PeerStream`], so the same
-//! msgpack/FileRequest logic works over TCP today and Tor / Reticulum mesh
+//! EDX logic works over TCP today and Tor / Reticulum mesh
 //! later - each is just another [`Transport`] that yields a `PeerStream`.
 
 use async_trait::async_trait;
@@ -25,6 +25,69 @@ pub type PeerStream = Pin<Box<dyn AsyncReadWrite>>;
 pub trait Transport: Send + Sync {
     fn scheme(&self) -> &'static str;
     async fn dial(&self, addr: &PeerAddr) -> Result<PeerStream>;
+}
+
+/// Read the first byte of a stream to route on it, and return it alongside
+/// a stream that still yields that byte. Portable across every transport
+/// (no `TcpStream::peek`, which overlays lack): the byte is buffered and
+/// replayed, so the EDX handshake sees the untouched stream. Used by the
+/// accept loop to drop a connection that does not open with the EDX magic.
+pub async fn peek_first_byte(mut stream: PeerStream) -> Result<(u8, PeerStream)> {
+    use tokio::io::AsyncReadExt;
+    let mut first = [0u8; 1];
+    stream
+        .read_exact(&mut first)
+        .await
+        .map_err(|e| Error::Protocol(format!("peek: {e}")))?;
+    let rewound: PeerStream = Box::pin(Prefixed { prefix: first, pos: 0, inner: stream });
+    Ok((first[0], rewound))
+}
+
+/// A stream with a leading byte to replay before delegating to the inner
+/// stream (see [`peek_first_byte`]).
+struct Prefixed {
+    prefix: [u8; 1],
+    pos: usize,
+    inner: PeerStream,
+}
+
+impl AsyncRead for Prefixed {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let remaining = &self.prefix[self.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Prefixed {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Clearnet TCP.

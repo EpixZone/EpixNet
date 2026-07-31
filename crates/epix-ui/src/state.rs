@@ -4,7 +4,6 @@
 use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{DialableNets, Peer, PeerCounts, Peers};
-use epix_protocol::Connection;
 use epix_transport::Transport;
 use epix_user::User;
 use epix_xite::{content_stats, FileEntry, Xite, XiteSettings, XiteStorage};
@@ -12,7 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -60,6 +59,233 @@ pub trait ContentSyncer: Send + Sync {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>);
 }
 
+/// Fetches a file's bytes over the EDX verified-streaming path (installed by
+/// the node, which owns the EDX client stack). Kept behind a trait so the UI
+/// crate stays free of the transport/swarm dependency, like the resolvers.
+#[async_trait::async_trait]
+pub trait EdxFetcher: Send + Sync {
+    /// Fetch `inner_path` of `address` from EDX peers, verify it against its
+    /// `b3` root, and write it into the xite's storage. `Ok(true)` when the
+    /// file is present afterward; `Err` when the EDX fetch could not complete
+    /// (the caller may fall back to the legacy path).
+    async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String>;
+
+    /// Fetch a signed inner_path (content.json - the manifest, or a child
+    /// content.json) of `address` from a single `peer` over an EDX link, via
+    /// `GetSigned`. This is the EDX manifest channel that replaces the msgpack
+    /// `getFile` for content.json: it works for any site (the signed bytes are
+    /// served independent of per-file `b3`). `Ok(Some(bytes))` on success,
+    /// `Ok(None)` if the peer served no such content, `Err` on dial/link
+    /// failure so the caller can score the peer and try another.
+    async fn fetch_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Result<Option<Vec<u8>>, String>;
+
+    /// Fetch many signed inner_paths (the child/user content.json files a
+    /// user_contents site declares) in ONE session: dial `peers` once and
+    /// `GetSigned` each path over the reused links. Returns the paths that were
+    /// served, mapped to their signed bytes; a path no peer had is simply
+    /// absent. The EDX analog of the msgpack `fetch_files_raw` for manifests,
+    /// without its per-file redial.
+    async fn fetch_signed_many(
+        &self,
+        address: &str,
+        paths: Vec<String>,
+        peers: Vec<PeerAddr>,
+    ) -> HashMap<String, Vec<u8>>;
+
+    /// Fetch just the byte range `[start, start+len)` of `inner_path` over
+    /// EDX and return the verified bytes, without materializing the whole
+    /// file (media seek). `Ok(None)` when the file has no EDX entry.
+    async fn fetch_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<Vec<u8>>, String>;
+
+    /// Push a signed update to a single `peer` over EDX (the `Req::Update`
+    /// message: the content.json `signed` body, `modified` version, per-file
+    /// `diffs` so data files patch in place, and the publisher's dial-back
+    /// `sender_peers`). `Ok(())` when the peer accepted it (newly applied or
+    /// already-known); `Err` distinguishes an unreachable peer from one that
+    /// answered but refused, so the caller can score reputation correctly.
+    /// The impl sets `progressed` once the link is up, so a timeout after the
+    /// handshake is scored Refused (slow-but-live), not Unreachable.
+    async fn push_update(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+        signed: Arc<Vec<u8>>,
+        modified: f64,
+        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+        sender_peers: Arc<Vec<String>>,
+        progressed: Arc<AtomicBool>,
+    ) -> Result<(), EdxPushError>;
+
+    /// Fetch many files of `address` over EDX in ONE session: dial the given
+    /// `peers` once and reuse the links across every file (the EDX analog of
+    /// the msgpack worker pool, without its per-file redial). Returns which
+    /// files landed (verified, on disk) and which EDX could not get - the
+    /// exact set for the caller to hand to the msgpack worker fallback. A file
+    /// with no `b3` (undeclared for EDX) comes back in `missed`.
+    async fn fetch_files(
+        &self,
+        address: &str,
+        want: Vec<EdxWant>,
+        peers: Vec<PeerAddr>,
+        on_file: Option<EdxBatchProgress>,
+    ) -> EdxBatch;
+
+    /// `listModified` over EDX (`Req::ListSigned`): the signed files of
+    /// `address` changed since `since` (unix seconds), as
+    /// `(inner_path, modified, size)`. Same error split as `fetch_signed`:
+    /// `Err` on dial/link failure (score the peer, try another), `Ok(None)`
+    /// when the peer is alive but served no list.
+    async fn list_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        since: u64,
+    ) -> Result<Option<Vec<(String, u64, u64)>>, String>;
+
+    /// Peer exchange over EDX (`Req::Pex`): send the peers we already know
+    /// of `address`, get back up to `need` we lack plus the peer's own
+    /// reachable overlay addresses.
+    async fn pex(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        need: u32,
+        have: Vec<PeerAddr>,
+    ) -> Result<Vec<PeerAddr>, String>;
+
+    /// The peer's working tracker set over EDX (`Req::GetTrackers`), the
+    /// Beacon gossip source.
+    async fn get_trackers(&self, peer: PeerAddr) -> Result<Vec<String>, String>;
+
+    /// One Kademlia RPC over EDX (`Req::Kad`). The payload is opaque here -
+    /// `epix-dht-net` owns both encode and decode.
+    async fn kad(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String>;
+
+    /// One tracker announce over EDX (`Req::Announce`). The payload is
+    /// opaque here - `epix-discovery` owns both encode and decode.
+    async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String>;
+
+    /// Store-and-forward hints after the `after` cursor over EDX
+    /// (`Req::UpdatesSince`): `(xite, modified)` pairs plus the peer's current
+    /// head, which the caller keeps as its next cursor.
+    async fn updates_since(
+        &self,
+        peer: PeerAddr,
+        after: u64,
+    ) -> Result<(Vec<(String, i64)>, u64), String>;
+}
+
+/// Carries tracker announces over EDX. `epix-discovery` owns the announce
+/// payload but no link, so it takes this seam; the fetcher is captured for the
+/// whole announce round rather than re-read per tracker.
+struct EdxAnnounceSender {
+    fetcher: Arc<dyn EdxFetcher>,
+}
+
+#[async_trait::async_trait]
+impl epix_discovery::AnnounceSender for EdxAnnounceSender {
+    async fn send(&self, tracker: &PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
+        self.fetcher.announce(tracker.clone(), payload).await
+    }
+}
+
+/// One file to fetch in a batch. `id`/`size`, when set, let a caller that has
+/// already resolved the object pass it directly - notably a resync, whose new
+/// content.json is staged but not yet committed, so the committed manifest
+/// would resolve the OLD `b3`. When absent they resolve from the committed
+/// content.json (root or governing child).
+pub struct EdxWant {
+    pub inner_path: String,
+    pub id: Option<epix_blob::ObjId>,
+    pub size: Option<u64>,
+}
+
+impl EdxWant {
+    /// A want that resolves itself from the committed content.json.
+    pub fn path(inner_path: impl Into<String>) -> Self {
+        Self { inner_path: inner_path.into(), id: None, size: None }
+    }
+}
+
+/// Result of a batch EDX fetch: the files that landed, bytes moved, and the
+/// inner_paths EDX could not get (hand these to the msgpack worker).
+pub struct EdxBatch {
+    pub done: Vec<String>,
+    pub missed: Vec<String>,
+    pub bytes: u64,
+}
+
+/// Per-file materialized callback `(inner_path, size)` - the EDX analog of the
+/// worker's progress hook, so a batch drives the same clone/ingest UI.
+pub type EdxBatchProgress = Arc<dyn Fn(&str, u64) + Send + Sync>;
+
+/// Read a file's `(b3 ObjId, size)` from a content.json `files` map, so a
+/// staged (uncommitted) update's files resolve against the NEW manifest rather
+/// than the committed one. `None` if the file is absent or has no `b3`.
+fn edx_want_from_staged(content: &Value, inner_path: &str) -> Option<(epix_blob::ObjId, u64)> {
+    let entry = content.get("files")?.get(inner_path)?;
+    let b3 = epix_blob::ObjId::from_hex(entry.get("b3")?.as_str()?)?;
+    let size = entry.get("size").and_then(Value::as_u64)?;
+    Some((b3, size))
+}
+
+/// Count of DISTINCT EDX-eligible files (they carry a `b3`) that fell back to
+/// the msgpack fetch because EDX could not land them. Zero on a healthy
+/// new-build clone/resync; a nonzero value on the 1b validation network flags
+/// an EDX path problem before the msgpack `getFile` fallback is removed in 1c.
+/// Legacy files with no `b3` are never EDX-eligible and never counted here.
+pub static EDX_MSGPACK_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The `(address, inner_path)` pairs already tallied, so a file counts ONCE no
+/// matter how many layers touch it: the optional flow tries EDX in the batch
+/// prepass AND again per-file in each `file_need` retry round, and an on-demand
+/// serve can retry a batch-missed file later. Without this de-dup the gauge
+/// would multiply a single unreachable file by the retry count. Reset on
+/// restart (which is how the 1b validation is run, one clone per node).
+fn edx_fallback_seen() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that an EDX-eligible file fell back to the msgpack path, counting
+/// each distinct `(address, inner_path)` at most once.
+pub fn note_edx_fallback_path(address: &str, inner_path: &str) {
+    let key = format!("{address}\u{0}{inner_path}");
+    if edx_fallback_seen().lock().unwrap().insert(key) {
+        EDX_MSGPACK_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Cumulative count of distinct EDX-eligible files that fell back to msgpack
+/// this run.
+pub fn edx_msgpack_fallbacks() -> u64 {
+    EDX_MSGPACK_FALLBACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Why an EDX update push to a peer did not land. Kept distinct so the peer
+/// registry scores an unreachable peer (dial/handshake failed - back it off)
+/// differently from one that answered but refused (alive - do not evict it).
+pub enum EdxPushError {
+    /// Dial or handshake failed; the peer looks dead or unreachable.
+    Unreachable(String),
+    /// The link came up but the peer refused the update (it is alive).
+    Refused(String),
+}
+
 /// One file's state during an on-demand clone (progressive serve).
 pub enum LoadingFile {
     /// Verified bytes are on disk - serve them now.
@@ -105,6 +331,25 @@ fn effective_enabled(name: &str, disabled: &[String], enabled: &[String]) -> boo
 
 /// How many warm peer connections the node keeps for live connection stats.
 const CONNECTION_POOL_MAX: usize = 8;
+
+/// How long after a feed segment's interval closes the node keeps treating it
+/// as churning. A record landing in an interval re-derives that interval's root
+/// (the root is a pure function of its record set), so pinning a still-churning
+/// segment would pin every superseded copy of it forever - eviction only ever
+/// reclaims refcount-0 objects. Segments inside this window are inserted
+/// unpinned, so superseded copies stay evictable and rebuild from the records.
+const FEED_PIN_GRACE_MS: u64 = 2 * crate::feed::SEGMENT_INTERVAL_MS;
+
+/// How many optional files one EDX bulk batch fetches before the pass re-checks
+/// the user's mandate. One batch is a single uncancellable await, so this bounds
+/// how long a toggled-off / paused / deleted xite keeps pulling bytes, while
+/// still dialing the seed peers once per batch rather than once per file.
+const EDX_BULK_OPTIONAL_CHUNK: usize = 32;
+
+/// How many of a body-less push's advertised publisher addresses are tried when
+/// fetching the content.json back. Each try costs one dial deadline, and the
+/// list comes from the pushing peer, so it cannot be walked in full.
+const PUSH_REFETCH_PEERS: usize = 4;
 
 /// Editable node config keys shown on the Config page:
 /// `(section, key, label, default, kind)`, grouped into the same sections
@@ -209,15 +454,22 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Optional Files",
         "download_optional_default",
-        "Download optional files on new xites",
+        "Allow new xites to fetch optional files you open (images, video you play)",
         "true",
         "bool",
     ),
     (
         "Optional Files",
         "autodownloadoptional_default",
-        "Help distribute all files on new xites (keeps fetching files new versions add)",
-        "true",
+        "Pre-download EVERY optional file on new xites, including ones you never open (you already share whatever you have downloaded - this is not needed to seed)",
+        "false",
+        "bool",
+    ),
+    (
+        "Optional Files",
+        "full_retention",
+        "Keep a full copy of every xite you visit (downloads everything, not just what you view)",
+        "false",
         "bool",
     ),
     // --- Storage. `data_dir` is special: the value is the live data root and
@@ -228,6 +480,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "data_dir",
         "Data directory (existing data is copied there; restart EpixNet to apply)",
         "",
+        "text",
+    ),
+    (
+        "Storage",
+        "volunteer_quota_bytes",
+        "Donate disk to hold encrypted shards you cannot read (0 = off)",
+        "0",
         "text",
     ),
     // --- Performance
@@ -435,6 +694,13 @@ pub struct AppState {
     /// in `serverInfo.ui_port` so the dashboard builds correct links.
     ui_port: RwLock<u16>,
     xites: RwLock<HashMap<String, ManagedXite>>,
+    /// Derived feed artifacts per `address -> feed name -> artifacts`. A pure,
+    /// recomputable read cache over the xite's signed OR-set records (see
+    /// [`crate::feed`]); never persisted, rebuilt on demand and on merge.
+    /// Behind an `Arc` because the artifacts hold the whole feed (every record's
+    /// canonical bytes plus every sealed segment blob): a query must hand out a
+    /// handle, not a deep copy of the dataset.
+    feed_cache: RwLock<HashMap<String, HashMap<String, Arc<crate::feed::FeedArtifacts>>>>,
     user: RwLock<User>,
     user_path: Option<PathBuf>,
     nonce_counter: AtomicU64,
@@ -462,6 +728,25 @@ pub struct AppState {
     peer_finder: RwLock<Option<Arc<dyn PeerFinder>>>,
     /// Included/user-content syncer, installed by the node.
     content_syncer: RwLock<Option<Arc<dyn ContentSyncer>>>,
+    /// Content-addressed EDX object store (bao-verified sparse objects +
+    /// slabs), installed by the node when EDX serving is enabled. When
+    /// absent (the default), the node runs the legacy XiteStorage-only path
+    /// unchanged; a loaded xite's local files are registered into it on
+    /// load so EDX can serve and dedup them (see [`Self::edx_register_xite`]).
+    edx_store: RwLock<Option<Arc<epix_blob::store::Store>>>,
+    /// EDX verified-streaming fetcher, installed by the node when EDX is
+    /// enabled. When absent, downloads use the legacy sha512/piecemap path.
+    edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
+    /// Opens the warm pool's EDX links, installed by the node alongside the
+    /// fetcher. Separate from `edx_fetcher` because the pool needs only a
+    /// ping, and a mock of one should not have to mock the other.
+    link_opener: RwLock<Option<Arc<dyn crate::conn_pool::LinkOpener>>>,
+    /// Shared update-hint store (set once by the node). Every EDX update we
+    /// receive records `(xite, modified)` here - the store-and-forward gossip
+    /// that lets a published post reach the network in seconds: peers polling
+    /// us learn a newer version exists and resync it immediately, instead of
+    /// waiting for the slow periodic pass. Set-once, lock-free to read.
+    prop_store: std::sync::OnceLock<Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>>,
     /// Per-tracker announce stats (`tracker -> {status, num_*, …}`) for the
     /// dashboard's Trackers panel.
     tracker_stats: RwLock<HashMap<String, Value>>,
@@ -785,51 +1070,65 @@ fn record_push_outcome(
     outcomes.push((peer, score));
 }
 
-/// Dial one publish candidate and push the update, bounded by the peer's
+/// Push one update to a publish candidate over EDX, bounded by the peer's
 /// connect timeout: reachable clearnet peers answer in ~1-3s, so the deadline
 /// only ever pays for dead candidates, and overlay peers get the longer dial
-/// bound - a fresh onion circuit takes 20-40s, and cutting it off is what
-/// made publishing to Tor-only peers silently fail. A deadline that expires
-/// after the handshake succeeded is scored Refused (the peer is alive), not
-/// Unreachable - repeatedly backing off a slow-but-live overlay peer would
-/// eventually get a reachable peer evicted.
+/// bound - a fresh onion circuit takes 20-40s, and cutting it off is what made
+/// publishing to Tor-only peers silently fail. The EDX push (`Req::Update`)
+/// carries the content.json, per-file diffs, version, and dial-back peers in
+/// one message; the receiver applies it exactly as a msgpack update. Its
+/// error kind distinguishes an unreachable peer (back it off) from one that
+/// answered but refused (alive - do not evict). A timeout BEFORE the link
+/// comes up is Unreachable; a timeout after it is Refused, so a slow-but-live
+/// overlay peer (a fresh onion circuit eats most of the dial bound) is not
+/// wrongly backed off and evicted.
+///
+/// The legacy msgpack `update` push is retired: EDX is the sole propagation
+/// transport now. (The offline-peer `announce_update` store-and-forward hint
+/// rode that push; migrating the propagation-hint layer to EDX is separate,
+/// and the re-broadcast flood + beacon + periodic resync still spread updates.)
+#[allow(clippy::too_many_arguments)]
 async fn push_update_to_peer(
-    transport: Arc<dyn Transport>,
+    edx: Arc<dyn EdxFetcher>,
     peer: PeerAddr,
     address: String,
     inner_path: String,
     body: Arc<Vec<u8>>,
     modified: f64,
-    diffs: Option<rmpv::Value>,
+    diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
     sender_peers: Arc<Vec<String>>,
 ) -> PushOutcome {
     let deadline = peer.connect_timeout();
     let timeout_peer = peer.clone();
-    // Set once the handshake succeeds (see the doc comment).
-    let progressed = AtomicBool::new(false);
-    let push = async {
-        let mut conn = match Connection::connect(transport.as_ref(), &peer).await {
-            Ok(conn) => conn,
-            Err(_) => return PushOutcome::Unreachable(peer),
-        };
-        if conn.handshake().await.is_err() {
-            return PushOutcome::Unreachable(peer);
+    // Set by the fetcher once the EDX link is up, so a timeout that fires
+    // after the handshake is scored Refused (alive), not a backoff.
+    let progressed = Arc::new(AtomicBool::new(false));
+    let push = {
+        let progressed = progressed.clone();
+        async move {
+            match edx
+                .push_update(
+                    peer.clone(),
+                    &address,
+                    &inner_path,
+                    body,
+                    modified,
+                    diffs,
+                    sender_peers,
+                    progressed,
+                )
+                .await
+            {
+                Ok(()) => PushOutcome::Accepted(peer),
+                Err(EdxPushError::Refused(e)) => PushOutcome::Refused(peer, e),
+                Err(EdxPushError::Unreachable(_)) => PushOutcome::Unreachable(peer),
+            }
         }
-        progressed.store(true, Ordering::Relaxed);
-        if let Err(e) =
-            conn.update(&address, &inner_path, &body, modified, diffs, &sender_peers).await
-        {
-            return PushOutcome::Refused(peer, e.to_string());
-        }
-        // Live-hook: tell the peer (acting as a propagation node) about the
-        // new version so peers that are offline now can pull it later.
-        let _ = epix_propagation::announce_update(&mut conn, &address, modified as i64).await;
-        PushOutcome::Accepted(peer)
     };
     match tokio::time::timeout(deadline, push).await {
         Ok(outcome) => outcome,
         Err(_) if progressed.load(Ordering::Relaxed) => {
-            PushOutcome::Refused(timeout_peer, "timed out mid-transfer".into())
+            PushOutcome::Refused(timeout_peer, "timed out after the link came up".into())
         }
         Err(_) => PushOutcome::Unreachable(timeout_peer),
     }
@@ -982,6 +1281,7 @@ impl AppState {
             rev: RwLock::new("0".to_string()),
             ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
+            feed_cache: RwLock::new(HashMap::new()),
             user: RwLock::new(User::generate()),
             user_path: None,
             nonce_counter: AtomicU64::new(1),
@@ -995,6 +1295,10 @@ impl AppState {
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
+            edx_store: RwLock::new(None),
+            edx_fetcher: RwLock::new(None),
+            link_opener: RwLock::new(None),
+            prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(HashMap::new()),
             grants_path: None,
@@ -1121,6 +1425,7 @@ impl AppState {
             rev: RwLock::new("0".to_string()),
             ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
+            feed_cache: RwLock::new(HashMap::new()),
             user: RwLock::new(user),
             user_path: Some(user_path),
             nonce_counter: AtomicU64::new(1),
@@ -1134,6 +1439,10 @@ impl AppState {
             on_demand: RwLock::new(None),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
+            edx_store: RwLock::new(None),
+            edx_fetcher: RwLock::new(None),
+            link_opener: RwLock::new(None),
+            prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             grants: RwLock::new(grants),
             grants_path: Some(grants_path),
@@ -1284,6 +1593,20 @@ impl AppState {
             .unwrap_or(default)
     }
 
+    /// Bytes of disk the operator donates to hold encrypted shards it cannot
+    /// read (the `volunteer_quota_bytes` config key). 0 (the default, and the
+    /// only value that parses to nothing) means not volunteering: the node
+    /// neither advertises `caps::SHARDS` nor runs the volunteer pull. The
+    /// Config page persists it as a string, so both a JSON number and a
+    /// numeric string are accepted. Read once at serve setup; a live toggle
+    /// (re-advertise the cap without a restart) is a deferred follow-up.
+    pub async fn volunteer_quota_bytes(&self) -> u64 {
+        self.config_get("volunteer_quota_bytes")
+            .await
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+            .unwrap_or(0)
+    }
+
     // --- NoNewSites: refuse to clone/add new sites when set -----------------
 
     /// Whether the operator has disabled adding new sites to this node.
@@ -1356,6 +1679,23 @@ impl AppState {
     /// The runtime-contributed trackers (beyond the configured/static list).
     pub async fn extra_trackers(&self) -> Vec<epix_xite::Tracker> {
         self.extra_trackers.read().await.clone()
+    }
+
+    /// The announcer list we hand to peers that ask (the AnnounceShare
+    /// exchange): our remembered plus Beacon-discovered trackers, deduped, in
+    /// their canonical `scheme://host:port` spelling so the receiver can parse
+    /// them straight back into a [`epix_xite::Tracker`].
+    ///
+    /// Codec-free so both wire protocols answer with the same list.
+    pub async fn tracker_list(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in self.shared_trackers().await.into_iter().chain(self.extra_trackers().await) {
+            let s = t.to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
     }
 
     /// Record the node's bootstrap tracker list (config or built-in defaults).
@@ -1960,8 +2300,13 @@ impl AppState {
                 settings.autodownloadoptional = auto;
             }
             None => {
+                // Default OFF. This is not "seed what you have" - a node
+                // already serves every chunk it holds, with no toggle. This
+                // one PREFETCHES the entire optional set, so defaulting it on
+                // meant opening a multi-GB xite silently pulled all of it over
+                // Tor. Fetch on demand; seed what that leaves behind.
                 let auto_default =
-                    self.config_bool("autodownloadoptional_default", true).await;
+                    self.config_bool("autodownloadoptional_default", false).await;
                 settings.autodownloadoptional = auto_default;
                 settings.download_optional =
                     auto_default || self.config_bool("download_optional_default", true).await;
@@ -2394,6 +2739,88 @@ impl AppState {
             .collect()
     }
 
+    /// Max peers one PEX reply hands out, whatever the requester asks for.
+    const PEX_NEED_CAP: usize = 100;
+
+    /// Serve one peer exchange: absorb the peers `from` sent us (and `from`
+    /// itself when it reached us over an overlay), then answer with our
+    /// connectable peers they lack plus our own reachable overlay addresses.
+    ///
+    /// Codec-free so both wire protocols serve the same exchange. An unknown
+    /// xite yields no peers - the caller decides how to say so.
+    pub async fn pex_exchange(
+        &self,
+        site: &str,
+        need: usize,
+        got: Vec<PeerAddr>,
+        from: &PeerAddr,
+    ) -> Vec<PeerAddr> {
+        if !self.has_any_alias(site).await {
+            return Vec::new();
+        }
+        let need = need.min(Self::PEX_NEED_CAP);
+
+        // What they already have, so we never echo it back.
+        let mut exclude: std::collections::HashSet<String> =
+            got.iter().map(|p| p.to_string()).collect();
+        exclude.insert(from.to_string());
+
+        // Record the requester itself when it arrived over an overlay: the
+        // handshake fills the connection's dialback slot with the peer's
+        // advertised listen address (`adopt_dialback` in epix-runtime's edx
+        // module), and the server passes that instead of the inbound
+        // onion/i2p/rns placeholder, so an overlay publisher that PEXes us
+        // becomes a peer we can dial back at first contact instead of waiting
+        // for gossip to name it. A placeholder (no self-address advertised) is
+        // dropped by add_peers' well-formedness filter. A clearnet requester
+        // still arrives from an ephemeral port unless its handshake advertised
+        // a fileserver port; trackers cover clearnet self-advertising, so
+        // those are not recorded here.
+        let mut got = got;
+        if from.is_overlay() {
+            got.push(from.clone());
+        }
+        // Only absorb addresses that round-trip through the packed wire form.
+        // The retired msgpack PEX validated implicitly by unpacking each entry
+        // (a non-base32 onion or a wrong-length i2p/rns key was unrepresentable);
+        // EDX deserializes PeerAddr directly, so that filter has to be explicit
+        // or a peer could seed us - and everyone we gossip to - with junk
+        // addresses that burn a full dial timeout each. Same rule as
+        // `adopt_dialback`.
+        got.retain(|p| p.is_wellformed() && p.pack().is_some());
+        self.add_peers(site, got).await;
+
+        let mut reply = self.pex_peers(site, need, &exclude).await;
+
+        // Advertise our own reachable overlay addresses (onion + i2p + mesh)
+        // so peers can reach us over an anonymity network or mesh link and
+        // gossip us on. Clearnet self-advertising is left to trackers (they
+        // see our source IP:port).
+        let fs_port = self.fileserver_port().await;
+        let mut self_addrs: Vec<PeerAddr> = Vec::new();
+        if let Some(onion) = self.onion_address().await {
+            self_addrs.push(PeerAddr::Onion { host: onion, port: fs_port });
+        }
+        if let Some(i2p) = self.i2p_address().await {
+            self_addrs.push(PeerAddr::I2p { dest: i2p, port: fs_port });
+        }
+        if let Some(hex) = self.rns_address().await {
+            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
+                self_addrs.push(p);
+            }
+        }
+        for p in self_addrs {
+            if !exclude.contains(&p.to_string()) {
+                reply.push(p);
+            }
+        }
+        // Never hand out an address we could not pack: the retired msgpack
+        // reply path dropped these when bucketing, and passing one on would
+        // spread a junk address through the swarm.
+        reply.retain(|p| p.pack().is_some());
+        reply
+    }
+
     /// content.json files modified after `since` (ms), as `{inner_path:
     /// modified}` - the `listModified` reply, covering the root plus every
     /// include / per-user content.json on disk.
@@ -2575,9 +3002,15 @@ impl AppState {
         address: &str,
     ) -> Option<&'a ManagedXite> {
         xites.get(address).or_else(|| {
-            xites
-                .values()
-                .find(|x| canonical_address(x.content.as_ref(), address) == address)
+            // Only entries with content can alias another address: a
+            // registered-but-empty entry (content: None) would make
+            // canonical_address fall back to the QUERIED address and match
+            // everything - restore_sites then silently skips every later
+            // site and the exit persist erases it from sites.json.
+            xites.values().find(|x| {
+                x.content.is_some()
+                    && canonical_address(x.content.as_ref(), address) == address
+            })
         })
     }
 
@@ -2772,7 +3205,11 @@ impl AppState {
         address: &str,
         trackers: &[epix_xite::Tracker],
     ) -> Vec<PeerAddr> {
-        let Some(transport) = self.transport.read().await.clone() else { return Vec::new() };
+        // Epix trackers are announced to over EDX; without the fetcher there is
+        // no link to carry the announce (and no peers to find).
+        let Some(fetcher) = self.edx_fetcher.read().await.clone() else { return Vec::new() };
+        let sender: Arc<dyn epix_discovery::AnnounceSender> =
+            Arc::new(EdxAnnounceSender { fetcher });
         let (tor_on, tor_st) = self.tor_status().await;
         // Trackers key peers by the signed content address, so a `.epix` alias
         // must announce under that (not the display name) to find the same
@@ -2798,13 +3235,17 @@ impl AppState {
                 skipped += 1;
                 continue;
             }
-            let transport = transport.clone();
+            let sender = sender.clone();
             let key = key.clone();
             let advert = advert.clone();
             set.spawn(async move {
+                // Tor-routed announces need a cold-circuit budget: an onion
+                // tracker dial (HSDir fetch + rendezvous) or an exit-circuit
+                // build routinely exceeds 20s, and announces run concurrently
+                // so a longer timeout does not stretch the pass.
                 let peers = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
-                    epix_xite::announce(transport.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
+                    std::time::Duration::from_secs(75),
+                    epix_xite::announce(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
                 )
                 .await
                 .unwrap_or_default();
@@ -3702,6 +4143,157 @@ impl AppState {
         self.tracker.peer_list(hash, exclude, limit, now_secs(), need).await
     }
 
+    /// Max hashes one announce reply answers for, whatever the request names.
+    /// A real client announces one hash at a time (see `epix-xite`'s
+    /// announcer), but a peer can pack thousands into a single small request,
+    /// and the bucket-set reply for all of them would not fit one frame.
+    const ANNOUNCE_HASH_CAP: usize = 64;
+
+    /// Serve one tracker announce: record the announcer's addresses for every
+    /// hash it named, then answer with the peers we know for each hash, in
+    /// request order (at most `ANNOUNCE_HASH_CAP` of them).
+    ///
+    /// Codec-free so both wire protocols serve the same tracker. The request
+    /// type comes from `epix-discovery` (already a dependency through
+    /// `epix-xite`), so no conversion struct sits in between.
+    pub async fn announce_serve(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+    ) -> epix_discovery::tracker_pc::AnnounceResp {
+        use epix_discovery::tracker_pc::{AnnounceResp, PeerBuckets};
+
+        let mut resp = AnnounceResp::default();
+        if !self.tracker_enabled().await {
+            resp.error = "Tracker disabled".into();
+            return resp;
+        }
+        if req.hashes.is_empty() {
+            return resp;
+        }
+        let need = crate::tracker::NeedTypes::from_list(&req.need_types);
+        let mine = self.register_announcer_addrs(req, from).await;
+
+        // Reply: the peers we know for each hash, bucketed by type. `need_num`
+        // is what the requester would like; 30 per hash is what any requester
+        // gets.
+        let limit = (req.need_num as usize).min(30);
+        for h in req.hashes.iter().take(Self::ANNOUNCE_HASH_CAP) {
+            let peers = self.tracker_peer_list(h, &mine, limit, need).await;
+            resp.peers.push(PeerBuckets::pack(&peers));
+        }
+        resp
+    }
+
+    /// Record the announcer's addresses for every hash it named, returning them
+    /// so it never gets itself back in the results.
+    async fn register_announcer_addrs(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+    ) -> std::collections::HashSet<String> {
+        let mut mine: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.register_clearnet_addr(req, from, &mut mine).await;
+        self.register_i2p_source_addr(req, from, &mut mine).await;
+        self.register_request_self_addrs(req, &mut mine).await;
+        mine
+    }
+
+    /// Clearnet: source IP + the port it announced, if it asked to be added.
+    async fn register_clearnet_addr(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+        mine: &mut std::collections::HashSet<String>,
+    ) {
+        if req.port == 0 {
+            return;
+        }
+        let PeerAddr::Ip(sa) = from else { return };
+        let wants = if sa.is_ipv6() {
+            req.add.iter().any(|t| t == "ipv6")
+        } else {
+            req.add.iter().any(|t| t == "ipv4" || t == "ip4")
+        };
+        if !wants {
+            return;
+        }
+        let mut a = *sa;
+        a.set_port(req.port);
+        let addr = PeerAddr::Ip(a);
+        self.tracker_announce(&req.hashes, &addr).await;
+        mine.insert(addr.to_string());
+    }
+
+    /// If the announce arrived over i2p, the source destination is authoritative.
+    async fn register_i2p_source_addr(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        from: &PeerAddr,
+        mine: &mut std::collections::HashSet<String>,
+    ) {
+        let PeerAddr::I2p { dest, .. } = from else { return };
+        if dest.is_empty() {
+            return;
+        }
+        self.tracker_announce(&req.hashes, from).await;
+        mine.insert(from.to_string());
+    }
+
+    /// Onion / i2p self-addresses from the request. We register them on
+    /// trust: this tracker issues no `onion_sign_this` challenge, so
+    /// `resp.onion_sign_this` stays empty and the request's `onion_signs`
+    /// are never needed.
+    async fn register_request_self_addrs(
+        &self,
+        req: &epix_discovery::tracker_pc::AnnounceReq,
+        mine: &mut std::collections::HashSet<String>,
+    ) {
+        for (list, is_onion) in [(&req.onions, true), (&req.i2p, false)] {
+            for (i, host) in list.iter().enumerate() {
+                if !Self::is_overlay_self_host(host, is_onion) {
+                    continue;
+                }
+                let addr = Self::request_self_addr(host, is_onion, req.port);
+                self.tracker_announce(Self::hashes_for(list, i, &req.hashes), &addr).await;
+                mine.insert(addr.to_string());
+            }
+        }
+    }
+
+    /// Whether an announce request's claimed onion / i2p self-address has the
+    /// shape of a real overlay host. Registered on trust, so the shape is the
+    /// only check there is: without it a peer fills the tracker db with
+    /// arbitrary strings, one row per hash it named, and we hand them back to
+    /// everyone who asks. Onion is a v2 (16 char) or v3 (56 char) b32 host
+    /// without the `.onion`; i2p is a 52 char b32 host, with or without the
+    /// `.b32` label the transport carries (never the `.i2p` suffix).
+    fn is_overlay_self_host(host: &str, is_onion: bool) -> bool {
+        let label = if is_onion { host } else { host.strip_suffix(".b32").unwrap_or(host) };
+        let len_ok =
+            if is_onion { label.len() == 16 || label.len() == 56 } else { label.len() == 52 };
+        len_ok && label.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+
+    /// One entry of a request's onion or i2p self-address list, as a `PeerAddr`.
+    fn request_self_addr(host: &str, is_onion: bool, port: u16) -> PeerAddr {
+        if is_onion {
+            PeerAddr::Onion { host: host.to_string(), port }
+        } else {
+            PeerAddr::I2p { dest: host.to_string(), port }
+        }
+    }
+
+    /// The hashes one entry of a request's parallel array applies to: parallel
+    /// arrays map to hashes one-to-one; a single value applies to every hash.
+    fn hashes_for<'a>(list: &[String], i: usize, hashes: &'a [[u8; 32]]) -> &'a [[u8; 32]] {
+        if list.len() == hashes.len() {
+            std::slice::from_ref(&hashes[i])
+        } else {
+            hashes
+        }
+    }
+
     /// Drop stale tracker peers (called from the announce loop).
     pub async fn tracker_expire(&self) {
         self.tracker.expire(now_secs()).await;
@@ -3914,7 +4506,7 @@ impl AppState {
     /// whose file set completed. Called from the periodic resync tick, with a
     /// decaying per-update retry probability so files nobody serves don't cost
     /// bandwidth every pass.
-    pub async fn retry_pending_updates(&self) {
+    pub async fn retry_pending_updates(self: &Arc<Self>) {
         let due: Vec<(Vec<String>, String, Value, Vec<u8>)> = {
             let mut pending = self.pending_updates.lock().unwrap();
             pending
@@ -3941,7 +4533,7 @@ impl AppState {
     /// One retry pass for a single pending update: re-fetch its still-missing
     /// files and try to commit. Returns whether the update committed.
     async fn retry_pending_update(
-        &self,
+        self: &Arc<Self>,
         keys: &[String],
         canonical: &str,
         content: Value,
@@ -3974,30 +4566,118 @@ impl AppState {
     /// Fetch a pending update's missing files from connectable peers, updating
     /// the live worker stats. A no-op without a transport or peers - files
     /// that arrive some other way still let the caller's commit land.
-    async fn fetch_pending_files(&self, key: &str, xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
-        let Some(transport) = self.transport.read().await.clone() else { return };
+    async fn fetch_pending_files(
+        self: &Arc<Self>,
+        key: &str,
+        xite: &Xite,
+        needed: Vec<epix_xite::FileEntry>,
+    ) {
+        if self.transport.read().await.is_none() {
+            return; // offline
+        }
         let peers = self.connectable_peers(key, 10).await;
         if peers.is_empty() {
             return;
         }
-        self.set_worker_stats(key, needed.len(), peers.len().min(8), needed.len()).await;
-        let feedback = epix_worker::CollectFeedback::new();
-        let report = epix_worker::sync_files_list(
-            needed,
-            xite,
-            &peers,
-            transport,
-            8,
-            None,
-            Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-        )
-        .await;
+        // EDX-only, resolved against the PENDING (staged) manifest: a deferred
+        // update never touches the committed in-memory content, so without the
+        // staged content here a changed file would resolve to the OLD `b3`,
+        // fetch stale bytes that never match the new sha512, and the update
+        // could never converge. A file with no `b3` simply does not arrive.
+        let staged = xite.content.clone();
+        let total = needed.len();
+        self.set_worker_stats(key, total, 1, total).await;
+        self.push_site_info(key).await;
+        let on_file = self.track_update_progress(key, total);
+        self.edx_first(key, needed, peers, staged.as_ref(), on_file).await;
         self.set_worker_stats(key, 0, 0, 0).await;
-        let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
-        self.absorb_sync_outcomes(key, feedback.drain(), failed_files).await;
-        if let Ok(report) = report {
-            self.add_transfer(key, report.bytes, 0).await;
+    }
+
+    /// Live "N files left" accounting for an update's file pull: returns the
+    /// per-file hook that counts a primed worker-stat total down, pushing the
+    /// row each time so the dashboard pill reads "Updating: N left" and tracks
+    /// the download (like the optional-file pass) instead of sitting on a bare
+    /// "Updating...". Callers seed the stats with `total` before the pull and
+    /// zero them when the pass ends.
+    fn track_update_progress(
+        self: &Arc<Self>,
+        address: &str,
+        total: usize,
+    ) -> Option<EdxBatchProgress> {
+        if total == 0 {
+            return None;
         }
+        let state = self.clone();
+        let address = address.to_string();
+        let left = Arc::new(AtomicUsize::new(total));
+        Some(Arc::new(move |_inner: &str, _bytes: u64| {
+            left.fetch_sub(1, Ordering::Relaxed);
+            let state = state.clone();
+            let address = address.clone();
+            let left = left.clone();
+            // The hook is sync (called from the fetch loop); the spawned task
+            // reads the counter at push time so late pushes never raise it.
+            tokio::spawn(async move {
+                state.set_worker_stats(&address, left.load(Ordering::Relaxed), 1, 0).await;
+                state.push_site_info(&address).await;
+            });
+        }))
+    }
+
+    /// EDX-first pass over a needed-file list: fetch what EDX can in one
+    /// dial-once session and return the leftovers (EDX-missed) as `FileEntry`s.
+    /// Counts the EDX bytes into the xite's transfer total. EDX is the only
+    /// transfer path now, so there is nothing to hand the leftovers to: callers
+    /// either drop the missed list (the next pass retries those files) or read
+    /// it only to see which files did arrive.
+    /// `staged` carries a not-yet-committed content.json (resync) so its files
+    /// resolve against the NEW `b3`, not the stale committed manifest. Made
+    /// `pub` so the node's clone/included-content passes share one EDX-first
+    /// entry point. `on_file` fires per landed file (so the clone loading bar
+    /// advances as EDX materializes files, not only when the worker runs).
+    pub async fn edx_first(
+        &self,
+        key: &str,
+        needed: Vec<epix_xite::FileEntry>,
+        peers: Vec<PeerAddr>,
+        staged: Option<&Value>,
+        on_file: Option<EdxBatchProgress>,
+    ) -> Vec<epix_xite::FileEntry> {
+        let want: Vec<EdxWant> = needed
+            .iter()
+            .map(|f| {
+                let (id, size) = staged
+                    .and_then(|c| edx_want_from_staged(c, &f.inner_path))
+                    .unzip();
+                EdxWant { inner_path: f.inner_path.clone(), id, size }
+            })
+            .collect();
+        let total = needed.len();
+        let Some(batch) = self.edx_fetch_files(key, want, peers, on_file).await else {
+            return needed; // no EDX fetcher: nothing could be fetched
+        };
+        if batch.bytes > 0 {
+            self.add_transfer(key, batch.bytes, 0).await;
+        }
+        // A running view of how much of each sync EDX served, plus the
+        // cumulative EDX-eligible-fallback counter - the 1b validation gate for
+        // retiring the msgpack fetch. Quiet unless there was something to fetch.
+        if total > 0 {
+            self.log(
+                "DEBUG",
+                format!(
+                    "EDX {key}: landed {}/{total} file(s), {} to msgpack worker \
+                     (cum. eligible-fallbacks: {})",
+                    batch.done.len(),
+                    batch.missed.len(),
+                    edx_msgpack_fallbacks(),
+                ),
+            )
+            .await;
+        }
+        // Keep only the files EDX did not land; the rest are on disk, verified.
+        let missed: std::collections::HashSet<&String> = batch.missed.iter().collect();
+        needed.into_iter().filter(|f| missed.contains(&f.inner_path)).collect()
     }
 
     /// Check a xite for a newer content.json among its peers and, if found,
@@ -4014,13 +4694,22 @@ impl AppState {
         // download pass from every 5-min resync tick used to hammer trackers
         // and flash the sidebar panel for xites whose seeder is offline.
         self.mark_optional_dirty(address);
-        let transport = self.transport.read().await.clone().ok_or("no transport")?;
-        // Reliable tracker-seeds first, then registry peers - a bumped
-        // content.json is fetched from a known seed instead of hoping the
-        // registry selection lands on one that has the new version.
+        if self.transport.read().await.is_none() {
+            // Offline (no transport yet - e.g. Tor still bootstrapping). This
+            // is a failure to update, not "already current": reporting success
+            // here is what let the Update button claim it worked seconds after
+            // a restart, before any transport existed.
+            return Err("no transport yet (still connecting)".into());
+        }
+        // The xite's own registry peers first, then tracker seeds (see
+        // `fetch_candidate_peers`): the peers that announced this xite are the
+        // ones holding its new version. Leading with trackers meant a resync
+        // spent its whole candidate list on nodes that answered "no such
+        // content.json" and never reached the actual seeder, so an updated
+        // xite kept serving the stale copy while reporting "Updated".
         let peers = self.fetch_candidate_peers(address, 10).await;
         if peers.is_empty() {
-            return Ok(false);
+            return Err("no known peers to ask".into());
         }
         let view = self.xite_view(address).await?;
         // Never resync a local working copy: a stored content.json that does
@@ -4038,9 +4727,15 @@ impl AppState {
                 view.storage.clone(),
             );
             if !probe.load_content().unwrap_or(false) {
-                return Ok(false);
+                return Err("local content.json does not verify for this address".into());
             }
         }
+        // Did any peer serve us a parseable content.json this pass? A resync
+        // that reached NOBODY is a failure to report, not a quiet "you are up
+        // to date" - the dashboard's Update button showed success while every
+        // peer was unreachable (a seeder whose onion descriptor is still
+        // republishing after a restart is exactly this case, for 1-3 minutes).
+        let mut answered = false;
         let local_modified = view
             .content
             .as_ref()
@@ -4052,124 +4747,157 @@ impl AppState {
         let canonical = canonical_address(view.content.as_ref(), address);
 
         for peer in &peers {
-            // Bound each peer attempt so a slow/unresponsive peer doesn't
-            // stall the whole update; overlay peers get the longer dial
-            // deadline (a flat clearnet bound meant resync could never fetch
-            // content.json from an onion/i2p peer). The nested Option
-            // separates "dial/handshake failed" (outer None) from "connected
-            // but the fetch failed" (inner None), and `progressed` marks a
-            // handshake that succeeded before the deadline expired - so each
-            // case feeds the registry its own outcome. Without this, probe
-            // failures taught selection nothing and dead candidates were
-            // redialed every pass. A reachable-but-unserving peer gets a
-            // FileFail ONLY (reputation dock): ConnectOk would reset its
-            // error count and freshen its response time, promoting a useless
-            // peer above never-tried candidates in the selection tiebreak.
-            let progressed = AtomicBool::new(false);
-            let fetched = tokio::time::timeout(peer.connect_timeout(), async {
-                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
-                conn.handshake().await.ok()?;
-                progressed.store(true, Ordering::Relaxed);
-                Some(conn.get_file(&canonical, "content.json").await.ok())
-            })
-            .await;
-            let bytes = match fetched {
-                Ok(Some(Some(bytes))) => bytes,
-                // Alive but couldn't serve the file (or stalled mid-fetch):
-                // dialable, deprioritized.
-                Ok(Some(None)) => {
-                    self.log("DEBUG", format!("resync {address}: {peer} had no content.json"))
-                        .await;
-                    self.apply_peer_outcomes(
-                        address,
-                        vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
-                    )
-                    .await;
-                    continue;
-                }
-                Err(_) if progressed.load(Ordering::Relaxed) => {
-                    self.apply_peer_outcomes(
-                        address,
-                        vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
-                    )
-                    .await;
-                    continue;
-                }
-                Ok(None) | Err(_) => {
-                    self.log("DEBUG", format!("resync {address}: {peer} unreachable")).await;
-                    self.apply_peer_outcomes(
-                        address,
-                        vec![(peer.clone(), epix_worker::PeerOutcome::ConnectFail)],
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
-                // Answered with junk: deprioritize like a failed fetch.
-                self.apply_peer_outcomes(
-                    address,
-                    vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
-                )
-                .await;
+            let Some((new, bytes)) = self.resync_probe_peer(address, &canonical, peer).await
+            else {
                 continue;
             };
+            answered = true;
             let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            // Served a valid content.json: the genuine positive signal.
-            self.apply_peer_outcomes(
-                address,
-                vec![(peer.clone(), epix_worker::PeerOutcome::ConnectOk)],
-            )
-            .await;
             if new_modified <= local_modified {
-                return Ok(false); // already current
+                // This peer has nothing newer - try the NEXT one. Returning
+                // here abandoned the whole pass on the first stale answer, so
+                // a peer lagging behind (or one still serving the previous
+                // version) hid an update that a later peer was ready to give.
+                continue;
             }
-
-            // Verify the newer content.json (full signer/rules check,
-            // size-limited) and STAGE it in memory only, then sync its changed
-            // files against the staged version. The stored content.json - the
-            // completeness marker the html gate keys on - is untouched until
-            // every declared file lands, so an incomplete sync leaves the node
-            // serving the previous consistent version instead of a loading
-            // screen (the "content.json updated but files stale" hang).
-            let mut xite = Xite::new(
-                Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
-                view.storage.clone(),
-            );
-            let limit = self.size_limit_bytes(address).await;
-            xite.stage_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
-
-            let needed = xite.files_needed().len();
-            let workers = peers.len().min(8);
-            self.set_worker_stats(address, needed, workers, needed).await;
-            let feedback = epix_worker::CollectFeedback::new();
-            let report = epix_worker::sync_files(
-                &xite,
-                &peers,
-                transport.clone(),
-                8,
-                Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-            )
-            .await;
-            // Always clear the live task counters - a leftover tasks>0 keeps
-            // the dashboard row's "Updating" spinner stuck.
-            self.set_worker_stats(address, 0, 0, 0).await;
-            self.apply_peer_outcomes(address, feedback.drain()).await;
-            let report = report.map_err(|e| e.to_string())?;
-            self.add_transfer(address, report.bytes, 0).await;
-
-            // Commit when complete, else defer (kept pending + retried by the
-            // resync tick); either way the node serves a consistent version.
-            let keys = self.alias_keys(&canonical, address).await;
-            let failed: Vec<String> =
-                xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
-            let Some(content) = xite.content else { return Ok(false) };
-            let committed = self
-                .finalize_root_update(&keys, &canonical, &view.storage, content, &bytes, &failed)
+            return self
+                .resync_apply_newer(address, &canonical, &view.storage, bytes, peers.clone())
                 .await;
-            return Ok(committed);
+        }
+        if !answered {
+            return Err("no peer could serve content.json (none reachable)".into());
         }
         Ok(false)
+    }
+
+    /// One resync candidate: bounded dial, fetch content.json over EDX, score
+    /// the peer registry with the outcome. Returns the parsed content.json
+    /// with its raw bytes only when the peer served a valid one; every other
+    /// outcome returns None after scoring and the caller moves on.
+    ///
+    /// Bound each peer attempt so a slow/unresponsive peer doesn't stall the
+    /// whole update; overlay peers get the longer dial deadline (a flat
+    /// clearnet bound meant resync could never fetch content.json from an
+    /// onion/i2p peer). The nested Option separates "dial/handshake failed"
+    /// (outer None) from "connected but the fetch failed" (inner None), and
+    /// `progressed` marks a handshake that succeeded before the deadline
+    /// expired - so each case feeds the registry its own outcome. Without
+    /// this, probe failures taught selection nothing and dead candidates were
+    /// redialed every pass. A reachable-but-unserving peer gets a FileFail
+    /// ONLY (reputation dock): ConnectOk would reset its error count and
+    /// freshen its response time, promoting a useless peer above never-tried
+    /// candidates in the selection tiebreak.
+    async fn resync_probe_peer(
+        self: &Arc<Self>,
+        address: &str,
+        canonical: &str,
+        peer: &PeerAddr,
+    ) -> Option<(Value, Vec<u8>)> {
+        let score = |outcome| self.apply_peer_outcomes(address, vec![(peer.clone(), outcome)]);
+        let progressed = AtomicBool::new(false);
+        let fetched = tokio::time::timeout(peer.connect_timeout(), async {
+            // EDX manifest channel: GetSigned over an EDX link works for any
+            // site. A live link marks `progressed` so a post-handshake
+            // failure scores the peer as alive-but-unserving, not dead.
+            match self.edx_fetch_signed(peer.clone(), canonical, "content.json").await {
+                // Dialed and served the bytes.
+                Some(Ok(Some(bytes))) => {
+                    progressed.store(true, Ordering::Relaxed);
+                    Some(Some(bytes))
+                }
+                // Dialed but no content (alive, unserving).
+                Some(Ok(None)) => {
+                    progressed.store(true, Ordering::Relaxed);
+                    Some(None)
+                }
+                // Dial/link failed, or no fetcher: unreachable.
+                Some(Err(_)) | None => None,
+            }
+        })
+        .await;
+        let bytes = match fetched {
+            Ok(Some(Some(bytes))) => bytes,
+            // Alive but couldn't serve the file (or stalled mid-fetch):
+            // dialable, deprioritized.
+            Ok(Some(None)) => {
+                self.log("DEBUG", format!("resync {address}: {peer} had no content.json")).await;
+                score(epix_worker::PeerOutcome::FileFail).await;
+                return None;
+            }
+            Err(_) if progressed.load(Ordering::Relaxed) => {
+                score(epix_worker::PeerOutcome::FileFail).await;
+                return None;
+            }
+            Ok(None) | Err(_) => {
+                self.log("DEBUG", format!("resync {address}: {peer} unreachable")).await;
+                score(epix_worker::PeerOutcome::ConnectFail).await;
+                return None;
+            }
+        };
+        let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
+            // Answered with junk: deprioritize like a failed fetch.
+            score(epix_worker::PeerOutcome::FileFail).await;
+            return None;
+        };
+        // Served a valid content.json: the genuine positive signal.
+        score(epix_worker::PeerOutcome::ConnectOk).await;
+        Some((new, bytes))
+    }
+
+    /// A peer served a NEWER content.json: verify it (full signer/rules
+    /// check, size-limited) and STAGE it in memory only, then sync its
+    /// changed files against the staged version. The stored content.json -
+    /// the completeness marker the html gate keys on - is untouched until
+    /// every declared file lands, so an incomplete sync leaves the node
+    /// serving the previous consistent version instead of a loading screen
+    /// (the "content.json updated but files stale" hang). Returns whether the
+    /// update was committed.
+    async fn resync_apply_newer(
+        self: &Arc<Self>,
+        address: &str,
+        canonical: &str,
+        storage: &XiteStorage,
+        bytes: Vec<u8>,
+        peers: Vec<PeerAddr>,
+    ) -> Result<bool, String> {
+        let mut xite = Xite::new(
+            Address::parse(canonical.to_string()).map_err(|e| e.to_string())?,
+            storage.clone(),
+        );
+        let limit = self.size_limit_bytes(address).await;
+        xite.stage_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
+
+        // EDX-only: pull the changed files over one dial-once session. The
+        // staged content.json is not committed yet, so its NEW b3 is
+        // authoritative for resolution (the committed manifest is stale). A
+        // changed file with no `b3` does not arrive (post-msgpack contract)
+        // and the completeness check below defers the update. edx_first
+        // counts the transferred bytes itself. Worker stats are primed with
+        // the batch and counted down per landed file so the dashboard pill
+        // shows "Updating: N left".
+        let needed = xite.files_needed();
+        let staged = xite.content.clone();
+        let total = needed.len();
+        if total > 0 {
+            self.set_worker_stats(address, total, 1, total).await;
+            self.push_site_info(address).await;
+        }
+        let on_file = self.track_update_progress(address, total);
+        let _ = self.edx_first(address, needed, peers, staged.as_ref(), on_file).await;
+        if total > 0 {
+            self.set_worker_stats(address, 0, 0, 0).await;
+        }
+
+        // Commit when complete, else defer (kept pending + retried by the
+        // resync tick); either way the node serves a consistent version.
+        let keys = self.alias_keys(canonical, address).await;
+        let failed: Vec<String> =
+            xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
+        let Some(content) = xite.content else { return Ok(false) };
+        let committed = self
+            .finalize_root_update(&keys, canonical, storage, content, &bytes, &failed)
+            .await;
+        Ok(committed)
     }
 
     /// Peer counts (connected/connectable/onion/local/total) for the sidebar.
@@ -4225,15 +4953,48 @@ impl AppState {
     /// with hundreds of dead gossip peers all at reputation 0, it often never
     /// does within a useful window.
     pub async fn fetch_candidate_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
-        let mut out = self.tracker_seed_peers().await;
+        // The xite's OWN registry peers come first: they are there because they
+        // announced holding THIS xite, so they are the only candidates known to
+        // have its files. Tracker seeds follow as a fallback - an operator node
+        // usually seeds popular xites, but it holds nothing of a freshly
+        // published one. Leading with trackers filled the (capped) dial session
+        // with peers that had no data while the one real seeder waited behind
+        // them, and every fetch then ground through its full timeout: a clone
+        // that should take seconds stalled for many minutes and then failed as
+        // "incomplete", leaving nothing on disk to serve.
+        let mut out = self.connectable_peers(address, limit).await;
         let mut seen: std::collections::HashSet<String> =
             out.iter().map(|p| p.to_string()).collect();
-        for p in self.connectable_peers(address, limit).await {
+        for p in self.tracker_seed_peers().await {
             if seen.insert(p.to_string()) {
                 out.push(p);
             }
         }
         out
+    }
+
+    /// Record EDX dial outcomes into the peer registry so a clone/batch fetch
+    /// learns which peers are alive: a dead peer sinks (backoff + reputation)
+    /// and a live one rises in selection, instead of the same unranked top-N
+    /// being redialed every pass and the clone falsely giving up while a
+    /// reachable seeder sits lower in the list. `results` pairs each peer with
+    /// whether its EDX handshake succeeded.
+    pub async fn note_edx_dials(&self, address: &str, results: Vec<(PeerAddr, bool)>) {
+        if results.is_empty() {
+            return;
+        }
+        let outcomes = results
+            .into_iter()
+            .map(|(p, ok)| {
+                let o = if ok {
+                    epix_worker::PeerOutcome::ConnectOk
+                } else {
+                    epix_worker::PeerOutcome::ConnectFail
+                };
+                (p, o)
+            })
+            .collect();
+        self.apply_peer_outcomes(address, outcomes).await;
     }
 
     /// A deduplicated set of connectable peers across all served xites, for the
@@ -4276,38 +5037,7 @@ impl AppState {
         DialableNets { clearnet: true, onion, i2p, rns }
     }
 
-    /// Apply a sync pass's outcomes and, when files are still missing, log
-    /// one line saying what was tried. Without it a failing fetch is
-    /// invisible: the worker skips bad peers silently and the operator only
-    /// ever saw "N file(s) not yet available" with nothing to go on.
-    async fn absorb_sync_outcomes(
-        &self,
-        key: &str,
-        outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)>,
-        failed_files: usize,
-    ) {
-        if failed_files > 0 {
-            use epix_worker::PeerOutcome as O;
-            let peers_tried: std::collections::HashSet<String> =
-                outcomes.iter().map(|(p, _)| p.to_string()).collect();
-            let count = |o: O| outcomes.iter().filter(|(_, x)| *x == o).count();
-            self.log(
-                "INFO",
-                format!(
-                    "Fetch pass for {key}: {failed_files} file(s) still missing after {} peer(s) tried ({} connect failures, {} file failures, {} files ok)",
-                    peers_tried.len(),
-                    count(O::ConnectFail),
-                    count(O::FileFail),
-                    count(O::FileOk),
-                ),
-            )
-            .await;
-        }
-        self.apply_peer_outcomes(key, outcomes).await;
-    }
-
-    /// Apply a sync pass's per-peer outcomes (drained from an
-    /// [`epix_worker::CollectFeedback`]) to a xite's peer registry: a
+    /// Apply per-peer fetch outcomes to a xite's peer registry: a
     /// success clears the backoff and rewards the peer, a failure docks its
     /// reputation and backs it off exponentially. This is what feeds
     /// [`Self::connectable_peers`]' ordering - without it reputation never
@@ -5019,18 +5749,14 @@ impl AppState {
     /// Download a file (required or optional) on demand from peers, verifying
     /// its hash before writing. `fileNeed`. Returns true if present after.
     pub async fn file_need(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        let (entry, _, optional) = self
+        let (entry, _, _optional) = self
             .declared_entry(address, inner_path)
             .await
             .ok_or("file not declared in content.json")?;
-        let info = FileEntry {
-            inner_path: inner_path.to_string(),
-            size: entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
-            sha512: entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        };
+        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // A multi-piece big file's declared sha512 is a merkle root over its
-        // pieces - a whole-file flat hash never matches it, neither for the
-        // on-disk check nor for a fetched blob.
+        // pieces - a whole-file flat hash never matches it, so skip the on-disk
+        // shortcut for it and let the EDX store's completion check dedup.
         let is_bigfile = entry.get("piecemap").is_some();
         let storage = self
             .xites
@@ -5039,7 +5765,7 @@ impl AppState {
             .get(address)
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
-        if !is_bigfile && storage.verify(inner_path, &info.sha512) {
+        if !is_bigfile && storage.verify(inner_path, &sha512) {
             return Ok(true); // already have it
         }
         // Coalesce concurrent requests for the same file (a page asks for the
@@ -5064,114 +5790,45 @@ impl AppState {
         }
         let _cleanup = Cleanup { locks: &self.file_need_locks, key };
         let _guard = lock.lock().await;
-        async {
-            if is_bigfile {
-                // Fetch the missing pieces, each verified against the
-                // piecemap (EpixNet needFile's Bigfile path). Boxed: the
-                // piecemap itself downloads through file_need.
-                Box::pin(self.bigfile_fetch_range(address, inner_path, 0, info.size.max(0) as u64))
-                    .await?;
-                // First-completion stamp only: fetch_range on an already-
-                // complete bigfile is a no-op re-check, not a new download.
-                if optional {
-                    if let Some(x) = self.xites.write().await.get_mut(address) {
-                        let stat = x
-                            .settings
-                            .cache
-                            .optional_stats
-                            .entry(inner_path.to_string())
-                            .or_default();
-                        if stat.time_downloaded == 0 {
-                            stat.time_downloaded = now_secs() as i64;
+        if !is_bigfile && storage.verify(inner_path, &sha512) {
+            return Ok(true); // fetched by the caller we waited on
+        }
+        // EDX-only: a file must carry a `b3` to be fetchable. The verified-
+        // streaming path fetches and materializes it (and does the optional-file
+        // bookkeeping in edx_materialize_file). A file with no `b3`, or with no
+        // fetcher installed, cannot be fetched (msgpack retired).
+        match entry.get("b3") {
+            Some(_) => {
+                // Retry a failed pass instead of surfacing the first stumble as
+                // "not found". Over Tor a multi-MB asset routinely loses its
+                // peer mid-transfer, and one incomplete swarm pass 404'd the
+                // request - the browser drew a broken image while the caller
+                // still had most of its deadline left. Partial groups persist
+                // in the store, so each attempt RESUMES rather than restarting,
+                // and the caller's timeout bounds the whole loop.
+                const ATTEMPTS: usize = 3;
+                let mut last = String::new();
+                for attempt in 0..ATTEMPTS {
+                    match self.edx_fetch_file(address, inner_path).await {
+                        Some(Ok(true)) => return Ok(true),
+                        Some(Ok(false)) => {
+                            last = format!("EDX could not complete {inner_path}")
                         }
+                        Some(Err(e)) => last = e,
+                        // No fetcher is a permanent condition - retrying it
+                        // would just burn the caller's deadline.
+                        None => return Err("no EDX fetcher installed".into()),
+                    }
+                    if attempt + 1 < ATTEMPTS {
+                        // Let the just-scored dial outcomes settle so the next
+                        // pass draws a different (better) peer set.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
-                return Ok(true);
+                Err(last)
             }
-            if storage.verify(inner_path, &info.sha512) {
-                return Ok(true); // fetched by the caller we waited on
-            }
-            self.fetch_file_from_peers(address, &info, optional, &storage).await
+            None => Err(format!("{inner_path} has no b3 and cannot be fetched")),
         }
-        .await
-    }
-
-    /// Ask each connectable peer for the file until one hands over a blob
-    /// matching the declared hash, then write it and do the optional-file
-    /// bookkeeping. The fetch half of [`file_need`](Self::file_need).
-    async fn fetch_file_from_peers(
-        &self,
-        address: &str,
-        info: &FileEntry,
-        optional: bool,
-        storage: &XiteStorage,
-    ) -> Result<bool, String> {
-        let transport = self.transport.read().await.clone().ok_or("no transport")?;
-        let peers = self.connectable_peers(address, 20).await;
-        // Feed every attempt back into peer reputation/backoff (the same
-        // outcomes the worker-sync path reports). Without this the on-demand
-        // path was invisible to selection: a dead peer was redialed every
-        // fetch, and - worse - a good seeder's stale backoff was never reset
-        // by the successful download, so rare xites stayed "no peers" long
-        // after their seeder was reachable again.
-        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
-        let mut found = None;
-        for peer in peers {
-            let Ok(mut conn) = Connection::connect(transport.as_ref(), &peer).await else {
-                outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
-                continue;
-            };
-            if conn.handshake().await.is_err() {
-                outcomes.push((peer, epix_worker::PeerOutcome::ConnectFail));
-                continue;
-            }
-            let Ok(bytes) = conn.get_file(address, &info.inner_path).await else {
-                // The dial worked; only the file failed (refused/timeout).
-                outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
-                continue;
-            };
-            if XiteStorage::hash_bytes(&bytes) != info.sha512 {
-                outcomes.push((peer, epix_worker::PeerOutcome::FileFail));
-                continue;
-            }
-            outcomes.push((peer.clone(), epix_worker::PeerOutcome::ConnectOk));
-            outcomes.push((peer.clone(), epix_worker::PeerOutcome::FileOk));
-            found = Some((peer, bytes));
-            break;
-        }
-        self.apply_peer_outcomes(address, outcomes).await;
-        let Some((peer, bytes)) = found else {
-            return Err("could not fetch the file from any peer".into());
-        };
-        // A fetch that raced a siteDelete must not write: XiteStorage::write
-        // create_dir_all's the parent, which would resurrect the removed site
-        // directory with an orphan file.
-        if !self.xites.read().await.contains_key(address) {
-            return Err("xite removed".into());
-        }
-        storage.write(&info.inner_path, &bytes).map_err(|e| e.to_string())?;
-        self.set_peer_connected(address, &peer, true).await;
-        // Count the transfer (site totals + per-peer) - without this the
-        // dashboard's download bytes and the Stats download graph never
-        // moved for on-demand fetches.
-        self.record_transfer(address, &peer, bytes.len() as u64, 0).await;
-        // Count optional bytes downloaded and advertise it in our
-        // hashfield so peers can discover we now hold it.
-        if optional {
-            if let Some(x) = self.xites.write().await.get_mut(address) {
-                x.settings.optional_downloaded += info.size;
-                x.hashfield.add_hash(&info.sha512);
-                // The Files tab's "Finished" column.
-                let stat = x
-                    .settings
-                    .cache
-                    .optional_stats
-                    .entry(info.inner_path.clone())
-                    .or_default();
-                stat.time_downloaded = now_secs() as i64;
-            }
-        }
-        Ok(true)
     }
 
     /// List optional files with their state and the per-file counters the
@@ -5336,208 +5993,6 @@ impl AppState {
         Some(entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64)
     }
 
-    /// Ensure the pieces covering `[offset, offset+size)` of a big file are
-    /// present, downloading only the missing ones from peers and verifying each
-    /// against the piecemap before writing it into the sparse file. A no-op for
-    /// files that aren't big files. This is true piecewise Bigfile download.
-    pub async fn bigfile_fetch_range(
-        &self,
-        address: &str,
-        inner_path: &str,
-        offset: u64,
-        size: u64,
-    ) -> Result<(), String> {
-        let Some((entry, dir, optional)) = self.declared_entry(address, inner_path).await else {
-            return Ok(()); // not declared -> nothing to do
-        };
-        let Some(piecemap_path) = entry.get("piecemap").and_then(|v| v.as_str()) else {
-            return Ok(()); // not a big file
-        };
-        // A child content.json's piecemap path is relative to its own dir.
-        let piecemap_path =
-            if dir.is_empty() { piecemap_path.to_string() } else { format!("{dir}/{piecemap_path}") };
-        let piece_size = entry.get("piece_size").and_then(|v| v.as_i64()).unwrap_or(1024 * 1024) as u64;
-        let total = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
-        if piece_size == 0 || total == 0 || size == 0 {
-            return Ok(());
-        }
-
-        let storage = self
-            .xites
-            .read()
-            .await
-            .get(address)
-            .map(|x| x.storage.clone())
-            .ok_or("unknown xite")?;
-
-        // The piecemap is itself a (small) optional file - fetch it if missing.
-        if !storage.exists(&piecemap_path) {
-            self.file_need(address, &piecemap_path).await?;
-        }
-        let pm_bytes = storage.read(&piecemap_path).map_err(|e| e.to_string())?;
-        let file_name = inner_path.rsplit('/').next().unwrap_or(inner_path);
-        let hashes = epix_xite::parse_piecemap(&pm_bytes, file_name).ok_or("malformed piecemap")?;
-
-        ensure_sparse_file(&storage, inner_path, total)?;
-
-        let last_byte = (offset + size - 1).min(total - 1);
-        let (first, last) = (offset / piece_size, last_byte / piece_size);
-        let transport = self.transport.read().await.clone();
-        let peers = self.connectable_peers(address, 20).await;
-
-        // Reputation/backoff feedback, ONE outcome per peer per call (a dead
-        // peer must not be docked once per piece - that would back it off for
-        // an hour after a single bad pass). Independent BITS per peer, not a
-        // best-wins rank: the piecefield probe's bare handshake must not mask
-        // later piece-request failures, or a reachable peer that serves
-        // nothing would be REWARDED (ConnectOk resets backoff, +1 rep) every
-        // pass and float to the top of reputation-ordered selection forever.
-        const PF_CONNECTED: u8 = 1;
-        const PF_FILE_OK: u8 = 2;
-        const PF_FILE_FAIL: u8 = 4;
-        let mut peer_flags: std::collections::HashMap<String, (PeerAddr, u8)> =
-            std::collections::HashMap::new();
-        macro_rules! rank {
-            ($peer:expr, $r:expr) => {{
-                let e = peer_flags
-                    .entry($peer.to_string())
-                    .or_insert_with(|| ($peer.clone(), 0));
-                e.1 |= $r;
-            }};
-        }
-
-        // Piece-aware peer selection (Bigfile piecefields): for a multi-piece
-        // fetch, ask each peer up front which pieces of this file it holds, so we
-        // skip peers that don't have a given piece. `sha512` keys the piecefield.
-        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let mut peer_pf: std::collections::HashMap<String, epix_xite::Piecefield> =
-            std::collections::HashMap::new();
-        if last > first {
-            if let Some(t) = &transport {
-                for peer in &peers {
-                    if let Ok(mut conn) = Connection::connect(t.as_ref(), peer).await {
-                        if conn.handshake().await.is_ok() {
-                            rank!(peer, PF_CONNECTED);
-                            if let Ok(map) = conn.get_piecefields(address).await {
-                                if let Some(bytes) = map.get(&sha512) {
-                                    peer_pf.insert(peer.to_string(), epix_xite::Piecefield::unpack(bytes));
-                                }
-                            }
-                        } else {
-                            rank!(peer, 0);
-                        }
-                    } else {
-                        rank!(peer, 0);
-                    }
-                }
-            }
-        }
-
-        // Single exit below so the accumulated peer outcomes are ALWAYS
-        // applied, including on a failed piece or disk error.
-        let mut fetch_err: Option<String> = None;
-        'pieces: for i in first..=last {
-            // Per-piece guards: a deleted xite must not have pieces written
-            // back into its removed directory, and an OPTIONAL bigfile whose
-            // toggles were switched off mid-download (a multi-GB fetch can
-            // run for a long time) stops at the next piece instead of
-            // finishing against the user's withdrawn permission.
-            {
-                let exists = self.xites.read().await.contains_key(address);
-                if !exists {
-                    fetch_err = Some("xite removed".into());
-                    break 'pieces;
-                }
-                if optional && !self.optional_fetch_allowed(address).await {
-                    fetch_err = Some("optional downloads disabled".into());
-                    break 'pieces;
-                }
-            }
-            let poff = i * piece_size;
-            let plen = piece_size.min(total - poff);
-            let Some(expected) = hashes.get(i as usize) else {
-                fetch_err = Some("piece index past piecemap".into());
-                break 'pieces;
-            };
-            if piece_present(&storage, inner_path, poff, plen, expected) {
-                continue;
-            }
-            let Some(transport) = transport.clone() else {
-                fetch_err = Some("no transport".into());
-                break 'pieces;
-            };
-            let mut got = false;
-            for peer in &peers {
-                // Skip peers we know (from their piecefield) don't have this piece.
-                if let Some(pf) = peer_pf.get(&peer.to_string()) {
-                    if !pf.get(i as usize) {
-                        continue;
-                    }
-                }
-                let Ok(mut conn) = Connection::connect(transport.as_ref(), peer).await else {
-                    rank!(peer, 0);
-                    continue;
-                };
-                if conn.handshake().await.is_err() {
-                    rank!(peer, 0);
-                    continue;
-                }
-                let Ok(data) = conn.get_file_range(address, inner_path, poff, plen).await else {
-                    rank!(peer, PF_CONNECTED | PF_FILE_FAIL);
-                    continue;
-                };
-                if data.len() as u64 == plen && XiteStorage::hash_bytes(&data) == *expected {
-                    if let Err(e) = write_at(&storage, inner_path, poff, &data) {
-                        fetch_err = Some(e.to_string());
-                        break 'pieces;
-                    }
-                    rank!(peer, PF_CONNECTED | PF_FILE_OK);
-                    self.set_peer_connected(address, peer, true).await;
-                    self.record_transfer(address, peer, plen, 0).await;
-                    if optional {
-                        if let Some(x) = self.xites.write().await.get_mut(address) {
-                            x.settings.optional_downloaded += plen as i64;
-                        }
-                    }
-                    got = true;
-                    break;
-                } else {
-                    rank!(peer, PF_CONNECTED | PF_FILE_FAIL);
-                }
-            }
-            if !got {
-                fetch_err = Some(format!("could not fetch piece {i} of {inner_path}"));
-                break 'pieces;
-            }
-        }
-        // Flags -> outcomes: a peer that served anything is a good seeder
-        // (reset backoff, reward); a connected peer that only failed piece
-        // requests is a FileFail (dock reputation, keep backoff - same as the
-        // whole-file path); a probe-only peer proved reachable (ConnectOk);
-        // an entry with no bits never answered a dial (ConnectFail).
-        let outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = peer_flags
-            .into_values()
-            .flat_map(|(addr, f)| {
-                if f & PF_FILE_OK != 0 {
-                    vec![
-                        (addr.clone(), epix_worker::PeerOutcome::ConnectOk),
-                        (addr, epix_worker::PeerOutcome::FileOk),
-                    ]
-                } else if f & PF_FILE_FAIL != 0 {
-                    vec![(addr, epix_worker::PeerOutcome::FileFail)]
-                } else if f & PF_CONNECTED != 0 {
-                    vec![(addr, epix_worker::PeerOutcome::ConnectOk)]
-                } else {
-                    vec![(addr, epix_worker::PeerOutcome::ConnectFail)]
-                }
-            })
-            .collect();
-        self.apply_peer_outcomes(address, outcomes).await;
-        match fetch_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
 
     /// Which pieces of each big file we hold, keyed by the file's `sha512`
     /// (`getPiecefields`). A big file is one with a `piecemap` + `piece_size` in
@@ -5828,6 +6283,14 @@ impl AppState {
         {
             let xites = self.xites.read().await;
             for (addr, x) in xites.iter() {
+                // Never treat an OWN xite's optional files as evictable cache:
+                // they are the authored originals, and deleting them can lose
+                // the only copy. A help-distribute xite (autodownloadoptional)
+                // promised to hold everything, so it is exempt too - and
+                // neither counts toward the cache budget.
+                if x.settings.own || x.settings.autodownloadoptional {
+                    continue;
+                }
                 let Some(files_opt) =
                     x.content.as_ref().and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
                 else {
@@ -6064,7 +6527,7 @@ impl AppState {
     /// membership onto each xite's peer `connected` flags. Called periodically
     /// by the runtime so connection stats stay live.
     pub async fn manage_connections(&self) {
-        let Some(transport) = self.transport.read().await.clone() else { return };
+        let Some(opener) = self.link_opener.read().await.clone() else { return };
         // Candidate peers across all served xites - best sources first
         // (tracker seeds, then connectable registry peers), skipping peers in
         // failure backoff and undialable networks. Feeding the pool the RAW
@@ -6081,7 +6544,7 @@ impl AppState {
                 }
             }
         }
-        self.conn_pool.ensure(transport, &candidates).await;
+        self.conn_pool.ensure(opener, &candidates).await;
         self.conn_pool.ping_all().await;
 
         // Mark peers we hold a live connection to as connected.
@@ -6111,85 +6574,33 @@ impl AppState {
     /// fold in any new ones. Trackers/DHT bootstrap discovery; PEX keeps it
     /// self-healing between announces (EpixNet runs this in its cleanup loop).
     /// Returns how many new peers were learned.
-    pub async fn run_pex(&self, address: &str, max_peers: usize, need: i64) -> usize {
-        let Some(transport) = self.transport.read().await.clone() else { return 0 };
+    pub async fn run_pex(&self, address: &str, max_peers: usize, need: u32) -> usize {
         let canonical = {
             let xites = self.xites.read().await;
             let Some(x) = self.resolve_xite(&xites, address) else { return 0 };
             canonical_address(x.content.as_ref(), address)
         };
-        // The peers we offer them (packed by type), and the set we already know.
+        // The peers we offer them, and the set we already know.
         let ours = self.connectable_peers(address, 10).await;
         let mut known: std::collections::HashSet<String> =
             ours.iter().map(|p| p.to_string()).collect();
-        let (mut ipv4, mut ipv6, mut onion, mut i2p) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut rns: Vec<Vec<u8>> = Vec::new();
-        for p in &ours {
-            if p.is_private() {
-                continue;
-            }
-            match (p.ip_type(), p.pack()) {
-                (epix_core::IpType::Ipv4, Some(b)) => ipv4.push(b),
-                (epix_core::IpType::Ipv6, Some(b)) => ipv6.push(b),
-                (epix_core::IpType::Onion, Some(b)) => onion.push(b),
-                (epix_core::IpType::I2p, Some(b)) => i2p.push(b),
-                (epix_core::IpType::Rns, Some(b)) => rns.push(b),
-                _ => {}
-            }
-        }
-        // Advertise our own reachable overlay addresses so the peers we reach
-        // add and gossip us (mirrors the server-side pex reply).
-        let fs_port = self.fileserver_port().await;
-        if let Some(host) = self.onion_address().await {
-            if let Some(b) = (PeerAddr::Onion { host, port: fs_port }).pack() {
-                onion.push(b);
-            }
-        }
-        if let Some(dest) = self.i2p_address().await {
-            if let Some(b) = (PeerAddr::I2p { dest, port: fs_port }).pack() {
-                i2p.push(b);
-            }
-        }
-        if let Some(hex) = self.rns_address().await {
-            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
-                if let Some(b) = p.pack() {
-                    rns.push(b);
-                }
-            }
-        }
+        let have = self.pex_have_addrs(&ours).await;
 
         let mut learned: Vec<PeerAddr> = Vec::new();
         for peer in ours.iter().take(max_peers) {
-            // Overlay-aware bound: an onion/i2p peer can't finish a dial +
-            // PEX inside a clearnet-sized timeout.
-            let got = tokio::time::timeout(peer.connect_timeout(), async {
-                let mut conn = Connection::connect(transport.as_ref(), peer).await.ok()?;
-                conn.handshake().await.ok()?;
-                conn.pex(
-                    &canonical,
-                    ipv4.clone(),
-                    ipv6.clone(),
-                    onion.clone(),
-                    i2p.clone(),
-                    rns.clone(),
-                    need,
-                )
-                .await
-                .ok()
-            })
-            .await;
-            let Ok(Some(reply)) = got else { continue };
+            let Some(Ok(found)) =
+                self.edx_pex(peer.clone(), &canonical, need, have.clone()).await
+            else {
+                continue;
+            };
             self.set_peer_connected(address, peer, true).await;
-            let unpacked = reply
-                .ipv4
-                .iter()
-                .chain(reply.ipv6.iter())
-                .filter_map(|b| PeerAddr::unpack_ip(b))
-                .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
-                .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)))
-                .chain(reply.rns.iter().filter_map(|b| PeerAddr::unpack_rns(b)));
-            for p in unpacked {
+            for p in found {
+                // Same wire-form gate as the serving side: a peer's PEX
+                // answer is untrusted input, and an unpackable address
+                // would cost a full dial timeout every selection pass.
+                if !p.is_wellformed() || p.pack().is_none() {
+                    continue;
+                }
                 if known.insert(p.to_string()) {
                     learned.push(p);
                 }
@@ -6200,6 +6611,27 @@ impl AppState {
             self.add_peers(address, learned).await;
         }
         count
+    }
+
+    /// The addresses a PEX exchange offers the peer: the public ones we already
+    /// know, plus our own reachable overlay addresses so the peers we reach
+    /// add and gossip us (mirrors the server-side pex reply).
+    async fn pex_have_addrs(&self, ours: &[PeerAddr]) -> Vec<PeerAddr> {
+        let mut have: Vec<PeerAddr> =
+            ours.iter().filter(|p| !p.is_private()).cloned().collect();
+        let fs_port = self.fileserver_port().await;
+        if let Some(host) = self.onion_address().await {
+            have.push(PeerAddr::Onion { host, port: fs_port });
+        }
+        if let Some(dest) = self.i2p_address().await {
+            have.push(PeerAddr::I2p { dest, port: fs_port });
+        }
+        if let Some(hex) = self.rns_address().await {
+            if let Ok(p) = PeerAddr::parse(&format!("rns:{hex}")) {
+                have.push(p);
+            }
+        }
+        have
     }
 
     /// Live connection stats (`connection`, `connection_in`, `connection_onion`,
@@ -6334,7 +6766,7 @@ impl AppState {
         let totals = epix_protocol::registry::totals();
         let _ = write!(
             h,
-            "<h2>Connections ({} live, in: {}, out: {}, total made: {} -             clearnet: {}, tor: {}, i2p: {}, mesh: {})</h2>             <table><tr><th>id</th><th>dir</th><th>peer</th><th>type</th>             <th>version</th><th>ping</th><th>open</th><th>idle</th><th>out</th>             <th>in</th><th>last sent</th><th>last recv</th><th>xites</th></tr>",
+            "<h2>Connections ({} live, in: {}, out: {}, total made: {} -             clearnet: {}, tor: {}, i2p: {}, mesh: {})</h2>             <table><tr><th>id</th><th>dir</th><th>peer</th><th>type</th>             <th>client</th><th>ping</th><th>open</th><th>idle</th><th>out</th>             <th>in</th><th>last sent</th><th>last recv</th><th>xites</th></tr>",
             stats.total,
             stats.incoming,
             stats.total - stats.incoming,
@@ -6366,9 +6798,18 @@ impl AppState {
                 epix_protocol::registry::Direction::In => "in",
                 epix_protocol::registry::Direction::Out => "out",
             };
-            // Version + rev, like the Python page's "0.7.1 r4556".
-            let version = match &d.peer {
-                Some(p) if !p.version.is_empty() => esc(&format!("{} r{}", p.version, p.rev)),
+            // Client + advertised version, e.g. "EpixNet v0.3.28". Older
+            // nodes send "EpixNet"/"EpixRS" as the version with no real
+            // number, so show just the client name for those.
+            let client = match &d.peer {
+                Some(p) if !p.version.is_empty() => {
+                    let v = p.version.trim_start_matches('v');
+                    if v.eq_ignore_ascii_case("EpixNet") || v.eq_ignore_ascii_case("EpixRS") {
+                        "EpixNet".to_string()
+                    } else {
+                        esc(&format!("EpixNet v{v}"))
+                    }
+                }
                 _ => "-".into(),
             };
             let ping = d.ping_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "-".into());
@@ -6384,7 +6825,7 @@ impl AppState {
                 dir,
                 esc(&d.addr.to_string()),
                 kind,
-                version,
+                client,
                 ping,
                 fmt_dur(d.opened_secs),
                 fmt_dur(d.idle_secs),
@@ -6977,6 +7418,24 @@ impl AppState {
         // update_content also finalizes settings (size/modified via
         // apply_content_stats) and rebuilds the db from the on-disk files.
         self.update_content(address, xite.content.clone()).await;
+        // Register the just-loaded files into the EDX object store (no-op
+        // when no store is installed), so EDX can serve and dedup them
+        // without a re-download. On the blocking pool: edx_register reads and
+        // BLAKE3-hashes every declared file, which is minutes of CPU for a
+        // multi-GB one and must not sit on a runtime worker.
+        if let Some(store) = self.edx_store().await {
+            let now = now_secs().max(0) as u64;
+            let result = tokio::task::spawn_blocking(move || xite.edx_register(&store, now)).await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    self.log("WARN", format!("edx_register {address}: {e}")).await;
+                }
+                Err(e) => {
+                    self.log("WARN", format!("edx_register {address}: task failed: {e}")).await;
+                }
+            }
+        }
         self.persist_sites().await;
         self.push_site_info(address).await;
         true
@@ -7315,6 +7774,12 @@ impl AppState {
             .entry(address.to_string())
             .or_default()
             .insert(conn_id);
+        // A viewer just arrived: let the retry loop re-examine this xite on
+        // its next tick instead of waiting out the backoff. The retention
+        // prompt only fires with a viewer bound, so without this a xite
+        // parked at the slow interval would miss every short visit and its
+        // over-budget completion could never ask for consent.
+        self.mark_optional_dirty(address);
         self.pending_prompts.lock().unwrap().remove(address).unwrap_or_default()
     }
 
@@ -7709,6 +8174,313 @@ impl AppState {
         *self.content_syncer.write().await = Some(syncer);
     }
 
+    /// Install the content-addressed EDX object store (set by the node when
+    /// EDX serving is enabled). Until this is called, every EDX-store hook
+    /// is a no-op and the node behaves exactly as before.
+    pub async fn set_edx_store(&self, store: Arc<epix_blob::store::Store>) {
+        *self.edx_store.write().await = Some(store);
+    }
+
+    /// The installed EDX object store, if any.
+    pub async fn edx_store(&self) -> Option<Arc<epix_blob::store::Store>> {
+        self.edx_store.read().await.clone()
+    }
+
+    /// Install the EDX verified-streaming fetcher (set by the node).
+    pub async fn set_edx_fetcher(&self, fetcher: Arc<dyn EdxFetcher>) {
+        *self.edx_fetcher.write().await = Some(fetcher);
+    }
+
+    /// Install the warm pool's link opener (set by the node).
+    pub async fn set_link_opener(&self, opener: Arc<dyn crate::conn_pool::LinkOpener>) {
+        *self.link_opener.write().await = Some(opener);
+    }
+
+    /// Install the shared update-hint store (the node's `PropagationStore`),
+    /// so received EDX updates gossip a hint that pollers can catch up on.
+    pub fn set_prop_store(
+        &self,
+        store: Arc<tokio::sync::Mutex<epix_propagation::PropagationStore>>,
+    ) {
+        let _ = self.prop_store.set(store);
+    }
+
+    /// Record that `xite` advanced to `modified` in the shared hint store, if
+    /// one is installed. Called for every update we receive over EDX (the
+    /// original push and every re-broadcast), so the hint spreads with the
+    /// flood - a node that only relays the site still records it for others.
+    /// No-op before the store is installed. Untrusted like the store itself:
+    /// a bad hint only ever costs a poller one wasted (signature-verified)
+    /// resync, and the store is bounded and evicts.
+    pub async fn record_update_hint(&self, xite: &str, modified: i64) {
+        // A xite address is ~42 chars; anything longer is not an address.
+        // The bound matters because the hint is recorded from a peer-supplied
+        // string BEFORE the update is authorized, and the hints are replayed
+        // verbatim in every `UpdatesSince` reply - a few huge strings would
+        // otherwise bloat that reply past the frame cap for everyone.
+        const MAX_XITE_LEN: usize = 128;
+        if xite.is_empty() || xite.len() > MAX_XITE_LEN {
+            return;
+        }
+        if let Some(store) = self.prop_store.get() {
+            store.lock().await.record(xite, modified);
+        }
+    }
+
+    /// Fetch `inner_path` of `address` over EDX via the installed fetcher.
+    /// `Ok(None)` when no fetcher is installed (fall back to the legacy path);
+    /// otherwise the fetcher's result.
+    pub async fn edx_fetch_file(&self, address: &str, inner_path: &str) -> Option<Result<bool, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_file(address, inner_path).await)
+    }
+
+    /// Fetch a signed inner_path (content.json) of `address` from `peer` over
+    /// EDX `GetSigned`. `None` when no fetcher is installed; otherwise the
+    /// fetcher's result (`Ok(Some)` bytes, `Ok(None)` peer had none, `Err`
+    /// unreachable). The manifest channel the clone/resync use in place of the
+    /// msgpack `getFile`.
+    pub async fn edx_fetch_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Option<Result<Option<Vec<u8>>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_signed(peer, address, inner_path).await)
+    }
+
+    /// Batch EDX signed-content fetch via the installed fetcher (dial `peers`
+    /// once, `GetSigned` each path). `None` when no fetcher is installed - the
+    /// caller then runs the msgpack `fetch_files_raw`; otherwise the map of the
+    /// paths that were served.
+    pub async fn edx_fetch_signed_many(
+        &self,
+        address: &str,
+        paths: Vec<String>,
+        peers: Vec<PeerAddr>,
+    ) -> Option<HashMap<String, Vec<u8>>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_signed_many(address, paths, peers).await)
+    }
+
+    /// Batch EDX fetch via the installed fetcher (one dial-once session over
+    /// `peers`). `None` when no fetcher is installed - the caller then runs the
+    /// full msgpack list; otherwise the batch report, whose `missed` set is the
+    /// leftover the caller hands to the worker.
+    pub async fn edx_fetch_files(
+        &self,
+        address: &str,
+        want: Vec<EdxWant>,
+        peers: Vec<PeerAddr>,
+        on_file: Option<EdxBatchProgress>,
+    ) -> Option<EdxBatch> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_files(address, want, peers, on_file).await)
+    }
+
+    /// Fetch a byte range of `inner_path` over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed; otherwise the verified bytes (or
+    /// an error / `Ok(None)` for a non-EDX file).
+    pub async fn edx_fetch_range(
+        &self,
+        address: &str,
+        inner_path: &str,
+        start: u64,
+        len: u64,
+    ) -> Option<Result<Option<Vec<u8>>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_range(address, inner_path, start, len).await)
+    }
+
+    /// `listModified` from one peer over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed; otherwise the fetcher's result.
+    pub async fn edx_list_signed(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        since: u64,
+    ) -> Option<Result<Option<Vec<(String, u64, u64)>>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.list_signed(peer, address, since).await)
+    }
+
+    /// Peer exchange with one peer over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed.
+    pub async fn edx_pex(
+        &self,
+        peer: PeerAddr,
+        address: &str,
+        need: u32,
+        have: Vec<PeerAddr>,
+    ) -> Option<Result<Vec<PeerAddr>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.pex(peer, address, need, have).await)
+    }
+
+    /// A peer's tracker set over EDX via the installed fetcher (Beacon
+    /// gossip). `None` when no fetcher is installed.
+    pub async fn edx_get_trackers(&self, peer: PeerAddr) -> Option<Result<Vec<String>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.get_trackers(peer).await)
+    }
+
+    /// One Kademlia RPC over EDX via the installed fetcher (payload encoded
+    /// and decoded by `epix-dht-net`). `None` when no fetcher is installed.
+    pub async fn edx_kad(&self, peer: PeerAddr, payload: Vec<u8>) -> Option<Result<Vec<u8>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.kad(peer, payload).await)
+    }
+
+    /// One tracker announce over EDX via the installed fetcher (payload
+    /// encoded and decoded by `epix-discovery`). `None` when no fetcher is
+    /// installed.
+    pub async fn edx_announce(
+        &self,
+        peer: PeerAddr,
+        payload: Vec<u8>,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.announce(peer, payload).await)
+    }
+
+    /// Propagation hints after `after` over EDX via the installed fetcher.
+    /// `None` when no fetcher is installed.
+    pub async fn edx_updates_since(
+        &self,
+        peer: PeerAddr,
+        after: u64,
+    ) -> Option<Result<(Vec<(String, i64)>, u64), String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.updates_since(peer, after).await)
+    }
+
+    /// The declared size of an EDX file from its signed content.json entry,
+    /// so the range serve path knows the total before any bytes are on disk.
+    pub async fn edx_size(&self, address: &str, inner_path: &str) -> Option<u64> {
+        // Root or child content.json: declared_entry walks to the governing
+        // content.json, so per-user files resolve too.
+        let (entry, _, _) = self.declared_entry(address, inner_path).await?;
+        entry.get("size").and_then(Value::as_u64)
+    }
+
+    /// Resolve a declared file to its EDX object id + size, from the root OR
+    /// the child/per-user content.json that governs the path. Every signed
+    /// content.json stamps a `b3` per file, so forum and per-user content is
+    /// EDX-addressable without a root-only lookup.
+    pub async fn edx_resolve(&self, address: &str, inner_path: &str) -> Option<(epix_blob::ObjId, u64)> {
+        let (entry, _dir, _opt) = self.declared_entry(address, inner_path).await?;
+        let b3 = epix_blob::ObjId::from_hex(entry.get("b3")?.as_str()?)?;
+        let size = entry.get("size").and_then(Value::as_u64)?;
+        Some((b3, size))
+    }
+
+    /// Write EDX-fetched bytes into a xite's storage as `inner_path`, so the
+    /// existing file readers/serve path see a normal on-disk file. Used by
+    /// the EDX fetcher to materialize a completed object.
+    pub async fn edx_materialize_file(
+        &self,
+        address: &str,
+        inner_path: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
+        if let Some((entry, _dir, optional)) = self.declared_entry(address, inner_path).await {
+            if optional {
+                self.note_optional_materialized(address, inner_path, &entry).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Optional-file bookkeeping: mirror fetch_file_from_peers so an
+    /// EDX-fetched optional file advertises in our hashfield (peers can
+    /// discover we hold it), counts toward optional_downloaded, and stamps
+    /// its finished time. Without this an optional file fetched over EDX
+    /// lands on disk invisible to the swarm - it never seeds. A required
+    /// file, or one not declared here, does none of this (the caller only
+    /// calls this for optional=true). Idempotent by construction: the
+    /// first-completion stamp gates the once-only counter, and add_hash is a
+    /// set, so a re-materialize (resync, refetch) is safe.
+    async fn note_optional_materialized(&self, address: &str, inner_path: &str, entry: &Value) {
+        let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let size = entry.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            let first = {
+                let stat =
+                    x.settings.cache.optional_stats.entry(inner_path.to_string()).or_default();
+                let first = stat.time_downloaded == 0;
+                if first {
+                    stat.time_downloaded = now_secs() as i64;
+                }
+                first
+            };
+            if !sha512.is_empty() {
+                x.hashfield.add_hash(&sha512);
+            }
+            if first {
+                x.settings.optional_downloaded += size;
+            }
+        }
+    }
+
+    /// Register every currently-loaded xite's files into the EDX store, so a
+    /// store installed after xites already loaded still serves them (load
+    /// order independence). Returns the number of xites registered.
+    pub async fn edx_register_all_loaded(&self) -> usize {
+        let addresses: Vec<String> = self.xites.read().await.keys().cloned().collect();
+        let mut n = 0;
+        for address in addresses {
+            if self.edx_register_xite(&address).await.is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Register a xite's local files (and the bundles its manifest declares)
+    /// into the EDX object store, content-addressed by BLAKE3. No re-download
+    /// and no second copy: small files pack into slabs, large files adopt in
+    /// place. A no-op returning `None` when no store is installed, the xite
+    /// is unknown, or it has no EDX manifest fields yet. Otherwise returns
+    /// `(registered, skipped)`; a skip is a missing or changed local file,
+    /// which simply stays fetchable from the swarm.
+    pub async fn edx_register_xite(&self, address: &str) -> Option<(usize, usize)> {
+        let store = self.edx_store().await?;
+        let storage = {
+            let xites = self.xites.read().await;
+            self.resolve_xite(&xites, address)?.storage.clone()
+        };
+        let addr = Address::parse(address.to_string()).ok()?;
+        let mut xite = Xite::new(addr, storage);
+        if !(xite.load_content().unwrap_or(false) || xite.load_content_local()) {
+            return None;
+        }
+        // On the blocking pool: edx_register reads and BLAKE3-hashes every
+        // declared file (minutes for a multi-GB one), and the boot-time
+        // `edx_register_all_loaded` runs it for every xite back to back, so a
+        // runtime worker must not carry it.
+        let now = now_secs().max(0) as u64;
+        match tokio::task::spawn_blocking(move || xite.edx_register(&store, now)).await {
+            Ok(Ok(counts)) => Some(counts),
+            Ok(Err(e)) => {
+                self.log("WARN", format!("edx_register {address}: {e}")).await;
+                None
+            }
+            Err(e) => {
+                self.log("WARN", format!("edx_register {address}: task failed: {e}")).await;
+                None
+            }
+        }
+    }
+
     /// Sync a xite's included / per-user content via the installed
     /// [`ContentSyncer`]; rebuilds the db when anything new arrived.
     pub async fn sync_user_content(&self, address: &str) -> u64 {
@@ -7973,10 +8745,35 @@ impl AppState {
     }
 
     /// Save a xite's private key directly (`userSetSitePrivatekey`), marking it
-    /// owned.
+    /// owned. An empty key clears the saved one instead ("forget private key").
+    ///
+    /// The key is checked here, not at signing time: a key that is malformed,
+    /// or valid but for a different xite, can never sign this one (`Xite::sign`
+    /// requires the signer to be the xite address), so accepting it would only
+    /// store a key that fails later - after marking the xite owned and telling
+    /// the user it was saved.
     pub async fn set_site_privatekey(&self, address: &str, privatekey: &str) -> Result<(), String> {
+        if !privatekey.is_empty() {
+            let signer = epix_crypt::privatekey_to_address(privatekey)
+                .map_err(|_| "That is not a valid private key".to_string())?;
+            if signer != address {
+                return Err(format!(
+                    "That private key belongs to {signer}, not to this xite ({address})"
+                ));
+            }
+        }
         self.user.write().await.set_site_privatekey(address, privatekey)?;
-        self.set_owned(address, true).await;
+        // Persist it - `recover_privatekey` saves, this path never did, so a key
+        // added from the sidebar was silently lost on restart.
+        self.save_user().await;
+        if privatekey.is_empty() {
+            // Forgetting a key says nothing about ownership (a xite whose key
+            // is recoverable from the master seed is still owned), so only
+            // re-render rather than going through set_owned.
+            self.push_site_info(address).await;
+        } else {
+            self.set_owned(address, true).await;
+        }
         Ok(())
     }
 
@@ -8215,6 +9012,16 @@ impl AppState {
             }
             x.content = signed;
         }
+        // `own` must reach sites.json NOW: the offline CLI sign exits without
+        // any later flush, and a xite left `own: false` is evictable cache to
+        // enforce_optional_limit - the authored originals can be deleted.
+        self.persist_sites().await;
+        // Re-register the freshly signed files and bundles into the EDX store.
+        // Registration otherwise happens only at startup, so every re-sign on
+        // a running node published a manifest whose new objects no peer could
+        // fetch ("N file(s) not yet available" on every updater until the
+        // seeder restarts). Cheap on repeat: present objects short-circuit.
+        self.edx_register_xite(address).await;
         Ok(bytes)
     }
 
@@ -8266,9 +9073,9 @@ impl AppState {
         sender: Option<&PeerAddr>,
         sender_peers: &[PeerAddr],
     ) {
-        let Some(transport) = self.transport.read().await.clone() else {
-            return;
-        };
+        if self.transport.read().await.is_none() {
+            return; // offline
+        }
         // Peers key files by the signed (canonical) address even when we serve
         // under a `.epix` alias; storage is keyed by the served address.
         let (storage, canonical) = {
@@ -8299,25 +9106,21 @@ impl AppState {
         let mut fetched: Option<Vec<u8>> = None;
         let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
         for p in &peers {
-            let result = tokio::time::timeout(p.connect_timeout(), async {
-                let mut conn = Connection::connect(transport.as_ref(), p).await.ok()?;
-                conn.handshake().await.ok()?;
-                Some(conn.get_file(&canonical, inner_path).await)
-            })
-            .await
-            .ok()
-            .flatten();
-            match result {
-                Some(Ok(bytes)) => {
+            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
+            // link; the caller verifies them against the merge rules.
+            match self.edx_fetch_signed(p.clone(), &canonical, inner_path).await {
+                Some(Ok(Some(bytes))) => {
                     outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
                     fetched = Some(bytes);
                     break;
                 }
                 // Dialed fine but couldn't serve this file: dock reputation only
                 // (it may still serve others), don't back it off.
-                Some(Err(_)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
-                // Dial/handshake failed or timed out: back it off.
-                None => outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail)),
+                Some(Ok(None)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
+                // Dial/link failed, or no fetcher: back it off.
+                Some(Err(_)) | None => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail))
+                }
             }
         }
         if !outcomes.is_empty() {
@@ -8347,6 +9150,9 @@ impl AppState {
                 if after != before {
                     self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
                         .await;
+                    // New records landed: re-derive the feed cache off the merge
+                    // path (a no-op unless this xite declares feeds). Read-only.
+                    self.recompute_feeds(address).await;
                 }
             }
         }
@@ -8422,6 +9228,320 @@ impl AppState {
             let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
             self.fetch_and_merge_records(address, &mpath, &signers, None, peers).await;
         }
+    }
+
+    // ---- Feed engine (derived, read-only cache over the OR-set records) -----
+
+    /// The owner-signed feed descriptors declared in a xite's root content.json
+    /// `"feeds"` object. Empty when the xite declares none (the common case),
+    /// so the whole feed path is inert for a xite that never opts in.
+    pub async fn feed_descriptors(
+        &self,
+        address: &str,
+    ) -> Vec<epix_feed::adapter::FeedDescriptor> {
+        let Some(content) = self.content(address).await else {
+            return Vec::new();
+        };
+        let Some(feeds) = content.get("feeds").and_then(|v| v.as_object()) else {
+            return Vec::new();
+        };
+        let common = feeds.get("_common");
+        feeds
+            .iter()
+            .filter(|(name, _)| name.as_str() != "_common")
+            .filter_map(|(name, obj)| {
+                epix_feed::adapter::FeedDescriptor::parse(name, obj, common)
+            })
+            .collect()
+    }
+
+    /// Gather the VERIFIED records for one feed across its `files` glob. Reads
+    /// only: for every content.json unit, resolves the same authorized signer
+    /// set the merge path uses, re-verifies each record, and converts survivors
+    /// with the descriptor adapter. Never writes, never re-signs.
+    async fn gather_feed_records(
+        &self,
+        address: &str,
+        desc: &epix_feed::adapter::FeedDescriptor,
+    ) -> Vec<epix_feed::Record> {
+        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
+            return Vec::new();
+        };
+        let Ok(view) = self.xite_view(address).await else {
+            return Vec::new();
+        };
+        let now = epix_core::now_ms();
+        let mut out = Vec::new();
+        for content_path in walk_content_json(storage.root()) {
+            let Ok(bytes) = storage.read(&content_path) else { continue };
+            let Ok(content) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            let dir =
+                content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
+            // Only resolve signers once per unit, and only if a declared merge
+            // file actually matches this feed's glob.
+            let mut signers: Option<Vec<String>> = None;
+            for mpath in Self::matching_merge_paths(&content, dir, desc) {
+                self.feed_records_from_merge_file(
+                    &storage,
+                    &view,
+                    desc,
+                    &content_path,
+                    &mpath,
+                    &mut signers,
+                    now,
+                    &mut out,
+                )
+                .await;
+            }
+        }
+        out
+    }
+
+    /// Append the VERIFIED records one merge file contributes to `desc`. Each
+    /// record is verified against the authorized signer set of the unit that
+    /// declared the merge file, and `signers` is that unit's cache: it is
+    /// resolved here at most once per unit, and only once a merge file got as
+    /// far as holding records for this feed (resolving the xid map is not free).
+    #[allow(clippy::too_many_arguments)]
+    async fn feed_records_from_merge_file(
+        &self,
+        storage: &XiteStorage,
+        view: &Xite,
+        desc: &epix_feed::adapter::FeedDescriptor,
+        content_path: &str,
+        mpath: &str,
+        signers: &mut Option<Vec<String>>,
+        now: i64,
+        out: &mut Vec<epix_feed::Record>,
+    ) {
+        let Ok(cbytes) = storage.read(mpath) else { return };
+        let Ok(container) = serde_json::from_slice::<Value>(&cbytes) else { return };
+        // Honour the descriptor's declared record_format (untrusted
+        // marker, but a mismatch means these aren't this feed's records).
+        let fmt = container.get("record_format").and_then(|v| v.as_str()).unwrap_or("");
+        if fmt != desc.record_format {
+            return;
+        }
+        let Some(records) = container.get(&desc.record_key).and_then(|v| v.as_array()) else {
+            return;
+        };
+        if signers.is_none() {
+            let xid_map = Self::resolve_xid_map(storage, content_path).await;
+            *signers = Some(view.valid_signers_for(content_path, &xid_map));
+        }
+        let signers_ref = signers.as_deref().unwrap_or(&[]);
+        for record in records {
+            if epix_content::verify_record(record, signers_ref, now).is_err() {
+                continue;
+            }
+            let canonical = epix_content::dumps_sorted(record).into_bytes();
+            if let Ok(r) = epix_feed::adapter::record_from_value(desc, record, canonical) {
+                out.push(r);
+            }
+        }
+    }
+
+    /// The merge files one content.json unit declares that belong to `desc`, as
+    /// full inner paths (`dir` is the unit's directory, empty at the root).
+    fn matching_merge_paths(
+        content: &Value,
+        dir: &str,
+        desc: &epix_feed::adapter::FeedDescriptor,
+    ) -> Vec<String> {
+        epix_content::declared_merge_files(content)
+            .into_iter()
+            .map(|rel| if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") })
+            .filter(|mpath| crate::feed::glob_match(&desc.files, mpath))
+            .collect()
+    }
+
+    /// Re-derive every feed for a xite and cache the artifacts, inserting the
+    /// sealed (immutable) segment blobs into the EDX object store so they serve
+    /// over the wire like any content-addressed object. Pure and additive: a
+    /// no-op for a xite that declares no feeds, and it never touches stored
+    /// records, signatures, merge files, or the sqlite db. Idempotent - an
+    /// unchanged sealed segment dedups on insert.
+    pub async fn recompute_feeds(&self, address: &str) {
+        let descriptors = self.feed_descriptors(address).await;
+        if descriptors.is_empty() {
+            return;
+        }
+        // `now` is only the store insert timestamp; it never enters derivation
+        // (segmentation is a pure function of record clocks). Grace/live-tail is
+        // a caching policy that touches no root: segments whose interval closed
+        // less than `FEED_PIN_GRACE_MS` ago are still churning, so they go in
+        // unpinned (see `pin_feed_objects`).
+        let now = epix_core::now_ms();
+        let store = self.edx_store().await;
+        // What the previous derivation pinned. A record landing in an already
+        // sealed interval re-derives that interval under a NEW root, so the old
+        // root must be unpinned or it stays on disk for the life of the node.
+        let previous: HashMap<String, Arc<crate::feed::FeedArtifacts>> =
+            self.feed_cache.read().await.get(address).cloned().unwrap_or_default();
+        let mut derived = HashMap::new();
+        for desc in descriptors {
+            let records = self.gather_feed_records(address, &desc).await;
+            // The fold is CPU-bound (dedup, canonical sort, segment + filter
+            // build over every record) and the merge path calls this on every
+            // inbound record, so run it on a blocking thread instead of
+            // stalling an async worker. A join failure (the pool shutting down
+            // mid-run) just skips this feed; the next merge re-derives it.
+            let Ok(artifacts) =
+                tokio::task::spawn_blocking(move || crate::feed::derive_feed(records)).await
+            else {
+                continue;
+            };
+            if let Some(store) = &store {
+                Self::pin_feed_objects(store, &artifacts, now.max(0) as u64);
+                if let Some(old) = previous.get(&desc.name) {
+                    Self::unpin_superseded_feed_objects(store, old, &artifacts);
+                }
+            }
+            derived.insert(desc.name.clone(), Arc::new(artifacts));
+        }
+        self.feed_cache.write().await.insert(address.to_string(), derived);
+    }
+
+    /// Cache the sealed segments as EDX objects (content-addressed by
+    /// their own BLAKE3 root); pin so they survive eviction. Losing one
+    /// is harmless - it recomputes from the records.
+    ///
+    /// Only segments whose interval closed more than `FEED_PIN_GRACE_MS` ago are
+    /// pinned. A segment still inside that window gains a record (and therefore
+    /// a new root) on every merge, and nothing un-pins the copy it replaces, so
+    /// pinning the live tail would keep every superseded version of the current
+    /// day on disk forever.
+    fn pin_feed_objects(
+        store: &epix_blob::store::Store,
+        artifacts: &crate::feed::FeedArtifacts,
+        ts: u64,
+    ) {
+        for (i, seg) in artifacts.sealed.iter().enumerate() {
+            let settled = seg.boundary.saturating_add(FEED_PIN_GRACE_MS) <= ts;
+            if store.insert_bytes(seg.root, epix_blob::Ns::Plain, &seg.bytes, ts).is_ok() && settled
+            {
+                let _ = store.pin(seg.root);
+            }
+            // The segment's search skip-filter, as a sibling object a peer that
+            // wants to skip-scan our feed pulls instead of the whole segment.
+            // Stored under the BLAKE3 of its own bytes, the only key
+            // `insert_bytes` accepts: it verifies the bytes against the id it
+            // is given, so an id derived from the segment root could never be
+            // inserted. Peers therefore need the root -> filter id mapping
+            // published alongside the spine. Derived, so a failed insert costs
+            // nothing - it rebuilds from the segment.
+            if let Some(f) = artifacts.filters.get(i) {
+                let bytes = f.to_bytes();
+                let id = epix_blob::ObjId::of(&bytes);
+                if store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, ts).is_ok() && settled {
+                    let _ = store.pin(id);
+                }
+            }
+        }
+    }
+
+    /// Release the pins the previous derivation of this feed took on segments
+    /// (and their skip-filter siblings) that are no longer part of it. Without
+    /// this every re-sealed interval leaves a permanently pinned copy behind:
+    /// eviction and the quota only ever reclaim refcount-0 objects. The objects
+    /// are not deleted, only made evictable - they re-derive from the records.
+    fn unpin_superseded_feed_objects(
+        store: &epix_blob::store::Store,
+        old: &crate::feed::FeedArtifacts,
+        new: &crate::feed::FeedArtifacts,
+    ) {
+        let keep: std::collections::HashSet<epix_blob::ObjId> =
+            new.sealed.iter().map(|s| s.root).collect();
+        // Two segments can share filter bytes (an empty filter is the common
+        // case), so a superseded segment must not release a filter the new set
+        // still uses.
+        let keep_filters: std::collections::HashSet<epix_blob::ObjId> =
+            new.filters.iter().map(|f| epix_blob::ObjId::of(&f.to_bytes())).collect();
+        for (i, seg) in old.sealed.iter().enumerate() {
+            if keep.contains(&seg.root) {
+                continue;
+            }
+            let _ = store.ref_delta(seg.root, -1);
+            if let Some(f) = old.filters.get(i) {
+                let id = epix_blob::ObjId::of(&f.to_bytes());
+                if !keep_filters.contains(&id) {
+                    let _ = store.ref_delta(id, -1);
+                }
+            }
+        }
+    }
+
+    /// The cached artifacts for one feed, recomputing on a cache miss so the
+    /// first query after boot still answers. Returns `None` only when the xite
+    /// declares no such feed.
+    async fn feed_artifacts(
+        &self,
+        address: &str,
+        feed: &str,
+    ) -> Option<Arc<crate::feed::FeedArtifacts>> {
+        if let Some(a) =
+            self.feed_cache.read().await.get(address).and_then(|m| m.get(feed)).cloned()
+        {
+            return Some(a);
+        }
+        // Check the descriptors BEFORE recomputing: nothing is ever cached under
+        // an undeclared name, so a query naming one would miss forever and
+        // re-walk + re-verify the xite's whole record set on every call.
+        if !self.feed_descriptors(address).await.iter().any(|d| d.name == feed) {
+            return None;
+        }
+        self.recompute_feeds(address).await;
+        self.feed_cache.read().await.get(address).and_then(|m| m.get(feed)).cloned()
+    }
+
+    /// `feedItemQuery`: the live records attached to `target` (a post's
+    /// comments, or the post itself), plus its reaction counts and the roots a
+    /// caller can re-derive to verify. Read-only.
+    pub async fn feed_item_query(
+        &self,
+        address: &str,
+        feed: &str,
+        target: &str,
+        limit: Option<usize>,
+        before_clock: Option<u64>,
+    ) -> Result<Value, String> {
+        let art = self
+            .feed_artifacts(address, feed)
+            .await
+            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+        Ok(crate::feed::item_query(&art, target, limit, before_clock))
+    }
+
+    /// `feedGalleryRollup`: per-item counts for a gallery landing page in one
+    /// blob. Read-only.
+    pub async fn feed_gallery_rollup(
+        &self,
+        address: &str,
+        feed: &str,
+        items: &[String],
+    ) -> Result<Value, String> {
+        let art = self
+            .feed_artifacts(address, feed)
+            .await
+            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+        Ok(crate::feed::gallery_rollup(&art, items))
+    }
+
+    /// `feedSegmentSearch`: XOR8 skip-filter search over the sealed feed
+    /// segments. Returns verifiable pointers (`segment_root` + byte extent), not
+    /// record bodies - the caller fetches and verifies. Read-only.
+    pub async fn feed_segment_search(
+        &self,
+        address: &str,
+        feed: &str,
+        terms: &[String],
+        limit: usize,
+    ) -> Result<Value, String> {
+        let art = self
+            .feed_artifacts(address, feed)
+            .await
+            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+        Ok(crate::feed::segment_search(&art, terms, limit))
     }
 
     /// Right after a content pull, fetch + merge the declared merge files for
@@ -8728,7 +9848,15 @@ impl AppState {
             .ok()
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
-        let transport = self.transport.read().await.clone().ok_or("no transport for publishing")?;
+        // EDX is the sole propagation transport now; without it there is no
+        // push path (the msgpack update was retired). EPIX_EDX=0 therefore
+        // disables publishing, which is the intended clean-cut behavior.
+        let edx = self
+            .edx_fetcher
+            .read()
+            .await
+            .clone()
+            .ok_or("publishing requires EDX (it is disabled)")?;
         let pool =
             self.connectable_peers(address, if exhaustive { MAX_PUBLISH_DIALS } else { limit }).await;
         let total = pool.len();
@@ -8743,7 +9871,9 @@ impl AppState {
             )
             .await;
         }
-        let wire_diffs = (!diffs.is_empty()).then(|| crate::fileserve::encode_diffs(&diffs));
+        // Keep the diffs transport-neutral (the EDX edge lowers them to the
+        // wire form); Arc so 100 spawned pushes share one map.
+        let diffs = Arc::new(diffs);
         // The pushed body is cloned into every spawned task; Arc it so 100
         // candidates share one buffer instead of cloning a possibly-MB
         // content.json per dial.
@@ -8770,7 +9900,7 @@ impl AppState {
                 continue;
             }
             run.attempted += batch.len();
-            self.push_batch(address, inner_path, batch, &body, modified, &wire_diffs, &sender_peers, &transport, &mut run)
+            self.push_batch(address, inner_path, batch, &body, modified, &diffs, &sender_peers, &edx, &mut run)
                 .await;
             // One batch with any acceptor is enough: the accepted push
             // re-broadcasts peer-to-peer, and the remaining candidates get
@@ -8841,21 +9971,21 @@ impl AppState {
         batch: Vec<PeerAddr>,
         body: &Arc<Vec<u8>>,
         modified: f64,
-        wire_diffs: &Option<rmpv::Value>,
+        diffs: &Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
         sender_peers: &Arc<Vec<String>>,
-        transport: &Arc<dyn Transport>,
+        edx: &Arc<dyn EdxFetcher>,
         run: &mut PublishRun,
     ) {
         let mut set = tokio::task::JoinSet::new();
         for peer in batch {
             set.spawn(push_update_to_peer(
-                transport.clone(),
+                edx.clone(),
                 peer,
                 address.to_string(),
                 inner_path.to_string(),
                 body.clone(),
                 modified,
-                wire_diffs.clone(),
+                diffs.clone(),
                 sender_peers.clone(),
             ));
         }
@@ -8910,6 +10040,27 @@ impl AppState {
         });
     }
 
+    /// Fetch a signed `inner_path` back from one peer over EDX `GetSigned`,
+    /// bounded by that peer's dial deadline (an onion/i2p peer needs far more
+    /// than a flat clearnet one). `None` on any failure, so callers can just
+    /// try the next address.
+    async fn fetch_signed_from(
+        &self,
+        peer: &PeerAddr,
+        address: &str,
+        inner_path: &str,
+    ) -> Option<Vec<u8>> {
+        match tokio::time::timeout(
+            peer.connect_timeout(),
+            self.edx_fetch_signed(peer.clone(), address, inner_path),
+        )
+        .await
+        {
+            Ok(Some(Ok(Some(bytes)))) => Some(bytes),
+            _ => None,
+        }
+    }
+
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
     /// command - the receive half of the publish round-trip). Mirrors EpixNet's
     /// `FileRequest.actionUpdate`: reject unknown/not-downloaded sites, skip
@@ -8919,7 +10070,8 @@ impl AppState {
     ///
     /// `body` is the pushed content.json (None/empty when the sender omitted it
     /// - EpixNet drops bodies over 1 MB - in which case it is fetched back from
-    /// `sender`). `modified_hint` is the pushed version, letting us short-
+    /// `sender`, falling back to the first few `sender_peers` if that address
+    /// is unreachable). `modified_hint` is the pushed version, letting us short-
     /// circuit without parsing. Returns whether the update was applied.
     pub async fn apply_inbound_update(
         self: &Arc<Self>,
@@ -8993,22 +10145,27 @@ impl AppState {
         let bytes = match body.filter(|b| !b.is_empty()) {
             Some(b) => b,
             None => {
-                let fetched = match (&sender, self.transport.read().await.clone()) {
-                    (Some(s), Some(transport)) => {
-                        // The sender may be an onion/i2p peer: use its dial
-                        // deadline, not a flat clearnet one.
-                        tokio::time::timeout(s.connect_timeout(), async {
-                            let mut conn =
-                                Connection::connect(transport.as_ref(), s).await.ok()?;
-                            conn.handshake().await.ok()?;
-                            conn.get_file(site, inner_path).await.ok()
-                        })
-                        .await
-                        .ok()
-                        .flatten()
-                    }
-                    _ => None,
+                // Fetch the signed content.json back from the sender over EDX
+                // GetSigned. The sender may be an onion/i2p peer: use its dial
+                // deadline, not a flat clearnet one.
+                let mut fetched = match &sender {
+                    Some(s) => self.fetch_signed_from(s, site, inner_path).await,
+                    None => None,
                 };
+                // No sender wire address (or it turned out to be unreachable):
+                // the push carries the publisher's own dialable addresses, so
+                // try those before losing the update. First success wins.
+                if fetched.is_none() {
+                    for sp in sender_peers.iter().take(PUSH_REFETCH_PEERS) {
+                        if sender.as_ref() == Some(sp) {
+                            continue; // already tried above
+                        }
+                        fetched = self.fetch_signed_from(sp, site, inner_path).await;
+                        if fetched.is_some() {
+                            break;
+                        }
+                    }
+                }
                 fetched.ok_or("File invalid update: Can't download updated file")?
             }
         };
@@ -9231,13 +10388,21 @@ impl AppState {
                 self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
             }
         }
-        if let Some(transport) = self.transport.read().await.clone() {
+        if self.transport.read().await.is_some() {
             let mut peers = self.connectable_peers(&key, 10).await;
+            let nets = self.dialable_networks().await;
             // Prefer fetching from the sender - it definitely has the files
             // it just announced - but only if its address is dialable (an
             // inbound-only peer, e.g. `ip:0`, would just waste a worker).
+            // Screened the same way the advertised addresses below are: the
+            // sender is caller-supplied, so a peer that names our own address
+            // or an undialable network must not get a worker slot either.
             if let Some(s) = sender {
-                if epix_peer::Peer::new(s.clone(), 0).is_connectable() && !peers.contains(&s) {
+                if nets.can_dial(&s)
+                    && epix_peer::Peer::new(s.clone(), 0).is_connectable()
+                    && !self.is_own_peer(&s).await
+                    && !peers.contains(&s)
+                {
                     peers.insert(0, s);
                 }
             }
@@ -9246,7 +10411,6 @@ impl AppState {
             // For a NAT'd publisher these are the only routes to the new
             // files. Own addresses are dropped (a lone seeder must not dial
             // itself) and so are networks we cannot dial right now.
-            let nets = self.dialable_networks().await;
             for sp in sender_peers.into_iter().rev() {
                 if nets.can_dial(&sp)
                     && epix_peer::Peer::new(sp.clone(), 0).is_connectable()
@@ -9270,26 +10434,14 @@ impl AppState {
             if !needed.is_empty() && !peers.is_empty() {
                 let needed_paths: Vec<String> =
                     needed.iter().map(|f| f.inner_path.clone()).collect();
-                self.set_worker_stats(&key, needed.len(), peers.len().min(8), needed.len())
-                    .await;
-                let feedback = epix_worker::CollectFeedback::new();
-                let report = epix_worker::sync_files_list(
-                    needed,
-                    &xite,
-                    &peers,
-                    transport.clone(),
-                    8,
-                    None,
-                    Some(feedback.clone() as Arc<dyn epix_worker::PeerFeedback>),
-                )
-                .await;
-                let failed_files = report.as_ref().map(|r| r.failed.len()).unwrap_or(0);
-                if let Ok(report) = &report {
-                    self.add_transfer(&key, report.bytes, 0).await;
-                }
-                self.set_worker_stats(&key, 0, 0, 0).await;
-                self.absorb_sync_outcomes(&key, feedback.drain(), failed_files).await;
-                arrived.extend(needed_paths);
+                // EDX-only over the reused session (staged content's b3 is
+                // authoritative pre-commit). A file with no `b3` does not
+                // arrive; only the files EDX landed are reported for db ingest.
+                let missed =
+                    self.edx_first(&key, needed, peers.clone(), xite.content.as_ref(), None).await;
+                let missed: std::collections::HashSet<&String> =
+                    missed.iter().map(|f| &f.inner_path).collect();
+                arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
             }
         }
         if child_files.is_some() {
@@ -9345,26 +10497,6 @@ impl AppState {
 
     pub async fn has_xite(&self, address: &str) -> bool {
         self.xites.read().await.contains_key(address)
-    }
-
-    /// Read a file from a served xite's storage.
-    /// Serve one chunk of a local file to a peer (`getFile`): the bytes from
-    /// `offset` up to `length`, plus the file's total size. `None` if the xite or
-    /// file is not present here. Used by the inbound file server (seeding).
-    pub async fn serve_file_chunk(
-        &self,
-        address: &str,
-        inner_path: &str,
-        offset: u64,
-        length: usize,
-    ) -> Option<(Vec<u8>, u64)> {
-        let path = {
-            let xites = self.xites.read().await;
-            xites.get(address)?.storage.path(inner_path).ok()?
-        };
-        let total = std::fs::metadata(&path).ok()?.len();
-        let chunk = self.read_file_range(address, inner_path, offset, length).await?;
-        Some((chunk, total))
     }
 
     pub async fn read_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
@@ -9615,9 +10747,10 @@ impl AppState {
             self.persist_sites().await;
             if on {
                 self.spawn_optional_download(address, None);
-            } else if !self.optional_fetch_allowed(address).await {
-                // Both toggles now off: the in-flight pass (if any) aborts at
-                // its next check; drop a lingering waiting panel now.
+            } else {
+                // The bulk mandate is BOTH toggles, so switching this one off
+                // withdraws it: the in-flight pass (if any) aborts at its next
+                // check; drop the lingering waiting panel now.
                 self.set_optional_progress(address, None).await;
                 self.push_site_info(address).await;
             }
@@ -9669,12 +10802,11 @@ impl AppState {
                 // Re-arm the one-per-session prompt: switching the toggle off
                 // means a later page request should get to ask again.
                 self.optional_prompts.lock().unwrap().remove(address);
-                // Withdrawn mandate: any in-flight pass aborts at its next
-                // between-files check; drop a lingering waiting panel now.
-                if !self.optional_fetch_allowed(address).await {
-                    self.set_optional_progress(address, None).await;
-                    self.push_site_info(address).await;
-                }
+                // The bulk mandate is BOTH toggles, so this withdraws it: any
+                // in-flight pass aborts at its next between-files check; drop
+                // the lingering waiting panel now.
+                self.set_optional_progress(address, None).await;
+                self.push_site_info(address).await;
             }
         }
         found
@@ -9709,6 +10841,51 @@ impl AppState {
                 state.push_site_info(&address).await;
             }
         });
+    }
+
+    /// The retention pass hit the consent gate: ask ONCE per xite per session
+    /// (sharing the [`Self::prompt_optional_download`] once-per-session set),
+    /// stating the ACTUAL scope - how many files, how many bytes, and on whose
+    /// behalf: the reader's global full-retention setting or the xite's own
+    /// declared policy. The single-file prompt would misstate all three here.
+    /// Accepting grants the same per-xite optional-download consent the file
+    /// prompt grants, then re-runs the retention pass, which now completes
+    /// the whole plan.
+    async fn prompt_retention_completion(self: &Arc<Self>, address: &str, files: usize, bytes: u64) {
+        // Never burn the once-per-session slot without a viewer. The retry
+        // loop reaches an over-budget xite at boot long before any wrapper
+        // binds; a prompt raised then buffers unseen, `confirm` times out to
+        // false, and the consumed slot would silence BOTH this prompt and
+        // the page's own optional prompt for the whole session (they share
+        // the set). No viewer -> skip quietly; a later pass re-offers while
+        // the page is actually open.
+        if !self.has_bound_conn(address) {
+            return;
+        }
+        if !self.optional_prompts.lock().unwrap().insert(address.to_string()) {
+            return;
+        }
+        let reader = self.config_bool("full_retention", false).await;
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        let body = if reader {
+            format!(
+                "Your \"Keep a full copy of every xite\" setting wants to download \
+                 the rest of this xite: {files} file(s) ({mb:.1} MB), more than its \
+                 current size limit allows.<br>\
+                 Enable optional file downloads for this xite? (Turning the \
+                 setting off in Config stops these requests.)"
+            )
+        } else {
+            format!(
+                "This xite asks to be kept complete: {files} file(s) ({mb:.1} MB) \
+                 still missing, more than its current size limit allows.<br>\
+                 Enable optional file downloads for this xite?"
+            )
+        };
+        if self.confirm(address, &body, "Download").await {
+            self.set_download_optional(address, true, false).await;
+            self.spawn_retention_completion(address);
+        }
     }
 
     /// Background-fetch missing optional files with a completion notification -
@@ -9772,7 +10949,13 @@ impl AppState {
             .iter()
             .filter(|(_, x)| x.settings.serving)
             .filter_map(|(a, x)| {
-                if x.settings.download_optional || x.settings.autodownloadoptional {
+                // Only the help-distribute toggle is a whole-site promise.
+                // `download_optional` alone is the ON-DEMAND permission - the
+                // prompt path (prompt_optional_download) enables it to fetch
+                // exactly one requested file, and enrolling it here would
+                // start a full background pull of every optional file ~30s
+                // later, defeating that and any on-demand-only setup.
+                if x.settings.autodownloadoptional && x.settings.download_optional {
                     Some((a.clone(), None))
                 } else if !x.settings.optional_help.is_empty() {
                     Some((
@@ -9784,6 +10967,62 @@ impl AppState {
                 }
             })
             .collect()
+    }
+
+    /// The xites the reader's global `full_retention` setting watches: every
+    /// serving, non-own xite WITHOUT its own whole-site optional promise
+    /// (those are already covered by [`Self::optional_retry_flagged`]; a xite
+    /// with only directory-scoped `optionalHelp` commitments still needs the
+    /// full-retention pass for the rest of its files). This is what makes
+    /// "keep a full copy of every xite you visit" hold for xites visited
+    /// BEFORE the setting was turned on, and what heals a full copy as the
+    /// owner publishes new versions - the clone-time pass alone covers
+    /// neither. Empty when the setting is off.
+    async fn full_retention_watch(&self) -> Vec<String> {
+        if !self.config_bool("full_retention", false).await {
+            return Vec::new();
+        }
+        let xites = self.xites.read().await;
+        let mut watch: Vec<String> = xites
+            .iter()
+            .filter(|(_, x)| {
+                x.settings.serving
+                    && !x.settings.own
+                    && !(x.settings.download_optional || x.settings.autodownloadoptional)
+            })
+            .map(|(a, _)| a.clone())
+            .collect();
+        watch.sort();
+        watch
+    }
+
+    /// One full-retention candidate per retry tick: pace it like the optional
+    /// candidates, and when its plan still has work, run the CONSENT-GATED
+    /// retention pass - never the raw optional pass. The global setting
+    /// widens WHAT completes; the per-xite size budget (and its prompt) still
+    /// decides quietly-vs-ask.
+    async fn retry_retention_candidate(
+        self: &Arc<Self>,
+        addr: &str,
+        schedule: &mut HashMap<String, (u32, i64)>,
+    ) {
+        let key = format!("full:{addr}");
+        let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
+        if next_at > now_secs() {
+            return;
+        }
+        let plan = self.retention_completion_plan(addr).await;
+        if plan.paths.is_empty() {
+            // Full copy on disk: park on the slow re-verify interval (a
+            // dirty mark bypasses it the tick after new content lands).
+            schedule.insert(key, (0, now_secs() + 600));
+            return;
+        }
+        // Pace BEFORE spawning, like the optional candidates: `file_need`
+        // dedupes per file, so an overlapping pass is wasteful, not harmful.
+        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        schedule.insert(key, (fails + 1, now_secs() + delay));
+        self.spawn_retention_completion(addr);
     }
 
     /// Whether any file within a retry scope is still missing on disk.
@@ -9834,40 +11073,68 @@ impl AppState {
             // Per-xite schedule: (consecutive not-done passes, next check at).
             let mut schedule: HashMap<String, (u32, i64)> = HashMap::new();
             loop {
-                // Dirty addresses bypass their delay this tick.
-                for addr in state.optional_dirty.lock().unwrap().drain() {
-                    schedule.remove(&addr);
-                }
-                let flagged = state.optional_retry_flagged().await;
-                for (addr, dirs) in &flagged {
-                    state.retry_optional_candidate(addr, dirs, &mut schedule).await;
-                }
-                // Registered xites whose CORE files never completed - an
-                // interrupted or failed clone (the seeder was offline when
-                // siteAdd/siteDownload ran) - keep resuming the clone with
-                // the same backoff, until it lands or the user deletes the
-                // xite. Without this, one failed resolve left a permanently
-                // empty registered site that only a manual re-add would heal.
-                let core_watch: Vec<String> = {
-                    let xites = state.xites.read().await;
-                    xites
-                        .iter()
-                        .filter(|(_, x)| x.settings.serving && !x.settings.own)
-                        .map(|(a, _)| a.clone())
-                        .collect()
-                };
-                for addr in &core_watch {
-                    state.retry_clone_candidate(addr, &mut schedule).await;
-                }
-                // A xite that was toggled off, paused, or deleted leaves the
-                // watched sets - drop its schedule entries.
-                schedule.retain(|k, _| match k.strip_prefix("core:") {
-                    Some(a) => core_watch.iter().any(|w| w == a),
-                    None => flagged.iter().any(|(a, _)| a == k),
-                });
+                state.optional_retry_tick(&mut schedule).await;
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
         });
+    }
+
+    /// One tick of the optional retry loop: run every watched scope through
+    /// its candidate check, then prune schedule entries whose scope left the
+    /// watched sets (toggled off, paused, or deleted).
+    async fn optional_retry_tick(self: &Arc<Self>, schedule: &mut HashMap<String, (u32, i64)>) {
+        // Dirty addresses bypass their delay this tick.
+        for addr in self.optional_dirty.lock().unwrap().drain() {
+            schedule.remove(&format!("full:{addr}"));
+            schedule.remove(&addr);
+        }
+        let flagged = self.optional_retry_flagged().await;
+        for (addr, dirs) in &flagged {
+            self.retry_optional_candidate(addr, dirs, schedule).await;
+        }
+        // The reader's global full-retention promise rides the same loop:
+        // xites without their own optional promise get the consent-gated
+        // retention pass.
+        let full_watch = self.full_retention_watch().await;
+        for addr in &full_watch {
+            self.retry_retention_candidate(addr, schedule).await;
+        }
+        // Registered xites whose CORE files never completed - an interrupted
+        // or failed clone (the seeder was offline when siteAdd/siteDownload
+        // ran) - keep resuming the clone with the same backoff, until it
+        // lands or the user deletes the xite. Without this, one failed
+        // resolve left a permanently empty registered site that only a
+        // manual re-add would heal.
+        let core_watch: Vec<String> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(_, x)| x.settings.serving && !x.settings.own)
+                .map(|(a, _)| a.clone())
+                .collect()
+        };
+        for addr in &core_watch {
+            self.retry_clone_candidate(addr, schedule).await;
+        }
+        schedule.retain(|k, _| Self::retry_key_watched(k, &flagged, &full_watch, &core_watch));
+    }
+
+    /// Whether a schedule key still belongs to a watched scope: `core:` keys
+    /// follow the core clone watch, `full:` keys the retention watch, and
+    /// bare keys the per-xite optional promise.
+    fn retry_key_watched(
+        key: &str,
+        flagged: &[(String, Option<Vec<String>>)],
+        full_watch: &[String],
+        core_watch: &[String],
+    ) -> bool {
+        if let Some(a) = key.strip_prefix("core:") {
+            return core_watch.iter().any(|w| w == a);
+        }
+        if let Some(a) = key.strip_prefix("full:") {
+            return full_watch.iter().any(|w| w == a);
+        }
+        flagged.iter().any(|(a, _)| a == key)
     }
 
     /// One optional-scope candidate per retry tick: gate on its schedule, an
@@ -9958,7 +11225,15 @@ impl AppState {
             return;
         }
         self.log("INFO", format!("Resuming interrupted download of {addr}")).await;
-        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        // A xite the user is waiting on retries briskly. The common reason a
+        // first clone fails is transient and clears within a minute or two -
+        // the seeder's onion descriptor has not finished publishing to the
+        // HSDirs yet (1-3 min after it boots), so every dial to it fails until
+        // it has. Backing off to 10 minutes meant the node then SLEPT through
+        // the seeder becoming reachable and the page sat on the loading screen
+        // long after a retry would have worked. 20s doubling to 90s keeps a
+        // dead site cheap while catching a peer that just came up.
+        let delay = (20i64 * (1i64 << fails.min(3))).min(90);
         schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
         let state = self.clone();
         let addr = addr.to_string();
@@ -9986,7 +11261,12 @@ impl AppState {
         }
         match directory {
             Some(dir) => x.settings.optional_help.contains_key(dir),
-            None => x.settings.download_optional || x.settings.autodownloadoptional,
+            // BOTH must hold. With `||`, switching off "Download optional
+            // files" left a multi-GB prefetch running because the other toggle
+            // was still set - the user turned the thing off and it kept going,
+            // with no obvious way to stop it. Either switch is now an off
+            // switch, checked between files so it takes effect immediately.
+            None => x.settings.download_optional && x.settings.autodownloadoptional,
         }
     }
 
@@ -10225,30 +11505,7 @@ impl AppState {
         let total = todo.len();
         self.log("INFO", format!("Downloading {total} optional file(s) for {address}")).await;
         self.set_worker_stats(address, total, 1, total).await;
-        // Seed the live progress snapshot the sidebar renders: every file starts
-        // Pending, and the overall bar is sized by the sum of declared bytes.
-        let bytes_total: u64 = todo.iter().map(|(_, s)| *s).sum();
-        self.set_optional_progress(
-            address,
-            Some(OptionalProgress {
-                total_files: total,
-                done_files: 0,
-                failed_files: 0,
-                bytes_total,
-                bytes_done: 0,
-                current: String::new(),
-                status: String::new(),
-                files: todo
-                    .iter()
-                    .map(|(path, size)| OptionalProgressFile {
-                        path: path.clone(),
-                        size: *size,
-                        state: OptFileState::Pending,
-                    })
-                    .collect(),
-            }),
-        )
-        .await;
+        self.seed_optional_progress(address, &todo).await;
         self.push_site_info(address).await;
         // A cold registry (right after a restart) has no peers to try yet -
         // announce NOW instead of failing the whole pass and telling the user
@@ -10267,6 +11524,15 @@ impl AppState {
         // retried files flip back to Pending/Active in place in the file list.
         let mut queue: Vec<(usize, &String, u64)> =
             todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        self.edx_bulk_optional_pass(
+            address,
+            directory,
+            &todo,
+            &mut queue,
+            &mut fetched,
+            &mut bytes_done,
+        )
+        .await;
         for round in 1..=ROUNDS {
             let (requeue, aborted) = self
                 .run_optional_round(address, directory, &queue, round, ROUNDS, &mut fetched, &mut bytes_done)
@@ -10299,6 +11565,97 @@ impl AppState {
         )
         .await;
         (fetched, failed)
+    }
+
+    /// EDX-first bulk pass: dial the seed peers ONCE and pull every optional
+    /// file the verified-streaming path can serve, then the msgpack rounds
+    /// mop up only what EDX missed. Per-file bookkeeping (hashfield advertise,
+    /// optional_downloaded, finished stamp) happens in edx_materialize_file, so
+    /// an EDX-fetched optional file seeds just like a msgpack-fetched one. A
+    /// legacy site (no `b3`) resolves nothing and this returns at once, leaving
+    /// the whole queue to the rounds. What it fetched is dropped from `queue`
+    /// and added to the counters, so the rounds never re-try a done file.
+    ///
+    /// Batched in `EDX_BULK_OPTIONAL_CHUNK`-file chunks with the same mandate
+    /// check the msgpack rounds do between files: one `edx_fetch_files` call is
+    /// a single uncancellable await, so handing it the whole queue would let a
+    /// toggled-off, paused or deleted xite keep pulling multi-GB files to the
+    /// end of the list.
+    async fn edx_bulk_optional_pass<'a>(
+        &self,
+        address: &str,
+        directory: Option<&str>,
+        todo: &'a [(String, u64)],
+        queue: &mut Vec<(usize, &'a String, u64)>,
+        fetched: &mut usize,
+        bytes_done: &mut u64,
+    ) {
+        if queue.is_empty() {
+            return;
+        }
+        let peers = self.fetch_candidate_peers(address, 20).await;
+        if peers.is_empty() {
+            return;
+        }
+        // Owned so the chunk loop does not borrow `queue`, which it mutates.
+        let paths: Vec<String> = todo.iter().map(|(p, _)| p.clone()).collect();
+        for chunk in paths.chunks(EDX_BULK_OPTIONAL_CHUNK) {
+            if !self.optional_pass_should_continue(address, directory).await {
+                return;
+            }
+            let want: Vec<EdxWant> = chunk
+                .iter()
+                .map(|p| EdxWant { inner_path: p.clone(), id: None, size: None })
+                .collect();
+            let Some(batch) = self.edx_fetch_files(address, want, peers.clone(), None).await else {
+                return;
+            };
+            if batch.bytes > 0 {
+                self.add_transfer(address, batch.bytes, 0).await;
+            }
+            let done: std::collections::HashSet<&str> =
+                batch.done.iter().map(|s| s.as_str()).collect();
+            if done.is_empty() {
+                continue;
+            }
+            for (idx, path, size) in queue.iter() {
+                if done.contains(path.as_str()) {
+                    *fetched += 1;
+                    *bytes_done += *size;
+                    self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
+                    self.push_site_info_file_done(address, path, None).await;
+                }
+            }
+            self.bump_optional_progress(address, *fetched, 0, *bytes_done).await;
+            queue.retain(|(_, path, _)| !done.contains(path.as_str()));
+        }
+    }
+
+    /// Seed the live progress snapshot the sidebar renders: every file starts
+    /// Pending, and the overall bar is sized by the sum of declared bytes.
+    async fn seed_optional_progress(&self, address: &str, todo: &[(String, u64)]) {
+        let bytes_total: u64 = todo.iter().map(|(_, s)| *s).sum();
+        self.set_optional_progress(
+            address,
+            Some(OptionalProgress {
+                total_files: todo.len(),
+                done_files: 0,
+                failed_files: 0,
+                bytes_total,
+                bytes_done: 0,
+                current: String::new(),
+                status: String::new(),
+                files: todo
+                    .iter()
+                    .map(|(path, size)| OptionalProgressFile {
+                        path: path.clone(),
+                        size: *size,
+                        state: OptFileState::Pending,
+                    })
+                    .collect(),
+            }),
+        )
+        .await;
     }
 
     /// The declared optional files not present on disk, as site-relative inner
@@ -10341,6 +11698,217 @@ impl AppState {
             .collect()
     }
 
+    /// What a background completion pass would still fetch for `address` under
+    /// the owner's signed `distribution` policy (issue #340): the missing
+    /// declared files - required and optional - whose unit committed to
+    /// `retention:complete`, plus whether fetching them would push the xite
+    /// past its size limit and so needs the user's consent.
+    ///
+    /// `retention:partial` paths are absent from the plan by construction:
+    /// those keep today's fetch-what-you-view behavior. The exception is the
+    /// global `full_retention` setting: a reader who turned it on replicates
+    /// every xite fully, so the plan covers ALL missing declared files
+    /// regardless of the owner's carve-outs. Retention is a floor, not a
+    /// ceiling - holding more than the owner asked for breaks no commitment -
+    /// and the size-limit consent gate applies unchanged.
+    pub async fn retention_completion_plan(
+        &self,
+        address: &str,
+    ) -> epix_blob::policy::CompletionPlan {
+        let reader = self.config_bool("full_retention", false).await;
+        self.retention_completion_plan_as(address, reader).await
+    }
+
+    /// [`Self::retention_completion_plan`] with the reader-override decision
+    /// made by the CALLER. A pass that later re-checks its mandate must
+    /// classify itself with the SAME snapshot the plan was built from - two
+    /// separate config reads let a mid-build toggle produce a site-sized
+    /// override plan whose pass believes it is owner-driven and so never
+    /// stops when the setting goes off.
+    async fn retention_completion_plan_as(
+        &self,
+        address: &str,
+        reader: bool,
+    ) -> epix_blob::policy::CompletionPlan {
+        let Some((storage, content, stats)) = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| {
+                (x.storage.clone(), x.content.clone(), x.settings.cache.optional_stats.clone())
+            })
+        else {
+            return Default::default();
+        };
+        let Some(content) = content else {
+            return Default::default();
+        };
+        let policy = if reader {
+            epix_blob::policy::DistributionPolicy::complete_everything()
+        } else {
+            epix_blob::policy::DistributionPolicy::from_content(&content)
+        };
+
+        // One SIZE-ONLY inventory of every declared file - required and
+        // optional, root and child units alike. `missing` and `present` come
+        // from the SAME walk, so a held byte the walk can see is always
+        // charged against the budget (settings stats are root-only and reset
+        // on every root update, which silently dropped child-unit bytes; an
+        // optional-only walk missed the child units' required per-user data,
+        // the dominant bytes on a hub). No hashing here - this runs from the
+        // background retry tick, and hashing every declared file of every
+        // watched xite each pass reads and SHA512s entire sites forever
+        // (corruption is still caught at serve/verify/resync time).
+        let mut missing: Vec<(String, u64)> = Vec::new();
+        let mut present: u64 = 0;
+        // Required files: present = exists at the declared size. A required
+        // bigfile counts as present at full sparse size - piece-level
+        // completion belongs to the bigfile machinery, and (unlike optional
+        // files) there is no completion stamp to consult, so counting it
+        // missing would re-plan it forever.
+        for f in declared_files_under(&storage, Some(&content), "files") {
+            let size = f.size.max(0) as u64;
+            let at_size = storage
+                .path(&f.inner_path)
+                .ok()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len() as i64 == f.size)
+                .unwrap_or(false);
+            if at_size {
+                present = present.saturating_add(size);
+            } else {
+                missing.push((f.inner_path, size));
+            }
+        }
+        for f in declared_files_under(&storage, Some(&content), "files_optional") {
+            let size = f.size.max(0) as u64;
+            if optional_file_present(&storage, &stats, &f.inner_path, f.size, f.bigfile) {
+                present = present.saturating_add(size);
+            } else {
+                missing.push((f.inner_path, size));
+            }
+        }
+
+        // The consent budget charges what is ALREADY held against the xite's
+        // size limit, so completion can never quietly overshoot the cap: the
+        // gate compares the size AFTER completing (present + planned) with
+        // the limit, not the increment alone.
+        let limit = self.size_limit_bytes(address).await.max(0) as u64;
+        policy.completion_plan(&missing, limit.saturating_sub(present))
+    }
+
+    /// Finish a `retention:complete` unit in the BACKGROUND, after first paint.
+    ///
+    /// The three locked rules of issue #340 live here:
+    /// 1. STREAM-FIRST ALWAYS. This is spawned once the core set is on disk and
+    ///    the loading screen is gone, and it only ever fetches what is still
+    ///    missing, so a package unit can never block the first render on a full
+    ///    download.
+    /// 2. CONSENT-GATED, reusing the existing machinery. While the xite stays
+    ///    within its `size_limit` (bytes already held count against it) the
+    ///    unit completes quietly; over it we ask through the same wrapper
+    ///    confirm flow, worded for the ACTUAL scope
+    ///    ([`Self::prompt_retention_completion`]), and skip until the user
+    ///    says yes.
+    /// 3. Availability advertising is untouched: we keep advertising per-chunk
+    ///    partial ranges while completing, so the swarm self-completes.
+    ///    Complete-or-unavailable is an OUTPUT rule - a file only reaches the
+    ///    app after it verifies whole, which
+    ///    [`Self::edx_materialize_file`] already enforces - never a reason to
+    ///    hide availability.
+    pub fn spawn_retention_completion(self: &Arc<Self>, address: &str) {
+        let state = self.clone();
+        let address = address.to_string();
+        tokio::spawn(async move {
+            // One snapshot of the override decides BOTH the plan's scope and
+            // the pass's mandate class - see retention_completion_plan_as.
+            let reader = state.config_bool("full_retention", false).await;
+            let plan = state.retention_completion_plan_as(&address, reader).await;
+            if plan.paths.is_empty() {
+                return;
+            }
+            if plan.needs_consent && !state.optional_fetch_allowed(&address).await {
+                // Over the budget and no standing consent: ask once per xite
+                // per session, scoped to what would ACTUALLY happen (file
+                // count, total bytes, and on whose behalf), and stop.
+                // Accepting re-runs this pass with the consent in place.
+                state
+                    .prompt_retention_completion(&address, plan.paths.len(), plan.bytes)
+                    .await;
+                return;
+            }
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "Completing {} retention:complete file(s) for {address} ({} bytes)",
+                        plan.paths.len(),
+                        plan.bytes
+                    ),
+                )
+                .await;
+            state.run_retention_pass(&address, plan.paths, reader, plan.needs_consent).await;
+        });
+    }
+
+    /// The body of a retention pass: fetch each planned path while the
+    /// mandate holds. Sequential and unhurried - this is background work
+    /// behind an already-painted page, and `file_need` dedupes against any
+    /// fetch the page itself started. The mandate is re-checked between
+    /// files: a plan can be site-sized, and pausing the xite or withdrawing
+    /// the setting/consent must stop it HERE, not only block the next pass.
+    /// Returns how many paths were attempted (a withdrawal stops the walk).
+    async fn run_retention_pass(
+        self: &Arc<Self>,
+        address: &str,
+        paths: Vec<String>,
+        reader: bool,
+        consented: bool,
+    ) -> usize {
+        let mut attempted = 0usize;
+        for path in paths {
+            if !self.retention_pass_should_continue(address, reader, consented).await {
+                break;
+            }
+            attempted += 1;
+            let _ = self.file_need(address, &path).await;
+        }
+        attempted
+    }
+
+    /// Whether an in-flight retention pass still has its mandate: the xite is
+    /// still served here (pause/delete withdraws it), the global setting - for
+    /// a reader-driven pass - is still on, and the optional-download consent,
+    /// when the plan needed it, still stands. The bulk optional pass keeps the
+    /// same promise through `optional_pass_should_continue`; without this a
+    /// site-sized pass would keep downloading for hours after the user said
+    /// stop.
+    async fn retention_pass_should_continue(
+        &self,
+        address: &str,
+        reader_driven: bool,
+        consented: bool,
+    ) -> bool {
+        let serving = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.serving)
+            .unwrap_or(false);
+        if !serving {
+            return false;
+        }
+        if reader_driven && !self.config_bool("full_retention", false).await {
+            return false;
+        }
+        if consented && !self.optional_fetch_allowed(address).await {
+            return false;
+        }
+        true
+    }
+
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
     /// Returns false if the xite isn't served here.
     pub async fn rebuild_xite_db(&self, address: &str) -> bool {
@@ -10377,11 +11945,12 @@ impl AppState {
     pub async fn remove_xite(&self, address: &str) -> bool {
         let mut roots = Vec::new();
         let mut removed_keys = Vec::new();
+        let canonical;
         {
             let mut xites = self.xites.write().await;
             // Canonical (signed content) address of the target, alias-aware.
             let Some(x) = self.resolve_xite(&xites, address) else { return false };
-            let canonical = canonical_address(x.content.as_ref(), address);
+            canonical = canonical_address(x.content.as_ref(), address);
             // Remove every serving key that shares this canonical address.
             let keys: Vec<String> = xites
                 .iter()
@@ -10408,6 +11977,15 @@ impl AppState {
         // stays deleted across restarts.
         for root in roots {
             let _ = std::fs::remove_dir_all(&root);
+        }
+        // The derived feed artifacts hold the whole record set in memory; a
+        // deleted site's copy would stay resident until restart.
+        {
+            let mut cache = self.feed_cache.write().await;
+            cache.remove(&canonical);
+            for key in &removed_keys {
+                cache.remove(key);
+            }
         }
         // EpixNet parity (`user.deleteSiteData`): forget the site's derived
         // auth identity, cert selection, and feed follows. Harmless to the
@@ -10838,34 +12416,6 @@ fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, D
     Some((db, schema))
 }
 
-/// Create (or right-size) a file at `size` bytes so pieces can be written into
-/// it sparsely at their offsets.
-fn ensure_sparse_file(storage: &XiteStorage, inner_path: &str, size: u64) -> Result<(), String> {
-    let path = storage.path(inner_path).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let wrong_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX) != size;
-    if wrong_size {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
-        f.set_len(size).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Write `data` at `offset` in an existing file.
-fn write_at(storage: &XiteStorage, inner_path: &str, offset: u64, data: &[u8]) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom, Write};
-    let path = storage.path(inner_path).map_err(|e| e.to_string())?;
-    let mut f = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| e.to_string())?;
-    f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
-    f.write_all(data).map_err(|e| e.to_string())
-}
-
 /// Whether the piece at `offset` (length `len`) is present and matches `hash`.
 fn piece_present(storage: &XiteStorage, inner_path: &str, offset: u64, len: u64, hash: &str) -> bool {
     use std::io::{Read, Seek, SeekFrom};
@@ -11010,6 +12560,19 @@ struct DeclaredOptional {
 /// directory. Root-only readers (`Xite::optional_files`) miss the per-user
 /// files entirely, which left a hub's Files-tab list empty.
 fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Vec<DeclaredOptional> {
+    declared_files_under(storage, content, "files_optional")
+}
+
+/// Every file the root content.json and the child content.json units ON DISK
+/// declare under `key` (`"files"` or `"files_optional"`), child paths
+/// prefixed with their unit's directory. The retention inventory needs BOTH
+/// keys: on user-content hubs the dominant bytes are the child units'
+/// required `files` (per-user data), which no optional-only walk sees.
+fn declared_files_under(
+    storage: &XiteStorage,
+    content: Option<&Value>,
+    key: &str,
+) -> Vec<DeclaredOptional> {
     let mut out = Vec::new();
     let mut scan = |files: Option<&Value>, dir: &str| {
         let Some(files) = files.and_then(|f| f.as_object()) else { return };
@@ -11028,7 +12591,7 @@ fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Ve
             });
         }
     };
-    scan(content.and_then(|c| c.get("files_optional")), "");
+    scan(content.and_then(|c| c.get(key)), "");
     for child in storage.list_files() {
         if !child.ends_with("/content.json") || child == "content.json" {
             continue;
@@ -11036,7 +12599,7 @@ fn declared_optional_files(storage: &XiteStorage, content: Option<&Value>) -> Ve
         let Ok(bytes) = storage.read(&child) else { continue };
         let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { continue };
         let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        scan(json.get("files_optional"), dir);
+        scan(json.get(key), dir);
     }
     out
 }
@@ -11249,6 +12812,132 @@ mod tests {
         let all = state.all_trackers(&bootstrap).await;
         assert_eq!(all.iter().filter(|t| **t == mk("1.1.1.1:26959")).count(), 1);
         assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn tracker_list_is_canonical_and_deduped() {
+        let state = AppState::new("test");
+        state.config_set("shared_trackers", json!(["1.1.1.1:26959", "epix://2.2.2.2:26959"])).await;
+        state.set_extra_trackers(vec![
+            epix_xite::Tracker::Epix(PeerAddr::parse("2.2.2.2:26959").unwrap()),
+            epix_xite::Tracker::Epix(PeerAddr::parse("3.3.3.3:26959").unwrap()),
+        ])
+        .await;
+        // Every entry comes out in the transport-explicit spelling the
+        // receiver parses back, and the shared/extra overlap appears once.
+        assert_eq!(
+            state.tracker_list().await,
+            vec![
+                "tcp://1.1.1.1:26959".to_string(),
+                "tcp://2.2.2.2:26959".to_string(),
+                "tcp://3.3.3.3:26959".to_string(),
+            ]
+        );
+        for t in state.tracker_list().await {
+            assert!(epix_xite::Tracker::parse(&t).is_some(), "unparseable: {t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn announce_serve_answers_in_request_order() {
+        use epix_discovery::tracker_pc::AnnounceReq;
+
+        let state = AppState::new("test");
+        let (h1, h2) = ([1u8; 32], [2u8; 32]);
+        let announcer = PeerAddr::parse("8.8.8.8:1111").unwrap();
+        let req = |hashes: Vec<[u8; 32]>| AnnounceReq {
+            hashes,
+            port: 15441,
+            need_types: vec!["ipv4".into()],
+            need_num: 20,
+            add: vec!["ipv4".into()],
+            ..Default::default()
+        };
+        // One peer registers under h1 only.
+        state.announce_serve(&req(vec![h1]), &announcer).await;
+
+        // A second announcer asks about h2 then h1: one bucket set per hash,
+        // in the order asked.
+        let other = PeerAddr::parse("9.9.9.9:2222").unwrap();
+        let resp = state.announce_serve(&req(vec![h2, h1]), &other).await;
+        assert_eq!(resp.peers.len(), 2);
+        assert!(resp.error.is_empty());
+        assert!(resp.peers[0].ipv4.is_empty(), "nobody announced h2 yet");
+        assert_eq!(resp.peers[1].unpack(), vec![PeerAddr::parse("8.8.8.8:15441").unwrap()]);
+
+        // No hashes: nothing recorded, nothing returned.
+        assert!(state.announce_serve(&req(Vec::new()), &other).await.peers.is_empty());
+
+        // Disabled tracker reports the refusal instead of an empty list.
+        state.config_set("tracker", json!("disable")).await;
+        let resp = state.announce_serve(&req(vec![h1]), &other).await;
+        assert_eq!(resp.error, "Tracker disabled");
+        assert!(resp.peers.is_empty());
+    }
+
+    #[test]
+    fn overlay_self_host_shapes_are_screened() {
+        // v2 (16 char) and v3 (56 char) onion b32 hosts.
+        assert!(AppState::is_overlay_self_host("abcdefghij234567", true));
+        assert!(AppState::is_overlay_self_host(&"a".repeat(56), true));
+        // Anything else a peer could park in the tracker db.
+        assert!(!AppState::is_overlay_self_host("", true));
+        assert!(!AppState::is_overlay_self_host("tooshort", true));
+        assert!(!AppState::is_overlay_self_host(&"a".repeat(57), true));
+        assert!(!AppState::is_overlay_self_host(&format!("{}-", "a".repeat(15)), true));
+
+        // i2p: the 52 char b32 label, with or without the `.b32` the
+        // transport carries. Never the full `.i2p` host.
+        let b32 = "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa";
+        assert_eq!(b32.len(), 52);
+        assert!(AppState::is_overlay_self_host(b32, false));
+        assert!(AppState::is_overlay_self_host(&format!("{b32}.b32"), false));
+        assert!(!AppState::is_overlay_self_host(&format!("{b32}.i2p"), false));
+        assert!(!AppState::is_overlay_self_host("", false));
+        assert!(!AppState::is_overlay_self_host("abcdefghij234567", false));
+    }
+
+    #[tokio::test]
+    async fn announce_serve_caps_hashes_and_screens_claimed_overlay_addrs() {
+        use epix_discovery::tracker_pc::AnnounceReq;
+
+        let state = AppState::new("test");
+        let hashes: Vec<[u8; 32]> = (0..200u16)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..2].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+        let onion = "a".repeat(56);
+        let req = AnnounceReq {
+            hashes: hashes.clone(),
+            port: 26959,
+            need_types: vec!["onion".into()],
+            need_num: 20,
+            add: vec!["onion".into()],
+            onions: vec![onion.clone(), "not a real onion".into()],
+            ..Default::default()
+        };
+        let announcer = PeerAddr::parse("8.8.8.8:1111").unwrap();
+        let resp = state.announce_serve(&req, &announcer).await;
+        // 200 hashes in one small request would build a reply that cannot be
+        // framed; only the cap is answered.
+        assert_eq!(resp.peers.len(), AppState::ANNOUNCE_HASH_CAP);
+        // Only the well-formed onion was stored, under each named hash - the
+        // junk claim never entered the db.
+        assert_eq!(state.tracker_stats().await, (hashes.len(), hashes.len()));
+
+        // And it is what we hand back to the next requester.
+        let ask = AnnounceReq {
+            hashes: vec![hashes[0]],
+            need_types: vec!["onion".into()],
+            need_num: 20,
+            ..Default::default()
+        };
+        let other = PeerAddr::parse("9.9.9.9:2222").unwrap();
+        let resp = state.announce_serve(&ask, &other).await;
+        assert_eq!(resp.peers[0].unpack(), vec![PeerAddr::Onion { host: onion, port: 26959 }]);
     }
 
     #[tokio::test]
@@ -11972,6 +13661,299 @@ mod tests {
         state.ingest_file(addr, "index.html").await;
     }
 
+    /// A resync stages its new content.json without committing it, so EDX must
+    /// resolve the changed files against that STAGED manifest's b3 (the
+    /// committed one is the stale version). edx_want_from_staged reads b3+size
+    /// straight from a content.json Value, and returns None when the file is
+    /// absent or un-b3'd (so it falls back to committed resolution).
+    #[test]
+    fn edx_want_from_staged_resolves_against_the_new_manifest() {
+        let id = epix_blob::ObjId::of(b"the new data.json bytes");
+        let content = json!({
+            "files": { "data.json": { "b3": id.to_string(), "size": 4242 } }
+        });
+        assert_eq!(edx_want_from_staged(&content, "data.json"), Some((id, 4242)));
+        // Absent file, or a file with no b3, resolves to None (falls back).
+        assert_eq!(edx_want_from_staged(&content, "missing.json"), None);
+        let no_b3 = json!({ "files": { "x": { "size": 1 } } });
+        assert_eq!(edx_want_from_staged(&no_b3, "x"), None);
+    }
+
+    /// push_update_to_peer maps the EDX push result to a peer outcome, and -
+    /// the reputation-critical part - scores a timeout that fires AFTER the
+    /// link came up as Refused (peer alive), not Unreachable, so a slow-but-
+    /// live overlay peer is not backed off and evicted.
+    #[tokio::test(start_paused = true)]
+    async fn edx_push_outcomes_map_and_score_timeouts() {
+        // 0 = accept, 1 = refuse, 2 = unreachable, 3 = come up then hang.
+        struct MockPush {
+            mode: u8,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for MockPush {
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+            ) -> HashMap<String, Vec<u8>> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _peer: PeerAddr,
+                _address: &str,
+                _inner_path: &str,
+                _signed: Arc<Vec<u8>>,
+                _modified: f64,
+                _diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+                _sender_peers: Arc<Vec<String>>,
+                progressed: Arc<AtomicBool>,
+            ) -> Result<(), EdxPushError> {
+                match self.mode {
+                    0 => Ok(()),
+                    1 => Err(EdxPushError::Refused("nope".into())),
+                    2 => Err(EdxPushError::Unreachable("dead".into())),
+                    _ => {
+                        // The link came up, then the request stalls past the
+                        // deadline.
+                        progressed.store(true, Ordering::Relaxed);
+                        std::future::pending().await
+                    }
+                }
+            }
+            async fn fetch_files(
+                &self,
+                _: &str,
+                _: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
+                unreachable!()
+            }
+        }
+
+        let peer = PeerAddr::Ip("1.2.3.4:15441".parse().unwrap());
+        async fn run(mode: u8, peer: PeerAddr) -> PushOutcome {
+            push_update_to_peer(
+                Arc::new(MockPush { mode }),
+                peer,
+                "1Site".into(),
+                "content.json".into(),
+                Arc::new(vec![1, 2, 3]),
+                1.0,
+                Arc::new(HashMap::new()),
+                Arc::new(vec![]),
+            )
+            .await
+        }
+
+        assert!(matches!(run(0, peer.clone()).await, PushOutcome::Accepted(_)));
+        assert!(matches!(run(1, peer.clone()).await, PushOutcome::Refused(..)));
+        assert!(matches!(run(2, peer.clone()).await, PushOutcome::Unreachable(_)));
+        // Came up then timed out -> Refused (alive), NOT Unreachable.
+        assert!(matches!(run(3, peer.clone()).await, PushOutcome::Refused(..)));
+    }
+
+    /// A body-less push (the publisher dropped a >1 MB content.json) with no
+    /// usable sender wire address must still be fetched back: the push carries
+    /// the publisher's own dialable addresses, and the first one that answers
+    /// wins. Without the fallback the update was simply lost.
+    #[tokio::test]
+    async fn bodyless_push_refetches_from_the_advertised_publisher_addrs() {
+        struct Refetch {
+            good: PeerAddr,
+            signed: Vec<u8>,
+            tried: Arc<std::sync::Mutex<Vec<PeerAddr>>>,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for Refetch {
+            async fn fetch_signed(
+                &self,
+                peer: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
+                self.tried.lock().unwrap().push(peer.clone());
+                if peer == self.good {
+                    Ok(Some(self.signed.clone()))
+                } else {
+                    Err("unreachable".into())
+                }
+            }
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+            ) -> HashMap<String, Vec<u8>> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+                _: Arc<Vec<u8>>,
+                _: f64,
+                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+                _: Arc<Vec<String>>,
+                _: Arc<AtomicBool>,
+            ) -> Result<(), EdxPushError> {
+                unreachable!()
+            }
+            async fn fetch_files(
+                &self,
+                _: &str,
+                _: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
+                unreachable!()
+            }
+        }
+
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let mut v1 = json!({ "address": address, "modified": 1000, "files": {} });
+        epix_content::sign(&mut v1, &privkey).unwrap();
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("content.json", &serde_json::to_vec(&v1).unwrap()).unwrap();
+        let state = AppState::new("test");
+        state.add_xite(&address, XiteEntry { storage, content: Some(v1) }).await;
+
+        let mut v2 = json!({ "address": address, "modified": 2000, "files": {} });
+        epix_content::sign(&mut v2, &privkey).unwrap();
+
+        let dead = PeerAddr::parse("10.0.0.1:26959").unwrap();
+        let good = PeerAddr::parse("10.0.0.2:26959").unwrap();
+        let tried = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_edx_fetcher(Arc::new(Refetch {
+                good: good.clone(),
+                signed: serde_json::to_vec(&v2).unwrap(),
+                tried: tried.clone(),
+            }))
+            .await;
+
+        // No body and no sender address: only the advertised addresses are left.
+        let applied = state
+            .apply_inbound_update(
+                &address,
+                "content.json",
+                None,
+                None,
+                None,
+                Default::default(),
+                vec![dead.clone(), good.clone()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied, InboundUpdate::Applied);
+        // Tried in order, stopping at the first that answered.
+        assert_eq!(*tried.lock().unwrap(), vec![dead, good]);
+        assert_eq!(state.content(&address).await.unwrap()["modified"].as_i64(), Some(2000));
+    }
+
     /// A pushed user-content update whose data file arrives as a DIFF PATCH
     /// (not a download) must still be ingested into the xite db. The patched
     /// file verifies against the pushed content.json, so the download list
@@ -12121,6 +14103,445 @@ mod tests {
         // Unbinding the last connection stops delivery again.
         state.unregister_bound_conn(addr, 42);
         assert!(!state.has_bound_conn(addr));
+    }
+
+    /// A `retention:complete` package unit does NOT block first paint - the
+    /// completion set is computed as a background plan over what is still
+    /// missing - and it honours the xite's size limit through the same
+    /// optional-download consent the rest of the node uses.
+    #[tokio::test]
+    async fn package_unit_completes_after_first_paint_within_the_size_limit() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // First paint is already on disk; the rest of the package is not.
+        let shell: &[u8] = b"<html>shell</html>";
+        storage.write("index.html", shell).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": {
+                "default": {"unit": "package", "retention": "complete"},
+                "paths": { "data/feed/": {"unit": "feed", "retention": "partial"} }
+            },
+            "files": {
+                "index.html": { "size": shell.len(), "sha512": XiteStorage::hash_bytes(shell) },
+                "js/app.js": { "size": 2 * 1024 * 1024, "sha512": "aa" },
+            },
+            "files_optional": {
+                "data/feed/seg7.bin": { "size": 900 * 1024 * 1024, "sha512": "bb" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        // The default size limit (DEFAULT_SIZE_LIMIT_MB = 1000 MB) covers the
+        // 2 MB remainder -> completes quietly. index.html verifies on disk, so
+        // first paint is NOT in the plan: streaming already delivered it,
+        // completion is only the rest.
+        let plan = state.retention_completion_plan(addr).await;
+        assert_eq!(plan.paths, vec!["js/app.js".to_string()], "only the missing complete-unit file");
+        assert!(!plan.paths.contains(&"index.html".to_string()), "first paint is not re-fetched");
+        assert!(
+            !plan.paths.contains(&"data/feed/seg7.bin".to_string()),
+            "retention:partial feed stays fetch-what-you-view"
+        );
+        assert_eq!(plan.bytes, 2 * 1024 * 1024);
+        assert!(!plan.needs_consent, "under the size limit -> completes quietly");
+
+        // Drop the limit below the remainder: the same plan now needs the
+        // existing optional-download consent, which this xite has not given.
+        state.set_size_limit(addr, 1).await;
+        let gated = state.retention_completion_plan(addr).await;
+        assert_eq!(gated.paths, vec!["js/app.js".to_string()]);
+        assert!(gated.needs_consent, "over the size limit -> consent gate");
+        assert!(!state.optional_fetch_allowed(addr).await, "no standing consent");
+
+        // Granting the standing consent (the familiar toggle) clears the gate.
+        assert!(state.set_autodownloadoptional(addr, true).await);
+        assert!(state.optional_fetch_allowed(addr).await);
+
+        // A xite declaring no distribution policy completes nothing at all.
+        let bare_dir = tempdir().unwrap();
+        let bare = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state
+            .add_xite(
+                bare,
+                XiteEntry {
+                    storage: XiteStorage::new(bare_dir.path()),
+                    content: Some(json!({
+                        "address": bare, "modified": 1.0,
+                        "files": { "big.bin": { "size": 99, "sha512": "cc" } }
+                    })),
+                },
+            )
+            .await;
+        assert!(
+            state.retention_completion_plan(bare).await.paths.is_empty(),
+            "no declared retention -> partial default, nothing to complete"
+        );
+    }
+
+    /// The global `full_retention` setting makes a reader replicate every xite
+    /// fully: the plan covers ALL missing declared files, including the
+    /// owner's `retention:partial` carve-outs and xites that declared no
+    /// distribution policy at all. The size-limit consent gate is unchanged -
+    /// the override widens what completes, not who decides.
+    #[tokio::test]
+    async fn full_retention_setting_plans_every_missing_path() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": {
+                "default": {"unit": "package", "retention": "complete"},
+                "paths": { "data/feed/": {"unit": "feed", "retention": "partial"} }
+            },
+            "files": {
+                "js/app.js": { "size": 2 * 1024 * 1024, "sha512": "aa" },
+            },
+            "files_optional": {
+                "data/feed/seg7.bin": { "size": 3 * 1024 * 1024, "sha512": "bb" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        // Owner policy alone: the partial feed stays out of the plan.
+        let owner = state.retention_completion_plan(addr).await;
+        assert_eq!(owner.paths, vec!["js/app.js".to_string()]);
+
+        // Override on: the feed carve-out is planned too, well under the
+        // default limit (DEFAULT_SIZE_LIMIT_MB = 1000 MB) -> still quiet.
+        state.config_set("full_retention", Value::from("true")).await;
+        let full = state.retention_completion_plan(addr).await;
+        assert_eq!(
+            full.paths,
+            vec!["data/feed/seg7.bin".to_string(), "js/app.js".to_string()],
+            "every missing declared file is planned"
+        );
+        assert_eq!(full.bytes, 5 * 1024 * 1024);
+        assert!(!full.needs_consent, "under the size limit -> completes quietly");
+
+        // The consent gate still holds when the plan outgrows the limit.
+        state.set_size_limit(addr, 1).await;
+        assert!(state.retention_completion_plan(addr).await.needs_consent);
+
+        // A bare xite (no distribution declared) is also fully replicated.
+        let bare_dir = tempdir().unwrap();
+        let bare = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state
+            .add_xite(
+                bare,
+                XiteEntry {
+                    storage: XiteStorage::new(bare_dir.path()),
+                    content: Some(json!({
+                        "address": bare, "modified": 1.0,
+                        "files": { "big.bin": { "size": 99, "sha512": "cc" } }
+                    })),
+                },
+            )
+            .await;
+        assert_eq!(
+            state.retention_completion_plan(bare).await.paths,
+            vec!["big.bin".to_string()],
+            "undeclared xites are fully replicated under the override"
+        );
+
+        // Off again: back to the owner's declaration.
+        state.config_set("full_retention", Value::from("false")).await;
+        assert_eq!(state.retention_completion_plan(addr).await.paths, vec!["js/app.js".to_string()]);
+    }
+
+    /// The schema default for `full_retention` must be OFF. The Config page
+    /// renders an unset bool from this schema row and persists every bool on
+    /// any save, so a drifted default would silently enroll fresh installs in
+    /// whole-network replication. `config_bool` call sites must mirror it
+    /// (their doc says so); this pins the schema side.
+    #[test]
+    fn full_retention_schema_default_is_off() {
+        let row = CONFIG_SCHEMA
+            .iter()
+            .find(|(_, key, ..)| *key == "full_retention")
+            .expect("full_retention must be in CONFIG_SCHEMA");
+        assert_eq!(row.3, "false", "full replication must be opt-in");
+        assert_eq!(row.4, "bool");
+    }
+
+    /// The consent gate charges bytes ALREADY held against the size limit:
+    /// a plan that fits the limit on its own but would push the xite past it
+    /// must prompt. Regression: the gate used to compare only the increment,
+    /// so a xite could quietly grow to nearly twice its consented cap.
+    #[tokio::test]
+    async fn completion_consent_counts_bytes_already_on_disk() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // 700 KB already on disk (verifies against its declared hash), 500 KB
+        // missing, and a 1 MB size limit: the missing 500 KB fits the limit
+        // alone but not on top of what is held.
+        let held = vec![0xEEu8; 700 * 1024];
+        storage.write("held.bin", &held).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": { "default": {"unit": "package", "retention": "complete"} },
+            "files": {
+                "held.bin": { "size": held.len(), "sha512": XiteStorage::hash_bytes(&held) },
+                "missing.bin": { "size": 500 * 1024, "sha512": "aa" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_size_limit(addr, 1).await;
+
+        let plan = state.retention_completion_plan(addr).await;
+        assert_eq!(plan.paths, vec!["missing.bin".to_string()]);
+        assert_eq!(plan.bytes, 500 * 1024);
+        assert!(
+            plan.needs_consent,
+            "500 KB fits 1 MB alone, but not on top of the 700 KB already held"
+        );
+
+        // With room for both (2 MB limit), it completes quietly again.
+        state.set_size_limit(addr, 2).await;
+        assert!(!state.retention_completion_plan(addr).await.needs_consent);
+    }
+
+    /// `full_retention_watch` is the set the retry loop drives the global
+    /// promise over: serving, not own, and no whole-site optional promise of
+    /// its own. A directory-scoped optionalHelp commitment does NOT exclude a
+    /// xite - the rest of its files still need the retention pass. Empty when
+    /// the setting is off.
+    #[tokio::test]
+    async fn full_retention_watch_covers_only_unpromised_xites() {
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        let mut addrs = Vec::new();
+        for _ in 0..4 {
+            let dir = tempdir().unwrap();
+            let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+            let content = json!({ "address": addr, "modified": 1.0, "files": {} });
+            state
+                .add_xite(
+                    &addr,
+                    XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) },
+                )
+                .await;
+            addrs.push(addr);
+        }
+        {
+            let mut xites = state.xites.write().await;
+            // [0] plain -> watched. [1] has its own whole-site promise.
+            xites.get_mut(&addrs[1]).unwrap().settings.download_optional = true;
+            // [2] own xite. [3] dir-scoped help only -> still watched.
+            xites.get_mut(&addrs[2]).unwrap().settings.own = true;
+            xites
+                .get_mut(&addrs[3])
+                .unwrap()
+                .settings
+                .optional_help
+                .insert("data/media/".to_string(), Value::from("help"));
+        }
+
+        assert!(
+            state.full_retention_watch().await.is_empty(),
+            "setting off -> nothing watched"
+        );
+
+        state.config_set("full_retention", Value::from("true")).await;
+        let mut expected = vec![addrs[0].clone(), addrs[3].clone()];
+        expected.sort();
+        assert_eq!(state.full_retention_watch().await, expected);
+    }
+
+    /// Bytes held in CHILD content.json units count against the consent
+    /// budget. Regression: `present` used to come from the settings stats,
+    /// which are root-only and reset on every root update, so a hub xite
+    /// (per-user child units holding most bytes) fell back to the
+    /// increment-only comparison and quietly overshot its size limit.
+    #[tokio::test]
+    async fn completion_consent_counts_child_unit_bytes() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // A child unit declares 700 KB of optional media, present on disk.
+        let media = vec![0xEEu8; 700 * 1024];
+        storage.write("data/users/u1/big.bin", &media).unwrap();
+        let child = json!({
+            "files_optional": { "big.bin": { "size": media.len(), "sha512": "dd" } }
+        });
+        storage
+            .write("data/users/u1/content.json", child.to_string().as_bytes())
+            .unwrap();
+        // The root declares 500 KB still missing; the limit is 1 MB.
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": { "default": {"unit": "package", "retention": "complete"} },
+            "files": { "missing.bin": { "size": 500 * 1024, "sha512": "aa" } },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_size_limit(addr, 1).await;
+
+        let plan = state.retention_completion_plan(addr).await;
+        assert_eq!(plan.paths, vec!["missing.bin".to_string()]);
+        assert!(
+            plan.needs_consent,
+            "500 KB fits 1 MB alone, but not on top of 700 KB held in a child unit"
+        );
+        // The budget does not depend on the root-only settings stats: zeroing
+        // them (what a root update used to do to the old arithmetic) changes
+        // nothing, because present bytes come from the declared-file walk.
+        {
+            let mut xites = state.xites.write().await;
+            let settings = &mut xites.get_mut(addr).unwrap().settings;
+            settings.size = 0;
+            settings.size_optional = 0;
+        }
+        assert!(state.retention_completion_plan(addr).await.needs_consent);
+    }
+
+    /// Child-unit REQUIRED `files` (per-user data.json - the dominant bytes
+    /// on a hub xite) take part in the inventory on both sides: held ones are
+    /// charged against the consent budget, and missing ones are planned under
+    /// the override. Regression: the optional-only child walk saw neither, so
+    /// a hub could quietly overshoot its cap and "keep a full copy" silently
+    /// skipped user content.
+    #[tokio::test]
+    async fn child_required_files_are_charged_and_planned() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // One child unit holds 700 KB of required user data on disk; another
+        // declares 300 KB that is absent.
+        let held = vec![0xEEu8; 700 * 1024];
+        storage.write("data/users/u1/data.json", &held).unwrap();
+        let child_held = json!({ "files": { "data.json": { "size": held.len(), "sha512": "dd" } } });
+        storage.write("data/users/u1/content.json", child_held.to_string().as_bytes()).unwrap();
+        let child_missing =
+            json!({ "files": { "data.json": { "size": 300 * 1024, "sha512": "ee" } } });
+        storage.write("data/users/u2/content.json", child_missing.to_string().as_bytes()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0,
+            "distribution": { "default": {"unit": "package", "retention": "complete"} },
+            "files": { "missing.bin": { "size": 500 * 1024, "sha512": "aa" } },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        state.set_size_limit(addr, 1).await;
+
+        let plan = state.retention_completion_plan(addr).await;
+        // Both missing files are planned - including the child-required one.
+        assert_eq!(
+            plan.paths,
+            vec!["data/users/u2/data.json".to_string(), "missing.bin".to_string()],
+            "child-required user data is part of the plan"
+        );
+        // And the held child bytes are charged: 800 KB planned fits 1 MB
+        // alone, but not on top of the 700 KB held in the child unit.
+        assert!(plan.needs_consent, "held child-required bytes count against the budget");
+    }
+
+    /// The retention prompt never burns its once-per-session slot without a
+    /// viewer: at boot the retry loop reaches an over-budget xite before any
+    /// wrapper binds, and a slot consumed by an unseen, timed-out confirm
+    /// would silence both this prompt and the page's own optional prompt for
+    /// the session.
+    #[tokio::test(start_paused = true)]
+    async fn retention_prompt_needs_a_viewer_to_consume_the_slot() {
+        let state = AppState::new("test");
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state.prompt_retention_completion(addr, 3, 5 * 1024 * 1024).await;
+        assert!(
+            !state.optional_prompts.lock().unwrap().contains(addr.as_str()),
+            "no viewer -> slot untouched, a later pass may still ask"
+        );
+
+        // With a wrapper bound, the prompt fires and consumes the slot (the
+        // unanswered confirm times out under paused time; consumption is the
+        // once-per-session contract).
+        state.register_bound_conn(addr, 42);
+        state.prompt_retention_completion(addr, 3, 5 * 1024 * 1024).await;
+        assert!(state.optional_prompts.lock().unwrap().contains(addr.as_str()));
+    }
+
+    /// An in-flight retention pass loses its mandate when the xite stops
+    /// serving, when a reader-driven pass's global setting is turned off, or
+    /// when needed consent is withdrawn - checked between files so a
+    /// site-sized pass stops mid-way, mirroring the bulk optional pass.
+    #[tokio::test]
+    async fn retention_pass_mandate_follows_serving_setting_and_consent() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": addr, "modified": 1.0, "files": {} })),
+                },
+            )
+            .await;
+
+        // Unknown xite -> no mandate.
+        assert!(!state.retention_pass_should_continue("unknown", false, false).await);
+        // Served, no further conditions -> mandate holds.
+        assert!(state.retention_pass_should_continue(addr, false, false).await);
+        // Reader-driven while the global setting is off -> stops.
+        assert!(!state.retention_pass_should_continue(addr, true, false).await);
+        state.config_set("full_retention", Value::from("true")).await;
+        assert!(state.retention_pass_should_continue(addr, true, false).await);
+        // A consented plan stops once consent is withdrawn.
+        assert!(!state.retention_pass_should_continue(addr, true, true).await);
+        assert!(state.set_download_optional(addr, true, false).await);
+        assert!(state.retention_pass_should_continue(addr, true, true).await);
+        // Pausing withdraws every mandate.
+        assert!(state.set_serving(addr, false).await);
+        assert!(!state.retention_pass_should_continue(addr, false, false).await);
+    }
+
+    /// The pass BODY consults the mandate between files - not just the
+    /// predicate in isolation. A pass whose mandate is gone attempts nothing;
+    /// one whose mandate holds attempts every path (fetch failures do not
+    /// stop the walk).
+    #[tokio::test]
+    async fn retention_pass_body_stops_when_the_mandate_is_withdrawn() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({ "address": addr, "modified": 1.0, "files": {} })),
+                },
+            )
+            .await;
+        let paths = vec!["a.bin".to_string(), "b.bin".to_string()];
+
+        // Mandate holds: both paths are attempted (the fetches fail - no
+        // peers - but failure must not stop the walk).
+        assert_eq!(state.run_retention_pass(addr, paths.clone(), false, false).await, 2);
+        // Reader-driven pass with the setting off: nothing is attempted.
+        assert_eq!(state.run_retention_pass(addr, paths.clone(), true, false).await, 0);
+        // Paused xite: nothing is attempted.
+        assert!(state.set_serving(addr, false).await);
+        assert_eq!(state.run_retention_pass(addr, paths, false, false).await, 0);
     }
 
     #[tokio::test]
@@ -12340,8 +14761,10 @@ mod tests {
         // Phase setter without a live snapshot must not panic.
         state.set_optional_phase("1Opt", "Announcing…").await;
 
-        // The pass needs a standing mandate or it cancels immediately.
+        // The pass needs a standing mandate - BOTH toggles - or it cancels
+        // immediately.
         state.set_download_optional("1Opt", true, false).await;
+        state.set_autodownloadoptional("1Opt", true).await;
         let (fetched, failed) = state.download_optional_files("1Opt", None).await;
         assert_eq!((fetched, failed), (0, 2), "both files fail, counted once each");
         // Files are still missing and the background loop keeps chasing them,
@@ -12352,17 +14775,12 @@ mod tests {
             progress["status"].as_str().unwrap_or("").contains("retrying in background"),
             "waiting status names the background retry"
         );
-        // Withdrawing the mandate needs BOTH toggles off (the node defaults
-        // seeded autodownloadoptional on); only then does the panel clear.
+        // EITHER toggle going off withdraws the mandate: the pass is a bulk
+        // prefetch, and both switches must read as off switches for it.
         state.set_download_optional("1Opt", false, false).await;
         assert!(
-            !state.site_info("1Opt").await["optional_progress"].is_null(),
-            "help-distribute still on -> mandate stands, panel stays"
-        );
-        state.set_autodownloadoptional("1Opt", false).await;
-        assert!(
             state.site_info("1Opt").await["optional_progress"].is_null(),
-            "panel cleared when the last toggle goes off"
+            "download toggle off -> mandate gone, panel clears"
         );
     }
 
@@ -12383,8 +14801,11 @@ mod tests {
         // Toggle off (and no optionalHelp) -> not watched, even with files missing.
         assert!(state.optional_retry_flagged().await.is_empty());
 
-        // Toggle on -> watched with whole-site scope, and the scope is missing.
+        // Whole-site watching needs BOTH toggles: the prefetch mandate plus
+        // the on-demand download permission. One alone is not enough.
         state.set_download_optional("1Opt", true, false).await;
+        assert!(state.optional_retry_flagged().await.is_empty());
+        state.set_autodownloadoptional("1Opt", true).await;
         let flagged = state.optional_retry_flagged().await;
         assert_eq!(flagged, vec![("1Opt".to_string(), None)]);
         assert!(state.optional_scope_missing("1Opt", &None).await);
@@ -12403,7 +14824,8 @@ mod tests {
         storage.write("a.bin", b"12345").unwrap();
         assert!(!state.optional_scope_missing("1Opt", &None).await);
 
-        // An optionalHelp commitment (toggles off) is watched dir-scoped.
+        // An optionalHelp commitment (whole-site mandate off) is watched
+        // dir-scoped.
         state.set_download_optional("1Opt", false, false).await;
         if let Some(x) = state.xites.write().await.get_mut("1Opt") {
             x.settings.optional_help.insert("data/users/alice".into(), "1".into());
@@ -12422,7 +14844,9 @@ mod tests {
             "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
         });
 
-        // Defaults untouched -> both toggles ON for a fresh xite.
+        // Defaults untouched -> download on demand yes, bulk prefetch NO.
+        // Prefetch defaulting on meant opening a multi-GB xite silently
+        // pulled its whole optional set.
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
         state
@@ -12435,14 +14859,14 @@ mod tests {
             let xites = state.xites.read().await;
             let s = &xites.get("1New").unwrap().settings;
             assert!(s.download_optional, "download on by default");
-            assert!(s.autodownloadoptional, "help-distribute on by default");
+            assert!(!s.autodownloadoptional, "prefetch off by default");
         }
         assert!(state.optional_fetch_allowed("1New").await);
 
-        // Operator turned the help-distribute default off but left download on.
+        // Operator turned the prefetch default on.
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
-        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("true")).await;
         state
             .add_xite(
                 "1New",
@@ -12453,13 +14877,14 @@ mod tests {
             let xites = state.xites.read().await;
             let s = &xites.get("1New").unwrap().settings;
             assert!(s.download_optional, "download default still on");
-            assert!(!s.autodownloadoptional, "help-distribute default honored");
+            assert!(s.autodownloadoptional, "prefetch default honored");
         }
 
-        // Help-distribute default ON implies downloading even if the download
+        // Prefetch default ON implies downloading even if the download
         // default was turned off.
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
+        state.config_set("autodownloadoptional_default", Value::from("true")).await;
         state.config_set("download_optional_default", Value::from("false")).await;
         state
             .add_xite(
@@ -12470,7 +14895,7 @@ mod tests {
         {
             let xites = state.xites.read().await;
             let s = &xites.get("1New").unwrap().settings;
-            assert!(s.download_optional, "help-distribute implies download");
+            assert!(s.download_optional, "prefetch implies download");
             assert!(s.autodownloadoptional);
         }
     }
@@ -13728,6 +16153,77 @@ mod tests {
         state.add_xite("small", XiteEntry { storage: XiteStorage::new(dir.path().join("s")), content: Some(small) }).await;
     }
 
+    /// Optional-file bookkeeping over EDX: materializing an optional file (the
+    /// verified-streaming path's terminal step) advertises it in our hashfield,
+    /// counts its bytes toward optional_downloaded, and stamps its finished
+    /// time - so an EDX-fetched optional file seeds exactly like a msgpack one.
+    /// A re-materialize (resync/refetch) must not double-count the bytes.
+    #[tokio::test]
+    async fn edx_materialize_advertises_and_stamps_an_optional_file() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let bytes = b"an avatar fetched over EDX".to_vec();
+        let sha = XiteStorage::hash_bytes(&bytes);
+        let content = json!({
+            "files": {},
+            "files_optional": { "avatar.png": { "size": bytes.len(), "sha512": sha } },
+        });
+        let addr = "1optseed";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        state.edx_materialize_file(addr, "avatar.png", &bytes).await.unwrap();
+        {
+            let xites = state.xites.read().await;
+            let x = xites.get(addr).unwrap();
+            assert_eq!(x.storage.read("avatar.png").unwrap(), bytes, "verified bytes on disk");
+            assert!(x.hashfield.has_hash(&sha), "hashfield advertises the optional file");
+            assert_eq!(x.settings.optional_downloaded, bytes.len() as i64, "bytes counted");
+            assert!(
+                x.settings.cache.optional_stats.get("avatar.png").unwrap().time_downloaded > 0,
+                "finished time stamped",
+            );
+        }
+
+        // Idempotent: a second materialize (a resync re-fetch) must not double
+        // the downloaded-bytes counter.
+        state.edx_materialize_file(addr, "avatar.png", &bytes).await.unwrap();
+        {
+            let xites = state.xites.read().await;
+            let x = xites.get(addr).unwrap();
+            assert_eq!(
+                x.settings.optional_downloaded,
+                bytes.len() as i64,
+                "re-materialize must not double-count",
+            );
+        }
+    }
+
+    /// A required (non-optional) file materialized over EDX does none of the
+    /// optional bookkeeping - optional_downloaded stays zero and no finished
+    /// stamp is written, so the Files tab does not show a core file as an
+    /// "optional download".
+    #[tokio::test]
+    async fn edx_materialize_leaves_a_required_file_out_of_optional_bookkeeping() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let bytes = b"<h1>index</h1>".to_vec();
+        let content = json!({
+            "files": { "index.html": { "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) } },
+            "files_optional": {},
+        });
+        let addr = "1reqseed";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+
+        state.edx_materialize_file(addr, "index.html", &bytes).await.unwrap();
+        let xites = state.xites.read().await;
+        let x = xites.get(addr).unwrap();
+        assert_eq!(x.storage.read("index.html").unwrap(), bytes);
+        assert_eq!(x.settings.optional_downloaded, 0, "required file is not optional");
+        assert!(x.settings.cache.optional_stats.get("index.html").is_none(), "no optional stamp");
+    }
+
     /// A version-3 merger site (schema + `Merger:EpixPost` permission, no own
     /// data). Returns the live temp dir (keep it in scope - dropping it deletes
     /// the files), the state, and the merger address.
@@ -14305,54 +16801,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_need_fetches_bigfile_pieces_not_the_whole_blob() {
-        let dir = tempdir().unwrap();
-        let storage = XiteStorage::new(dir.path());
-        // A 3-piece big file, declared by a child content.json (a per-user
-        // dir) whose piecemap path is relative to that child's own dir.
-        let data = vec![7u8; 2500];
-        let hash = epix_xite::hash_bigfile(&data, 1024);
-        storage.write("data/users/A/big.bin", &data).unwrap();
-        storage
-            .write(
-                "data/users/A/big.bin.piecemap.msgpack",
-                &epix_xite::build_piecemap("big.bin", &hash),
-            )
-            .unwrap();
-        storage
-            .write(
-                "data/users/A/content.json",
-                &serde_json::to_vec(&json!({
-                    "files_optional": {
-                        "big.bin": {
-                            "sha512": hash.merkle_root,
-                            "size": 2500,
-                            "piecemap": "big.bin.piecemap.msgpack",
-                            "piece_size": 1024,
-                        }
-                    }
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        let state = AppState::new("test");
-        state
-            .add_xite("epix1big", XiteEntry {
-                storage,
-                content: Some(json!({ "address": "epix1big", "files": {} })),
-            })
-            .await;
-        std::mem::forget(dir);
-
-        // The declared sha512 is a merkle root: a whole-file flat hash never
-        // matches it, so the old blob fetch path could only fail. The
-        // piecewise path verifies the on-disk pieces and succeeds without any
-        // transport.
-        assert_eq!(state.file_need("epix1big", "data/users/A/big.bin").await, Ok(true));
-        assert_eq!(state.bigfile_total("epix1big", "data/users/A/big.bin").await, Some(2500));
-    }
-
-    #[tokio::test]
     async fn a_cancelled_file_need_removes_its_lock_map_entry() {
         let dir = tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
@@ -14412,5 +16860,266 @@ mod tests {
         // (python tallies both via its file_optional table).
         let (num, size) = state.optional_help_add("epix1help", "data/users/A", "T").await.unwrap();
         assert_eq!((num, size), (2, 740));
+    }
+
+    /// A record landing in an already sealed interval re-derives that interval
+    /// under a NEW root, so pinning every derivation would keep every
+    /// superseded copy on disk forever (eviction only reclaims refcount-0).
+    /// Also pins the skip-filter sibling, which is keyed by the hash of its own
+    /// bytes because that is the only key `insert_bytes` accepts.
+    #[test]
+    fn feed_objects_pin_settled_segments_and_release_superseded_roots() {
+        let dir = tempdir().unwrap();
+        let store = epix_blob::store::Store::open(dir.path()).unwrap();
+        let rec = |id: &str, body: &str, clock: u64| epix_feed::Record {
+            canonical: json!({ "id": id, "body": body }).to_string().into_bytes(),
+            id: id.to_string(),
+            author: "epix1author".to_string(),
+            target: String::new(),
+            clock,
+            kind: epix_feed::Kind::Post,
+        };
+        // Well past both the interval and its pin grace, so the segment counts
+        // as settled and gets pinned.
+        let ts = 10 * crate::feed::SEGMENT_INTERVAL_MS;
+
+        let first = crate::feed::derive_feed(vec![rec("a", "alpha bravo", 1_000)]);
+        AppState::pin_feed_objects(&store, &first, ts);
+        let root = first.sealed[0].root;
+        let filter_id = epix_blob::ObjId::of(&first.filters[0].to_bytes());
+        assert!(store.contains(root).unwrap(), "the segment blob is stored");
+        assert!(store.contains(filter_id).unwrap(), "the skip-filter sibling is stored");
+        assert_eq!(store.ref_delta(root, 0).unwrap(), 1, "a settled segment is pinned");
+        assert_eq!(store.ref_delta(filter_id, 0).unwrap(), 1);
+
+        // A second record in the SAME interval re-seals it under a new root.
+        let second = crate::feed::derive_feed(vec![
+            rec("a", "alpha bravo", 1_000),
+            rec("b", "charlie delta", 2_000),
+        ]);
+        assert_ne!(second.sealed[0].root, root, "the interval re-sealed");
+        AppState::pin_feed_objects(&store, &second, ts);
+        AppState::unpin_superseded_feed_objects(&store, &first, &second);
+        assert_eq!(store.ref_delta(root, 0).unwrap(), 0, "the superseded root is evictable");
+        assert_eq!(store.ref_delta(filter_id, 0).unwrap(), 0);
+        assert_eq!(
+            store.ref_delta(second.sealed[0].root, 0).unwrap(),
+            1,
+            "the current root stays pinned"
+        );
+
+        // The live tail (an interval still inside the grace window) churns on
+        // every merge, so it goes in unpinned - superseded copies must stay
+        // evictable.
+        let live = crate::feed::derive_feed(vec![rec("c", "echo foxtrot", ts)]);
+        AppState::pin_feed_objects(&store, &live, ts);
+        assert!(store.contains(live.sealed[0].root).unwrap(), "still stored, just not pinned");
+        assert_eq!(store.ref_delta(live.sealed[0].root, 0).unwrap(), 0, "live tail is unpinned");
+    }
+
+    /// Nothing is ever cached under a feed name the descriptors do not declare,
+    /// so recomputing on that miss would re-walk and re-verify the xite's whole
+    /// record set on every call.
+    #[tokio::test]
+    async fn an_undeclared_feed_name_never_triggers_a_recompute() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1feed", XiteEntry {
+                storage: XiteStorage::new(dir.path()),
+                content: Some(json!({
+                    "address": "epix1feed",
+                    "modified": 1.0,
+                    "files": {},
+                    "feeds": {
+                        "posts": {
+                            "files": "data/users/*/posts.json",
+                            "record_key": "post",
+                            "map": { "id": "post_id", "author": "author", "clock": "date_added" },
+                            "kind": { "default": "post" },
+                        }
+                    },
+                })),
+            })
+            .await;
+
+        assert!(state.feed_artifacts("epix1feed", "nope").await.is_none());
+        assert!(state.feed_cache.read().await.is_empty(), "no derivation ran");
+
+        // A declared name still recomputes on the first query after boot.
+        assert!(state.feed_artifacts("epix1feed", "posts").await.is_some());
+        assert!(state.feed_cache.read().await.contains_key("epix1feed"));
+    }
+
+    /// One `edx_fetch_files` call is a single uncancellable await, so the bulk
+    /// optional pass must batch and re-check the user's mandate between batches
+    /// - otherwise toggling a 200 GB site off keeps pulling to the end of the
+    /// list.
+    #[tokio::test]
+    async fn the_edx_bulk_optional_pass_batches_and_stops_when_the_mandate_drops() {
+        /// Records the size of every batch it is handed; on the first one it
+        /// pauses the xite, which withdraws the pass's mandate.
+        struct ChunkFetcher {
+            batches: Arc<std::sync::Mutex<Vec<usize>>>,
+            pause_after_first: Arc<std::sync::Mutex<Option<Arc<AppState>>>>,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for ChunkFetcher {
+            async fn fetch_files(
+                &self,
+                address: &str,
+                want: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                let first = {
+                    let mut b = self.batches.lock().unwrap();
+                    b.push(want.len());
+                    b.len() == 1
+                };
+                // Cloned out of the lock: never await holding a std guard.
+                let state = self.pause_after_first.lock().unwrap().clone();
+                if let (true, Some(state)) = (first, state) {
+                    if let Some(x) = state.xites.write().await.get_mut(address) {
+                        x.settings.serving = false;
+                    }
+                }
+                EdxBatch { done: Vec::new(), missed: Vec::new(), bytes: 0 }
+            }
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+            ) -> HashMap<String, Vec<u8>> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+                _: Arc<Vec<u8>>,
+                _: f64,
+                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+                _: Arc<Vec<String>>,
+                _: Arc<AtomicBool>,
+            ) -> Result<(), EdxPushError> {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
+                unreachable!()
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite("epix1bulk", XiteEntry {
+                storage: XiteStorage::new(dir.path()),
+                content: Some(json!({ "address": "epix1bulk", "modified": 1.0, "files": {} })),
+            })
+            .await;
+        state.add_peers("epix1bulk", [PeerAddr::parse("1.2.3.4:26959").unwrap()]).await;
+        // The pass's mandate is BOTH toggles; prefetch no longer defaults on.
+        state.set_download_optional("epix1bulk", true, false).await;
+        state.set_autodownloadoptional("epix1bulk", true).await;
+        let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pause_after_first = Arc::new(std::sync::Mutex::new(None));
+        state
+            .set_edx_fetcher(Arc::new(ChunkFetcher {
+                batches: batches.clone(),
+                pause_after_first: pause_after_first.clone(),
+            }))
+            .await;
+
+        // Three chunks' worth of optional files.
+        let todo: Vec<(String, u64)> =
+            (0..EDX_BULK_OPTIONAL_CHUNK * 2 + 5).map(|i| (format!("f{i}.bin"), 10)).collect();
+        let mut queue: Vec<(usize, &String, u64)> =
+            todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        let (mut fetched, mut bytes_done) = (0usize, 0u64);
+
+        // Mandate held throughout: every file is offered, in bounded batches.
+        state
+            .edx_bulk_optional_pass(
+                "epix1bulk",
+                None,
+                &todo,
+                &mut queue,
+                &mut fetched,
+                &mut bytes_done,
+            )
+            .await;
+        let sizes = batches.lock().unwrap().clone();
+        assert_eq!(sizes.len(), 3, "one batch per chunk");
+        assert!(sizes.iter().all(|n| *n <= EDX_BULK_OPTIONAL_CHUNK), "batches are bounded");
+        assert_eq!(sizes.iter().sum::<usize>(), todo.len(), "every file was offered");
+
+        // Mandate withdrawn during the first batch: the pass stops instead of
+        // running the remaining chunks.
+        batches.lock().unwrap().clear();
+        *pause_after_first.lock().unwrap() = Some(state.clone());
+        state
+            .edx_bulk_optional_pass(
+                "epix1bulk",
+                None,
+                &todo,
+                &mut queue,
+                &mut fetched,
+                &mut bytes_done,
+            )
+            .await;
+        assert_eq!(batches.lock().unwrap().len(), 1, "stopped after the batch in flight");
     }
 }

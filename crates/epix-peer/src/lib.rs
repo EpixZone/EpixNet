@@ -307,7 +307,20 @@ impl Peers {
         if peers.is_empty() {
             peers = connectable;
         }
-        let net_rank = |p: &Peer| if p.addr.is_overlay() { 1 } else { 0 };
+        // Clearnet first normally (a direct socket beats a circuit) - but in
+        // Tor-always mode that inverts: an onion peer is one rendezvous, while
+        // an Ip peer needs an exit circuit out to a host that is usually not
+        // even reachable from the outside. Preferring clearnet there spends
+        // every slot on doomed exit dials while the onion seed sits unused.
+        let prefer_overlay = epix_core::route_all_via_overlay();
+        let net_rank = |p: &Peer| {
+            let overlay = p.addr.is_overlay();
+            if overlay == prefer_overlay {
+                0
+            } else {
+                1
+            }
+        };
         peers.sort_by(|a, b| {
             b.reputation
                 .cmp(&a.reputation)

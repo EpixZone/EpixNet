@@ -1,16 +1,14 @@
-//! The node's handshake self-advertisement: which dial-back addresses an
-//! outbound handshake offers the peer we are talking to.
+//! The node's self-advertisement: which dial-back addresses an outbound EDX
+//! Hello offers the peer we are talking to.
 //!
 //! An inbound connection arrives from an ephemeral port (clearnet) or a blank
 //! placeholder address (onion/i2p) - without an advertised self-address the
 //! receiver can never dial the caller back, so an overlay-only publisher that
 //! pushes an update stays unreachable until PEX or a tracker happens to name
-//! it. The handshake fixes that at first contact, the same way the Python
-//! client's `onion` handshake key does.
+//! it. The Hello fixes that at first contact.
 //!
 //! Which address is offered follows the CONNECTION's transport class, so a
-//! self-address is only ever claimed where it adds no linkage (the Python
-//! client's policy):
+//! self-address is only ever claimed where it adds no linkage:
 //!   - dialing an onion peer: our onion (the wire already rides Tor);
 //!   - dialing an i2p peer: our i2p destination;
 //!   - dialing a mesh peer: our rns destination hash;
@@ -24,8 +22,8 @@
 //! The advert is process-global (one node per process), like the chain-RPC
 //! SOCKS setting in `epix-chain`: the runtime seeds it at startup and the
 //! tor/i2p/mesh loops fill in each overlay address as it comes up, so every
-//! `Connection::handshake()` call site picks the current addresses up without
-//! threading node state through the protocol layer.
+//! dial picks the current addresses up without threading node state through
+//! the protocol layer.
 
 use std::sync::RwLock;
 
@@ -36,7 +34,7 @@ use std::sync::RwLock;
 #[derive(Clone, Debug, Default)]
 pub struct SelfAdvert {
     /// The node's release version (e.g. `0.3.9` from the git tag), reported in
-    /// both the handshake request and reply so peers see the real build, not
+    /// both the Hello and its ack so peers see the real build, not
     /// epix-protocol's own crate version. Empty falls back to that crate
     /// version (request) or the server's default banner (reply).
     pub version: String,
@@ -74,6 +72,13 @@ pub fn update_self_advert(f: impl FnOnce(&mut SelfAdvert)) {
     if let Ok(mut w) = SELF_ADVERT.write() {
         f(w.get_or_insert_with(SelfAdvert::default));
     }
+}
+
+/// The advertised release version: the EDX Hello reports it, and so does the
+/// Stats page's `client` column for peers that reach us. Empty when the advert
+/// is unseeded (tests).
+pub fn self_advert_version() -> String {
+    with_self_advert(|a| a.version.clone())
 }
 
 /// Run `f` against the current advert under the read lock, without cloning it.

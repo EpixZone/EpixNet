@@ -7,7 +7,6 @@
 //! background runtime loops, and - when enabled - in-process Tor).
 
 use epix_core::{Address, PeerAddr};
-use epix_protocol::Connection;
 use epix_transport::{TcpTransport, Transport};
 use epix_ui::{UiServer, XiteEntry};
 use epix_xite::{Xite, XiteStorage};
@@ -573,41 +572,9 @@ pub async fn run(opts: NodeOptions) -> Result<(), String> {
 /// against the first peers to respond, and the file download starts the
 /// moment content.json verifies - while discovery keeps feeding fresh peers
 /// (and replacement workers) into the running download.
-/// Applies worker peer outcomes to the live registry as they happen. A clone
-/// can run for minutes, so batching feedback to the end of the pass (like the
-/// short resync/push passes do) would let a dead peer keep being redialed for
-/// the whole download.
-struct LiveFeedback {
-    state: Arc<AppState>,
-    address: String,
-}
-
-impl epix_worker::PeerFeedback for LiveFeedback {
-    fn note(&self, peer: &PeerAddr, outcome: epix_worker::PeerOutcome) {
-        let state = self.state.clone();
-        let address = self.address.clone();
-        let peer = peer.clone();
-        tokio::spawn(async move {
-            state.apply_peer_outcomes(&address, vec![(peer, outcome)]).await;
-        });
-    }
-}
-
-/// The [`LiveFeedback`] sink for a clone/sync pass, when a state is present.
-fn live_feedback(
-    progress: Option<&Arc<AppState>>,
-    address: &str,
-) -> Option<Arc<dyn epix_worker::PeerFeedback>> {
-    progress.map(|state| {
-        Arc::new(LiveFeedback { state: state.clone(), address: address.to_string() })
-            as Arc<dyn epix_worker::PeerFeedback>
-    })
-}
-
 async fn clone_xite_with_progress(
     address: &str,
     data_dir: &std::path::Path,
-    transport: Arc<dyn Transport>,
     trackers: &[epix_xite::Tracker],
     progress: Option<&Arc<AppState>>,
 ) -> Result<(Option<serde_json::Value>, u64, Vec<String>), String> {
@@ -635,24 +602,16 @@ async fn clone_xite_with_progress(
         let tx = tx.clone();
         let found = found.clone();
         let address = address.to_string();
-        let transport = transport.clone();
         let state = progress.cloned();
         tokio::spawn(async move {
+            // Announces go over EDX links the state owns, so a clone with no
+            // state yet has nothing to announce with; it discovers peers
+            // through whatever the caller seeded instead.
             let peers = match &state {
                 // Through the state so per-tracker stats record + push live
                 // (the loading screen's tracker line).
                 Some(s) => s.announce_to_trackers(&address, std::slice::from_ref(&tracker)).await,
-                None => {
-                    // Bootstrap clone with no state yet: passive query (no
-                    // self-advertise), just fetch peers for the address.
-                    epix_xite::announce(
-                        transport.as_ref(),
-                        &address,
-                        std::slice::from_ref(&tracker),
-                        &epix_xite::SelfAdvert::default(),
-                    )
-                    .await
-                }
+                None => Vec::new(),
             };
             for p in peers {
                 if found.lock().unwrap().insert(p.to_string()) {
@@ -695,10 +654,11 @@ async fn clone_xite_with_progress(
     let spawn_pex = {
         let found = found.clone();
         let address = address.to_string();
-        let transport = transport.clone();
+        let state = progress.cloned();
         let budget = pex_budget.clone();
         move |peer: PeerAddr, tx: tokio::sync::mpsc::UnboundedSender<PeerAddr>| {
             use std::sync::atomic::Ordering;
+            let Some(state) = state.clone() else { return };
             if budget
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| b.checked_sub(1))
                 .is_err()
@@ -707,30 +667,13 @@ async fn clone_xite_with_progress(
             }
             let found = found.clone();
             let address = address.clone();
-            let transport = transport.clone();
             tokio::spawn(async move {
-                // Overlay-aware bound: an onion/i2p peer needs the longer
-                // dial deadline to answer the exchange at all.
-                let reply = tokio::time::timeout(peer.connect_timeout(), async {
-                    let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
-                    conn.handshake().await.ok()?;
-                    conn.pex(&address, Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), 10)
-                        .await
-                        .ok()
-                })
-                .await
-                .ok()
-                .flatten();
-                let Some(reply) = reply else { return };
-                let unpacked = reply
-                    .ipv4
-                    .iter()
-                    .chain(reply.ipv6.iter())
-                    .filter_map(|b| PeerAddr::unpack_ip(b))
-                    .chain(reply.onion.iter().filter_map(|b| PeerAddr::unpack_onion(b)))
-                    .chain(reply.i2p.iter().filter_map(|b| PeerAddr::unpack_i2p(b)))
-                    .chain(reply.rns.iter().filter_map(|b| PeerAddr::unpack_rns(b)));
-                for p in unpacked {
+                // We have nothing to offer yet (this is a cold clone), so the
+                // exchange is one-way: ask for peers, give none.
+                let Some(Ok(learned)) = state.edx_pex(peer, &address, 10, Vec::new()).await else {
+                    return;
+                };
+                for p in learned {
                     if found.lock().unwrap().insert(p.to_string()) {
                         let _ = tx.send(p);
                     }
@@ -788,9 +731,9 @@ async fn clone_xite_with_progress(
                             spawn_pex(peer.clone(), pex_tx.clone());
                             if fetchers.len() < 4 {
                                 fetchers.spawn(fetch_content(
-                                    transport.clone(),
                                     peer,
                                     address.to_string(),
+                                    progress.cloned(),
                                 ));
                             } else {
                                 untried.push_back(peer);
@@ -808,9 +751,9 @@ async fn clone_xite_with_progress(
                     if !got_content {
                         if let Some(peer) = untried.pop_front() {
                             fetchers.spawn(fetch_content(
-                                transport.clone(),
                                 peer,
                                 address.to_string(),
+                                progress.cloned(),
                             ));
                         }
                     }
@@ -831,19 +774,40 @@ async fn clone_xite_with_progress(
             state.update_content(address, xite.content.clone()).await;
         }
         if let Some(state) = progress {
-            let total = xite.files_needed().len();
+            let needed = xite.files_needed();
+            let total = needed.len();
+            let size_needed: i64 = needed.iter().map(|f| f.size).sum();
+            // Optional files are NOT part of the clone; surface their count +
+            // bytes separately so the loading screen can say "on demand"
+            // instead of looking like the whole site is about to download.
+            let (optional_files, size_optional) = xite
+                .content
+                .as_ref()
+                .and_then(|c| c.get("files_optional"))
+                .and_then(|f| f.as_object())
+                .map(|m| {
+                    let bytes: i64 = m
+                        .values()
+                        .filter_map(|v| v.get("size").and_then(|s| s.as_i64()))
+                        .sum();
+                    (m.len(), bytes)
+                })
+                .unwrap_or((0, 0));
             let counts = serde_json::json!({
                 "peers": peer_count,
                 "bad_files": total,
                 "tasks": total,
                 "started_task_num": total,
+                "size_needed": size_needed,
+                "optional_files": optional_files,
+                "size_optional": size_optional,
             });
             state.push_clone_event(
                 address,
                 serde_json::json!(["file_done", "content.json"]),
                 counts.clone(),
             );
-            // "N files needs to be downloaded"
+            // "N files (X) needed to load" + optional-on-demand note
             state.push_clone_event(address, serde_json::json!(["file_added", total]), counts);
         }
     }
@@ -876,14 +840,21 @@ async fn clone_xite_with_progress(
     drop(pex_tx);
     drop(sync_tx);
 
-    // Per-file progress: each finished file prints its line on the loading
-    // screen and advances the progress bar (tasks/started_task_num).
-    let on_file = progress.map(|state| {
+    // Per-file progress: each finished file advances the loading bar. Every
+    // fetch layer shares ONE emitter and ONE done-counter, with the denominator
+    // pinned to the pre-fetch core total - so the bar climbs monotonically
+    // 0..total no matter which layer fetched each file. Without the shared
+    // emitter the EDX prepass materialized files silently and the bar sat at 0
+    // then jumped on well-seeded sites (exactly EDX's target).
+    let clone_total = xite.files_needed().len();
+    let emit_done: Option<Arc<dyn Fn(&str) + Send + Sync>> = progress.map(|state| {
         let state = state.clone();
         let addr = address.to_string();
         let peers_n = peer_count.max(1);
-        Arc::new(move |inner: &str, done: usize, total: usize| {
-            let left = total.saturating_sub(done);
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move |inner: &str| {
+            let d = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let left = clone_total.saturating_sub(d);
             // The wrapper hides the loading screen on index.html's file_done
             // - and index.html downloads FIRST (priority queue). Firing it
             // mid-sync dropped the user into a half-downloaded site (styles
@@ -900,23 +871,70 @@ async fn clone_xite_with_progress(
                     "peers": peers_n,
                     "bad_files": left,
                     "tasks": left,
-                    "started_task_num": total,
+                    "started_task_num": clone_total,
                 }),
             );
-        }) as epix_worker::FileProgress
+        }) as Arc<dyn Fn(&str) + Send + Sync>
     });
-    let mut bytes_recv = 0;
-    if let Ok(report) = epix_worker::sync_files_streaming(
-        &xite,
-        sync_rx,
-        transport.clone(),
-        8,
-        on_file,
-        live_feedback(progress, address),
-    )
-    .await
-    {
-        bytes_recv = report.bytes;
+    // EDX-only streaming clone. Discovery adds every peer it finds to the state
+    // registry (also fed over sync_tx, unused here); each pass pulls the
+    // still-missing core files from the best candidates - tracker seeds first,
+    // then the reputation-ranked registry. edx_first records a dial outcome per
+    // peer, so a dead peer sinks and the next pass pulls fresh candidates rather
+    // than redialing the same unreachable top-N and giving up. It ends when
+    // every core file is on disk, or after a few passes make no progress (a
+    // legacy no-b3 site never completes; nor does a b3 site whose seeder is
+    // simply unreachable). The shared emitter advances the loading bar as EDX
+    // materializes each file.
+    drop(sync_rx); // the registry (fetch_candidate_peers) carries discovered peers
+    let mut bytes_recv = 0u64; // EDX bytes are counted by edx_first's add_transfer
+    let mut dry = 0u32;
+    let mut empty_waits = 0u32;
+    while let Some(state) = progress {
+        let before = xite.files_needed();
+        if before.is_empty() {
+            break;
+        }
+        let peers = state.fetch_candidate_peers(address, 50).await;
+        if peers.is_empty() {
+            // No peers to dial yet - let discovery turn some up, bounded so a
+            // truly peerless clone still terminates.
+            empty_waits += 1;
+            if empty_waits > 20 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        empty_waits = 0;
+        let staged = xite.content.clone();
+        let edx_progress = emit_done.clone().map(|emit| {
+            Arc::new(move |inner: &str, _bytes: u64| emit(inner))
+                as epix_ui::state::EdxBatchProgress
+        });
+        // Bound the pass. Inside, every dial and request has its own deadline,
+        // but a session of unresponsive peers times out serially and the whole
+        // pass can grind for many minutes with the loading screen frozen.
+        // Cutting it loose re-pulls candidates (dead peers have just been
+        // scored down by note_edx_dials) and retries with a better set; files
+        // already materialized stay on disk, so nothing is refetched.
+        const CLONE_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+        let _ = tokio::time::timeout(
+            CLONE_PASS_BUDGET,
+            state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress),
+        )
+        .await;
+        let after = xite.files_needed().len();
+        if after == 0 {
+            break;
+        }
+        dry = if after < before.len() { 0 } else { dry + 1 };
+        if dry >= 5 {
+            break;
+        }
+        // Brief pause so the just-recorded dial outcomes settle (dead peers back
+        // off) and late-discovered peers land before the next candidate pull.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
     // Staged adopt: commit the fetched content.json to disk (atomic rename)
     // only now that its core file set is complete, so neither a crash nor an
@@ -942,6 +960,12 @@ async fn clone_xite_with_progress(
             serde_json::json!(["file_done", "index.html"]),
             serde_json::json!({ "peers": peer_count.max(1), "bad_files": 0, "tasks": 0 }),
         );
+        // First paint has happened, so NOW a `retention:complete` unit may
+        // finish itself in the background (issue #340). Spawned, never awaited:
+        // stream-first is the rule, completion never gates the render. Over the
+        // xite's size limit it taps the existing optional-download prompt
+        // instead of downloading.
+        state.spawn_retention_completion(address);
     }
 
     // Recursive content: user_contents sites (EpixTalk, EpixPost, ...) keep their
@@ -952,7 +976,7 @@ async fn clone_xite_with_progress(
     let mut user_files = Vec::new();
     if !peers.is_empty() {
         let (bytes, files) =
-            sync_included_content(&xite, &peers, transport.clone(), progress, address).await;
+            sync_included_content(&xite, &peers, progress, address).await;
         bytes_recv += bytes;
         user_files = files;
     }
@@ -976,11 +1000,15 @@ async fn state_peers(progress: Option<&Arc<AppState>>, _xite: &Xite, address: &s
 async fn sync_included_content(
     xite: &Xite,
     peers: &[PeerAddr],
-    transport: Arc<dyn Transport>,
     progress: Option<&Arc<AppState>>,
     address: &str,
 ) -> (u64, Vec<String>) {
     use std::collections::HashSet;
+    // The owner's signed feed ordering directive, if any (see the sort below).
+    let feed_order = xite
+        .content
+        .as_ref()
+        .and_then(|c| epix_blob::policy::OrderPolicy::from_content(c).feed_order);
     // Enumerate content.json paths: the root's includes, plus everything a peer
     // advertises via listModified (this is how per-user content.json files -
     // never listed statically - are discovered).
@@ -1000,10 +1028,13 @@ async fn sync_included_content(
     // the first non-empty answer, so one slow/dead peer can't stall the pass.
     let mut probes = tokio::task::JoinSet::new();
     for peer in peers.iter().take(8).cloned() {
-        let transport = transport.clone();
+        let state = progress.cloned();
         let address = address.to_string();
         probes.spawn(async move {
-            let list = fetch_list_modified(transport.as_ref(), &peer, &address).await;
+            let list = match state {
+                Some(s) => fetch_list_modified(&s, &peer, &address).await,
+                None => None,
+            };
             (peer, list)
         });
     }
@@ -1043,9 +1074,31 @@ async fn sync_included_content(
     if paths.is_empty() {
         return (0, Vec::new());
     }
+    // Feed order (owner-signed `order_policy.feed_order`) decides which user's
+    // records go down first. This is the one place a xite's feed records are
+    // actually FETCHED: the sealed feed segments in `epix-ui::feed` are derived
+    // locally from records already on disk, not pulled from peers, so there is
+    // no segment fetch path to drive yet. `modified` (from the peers'
+    // listModified) is the newest-activity signal available before any bytes
+    // arrive, so newest-first = the most recently updated user content.json
+    // first, then page backward. Applied BEFORE the parent-first sort, which is
+    // a stable sort, so verification order (parents before children) is
+    // untouched and this only reorders within a depth level. No policy, or
+    // `custom`/`pinned-first` (resolved app-side after the records land) →
+    // newest-first is what a reader sees first either way; `oldest-first`
+    // reverses it.
+    let mut ordered: Vec<(String, f64)> = paths.into_iter().collect();
+    if let Some(order) = feed_order {
+        ordered.sort_by(|a, b| {
+            if order.newest_first() {
+                b.1.total_cmp(&a.1)
+            } else {
+                a.1.total_cmp(&b.1)
+            }
+        });
+    }
     // Parent-first: shallower paths (data/users/content.json) before deeper
     // ones (data/users/mud.epix/content.json), so each verifies against its parent.
-    let mut ordered: Vec<(String, f64)> = paths.into_iter().collect();
     ordered.sort_by_key(|(p, _)| p.matches('/').count());
 
     // Pre-warm the xID resolver cache: resolve every user's linked signers
@@ -1109,14 +1162,17 @@ async fn sync_included_content(
             }
         }
         if !to_fetch.is_empty() {
-            let mut results = epix_worker::fetch_files_raw(
-                to_fetch.iter().map(|(p, _)| p.clone()).collect(),
-                address,
-                peers,
-                transport.clone(),
-                8,
-            )
-            .await;
+            let want: Vec<String> = to_fetch.iter().map(|(p, _)| p.clone()).collect();
+            // EDX-only: dial the peers once and GetSigned every child manifest
+            // over the reused links. A path no peer serves stays absent and
+            // falls back to the on-disk copy (if any) below.
+            let mut results = match progress {
+                Some(state) => state
+                    .edx_fetch_signed_many(address, want, peers.to_vec())
+                    .await
+                    .unwrap_or_default(),
+                None => std::collections::HashMap::new(),
+            };
             for (path, disk) in to_fetch {
                 match results.remove(&path) {
                     Some(bytes) => fetched.push((path, bytes, true)),
@@ -1172,34 +1228,27 @@ async fn sync_included_content(
             .log("INFO", format!("Fetching {} user-content file(s) for {address}", needed.len()))
             .await;
     }
-    let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
-    // Each data file is ingested into the site's db (and its mergers') the
-    // moment it verifies, with its file_done pushed right after - this is
-    // what makes topics/posts appear one by one while the sync is running.
-    let on_file = progress.map(|state| {
-        let state = state.clone();
-        let addr = address.to_string();
-        Arc::new(move |inner: &str, _done: usize, _total: usize| {
-            let state = state.clone();
-            let addr = addr.clone();
-            let inner = inner.to_string();
-            tokio::spawn(async move {
-                state.ingest_file(&addr, &inner).await;
-            });
-        }) as epix_worker::FileProgress
-    });
-    let feedback = live_feedback(progress, address);
-    match epix_worker::sync_files_list(needed, xite, peers, transport, 8, on_file, feedback).await {
-        Ok(report) => {
-            // Report only the files that actually landed - a partial sync
-            // (dead peers) must not fire file_done for missing files.
-            arrived.extend(
-                needed_paths.into_iter().filter(|p| xite.storage().exists(p)),
-            );
-            (report.bytes, arrived)
+    // EDX-only for the child/user data files: dial the peers ONCE and pull what
+    // EDX can, ingesting each landed file so its posts appear one by one. A file
+    // with no `b3` does not arrive - EDX is the only transfer path. Bytes are
+    // counted by
+    // edx_first's add_transfer. The child content.json files are already on disk
+    // (add_content wrote them), so declared_entry resolves each data file's `b3`
+    // from its governing child.
+    if let Some(state) = progress {
+        let before: std::collections::HashSet<String> =
+            needed.iter().map(|f| f.inner_path.clone()).collect();
+        let missed = state.edx_first(address, needed, peers.to_vec(), None, None).await;
+        let still: std::collections::HashSet<&String> =
+            missed.iter().map(|f| &f.inner_path).collect();
+        for path in &before {
+            if !still.contains(path) {
+                state.ingest_file(address, path).await;
+                arrived.push(path.clone());
+            }
         }
-        Err(_) => (0, arrived),
     }
+    (0, arrived)
 }
 
 /// Every non-root `content.json` under `root` (per-user / included content
@@ -1265,53 +1314,38 @@ async fn resolve_user_signers(
     map
 }
 
-/// Ask a peer for its list of modified files (`listModified` since 0): the
+/// Ask a peer for its signed files changed since 0 (EDX `ListSigned`): the
 /// inner_paths of every content.json it serves, including per-user ones.
+/// `None` when the peer could not be reached or served no list.
 async fn fetch_list_modified(
-    transport: &dyn Transport,
+    state: &Arc<AppState>,
     peer: &PeerAddr,
     address: &str,
 ) -> Option<Vec<(String, f64)>> {
-    // Overlay-aware bound: user-content sync must be able to ask onion/i2p
-    // peers too, and a flat clearnet deadline cut them off mid-dial.
-    tokio::time::timeout(peer.connect_timeout(), async {
-        let mut conn = Connection::connect(transport, peer).await.ok()?;
-        conn.handshake().await.ok()?;
-        let reply = conn.list_modified(address, 0.0).await.ok()?;
-        let map = epix_protocol::vget(&reply, "modified_files")?.as_map()?;
-        Some(
-            map.iter()
-                .filter_map(|(k, v)| {
-                    let path = k.as_str()?.to_string();
-                    let modified = v.as_f64().or_else(|| v.as_i64().map(|n| n as f64))?;
-                    Some((path, modified))
-                })
-                .collect::<Vec<_>>(),
-        )
-    })
-    .await
-    .ok()
-    .flatten()
+    let entries = state.edx_list_signed(peer.clone(), address, 0).await?.ok()??;
+    Some(entries.into_iter().map(|(path, modified, _size)| (path, modified as f64)).collect())
 }
 
 /// One bounded attempt to pull content.json from a peer (phase 1 of a clone).
 async fn fetch_content(
-    transport: Arc<dyn Transport>,
     peer: PeerAddr,
     address: String,
+    state: Option<Arc<AppState>>,
 ) -> Option<Vec<u8>> {
-    let budget = std::time::Duration::from_secs(match peer {
-        PeerAddr::Onion { .. } | PeerAddr::I2p { .. } => 45,
-        _ => 10,
-    });
-    tokio::time::timeout(budget, async {
-        let mut conn = Connection::connect(transport.as_ref(), &peer).await.ok()?;
-        conn.handshake().await.ok()?;
-        conn.get_file(&address, "content.json").await.ok()
-    })
-    .await
-    .ok()
-    .flatten()
+    // Overlay-aware budget: an Ip peer is dialed through an exit circuit in
+    // Tor-always mode, so the clearnet 10s cut off every attempt before the
+    // circuit finished building and the clone never got content.json.
+    // connect_timeout() already folds in route_all_via_overlay.
+    let budget = peer.connect_timeout();
+    // EDX manifest channel: GetSigned returns the signed content.json over an
+    // EDX link, and works for ANY site (the signed bytes are served independent
+    // of per-file `b3`). With no state there is no fetcher, so nothing to do.
+    let state = state?;
+    match tokio::time::timeout(budget, state.edx_fetch_signed(peer, &address, "content.json")).await
+    {
+        Ok(Some(Ok(Some(bytes)))) => Some(bytes),
+        _ => None,
+    }
 }
 
 /// The on-demand resolver the browser proxy path uses: given a `.epix` host not
@@ -1321,7 +1355,6 @@ async fn fetch_content(
 struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
-    transport: Arc<dyn Transport>,
     trackers: Vec<epix_xite::Tracker>,
     /// Names currently being cloned, so concurrent requests coalesce.
     in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
@@ -1463,27 +1496,11 @@ impl epix_ui::ContentSyncer for OnDemand {
         if peers.is_empty() {
             return (0, Vec::new());
         }
-        sync_included_content(
-            &xite,
-            &peers,
-            self.live_transport().await,
-            Some(&self.state),
-            address,
-        )
-        .await
+        sync_included_content(&xite, &peers, Some(&self.state), address).await
     }
 }
 
 impl OnDemand {
-    /// The node's live peer transport - the Tor/I2P/mesh-upgraded one the
-    /// runtime installs on the state once those overlays come up, not the plain
-    /// TCP transport captured at boot. Onion/I2P peers fail instantly through
-    /// the captured one, so on-demand clones must dial through the live
-    /// transport or an onion-only seeder is never reachable.
-    async fn live_transport(&self) -> Arc<dyn Transport> {
-        self.state.transport().await.unwrap_or_else(|| self.transport.clone())
-    }
-
     /// Block (bounded) until the in-process Tor transport is installed, so a
     /// cold-start clone of an onion-seeded site dials through Tor instead of
     /// the plain TCP transport the node holds until Arti finishes bootstrapping.
@@ -1618,14 +1635,8 @@ impl OnDemand {
             // (the dashboard has few seeders) isn't doomed by one unlucky round.
             // Cheap when it works: a live peer makes the first try land.
             const CLONE_ATTEMPTS: usize = 4;
-            let mut cloned = clone_xite_with_progress(
-                &address,
-                &data_dir,
-                self.live_transport().await,
-                &trackers,
-                Some(&self.state),
-            )
-            .await;
+            let mut cloned =
+                clone_xite_with_progress(&address, &data_dir, &trackers, Some(&self.state)).await;
             for attempt in 1..CLONE_ATTEMPTS {
                 if cloned.is_ok() {
                     break;
@@ -1641,14 +1652,9 @@ impl OnDemand {
                     )
                     .await;
                 tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                cloned = clone_xite_with_progress(
-                    &address,
-                    &data_dir,
-                    self.live_transport().await,
-                    &trackers,
-                    Some(&self.state),
-                )
-                .await;
+                cloned =
+                    clone_xite_with_progress(&address, &data_dir, &trackers, Some(&self.state))
+                        .await;
             }
             self.state.end_clone(&address);
             let (content, bytes, user_files) = match cloned {
@@ -1811,7 +1817,6 @@ async fn serve(
     let on_demand = Arc::new(OnDemand {
         state: state.clone(),
         data_root: opts.data_root.clone(),
-        transport: transport.clone(),
         trackers: trackers.clone(),
         in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
@@ -1890,6 +1895,10 @@ async fn serve(
         epix_chain::set_chain_require_tor(tor_mode == epix_runtime::TorMode::Always);
         #[cfg(feature = "bittorrent")]
         epix_bt::http::set_require_tor(tor_mode == epix_runtime::TorMode::Always);
+        // Ip peers are dialed through exit circuits in Always mode, so every
+        // dial/transfer deadline must use the overlay budget - the clearnet
+        // 15s cuts off exit-circuit dials mid-build and discovery goes dark.
+        epix_core::set_route_all_via_overlay(tor_mode == epix_runtime::TorMode::Always);
     }
 
     // Privacy by default: turn the embedded I2P router on the first time a node

@@ -58,7 +58,7 @@ async fn main() {
             println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
             println!("         siteDelete, siteDownload, dbRebuild, dbQuery, importBundle,");
             println!("         cryptSign, cryptVerify, cryptGetPrivatekey,");
-            println!("         cryptPrivatekeyToAddress, peerPing, peerGetFile, peerCmd");
+            println!("         cryptPrivatekeyToAddress, peerPing, siteCmd");
             println!();
             println!("Env: EPIX_DATA_DIR, EPIX_UI_ADDR, EPIX_HEADLESS, EPIX_TOR");
             return;

@@ -1,8 +1,7 @@
 //! Peer announcing: discover peers for a xite across one or more trackers.
 
 use epix_core::PeerAddr;
-use epix_discovery::{address_hash, discover_via_epix_tracker, AnnounceParams};
-use epix_transport::Transport;
+use epix_discovery::{address_hash, discover_via_epix_tracker, AnnounceParams, AnnounceSender};
 
 pub use epix_discovery::Tracker;
 
@@ -38,12 +37,12 @@ impl std::fmt::Debug for SelfAdvert {
     }
 }
 
-/// Announce `xite_address` to each tracker - the Epix wire protocol for
-/// `epix://` announcers, the BitTorrent announce (UDP or HTTP, infohash =
+/// Announce `xite_address` to each tracker - an EDX `Announce` over `sender`
+/// for `epix://` announcers, the BitTorrent announce (UDP or HTTP, infohash =
 /// `sha1(address)`) for tracker URLs - and return the de-duplicated union of
 /// discovered peers. Trackers that error are skipped.
 pub async fn announce(
-    transport: &dyn Transport,
+    sender: &dyn AnnounceSender,
     xite_address: &str,
     trackers: &[Tracker],
     advert: &SelfAdvert,
@@ -87,7 +86,7 @@ pub async fn announce(
     for tracker in trackers {
         match tracker {
             Tracker::Epix(addr) => {
-                if let Ok(found) = discover_via_epix_tracker(transport, addr, &params).await {
+                if let Ok(found) = discover_via_epix_tracker(sender, addr, &params).await {
                     fold(found);
                 }
             }

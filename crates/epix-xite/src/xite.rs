@@ -555,6 +555,13 @@ impl Xite {
     /// a file only in `declared_optional` is skipped so its stored entry
     /// survives (it may not be on disk). Shared by the root
     /// [`sign`](Self::sign) and [`sign_child`](Self::sign_child).
+    ///
+    /// The third return value is the bytes of every bundle-eligible required
+    /// file (the only ones that bundle), so
+    /// [`stamp_edx_manifest`](Self::stamp_edx_manifest) can build the bundles
+    /// from exactly what was hashed. Re-reading there instead would sign a
+    /// manifest whose bundle bytes disagree with the b3/size it declares when
+    /// an app rewrites a file mid-sign.
     fn hash_unit_files(
         &self,
         dir: &str,
@@ -562,7 +569,11 @@ impl Xite {
         declared_merged: &serde_json::Map<String, Value>,
         ignore: &Option<fancy_regex::Regex>,
         optional: &Option<fancy_regex::Regex>,
-    ) -> Result<(serde_json::Map<String, Value>, serde_json::Map<String, Value>)> {
+    ) -> Result<(
+        serde_json::Map<String, Value>,
+        serde_json::Map<String, Value>,
+        std::collections::BTreeMap<String, Vec<u8>>,
+    )> {
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         let listing = self.storage.list_files();
         // Directories governed by their own content.json own their subtrees.
@@ -574,6 +585,7 @@ impl Xite {
             .collect();
         let mut files = serde_json::Map::new();
         let mut files_optional = serde_json::Map::new();
+        let mut hashed_bytes = std::collections::BTreeMap::new();
         for inner in listing {
             let Some(rel) = inner.strip_prefix(prefix.as_str()).map(str::to_string) else {
                 continue;
@@ -589,14 +601,25 @@ impl Xite {
                 continue;
             };
             let bytes = self.storage.read(&inner)?;
-            let entry = json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes) });
+            // `b3` is the EDX per-file BLAKE3 root (docs/edx-manifest.md);
+            // `sha512` stays alongside it for the migration window.
+            let entry = json!({
+                "size": bytes.len(),
+                "sha512": XiteStorage::hash_bytes(&bytes),
+                "b3": epix_blob::ObjId::of(&bytes).to_string(),
+            });
             if is_optional {
                 files_optional.insert(rel, entry);
             } else {
+                // Only required files bundle, so only they are worth keeping:
+                // an optional-heavy xite must not pay for a cache nothing reads.
+                if epix_blob::bundle::is_bundleable(bytes.len() as u64) {
+                    hashed_bytes.insert(rel.clone(), bytes);
+                }
                 files.insert(rel, entry);
             }
         }
-        Ok((files, files_optional))
+        Ok((files, files_optional, hashed_bytes))
     }
 
     /// Merge `files_optional` rebuilt by [`hash_unit_files`](Self::hash_unit_files)
@@ -626,8 +649,11 @@ impl Xite {
     /// The key must own the xite (its address must equal the xite address),
     /// otherwise the resulting signature wouldn't verify.
     pub fn sign(&mut self, privatekey: &str, modified: f64) -> Result<()> {
-        let signer =
-            epix_crypt::privatekey_to_address(privatekey).map_err(Error::Crypt)?;
+        // The underlying failure is a base58check/curve detail (checksum byte
+        // arrays and the like). This message reaches the user as a notification,
+        // and there is nothing actionable in the detail: the key is unusable.
+        let signer = epix_crypt::privatekey_to_address(privatekey)
+            .map_err(|_| Error::Crypt("that is not a valid private key".into()))?;
         if signer != self.address.as_str() {
             return Err(Error::Crypt(format!(
                 "private key address {signer} does not own xite {}",
@@ -655,7 +681,9 @@ impl Xite {
 
         let ignore = path_pattern(content.get("ignore"));
         let optional = path_pattern(content.get("optional"));
-        let (files, files_optional) =
+        // Files matching the `shard` pattern are self-encrypted (private).
+        let shard = path_pattern(content.get("shard"));
+        let (files, files_optional, hashed_bytes) =
             self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional)?;
 
         let map = content.as_object_mut().ok_or_else(|| {
@@ -677,6 +705,9 @@ impl Xite {
             map.insert("signs_required".into(), json!(1));
         }
 
+        self.encrypt_shard_files(&mut content, &shard)?;
+        self.stamp_edx_manifest(&mut content, hashed_bytes)?;
+
         epix_content::sign(&mut content, privatekey)?;
         // Python-EpixNet's on-disk format (helper.jsonDumps): human-readable
         // and diff-friendly; the signature covers the canonical form, not this.
@@ -684,6 +715,452 @@ impl Xite {
         self.storage.write_atomic("content.json", &bytes)?;
         self.content = Some(content);
         Ok(())
+    }
+
+    /// EDX shards: files matching the `shard` pattern are self-encrypted
+    /// into content-addressed ciphertext shards. Their data-map (chunk
+    /// list + the xite salt) lives in the signed content.json, so a reader
+    /// who resolves the xite can decrypt, while a volunteer that only holds
+    /// ciphertext shards by hash cannot. They leave `files` and
+    /// `files_optional` entirely, so they are never served or hashed as
+    /// plaintext.
+    ///
+    /// A content with no `shard` pattern is left untouched - no salt is
+    /// stamped and any stored `files_shard` stays as it is.
+    fn encrypt_shard_files(
+        &self,
+        content: &mut Value,
+        shard: &Option<fancy_regex::Regex>,
+    ) -> Result<()> {
+        if shard.is_none() {
+            return Ok(());
+        }
+        let salt = self.ensure_edx_salt(content);
+        content.as_object_mut().and_then(|o| o.remove("files_shard"));
+        // `files_optional` is scanned too: a path can match the `optional`
+        // pattern as well (or be a declared-optional entry carried over), and
+        // the shard pattern has to win - the owner marked it private.
+        let shard_paths: Vec<(&'static str, String)> = ["files", "files_optional"]
+            .into_iter()
+            .flat_map(|key| {
+                content
+                    .get(key)
+                    .and_then(Value::as_object)
+                    .map(|f| {
+                        f.keys()
+                            .filter(|p| pattern_matches(shard, p))
+                            .map(|p| (key, p.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        for (key, path) in shard_paths {
+            // A declared-optional entry may have no local copy. Fail the sign
+            // rather than re-publish its plaintext hash under a shard pattern.
+            let Ok(bytes) = self.storage.read(&path) else {
+                return Err(Error::Protocol(format!(
+                    "{path} matches the shard pattern but is not on disk, so it cannot be \
+                     encrypted; fetch it or drop it from files_optional before signing"
+                )));
+            };
+            let enc = epix_selfenc::encrypt_convergent(&bytes, &salt);
+            let chunks: Vec<epix_blob::manifest::ShardChunk> = enc
+                .chunks
+                .iter()
+                .zip(&enc.shards)
+                .map(|(c, (_addr, ct))| epix_blob::manifest::ShardChunk {
+                    plain_hash: c.plain_hash,
+                    cipher_addr: epix_blob::ObjId(c.cipher_addr),
+                    len: c.len,
+                    csize: ct.len() as u32,
+                })
+                .collect();
+            epix_blob::manifest::set_shard_entry(
+                content,
+                &path,
+                &epix_blob::manifest::ShardEntry { size: bytes.len() as u64, mode: 0, chunks },
+            );
+            if let Some(f) = content.get_mut(key).and_then(Value::as_object_mut) {
+                f.remove(&path);
+            }
+        }
+        // A unit whose only optional entries became shards must sign as one
+        // that never had any (`merge_files_optional` omits the empty key).
+        if content.get("files_optional").and_then(Value::as_object).is_some_and(|f| f.is_empty()) {
+            content.as_object_mut().and_then(|o| o.remove("files_optional"));
+        }
+        Ok(())
+    }
+
+    /// EDX (docs/edx-manifest.md): bundle small required files with
+    /// STABLE assignment against the previous manifest, then stamp
+    /// b3/bundle/off, the bundles section, files_merkle_root and edx:1.
+    ///
+    /// The stability comes from `self.content`, the manifest as it was BEFORE
+    /// this sign, so the bundles it already published keep their members.
+    ///
+    /// `hashed_bytes` is what [`hash_unit_files`](Self::hash_unit_files) read
+    /// to compute the declared b3/size; bundles must be built from those exact
+    /// bytes, never a second read.
+    fn stamp_edx_manifest(
+        &self,
+        content: &mut Value,
+        hashed_bytes: std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<()> {
+        let prev_bundles = self
+            .content
+            .as_ref()
+            .map(epix_blob::manifest::prev_memberships)
+            .unwrap_or_default();
+        let roots = Self::edx_file_roots(content);
+        let bundleable = self.edx_bundle_inputs(content, hashed_bytes)?;
+        let assignment = epix_blob::bundle::assign(&bundleable, &prev_bundles);
+        epix_blob::manifest::apply_edx(content, &roots, &assignment);
+        Ok(())
+    }
+
+    /// The declared b3 root of every entry in `files` and `files_optional`,
+    /// keyed by path. An entry without a usable `b3` is left out (pre-EDX or
+    /// malformed), which is what `apply_edx` treats as "leave untouched".
+    fn edx_file_roots(content: &Value) -> std::collections::BTreeMap<String, epix_blob::ObjId> {
+        let mut roots = std::collections::BTreeMap::new();
+        for key in ["files", "files_optional"] {
+            let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+            for (path, e) in entries {
+                if let Some(id) =
+                    e.get("b3").and_then(Value::as_str).and_then(epix_blob::ObjId::from_hex)
+                {
+                    roots.insert(path.clone(), id);
+                }
+            }
+        }
+        roots
+    }
+
+    /// The bytes the bundle packer works from: the small required files, in
+    /// path order. Only `files` is scanned - optional files must stay
+    /// individually fetchable on demand, so they never bundle.
+    ///
+    /// Bytes come from `hashed_bytes` (what this sign already read and declared
+    /// a b3 for), so a file rewritten between the hash pass and here cannot
+    /// make the bundle disagree with the manifest. Falling back to a read is
+    /// for entries carried in from a previous manifest, which this sign did not
+    /// re-hash.
+    fn edx_bundle_inputs(
+        &self,
+        content: &Value,
+        mut hashed_bytes: std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut bundleable = std::collections::BTreeMap::new();
+        let Some(entries) = content.get("files").and_then(Value::as_object) else {
+            return Ok(bundleable);
+        };
+        for (path, e) in entries {
+            let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
+            if !epix_blob::bundle::is_bundleable(size) {
+                continue;
+            }
+            let bytes = match hashed_bytes.remove(path) {
+                Some(bytes) => bytes,
+                None => self.storage.read(path)?,
+            };
+            bundleable.insert(path.clone(), bytes);
+        }
+        Ok(bundleable)
+    }
+
+    /// The owner salt for salted-convergent shards, read from `edx_salt` or
+    /// freshly generated and stamped (stable across re-signs for dedup).
+    fn ensure_edx_salt(&self, content: &mut Value) -> Vec<u8> {
+        if let Some(salt) = epix_blob::manifest::edx_salt(content) {
+            return salt;
+        }
+        let hex = epix_crypt::new_seed(); // 32 random bytes, hex
+        if let Some(o) = content.as_object_mut() {
+            o.insert("edx_salt".into(), json!(hex));
+        }
+        (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    /// The EDX migration pass: register this xite's local files (and the
+    /// bundles its manifest declares) as content-addressed objects in the
+    /// store - no re-download, no second copy (large files are adopted by
+    /// hard link where possible).
+    ///
+    /// Small files insert into slabs; files >= the bundle cutoff adopt in
+    /// place. Declared bundles are rebuilt from their member files and
+    /// verified against their declared id before insertion. Returns
+    /// `(registered, skipped)` - a skip is a missing/mismatched local
+    /// file, which simply stays fetchable from the swarm instead.
+    pub fn edx_register(
+        &self,
+        store: &epix_blob::store::Store,
+        now: u64,
+    ) -> Result<(usize, usize)> {
+        let Some(content) = &self.content else { return Ok((0, 0)) };
+        // Four independent passes whose store writes and pins must happen in
+        // this order. Sequential bindings, not an array of calls: with an array
+        // the ordering would rest on left-to-right element evaluation, and
+        // reshuffling the lines for readability would silently reorder the
+        // writes.
+        let (mut registered, mut skipped) = self.register_file_entries(store, content, "", now);
+        // Declared bundles: rebuild from member files, verify, insert.
+        let (r, s) = self.register_bundles(store, content, now);
+        registered += r;
+        skipped += s;
+        // The encrypted shards this content.json records.
+        let (r, s) = self.register_shards(store, content, now);
+        registered += r;
+        skipped += s;
+        // The child / per-user content.json units stored below the root.
+        let (r, s) = self.register_child_units(store, now);
+        registered += r;
+        skipped += s;
+        Ok((registered, skipped))
+    }
+
+    /// Register the per-file objects one content.json unit declares (`files`
+    /// and `files_optional`), each declared path prefixed with `dir_prefix`
+    /// (empty for the root unit, the child unit's dir - trailing '/' included -
+    /// for a child unit). Returns `(registered, skipped)`; an entry with no
+    /// `b3` is pre-EDX and counts as neither.
+    fn register_file_entries(
+        &self,
+        store: &epix_blob::store::Store,
+        content: &Value,
+        dir_prefix: &str,
+        now: u64,
+    ) -> (usize, usize) {
+        let mut registered = 0usize;
+        let mut skipped = 0usize;
+        for key in ["files", "files_optional"] {
+            let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+            for (rel, e) in entries {
+                let Some(id) =
+                    e.get("b3").and_then(Value::as_str).and_then(epix_blob::ObjId::from_hex)
+                else {
+                    continue; // pre-EDX entry: nothing to register
+                };
+                let size = e.get("size").and_then(Value::as_u64).unwrap_or(0);
+                let path = format!("{dir_prefix}{rel}");
+                if self.register_entry(store, id, &path, size, now) {
+                    registered += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+        (registered, skipped)
+    }
+
+    /// Register one local file as the object `id` and pin it: small files
+    /// insert into slabs, files >= the bundle cutoff adopt in place. Returns
+    /// whether it was registered - a `false` is a missing/mismatched local
+    /// file, which simply stays fetchable from the swarm instead.
+    fn register_entry(
+        &self,
+        store: &epix_blob::store::Store,
+        id: epix_blob::ObjId,
+        path: &str,
+        size: u64,
+        now: u64,
+    ) -> bool {
+        if !self.storage.exists(path) {
+            return false;
+        }
+        let res = if epix_blob::bundle::is_bundleable(size) {
+            self.storage
+                .read(path)
+                .and_then(|bytes| {
+                    store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, now).map_err(Error::Io)
+                })
+                .map(|_| ())
+        } else {
+            self.storage.path(path).and_then(|p| {
+                store
+                    .adopt_file(id, epix_blob::Ns::Plain, &p, now)
+                    .map(|_| ())
+                    .map_err(Error::Io)
+            })
+        };
+        match res {
+            Ok(()) => {
+                // Our own content: pin it so eviction never reclaims it.
+                let _ = store.pin(id);
+                true
+            }
+            Err(_) => false, // corrupt/changed local copy: refetch later
+        }
+    }
+
+    /// Rebuild every bundle the manifest declares from its member files and
+    /// insert it under its declared id. A member whose `off` does not continue
+    /// the bytes collected so far, an unreadable member, or a rebuild that
+    /// hashes to something else fails the whole bundle - it is counted skipped
+    /// and never inserted under an id it does not match. Returns
+    /// `(registered, skipped)`.
+    fn register_bundles(
+        &self,
+        store: &epix_blob::store::Store,
+        content: &Value,
+        now: u64,
+    ) -> (usize, usize) {
+        let mut registered = 0usize;
+        let mut skipped = 0usize;
+        let declared = epix_blob::manifest::bundles(content);
+        if declared.is_empty() {
+            return (registered, skipped);
+        }
+        for (hex, paths) in Self::collect_bundle_members(content) {
+            let Some(id) = epix_blob::ObjId::from_hex(&hex) else { continue };
+            if !declared.contains_key(&id) {
+                continue;
+            }
+            if self.register_bundle(store, id, paths, now) {
+                registered += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        (registered, skipped)
+    }
+
+    /// The members every bundle in `files` / `files_optional` claims, keyed by
+    /// the bundle id hex the entries name. The `(off, path)` pairs come out in
+    /// manifest order, not offset order - the caller sorts them.
+    fn collect_bundle_members(
+        content: &Value,
+    ) -> std::collections::BTreeMap<String, Vec<(u64, String)>> {
+        // bundle id -> ordered (off, member path).
+        let mut members: std::collections::BTreeMap<String, Vec<(u64, String)>> =
+            std::collections::BTreeMap::new();
+        for key in ["files", "files_optional"] {
+            let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+            for (path, e) in entries {
+                if let (Some(bundle), Some(off)) = (
+                    e.get("bundle").and_then(Value::as_str),
+                    e.get("off").and_then(Value::as_u64),
+                ) {
+                    members.entry(bundle.into()).or_default().push((off, path.clone()));
+                }
+            }
+        }
+        members
+    }
+
+    /// Rebuild one declared bundle from its members and insert it under `id`.
+    /// Returns whether it was registered - a gap in the members, an unreadable
+    /// member, or a rebuild that hashes to something else fails the bundle, so
+    /// it is never inserted under an id it does not match.
+    fn register_bundle(
+        &self,
+        store: &epix_blob::store::Store,
+        id: epix_blob::ObjId,
+        mut paths: Vec<(u64, String)>,
+        now: u64,
+    ) -> bool {
+        paths.sort();
+        let Some(bytes) = self.read_bundle_members(&paths) else { return false };
+        if epix_blob::ObjId::of(&bytes) != id {
+            return false;
+        }
+        if store.insert_bytes(id, epix_blob::Ns::Plain, &bytes, now).is_err() {
+            return false;
+        }
+        let _ = store.pin(id); // own content: never evict
+        true
+    }
+
+    /// Concatenate a bundle's members, `paths` already in offset order. `None`
+    /// if a member's `off` does not continue the bytes collected so far or a
+    /// member cannot be read.
+    fn read_bundle_members(&self, paths: &[(u64, String)]) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for (off, path) in paths {
+            let data = self.storage.read(path).ok()?;
+            // A zero-byte member shares its `off` with the member that follows
+            // it, so the (off, path) sort can put it after that member. It
+            // contributes nothing either way; only its position is odd.
+            if data.is_empty() {
+                if *off > bytes.len() as u64 {
+                    return None;
+                }
+            } else if *off != bytes.len() as u64 {
+                return None;
+            }
+            bytes.extend_from_slice(&data);
+        }
+        Some(bytes)
+    }
+
+    /// Encrypted shards: re-derive the ciphertext (deterministic from the
+    /// plaintext + xite salt) and store each shard object by its address as
+    /// Ns::Shard, so this node can serve them to peers. The addresses match
+    /// the ones the signed content.json already recorded. Returns
+    /// `(registered, skipped)`, counted per shard object (an unreadable
+    /// plaintext is one skip).
+    fn register_shards(
+        &self,
+        store: &epix_blob::store::Store,
+        content: &Value,
+        now: u64,
+    ) -> (usize, usize) {
+        let mut registered = 0usize;
+        let mut skipped = 0usize;
+        let Some(salt) = epix_blob::manifest::edx_salt(content) else {
+            return (registered, skipped);
+        };
+        let Some(fs) = content.get("files_shard").and_then(Value::as_object) else {
+            return (registered, skipped);
+        };
+        for path in fs.keys() {
+            let Ok(bytes) = self.storage.read(path) else {
+                skipped += 1;
+                continue;
+            };
+            let enc = epix_selfenc::encrypt_convergent(&bytes, &salt);
+            for (addr, ct) in &enc.shards {
+                let id = epix_blob::ObjId(*addr);
+                match store.insert_bytes(id, epix_blob::Ns::Shard, ct, now) {
+                    Ok(_) => {
+                        let _ = store.pin(id);
+                        registered += 1;
+                    }
+                    Err(_) => skipped += 1,
+                }
+            }
+        }
+        (registered, skipped)
+    }
+
+    /// Child / per-user content.json units: their files carry a b3 too, so
+    /// register them (full path = the unit's dir + the relative path) so
+    /// this node can serve forum and per-user content over EDX. A unit that
+    /// cannot be read or parsed is passed over, counting as neither. Returns
+    /// `(registered, skipped)`.
+    fn register_child_units(
+        &self,
+        store: &epix_blob::store::Store,
+        now: u64,
+    ) -> (usize, usize) {
+        let mut registered = 0usize;
+        let mut skipped = 0usize;
+        for cj in self.storage.list_files() {
+            if cj == "content.json" || !cj.ends_with("/content.json") {
+                continue;
+            }
+            let dir = &cj[..cj.len() - "content.json".len()]; // trailing '/'
+            let Ok(bytes) = self.storage.read(&cj) else { continue };
+            let Ok(child) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            let (r, s) = self.register_file_entries(store, &child, dir, now);
+            registered += r;
+            skipped += s;
+        }
+        (registered, skipped)
     }
 
     /// Sign a non-root content.json - a user content.json or include - with
@@ -753,7 +1230,8 @@ impl Xite {
             .unwrap_or_default();
         let ignore = path_pattern(map.get("ignore"));
         let optional = path_pattern(map.get("optional"));
-        let (files, files_optional) =
+        // Child units are not EDX-bundled, so the hashed bytes are dropped.
+        let (files, files_optional, _) =
             self.hash_unit_files(dir, &declared_optional, &declared_merged, &ignore, &optional)?;
         map.insert("files".into(), Value::Object(files));
         Self::merge_files_optional(map, files_optional, declared_optional);
@@ -930,5 +1408,161 @@ mod tests {
         let stored: Value =
             serde_json::from_slice(&storage.read(&user_inner).unwrap()).unwrap();
         assert!(stored["files_optional"]["1775.jpg"].is_object());
+    }
+
+    #[test]
+    fn a_shard_file_never_signs_as_optional_plaintext() {
+        // Overlapping patterns: the file matches `optional` (so the hasher
+        // routes it to files_optional) AND `shard`. The shard pattern wins;
+        // publishing its plaintext hash would serve a file the owner marked
+        // private in the clear.
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let mut xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        let secret = b"the home video";
+        storage.write("private/home-video.mp4", secret).unwrap();
+        storage.write("index.html", b"<h1>public</h1>").unwrap();
+        xite.content = Some(serde_json::json!({
+            "shard": "private/.*",
+            "optional": ".*\\.mp4",
+        }));
+        xite.sign(&pk, 1000.0).unwrap();
+        let content = xite.content.clone().unwrap();
+
+        assert!(
+            epix_blob::manifest::edx_shard_entry(&content, "private/home-video.mp4").is_some(),
+            "the shard-matched file must be encrypted"
+        );
+        assert!(content.get("files").and_then(|f| f.get("private/home-video.mp4")).is_none());
+        assert!(
+            content.get("files_optional").and_then(|f| f.get("private/home-video.mp4")).is_none(),
+            "must not be published as an optional plaintext file"
+        );
+        // files_optional held only that file, so it is gone entirely.
+        assert!(content.get("files_optional").is_none());
+        // And the plaintext hash is nowhere in the signed manifest on disk.
+        let on_disk = String::from_utf8(storage.read("content.json").unwrap()).unwrap();
+        assert!(!on_disk.contains(&XiteStorage::hash_bytes(secret)), "plaintext hash published");
+        assert!(content["files"]["index.html"].is_object(), "public files still sign");
+    }
+
+    #[test]
+    fn a_declared_optional_shard_file_that_is_gone_fails_the_sign() {
+        // A declared-optional entry the hasher never re-reads is carried
+        // forward by merge_files_optional. If it matches `shard` and has no
+        // local copy it cannot be encrypted, so the sign fails rather than
+        // re-publishing its plaintext hash.
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let mut xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        storage.write("index.html", b"<h1>public</h1>").unwrap();
+        xite.content = Some(serde_json::json!({
+            "shard": "private/.*",
+            "files_optional": {
+                "private/gone.dat": { "size": 4, "sha512": XiteStorage::hash_bytes(b"gone") },
+            },
+        }));
+        let err = xite.sign(&pk, 1000.0).unwrap_err();
+        assert!(err.to_string().contains("private/gone.dat"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_byte_bundle_member_does_not_fail_the_bundle() {
+        // bundle::build stamps a zero-byte member with the same `off` as the
+        // member that follows it, so register_bundle's (off, path) sort can
+        // place it after that member. It contributes no bytes either way.
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        storage.write("m.bin", b"MMMM").unwrap();
+        storage.write("z.keep", b"").unwrap();
+        storage.write("a.bin", b"AAA").unwrap();
+
+        // As signed: [m.bin@0, z.keep@4, a.bin@4]; register_bundle sorts to
+        // [m.bin, a.bin, z.keep].
+        let mut paths = vec![
+            (0u64, "m.bin".to_string()),
+            (4u64, "z.keep".to_string()),
+            (4u64, "a.bin".to_string()),
+        ];
+        paths.sort();
+        let bytes = xite.read_bundle_members(&paths).expect("zero-byte member must not fail");
+        assert_eq!(bytes, b"MMMMAAA".to_vec());
+
+        // A real gap still fails the bundle.
+        let gap = vec![(0u64, "m.bin".to_string()), (9u64, "a.bin".to_string())];
+        assert!(xite.read_bundle_members(&gap).is_none());
+    }
+
+    #[test]
+    fn hashing_hands_back_the_bytes_bundles_are_built_from() {
+        // hash_unit_files hands back the bytes it hashed, and only for the
+        // files that bundle: a file over the cutoff is never cached, so an
+        // optional-heavy or large xite does not hold its whole tree in RAM.
+        // That stamp_edx_manifest actually uses these bytes is covered by
+        // a_file_rewritten_mid_sign_does_not_change_the_bundle.
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        storage.write("small.txt", b"small").unwrap();
+        storage.write("big.bin", &vec![7u8; 200_000]).unwrap();
+        let none = serde_json::Map::new();
+        let (files, _optional, hashed) =
+            xite.hash_unit_files("", &none, &none, &None, &None).unwrap();
+
+        assert_eq!(hashed.get("small.txt").map(|b| b.as_slice()), Some(&b"small"[..]));
+        assert!(!hashed.contains_key("big.bin"), "over the bundle cutoff: never bundled");
+        assert_eq!(files["small.txt"]["size"], 5);
+    }
+
+    #[test]
+    fn a_file_rewritten_mid_sign_does_not_change_the_bundle() {
+        // The interleaving the cache exists for: hash_unit_files reads and
+        // declares b3/size, then an app rewrites the file (same length, so
+        // nothing downstream notices), then stamp_edx_manifest builds the
+        // bundle. Bundling must use the hashed bytes, or the signed bundle
+        // disagrees with the b3 the same manifest declares.
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        storage.write("a.txt", b"AAA").unwrap();
+        storage.write("small.txt", b"small").unwrap();
+        let none = serde_json::Map::new();
+        let (files, _optional, hashed) =
+            xite.hash_unit_files("", &none, &none, &None, &None).unwrap();
+
+        // Rewrite between the two passes, keeping the length identical.
+        storage.write("small.txt", b"DIRTY").unwrap();
+
+        let mut content = json!({ "files": files });
+        xite.stamp_edx_manifest(&mut content, hashed).unwrap();
+
+        // One bundle, members in path order: "AAA" then "small".
+        let clean = epix_blob::ObjId::of(b"AAAsmall").to_string();
+        let dirty = epix_blob::ObjId::of(b"AAADIRTY").to_string();
+        assert_ne!(clean, dirty, "the rewrite must change the bundle id");
+        assert_eq!(
+            content["files"]["small.txt"]["bundle"],
+            json!(clean),
+            "the bundle must be built from the hashed bytes, not a second read"
+        );
+        assert_eq!(content["files"]["small.txt"]["off"], json!(3));
+        assert!(content["bundles"].get(clean.as_str()).is_some(), "{}", content["bundles"]);
+        assert!(content["bundles"].get(dirty.as_str()).is_none(), "signed the rewritten bytes");
     }
 }
