@@ -150,6 +150,45 @@ impl SliceSink {
         })
     }
 
+    /// Take one data frame of the slice: bounds-check it against the
+    /// request's byte `cap`, buffer it, and keep the incremental commit
+    /// pipeline moving. Returns whether the frame was the terminal one.
+    async fn absorb(
+        &mut self,
+        last: bool,
+        bytes: &[u8],
+        cap: u64,
+        progress: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::io::Result<bool> {
+        // The byte cap is the only bound on the frame loop, so a frame
+        // that adds no bytes must not be allowed to repeat forever.
+        // FrameSink only emits a non-terminal frame once it is full
+        // (server.rs), so no honest server sends one.
+        if bytes.is_empty() && !last {
+            return Err(proto_err("peer sent an empty non-terminal data frame"));
+        }
+        if self.buf.len() as u64 + bytes.len() as u64 > cap {
+            return Err(proto_err("peer sent more slice bytes than the request implies"));
+        }
+        progress.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.buf.extend_from_slice(bytes);
+        if last {
+            return Ok(true);
+        }
+        // Incremental verified commit of the received prefix, so a
+        // failure later in the transfer keeps these groups. Reap a
+        // finished commit (surfacing verify errors) and start the
+        // next once enough new bytes buffered — never awaiting a
+        // running one, so the frame loop (and the progress counter
+        // the stall watcher reads) is never frozen by the disk.
+        self.reap(false).await?;
+        if self.pending.is_none() && self.buf.len() - self.flushed >= FLUSH_BYTES {
+            let flush = self.spawn_flush(false, progress);
+            self.pending = Some(flush);
+        }
+        Ok(false)
+    }
+
     /// Reap the in-flight flush: with `wait` it is awaited, otherwise only
     /// a FINISHED one is collected (never blocking the frame loop). A
     /// flush error (bytes that failed verification) surfaces here.
@@ -278,33 +317,8 @@ pub async fn fetch_ranges_observed(
         };
         match next {
             Some(FrameBody::Data { last, bytes }) => {
-                // The byte cap is the only bound on this loop, so a frame
-                // that adds no bytes must not be allowed to repeat forever.
-                // FrameSink only emits a non-terminal frame once it is full
-                // (server.rs), so no honest server sends one.
-                if bytes.is_empty() && !last {
-                    return Err(proto_err("peer sent an empty non-terminal data frame"));
-                }
-                if guard.sink.buf.len() as u64 + bytes.len() as u64 > cap {
-                    return Err(proto_err("peer sent more slice bytes than the request implies"));
-                }
-                progress.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                guard.sink.buf.extend_from_slice(&bytes);
-                if last {
+                if guard.sink.absorb(last, &bytes, cap, progress).await? {
                     break;
-                }
-                // Incremental verified commit of the received prefix, so a
-                // failure later in the transfer keeps these groups. Reap a
-                // finished commit (surfacing verify errors) and start the
-                // next once enough new bytes buffered — never awaiting a
-                // running one, so the frame loop (and the progress counter
-                // the stall watcher reads) is never frozen by the disk.
-                guard.sink.reap(false).await?;
-                if guard.sink.pending.is_none()
-                    && guard.sink.buf.len() - guard.sink.flushed >= FLUSH_BYTES
-                {
-                    let flush = guard.sink.spawn_flush(false, progress);
-                    guard.sink.pending = Some(flush);
                 }
             }
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {

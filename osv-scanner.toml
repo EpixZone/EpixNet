@@ -62,6 +62,3 @@ reason = "glib 0.18 VariantStrIter unsoundness; fixed in 0.20 but GTK3 pins 0.18
 id = "RUSTSEC-2024-0370"
 reason = "proc-macro-error unmaintained; build-time helper pulled by the GTK3 tray stack."
 
-[[IgnoredVulns]]
-id = "RUSTSEC-2024-0384"
-reason = "instant unmaintained; time shim pulled by the GTK3 tray stack."

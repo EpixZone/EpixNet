@@ -272,6 +272,163 @@ pub struct FetchReport {
 type BatchFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = BatchOutcome> + Send + 'a>>;
 
+/// The sliding window's bookkeeping for one [`Swarm::fetch`]: the per-peer
+/// pipeline load and failure counts, the groups an in-flight batch already
+/// covers, and the batch futures themselves. There is no round barrier —
+/// each completed batch frees its slot and [`Window::refill`] tops the
+/// window back up.
+struct Window<'a> {
+    /// Batches in flight per peer.
+    load: Vec<u32>,
+    /// Consecutive per-peer failures: a failing peer is picked last and,
+    /// past PEER_FAIL_LIMIT, exhausted (never picked again), so the swarm
+    /// routes around it instead of retrying it forever. This is also what
+    /// terminates the fetch when nothing is obtainable.
+    fails: Vec<u32>,
+    /// Groups an in-flight batch is already covering.
+    inflight: GroupBits,
+    /// Boxed so the window can hold a heterogenous set and drop completed
+    /// slots one at a time.
+    futs: Vec<BatchFut<'a>>,
+}
+
+impl<'a> Window<'a> {
+    fn new(peers: usize) -> Self {
+        Self {
+            load: vec![0u32; peers],
+            fails: vec![0u32; peers],
+            inflight: GroupBits::new(),
+            futs: Vec::new(),
+        }
+    }
+
+    /// Free pipeline slots across the peers still worth scheduling.
+    fn free_slots(&self) -> usize {
+        self.load
+            .iter()
+            .zip(self.fails.iter())
+            .filter(|(_, f)| **f < PEER_FAIL_LIMIT)
+            .map(|(l, _)| PIPELINE_DEPTH.saturating_sub(*l) as usize)
+            .sum()
+    }
+
+    /// Book one batch onto peer `idx`: take its pipeline slot, reserve its
+    /// groups and push the racing future.
+    #[allow(clippy::too_many_arguments)]
+    fn schedule(
+        &mut self,
+        swarm: &'a Swarm,
+        batch: std::ops::Range<u64>,
+        groups: Vec<u64>,
+        idx: usize,
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) {
+        self.load[idx] += 1;
+        for &g in &groups {
+            self.inflight.add(g..g + 1);
+        }
+        report.requests_issued += 1;
+        self.futs.push(Box::pin(swarm.race_batch(batch, groups, idx, peers, deadline, now)));
+    }
+
+    /// Assign one batch to a peer that holds all of it, else split it by
+    /// holder. Returns whether anything was scheduled.
+    fn assign(
+        &mut self,
+        swarm: &'a Swarm,
+        batch: std::ops::Range<u64>,
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) -> bool {
+        let bgroups = swarm.groups_of(&batch);
+        match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails) {
+            Some(idx) => {
+                self.schedule(swarm, batch, bgroups, idx, peers, deadline, now, report);
+                true
+            }
+            None => self.assign_split(swarm, &bgroups, peers, deadline, now, report),
+        }
+    }
+
+    /// A merged batch can straddle groups held by DISJOINT peers (equal
+    /// holder COUNTS don't mean the same holder SET), so no single peer
+    /// holds all of it. Split into maximal sub-batches each fully held by
+    /// some peer instead of skipping it — skipping would strand groups that
+    /// ARE available and leave the object stuck.
+    fn assign_split(
+        &mut self,
+        swarm: &'a Swarm,
+        bgroups: &[u64],
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) -> bool {
+        let mut assigned = false;
+        for sub in split_by_holder(bgroups, peers, swarm.size) {
+            let sgroups = swarm.groups_of(&sub);
+            let Some(idx) = swarm.pick_peer(&sgroups, peers, &self.load, &self.fails) else {
+                continue;
+            };
+            self.schedule(swarm, sub, sgroups, idx, peers, deadline, now, report);
+            assigned = true;
+        }
+        assigned
+    }
+
+    /// Fill every free slot with the next unassigned batches, until the
+    /// window is full or nothing in this slice is schedulable.
+    #[allow(clippy::too_many_arguments)]
+    fn refill(
+        &mut self,
+        swarm: &'a Swarm,
+        full_order: &[u64],
+        cursor: &mut usize,
+        remaining: &GroupBits,
+        peers: &'a [PeerHandle],
+        deadline: Deadline,
+        now: u64,
+        report: &mut FetchReport,
+    ) {
+        loop {
+            let free = self.free_slots();
+            if free == 0 {
+                break;
+            }
+            let order = next_unassigned(
+                full_order,
+                cursor,
+                remaining,
+                &self.inflight,
+                free * GROUPS_PER_REQUEST as usize,
+            );
+            if order.is_empty() {
+                break;
+            }
+            let mut assigned = false;
+            for batch in batch_into_ranges(&order, swarm.size) {
+                assigned |= self.assign(swarm, batch, peers, deadline, now, report);
+            }
+            if !assigned {
+                break; // nothing schedulable in this window slice
+            }
+        }
+    }
+
+    /// Give a completed batch's pipeline slot and group reservations back.
+    fn release(&mut self, outcome: &BatchOutcome) {
+        self.load[outcome.primary] = self.load[outcome.primary].saturating_sub(1);
+        for &g in &outcome.groups {
+            self.inflight.remove(g..g + 1);
+        }
+    }
+}
+
 impl Swarm {
     pub fn new(store: Arc<Store>, obj: ObjId, size: u64) -> Self {
         Self { store, obj, size, stats: Mutex::new(ClassStats::default()) }
@@ -302,11 +459,6 @@ impl Swarm {
         // Ensure the sparse object exists before writing slices.
         self.store.ensure_sparse(self.obj, epix_blob::Ns::Plain, self.size, now)?;
 
-        // Consecutive per-peer failures: a failing peer is picked last and,
-        // past PEER_FAIL_LIMIT, exhausted (never picked again), so the
-        // swarm routes around it instead of retrying it forever. This is
-        // also what terminates the fetch when nothing is obtainable.
-        let mut fails = vec![0u32; peers.len()];
         // The peer set and their bitfields are fixed for this call, so the
         // rarest-first order never changes: build it once and walk it with a
         // cursor. Re-counting holders and re-sorting every remaining group
@@ -314,89 +466,24 @@ impl Swarm {
         // (a 10 GB object is ~600k groups).
         let full_order = rarest_first_order(needed, peers);
         let mut cursor = 0usize;
-        // The sliding window: batches in flight per peer, the groups they
-        // cover, and their futures. No round barrier — each completed batch
-        // frees its slot and the refill below tops the window back up.
-        let mut load = vec![0u32; peers.len()];
-        let mut inflight = GroupBits::new();
         let this = &*self;
-        let mut flight: Vec<BatchFut<'_>> = Vec::new();
+        let mut window = Window::new(peers.len());
         loop {
-            // Refill every free slot with the next unassigned batches.
-            loop {
-                let free: usize = load
-                    .iter()
-                    .zip(fails.iter())
-                    .filter(|(_, f)| **f < PEER_FAIL_LIMIT)
-                    .map(|(l, _)| PIPELINE_DEPTH.saturating_sub(*l) as usize)
-                    .sum();
-                if free == 0 {
-                    break;
-                }
-                let order = next_unassigned(
-                    &full_order,
-                    &mut cursor,
-                    &remaining,
-                    &inflight,
-                    free * GROUPS_PER_REQUEST as usize,
-                );
-                if order.is_empty() {
-                    break;
-                }
-                let mut assigned = false;
-                for batch in batch_into_ranges(&order, this.size) {
-                    let bgroups = this.groups_of(&batch);
-                    match this.pick_peer(&bgroups, peers, &load, &fails) {
-                        Some(idx) => {
-                            assigned = true;
-                            load[idx] += 1;
-                            for &g in &bgroups {
-                                inflight.add(g..g + 1);
-                            }
-                            report.requests_issued += 1;
-                            flight.push(Box::pin(
-                                this.race_batch(batch, bgroups, idx, peers, deadline, now),
-                            ));
-                        }
-                        None => {
-                            // A merged batch can straddle groups held by
-                            // DISJOINT peers (equal holder COUNTS don't mean
-                            // the same holder SET), so no single peer holds
-                            // all of it. Split into maximal sub-batches each
-                            // fully held by some peer instead of skipping it
-                            // — skipping would strand groups that ARE
-                            // available and leave the object stuck.
-                            for sub in split_by_holder(&bgroups, peers, this.size) {
-                                let sgroups = this.groups_of(&sub);
-                                let Some(idx) = this.pick_peer(&sgroups, peers, &load, &fails)
-                                else {
-                                    continue;
-                                };
-                                assigned = true;
-                                load[idx] += 1;
-                                for &g in &sgroups {
-                                    inflight.add(g..g + 1);
-                                }
-                                report.requests_issued += 1;
-                                flight.push(Box::pin(
-                                    this.race_batch(sub, sgroups, idx, peers, deadline, now),
-                                ));
-                            }
-                        }
-                    }
-                }
-                if !assigned {
-                    break; // nothing schedulable in this window slice
-                }
-            }
-            let Some(outcome) = next_ready(&mut flight).await else {
+            window.refill(
+                this,
+                &full_order,
+                &mut cursor,
+                &remaining,
+                peers,
+                deadline,
+                now,
+                &mut report,
+            );
+            let Some(outcome) = next_ready(&mut window.futs).await else {
                 break; // nothing in flight and nothing left to assign
             };
-            load[outcome.primary] = load[outcome.primary].saturating_sub(1);
-            for &g in &outcome.groups {
-                inflight.remove(g..g + 1);
-            }
-            this.apply_outcome(outcome, &mut remaining, &mut fails, &mut report);
+            window.release(&outcome);
+            this.apply_outcome(outcome, &mut remaining, &mut window.fails, &mut report);
             if remaining.is_empty() {
                 break; // done; dropping `flight` cancels leftover duplicates
             }

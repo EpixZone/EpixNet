@@ -37,6 +37,33 @@ impl std::fmt::Debug for SelfAdvert {
     }
 }
 
+/// Ask one tracker: an EDX `Announce` over `sender` for `epix://`
+/// announcers, the BitTorrent announce (UDP or HTTP, infohash =
+/// `sha1(address)`) for tracker URLs.
+async fn ask_tracker(
+    sender: &dyn AnnounceSender,
+    tracker: &Tracker,
+    xite_address: &str,
+    port: u16,
+    params: &AnnounceParams<'_>,
+) -> Result<Vec<PeerAddr>, String> {
+    match tracker {
+        Tracker::Epix(addr) => {
+            discover_via_epix_tracker(sender, addr, params).await.map_err(|e| e.to_string())
+        }
+        Tracker::Bt(url) => epix_discovery::announce_bittorrent(url, xite_address, port).await,
+    }
+}
+
+/// Append the peers one tracker returned, skipping ones already known.
+fn fold_peers(peers: &mut Vec<PeerAddr>, found: Vec<PeerAddr>) {
+    for p in found {
+        if !peers.contains(&p) {
+            peers.push(p);
+        }
+    }
+}
+
 /// Announce `xite_address` to each tracker - an EDX `Announce` over `sender`
 /// for `epix://` announcers, the BitTorrent announce (UDP or HTTP, infohash =
 /// `sha1(address)`) for tracker URLs - and return the de-duplicated union of
@@ -80,28 +107,13 @@ pub async fn announce(
         onion_signer: advert.onion_signer.as_deref(),
     };
     let mut peers: Vec<PeerAddr> = Vec::new();
-    let mut fold = |found: Vec<PeerAddr>| {
-        for p in found {
-            if !peers.contains(&p) {
-                peers.push(p);
-            }
-        }
-    };
     let mut answered = trackers.is_empty();
     let mut last_error = String::new();
     for tracker in trackers {
-        let result = match tracker {
-            Tracker::Epix(addr) => discover_via_epix_tracker(sender, addr, &params)
-                .await
-                .map_err(|e| e.to_string()),
-            Tracker::Bt(url) => {
-                epix_discovery::announce_bittorrent(url, xite_address, advert.port).await
-            }
-        };
-        match result {
+        match ask_tracker(sender, tracker, xite_address, advert.port, &params).await {
             Ok(found) => {
                 answered = true;
-                fold(found);
+                fold_peers(&mut peers, found);
             }
             Err(e) => last_error = e,
         }

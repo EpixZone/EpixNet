@@ -1786,6 +1786,45 @@ impl RuntimeEdxFetcher {
         Ok((handles, node_pks))
     }
 
+    /// Fetch the groups of a served range the store still lacks. Returns the
+    /// failure text rather than erroring: the caller serves whatever
+    /// contiguous prefix landed, so a dial, claim or fetch failure must not
+    /// throw away bytes that are already committed.
+    async fn fetch_missing(
+        &self,
+        address: &str,
+        store: &Arc<Store>,
+        id: ObjId,
+        size: u64,
+        needed: &epix_blob::bitfield::GroupBits,
+        now: u64,
+    ) -> Option<String> {
+        // The cached (revalidated) session from the previous window
+        // or read-ahead, else fresh concurrent dials.
+        let (handles, node_pks) = match self.peers_for(address, id, needed).await {
+            Ok(peers) => peers,
+            Err(e) => return Some(e),
+        };
+        // Reserve the sparse record only now that a peer can serve it, and
+        // drop it again if nothing lands (same reason as pull_shard_chunk):
+        // reserving before the dial lets an owner-declared size sit in the
+        // store for bytes that never arrive. The claim holds that cleanup
+        // back while the moov warm-up, or a second concurrent Range request
+        // on the same media element, is still filling it.
+        let _claim = match self.claim_object(store, id, Ns::Plain, size, now) {
+            Ok(claim) => claim,
+            Err(e) => return Some(e.to_string()),
+        };
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        match swarm.fetch(needed, &handles, Deadline::tight(), now).await {
+            Ok(report) => {
+                self.credit(&report, &node_pks, now);
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        }
+    }
+
     /// On the FIRST touch of a large file, kick off a one-time background warm
     /// of the moov head+tail so the browser's metadata tail-fetch (often at
     /// EOF) does not stall playback. No-op below the size threshold or after
@@ -2417,31 +2456,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
             let needed = missing_groups(&present, &served);
             let mut fetch_err: Option<String> = None;
             if !needed.is_empty() {
-                // The cached (revalidated) session from the previous window
-                // or read-ahead, else fresh concurrent dials.
-                match self.peers_for(address, id, &needed).await {
-                    // Reserve the sparse record only now that a peer can
-                    // serve it, and drop it again if nothing lands (same
-                    // reason as pull_shard_chunk): reserving before the dial
-                    // lets an owner-declared size sit in the store for bytes
-                    // that never arrive. The claim holds that cleanup back
-                    // while the moov warm-up spawned above, or a second
-                    // concurrent Range request on the same media element, is
-                    // still filling it.
-                    Ok((handles, node_pks)) => {
-                        match self.claim_object(&store, id, Ns::Plain, size, now) {
-                            Ok(_claim) => {
-                                let mut swarm = Swarm::new(store.clone(), id, size);
-                                match swarm.fetch(&needed, &handles, Deadline::tight(), now).await {
-                                    Ok(report) => self.credit(&report, &node_pks, now),
-                                    Err(e) => fetch_err = Some(e.to_string()),
-                                }
-                            }
-                            Err(e) => fetch_err = Some(e.to_string()),
-                        }
-                    }
-                    Err(e) => fetch_err = Some(e),
-                }
+                fetch_err = self.fetch_missing(address, &store, id, size, &needed, now).await;
             }
             let present = store.present_bits(id).unwrap_or_default();
             let got = present_prefix_len(&present, &served, size);
