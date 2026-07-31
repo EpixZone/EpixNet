@@ -12,19 +12,19 @@ EpixNet needs `git` (to download the code), a C compiler, and a couple of small 
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential pkg-config git curl
+sudo apt install -y build-essential pkg-config git curl protobuf-compiler
 ```
 
 **Fedora:**
 
 ```sh
-sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config git curl
+sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config git curl protobuf-compiler
 ```
 
 **Arch:**
 
 ```sh
-sudo pacman -S --needed base-devel git curl
+sudo pacman -S --needed base-devel git curl protobuf
 ```
 
 ## 2. Install Rust
