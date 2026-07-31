@@ -8,17 +8,32 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Announce `address` to a BitTorrent tracker and return the peers it reports.
 /// Dispatches by URL scheme: `udp://` uses the BEP-15 UDP protocol, otherwise
-/// HTTP(S). Empty on any error.
-pub async fn announce_bittorrent(tracker_url: &str, address: &str, my_port: u16) -> Vec<PeerAddr> {
+/// HTTP(S). `Err` when the tracker could not be reached or answered garbage -
+/// a reachable tracker that knows no peers is `Ok(empty)`, so the caller can
+/// tell "alive but lonely" from "dead" and back off only the latter.
+pub async fn announce_bittorrent(
+    tracker_url: &str,
+    address: &str,
+    my_port: u16,
+) -> Result<Vec<PeerAddr>, String> {
     if tracker_url.starts_with("udp://") {
         return announce_bittorrent_udp(tracker_url, address, my_port).await;
     }
     announce_bittorrent_http(tracker_url, address, my_port).await
 }
 
+/// The whole-request budget for one HTTP(S) tracker announce. Without it a
+/// tracker that accepts the connection and stalls holds the announce until
+/// the caller's outer timeout.
+const HTTP_ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Announce `address` to an HTTP(S) tracker (`http(s)://host/announce`) and
-/// return the peers it reports. Empty on any error.
-pub async fn announce_bittorrent_http(tracker_url: &str, address: &str, my_port: u16) -> Vec<PeerAddr> {
+/// return the peers it reports.
+pub async fn announce_bittorrent_http(
+    tracker_url: &str,
+    address: &str,
+    my_port: u16,
+) -> Result<Vec<PeerAddr>, String> {
     let info_hash: [u8; 20] = Sha1::digest(address.as_bytes()).into();
     let peer_id = b"-EPX0001-aaaaaaaaaaaa";
     let url = format!(
@@ -28,9 +43,21 @@ pub async fn announce_bittorrent_http(tracker_url: &str, address: &str, my_port:
         percent_encode(&peer_id[..20]),
         my_port,
     );
-    let Ok(resp) = reqwest::get(&url).await else { return Vec::new() };
-    let Ok(body) = resp.bytes().await else { return Vec::new() };
-    parse_compact_peers(&extract_bstring(&body, "peers"))
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_ANNOUNCE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| format!("announce failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("announce failed: HTTP {}", resp.status()));
+    }
+    let body = resp.bytes().await.map_err(|e| format!("announce body: {e}"))?;
+    // A bencoded dict without `peers` is either a tracker failure message or
+    // not a tracker at all - not a "zero peers" answer.
+    if find_subslice(&body, b"5:peers").is_none() {
+        return Err("announce reply carried no peer list".into());
+    }
+    Ok(parse_compact_peers(&extract_bstring(&body, "peers")))
 }
 
 // ---- UDP tracker protocol (BEP 15) -----------------------------------------
@@ -43,42 +70,46 @@ const ACTION_ANNOUNCE: u32 = 1;
 const TXN_ID: u32 = 0x4550_4958; // "EPIX"
 
 /// Announce over a `udp://host:port` tracker (BEP 15): connect handshake, then
-/// announce, returning the compact peers. Empty on any error or timeout.
-pub async fn announce_bittorrent_udp(tracker_url: &str, address: &str, my_port: u16) -> Vec<PeerAddr> {
+/// announce, returning the compact peers.
+pub async fn announce_bittorrent_udp(
+    tracker_url: &str,
+    address: &str,
+    my_port: u16,
+) -> Result<Vec<PeerAddr>, String> {
     use tokio::net::UdpSocket;
     use tokio::time::{timeout, Duration};
 
     let host_port = tracker_url.trim_start_matches("udp://").split('/').next().unwrap_or("");
     if host_port.is_empty() {
-        return Vec::new();
+        return Err("no host in tracker url".into());
     }
     let info_hash: [u8; 20] = Sha1::digest(address.as_bytes()).into();
     let peer_id = b"-EPX0001-aaaaaaaaaaaa";
 
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    if sock.connect(host_port).await.is_err() {
-        return Vec::new();
-    }
+    let sock = UdpSocket::bind("0.0.0.0:0").await.map_err(|e| format!("bind: {e}"))?;
+    sock.connect(host_port).await.map_err(|e| format!("connect: {e}"))?;
     let wait = Duration::from_secs(5);
 
     // Connect handshake -> connection_id.
-    if sock.send(&build_connect_request()).await.is_err() {
-        return Vec::new();
-    }
+    sock.send(&build_connect_request()).await.map_err(|e| format!("send: {e}"))?;
     let mut buf = [0u8; 2048];
-    let Ok(Ok(n)) = timeout(wait, sock.recv(&mut buf)).await else { return Vec::new() };
-    let Some(connection_id) = parse_connect_response(&buf[..n]) else { return Vec::new() };
+    let n = match timeout(wait, sock.recv(&mut buf)).await {
+        Ok(res) => res.map_err(|e| format!("recv: {e}"))?,
+        Err(_) => return Err("connect timed out".into()),
+    };
+    let Some(connection_id) = parse_connect_response(&buf[..n]) else {
+        return Err("bad connect response".into());
+    };
 
-    // Announce -> peers.
+    // Announce -> peers. A valid response with zero peers is still Ok: the
+    // tracker answered, it just knows nobody (yet).
     let req = build_announce_request(connection_id, &info_hash, &peer_id[..20], my_port);
-    if sock.send(&req).await.is_err() {
-        return Vec::new();
-    }
-    let Ok(Ok(n)) = timeout(wait, sock.recv(&mut buf)).await else { return Vec::new() };
-    parse_announce_response(&buf[..n])
+    sock.send(&req).await.map_err(|e| format!("send: {e}"))?;
+    let n = match timeout(wait, sock.recv(&mut buf)).await {
+        Ok(res) => res.map_err(|e| format!("recv: {e}"))?,
+        Err(_) => return Err("announce timed out".into()),
+    };
+    parse_announce_response(&buf[..n]).ok_or_else(|| "bad announce response".into())
 }
 
 /// 16-byte connect request: protocol id, action=connect, transaction id.
@@ -129,17 +160,19 @@ fn build_announce_request(
 }
 
 /// Parse an announce response: skip the 20-byte header (action, txn, interval,
-/// leechers, seeders) and read the trailing compact peer list.
-fn parse_announce_response(buf: &[u8]) -> Vec<PeerAddr> {
+/// leechers, seeders) and read the trailing compact peer list. `None` when the
+/// datagram is not our announce's answer at all - distinct from a well-formed
+/// answer naming zero peers.
+fn parse_announce_response(buf: &[u8]) -> Option<Vec<PeerAddr>> {
     if buf.len() < 20 {
-        return Vec::new();
+        return None;
     }
     let action = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let txn = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     if action != ACTION_ANNOUNCE || txn != TXN_ID {
-        return Vec::new();
+        return None;
     }
-    parse_compact_peers(&buf[20..])
+    Some(parse_compact_peers(&buf[20..]))
 }
 
 /// Percent-encode raw bytes for a URL query value (BitTorrent `info_hash` style).
@@ -254,13 +287,16 @@ mod tests {
         resp.extend_from_slice(&2u32.to_be_bytes()); // seeders
         resp.extend_from_slice(&[1, 2, 3, 4, 0x3c, 0x41]); // 1.2.3.4:15425
         resp.extend_from_slice(&[10, 0, 0, 1, 0x1a, 0xe1]); // 10.0.0.1:6881
-        let peers = parse_announce_response(&resp);
+        let peers = parse_announce_response(&resp).unwrap();
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].to_string(), "1.2.3.4:15425");
 
-        // A response for a different action is ignored.
+        // A valid response naming zero peers is an answer, not a failure.
+        assert_eq!(parse_announce_response(&resp[..20]), Some(Vec::new()));
+
+        // A response for a different action is no answer at all.
         let mut wrong = resp.clone();
         wrong[3] = 9;
-        assert!(parse_announce_response(&wrong).is_empty());
+        assert_eq!(parse_announce_response(&wrong), None);
     }
 }

@@ -2400,15 +2400,24 @@ async fn serve_file(
                 let len = (end - start + 1) as usize;
                 // EDX: fetch just this range over the verified path and serve it
                 // straight from the object store (media seek, no whole-file
-                // download). Falls through to the legacy path on miss/error.
+                // download). The fetch may return only a contiguous PREFIX of
+                // the window (overlay peers mid-transfer): serve that prefix
+                // as a shorter 206 - the browser re-requests the remainder -
+                // instead of 404ing bytes we hold. Falls through to the
+                // legacy path on miss/error (zero bytes available).
                 if let Some(Ok(Some(bytes))) =
                     ctx.state.edx_fetch_range(&address, &path, start, len as u64).await
                 {
-                    let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
-                    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
-                        h.insert(header::CONTENT_RANGE, v);
+                    if !bytes.is_empty() {
+                        let end = start + bytes.len() as u64 - 1;
+                        let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
+                        if let Ok(v) =
+                            header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                        {
+                            h.insert(header::CONTENT_RANGE, v);
+                        }
+                        return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
                     }
-                    return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
                 }
                 // EDX range missed: serve the covering bytes if they are already
                 // on disk (a legacy file present locally); otherwise this range

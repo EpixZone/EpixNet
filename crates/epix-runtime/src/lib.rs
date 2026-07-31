@@ -17,6 +17,7 @@
 //! stops cleanly.
 
 use epix_core::PeerAddr;
+use epix_ui::conn_pool::LinkOpener;
 use epix_ui::AppState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -241,6 +242,14 @@ impl NodeRuntime {
             tor_always,
             self.shutdown.clone(),
             self.config.connection_interval,
+        )));
+        // Health prober: re-check benched (backed-off) peers off the streaming
+        // path, so a temporarily-down peer is reinstated the moment it answers
+        // instead of waiting out a full dial backoff. See peer_probe_loop.
+        self.handles.push(tokio::spawn(peer_probe_loop(
+            self.state.clone(),
+            tor_always,
+            self.shutdown.clone(),
         )));
         // DHT: probe known peers into the routing table, announce every served
         // site, and look up extra peers - a tracker-independent discovery path
@@ -467,9 +476,10 @@ async fn announce_loop(
         if let Some(bt) = state.config_get("bt_trackers").await.and_then(|v| v.as_array().cloned()) {
             for url in bt.iter().filter_map(|v| v.as_str()) {
                 for address in state.xite_addresses().await {
-                    let peers = epix_discovery::announce_bittorrent(url, &address, 0).await;
-                    if !peers.is_empty() {
-                        state.add_peers(&address, peers).await;
+                    if let Ok(peers) = epix_discovery::announce_bittorrent(url, &address, 0).await {
+                        if !peers.is_empty() {
+                            state.add_peers(&address, peers).await;
+                        }
                     }
                 }
             }
@@ -845,6 +855,89 @@ async fn connection_loop(
             }
         }
     }
+}
+
+/// How often the health prober wakes to look for benched peers due a re-check.
+const PROBE_TICK: Duration = Duration::from_secs(30);
+/// Most probes in flight at once, and the per-tick candidate cap. An overlay
+/// probe builds a whole circuit, so this stays tiny; with the tick period it
+/// also bounds total probe work per tick.
+const PROBE_CONCURRENCY: usize = 2;
+
+/// Background peer health prober. A peer that stops answering gets benched by
+/// the registry's dial backoff, and the streaming path should not burn a
+/// session slot rediscovering it. This loop re-checks benched peers whose
+/// probe cooldown expired - a fresh dial + control Ping, off the streaming
+/// path - and feeds the result back: an answer lifts the dial backoff so
+/// connectable_peers returns the peer immediately (session revalidation picks
+/// it up on its next window), while the error streak waits for a real fetch -
+/// a ping is weaker evidence than the fetch-level failures that bench a peer,
+/// and clearing the streak on it kept resurrecting zombies that handshake but
+/// never serve. Silence advances the exponential cooldown (~30s doubling to a
+/// ~10min cap + jitter, see epix_peer::probe_cooldown_secs).
+async fn peer_probe_loop(state: Arc<AppState>, tor_always: bool, shutdown: Arc<Notify>) {
+    // Probes are outbound dials: in Always mode, none before Tor routes us.
+    if !await_tor_routed(&state, tor_always, &shutdown).await {
+        return;
+    }
+    let mut tick = interval(PROBE_TICK);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick.tick().await; // nothing is benched at startup; skip the immediate tick
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => return,
+            _ = tick.tick() => {}
+        }
+        let Some(opener) = state.link_opener().await else { continue };
+        probe_pass(&state, opener).await;
+    }
+}
+
+/// One prober pass: probe up to [`PROBE_CONCURRENCY`] due candidates in
+/// parallel and fold the outcomes back into the registries. Split from the
+/// loop so a test can drive a pass directly. No state lock spans a probe
+/// await: candidates are snapshotted first, outcomes recorded after.
+async fn probe_pass(state: &Arc<AppState>, opener: Arc<dyn LinkOpener>) {
+    let candidates = state.probe_candidates(PROBE_CONCURRENCY).await;
+    if candidates.is_empty() {
+        return;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for c in candidates {
+        let opener = opener.clone();
+        set.spawn(async move {
+            let ok = probe_peer(opener.as_ref(), &c.addr).await;
+            (c, ok)
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        let Ok((c, ok)) = res else { continue };
+        state.note_probe_outcome(&c.addr, ok).await;
+        if ok {
+            state
+                .log(
+                    "INFO",
+                    format!("Peer {} answered a health probe after {} failure(s), reinstated", c.addr, c.failures),
+                )
+                .await;
+        }
+    }
+}
+
+/// One health probe: a fresh dial + frame-level Ping, bounded end to end
+/// (10s clearnet, 30s overlay - an onion dial builds a circuit). The link
+/// drops on return, so a probe never holds a connection or a session slot.
+async fn probe_peer(opener: &dyn LinkOpener, addr: &PeerAddr) -> bool {
+    let budget = if addr.is_overlay() || epix_core::route_all_via_overlay() {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(10)
+    };
+    matches!(
+        tokio::time::timeout(budget, async { opener.open_link(addr.clone()).await?.ping().await })
+            .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Snapshot node metrics into the chart db so the dashboard's Stats page has

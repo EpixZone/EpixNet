@@ -50,6 +50,14 @@ const DISCOVER_BUDGET: std::time::Duration = std::time::Duration::from_secs(120)
 /// Peer-gossiped entries are otherwise unbounded, and they end up in our own
 /// single-frame `GetTrackers` reply.
 const MAX_ENTRY_LEN: usize = 128;
+/// Most announcers the book remembers. Peers can gossip endlessly; without a
+/// cap the book (and every announce pass over it) grows without bound.
+const BOOK_CAP: usize = 200;
+/// An entry that sat in the book this long without ever being judged (its
+/// overlay gated the whole time, so no announce reached it) is dropped -
+/// previously a tor/i2p-gated entry kept `time_success: 0` forever, never
+/// judged, never pruned.
+const UNJUDGED_MAX_AGE: i64 = 7 * 24 * 3600;
 
 pub struct BeaconPlugin;
 
@@ -86,6 +94,7 @@ impl Plugin for BeaconPlugin {
                     }
                 } else {
                     state.set_extra_trackers(Vec::new()).await;
+                    state.set_gossip_trackers(Vec::new()).await;
                 }
                 tokio::time::sleep(REFRESH).await;
             }
@@ -93,11 +102,22 @@ impl Plugin for BeaconPlugin {
     }
 }
 
-/// One Beacon pass: fold announce results into the book, discover more
-/// announcers from peers when short, fold in the optional xite list, and hand
-/// the live set to the announcer.
+/// One Beacon pass: fold announce results into the book, register our own
+/// announcer address, discover more announcers from peers when short, fold in
+/// the optional xite list, prune, and hand the live set to the announcer and
+/// the working set to the gossip reply.
 async fn run_cycle(state: &Arc<AppState>, book: &mut TrackerBook, path: &PathBuf) {
     book.absorb_stats(&state.announcer_stats().await);
+
+    // Self-registration: when this node IS a dialable tracker (tracker
+    // enabled, open port or overlay service), its own address goes in the
+    // book as `my: true` - the way the Python client registered itself after
+    // a successful port check - so peers learn peer-tracker addresses
+    // first-hand instead of only second-hand.
+    let my: Vec<String> =
+        state.own_tracker_addresses().await.iter().map(|t| t.to_string()).collect();
+    book.set_my(&my);
+    book.prune();
 
     if book.working().len() < WORKING_LIMIT {
         discover_from_peers(state, book).await;
@@ -135,6 +155,12 @@ async fn run_cycle(state: &Arc<AppState>, book: &mut TrackerBook, path: &PathBuf
             .await;
     }
     state.set_extra_trackers(live).await;
+    // Peers asking for our trackers get the verified-working subset only -
+    // gossiping the whole book (dead entries included) is how every node's
+    // trackers.json used to fill with garbage.
+    state
+        .set_gossip_trackers(book.working().iter().filter_map(|w| parse_tracker_line(w)).collect())
+        .await;
     book.save(path);
 }
 
@@ -428,8 +454,9 @@ fn is_unreachable(addr: &PeerAddr) -> bool {
 /// …}}}`), read and written in place so a Python install's book carries over.
 pub struct TrackerBook {
     content: Value,
-    /// Announce-stats counters already folded in, so each cycle only judges
-    /// the announces made since the last one.
+    /// Announce-stats counters already folded in (`num_request`,
+    /// `num_success`), so each cycle only judges the announces made since the
+    /// last one.
     seen: std::collections::HashMap<String, (i64, i64)>,
 }
 
@@ -456,6 +483,18 @@ impl TrackerBook {
             let Some(stats) = book.shared().remove(&old) else { continue };
             let Some(tracker) = parse_tracker_line(&old) else { continue };
             book.shared().entry(tracker.to_string()).or_insert(stats);
+        }
+        // Unparseable keys (junk a peer once gossiped, or an entry kind we no
+        // longer accept) can never be announced to or judged - carrying them
+        // just re-saves and re-gossips them forever.
+        let junk: Vec<String> = book
+            .shared()
+            .keys()
+            .filter(|k| parse_tracker_line(k).is_none())
+            .cloned()
+            .collect();
+        for k in junk {
+            book.shared().remove(&k);
         }
         book
     }
@@ -492,17 +531,19 @@ impl TrackerBook {
         new
     }
 
-    /// Fold the node's announce stats in: an announcer that added peers since
-    /// the last cycle is a success; one that was tried without result is an
-    /// error. Errored-out entries are pruned like EpixNet (persistently
-    /// failing and no success for an hour).
+    /// Fold the node's announce stats in: an announcer that ANSWERED an
+    /// announce since the last cycle (`num_success` moved - reachability, not
+    /// peer count: a live tracker that knows no peers for our xites is still
+    /// alive) is a success; one that was tried without an answer is an error.
+    /// Errored-out entries are pruned like EpixNet (persistently failing and
+    /// no success for an hour).
     pub fn absorb_stats(&mut self, stats: &Value) {
         let Some(stats) = stats.as_object() else { return };
         let now = now_secs();
         let error_limit = if self.working().len() >= WORKING_LIMIT { 5 } else { 30 };
 
         // Judge each announcer's announces since the last cycle...
-        let mut successes: Vec<String> = Vec::new();
+        let mut successes: Vec<(String, Option<f64>)> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         for address in self.shared().keys().cloned().collect::<Vec<_>>() {
             // Book keys and announce-stats keys share the canonical
@@ -515,24 +556,30 @@ impl TrackerBook {
             };
             let Some(stat) = stats.get(&stat_key).and_then(|v| v.as_object()) else { continue };
             let requests = stat.get("num_request").and_then(|v| v.as_i64()).unwrap_or(0);
-            let added = stat.get("num_added").and_then(|v| v.as_i64()).unwrap_or(0);
-            let (seen_req, seen_added) = self.seen.get(&address).copied().unwrap_or((0, 0));
+            let succeeded = stat.get("num_success").and_then(|v| v.as_i64()).unwrap_or(0);
+            let (seen_req, seen_success) = self.seen.get(&address).copied().unwrap_or((0, 0));
             if requests <= seen_req {
                 continue; // not announced to since last cycle
             }
-            self.seen.insert(address.clone(), (requests, added));
-            if added > seen_added {
-                successes.push(address);
+            self.seen.insert(address.clone(), (requests, succeeded));
+            if succeeded > seen_success {
+                let latency = stat.get("latency").and_then(|v| v.as_f64());
+                successes.push((address, latency));
             } else {
                 failures.push(address);
             }
         }
 
         // ...then apply the verdicts.
-        for address in successes {
+        for (address, latency) in successes {
             if let Some(obj) = self.shared().get_mut(&address).and_then(|v| v.as_object_mut()) {
                 obj.insert("time_success".into(), json!(now));
                 obj.insert("num_error".into(), json!(0));
+                // The measured announce round-trip - the placeholder 99.0 was
+                // previously written once and never updated.
+                if let Some(latency) = latency {
+                    obj.insert("latency".into(), json!(latency));
+                }
             }
         }
         for address in failures {
@@ -551,6 +598,91 @@ impl TrackerBook {
         }
     }
 
+    /// Register our own announcer addresses as `my: true` entries, counted as
+    /// working while we run (we answer our own tracker requests by
+    /// definition), so they flow into the gossiped working set and any
+    /// published community list. Entries no longer ours (a rotated onion, a
+    /// closed port) are demoted so pruning can reap them.
+    pub fn set_my(&mut self, addrs: &[String]) {
+        let now = now_secs();
+        let canonical: Vec<String> =
+            addrs.iter().filter_map(|a| parse_tracker_line(a).map(|t| t.to_string())).collect();
+        let stale: Vec<String> = self
+            .shared()
+            .iter()
+            .filter(|(k, v)| {
+                v.get("my").and_then(|m| m.as_bool()).unwrap_or(false) && !canonical.contains(k)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            if let Some(obj) = self.shared().get_mut(&k).and_then(|v| v.as_object_mut()) {
+                obj.insert("my".into(), json!(false));
+            }
+        }
+        for key in canonical {
+            self.found(&key);
+            if let Some(obj) = self.shared().get_mut(&key).and_then(|v| v.as_object_mut()) {
+                obj.insert("my".into(), json!(true));
+                obj.insert("time_success".into(), json!(now));
+                obj.insert("num_error".into(), json!(0));
+            }
+        }
+    }
+
+    /// Reap what the per-announce judging can't: entries never judged at all
+    /// (their overlay gated since they arrived) age out after
+    /// [`UNJUDGED_MAX_AGE`], and the book is capped at [`BOOK_CAP`] entries,
+    /// evicting the worst (most consecutive errors, then oldest success)
+    /// first. `my` entries are never reaped - they are ours by observation,
+    /// not hearsay.
+    pub fn prune(&mut self) {
+        let now = now_secs() as f64;
+        let cutoff = now - UNJUDGED_MAX_AGE as f64;
+        let is_my =
+            |v: &Value| v.get("my").and_then(|m| m.as_bool()).unwrap_or(false);
+        let stale: Vec<String> = self
+            .shared()
+            .iter()
+            .filter(|(_, v)| {
+                let get = |k: &str| v.get(k).and_then(|t| t.as_f64()).unwrap_or(0.0);
+                !is_my(v)
+                    && get("time_success") < cutoff
+                    && get("time_error") < cutoff
+                    && get("time_added").max(get("time_found")) < cutoff
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in stale {
+            self.shared().remove(&k);
+            self.seen.remove(&k);
+        }
+
+        let len = self.shared().len();
+        if len <= BOOK_CAP {
+            return;
+        }
+        let mut ranked: Vec<(String, i64, f64)> = self
+            .shared()
+            .iter()
+            .filter(|(_, v)| !is_my(v))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.get("num_error").and_then(|e| e.as_i64()).unwrap_or(0),
+                    v.get("time_success").and_then(|t| t.as_f64()).unwrap_or(0.0),
+                )
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.1.cmp(&a.1).then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        for (k, _, _) in ranked.into_iter().take(len - BOOK_CAP) {
+            self.shared().remove(&k);
+            self.seen.remove(&k);
+        }
+    }
+
     /// Announcers that succeeded within the last hour (EpixNet's "working").
     pub fn working(&mut self) -> Vec<String> {
         let cutoff = (now_secs() as f64) - 3600.0;
@@ -561,9 +693,15 @@ impl TrackerBook {
             .collect()
     }
 
-    /// Every remembered announcer, parsed for the announce pass.
+    /// Every remembered announcer, parsed for the announce pass - except our
+    /// own (`my`) entries: a node announcing to itself would only ever hear
+    /// back an empty list (the tracker db excludes the asker's own addresses).
     pub fn addresses(&mut self) -> Vec<Tracker> {
-        self.shared().keys().filter_map(|k| parse_tracker_line(k)).collect()
+        self.shared()
+            .iter()
+            .filter(|(_, v)| !v.get("my").and_then(|m| m.as_bool()).unwrap_or(false))
+            .filter_map(|(k, _)| parse_tracker_line(k))
+            .collect()
     }
 }
 
@@ -612,25 +750,117 @@ mod tests {
         book.found("epix://1.2.3.4:1");
         book.found("epix://5.6.7.8:2");
 
-        // 1.2.3.4 answered with peers; 5.6.7.8 was tried and gave nothing.
-        // Stats are keyed by real transport (`tcp://…`), the way
+        // 1.2.3.4 answered (zero peers - it is still alive; every node is a
+        // tracker and small ones usually know nobody for our xites); 5.6.7.8
+        // was tried and never answered. Success keys on num_success, not
+        // num_added. Stats are keyed by real transport (`tcp://…`), the way
         // record_tracker writes them - the same canonical form the book now
         // keys entries with (the health check was silently dead when the two
         // disagreed).
         let stats = json!({
-            "tcp://1.2.3.4:1": { "num_request": 1, "num_added": 3 },
-            "tcp://5.6.7.8:2": { "num_request": 1, "num_added": 0 },
+            "tcp://1.2.3.4:1": { "num_request": 1, "num_success": 1, "num_added": 0, "latency": 0.25 },
+            "tcp://5.6.7.8:2": { "num_request": 1, "num_success": 0, "num_added": 0 },
         });
         book.absorb_stats(&stats);
         assert_eq!(book.working(), vec!["tcp://1.2.3.4:1".to_string()]);
+        // The measured round-trip replaces the 99.0 placeholder on success.
+        assert_eq!(book.shared()["tcp://1.2.3.4:1"]["latency"], json!(0.25));
 
         // Keep failing 5.6.7.8 past the limit: it gets pruned.
         for i in 2..40 {
             book.absorb_stats(&json!({
-                "tcp://5.6.7.8:2": { "num_request": i, "num_added": 0 },
+                "tcp://5.6.7.8:2": { "num_request": i, "num_success": 0 },
             }));
         }
         assert_eq!(book.addresses().len(), 1, "dead announcer pruned");
+    }
+
+    #[test]
+    fn prune_ages_out_unjudged_entries_and_caps_the_book() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trackers.json");
+        let mut book = TrackerBook::load(&path);
+
+        // An entry that sat gated (never judged: no success, no error) for
+        // over a week ages out; a fresh unjudged one stays.
+        book.found("epix://1.2.3.4:1");
+        let old = now_secs() - UNJUDGED_MAX_AGE - 10;
+        if let Some(obj) = book.shared().get_mut("tcp://1.2.3.4:1").and_then(|v| v.as_object_mut())
+        {
+            obj.insert("time_added".into(), json!(old));
+            obj.insert("time_found".into(), json!(old));
+        }
+        book.found("epix://5.6.7.8:2");
+        book.prune();
+        assert!(book.shared().get("tcp://1.2.3.4:1").is_none(), "aged-out gated entry dropped");
+        assert!(book.shared().get("tcp://5.6.7.8:2").is_some(), "fresh entry kept");
+
+        // Overfill way past the cap: one healthy keeper, our own entry, and
+        // a flood of erroring gossip. The cap evicts worst-first (most
+        // consecutive errors, oldest success) and never our own entry.
+        book.found("epix://8.0.0.1:15441");
+        if let Some(obj) =
+            book.shared().get_mut("tcp://8.0.0.1:15441").and_then(|v| v.as_object_mut())
+        {
+            obj.insert("time_success".into(), json!(now_secs()));
+        }
+        book.set_my(&["epix://9.9.9.9:3".to_string()]);
+        for i in 0..300u32 {
+            let addr = format!("epix://8.1.{}.{}:15441", i / 256, i % 256);
+            book.found(&addr);
+            let key = format!("tcp://8.1.{}.{}:15441", i / 256, i % 256);
+            if let Some(obj) = book.shared().get_mut(&key).and_then(|v| v.as_object_mut()) {
+                obj.insert("num_error".into(), json!(5));
+            }
+        }
+        assert!(book.shared().len() > BOOK_CAP);
+        book.prune();
+        assert_eq!(book.shared().len(), BOOK_CAP, "book capped");
+        assert!(book.shared().get("tcp://8.0.0.1:15441").is_some(), "healthy entry survives");
+        assert!(book.shared().get("tcp://9.9.9.9:3").is_some(), "own entry never evicted");
+    }
+
+    #[test]
+    fn set_my_registers_own_address_as_working_but_never_announces_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = TrackerBook::load(&dir.path().join("trackers.json"));
+        book.set_my(&["1.2.3.4:15441".to_string()]);
+        // Ours counts as working (we answer announces while we run), so it is
+        // gossiped and published first-hand...
+        assert_eq!(book.working(), vec!["tcp://1.2.3.4:15441".to_string()]);
+        assert_eq!(book.shared()["tcp://1.2.3.4:15441"]["my"], json!(true));
+        // ...but we never announce to ourselves.
+        assert!(book.addresses().is_empty());
+
+        // The address rotates: the old entry is demoted to hearsay (so
+        // pruning can reap it), the new one takes over.
+        book.set_my(&["5.6.7.8:15441".to_string()]);
+        assert_eq!(book.shared()["tcp://1.2.3.4:15441"]["my"], json!(false));
+        assert_eq!(book.shared()["tcp://5.6.7.8:15441"]["my"], json!(true));
+        assert_eq!(book.addresses(), vec![Tracker::parse("1.2.3.4:15441").unwrap()]);
+    }
+
+    #[test]
+    fn load_drops_unparseable_book_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trackers.json");
+        std::fs::write(
+            &path,
+            br#"{"shared": {
+                "tcp://1.2.3.4:15441": {"time_added": 1, "time_success": 0, "num_error": 0},
+                "garbage no one can dial": {"time_added": 1},
+                "epix://192.168.1.10:15441": {"time_added": 1}
+            }}"#,
+        )
+        .unwrap();
+        let mut book = TrackerBook::load(&path);
+        // Junk a peer once gossiped (and the non-routable range entry) is
+        // gone; it used to survive load forever because only addresses()
+        // filtered it, while save() and the gossip reply carried it on.
+        assert_eq!(
+            book.shared().keys().cloned().collect::<Vec<_>>(),
+            vec!["tcp://1.2.3.4:15441".to_string()]
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! an object against its outboard and shrinks the present set, so torn
 //! writes are refetched instead of served.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -30,7 +31,7 @@ use std::sync::Mutex;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::bitfield::{groups_for_bytes, GroupBits, GROUP_BYTES};
+use crate::bitfield::{group_count, groups_for_bytes, GroupBits, GROUP_BYTES};
 use crate::verified::{self, outboard_size, OutboardBytes};
 use crate::{Ns, ObjId};
 
@@ -102,6 +103,59 @@ fn bits_from_local(wire: &[u64]) -> GroupBits {
     bits
 }
 
+/// Records the byte extents a verified decode wrote into the sparse file,
+/// so a decode that dies mid-stream can still commit the groups that made
+/// it to disk (`Store::write_slice_partial`). The decoder only writes a
+/// leaf after verifying it, so every recorded extent holds verified bytes.
+struct TrackWrites<W> {
+    inner: W,
+    written: Vec<Range<u64>>,
+}
+
+impl<W: positioned_io::WriteAt> positioned_io::WriteAt for TrackWrites<W> {
+    fn write_at(&mut self, pos: u64, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write_at(pos, buf)?;
+        if n > 0 {
+            let end = pos + n as u64;
+            // Leaves arrive in order, so extending the last extent is the
+            // common case; anything else opens a new one.
+            match self.written.last_mut() {
+                Some(last) if last.end == pos => last.end = end,
+                _ => self.written.push(pos..end),
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The chunk groups every byte of which lies inside one of `written`'s
+/// extents (the object's final group counts as covered at `size`). A group
+/// only partially written must not be marked present: its unwritten tail
+/// would be served as zeros.
+fn fully_covered_groups(mut written: Vec<Range<u64>>, size: u64) -> GroupBits {
+    written.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<u64>> = Vec::new();
+    for r in written {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    let mut bits = GroupBits::new();
+    for r in merged {
+        let first = r.start.div_ceil(GROUP_BYTES);
+        let last = if r.end >= size { group_count(size) } else { r.end / GROUP_BYTES };
+        if first < last {
+            bits.add(first..last);
+        }
+    }
+    bits
+}
+
 impl ObjRecord {
     fn bits(&self) -> GroupBits {
         match self.loc {
@@ -165,6 +219,40 @@ pub struct Store {
     cfg: StoreConfig,
     /// Serializes slab appends (id + current length of the open slab).
     open_slab: Mutex<(u32, u64)>,
+    /// Objects with a sparse verified decode in flight (`write_slice` /
+    /// `write_slice_partial`), by count. The delete paths skip an id with
+    /// an active writer — and hold this lock across record-delete + file
+    /// unlink — so a decode can never mark groups present on a record
+    /// recreated over files it did not write: without this, a detached
+    /// salvage decode racing a remove + re-`ensure_sparse` would poison
+    /// the fresh record's present bits with groups whose bytes went to
+    /// the unlinked inode.
+    sparse_writers: Mutex<HashMap<ObjId, usize>>,
+}
+
+/// Registration of one in-flight sparse decode (see `Store::sparse_writers`).
+struct SparseWriteGuard<'a> {
+    store: &'a Store,
+    id: ObjId,
+}
+
+impl<'a> SparseWriteGuard<'a> {
+    fn register(store: &'a Store, id: ObjId) -> Self {
+        *store.sparse_writers.lock().expect("sparse_writers").entry(id).or_insert(0) += 1;
+        Self { store, id }
+    }
+}
+
+impl Drop for SparseWriteGuard<'_> {
+    fn drop(&mut self) {
+        let mut writers = self.store.sparse_writers.lock().expect("sparse_writers");
+        if let Some(n) = writers.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                writers.remove(&self.id);
+            }
+        }
+    }
 }
 
 fn db_err(e: impl std::error::Error + Send + Sync + 'static) -> io::Error {
@@ -263,7 +351,13 @@ impl Store {
             }
         }
 
-        Ok(Self { root, db, cfg, open_slab: Mutex::new(open_slab) })
+        Ok(Self {
+            root,
+            db,
+            cfg,
+            open_slab: Mutex::new(open_slab),
+            sparse_writers: Mutex::new(HashMap::new()),
+        })
     }
 
     fn sparse_path(&self, id: ObjId) -> PathBuf {
@@ -540,6 +634,10 @@ impl Store {
         encoded: impl Read,
         now: u64,
     ) -> io::Result<()> {
+        // Registered before the record is read: from here to the present-
+        // bits commit, the delete paths leave this object alone (see
+        // `sparse_writers`).
+        let _writing = SparseWriteGuard::register(self, id);
         let rec = self.required(id)?;
         let Loc::Sparse = rec.loc else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "object is slab-complete"));
@@ -570,6 +668,74 @@ impl Store {
             cur.last_access = cur.last_access.max(now);
         })?;
         Ok(())
+    }
+
+    /// Like [`Store::write_slice`], but commits progress incrementally: the
+    /// chunk groups whose verified bytes reached the sparse file are marked
+    /// present even when the encoded stream ends early (a stalled peer, an
+    /// abandoned fetch). The decode writes a leaf only after it verifies, so
+    /// every fully-written group is safe to mark; the outboard likewise only
+    /// ever receives parents that verified up the chain to the root. Returns
+    /// the verified payload bytes written; a decode error is still returned
+    /// AFTER the groups that did land are committed, so a timed-out transfer
+    /// keeps its bytes instead of discarding the whole batch.
+    pub fn write_slice_partial(
+        &self,
+        id: ObjId,
+        byte_ranges: &[Range<u64>],
+        encoded: impl Read,
+        now: u64,
+    ) -> io::Result<u64> {
+        // Registered before the record is read: this also runs UNCLAIMED on
+        // detached salvage threads (`fetch::RangeGuard`), where only this
+        // registration keeps a concurrent remove + re-ensure_sparse from
+        // recreating the record while the decode writes the old, unlinked
+        // files — the groups would be marked present with no bytes behind
+        // them, poisoning the object until eviction.
+        let _writing = SparseWriteGuard::register(self, id);
+        let rec = self.required(id)?;
+        let Loc::Sparse = rec.loc else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "object is slab-complete"));
+        };
+        for r in byte_ranges {
+            if r.end > rec.size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("range {r:?} beyond size {}", rec.size),
+                ));
+            }
+        }
+        let data = OpenOptions::new().read(true).write(true).open(self.sparse_path(id))?;
+        let mut obao = OpenOptions::new().read(true).write(true).open(self.obao_path(id))?;
+        let mut tracked = TrackWrites { inner: data, written: Vec::new() };
+        let res = verified::decode_slice_into(encoded, id, rec.size, byte_ranges, &mut tracked, &mut obao);
+        let TrackWrites { inner: data, written } = tracked;
+        let landed = fully_covered_groups(written, rec.size);
+        let held: u64 = landed
+            .ranges()
+            .iter()
+            .map(|r| {
+                let start = r.start * GROUP_BYTES;
+                let end = (r.end * GROUP_BYTES).min(rec.size);
+                end - start
+            })
+            .sum();
+        if !landed.is_empty() {
+            data.sync_data()?;
+            obao.sync_data()?;
+            // Fold into whatever the record holds NOW (see write_slice): a
+            // concurrent writer's groups must not be dropped.
+            self.update_record(id, |cur| {
+                let mut bits = cur.bits();
+                for r in landed.ranges() {
+                    bits.add(r.clone());
+                }
+                cur.present = bits.to_wire();
+                cur.last_access = cur.last_access.max(now);
+            })?;
+        }
+        res?;
+        Ok(held)
     }
 
     /// Serve a verified slice for the requested ranges. Fails with
@@ -707,7 +873,11 @@ impl Store {
         Ok(rec.refcount)
     }
 
-    /// Drop an object unconditionally (tools/tests; normal flow evicts).
+    /// Drop an object unconditionally (tools/tests; normal flow evicts) —
+    /// unless a sparse decode is mid-flight on it, in which case the
+    /// delete is skipped: the writer's verified bytes matter more than the
+    /// cleanup, which the next pass (or `drop_if_unfilled`'s next caller)
+    /// can redo.
     pub fn remove(&self, id: ObjId) -> io::Result<()> {
         let Some(rec) = self.get_record(id)? else { return Ok(()) };
         self.delete_object(id, &rec)?;
@@ -715,6 +885,15 @@ impl Store {
     }
 
     fn delete_object(&self, id: ObjId, rec: &ObjRecord) -> io::Result<()> {
+        // Held across the record delete AND the unlink: a sparse decode
+        // registering meanwhile blocks on this lock and then finds the
+        // record gone (its decode aborts) instead of opening files this
+        // delete is about to unlink; one already registered wins, and the
+        // delete is skipped (see `sparse_writers`).
+        let writers = self.sparse_writers.lock().expect("sparse_writers");
+        if writers.contains_key(&id) {
+            return Ok(());
+        }
         let txn = self.db.begin_write().map_err(db_err)?;
         {
             let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
@@ -745,8 +924,14 @@ impl Store {
     /// list minutes before it reaches a given object; redb serializes write
     /// txns, so a `pin` committed after that snapshot is seen here and the
     /// object is left alone. Returns the deleted record, `None` if the
-    /// object was pinned meanwhile or is already gone.
+    /// object was pinned meanwhile, has a sparse decode mid-flight (evict
+    /// it next pass — see `sparse_writers`), or is already gone.
     fn delete_if_unreferenced(&self, id: ObjId) -> io::Result<Option<ObjRecord>> {
+        // Held across the delete + unlink, same as `delete_object`.
+        let writers = self.sparse_writers.lock().expect("sparse_writers");
+        if writers.contains_key(&id) {
+            return Ok(None);
+        }
         let txn = self.db.begin_write().map_err(db_err)?;
         let deleted: Option<ObjRecord>;
         {
@@ -1335,6 +1520,71 @@ mod tests {
 
         assert_eq!(fs::read(&data_path).unwrap(), data_before, "verified bytes were truncated");
         assert_eq!(fs::read(&obao_path).unwrap(), obao_before, "the outboard was truncated");
+    }
+
+    /// A reader that announces its first read and then blocks until
+    /// released, standing in for a decode caught mid-flight by a delete.
+    struct GatedReader<'a> {
+        inner: &'a [u8],
+        started: Option<std::sync::mpsc::Sender<()>>,
+        gate: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for GatedReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if let Some(tx) = self.started.take() {
+                let _ = tx.send(());
+                let _ = self.gate.recv();
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// A delete must never interleave with an in-flight sparse decode: the
+    /// detached salvage path decodes with NO claim held, so without the
+    /// writer registration a remove + re-ensure_sparse pair could recreate
+    /// the record while the decode writes the unlinked files — and the
+    /// decode's present-bits commit would then claim groups the fresh file
+    /// never received. The delete is skipped and the decode's groups land
+    /// on the surviving record.
+    #[test]
+    fn a_delete_never_interleaves_with_an_inflight_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path()).unwrap());
+
+        let data = test_data(200_000);
+        let held = 0u64..(GROUP_BYTES * 2);
+        let (id, size, slice) = slice_for(&data, &[held.clone()]);
+        store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let store = store.clone();
+            let ranges = [held.clone()];
+            std::thread::spawn(move || {
+                let reader =
+                    GatedReader { inner: &slice[..], started: Some(started_tx), gate: gate_rx };
+                store.write_slice_partial(id, &ranges, reader, 2)
+            })
+        };
+
+        // The decode is registered and parked on its first read: a remove
+        // now must leave the record (and its files) alone.
+        started_rx.recv().unwrap();
+        store.remove(id).unwrap();
+        assert!(store.contains(id).unwrap(), "the record survives an in-flight decode");
+
+        gate_tx.send(()).unwrap();
+        let held_bytes = writer.join().unwrap().unwrap();
+        assert_eq!(held_bytes, GROUP_BYTES * 2, "the decode committed its groups");
+        assert!(!store.present_bits(id).unwrap().is_empty());
+        let got = store.read_range(id, 0, GROUP_BYTES, 3).unwrap();
+        assert_eq!(got, data[..GROUP_BYTES as usize], "committed bytes verify and read back");
+
+        // With the decode finished, the delete goes through.
+        store.remove(id).unwrap();
+        assert!(!store.contains(id).unwrap(), "an idle object still deletes");
     }
 
     #[test]

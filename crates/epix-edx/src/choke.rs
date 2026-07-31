@@ -5,10 +5,12 @@
 //! on the UPLOAD side — who we send BULK data to, in what priority — plus
 //! the two guardrails the plan calls load-bearing:
 //!
-//! - **first-paint is exempt from choking** up to a per-new-peer free
-//!   byte budget: making a fresh visitor wait a 30 s optimistic-unchoke
-//!   rotation would be a catastrophic time-to-first-paint regression.
-//!   Reciprocity choking applies to bulk/media only.
+//! - **generous by default, choking only under real contention**: home
+//!   uplinks are ~1 Gbps now, so every peer gets a large free serving
+//!   budget (~10 MB/s sustained) and the unchoke set is wide. A fresh
+//!   visitor's first paint AND an ordinary site sync ride the free budget;
+//!   reciprocity only decides who keeps getting served when more peers
+//!   compete than there are slots.
 //! - **global upload governance**: a global cap (min(share of measured
 //!   uplink, absolute ceiling)) and a LEDBAT-style yield to the user's
 //!   own foreground traffic, so "invisible seeding" never becomes visible
@@ -17,12 +19,15 @@
 //!
 //! This module is pure decision logic over accounted bytes and a clock;
 //! the server consults it before serving bulk and reports transfers back.
-//! Control-plane replies and first-paint bytes bypass it entirely.
+//! Control-plane replies bypass it entirely; first-paint bytes bypass only
+//! the reciprocity choke, never the global cap or the foreground yield.
 
 use std::collections::{HashMap, HashSet};
 
-/// Free first-paint budget per new peer (bytes) and its refill window.
-pub const FIRST_PAINT_FREE_BYTES: u64 = 4 << 20; // 4 MiB
+/// Free serving budget per peer (bytes) and its refill window: ~10 MB/s
+/// sustained, so an uncontended peer is simply served. Only past this does
+/// bulk service depend on reciprocity.
+pub const FIRST_PAINT_FREE_BYTES: u64 = 6 << 30; // 6 GiB
 pub const FIRST_PAINT_WINDOW_SECS: u64 = 600; // per 10 min
 
 /// Ceiling on tracked peer accounts, and how long an account may sit
@@ -34,9 +39,10 @@ pub const PEER_IDLE_EVICT_SECS: u64 = 24 * 3600;
 
 /// How many bulk peers we actively serve (unchoke) at once, and how many
 /// of those slots are reserved for overlay peers so a Tor-only swarm is
-/// never fully choked out by faster clearnet peers.
-pub const UNCHOKE_SLOTS: usize = 4;
-pub const OVERLAY_RESERVED_SLOTS: usize = 1;
+/// never fully choked out by faster clearnet peers. Wide on purpose: with
+/// fewer competing peers than slots, nobody is ever choked.
+pub const UNCHOKE_SLOTS: usize = 16;
+pub const OVERLAY_RESERVED_SLOTS: usize = 4;
 
 /// Optimistic-unchoke rotation: one slot periodically goes to a random
 /// choked peer regardless of reciprocity, so newcomers can bootstrap.
@@ -178,8 +184,15 @@ impl Choker {
     }
 
     /// Decide whether to serve `bytes` of BULK data to a peer right now.
-    /// `first_paint` marks a first-paint fetch (index.html + first
-    /// bundles), which is exempt up to the free budget. `foreground`
+    /// `first_paint` marks a fetch of a small object (page assets: index,
+    /// bundles, thumbnails — classified by the OBJECT's total size, not the
+    /// request's), which is exempt from the reciprocity CHOKE up to the
+    /// free budget; large-object (media) requests are bulk and never draw
+    /// on it. The global cap and the foreground yield govern EVERY byte,
+    /// first-paint included: the free budget decides who is served, never
+    /// how fast the node uploads — with a multi-GB budget per peer, an
+    /// exemption from the cap would let a handful of syncing peers saturate
+    /// the uplink the moment the user's own traffic needs it. `foreground`
     /// signals the user's own traffic is active (LEDBAT yield).
     pub fn decide(
         &mut self,
@@ -193,7 +206,23 @@ impl Choker {
             return ServeDecision::Throttled;
         }
 
-        // First-paint exemption (per-peer free budget, windowed).
+        // Global governance first: cap per second, yielding under
+        // foreground. Applies to first-paint too — see above.
+        if now != self.second_ts {
+            self.second_ts = now;
+            self.second_bytes = 0;
+        }
+        let effective_cap = if foreground {
+            self.global_cap_bps.saturating_mul(self.foreground_yield_num) / 256
+        } else {
+            self.global_cap_bps
+        };
+        if self.second_bytes + bytes > effective_cap {
+            return ServeDecision::Throttled;
+        }
+
+        // First-paint exemption from the choke (per-peer free budget,
+        // windowed). Counted against the global cap like everything else.
         if first_paint {
             let acct = self.touch(node_pk, now);
             if now.saturating_sub(acct.free_window_start) >= FIRST_PAINT_WINDOW_SECS {
@@ -202,23 +231,10 @@ impl Choker {
             }
             if acct.free_spent + bytes <= FIRST_PAINT_FREE_BYTES {
                 acct.free_spent += bytes;
+                self.second_bytes += bytes;
                 return ServeDecision::FirstPaint;
             }
-            // Over the free budget: fall through to normal governance.
-        }
-
-        // Global governance: cap per second, yielding under foreground.
-        if now != self.second_ts {
-            self.second_ts = now;
-            self.second_bytes = 0;
-        }
-        let effective_cap = if foreground {
-            self.global_cap_bps * self.foreground_yield_num / 256
-        } else {
-            self.global_cap_bps
-        };
-        if self.second_bytes + bytes > effective_cap {
-            return ServeDecision::Throttled;
+            // Over the free budget: fall through to the choke.
         }
 
         // Reciprocity choke: is this peer in an unchoke slot?
@@ -318,11 +334,13 @@ mod tests {
     #[test]
     fn first_paint_is_exempt_up_to_the_budget() {
         // Large cap so governance never trips — this test is about the
-        // first-paint exemption and the choke, not the byte cap.
-        let mut c = Choker::new(1_000_000_000);
-        // Fill every unchoke slot with high contributors so the fresh
-        // peer is genuinely choked for bulk (not just handed a free slot).
-        for i in 10..16u8 {
+        // first-paint exemption and the choke, not the byte cap. (The
+        // whole multi-GB budget is drawn in one call, so the cap must
+        // exceed it.)
+        let mut c = Choker::new(1 << 40);
+        // More high contributors than unchoke slots, so the fresh peer is
+        // genuinely choked for bulk (not just handed a free slot).
+        for i in 10..(10 + UNCHOKE_SLOTS as u8 + 4) {
             let p = pk(i);
             c.note_peer(&p, Reach::Clearnet, 0);
             c.credit_peer(&p, 1_000_000, 0);
@@ -338,9 +356,35 @@ mod tests {
         assert_eq!(c.decide(&peer, 1000, true, false, 0), ServeDecision::Choked);
     }
 
+    /// The generous defaults: with no contention (fewer peers than slots),
+    /// nobody is ever choked, even with zero contribution — reciprocity
+    /// only decides who keeps service when peers COMPETE for slots.
+    #[test]
+    fn a_small_swarm_is_never_choked() {
+        let mut c = Choker::new(1_000_000_000);
+        for i in 0..10u8 {
+            c.note_peer(&pk(i), Reach::Clearnet, 0);
+        }
+        for i in 0..10u8 {
+            assert_eq!(c.decide(&pk(i), 100_000, false, false, 5), ServeDecision::Serve);
+        }
+    }
+
+    /// The free budget sustains ~10 MB/s for a whole window: a fresh peer
+    /// syncing a site at home-connection speed never hits the choke.
+    #[test]
+    fn a_fresh_peer_draws_ten_megabytes_per_second_free() {
+        let mut c = Choker::new(1_000_000_000);
+        let peer = pk(1);
+        c.note_peer(&peer, Reach::Clearnet, 0);
+        for t in 0..FIRST_PAINT_WINDOW_SECS {
+            assert_eq!(c.decide(&peer, 10_000_000, true, false, t), ServeDecision::FirstPaint);
+        }
+    }
+
     #[test]
     fn free_budget_refills_each_window() {
-        let mut c = Choker::new(1_000_000);
+        let mut c = Choker::new(1 << 40);
         let peer = pk(1);
         c.note_peer(&peer, Reach::Clearnet, 0);
         assert_eq!(c.decide(&peer, FIRST_PAINT_FREE_BYTES, true, false, 0), ServeDecision::FirstPaint);
@@ -354,25 +398,25 @@ mod tests {
     #[test]
     fn high_contributors_are_unchoked_over_freeloaders() {
         let mut c = Choker::new(1_000_000_000);
-        // Six peers, only 4 unchoke slots. Give distinct contributions.
-        for i in 0..6u8 {
+        // Twenty peers, more than the unchoke slots. Distinct contributions.
+        for i in 0..20u8 {
             let p = pk(i);
             c.note_peer(&p, Reach::Clearnet, 0);
             c.credit_peer(&p, (i as u64 + 1) * 1000, 0);
         }
-        // The top contributor (i=5) is served; the lowest (i=0) is choked
-        // (unless it happens to hold the single optimistic slot at t=0).
-        assert_eq!(c.decide(&pk(5), 100, false, false, 100), ServeDecision::Serve);
-        // A peer well outside the top-4 and not the optimistic pick.
-        let low = c.decide(&pk(0), 100, false, false, 100);
-        assert!(matches!(low, ServeDecision::Choked | ServeDecision::Serve));
+        // The top contributor (i=19) is served; the lowest (i=0) ranks
+        // outside every general slot and is not the optimistic pick at
+        // t=100 (epoch 3 of 20 lands on a top contributor).
+        assert_eq!(c.decide(&pk(19), 100, false, false, 100), ServeDecision::Serve);
+        assert_eq!(c.decide(&pk(0), 100, false, false, 100), ServeDecision::Choked);
     }
 
     #[test]
     fn overlay_slot_is_reserved() {
         let mut c = Choker::new(1_000_000_000);
-        // Four high-contributing clearnet peers fill the general slots...
-        for i in 0..4u8 {
+        // Enough high-contributing clearnet peers to fill every general
+        // slot...
+        for i in 0..UNCHOKE_SLOTS as u8 {
             let p = pk(i);
             c.note_peer(&p, Reach::Clearnet, 0);
             c.credit_peer(&p, 1_000_000, 0);
@@ -384,6 +428,29 @@ mod tests {
         // The reserved overlay slot means it is still served despite being
         // outclassed on contribution (a Tor-only peer isn't frozen out).
         assert_eq!(c.decide(&overlay, 100, false, false, 5), ServeDecision::Serve);
+    }
+
+    /// First-paint bypasses only the CHOKE, never the governor: with a
+    /// multi-GB free budget per peer, a cap exemption would let a few
+    /// syncing peers saturate the uplink. Free-budget bytes must respect
+    /// the cap, the foreground yield, and count into the global tally.
+    #[test]
+    fn first_paint_respects_the_global_cap_and_foreground_yield() {
+        let mut c = Choker::new(10_000); // 10 KB/s
+        let a = pk(1);
+        let b = pk(2);
+        c.note_peer(&a, Reach::Clearnet, 0);
+        c.note_peer(&b, Reach::Clearnet, 0);
+        // Within the cap: served off the free budget.
+        assert_eq!(c.decide(&a, 8000, true, false, 1), ServeDecision::FirstPaint);
+        // A SECOND peer's first-paint in the same second exceeds the cap:
+        // free-budget bytes count into the global tally, so the exemption
+        // has a cross-peer bound.
+        assert_eq!(c.decide(&b, 8000, true, false, 1), ServeDecision::Throttled);
+        // Under foreground load the effective cap is ~25%: too-large
+        // first-paint yields to the user's own traffic.
+        assert_eq!(c.decide(&a, 8000, true, true, 2), ServeDecision::Throttled);
+        assert_eq!(c.decide(&a, 2000, true, true, 2), ServeDecision::FirstPaint);
     }
 
     #[test]
@@ -451,7 +518,7 @@ mod tests {
     #[test]
     fn unchoke_cache_reflects_credit_within_the_same_rotation() {
         let mut c = Choker::new(1_000_000_000);
-        for i in 0..6u8 {
+        for i in 0..20u8 {
             let p = pk(i);
             c.note_peer(&p, Reach::Clearnet, 0);
             c.credit_peer(&p, 1_000_000, 0);
@@ -459,7 +526,7 @@ mod tests {
         let late = pk(200);
         c.note_peer(&late, Reach::Clearnet, 100);
         // Zero contribution, every slot held, and not the optimistic pick
-        // at t=100 (rotation index 3 of 7 lands on a contributor).
+        // at t=100 (rotation index 3 of 21 lands on a contributor).
         assert_eq!(c.decide(&late, 100, false, false, 100), ServeDecision::Choked);
         // A big credit inside the SAME rotation window takes effect at
         // once: the cached set is invalidated, not held until the next one.
@@ -470,18 +537,18 @@ mod tests {
     #[test]
     fn unchoke_cache_rotates_with_the_clock() {
         let mut c = Choker::new(1_000_000_000);
-        for i in 0..6u8 {
+        for i in 0..16u8 {
             let p = pk(i);
             c.note_peer(&p, Reach::Clearnet, 0);
             c.credit_peer(&p, (i as u64 + 1) * 1000, 0);
         }
-        // pk(2) is outside the top 3 general slots, so it is served only
-        // in the rotation window where it holds the optimistic slot.
-        // ranked is pk5,pk4,pk3,pk2,pk1,pk0; index 3 is pk(2).
-        let held = c.decide(&pk(2), 100, false, false, 3 * OPTIMISTIC_ROTATE_SECS);
+        // pk(2) is outside the 12 general slots (ranked is pk15..pk0, so
+        // it sits at index 13), so it is served only in the rotation
+        // window where it holds the optimistic slot (epoch % 16 == 13).
+        let held = c.decide(&pk(2), 100, false, false, 13 * OPTIMISTIC_ROTATE_SECS);
         assert_eq!(held, ServeDecision::Serve);
         // Next rotation the slot moves on, and the cached set moves with it.
-        let dropped = c.decide(&pk(2), 100, false, false, 4 * OPTIMISTIC_ROTATE_SECS);
+        let dropped = c.decide(&pk(2), 100, false, false, 14 * OPTIMISTIC_ROTATE_SECS);
         assert_eq!(dropped, ServeDecision::Choked);
     }
 }

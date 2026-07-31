@@ -54,7 +54,8 @@ fn remote_err(code: u16, msg: &str) -> std::io::Error {
 
 /// Fires a best-effort `Conn::cancel_now` for its stream when dropped while
 /// still armed, so an abandoned in-flight fetch stops the peer's encode
-/// (see `fetch_ranges`). Disarm (`armed = false`) once the slice arrives.
+/// (see `fetch_many`; the range path uses [`RangeGuard`], which also
+/// salvages). Disarm (`armed = false`) once the reply arrives.
 struct CancelOnAbandon<'a> {
     conn: &'a Conn,
     stream: u64,
@@ -69,9 +70,137 @@ impl Drop for CancelOnAbandon<'_> {
     }
 }
 
+/// New slice bytes between incremental verified commits. Each flush
+/// re-decodes the buffered prefix from the start, so the threshold trades
+/// redundant hashing (cheap, blake3) against how many bytes a mid-transfer
+/// failure can lose. 256 KiB means a 1 MiB batch dying at 90% keeps ~3/4.
+const FLUSH_BYTES: usize = 256 * 1024;
+
+/// A reader that bumps the shared progress counter as the verified decode
+/// consumes it, so a flush's own disk commit counts as transfer liveness:
+/// the scheduler's stall watcher (`sched::race_batch`) must never mistake
+/// our disk-commit latency for a peer that stopped sending.
+struct BumpReads<'a> {
+    inner: &'a [u8],
+    progress: &'a std::sync::atomic::AtomicU64,
+}
+
+impl std::io::Read for BumpReads<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.inner, buf)?;
+        if n > 0 {
+            self.progress.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+}
+
+/// The receive buffer of one in-flight `GetRange`, with incremental
+/// verified commits: a flush decodes the buffered slice prefix into the
+/// store (`Store::write_slice_partial`), so the groups received so far
+/// survive a later timeout or abandonment. At most one flush runs at a
+/// time and the frame loop never awaits a running one (it reaps finished
+/// flushes between frames), so the loop keeps reading — and the shared
+/// progress counter keeps moving — while the disk works; an awaited flush
+/// would freeze the counter and read as a peer stall to the scheduler.
+/// Each flush is still a SHORT blocking task, never one that lives for the
+/// whole transfer, which would hold tokio's paused test clock
+/// (auto-advance is inhibited while a blocking task runs) and deadlock the
+/// sim harness.
+struct SliceSink {
+    store: Arc<Store>,
+    obj: ObjId,
+    ranges: Vec<Range<u64>>,
+    now: u64,
+    buf: Vec<u8>,
+    /// `buf` length at the last flush; a drop with nothing new skips the
+    /// salvage pass.
+    flushed: usize,
+    /// The one in-flight incremental commit, reaped between frames.
+    pending: Option<tokio::task::JoinHandle<std::io::Result<u64>>>,
+}
+
+impl SliceSink {
+    /// Start the decode-and-commit of the buffered prefix on the blocking
+    /// pool. Mid-stream the buffer legitimately ends inside a leaf, so
+    /// `UnexpectedEof` is expected on a non-`terminal` flush — the groups
+    /// that did verify are committed regardless; any other decode error
+    /// means the peer sent bytes that do not verify. Resolves to the
+    /// verified payload bytes the pass wrote.
+    fn spawn_flush(
+        &mut self,
+        terminal: bool,
+        progress: &Arc<std::sync::atomic::AtomicU64>,
+    ) -> tokio::task::JoinHandle<std::io::Result<u64>> {
+        self.flushed = self.buf.len();
+        let store = self.store.clone();
+        let obj = self.obj;
+        let ranges = self.ranges.clone();
+        let bytes = self.buf.clone();
+        let now = self.now;
+        let progress = progress.clone();
+        tokio::task::spawn_blocking(move || {
+            let reader = BumpReads { inner: &bytes[..], progress: &progress };
+            let res = store.write_slice_partial(obj, &ranges, reader, now);
+            match res {
+                Ok(held) => Ok(held),
+                Err(e) if !terminal && e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Reap the in-flight flush: with `wait` it is awaited, otherwise only
+    /// a FINISHED one is collected (never blocking the frame loop). A
+    /// flush error (bytes that failed verification) surfaces here.
+    async fn reap(&mut self, wait: bool) -> std::io::Result<()> {
+        let Some(handle) = &self.pending else { return Ok(()) };
+        if !wait && !handle.is_finished() {
+            return Ok(());
+        }
+        let handle = self.pending.take().expect("pending flush");
+        handle.await.map_err(|e| std::io::Error::other(e.to_string()))??;
+        Ok(())
+    }
+}
+
+/// Fires when an in-flight `GetRange` is dropped while still armed (the
+/// scheduler abandoning a stalled batch or a losing duplicate racer, a
+/// caller timing the future out): a best-effort Cancel so the peer stops
+/// encoding, plus a detached salvage decode of any received-but-unflushed
+/// bytes — everything that verifies stays in the store. Disarm once the
+/// terminal frame lands (the final flush commits everything).
+struct RangeGuard<'a> {
+    conn: &'a Conn,
+    stream: u64,
+    armed: bool,
+    sink: SliceSink,
+}
+
+impl Drop for RangeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.conn.cancel_now(self.stream);
+        if self.sink.buf.len() > self.sink.flushed {
+            let store = self.sink.store.clone();
+            let obj = self.sink.obj;
+            let ranges = std::mem::take(&mut self.sink.ranges);
+            let bytes = std::mem::take(&mut self.sink.buf);
+            let now = self.sink.now;
+            // A plain thread, not the runtime's blocking pool: drop may run
+            // while the runtime itself is shutting down.
+            std::thread::spawn(move || {
+                let _ = store.write_slice_partial(obj, &ranges, &bytes[..], now);
+            });
+        }
+    }
+}
+
 /// Fetch byte ranges of `obj` from a peer and land them (verified) in
 /// the store. The object must already be `ensure_sparse`'d. Returns the
-/// slice size received.
+/// verified payload bytes written.
 pub async fn fetch_ranges(
     conn: &Conn,
     store: &Arc<Store>,
@@ -81,25 +210,60 @@ pub async fn fetch_ranges(
     deadline_ms: u32,
     now: u64,
 ) -> std::io::Result<usize> {
+    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    fetch_ranges_observed(conn, store, obj, size, ranges, deadline_ms, now, &progress).await
+}
+
+/// [`fetch_ranges`], reporting liveness: `progress` is bumped by every
+/// received byte (and by the incremental commits decoding them), so the
+/// scheduler can tell a slow-but-moving transfer from a stalled one
+/// (`sched::race_batch`'s stall-only duplication).
+///
+/// Progress is durable: every FLUSH_BYTES the buffered slice prefix is
+/// verified-decoded into the store, and abandonment salvages the tail
+/// ([`RangeGuard`]) — a timeout keeps every group that made it, instead of
+/// discarding the whole batch.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_ranges_observed(
+    conn: &Conn,
+    store: &Arc<Store>,
+    obj: ObjId,
+    size: u64,
+    ranges: &[Range<u64>],
+    deadline_ms: u32,
+    now: u64,
+    progress: &Arc<std::sync::atomic::AtomicU64>,
+) -> std::io::Result<usize> {
     let req_ranges: Vec<(u64, u64)> = ranges.iter().map(|r| (r.start, r.end)).collect();
     let mut rx = conn
         .request_stream(Req::GetRange { obj, size, ranges: req_ranges, deadline_ms })
         .await?;
 
-    // Cancel-on-abandon: the scheduler duplicates a stalled range onto other
-    // peers (`sched::race_batch`) and drops the losers the moment one wins.
-    // A dropped fetch future must tell its peer to STOP encoding, or the
-    // loser keeps pushing a full slice we already have from the winner. The
-    // guard fires a best-effort Cancel on drop while armed; it also covers
-    // seek-abandon and deadline give-up. Disarmed once the terminal frame
-    // lands, so a cleanly completed fetch never cancels.
-    let mut guard = CancelOnAbandon { conn, stream: rx.id, armed: true };
+    // Cancel-on-abandon + salvage: the scheduler duplicates a stalled range
+    // onto other peers (`sched::race_batch`) and drops the losers the
+    // moment one wins. A dropped fetch future must tell its peer to STOP
+    // encoding, or the loser keeps pushing a full slice we already have
+    // from the winner; anything received that still verifies is committed
+    // rather than thrown away. Disarmed once the terminal frame lands, so
+    // a cleanly completed fetch never cancels.
+    let mut guard = RangeGuard {
+        conn,
+        stream: rx.id,
+        armed: true,
+        sink: SliceSink {
+            store: store.clone(),
+            obj,
+            ranges: ranges.to_vec(),
+            now,
+            buf: Vec::new(),
+            flushed: 0,
+            pending: None,
+        },
+    };
 
-    // Collect the slice. Bounded: requested bytes + outboard overhead.
+    // Bounded: requested bytes + ~2% outboard overhead + 1 MiB slack.
     let requested: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-    // Requested bytes + ~2% outboard overhead + 1 MiB slack.
     let cap = (requested + requested / 50 + (1 << 20)).min(crate::server::MAX_BYTES_PER_REQ * 2);
-    let mut slice = Vec::new();
     loop {
         // Per-frame deadline: the byte cap only bounds a peer that keeps
         // sending, not one that answers a frame and then goes quiet.
@@ -121,12 +285,26 @@ pub async fn fetch_ranges(
                 if bytes.is_empty() && !last {
                     return Err(proto_err("peer sent an empty non-terminal data frame"));
                 }
-                if slice.len() as u64 + bytes.len() as u64 > cap {
+                if guard.sink.buf.len() as u64 + bytes.len() as u64 > cap {
                     return Err(proto_err("peer sent more slice bytes than the request implies"));
                 }
-                slice.extend_from_slice(&bytes);
+                progress.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                guard.sink.buf.extend_from_slice(&bytes);
                 if last {
                     break;
+                }
+                // Incremental verified commit of the received prefix, so a
+                // failure later in the transfer keeps these groups. Reap a
+                // finished commit (surfacing verify errors) and start the
+                // next once enough new bytes buffered — never awaiting a
+                // running one, so the frame loop (and the progress counter
+                // the stall watcher reads) is never frozen by the disk.
+                guard.sink.reap(false).await?;
+                if guard.sink.pending.is_none()
+                    && guard.sink.buf.len() - guard.sink.flushed >= FLUSH_BYTES
+                {
+                    let flush = guard.sink.spawn_flush(false, progress);
+                    guard.sink.pending = Some(flush);
                 }
             }
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
@@ -141,17 +319,16 @@ pub async fn fetch_ranges(
             }
         }
     }
-    // The stream ended on its own; there is nothing to cancel.
+    // The stream ended on its own; there is nothing to cancel and the final
+    // flush commits everything, so the salvage pass has nothing to add.
     guard.armed = false;
-
-    // Verified decode into the sparse store (blocking IO off the runtime).
-    let store = store.clone();
-    let ranges = ranges.to_vec();
-    let len = slice.len();
-    tokio::task::spawn_blocking(move || store.write_slice(obj, &ranges, &slice[..], now))
+    guard.sink.reap(true).await?;
+    let held = guard
+        .sink
+        .spawn_flush(true, progress)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))??;
-    Ok(len)
+    Ok(held as usize)
 }
 
 /// Push a signed update to a peer: the content.json `signed` body plus the
@@ -577,6 +754,69 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!server.take_cancelled(stream), "a completed fetch must not cancel its stream");
+    }
+
+    /// A transfer that dies mid-slice must KEEP the groups that already
+    /// verified: the encoded prefix a stalling peer managed to send is
+    /// decoded and committed as it arrives, not discarded with the batch.
+    /// (A 1 MiB batch over a slow onion circuit used to sit exactly on the
+    /// deadline cliff and throw away every received byte on timeout.)
+    #[tokio::test]
+    async fn a_truncated_slice_keeps_its_verified_prefix() {
+        let data = test_data(200_000);
+        let obj = ObjId::of(&data);
+        let size = data.len() as u64;
+        let ob = OutboardBytes::from_slice(&data);
+        let ranges = vec![0..size];
+        let mut slice = Vec::new();
+        encode_slice(&data[..], &ob, &ranges, &mut slice).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        // Server: send HALF the slice, then go silent with the stream open.
+        let half = slice.len() / 2;
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let inc = server_in.recv().await.expect("GetRange");
+            let mut off = 0usize;
+            while off < half {
+                let end = (off + 50_000).min(half);
+                let body = FrameBody::Data { last: false, bytes: slice[off..end].to_vec() };
+                if srv.send(Frame { stream: inc.stream, body }).await.is_err() {
+                    return;
+                }
+                off = end;
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.ensure_sparse(obj, Ns::Plain, size, 1).unwrap();
+
+        // No terminal frame ever comes: abandon the fetch, exactly what the
+        // scheduler's stall failure does to a batch.
+        let fut = Box::pin(fetch_ranges(&client, &store, obj, size, &ranges, 0, 2));
+        let abandoned = tokio::time::timeout(std::time::Duration::from_millis(500), fut).await;
+        assert!(abandoned.is_err(), "the truncated fetch must not complete");
+
+        // The detached decode drains and commits what verified; poll for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let present = loop {
+            let bits = store.present_bits(obj).unwrap();
+            if !bits.is_empty() {
+                break bits;
+            }
+            assert!(std::time::Instant::now() < deadline, "no partial group was committed");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(!store.is_complete(obj).unwrap(), "only a prefix arrived");
+        assert!(present.contains(0), "the committed prefix starts at group 0");
+        let g = epix_blob::bitfield::GROUP_BYTES as usize;
+        let got = store.read_range(obj, 0, g as u64, 3).unwrap();
+        assert_eq!(got, data[..g], "committed prefix bytes verify and read back");
     }
 
     /// An empty non-terminal Data frame adds no bytes, so the byte cap can

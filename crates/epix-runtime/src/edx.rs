@@ -358,10 +358,12 @@ fn shard_universe_bytes() -> u64 {
         .unwrap_or(VOLUNTEER_SHARD_UNIVERSE_BYTES)
 }
 
-/// How far ahead of the play position a served range prefetches. A few
-/// seconds of typical media over the next window so sequential playback finds
-/// the bytes already in the store, small enough that a seek away wastes little.
-const READAHEAD_BYTES: u64 = 6 * 1024 * 1024;
+/// How far ahead of the play position a served range prefetches. Sized for
+/// overlay links: a Tor circuit moves a few hundred KB/s, so the pipeline
+/// must stay minutes deep for sequential playback to find its bytes already
+/// in the store. Read-ahead skips present groups and a seek re-anchors the
+/// window, so the cost of a seek away is only the in-flight batches.
+const READAHEAD_BYTES: u64 = 48 * 1024 * 1024;
 
 /// Files at least this large get a one-time head+tail warm-up on first touch.
 /// Browsers read an mp4 moov atom (often at EOF) for metadata before playback;
@@ -376,10 +378,35 @@ const MOOV_TAIL_BYTES: u64 = 1_536 * 1024;
 /// The head span ensured on first touch (container/init metadata).
 const MOOV_HEAD_BYTES: u64 = 1024 * 1024;
 
-/// How long a serve's dialed peers stay reusable by its read-ahead. A fetch
-/// path that redials is correct, just slower, so a stale entry only costs a
-/// wasted attempt (read-ahead is silent on failure).
-const PEER_CACHE_TTL: u64 = 15;
+/// How long a serve's dialed peer sessions stay reusable — by the next
+/// windows of the same file AND its read-ahead. Overlay dials cost tens of
+/// seconds, so consecutive 4 MiB windows of one playback must ride the same
+/// links instead of redialing per window. Reuse revalidates each cached
+/// handle (bitfield refresh) and evicts the dead, so a stale entry costs one
+/// cheap round trip, never a wrong serve.
+const PEER_CACHE_TTL: u64 = 120;
+
+/// How many EDX dials a session opens at once. Dead overlay peers take up to
+/// their whole connect timeout to fail, so dialing serially let one dead
+/// onion stall the serve for 45s per peer; a small cap keeps a dial burst
+/// from flooding the Tor/I2P client.
+const SESSION_DIAL_CONCURRENCY: usize = 4;
+
+/// Bound on a cached-session revalidation round trip (one GetBitfield per
+/// live link). Much tighter than EDX_FETCH_TIMEOUT: a healthy overlay link
+/// answers in a couple of seconds, and a dead one must not stall the serve
+/// for the full request timeout before the session falls back to fresh dials.
+const SESSION_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a session keeps collecting further dial results once the FIRST
+/// usable handle exists. A live seeder must start serving in seconds while
+/// dead overlay peers burn their connect timeouts in the background —
+/// waiting for every dial to resolve gated cold-start time-to-first-byte
+/// on the slowest dead onion (up to ~90 s). Peers resolving within the
+/// grace still join the swarm; later ones are dropped, their outcomes
+/// still reach the peer registry, and the next session (or the missing-
+/// group fallback in `peers_for`) picks them up.
+const SESSION_FIRST_HANDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Cap on the per-file streaming hints (`anchor`/`warmed`) kept in memory.
 /// These are only optimizations - a coalescing hint and a one-time moov-warm
@@ -412,6 +439,51 @@ fn plan_readahead(served: &Range<u64>, size: u64, anchor: Option<u64>) -> Option
         return None; // play head unmoved since the last window - coalesce
     }
     Some((from..to, from))
+}
+
+/// The chunk groups of the byte `window` that `present` still lacks - the
+/// only groups a range fetch or read-ahead asks the swarm for, so a window
+/// overlapping already-held bytes costs no network. Pure (shared by the
+/// serve path and `run_readahead`).
+fn missing_groups(
+    present: &epix_blob::bitfield::GroupBits,
+    window: &Range<u64>,
+) -> epix_blob::bitfield::GroupBits {
+    let want = epix_blob::bitfield::groups_for_bytes(window);
+    let mut needed = epix_blob::bitfield::GroupBits::new();
+    for gap in present.gaps(&want) {
+        needed.add(gap);
+    }
+    needed
+}
+
+/// Whether any handle holds at least one of the `needed` groups — the bar
+/// a cached peer session must clear to be reused for a fetch of them. An
+/// empty `needed` (nothing to fetch) clears it trivially. Pure.
+fn can_supply(handles: &[PeerHandle], needed: &epix_blob::bitfield::GroupBits) -> bool {
+    needed.is_empty()
+        || needed
+            .ranges()
+            .iter()
+            .any(|r| r.clone().any(|g| handles.iter().any(|h| h.bits.contains(g))))
+}
+
+/// The length of the contiguous prefix of the byte `window` whose covering
+/// groups are all in `present`, clamped to `size`. What a partial fetch can
+/// serve as a shorter 206 instead of a 404. Pure.
+fn present_prefix_len(
+    present: &epix_blob::bitfield::GroupBits,
+    window: &Range<u64>,
+    size: u64,
+) -> u64 {
+    let mut end = window.start;
+    for g in epix_blob::bitfield::groups_for_bytes(window) {
+        if !present.contains(g) {
+            break;
+        }
+        end = epix_blob::bitfield::bytes_of_group(g, size).end.min(window.end);
+    }
+    end - window.start
 }
 
 /// The head and tail spans to warm on first touch of a large file (the mp4
@@ -735,6 +807,7 @@ pub fn edx_hook(
         let on_inbound = on_inbound.clone();
         let dialback: DialbackSlot = Arc::new(Mutex::new(None));
         let control = control_provider(&state, &control, peer.clone(), dialback.clone());
+        let state = state.clone();
         Box::pin(async move {
             let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(stream);
             let handshake = tokio::time::timeout(
@@ -742,7 +815,7 @@ pub fn edx_hook(
                 epix_edx::link::accept(stream),
             );
             let Ok(Ok(l)) = handshake.await else { return };
-            let mut ctx = serve_ctx(store, provider, privatekey, control, shards);
+            let mut ctx = serve_ctx(&state, store, provider, privatekey, control, shards);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
@@ -768,9 +841,11 @@ fn control_provider(
 }
 
 /// A serve context that answers the control plane too (so it advertises
-/// `caps::CONTROL`) and reports this node's release version in its Hello -
-/// which is what the Stats page's `client` column shows.
+/// `caps::CONTROL`), reports this node's release version in its Hello -
+/// which is what the Stats page's `client` column shows - and credits
+/// served bytes to the node's upload counters.
 fn serve_ctx(
+    state: &Arc<AppState>,
     store: Arc<Store>,
     provider: Arc<dyn SignedProvider>,
     privatekey: String,
@@ -781,6 +856,23 @@ fn serve_ctx(
         .with_version(epix_protocol::self_advert_version())
         .with_control(control)
         .with_shards(shards)
+        .with_on_served(upload_recorder(state.clone()))
+}
+
+/// The serve-side upload recorder: resolve the object just served back to
+/// its xite + inner_path and credit the dashboard counters (the xite's
+/// `bytes_sent`, plus the per-optional-file `uploaded`). The hook fires on
+/// blocking serve threads, so the resolution is a sync map read and the
+/// accounting hops onto the runtime.
+fn upload_recorder(state: Arc<AppState>) -> epix_edx::server::ServedHook {
+    let handle = tokio::runtime::Handle::current();
+    Arc::new(move |obj, bytes| {
+        let Some((address, inner_path)) = state.edx_object_path(&obj) else { return };
+        let state = state.clone();
+        handle.spawn(async move {
+            state.record_upload(&address, &inner_path, bytes).await;
+        });
+    })
 }
 
 /// Build the OVERLAY accept-hook (Tor/I2P/Reticulum): the transport already
@@ -801,6 +893,7 @@ pub fn edx_hook_overlay(
         let choker = choker.clone();
         let dialback: DialbackSlot = Arc::new(Mutex::new(None));
         let control = control_provider(&state, &control, peer.clone(), dialback.clone());
+        let state = state.clone();
         Box::pin(async move {
             let (reg, stream) = ConnHandle::new(Direction::In, peer.clone()).attach(stream);
             let handshake = tokio::time::timeout(
@@ -808,7 +901,7 @@ pub fn edx_hook_overlay(
                 epix_edx::link::accept_overlay(stream),
             );
             let Ok(Ok((conn, incoming))) = handshake.await else { return };
-            let mut ctx = serve_ctx(store, provider, privatekey, control, shards);
+            let mut ctx = serve_ctx(&state, store, provider, privatekey, control, shards);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
@@ -1042,9 +1135,10 @@ struct RuntimeEdxFetcher {
     /// Streaming read-ahead bookkeeping, Arc-shared like the fetcher so every
     /// clone sees the same in-flight/anchor/warmed state.
     streaming: Arc<Mutex<Streaming>>,
-    /// A serve's dialed peers, briefly cached per object so its read-ahead
-    /// reuses the same links instead of redialing. The serve itself always
-    /// builds fresh peers (correctness); this only warms the background path.
+    /// Per-object peer sessions, cached so a serve's next windows and its
+    /// read-ahead reuse the dialed links instead of redialing through the
+    /// overlay. Hits are revalidated and dead links evicted (`peers_for`),
+    /// so reuse is only ever a shortcut, never a wrong answer.
     peer_cache: Arc<Mutex<HashMap<ObjId, CachedPeers>>>,
     /// Objects with a fetch in flight (see [`ObjClaim`]). Arc-shared like the
     /// rest so every clone of the fetcher sees the same claims.
@@ -1062,11 +1156,17 @@ struct Streaming {
     /// Files with a read-ahead task in flight - at most one per file, so a
     /// burst of Range requests cannot fan out into a burst of prefetches.
     inflight: HashSet<(String, String)>,
+    /// The next window planned for a file whose read-ahead task is still
+    /// running: the running task picks it up when it finishes, so streaming
+    /// keeps the pipeline refilling continuously instead of waiting for the
+    /// next Range request to re-arm it.
+    queued: HashMap<(String, String), Range<u64>>,
     /// Files whose one-time moov head/tail warm-up has been kicked off.
     warmed: HashSet<(String, String)>,
 }
 
-/// A serve's dialed peers, kept for a short TTL so its read-ahead reuses them.
+/// A serve's dialed peer session, kept for PEER_CACHE_TTL so consecutive
+/// windows and the read-ahead reuse the links.
 struct CachedPeers {
     handles: Vec<PeerHandle>,
     node_pks: HashMap<String, Vec<u8>>,
@@ -1494,6 +1594,14 @@ impl RuntimeEdxFetcher {
     /// Dial the xite's connectable peers as EDX links and learn what each
     /// holds of `id`. One link per peer, reused for the whole fetch. Also
     /// returns each peer label's authenticated node key, for crediting.
+    ///
+    /// Dials run CONCURRENTLY (capped) and the serve starts EARLY: once the
+    /// first usable handle exists, later dials get only a short grace
+    /// instead of gating the serve on the slowest dead onion's connect
+    /// timeout. The dial driver keeps running detached, so every outcome
+    /// still feeds the xite's peer registry via note_edx_dials — a dead (or
+    /// zombie: handshakes, never answers the bitfield) peer sinks (backoff)
+    /// instead of being redialed at the top of the list on every window.
     async fn build_peers(
         &self,
         address: &str,
@@ -1504,15 +1612,73 @@ impl RuntimeEdxFetcher {
         if peers.is_empty() {
             return Err("no peers".into());
         }
+        let total = peers.len();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let this = self.clone();
+            let address = address.to_string();
+            tokio::spawn(async move {
+                let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
+                let mut join = tokio::task::JoinSet::new();
+                let mut pending = peers.into_iter();
+                loop {
+                    while join.len() < SESSION_DIAL_CONCURRENCY {
+                        let Some(peer) = pending.next() else { break };
+                        let this = this.clone();
+                        let transport = transport.clone();
+                        let address = address.clone();
+                        join.spawn(async move {
+                            let Ok((conn, identity, reg)) = this.dial(&transport, &peer).await
+                            else {
+                                return (peer, false, None);
+                            };
+                            reg.note_cmd_sent("GetBitfield", Some(&address));
+                            match tokio::time::timeout(
+                                EDX_FETCH_TIMEOUT,
+                                epix_edx::fetch::fetch_bitfield(&conn, id),
+                            )
+                            .await
+                            {
+                                Ok(Ok((_sz, bits))) => (peer, true, Some((conn, identity, bits))),
+                                // A quick refusal: reachable, just nothing
+                                // usable for this object.
+                                Ok(Err(_)) => (peer, true, None),
+                                // Handshook but never answered the bitfield:
+                                // a zombie. Scored as a failed dial so the
+                                // registry backs it off, instead of rewarding
+                                // it as reachable and re-burning this timeout
+                                // at the top of every cold session.
+                                Err(_) => (peer, false, None),
+                            }
+                        });
+                    }
+                    let Some(res) = join.join_next().await else { break };
+                    let Ok((peer, dialed, got)) = res else { continue };
+                    outcomes.push((peer.clone(), dialed));
+                    let _ = tx.send((peer, got));
+                }
+                this.state.note_edx_dials(&address, outcomes).await;
+            });
+        }
+
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
-        for peer in peers {
-            let Ok((conn, identity, reg)) = self.dial(&transport, &peer).await else { continue };
-            reg.note_cmd_sent("GetBitfield", Some(address));
-            if let Ok(Ok((_sz, bits))) =
-                tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
-                    .await
-            {
+        let mut resolved = 0usize;
+        // Armed by the first usable handle: from then on the collection is
+        // bounded by the grace, not by the slowest dial.
+        let mut grace: Option<tokio::time::Instant> = None;
+        while resolved < total {
+            let next = tokio::select! {
+                r = rx.recv() => r,
+                _ = async { tokio::time::sleep_until(grace.unwrap()).await },
+                    if grace.is_some() => break,
+            };
+            let Some((peer, got)) = next else { break };
+            resolved += 1;
+            if let Some((conn, identity, bits)) = got {
+                if handles.is_empty() {
+                    grace = Some(tokio::time::Instant::now() + SESSION_FIRST_HANDLE_GRACE);
+                }
                 let label = peer.to_string();
                 node_pks.insert(label.clone(), identity.node_pk);
                 handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label });
@@ -1524,7 +1690,39 @@ impl RuntimeEdxFetcher {
         Ok((handles, node_pks))
     }
 
-    /// Cache a serve's freshly dialed peers so its read-ahead reuses the links.
+    /// Revalidate cached session handles for `id`: refresh each link's
+    /// bitfield (the peer may hold more groups than when it was dialed) and
+    /// drop handles whose connection died or stopped answering - the
+    /// eviction that keeps a dead session from being reused for a whole TTL.
+    async fn refresh_handles(&self, handles: Vec<PeerHandle>, id: ObjId) -> Vec<PeerHandle> {
+        let mut join = tokio::task::JoinSet::new();
+        for h in handles {
+            if h.conn.is_closed() {
+                continue;
+            }
+            join.spawn(async move {
+                match tokio::time::timeout(
+                    SESSION_REFRESH_TIMEOUT,
+                    epix_edx::fetch::fetch_bitfield(&h.conn, id),
+                )
+                .await
+                {
+                    Ok(Ok((_sz, bits))) => Some(PeerHandle { bits, ..h }),
+                    _ => None,
+                }
+            });
+        }
+        let mut live = Vec::new();
+        while let Some(res) = join.join_next().await {
+            if let Ok(Some(h)) = res {
+                live.push(h);
+            }
+        }
+        live
+    }
+
+    /// Cache a serve's dialed peer session so the next windows of the same
+    /// file and its read-ahead reuse the links.
     fn cache_peers(&self, id: ObjId, handles: &[PeerHandle], node_pks: &HashMap<String, Vec<u8>>) {
         let now = now_secs();
         let mut cache = self.peer_cache.lock().expect("peer_cache");
@@ -1545,22 +1743,42 @@ impl RuntimeEdxFetcher {
         );
     }
 
-    /// Peers for `id`, reused from the short-lived cache when a serve dialed
-    /// them recently, else dialed fresh and cached. Used only by the background
-    /// read-ahead / moov warm-up so a seek and its prefetch share links; the
-    /// user-facing serve always builds fresh peers itself.
+    /// Peer session for `id`, able to supply at least one of the `needed`
+    /// groups: reused from the cache when a serve dialed the links within
+    /// the TTL, else dialed fresh (concurrently) and cached. Shared by the
+    /// range serve, the read-ahead and the moov warm-up, so consecutive
+    /// windows of one playback ride the same overlay links.
+    ///
+    /// A cache hit is REVALIDATED (bitfield refresh per link): handles
+    /// whose connection errored are evicted, and the survivors must still
+    /// hold something we need — liveness alone would pin a session of peers
+    /// that answer bitfields but hold none of the needed groups, with the
+    /// per-request re-stamp keeping the useless entry warm forever while a
+    /// redial would find the peer that holds them. Only a usable session is
+    /// reused and re-stamped, so an actively streaming file keeps its
+    /// session for as long as it works.
     async fn peers_for(
         &self,
         address: &str,
         id: ObjId,
+        needed: &epix_blob::bitfield::GroupBits,
     ) -> Result<(Vec<PeerHandle>, HashMap<String, Vec<u8>>), String> {
         let now = now_secs();
-        {
+        let cached = {
             let cache = self.peer_cache.lock().expect("peer_cache");
-            if let Some(hit) = cache.get(&id) {
-                if !hit.handles.is_empty() && now.saturating_sub(hit.at) < PEER_CACHE_TTL {
-                    return Ok((hit.handles.iter().map(clone_handle).collect(), hit.node_pks.clone()));
-                }
+            cache.get(&id).filter(|hit| now.saturating_sub(hit.at) < PEER_CACHE_TTL).map(|hit| {
+                (hit.handles.iter().map(clone_handle).collect::<Vec<_>>(), hit.node_pks.clone())
+            })
+        };
+        if let Some((handles, node_pks)) = cached {
+            let live = self.refresh_handles(handles, id).await;
+            if !live.is_empty() && can_supply(&live, needed) {
+                let node_pks: HashMap<String, Vec<u8>> = live
+                    .iter()
+                    .filter_map(|h| node_pks.get(&h.label).map(|pk| (h.label.clone(), pk.clone())))
+                    .collect();
+                self.cache_peers(id, &live, &node_pks);
+                return Ok((live, node_pks));
             }
         }
         let (handles, node_pks) = self.build_peers(address, id).await?;
@@ -1595,9 +1813,12 @@ impl RuntimeEdxFetcher {
     /// After serving a range, arm the background read-ahead of the NEXT window.
     /// Plans + reserves under the lock: coalesces an unmoved play head and caps
     /// to one in-flight task per file, so a browser's burst of Range requests
-    /// cannot fan out into a burst of prefetches. Backpressure is inherent -
-    /// a paused video issues no Range requests, so this stops being called and
-    /// prefetch quiesces after the current window with no separate mechanism.
+    /// cannot fan out into a burst of prefetches. While a task is running the
+    /// newest planned window is QUEUED instead of dropped, and the running
+    /// task rolls straight into it - so an actively streaming file keeps the
+    /// pipeline refilling continuously. Backpressure is inherent - a paused
+    /// video issues no Range requests, so nothing re-queues and prefetch
+    /// quiesces after the current window with no separate mechanism.
     fn maybe_spawn_readahead(
         &self,
         address: &str,
@@ -1613,20 +1834,40 @@ impl RuntimeEdxFetcher {
             let Some((window, new_anchor)) = plan_readahead(&served, size, anchor) else {
                 return;
             };
-            if s.inflight.contains(&key) {
-                return; // a read-ahead is already running for this file
-            }
             if s.anchor.len() >= MAX_STREAMING_FILES {
                 s.anchor.clear(); // bound memory; a cleared file re-anchors once
+                s.queued.clear();
             }
             s.anchor.insert(key.clone(), new_anchor);
+            if s.inflight.contains(&key) {
+                // A read-ahead is already running for this file: hand it the
+                // newest window to continue with instead of dropping it.
+                s.queued.insert(key, window);
+                return;
+            }
             s.inflight.insert(key.clone());
             window
         };
         let this = self.clone();
         tokio::spawn(async move {
-            this.run_readahead(&key.0, id, size, window).await;
-            this.streaming.lock().expect("streaming").inflight.remove(&key);
+            let mut window = window;
+            loop {
+                this.run_readahead(&key.0, id, size, window).await;
+                let next = {
+                    let mut s = this.streaming.lock().expect("streaming");
+                    match s.queued.remove(&key) {
+                        Some(w) => Some(w), // roll into the freshest window
+                        None => {
+                            s.inflight.remove(&key);
+                            None
+                        }
+                    }
+                };
+                match next {
+                    Some(w) => window = w,
+                    None => break,
+                }
+            }
         });
     }
 
@@ -1639,16 +1880,12 @@ impl RuntimeEdxFetcher {
         let now = now_secs();
         // Only the groups of the window the store is still missing, so a
         // re-watch or an overlap with the served range does no work.
-        let want = epix_blob::bitfield::groups_for_bytes(&window);
         let present = store.present_bits(id).unwrap_or_default();
-        let mut needed = epix_blob::bitfield::GroupBits::new();
-        for gap in present.gaps(&want) {
-            needed.add(gap);
-        }
+        let needed = missing_groups(&present, &window);
         if needed.is_empty() {
             return; // already warm
         }
-        let Ok((handles, node_pks)) = self.peers_for(address, id).await else { return };
+        let Ok((handles, node_pks)) = self.peers_for(address, id, &needed).await else { return };
         // Reserve only once a holder is known: reserving before the dial lets
         // an unobtainable owner-declared size sit in the store for bytes that
         // never arrive. This runs concurrently with the serve of the same
@@ -2163,35 +2400,56 @@ impl EdxFetcher for RuntimeEdxFetcher {
         self.maybe_warm_moov(address, inner_path, id, size);
 
         // Serve straight from the store if the covering range is already
-        // present; otherwise fetch just the covering chunk groups (a seek,
-        // never the whole file). This served range must stay byte-exact at the
-        // tight deadline - read-ahead below is a pure background addition.
+        // present; otherwise fetch just the covering chunk groups the store
+        // still lacks (a seek, never the whole file, and never a group we
+        // already hold). A fetch that fell short of the whole window serves
+        // the contiguous prefix that DID land as a shorter range - the
+        // browser re-requests the remainder - instead of failing bytes we
+        // hold. That includes the case where no peer is currently dialable
+        // at all: a dial or claim failure must not fail bytes a previous
+        // (partial) fetch already committed, so the prefix check runs even
+        // when the fetch could not. Read-ahead below is a pure background
+        // addition.
         let bytes = if let Ok(bytes) = store.read_range(id, start, end - start, now) {
             bytes
         } else {
-            let (handles, node_pks) = self.build_peers(address, id).await?;
-            // Reserve the sparse record only now that a peer can serve it, and
-            // drop it again if nothing lands (same reason as pull_shard_chunk):
-            // reserving before the dial lets an owner-declared size sit in the
-            // store for bytes that never arrive. The claim holds that cleanup
-            // back while the moov warm-up spawned above, or a second concurrent
-            // Range request on the same media element, is still filling it.
-            let _claim =
-                self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
-            // Warm the peer cache so the read-ahead reuses these dialed links.
-            self.cache_peers(id, &handles, &node_pks);
-            let groups = epix_blob::bitfield::groups_for_bytes(&served);
-            let mut needed = epix_blob::bitfield::GroupBits::new();
-            needed.add(groups.start..groups.end);
-            let mut swarm = Swarm::new(store.clone(), id, size);
-            let got = match swarm.fetch(&needed, &handles, Deadline::tight(), now).await {
-                Ok(report) => {
-                    self.credit(&report, &node_pks, now);
-                    store.read_range(id, start, end - start, now).map_err(|e| e.to_string())
+            let present = store.present_bits(id).unwrap_or_default();
+            let needed = missing_groups(&present, &served);
+            let mut fetch_err: Option<String> = None;
+            if !needed.is_empty() {
+                // The cached (revalidated) session from the previous window
+                // or read-ahead, else fresh concurrent dials.
+                match self.peers_for(address, id, &needed).await {
+                    // Reserve the sparse record only now that a peer can
+                    // serve it, and drop it again if nothing lands (same
+                    // reason as pull_shard_chunk): reserving before the dial
+                    // lets an owner-declared size sit in the store for bytes
+                    // that never arrive. The claim holds that cleanup back
+                    // while the moov warm-up spawned above, or a second
+                    // concurrent Range request on the same media element, is
+                    // still filling it.
+                    Ok((handles, node_pks)) => {
+                        match self.claim_object(&store, id, Ns::Plain, size, now) {
+                            Ok(_claim) => {
+                                let mut swarm = Swarm::new(store.clone(), id, size);
+                                match swarm.fetch(&needed, &handles, Deadline::tight(), now).await {
+                                    Ok(report) => self.credit(&report, &node_pks, now),
+                                    Err(e) => fetch_err = Some(e.to_string()),
+                                }
+                            }
+                            Err(e) => fetch_err = Some(e.to_string()),
+                        }
+                    }
+                    Err(e) => fetch_err = Some(e),
                 }
-                Err(e) => Err(e.to_string()),
-            };
-            let bytes = got?;
+            }
+            let present = store.present_bits(id).unwrap_or_default();
+            let got = present_prefix_len(&present, &served, size);
+            if got == 0 {
+                return Err(fetch_err
+                    .unwrap_or_else(|| "no bytes of the requested range are available".into()));
+            }
+            let bytes = store.read_range(id, start, got, now).map_err(|e| e.to_string())?;
             let _ = store.enforce_quota(store_quota());
             bytes
         };
@@ -2744,6 +3002,97 @@ mod tests {
         assert_eq!(client_store.read_bytes(e.b3, 3).unwrap(), movie, "bytes verify and reassemble");
     }
 
+    /// Serving over EDX credits the seeder's upload counters through the
+    /// serve hook: the xite's `bytes_sent` and the per-optional-file
+    /// `uploaded` both move. They froze at 0 when the msgpack file-serve
+    /// layer - `record_upload`'s only caller - was deleted.
+    #[tokio::test]
+    async fn serving_over_edx_credits_upload_counters() {
+        // A signed xite whose movie.bin is OPTIONAL, so the per-file
+        // uploaded counter applies to it.
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(site_dir.path());
+        storage.write("index.html", &vec![b'h'; 5_000]).unwrap();
+        let movie: Vec<u8> = (0..400_000usize).map(|i| (i % 251) as u8).collect();
+        storage.write("movie.bin", &movie).unwrap();
+        let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
+        xite.content = Some(serde_json::json!({ "optional": "movie\\.bin" }));
+        xite.sign(&privkey, 1000.0).unwrap();
+        let content: serde_json::Value =
+            serde_json::from_slice(&xite.storage.read("content.json").unwrap()).unwrap();
+
+        let state_b = AppState::new("uploader");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        state_b
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .await;
+        assert!(state_b.load_content_from_disk(&address).await, "load registers the files");
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state_b.clone(),
+            store_b,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            false,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        // A peer pulls the whole optional file over EDX.
+        let stream = TcpTransport.dial(&epix_core::PeerAddr::Ip(addr)).await.unwrap();
+        let l = epix_edx::link::dial(stream).await.unwrap();
+        let cdir = tempfile::tempdir().unwrap();
+        let cstore = Arc::new(Store::open(cdir.path()).unwrap());
+        let cctx = ServeCtx {
+            now: || 0,
+            ..ServeCtx::new(cstore.clone(), Arc::new(NoProvider), epix_crypt::new_seed())
+        };
+        client_hello(&l.conn, &cctx, vec![], Some(l.handshake_hash)).await.unwrap();
+        let e = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap();
+        let size = movie.len() as u64;
+        cstore.ensure_sparse(e.b3, Ns::Plain, size, 1).unwrap();
+        epix_edx::fetch::fetch_ranges(&l.conn, &cstore, e.b3, size, &[0..size], 100, 2)
+            .await
+            .unwrap();
+
+        // The hook credits asynchronously (a spawned task per serve); wait
+        // for the full transfer to land rather than racing it. Each credit
+        // bumps bytes_sent before the per-file counter, so polling the
+        // per-file counter to `size` proves both.
+        let per_file = || async {
+            state_b
+                .optional_file_list(&address, "all", "", 0)
+                .await
+                .unwrap()
+                .iter()
+                .find(|f| f["inner_path"] == "movie.bin")
+                .and_then(|f| f["uploaded"].as_i64())
+                .unwrap_or(0)
+        };
+        let mut uploaded = 0i64;
+        for _ in 0..100 {
+            uploaded = per_file().await;
+            if uploaded >= size as i64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(uploaded >= size as i64, "per-file uploaded credited, got {uploaded}");
+        let sent = state_b.transfer(&address).await.1;
+        assert!(sent >= size, "bytes_sent credited with the served bytes, got {sent}");
+    }
+
     /// End-to-end fetch driver: a node with only the signed content.json
     /// pulls a declared file from an EDX peer through the injected fetcher
     /// (dial -> swarm -> materialize), and the bytes land in its storage.
@@ -2938,6 +3287,148 @@ mod tests {
         // Only the covering groups were fetched: the object is NOT complete.
         let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
         assert!(!a_store.is_complete(id).unwrap(), "a seek must not pull the whole file");
+    }
+
+    /// A range fetch asks the swarm only for the groups the store still
+    /// lacks: with the first half of the window already present, the seeder
+    /// is credited for roughly half the window, never all of it.
+    #[tokio::test]
+    async fn a_range_fetch_requests_only_the_missing_groups() {
+        let (address, content_bytes, content, movie, addr, server_pk) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content.clone()) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        state_a.set_edx_store(a_store.clone()).await;
+        let choker: SharedChoker = Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS)));
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                Some(choker.clone()),
+            )))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+        std::mem::forget(a_dir);
+        std::mem::forget(a_store_dir);
+
+        // The first half of the file is already in the local store.
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        let size = movie.len() as u64;
+        a_store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+        let ob = epix_blob::verified::OutboardBytes::from_slice(&movie);
+        let held = vec![0..200_000u64];
+        let mut slice = Vec::new();
+        epix_blob::verified::encode_slice(&movie[..], &ob, &held, &mut slice).unwrap();
+        a_store.write_slice(id, &held, &slice[..], 1).unwrap();
+
+        // Fetch the whole file as one range window.
+        let bytes = match state_a.edx_fetch_range(&address, "movie.bin", 0, size).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range fetch: {other:?}"),
+        };
+        assert_eq!(bytes, movie, "the served window is byte-exact");
+
+        // Only the missing half went over the wire: the seeder's
+        // reciprocity credit covers about half the file, not the window.
+        let credit = choker.lock().unwrap().credit_of(&server_pk);
+        assert!(credit > 0, "the seeder served the missing half");
+        assert!(
+            credit < 300_000,
+            "a gap-only fetch must not refetch the present half (credited {credit})"
+        );
+    }
+
+    /// Bytes the store already holds serve as a shorter 206 even when NO
+    /// peer is dialable: a dial (or claim) failure must not preempt the
+    /// present-prefix check - the exact seeder-vanished case the partial
+    /// salvage work exists for.
+    #[tokio::test]
+    async fn a_held_prefix_serves_when_no_peer_is_dialable() {
+        let (address, content_bytes, content, movie, _addr, _server_pk) = spawn_seeder().await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content.clone()) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        state_a.set_edx_store(a_store.clone()).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
+            .await;
+        // NO peers added: every dial path fails (the seeder vanished).
+        std::mem::forget(a_dir);
+        std::mem::forget(a_store_dir);
+
+        // A previous partial fetch left the head of the file in the store.
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        let size = movie.len() as u64;
+        a_store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+        let ob = epix_blob::verified::OutboardBytes::from_slice(&movie);
+        let held = vec![0..200_000u64];
+        let mut slice = Vec::new();
+        epix_blob::verified::encode_slice(&movie[..], &ob, &held, &mut slice).unwrap();
+        a_store.write_slice(id, &held, &slice[..], 1).unwrap();
+
+        // Request the whole file: the held prefix must come back as a
+        // shorter range, never an error for bytes the store holds.
+        let bytes = match state_a.edx_fetch_range(&address, "movie.bin", 0, size).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range fetch: {other:?}"),
+        };
+        assert!(
+            bytes.len() >= 200_000 && (bytes.len() as u64) < size,
+            "a held prefix serves short, got {} of {size}",
+            bytes.len()
+        );
+        assert_eq!(bytes[..], movie[..bytes.len()], "the served prefix is byte-exact");
+    }
+
+    /// The gap-only group set a range fetch requests, and the contiguous
+    /// prefix a partial window can serve. Pure - no network.
+    #[test]
+    fn window_helpers_compute_gaps_and_prefix() {
+        use epix_blob::bitfield::{GroupBits, GROUP_BYTES};
+        let size = 100 * GROUP_BYTES;
+        let mut present = GroupBits::new();
+        present.add(0..3);
+        present.add(5..7);
+
+        let window = 0..10 * GROUP_BYTES;
+        let needed = missing_groups(&present, &window);
+        assert_eq!(needed.ranges(), [3..5, 7..10], "only the gaps are requested");
+        assert!(
+            missing_groups(&GroupBits::complete(size), &window).is_empty(),
+            "a warm window requests nothing"
+        );
+
+        // Prefix: groups 0..3 are present, so exactly their bytes serve.
+        assert_eq!(present_prefix_len(&present, &window, size), 3 * GROUP_BYTES);
+        // A window starting in a hole serves nothing (the 404 case).
+        let hole = 3 * GROUP_BYTES..5 * GROUP_BYTES;
+        assert_eq!(present_prefix_len(&present, &hole, size), 0);
+        // A fully present span clamps to the window end, not group end.
+        let tail = GROUP_BYTES..2 * GROUP_BYTES + 5;
+        assert_eq!(present_prefix_len(&present, &tail, size), GROUP_BYTES + 5);
+        // The object's final short group counts as covered at `size`.
+        let odd_size = 4 * GROUP_BYTES + 100;
+        let mut all = GroupBits::new();
+        all.add(0..5);
+        assert_eq!(present_prefix_len(&all, &(0..odd_size), odd_size), odd_size);
     }
 
     /// Read-ahead window/anchor logic, tested as a pure function (no network):
@@ -3808,6 +4299,63 @@ mod tests {
         })
         .await;
         assert_eq!(delisted, Ok(true), "a dropped link leaves the Stats page");
+    }
+
+    /// The health prober's full arc over a real socket: two peers restored
+    /// from peers.json mid-failure-streak (benched, cooldown already expired -
+    /// the restore shape, so the test never waits out a ~30s cooldown). One
+    /// answers the probe's dial + Ping and is reinstated - visible through
+    /// `connectable_peers` - the other refuses the dial and steps to its next
+    /// cooldown, staying benched.
+    #[tokio::test]
+    async fn probe_pass_reinstates_a_recovered_peer_and_rebenches_a_dead_one() {
+        let (_address, _content_bytes, _content, _movie, addr, _pk) = spawn_seeder().await;
+        let alive = PeerAddr::Ip(addr);
+        // A dead peer: bind a port, then drop the listener so dials are refused.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = PeerAddr::Ip(dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+
+        let root = tempfile::tempdir().unwrap();
+        let site = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        std::fs::create_dir_all(root.path().join("private")).unwrap();
+        std::fs::write(
+            root.path().join("private/peers.json"),
+            serde_json::to_vec(&serde_json::json!({
+                site: [
+                    { "addr": alive.to_string(), "rep": -3, "errors": 3, "seen": 0 },
+                    { "addr": dead.to_string(), "rep": -3, "errors": 3, "seen": 0 },
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = AppState::with_data_dir("client", root.path());
+        state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let store_dir = tempfile::tempdir().unwrap();
+        state.set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap())).await;
+        let site_dir = tempfile::tempdir().unwrap();
+        state
+            .add_xite(site, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .await;
+
+        // Both restored peers are benched and due a probe.
+        let due = state.probe_candidates(10).await;
+        assert_eq!(due.len(), 2, "{due:?}");
+        assert!(due.iter().all(|c| c.failures == 3), "{due:?}");
+
+        let opener: Arc<dyn LinkOpener> =
+            Arc::new(RuntimeEdxFetcher::new(state.clone(), epix_crypt::new_seed(), None));
+        crate::probe_pass(&state, opener).await;
+
+        // The answering peer is back in selection (dial backoff lifted; its
+        // streak waits for a real fetch to clear); the refusing one is in a
+        // (grown) backoff, and neither is due another probe before its
+        // re-armed cooldown.
+        let connectable = state.connectable_peers(site, 10).await;
+        assert!(connectable.contains(&alive), "recovered peer reinstated: {connectable:?}");
+        assert!(!connectable.contains(&dead), "dead peer stays benched: {connectable:?}");
+        assert!(state.probe_candidates(10).await.is_empty());
     }
 
     /// The INBOUND half of the accept path: a peer that dials us and speaks
