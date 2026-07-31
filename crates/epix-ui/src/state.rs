@@ -4361,11 +4361,27 @@ impl AppState {
     /// Replace a xite's content.json, refreshing its stats and rebuilding its db.
     pub async fn update_content(&self, address: &str, content: Option<Value>) {
         let muted = self.muted_authors().await;
+        let mut author_optout = false;
         let is_merger = {
             let mut xites = self.xites.write().await;
             let Some(x) = xites.get_mut(address) else { return };
             if let Some(c) = &content {
                 x.settings.apply_content_stats(&content_stats(c));
+                // The FIRST root content for this record is the fresh-clone
+                // commit, and it is the only moment the author's
+                // `autodownloadoptional_default: false` opt-out can apply to
+                // a clone: at add time the manifest did not exist yet, so the
+                // add-time default check never saw it. Only first content -
+                // a later update must not undo a user's deliberate toggle.
+                if x.content.is_none()
+                    && !x.settings.own
+                    && x.settings.autodownloadoptional
+                    && c.get("autodownloadoptional_default").and_then(|v| v.as_bool())
+                        == Some(false)
+                {
+                    x.settings.autodownloadoptional = false;
+                    author_optout = true;
+                }
             }
             x.content = content;
             let (db, schema) = match build_xite_db(&x.storage, &muted) {
@@ -4377,6 +4393,14 @@ impl AppState {
             x.db_schema = schema;
             is_merger
         };
+        if author_optout {
+            self.log(
+                "INFO",
+                format!("{address}: content.json opts out of prefetch-by-default; Pre-download everything stays off"),
+            )
+            .await;
+            self.persist_sites().await;
+        }
         // build_xite_db leaves a version-3 merger db EMPTY (its rows come from
         // the merged sites, not its own tree). Replacing a merger site's own
         // content.json - a republish, or an inbound root update - must refill it
@@ -14934,6 +14958,38 @@ mod tests {
             let s = &xites.get("1New").unwrap().settings;
             assert!(!s.autodownloadoptional, "author opt-out beats the node default");
         }
+
+        // The FRESH-CLONE path: the xite is added with NO content (the
+        // manifest has not been fetched yet), inherits the operator's
+        // prefetch-on default, and the author opt-out must then apply when
+        // the first content.json commits.
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+        state.config_set("autodownloadoptional_default", Value::from("true")).await;
+        state
+            .add_xite("1New", XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        assert!(
+            state.xites.read().await.get("1New").unwrap().settings.autodownloadoptional,
+            "no manifest yet, operator default applies"
+        );
+        let cloned = json!({
+            "address": "1New", "modified": 2.0, "files": {},
+            "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
+            "autodownloadoptional_default": false,
+        });
+        state.update_content("1New", Some(cloned.clone())).await;
+        assert!(
+            !state.xites.read().await.get("1New").unwrap().settings.autodownloadoptional,
+            "author opt-out applies when the cloned manifest lands"
+        );
+        // A LATER update must not undo the user's deliberate choice.
+        state.set_autodownloadoptional("1New", true).await;
+        state.update_content("1New", Some(cloned)).await;
+        assert!(
+            state.xites.read().await.get("1New").unwrap().settings.autodownloadoptional,
+            "user toggle survives subsequent content updates"
+        );
 
         // The author key can only lower the default: `true` in content.json
         // must NOT switch prefetch on against a node default of off.
