@@ -935,15 +935,21 @@ async fn serve_wrapper(
 /// The inner file a wrapper request points its iframe at, for a `/:address/path`
 /// URL. A top-level navigation to a directory renders the wrapper with the
 /// iframe pointed at that directory's `index.html` (this is how multi-page
-/// xites like Git Epix navigate: `index/`, `myrepos/`). A request for a
-/// specific file (js, css, image, or even a bare `.html`) is a raw resource
-/// load and returns `None` - the iframe fetches those directly (with the
-/// wrapper nonce), and a direct address of a file is served raw as before.
-fn wrapper_inner_path(path: &str) -> Option<String> {
+/// xites like Git Epix navigate: `index/`, `myrepos/`). A bare `.html` file
+/// wraps too, but ONLY for a top-level document navigation
+/// (`top_level_document`, from `Sec-Fetch-Dest: document`): a deep link like
+/// `/addr/videos.html` must get the wrapper - loading screen, websocket, nav
+/// icon - while the same URL clicked INSIDE the iframe (no nonce either, the
+/// query does not survive relative links) must stay raw or the frame nests a
+/// second wrapper. Non-html files and nonce-less requests from clients that
+/// send no Sec-Fetch-Dest (curl, old browsers) serve raw as before.
+fn wrapper_inner_path(path: &str, top_level_document: bool) -> Option<String> {
     if path.is_empty() {
         Some("index.html".to_string())
     } else if path.ends_with('/') {
         Some(format!("{path}index.html"))
+    } else if top_level_document && (path.ends_with(".html") || path.ends_with(".htm")) {
+        Some(path.to_string())
     } else {
         None
     }
@@ -2193,7 +2199,11 @@ async fn serve_file(
     // `myrepos/`) navigate this way. Iframe resource loads carry the nonce and
     // fall through to the raw file below.
     if q.wrapper_nonce.is_none() {
-        if let Some(inner) = wrapper_inner_path(&path) {
+        let top_level_document = headers
+            .get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|d| d.eq_ignore_ascii_case("document"));
+        if let Some(inner) = wrapper_inner_path(&path, top_level_document) {
             // Strip the wrapper_nonce we would append back; the caller had none.
             let outer_query = raw_query
                 .as_deref()
