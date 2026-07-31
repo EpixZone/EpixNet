@@ -1521,11 +1521,81 @@ async fn bootstrap_tor_attempt(
     }
 }
 
+/// Why one Tor generation stopped serving.
+#[cfg(feature = "tor")]
+enum TorGenerationEnd {
+    /// The node is shutting down; leave Tor down.
+    Shutdown,
+    /// Onion transport stopped working. Clear the guard sample and re-bootstrap.
+    Unhealthy,
+}
+
+/// How often to probe that onion traffic still works.
+#[cfg(feature = "tor")]
+const ONION_HEALTH_INTERVAL: Duration = Duration::from_secs(180);
+/// Budget for one probe. A live onion dial needs a descriptor fetch plus a
+/// rendezvous circuit (single-digit seconds when healthy), so this is generous
+/// enough that only a real outage trips it.
+#[cfg(feature = "tor")]
+const ONION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Consecutive failed probes before rebuilding the client. Onion circuits fail
+/// individually all the time; only a sustained run means the guard sample has
+/// gone bad, and the rebuild is disruptive enough to be worth confirming.
+#[cfg(feature = "tor")]
+const ONION_FAILURES_BEFORE_RESET: u32 = 3;
+
+/// Resolve once onion transport has been unreachable for
+/// `ONION_FAILURES_BEFORE_RESET` consecutive probes - the signal that arti's
+/// guard sample has rotted and the client needs rebuilding.
+///
+/// Arti can keep reporting "bootstrapped", keep its directory fresh and keep
+/// building ordinary exit circuits while every onion circuit dies, so the node
+/// looks healthy from the inside and is invisible to the network: peers cannot
+/// fetch from us and we cannot reach them. Probing is the only way to see it.
+/// Pends forever when there is no onion service to probe (nothing to check, and
+/// nothing that a rebuild would fix).
+#[cfg(feature = "tor")]
+async fn await_onion_failure(
+    state: &AppState,
+    tor: &epix_tor::Tor,
+    onion: Option<(String, u16)>,
+) {
+    let Some((host, port)) = onion else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let mut failures = 0u32;
+    loop {
+        tokio::time::sleep(ONION_HEALTH_INTERVAL).await;
+        if tor.onion_reachable(&host, port, ONION_PROBE_TIMEOUT).await {
+            failures = 0;
+            continue;
+        }
+        failures += 1;
+        state
+            .log(
+                "WARNING",
+                format!(
+                    "Tor: onion self-check failed ({failures}/{ONION_FAILURES_BEFORE_RESET}); \
+                     peers cannot reach this node over Tor"
+                ),
+            )
+            .await;
+        if failures >= ONION_FAILURES_BEFORE_RESET {
+            return;
+        }
+    }
+}
+
 /// Bootstrap in-process Tor and run its three surfaces until shutdown: the peer
 /// transport (set on the app state so onion peers are dialable, or all traffic
 /// is Tor-routed in Always mode), an onion service whose inbound streams feed
 /// the same node handler as the TCP seed loop, and a local SOCKS listener for
 /// the browser shells.
+///
+/// Runs as a supervision loop: each pass owns one bootstrapped client and the
+/// surfaces built on it, and a failed onion health check ends the pass so the
+/// poisoned guard state can be cleared and the client rebuilt.
 #[cfg(feature = "tor")]
 async fn tor_loop(
     state: Arc<AppState>,
@@ -1537,6 +1607,62 @@ async fn tor_loop(
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
+    loop {
+        let end = run_tor_generation(
+            state.clone(),
+            data_dir.clone(),
+            mode,
+            fileserver_port,
+            socks_port,
+            tor_use_bridges,
+            edx_cell.clone(),
+            shutdown.clone(),
+        )
+        .await;
+        match end {
+            TorGenerationEnd::Shutdown => break,
+            TorGenerationEnd::Unhealthy => {
+                // Fail closed while no client is routed: in Always mode a
+                // transport without Tor must never fall through to clearnet.
+                state.set_transport(Arc::new(epix_tor::MixedTransport::new(None, mode))).await;
+                state.set_tor_status(false, "Recovering").await;
+                let cleared = epix_tor::reset_guard_state(&data_dir);
+                state
+                    .log(
+                        "WARNING",
+                        format!(
+                            "Tor: onion transport was dead; {}re-bootstrapping \
+                             (the .onion address is unchanged)",
+                            if cleared { "cleared the guard sample and " } else { "" }
+                        ),
+                    )
+                    .await;
+                // Give the decommissioned onion service and the SOCKS listener a
+                // moment to release the port the next generation rebinds.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+    state.set_tor_status(false, "Disabled").await;
+}
+
+/// One Tor generation: bootstrap a client, run the transport, onion service and
+/// SOCKS listener on it, and serve until shutdown or an onion health failure.
+/// Every task spawned here is tied to `generation` so the whole set is torn down
+/// together when the generation ends.
+#[cfg(feature = "tor")]
+async fn run_tor_generation(
+    state: Arc<AppState>,
+    data_dir: std::path::PathBuf,
+    mode: epix_tor::TorMode,
+    fileserver_port: Option<u16>,
+    socks_port: Option<u16>,
+    tor_use_bridges: bool,
+    edx_cell: edx::EdxServeCell,
+    shutdown: Arc<Notify>,
+) -> TorGenerationEnd {
+    // Cancels this generation's spawned tasks (onion accept loop, SOCKS).
+    let (generation, _) = tokio::sync::watch::channel(false);
     // Bootstrap under a watchdog (heartbeat + timeout + retry). It starts a
     // Snowflake bridge when `tor_use_bridges` forces it, or automatically after
     // repeated direct failures (a censored network). `None` means shutdown fired
@@ -1546,9 +1672,11 @@ async fn tor_loop(
     let Some((tor, snowflake_guard)) =
         bootstrap_tor_with_watchdog(&state, &data_dir, &shutdown, tor_use_bridges).await
     else {
-        return;
+        return TorGenerationEnd::Shutdown;
     };
     state.log("INFO", "Tor: bootstrapped".to_string()).await;
+    // Set once the onion service is up; what the health watchdog probes.
+    let mut onion_probe: Option<(String, u16)> = None;
 
     // Self-heal the Snowflake rendezvous params: now that Tor is up (possibly
     // via the current params on a censored link), refresh them from Tor's Moat
@@ -1582,6 +1710,7 @@ async fn tor_loop(
                     .log("INFO", format!("Tor: onion service up at {onion_host}.onion:{port}"))
                     .await;
                 state.set_onion_address(&onion_host).await;
+                onion_probe = Some((onion_host.clone(), port));
                 // Handshakes on Tor-bound connections now offer this onion as
                 // our dial-back address (Phase 6).
                 let advert_host = onion_host.clone();
@@ -1604,6 +1733,7 @@ async fn tor_loop(
                 }
                 let hook_state = state.clone();
                 let hook_cell = edx_cell.clone();
+                let mut gen_rx = generation.subscribe();
                 tokio::spawn(async move {
                     // The RunningOnionService handle keeps the service alive:
                     // dropping it decommissions the service, so its descriptor
@@ -1617,7 +1747,17 @@ async fn tor_loop(
                         return;
                     };
                     let edx_hook = es.overlay_hook();
-                    while let Some(stream) = inbound.recv().await {
+                    loop {
+                        // Ending the generation drops `_svc`, decommissioning the
+                        // service so the rebuilt client can relaunch it on the
+                        // same key (and so the same address).
+                        let stream = tokio::select! {
+                            _ = gen_rx.changed() => break,
+                            recv = inbound.recv() => match recv {
+                                Some(s) => s,
+                                None => break,
+                            },
+                        };
                         let edx_hook = edx_hook.clone();
                         // Inbound onion peers arrive with no dial-back address;
                         // the Hello carries the peer's advertised `onion`
@@ -1641,8 +1781,14 @@ async fn tor_loop(
             Ok(listener) => {
                 state.log("INFO", format!("Tor: SOCKS5 listener on 127.0.0.1:{sport}")).await;
                 let tor = tor.clone();
+                let mut gen_rx = generation.subscribe();
                 tokio::spawn(async move {
-                    let _ = tor.serve_socks(listener).await;
+                    // Cancelling drops the listener, freeing the port for the
+                    // next generation to rebind.
+                    tokio::select! {
+                        _ = gen_rx.changed() => {}
+                        _ = tor.serve_socks(listener) => {}
+                    }
                 });
             }
             Err(e) => state.log("WARNING", format!("Tor: SOCKS bind on {sport} failed: {e}")).await,
@@ -1654,26 +1800,37 @@ async fn tor_loop(
     // Snowflake bridge (Arti retires the affected circuits and rebuilds them over
     // the new path) instead of restarting the node - the onion service and SOCKS
     // listener above keep running on the same client throughout.
+    // A third exit joins shutdown and the bridges setting: the onion health
+    // watchdog, which ends the generation so the caller can clear the guard
+    // sample and rebuild the client.
     #[cfg(feature = "bridges")]
-    {
+    let end = {
         let tor_config_changed = state.tor_config_changed();
         let mut snowflake_guard = snowflake_guard;
+        let health = await_onion_failure(&state, &tor, onion_probe);
+        tokio::pin!(health);
         loop {
             tokio::select! {
-                _ = shutdown.notified() => break,
+                _ = shutdown.notified() => break TorGenerationEnd::Shutdown,
                 _ = tor_config_changed.notified() => {
                     apply_bridge_change(&state, &data_dir, &tor, &mut snowflake_guard).await;
                 }
+                _ = &mut health => break TorGenerationEnd::Unhealthy,
             }
         }
-    }
+    };
     #[cfg(not(feature = "bridges"))]
-    {
+    let end = {
         let _ = snowflake_guard;
-        shutdown.notified().await;
-    }
+        tokio::select! {
+            _ = shutdown.notified() => TorGenerationEnd::Shutdown,
+            _ = await_onion_failure(&state, &tor, onion_probe) => TorGenerationEnd::Unhealthy,
+        }
+    };
 
-    state.set_tor_status(false, "Disabled").await;
+    // Tear down this generation's surfaces before the client is dropped.
+    let _ = generation.send(true);
+    end
 }
 
 /// Apply a live change to the Tor bridges setting on the running client: start

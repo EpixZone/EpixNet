@@ -2830,6 +2830,15 @@ impl AppState {
                 if port == 0 || sa.port() != port {
                     return false;
                 }
+                // Loopback on our own fileserver port is this node. Without
+                // this, `127.0.0.1:<port>` entered the peer table and a publish
+                // that reached nothing but ourselves still reported "accepted
+                // by" - propagation failure indistinguishable from success. The
+                // port check above keeps a second node on the same host (a
+                // different port) dialable.
+                if sa.ip().is_loopback() {
+                    return true;
+                }
                 let (_, detected) = self.port_status().await;
                 let configured = self
                     .config_get("ip_external")
@@ -3236,13 +3245,34 @@ impl AppState {
                                     as u32;
                             peer.time_response =
                                 o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
-                            // The bench stamps are in-memory only, so a peer
-                            // restored mid-streak has none: without this its
-                            // bench age reads as the whole epoch. The restore
-                            // is the bench start we know; the probe cooldown
-                            // stays expired (a restart is a natural moment to
-                            // re-check a benched peer).
-                            if peer.connection_errors > 0 {
+                            // Restore the dial/probe backoff. Without it every
+                            // restart handed each dead peer a fresh dial slot:
+                            // a node that restarts often re-burned its whole
+                            // publish budget on the same unreachable addresses
+                            // and never reached the live ones. Stamps are
+                            // absolute, so a long downtime still expires them
+                            // naturally - which is the wanted behaviour.
+                            //
+                            // Cap against the ceilings the in-memory backoff
+                            // uses (dial 1h, probe ~10min) so a hand-edited or
+                            // corrupt file can't bench a peer forever.
+                            let cap = |v: Option<&Value>, max: i64| {
+                                v.and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now + max)
+                            };
+                            peer.retry_after = cap(o.get("retry_after"), 3600);
+                            peer.probe_after = cap(o.get("probe_after"), 600);
+                            peer.probe_failures = o
+                                .get("probe_failures")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                .min(u32::MAX as u64)
+                                as u32;
+                            peer.benched_since =
+                                o.get("benched_since").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+                            // Pre-backoff files carry no stamp, so a peer
+                            // restored mid-streak would read as benched since
+                            // the epoch. The restore is the bench start we know.
+                            if peer.benched_since == 0 && peer.connection_errors > 0 {
                                 peer.benched_since = now;
                             }
                         }
@@ -3303,23 +3333,39 @@ impl AppState {
             if x.peers.len() == 0 {
                 continue;
             }
-            let list: Vec<Value> = x
-                .peers
-                .peers()
-                .map(|p| {
-                    json!({
-                        "addr": p.addr.to_string(),
-                        "rep": p.reputation,
-                        "errors": p.connection_errors,
-                        "seen": p.time_response,
-                    })
-                })
-                .collect();
+            let now = now_secs();
+            let list: Vec<Value> = x.peers.peers().map(|p| Self::persisted_peer(p, now)).collect();
             map.insert(canonical, Value::Array(list));
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
             let _ = std::fs::write(path, bytes);
         }
+    }
+
+    /// One peer's `peers.json` entry: the learned selection state, so a restart
+    /// resumes where the previous run left off.
+    ///
+    /// The backoff stamps are written only while a peer is actually in a failure
+    /// streak, so a healthy table stays as compact as it was before these fields
+    /// existed. `retry_after`/`probe_after` are absolute, and already-expired
+    /// stamps carry no information, so they are dropped rather than stored.
+    fn persisted_peer(p: &Peer, now: i64) -> Value {
+        let mut o = serde_json::Map::new();
+        o.insert("addr".into(), json!(p.addr.to_string()));
+        o.insert("rep".into(), json!(p.reputation));
+        o.insert("errors".into(), json!(p.connection_errors));
+        o.insert("seen".into(), json!(p.time_response));
+        for (key, value) in [
+            ("retry_after", (p.retry_after > now).then_some(p.retry_after)),
+            ("probe_after", (p.probe_after > now).then_some(p.probe_after)),
+            ("benched_since", (p.benched_since > 0).then_some(p.benched_since)),
+            ("probe_failures", (p.probe_failures > 0).then_some(p.probe_failures as i64)),
+        ] {
+            if let Some(v) = value {
+                o.insert(key.into(), json!(v));
+            }
+        }
+        Value::Object(o)
     }
 
     // --- OptionalManager: persist optional-file pins across restarts ---------
@@ -13703,6 +13749,33 @@ mod tests {
     /// connectable_peers, which would also drop them for dialability and mask a
     /// broken arm). Phase 4 announces i2p/rns self-claims to the DHT that echo
     /// straight back, so these arms are the only guard against self-dialing.
+    #[tokio::test]
+    /// Loopback on our own fileserver port is this node, so it never enters the
+    /// peer table: a publish that reached only ourselves used to report a peer
+    /// acceptance, making total propagation failure look like success. A second
+    /// node on the same host (different port) must still be dialable.
+    async fn is_own_peer_matches_loopback_on_our_fileserver_port() {
+        let state = AppState::new("test");
+        state.set_fileserver_port(26552).await;
+
+        for addr in ["127.0.0.1:26552", "[::1]:26552"] {
+            assert!(
+                state.is_own_peer(&PeerAddr::parse(addr).unwrap()).await,
+                "{addr} is this node"
+            );
+        }
+        // Another node on this host, on a different port, is a real peer.
+        assert!(
+            !state.is_own_peer(&PeerAddr::parse("127.0.0.1:26553").unwrap()).await,
+            "a different port is a different node"
+        );
+        // A non-loopback address we have not detected as ours stays dialable.
+        assert!(
+            !state.is_own_peer(&PeerAddr::parse("74.208.249.9:26552").unwrap()).await,
+            "a remote peer on our port is not us"
+        );
+    }
+
     #[tokio::test]
     async fn is_own_peer_matches_i2p_and_rns_self_addresses() {
         let state = AppState::new("test");

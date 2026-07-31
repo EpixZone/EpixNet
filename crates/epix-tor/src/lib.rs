@@ -20,6 +20,7 @@ use epix_transport::{PeerStream, Transport};
 use futures::StreamExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -263,6 +264,35 @@ fn clear_poisoned_guard_state(state_dir: &Path) {
     }
 }
 
+/// Drop the persisted guard sample and circuit-timeout estimates unconditionally,
+/// so the next [`Tor::bootstrap`] draws a fresh sample.
+///
+/// [`clear_poisoned_guard_state`] only fires when the *persisted* sample already
+/// looks poisoned, which misses the case this exists for: a sample that rots
+/// while the node runs. Arti keeps guard state in memory and flushes it lazily,
+/// so a live poisoning ("N% of circuits died under mysterious circumstances" ->
+/// guards disabled one by one -> every onion dial and our own descriptor upload
+/// time out) need not be visible on disk at all. The runtime health watchdog
+/// detects that behaviourally and calls this before re-bootstrapping.
+///
+/// Only resumable network state is removed. Onion-service keys live under
+/// `hss/` and `keystore/`, which are untouched, so the node keeps its `.onion`
+/// address across a reset.
+pub fn reset_guard_state(data_dir: &Path) -> bool {
+    let state = data_dir.join("tor").join("state").join("state");
+    let mut cleared = false;
+    for name in ["guards.json", "circuit_timeouts.json"] {
+        let path = state.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => cleared = true,
+            // Nothing to clear is a normal outcome, not a failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("tor: could not clear {}: {e}", path.display()),
+        }
+    }
+    cleared
+}
+
 impl Tor {
     /// Bootstrap a Tor client, keeping its state + directory cache under
     /// `data_dir` (`<data>/tor/state`, `<data>/tor/cache`) so later starts
@@ -319,6 +349,35 @@ impl Tor {
     /// `.onion` peers use it.
     pub fn transport(&self, route_all: bool) -> TorTransport {
         TorTransport { client: self.client.clone(), route_all }
+    }
+
+    /// Probe whether onion traffic actually works right now, by opening a
+    /// circuit to our *own* onion service and closing it again.
+    ///
+    /// This is the health signal the guard watchdog runs on. It is deliberately
+    /// end-to-end: reaching our own service exercises descriptor publication,
+    /// descriptor lookup, rendezvous and circuit construction - the exact chain
+    /// that dies when the guard sample rots, and the exact chain a peer must
+    /// traverse to fetch content from us. A node whose guards have gone bad
+    /// still reports "bootstrapped" and still builds ordinary exit circuits, so
+    /// nothing cheaper distinguishes healthy from mute.
+    ///
+    /// Self-dialling keeps the check private: no third party is contacted, and
+    /// the peer handler drops the probe stream as soon as it closes without a
+    /// handshake. `false` means "no onion circuit within `timeout`".
+    pub async fn onion_reachable(&self, host: &str, port: u16, timeout: Duration) -> bool {
+        let target = format!("{host}.onion");
+        match tokio::time::timeout(timeout, self.client.connect((target.as_str(), port))).await {
+            Ok(Ok(_stream)) => true,
+            Ok(Err(e)) => {
+                tracing::debug!("tor: onion self-probe failed: {e}");
+                false
+            }
+            Err(_) => {
+                tracing::debug!("tor: onion self-probe timed out after {timeout:?}");
+                false
+            }
+        }
     }
 
     /// Launch (or resume) the onion service `nickname`, accepting streams to
