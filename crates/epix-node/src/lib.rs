@@ -774,19 +774,40 @@ async fn clone_xite_with_progress(
             state.update_content(address, xite.content.clone()).await;
         }
         if let Some(state) = progress {
-            let total = xite.files_needed().len();
+            let needed = xite.files_needed();
+            let total = needed.len();
+            let size_needed: i64 = needed.iter().map(|f| f.size).sum();
+            // Optional files are NOT part of the clone; surface their count +
+            // bytes separately so the loading screen can say "on demand"
+            // instead of looking like the whole site is about to download.
+            let (optional_files, size_optional) = xite
+                .content
+                .as_ref()
+                .and_then(|c| c.get("files_optional"))
+                .and_then(|f| f.as_object())
+                .map(|m| {
+                    let bytes: i64 = m
+                        .values()
+                        .filter_map(|v| v.get("size").and_then(|s| s.as_i64()))
+                        .sum();
+                    (m.len(), bytes)
+                })
+                .unwrap_or((0, 0));
             let counts = serde_json::json!({
                 "peers": peer_count,
                 "bad_files": total,
                 "tasks": total,
                 "started_task_num": total,
+                "size_needed": size_needed,
+                "optional_files": optional_files,
+                "size_optional": size_optional,
             });
             state.push_clone_event(
                 address,
                 serde_json::json!(["file_done", "content.json"]),
                 counts.clone(),
             );
-            // "N files needs to be downloaded"
+            // "N files (X) needed to load" + optional-on-demand note
             state.push_clone_event(address, serde_json::json!(["file_added", total]), counts);
         }
     }
@@ -891,7 +912,18 @@ async fn clone_xite_with_progress(
             Arc::new(move |inner: &str, _bytes: u64| emit(inner))
                 as epix_ui::state::EdxBatchProgress
         });
-        state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress).await;
+        // Bound the pass. Inside, every dial and request has its own deadline,
+        // but a session of unresponsive peers times out serially and the whole
+        // pass can grind for many minutes with the loading screen frozen.
+        // Cutting it loose re-pulls candidates (dead peers have just been
+        // scored down by note_edx_dials) and retries with a better set; files
+        // already materialized stay on disk, so nothing is refetched.
+        const CLONE_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+        let _ = tokio::time::timeout(
+            CLONE_PASS_BUDGET,
+            state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress),
+        )
+        .await;
         let after = xite.files_needed().len();
         if after == 0 {
             break;
@@ -1300,10 +1332,11 @@ async fn fetch_content(
     address: String,
     state: Option<Arc<AppState>>,
 ) -> Option<Vec<u8>> {
-    let budget = std::time::Duration::from_secs(match peer {
-        PeerAddr::Onion { .. } | PeerAddr::I2p { .. } => 45,
-        _ => 10,
-    });
+    // Overlay-aware budget: an Ip peer is dialed through an exit circuit in
+    // Tor-always mode, so the clearnet 10s cut off every attempt before the
+    // circuit finished building and the clone never got content.json.
+    // connect_timeout() already folds in route_all_via_overlay.
+    let budget = peer.connect_timeout();
     // EDX manifest channel: GetSigned returns the signed content.json over an
     // EDX link, and works for ANY site (the signed bytes are served independent
     // of per-file `b3`). With no state there is no fetcher, so nothing to do.
@@ -1862,6 +1895,10 @@ async fn serve(
         epix_chain::set_chain_require_tor(tor_mode == epix_runtime::TorMode::Always);
         #[cfg(feature = "bittorrent")]
         epix_bt::http::set_require_tor(tor_mode == epix_runtime::TorMode::Always);
+        // Ip peers are dialed through exit circuits in Always mode, so every
+        // dial/transfer deadline must use the overlay budget - the clearnet
+        // 15s cuts off exit-circuit dials mid-build and discovery goes dark.
+        epix_core::set_route_all_via_overlay(tor_mode == epix_runtime::TorMode::Always);
     }
 
     // Privacy by default: turn the embedded I2P router on the first time a node

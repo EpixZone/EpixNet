@@ -16,8 +16,12 @@ use crate::{MAGIC, MAX_FRAME_LEN};
 pub const FRAME_HARD_CAP: usize = MAX_FRAME_LEN + 4096;
 
 /// Send the 4-byte magic (each side sends it once, before anything else).
+/// Flushed: overlay streams (Arti's DataStream) buffer writes until an
+/// explicit flush, so an unflushed magic never leaves this node and the
+/// handshake deadlocks - TCP is unbuffered and unaffected.
 pub async fn write_magic<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
-    w.write_all(&MAGIC).await
+    w.write_all(&MAGIC).await?;
+    w.flush().await
 }
 
 /// Read and check the peer's magic.
@@ -49,10 +53,12 @@ pub fn encode(frame: &Frame) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Write one frame.
+/// Write one frame. Flushed for the same overlay-buffering reason as
+/// [`write_magic`].
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
     let bytes = encode(frame)?;
-    w.write_all(&bytes).await
+    w.write_all(&bytes).await?;
+    w.flush().await
 }
 
 /// Read one frame, rejecting oversize claims BEFORE allocating.

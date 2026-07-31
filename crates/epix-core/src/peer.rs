@@ -32,6 +32,25 @@ impl IpType {
     }
 }
 
+/// Whether ALL peer traffic rides an overlay (Tor-always mode): Ip peers are
+/// then dialed through exit circuits and need overlay-sized timeouts, not
+/// clearnet ones. Set once at node boot when the Tor mode resolves; false is
+/// the clearnet default.
+static ROUTE_ALL_VIA_OVERLAY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that every peer dial is overlay-routed (Tor-always), so
+/// [`PeerAddr::connect_timeout`]/[`PeerAddr::file_timeout`] use the overlay
+/// budget even for Ip peers.
+pub fn set_route_all_via_overlay(on: bool) {
+    ROUTE_ALL_VIA_OVERLAY.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_route_all_via_overlay`].
+pub fn route_all_via_overlay() -> bool {
+    ROUTE_ALL_VIA_OVERLAY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A peer endpoint. The `Rns` variant is what makes mesh a first-class
 /// transport: trackers/PEX can carry Reticulum destination hashes alongside
 /// IP and onion endpoints.
@@ -63,7 +82,8 @@ impl PeerAddr {
     /// Reticulum mesh) rather than a direct clearnet TCP socket. Overlay dials
     /// and transfers need far more generous timeouts: a Tor circuit + onion
     /// rendezvous alone can take tens of seconds, and multi-hop bandwidth is a
-    /// fraction of clearnet.
+    /// fraction of clearnet. Note this is about the ADDRESS type; in Tor-always
+    /// mode even Ip peers ride Tor - see [`set_route_all_via_overlay`].
     pub fn is_overlay(&self) -> bool {
         matches!(
             self,
@@ -98,8 +118,11 @@ impl PeerAddr {
     /// circuit and finishing an onion rendezvous routinely takes 20-40s, so
     /// clearnet-sized bounds cut off reachable overlay peers mid-handshake.
     /// Every per-peer dial site shares this so no path is overlay-blind.
+    /// In Tor-always mode ([`set_route_all_via_overlay`]) an Ip peer is dialed
+    /// through an exit circuit, so it gets the overlay budget too - the
+    /// clearnet 15s cut off every tracker dial and blacked out discovery.
     pub fn connect_timeout(&self) -> std::time::Duration {
-        if self.is_overlay() {
+        if self.is_overlay() || route_all_via_overlay() {
             std::time::Duration::from_secs(45)
         } else {
             std::time::Duration::from_secs(15)
@@ -110,8 +133,10 @@ impl PeerAddr {
     /// that stalls mid-transfer gets requeued quickly), 180s overlay -
     /// multi-hop circuits move data at a fraction of clearnet bandwidth, so a
     /// file that lands in seconds directly can take a minute-plus over Tor.
+    /// Ip peers get the overlay budget in Tor-always mode for the same reason
+    /// as [`Self::connect_timeout`].
     pub fn file_timeout(&self) -> std::time::Duration {
-        if self.is_overlay() {
+        if self.is_overlay() || route_all_via_overlay() {
             std::time::Duration::from_secs(180)
         } else {
             std::time::Duration::from_secs(60)

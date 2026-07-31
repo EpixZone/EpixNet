@@ -13,7 +13,7 @@ pub mod time;
 pub use address::{classify_label, Address, LabelClass};
 pub use emitter::{CollectingEmitter, Emitter, NoopEmitter};
 pub use error::{Error, Result};
-pub use peer::{IpType, PeerAddr};
+pub use peer::{route_all_via_overlay, set_route_all_via_overlay, IpType, PeerAddr};
 pub use time::{now_ms, now_secs};
 
 /// The default bootstrap announcers: Epix-protocol trackers (`host:port`) and
