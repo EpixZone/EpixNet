@@ -3334,38 +3334,38 @@ impl AppState {
                 continue;
             }
             let now = now_secs();
-            let list: Vec<Value> = x
-                .peers
-                .peers()
-                .map(|p| {
-                    let mut o = serde_json::Map::new();
-                    o.insert("addr".into(), json!(p.addr.to_string()));
-                    o.insert("rep".into(), json!(p.reputation));
-                    o.insert("errors".into(), json!(p.connection_errors));
-                    o.insert("seen".into(), json!(p.time_response));
-                    // Backoff state, written only while a peer is actually in a
-                    // failure streak so a healthy table stays as compact as it
-                    // was before these fields existed.
-                    if p.retry_after > now {
-                        o.insert("retry_after".into(), json!(p.retry_after));
-                    }
-                    if p.probe_after > now {
-                        o.insert("probe_after".into(), json!(p.probe_after));
-                    }
-                    if p.benched_since > 0 {
-                        o.insert("benched_since".into(), json!(p.benched_since));
-                    }
-                    if p.probe_failures > 0 {
-                        o.insert("probe_failures".into(), json!(p.probe_failures));
-                    }
-                    Value::Object(o)
-                })
-                .collect();
+            let list: Vec<Value> = x.peers.peers().map(|p| Self::persisted_peer(p, now)).collect();
             map.insert(canonical, Value::Array(list));
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
             let _ = std::fs::write(path, bytes);
         }
+    }
+
+    /// One peer's `peers.json` entry: the learned selection state, so a restart
+    /// resumes where the previous run left off.
+    ///
+    /// The backoff stamps are written only while a peer is actually in a failure
+    /// streak, so a healthy table stays as compact as it was before these fields
+    /// existed. `retry_after`/`probe_after` are absolute, and already-expired
+    /// stamps carry no information, so they are dropped rather than stored.
+    fn persisted_peer(p: &Peer, now: i64) -> Value {
+        let mut o = serde_json::Map::new();
+        o.insert("addr".into(), json!(p.addr.to_string()));
+        o.insert("rep".into(), json!(p.reputation));
+        o.insert("errors".into(), json!(p.connection_errors));
+        o.insert("seen".into(), json!(p.time_response));
+        for (key, value) in [
+            ("retry_after", (p.retry_after > now).then_some(p.retry_after)),
+            ("probe_after", (p.probe_after > now).then_some(p.probe_after)),
+            ("benched_since", (p.benched_since > 0).then_some(p.benched_since)),
+            ("probe_failures", (p.probe_failures > 0).then_some(p.probe_failures as i64)),
+        ] {
+            if let Some(v) = value {
+                o.insert(key.into(), json!(v));
+            }
+        }
+        Value::Object(o)
     }
 
     // --- OptionalManager: persist optional-file pins across restarts ---------
