@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use epix_core::{Error, PeerAddr, Result};
 use epix_transport::{PeerStream, Transport};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use yosemite::{style::Stream, DestinationKind, RouterApi, Session, SessionOptions};
 
@@ -164,7 +166,7 @@ impl I2p {
     pub fn spawn(config: I2pConfig) -> (Self, mpsc::Receiver<PeerStream>) {
         let (tx, rx) = mpsc::channel::<PeerStream>(16);
         let status: SharedStatus = Arc::new(RwLock::new(I2pStatus::new(config.mode.clone())));
-        let transport = I2pTransport { status: status.clone(), outbound: Arc::new(Mutex::new(None)) };
+        let transport = I2pTransport::new(status.clone());
 
         if config.mode != I2pMode::Disable {
             let status = status.clone();
@@ -412,13 +414,51 @@ fn i2p_base64_decode(s: &str) -> Option<Vec<u8>> {
     encoding.decode(input.as_bytes()).ok()
 }
 
+/// How long a single SAM `connect` may run before the slot is reclaimed.
+///
+/// A destination whose leaseset cannot be resolved does not fail fast - the
+/// router keeps looking until it gives up ("lease set not found ... Timeout"),
+/// which is long enough to burn the caller's whole dial budget. Bounding it
+/// here frees the session slot for the next candidate while still leaving room
+/// for a genuinely slow first contact (leaseset lookup plus stream handshake).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Outbound SAM sessions kept for dialling.
+///
+/// yosemite's `Session::connect` takes `&mut self`, so a single shared session
+/// serialises every dial behind one lock: with a batch of candidates, the first
+/// dead destination holds the lock for its whole timeout while the rest of the
+/// batch expires without ever reaching the router. A small pool of
+/// independently-locked sessions restores real concurrency.
+///
+/// Slots are tried in order and only built on first use, so an idle node still
+/// keeps exactly one session (and one set of tunnels); extra sessions appear
+/// only while dials actually overlap. Outbound sessions are transient - our
+/// stable `.b32.i2p` identity is the separate inbound session - so additional
+/// sessions cost tunnels, not identity.
+const OUTBOUND_SESSIONS: usize = 4;
+
 /// Dials `.b32.i2p` peers through the router's SAM bridge. Shares the status so
 /// dials are refused (cleanly) until I2P is ready and clearnet keeps working.
-/// Holds one persistent outbound session so dials reuse the same tunnels.
+/// Holds a small pool of outbound sessions so dials reuse tunnels without
+/// serialising on one another.
 #[derive(Clone)]
 pub struct I2pTransport {
     status: SharedStatus,
-    outbound: Arc<Mutex<Option<Session<Stream>>>>,
+    outbound: Arc<[Mutex<Option<Session<Stream>>>; OUTBOUND_SESSIONS]>,
+    /// Rotates the starting slot so concurrent dials spread across the pool
+    /// instead of all queueing on slot 0 when every slot is busy.
+    next_slot: Arc<AtomicUsize>,
+}
+
+impl I2pTransport {
+    fn new(status: SharedStatus) -> Self {
+        Self {
+            status,
+            outbound: Arc::new(std::array::from_fn(|_| Mutex::new(None))),
+            next_slot: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 #[async_trait]
@@ -438,13 +478,31 @@ impl Transport for I2pTransport {
             }
             s.sam_port
         };
-        let mut guard = self.outbound.lock().await;
-        // Reuse the one persistent outbound session. If a dial wedges it (the
-        // router's SAM control connection dropped, leaving the session
-        // `Poisoned` so every later dial fails), the attempt drops it and
-        // signals a retry, so we rebuild once and I2P recovers without a node
-        // restart. A clean per-peer failure leaves the session healthy and is
-        // surfaced as-is (no retry).
+        // Take the first free session, preferring the low slots so an idle node
+        // reuses one session; fall back to waiting on a rotating slot when every
+        // session is busy. Holding a per-slot lock (rather than one global one)
+        // is what lets a batch of dials actually overlap.
+        let mut guard = {
+            let mut free = None;
+            for slot in self.outbound.iter() {
+                if let Ok(g) = slot.try_lock() {
+                    free = Some(g);
+                    break;
+                }
+            }
+            match free {
+                Some(g) => g,
+                None => {
+                    let i = self.next_slot.fetch_add(1, Ordering::Relaxed) % OUTBOUND_SESSIONS;
+                    self.outbound[i].lock().await
+                }
+            }
+        };
+        // Reuse the session in this slot. If a dial wedges it (the router's SAM
+        // control connection dropped, leaving the session `Poisoned` so every
+        // later dial fails), the attempt drops it and signals a retry, so we
+        // rebuild once and I2P recovers without a node restart. A clean per-peer
+        // failure leaves the session healthy and is surfaced as-is (no retry).
         match dial_once(&mut guard, sam_port, &dest).await {
             Ok(stream) => return Ok(stream),
             Err((e, retry)) if !retry => return Err(e),
@@ -474,14 +532,26 @@ async fn dial_once(
         }
     }
     let session = guard.as_mut().expect("session set above");
-    match session.connect(dest).await {
-        Ok(stream) => Ok(Box::pin(stream) as PeerStream),
-        Err(e) => {
+    match tokio::time::timeout(CONNECT_TIMEOUT, session.connect(dest)).await {
+        Ok(Ok(stream)) => Ok(Box::pin(stream) as PeerStream),
+        Ok(Err(e)) => {
             let wedged = session_fatal(&e);
             if wedged {
                 *guard = None; // drop the wedged session so a retry rebuilds it
             }
             Err((Error::Protocol(format!("i2p connect {dest}: {e}")), wedged))
+        }
+        // Timed out: the router never resolved the destination. Cancelling
+        // `connect` mid-handshake can leave the session's state machine out of
+        // step with the router, so drop it rather than risk every later dial on
+        // this slot failing with `invalid state`. No retry - the destination,
+        // not the session, is what failed.
+        Err(_) => {
+            *guard = None;
+            Err((
+                Error::Protocol(format!("i2p connect {dest}: timed out after {CONNECT_TIMEOUT:?}")),
+                false,
+            ))
         }
     }
 }

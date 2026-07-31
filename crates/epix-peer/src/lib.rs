@@ -93,23 +93,25 @@ pub struct Peer {
     /// Consecutive connection failures.
     pub connection_errors: u32,
     /// Unix time before which selection skips the peer (exponential backoff
-    /// after failures). In-memory only - never serialized or sent to peers,
-    /// so it is wire-safe.
+    /// after failures). Persisted locally (`peers.json`) so a restart does not
+    /// hand every benched peer a fresh dial slot, but never sent to peers, so
+    /// it stays wire-safe.
     pub retry_after: i64,
     /// Unix time before which the health prober skips the peer. Its own
     /// cooldown, separate from `retry_after`: probes cap at ~10min (see
     /// [`probe_cooldown_secs`]) while the dial backoff grows to an hour, so
     /// a recovered peer is spotted quickly without the streaming path ever
-    /// redialing it. In-memory only, like `retry_after`.
+    /// redialing it. Locally persisted, like `retry_after`.
     pub probe_after: i64,
     /// Unix time the current failure streak began (0 = not benched).
-    /// In-memory only, like `retry_after`.
+    /// Locally persisted, like `retry_after`.
     pub benched_since: i64,
     /// Consecutive failed health probes since the last dial failure. Kept
     /// apart from `connection_errors` on purpose: probes run on their own
     /// clock (minutes, not fetch demand), so folding them into the dial
     /// streak would manufacture eviction-grade error counts and reputation
-    /// docks for a peer no fetch ever asked for. In-memory only.
+    /// docks for a peer no fetch ever asked for. Locally persisted, like
+    /// `retry_after`.
     pub probe_failures: u32,
     /// Whether we currently hold a live connection to the peer.
     pub connected: bool,
