@@ -233,11 +233,48 @@ impl UiServer {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
             let _ = std::fs::remove_file(&path); // a stale socket from a crash
-            let listener = match tokio::net::UnixListener::bind(&path) {
-                Ok(l) => l,
+            let pointer = path.with_extension("sock.path");
+            let (listener, path) = match tokio::net::UnixListener::bind(&path) {
+                Ok(l) => {
+                    let _ = std::fs::remove_file(&pointer);
+                    (l, path)
+                }
                 Err(e) => {
-                    ctx.state.log("WARNING", format!("admin socket {path:?}: {e}")).await;
-                    return;
+                    // A data dir on a network share (SMB/NFS) cannot host a
+                    // unix socket; without this fallback every live CLI
+                    // command (siteCmd, live sitePublish) silently dies. Bind
+                    // in the temp dir instead and leave the actual path in
+                    // admin.sock.path for the CLI to follow.
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    path.hash(&mut h);
+                    let fb = std::env::temp_dir()
+                        .join(format!("epix-admin-{:016x}.sock", h.finish()));
+                    let _ = std::fs::remove_file(&fb);
+                    match tokio::net::UnixListener::bind(&fb) {
+                        Ok(l) => {
+                            let _ = std::fs::write(&pointer, fb.to_string_lossy().as_bytes());
+                            ctx.state
+                                .log(
+                                    "INFO",
+                                    format!(
+                                        "admin socket {path:?}: {e}; listening on {} instead",
+                                        fb.display()
+                                    ),
+                                )
+                                .await;
+                            (l, fb)
+                        }
+                        Err(e2) => {
+                            ctx.state
+                                .log(
+                                    "WARNING",
+                                    format!("admin socket {path:?}: {e}; fallback {fb:?}: {e2}"),
+                                )
+                                .await;
+                            return;
+                        }
+                    }
                 }
             };
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -2191,8 +2228,18 @@ async fn serve_file(
                 return (StatusCode::NOT_FOUND, "optional file (downloads disabled)")
                     .into_response();
             }
+            // Overlay-aware wait. A multi-MB asset pulled over Tor moves at a
+            // fraction of clearnet speed - a 2.5MB image measures 25-45s - so
+            // the clearnet 45s expired mid-transfer and the browser rendered a
+            // broken image even though the file landed moments later. Mirrors
+            // PeerAddr::file_timeout's clearnet/overlay split.
+            let need_deadline = if epix_core::route_all_via_overlay() {
+                std::time::Duration::from_secs(180)
+            } else {
+                std::time::Duration::from_secs(45)
+            };
             let need = ctx.state.file_need(&address, &path);
-            match tokio::time::timeout(std::time::Duration::from_secs(45), need).await {
+            match tokio::time::timeout(need_deadline, need).await {
                 Ok(Ok(true)) => {} // on disk now - the normal Range/read path serves it
                 _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
             }

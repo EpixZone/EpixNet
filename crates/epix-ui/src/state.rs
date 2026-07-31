@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -454,15 +454,15 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Optional Files",
         "download_optional_default",
-        "Download optional files on new xites",
+        "Allow new xites to fetch optional files you open (images, video you play)",
         "true",
         "bool",
     ),
     (
         "Optional Files",
         "autodownloadoptional_default",
-        "Help distribute all files on new xites (keeps fetching files new versions add)",
-        "true",
+        "Pre-download EVERY optional file on new xites, including ones you never open (you already share whatever you have downloaded - this is not needed to seed)",
+        "false",
         "bool",
     ),
     (
@@ -2300,8 +2300,13 @@ impl AppState {
                 settings.autodownloadoptional = auto;
             }
             None => {
+                // Default OFF. This is not "seed what you have" - a node
+                // already serves every chunk it holds, with no toggle. This
+                // one PREFETCHES the entire optional set, so defaulting it on
+                // meant opening a multi-GB xite silently pulled all of it over
+                // Tor. Fetch on demand; seed what that leaves behind.
                 let auto_default =
-                    self.config_bool("autodownloadoptional_default", true).await;
+                    self.config_bool("autodownloadoptional_default", false).await;
                 settings.autodownloadoptional = auto_default;
                 settings.download_optional =
                     auto_default || self.config_bool("download_optional_default", true).await;
@@ -2997,9 +3002,15 @@ impl AppState {
         address: &str,
     ) -> Option<&'a ManagedXite> {
         xites.get(address).or_else(|| {
-            xites
-                .values()
-                .find(|x| canonical_address(x.content.as_ref(), address) == address)
+            // Only entries with content can alias another address: a
+            // registered-but-empty entry (content: None) would make
+            // canonical_address fall back to the QUERIED address and match
+            // everything - restore_sites then silently skips every later
+            // site and the exit persist erases it from sites.json.
+            xites.values().find(|x| {
+                x.content.is_some()
+                    && canonical_address(x.content.as_ref(), address) == address
+            })
         })
     }
 
@@ -3228,8 +3239,12 @@ impl AppState {
             let key = key.clone();
             let advert = advert.clone();
             set.spawn(async move {
+                // Tor-routed announces need a cold-circuit budget: an onion
+                // tracker dial (HSDir fetch + rendezvous) or an exit-circuit
+                // build routinely exceeds 20s, and announces run concurrently
+                // so a longer timeout does not stretch the pass.
                 let peers = tokio::time::timeout(
-                    std::time::Duration::from_secs(20),
+                    std::time::Duration::from_secs(75),
                     epix_xite::announce(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert),
                 )
                 .await
@@ -4491,7 +4506,7 @@ impl AppState {
     /// whose file set completed. Called from the periodic resync tick, with a
     /// decaying per-update retry probability so files nobody serves don't cost
     /// bandwidth every pass.
-    pub async fn retry_pending_updates(&self) {
+    pub async fn retry_pending_updates(self: &Arc<Self>) {
         let due: Vec<(Vec<String>, String, Value, Vec<u8>)> = {
             let mut pending = self.pending_updates.lock().unwrap();
             pending
@@ -4518,7 +4533,7 @@ impl AppState {
     /// One retry pass for a single pending update: re-fetch its still-missing
     /// files and try to commit. Returns whether the update committed.
     async fn retry_pending_update(
-        &self,
+        self: &Arc<Self>,
         keys: &[String],
         canonical: &str,
         content: Value,
@@ -4551,7 +4566,12 @@ impl AppState {
     /// Fetch a pending update's missing files from connectable peers, updating
     /// the live worker stats. A no-op without a transport or peers - files
     /// that arrive some other way still let the caller's commit land.
-    async fn fetch_pending_files(&self, key: &str, xite: &Xite, needed: Vec<epix_xite::FileEntry>) {
+    async fn fetch_pending_files(
+        self: &Arc<Self>,
+        key: &str,
+        xite: &Xite,
+        needed: Vec<epix_xite::FileEntry>,
+    ) {
         if self.transport.read().await.is_none() {
             return; // offline
         }
@@ -4565,7 +4585,43 @@ impl AppState {
         // fetch stale bytes that never match the new sha512, and the update
         // could never converge. A file with no `b3` simply does not arrive.
         let staged = xite.content.clone();
-        self.edx_first(key, needed, peers, staged.as_ref(), None).await;
+        let total = needed.len();
+        self.set_worker_stats(key, total, 1, total).await;
+        self.push_site_info(key).await;
+        let on_file = self.track_update_progress(key, total);
+        self.edx_first(key, needed, peers, staged.as_ref(), on_file).await;
+        self.set_worker_stats(key, 0, 0, 0).await;
+    }
+
+    /// Live "N files left" accounting for an update's file pull: returns the
+    /// per-file hook that counts a primed worker-stat total down, pushing the
+    /// row each time so the dashboard pill reads "Updating: N left" and tracks
+    /// the download (like the optional-file pass) instead of sitting on a bare
+    /// "Updating...". Callers seed the stats with `total` before the pull and
+    /// zero them when the pass ends.
+    fn track_update_progress(
+        self: &Arc<Self>,
+        address: &str,
+        total: usize,
+    ) -> Option<EdxBatchProgress> {
+        if total == 0 {
+            return None;
+        }
+        let state = self.clone();
+        let address = address.to_string();
+        let left = Arc::new(AtomicUsize::new(total));
+        Some(Arc::new(move |_inner: &str, _bytes: u64| {
+            left.fetch_sub(1, Ordering::Relaxed);
+            let state = state.clone();
+            let address = address.clone();
+            let left = left.clone();
+            // The hook is sync (called from the fetch loop); the spawned task
+            // reads the counter at push time so late pushes never raise it.
+            tokio::spawn(async move {
+                state.set_worker_stats(&address, left.load(Ordering::Relaxed), 1, 0).await;
+                state.push_site_info(&address).await;
+            });
+        }))
     }
 
     /// EDX-first pass over a needed-file list: fetch what EDX can in one
@@ -4639,14 +4695,21 @@ impl AppState {
         // and flash the sidebar panel for xites whose seeder is offline.
         self.mark_optional_dirty(address);
         if self.transport.read().await.is_none() {
-            return Ok(false); // offline
+            // Offline (no transport yet - e.g. Tor still bootstrapping). This
+            // is a failure to update, not "already current": reporting success
+            // here is what let the Update button claim it worked seconds after
+            // a restart, before any transport existed.
+            return Err("no transport yet (still connecting)".into());
         }
-        // Reliable tracker-seeds first, then registry peers - a bumped
-        // content.json is fetched from a known seed instead of hoping the
-        // registry selection lands on one that has the new version.
+        // The xite's own registry peers first, then tracker seeds (see
+        // `fetch_candidate_peers`): the peers that announced this xite are the
+        // ones holding its new version. Leading with trackers meant a resync
+        // spent its whole candidate list on nodes that answered "no such
+        // content.json" and never reached the actual seeder, so an updated
+        // xite kept serving the stale copy while reporting "Updated".
         let peers = self.fetch_candidate_peers(address, 10).await;
         if peers.is_empty() {
-            return Ok(false);
+            return Err("no known peers to ask".into());
         }
         let view = self.xite_view(address).await?;
         // Never resync a local working copy: a stored content.json that does
@@ -4664,9 +4727,15 @@ impl AppState {
                 view.storage.clone(),
             );
             if !probe.load_content().unwrap_or(false) {
-                return Ok(false);
+                return Err("local content.json does not verify for this address".into());
             }
         }
+        // Did any peer serve us a parseable content.json this pass? A resync
+        // that reached NOBODY is a failure to report, not a quiet "you are up
+        // to date" - the dashboard's Update button showed success while every
+        // peer was unreachable (a seeder whose onion descriptor is still
+        // republishing after a restart is exactly this case, for 1-3 minutes).
+        let mut answered = false;
         let local_modified = view
             .content
             .as_ref()
@@ -4760,8 +4829,13 @@ impl AppState {
                 vec![(peer.clone(), epix_worker::PeerOutcome::ConnectOk)],
             )
             .await;
+            answered = true;
             if new_modified <= local_modified {
-                return Ok(false); // already current
+                // This peer has nothing newer - try the NEXT one. Returning
+                // here abandoned the whole pass on the first stale answer, so
+                // a peer lagging behind (or one still serving the previous
+                // version) hid an update that a later peer was ready to give.
+                continue;
             }
 
             // Verify the newer content.json (full signer/rules check,
@@ -4791,7 +4865,18 @@ impl AppState {
             // authoritative for resolution. A changed file with no `b3` does not
             // arrive (post-msgpack contract) and the completeness check below
             // defers the update. edx_first counts the transferred bytes itself.
-            let _ = self.edx_first(address, needed, peers, staged.as_ref(), None).await;
+            // Worker stats are primed with the batch and counted down per
+            // landed file so the dashboard pill shows "Updating: N left".
+            let total = needed.len();
+            if total > 0 {
+                self.set_worker_stats(address, total, 1, total).await;
+                self.push_site_info(address).await;
+            }
+            let on_file = self.track_update_progress(address, total);
+            let _ = self.edx_first(address, needed, peers, staged.as_ref(), on_file).await;
+            if total > 0 {
+                self.set_worker_stats(address, 0, 0, 0).await;
+            }
 
             // Commit when complete, else defer (kept pending + retried by the
             // resync tick); either way the node serves a consistent version.
@@ -4803,6 +4888,9 @@ impl AppState {
                 .finalize_root_update(&keys, &canonical, &view.storage, content, &bytes, &failed)
                 .await;
             return Ok(committed);
+        }
+        if !answered {
+            return Err("no peer could serve content.json (none reachable)".into());
         }
         Ok(false)
     }
@@ -4860,10 +4948,19 @@ impl AppState {
     /// with hundreds of dead gossip peers all at reputation 0, it often never
     /// does within a useful window.
     pub async fn fetch_candidate_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
-        let mut out = self.tracker_seed_peers().await;
+        // The xite's OWN registry peers come first: they are there because they
+        // announced holding THIS xite, so they are the only candidates known to
+        // have its files. Tracker seeds follow as a fallback - an operator node
+        // usually seeds popular xites, but it holds nothing of a freshly
+        // published one. Leading with trackers filled the (capped) dial session
+        // with peers that had no data while the one real seeder waited behind
+        // them, and every fetch then ground through its full timeout: a clone
+        // that should take seconds stalled for many minutes and then failed as
+        // "incomplete", leaving nothing on disk to serve.
+        let mut out = self.connectable_peers(address, limit).await;
         let mut seen: std::collections::HashSet<String> =
             out.iter().map(|p| p.to_string()).collect();
-        for p in self.connectable_peers(address, limit).await {
+        for p in self.tracker_seed_peers().await {
             if seen.insert(p.to_string()) {
                 out.push(p);
             }
@@ -5696,12 +5793,35 @@ impl AppState {
         // bookkeeping in edx_materialize_file). A file with no `b3`, or with no
         // fetcher installed, cannot be fetched (msgpack retired).
         match entry.get("b3") {
-            Some(_) => match self.edx_fetch_file(address, inner_path).await {
-                Some(Ok(true)) => Ok(true),
-                Some(Ok(false)) => Err(format!("EDX could not complete {inner_path}")),
-                Some(Err(e)) => Err(e),
-                None => Err("no EDX fetcher installed".into()),
-            },
+            Some(_) => {
+                // Retry a failed pass instead of surfacing the first stumble as
+                // "not found". Over Tor a multi-MB asset routinely loses its
+                // peer mid-transfer, and one incomplete swarm pass 404'd the
+                // request - the browser drew a broken image while the caller
+                // still had most of its deadline left. Partial groups persist
+                // in the store, so each attempt RESUMES rather than restarting,
+                // and the caller's timeout bounds the whole loop.
+                const ATTEMPTS: usize = 3;
+                let mut last = String::new();
+                for attempt in 0..ATTEMPTS {
+                    match self.edx_fetch_file(address, inner_path).await {
+                        Some(Ok(true)) => return Ok(true),
+                        Some(Ok(false)) => {
+                            last = format!("EDX could not complete {inner_path}")
+                        }
+                        Some(Err(e)) => last = e,
+                        // No fetcher is a permanent condition - retrying it
+                        // would just burn the caller's deadline.
+                        None => return Err("no EDX fetcher installed".into()),
+                    }
+                    if attempt + 1 < ATTEMPTS {
+                        // Let the just-scored dial outcomes settle so the next
+                        // pass draws a different (better) peer set.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+                Err(last)
+            }
             None => Err(format!("{inner_path} has no b3 and cannot be fetched")),
         }
     }
@@ -6158,6 +6278,14 @@ impl AppState {
         {
             let xites = self.xites.read().await;
             for (addr, x) in xites.iter() {
+                // Never treat an OWN xite's optional files as evictable cache:
+                // they are the authored originals, and deleting them can lose
+                // the only copy. A help-distribute xite (autodownloadoptional)
+                // promised to hold everything, so it is exempt too - and
+                // neither counts toward the cache budget.
+                if x.settings.own || x.settings.autodownloadoptional {
+                    continue;
+                }
                 let Some(files_opt) =
                     x.content.as_ref().and_then(|c| c.get("files_optional")).and_then(|f| f.as_object())
                 else {
@@ -8879,6 +9007,16 @@ impl AppState {
             }
             x.content = signed;
         }
+        // `own` must reach sites.json NOW: the offline CLI sign exits without
+        // any later flush, and a xite left `own: false` is evictable cache to
+        // enforce_optional_limit - the authored originals can be deleted.
+        self.persist_sites().await;
+        // Re-register the freshly signed files and bundles into the EDX store.
+        // Registration otherwise happens only at startup, so every re-sign on
+        // a running node published a manifest whose new objects no peer could
+        // fetch ("N file(s) not yet available" on every updater until the
+        // seeder restarts). Cheap on repeat: present objects short-circuit.
+        self.edx_register_xite(address).await;
         Ok(bytes)
     }
 
@@ -10806,7 +10944,13 @@ impl AppState {
             .iter()
             .filter(|(_, x)| x.settings.serving)
             .filter_map(|(a, x)| {
-                if x.settings.download_optional || x.settings.autodownloadoptional {
+                // Only the help-distribute toggle is a whole-site promise.
+                // `download_optional` alone is the ON-DEMAND permission - the
+                // prompt path (prompt_optional_download) enables it to fetch
+                // exactly one requested file, and enrolling it here would
+                // start a full background pull of every optional file ~30s
+                // later, defeating that and any on-demand-only setup.
+                if x.settings.autodownloadoptional && x.settings.download_optional {
                     Some((a.clone(), None))
                 } else if !x.settings.optional_help.is_empty() {
                     Some((
@@ -11059,7 +11203,15 @@ impl AppState {
             return;
         }
         self.log("INFO", format!("Resuming interrupted download of {addr}")).await;
-        let delay = (60i64 * (1i64 << fails.min(4))).min(600);
+        // A xite the user is waiting on retries briskly. The common reason a
+        // first clone fails is transient and clears within a minute or two -
+        // the seeder's onion descriptor has not finished publishing to the
+        // HSDirs yet (1-3 min after it boots), so every dial to it fails until
+        // it has. Backing off to 10 minutes meant the node then SLEPT through
+        // the seeder becoming reachable and the page sat on the loading screen
+        // long after a retry would have worked. 20s doubling to 90s keeps a
+        // dead site cheap while catching a peer that just came up.
+        let delay = (20i64 * (1i64 << fails.min(3))).min(90);
         schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
         let state = self.clone();
         let addr = addr.to_string();
@@ -11087,7 +11239,12 @@ impl AppState {
         }
         match directory {
             Some(dir) => x.settings.optional_help.contains_key(dir),
-            None => x.settings.download_optional || x.settings.autodownloadoptional,
+            // BOTH must hold. With `||`, switching off "Download optional
+            // files" left a multi-GB prefetch running because the other toggle
+            // was still set - the user turned the thing off and it kept going,
+            // with no obvious way to stop it. Either switch is now an off
+            // switch, checked between files so it takes effect immediately.
+            None => x.settings.download_optional && x.settings.autodownloadoptional,
         }
     }
 

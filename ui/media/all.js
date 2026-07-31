@@ -1264,7 +1264,7 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.toRelativeQuery = function (query) {
-      var back;
+      var back, m;
       if (query == null) {
         query = null;
       }
@@ -1277,6 +1277,11 @@ if (window.getComputedStyle(document.body).transform) {
       }
       if (query.startsWith("#")) {
         back = query;
+      } else if (query.startsWith("/")) {
+        // Site-relative path: keep the address segment, replace the rest, so
+        // a page can put itself in the address bar (refresh + direct links).
+        m = window.location.pathname.match(/^\/[^\/]+/);
+        back = (m ? m[0] : "") + query;
       } else if (query.replace("?", "")) {
         back += "?" + query.replace("?", "");
       }
@@ -1749,6 +1754,17 @@ if (window.getComputedStyle(document.body).transform) {
       var ref;
       this.log("onPageLoad");
       this.inner_loaded = true;
+      // The iframe often finishes AFTER the first siteInfo response has
+      // already been handled (with inner_loaded still false, so the screen
+      // was not hidden). Without this re-check the overlay only goes away on
+      // the next site event - typically the announce finishing seconds later -
+      // and until then it invisibly swallows every click on the page.
+      if (this.site_info && this.loading.screen_visible && this.site_info.settings &&
+          this.site_info.settings.size > 0 &&
+          this.site_info.settings.size < this.site_info.size_limit * 1024 * 1024) {
+        this.log("Inner loaded with siteInfo already in - hiding loading screen");
+        this.loading.hideScreen();
+      }
       if (!this.inner_ready) {
         this.sendInner({
           "cmd": "wrapperReady"
@@ -1915,7 +1931,20 @@ if (window.getComputedStyle(document.body).transform) {
       var ref, ref1, ref2, ref3;
       if (site_info.event != null) {
         if (site_info.event[0] === "file_added" && site_info.bad_files) {
-          this.loading.printLine(site_info.bad_files + " files needs to be downloaded");
+          // Only the required core downloads before the page loads; optional
+          // files (site_info.optional_files/size_optional) fetch on demand.
+          var fmtSize = function (bytes) {
+            if (!bytes && bytes !== 0) return "";
+            if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+            if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
+            return Math.max(1, Math.round(bytes / 1024)) + " KB";
+          };
+          var needed_line = site_info.bad_files + " files needed to load";
+          if (site_info.size_needed) needed_line = site_info.bad_files + " files (" + fmtSize(site_info.size_needed) + ") needed to load";
+          this.loading.printLine(needed_line);
+          if (site_info.optional_files) {
+            this.loading.printLine("+ " + site_info.optional_files + " optional files (" + fmtSize(site_info.size_optional) + ") download on demand");
+          }
           this.loading.setStage(2, "0 / " + site_info.bad_files + " files");
         } else if (site_info.event[0] === "file_done") {
           this.loading.printLine(site_info.event[1] + " downloaded");

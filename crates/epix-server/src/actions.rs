@@ -70,6 +70,16 @@ async fn dispatch(
             };
             let privatekey = rest.first().filter(|k| !k.is_empty()).cloned();
             let inner_path = rest.get(1).cloned().unwrap_or_else(|| "content.json".to_string());
+            // Live path first, like sitePublish: a running node must do the
+            // signing itself so its EDX store registers the new bundles - an
+            // offline sign next to a running node leaves the store on the old
+            // version and peers get "file(s) not yet available" until restart.
+            let live_params =
+                serde_json::json!({ "inner_path": inner_path, "privatekey": privatekey });
+            if admin_call(data_root, "siteSign", Some(address), live_params).await?.is_some() {
+                println!("{inner_path} signed via the running node [live]");
+                return Ok(());
+            }
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
                 return Err(format!("Site not found: {address}"));
@@ -380,7 +390,20 @@ async fn admin_call(
     let path = data_root.join("admin.sock");
     let mut stream = match tokio::net::UnixStream::connect(&path).await {
         Ok(s) => s,
-        Err(_) => return Ok(None), // node not running -> offline path
+        Err(_) => {
+            // A node whose data dir cannot host unix sockets (network share)
+            // binds in the temp dir and records where in admin.sock.path.
+            let redirected = std::fs::read_to_string(data_root.join("admin.sock.path"))
+                .ok()
+                .map(|p| p.trim().to_string());
+            match redirected {
+                Some(p) => match tokio::net::UnixStream::connect(&p).await {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None), // node not running -> offline path
+                },
+                None => return Ok(None),
+            }
+        }
     };
     let mut req_obj = serde_json::json!({ "cmd": cmd, "params": params });
     if let Some(x) = xite {

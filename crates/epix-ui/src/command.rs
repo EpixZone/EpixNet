@@ -1943,7 +1943,21 @@ impl WsCommand for SiteUpdate {
                 let state = state.clone();
                 let address = address.clone();
                 async move {
-                    let ok = state.resync_xite(&address).await.is_ok();
+                    // Report the real outcome. `is_ok()` alone was true even
+                    // when the pass reached no peer at all, so the row showed
+                    // a successful update for a resync that fetched nothing -
+                    // the "I clicked Update and it says it worked but the xite
+                    // is still stale" complaint. resync_xite now errors when
+                    // nobody answered, which surfaces here as a failed update.
+                    let ok = match state.resync_xite(&address).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            state
+                                .log("INFO", format!("Update of {address} failed: {e}"))
+                                .await;
+                            false
+                        }
+                    };
                     // Root files alone miss a user_contents site's actual data
                     // (topics and posts live in per-user files) - sync those
                     // too, like the periodic resync cycle does.
