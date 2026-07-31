@@ -4747,89 +4747,12 @@ impl AppState {
         let canonical = canonical_address(view.content.as_ref(), address);
 
         for peer in &peers {
-            // Bound each peer attempt so a slow/unresponsive peer doesn't
-            // stall the whole update; overlay peers get the longer dial
-            // deadline (a flat clearnet bound meant resync could never fetch
-            // content.json from an onion/i2p peer). The nested Option
-            // separates "dial/handshake failed" (outer None) from "connected
-            // but the fetch failed" (inner None), and `progressed` marks a
-            // handshake that succeeded before the deadline expired - so each
-            // case feeds the registry its own outcome. Without this, probe
-            // failures taught selection nothing and dead candidates were
-            // redialed every pass. A reachable-but-unserving peer gets a
-            // FileFail ONLY (reputation dock): ConnectOk would reset its
-            // error count and freshen its response time, promoting a useless
-            // peer above never-tried candidates in the selection tiebreak.
-            let progressed = AtomicBool::new(false);
-            let fetched = tokio::time::timeout(peer.connect_timeout(), async {
-                // EDX manifest channel: GetSigned over an EDX link works for any
-                // site. A live link marks `progressed` so a post-handshake
-                // failure scores the peer as alive-but-unserving, not dead.
-                match self.edx_fetch_signed(peer.clone(), &canonical, "content.json").await {
-                    // Dialed and served the bytes.
-                    Some(Ok(Some(bytes))) => {
-                        progressed.store(true, Ordering::Relaxed);
-                        Some(Some(bytes))
-                    }
-                    // Dialed but no content (alive, unserving).
-                    Some(Ok(None)) => {
-                        progressed.store(true, Ordering::Relaxed);
-                        Some(None)
-                    }
-                    // Dial/link failed, or no fetcher: unreachable.
-                    Some(Err(_)) | None => None,
-                }
-            })
-            .await;
-            let bytes = match fetched {
-                Ok(Some(Some(bytes))) => bytes,
-                // Alive but couldn't serve the file (or stalled mid-fetch):
-                // dialable, deprioritized.
-                Ok(Some(None)) => {
-                    self.log("DEBUG", format!("resync {address}: {peer} had no content.json"))
-                        .await;
-                    self.apply_peer_outcomes(
-                        address,
-                        vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
-                    )
-                    .await;
-                    continue;
-                }
-                Err(_) if progressed.load(Ordering::Relaxed) => {
-                    self.apply_peer_outcomes(
-                        address,
-                        vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
-                    )
-                    .await;
-                    continue;
-                }
-                Ok(None) | Err(_) => {
-                    self.log("DEBUG", format!("resync {address}: {peer} unreachable")).await;
-                    self.apply_peer_outcomes(
-                        address,
-                        vec![(peer.clone(), epix_worker::PeerOutcome::ConnectFail)],
-                    )
-                    .await;
-                    continue;
-                }
-            };
-            let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
-                // Answered with junk: deprioritize like a failed fetch.
-                self.apply_peer_outcomes(
-                    address,
-                    vec![(peer.clone(), epix_worker::PeerOutcome::FileFail)],
-                )
-                .await;
+            let Some((new, bytes)) = self.resync_probe_peer(address, &canonical, peer).await
+            else {
                 continue;
             };
-            let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            // Served a valid content.json: the genuine positive signal.
-            self.apply_peer_outcomes(
-                address,
-                vec![(peer.clone(), epix_worker::PeerOutcome::ConnectOk)],
-            )
-            .await;
             answered = true;
+            let new_modified = new.get("modified").and_then(|v| v.as_f64()).unwrap_or(0.0);
             if new_modified <= local_modified {
                 // This peer has nothing newer - try the NEXT one. Returning
                 // here abandoned the whole pass on the first stale answer, so
@@ -4837,62 +4760,144 @@ impl AppState {
                 // version) hid an update that a later peer was ready to give.
                 continue;
             }
-
-            // Verify the newer content.json (full signer/rules check,
-            // size-limited) and STAGE it in memory only, then sync its changed
-            // files against the staged version. The stored content.json - the
-            // completeness marker the html gate keys on - is untouched until
-            // every declared file lands, so an incomplete sync leaves the node
-            // serving the previous consistent version instead of a loading
-            // screen (the "content.json updated but files stale" hang).
-            let mut xite = Xite::new(
-                Address::parse(canonical.clone()).map_err(|e| e.to_string())?,
-                view.storage.clone(),
-            );
-            let limit = self.size_limit_bytes(address).await;
-            xite.stage_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
-
-            // EDX first: pull the changed files over one dial-once session. The
-            // staged content.json is not committed yet, so its NEW b3 is
-            // authoritative for resolution (the committed manifest is stale).
-            // EDX writes verified bytes to disk, so the worker below - which
-            // recomputes files_needed() from disk - then fetches only the
-            // files EDX could not get.
-            let needed = xite.files_needed();
-            let staged = xite.content.clone();
-            // EDX-only: pull the changed files over one dial-once session. The
-            // staged content.json is not committed yet, so its NEW b3 is
-            // authoritative for resolution. A changed file with no `b3` does not
-            // arrive (post-msgpack contract) and the completeness check below
-            // defers the update. edx_first counts the transferred bytes itself.
-            // Worker stats are primed with the batch and counted down per
-            // landed file so the dashboard pill shows "Updating: N left".
-            let total = needed.len();
-            if total > 0 {
-                self.set_worker_stats(address, total, 1, total).await;
-                self.push_site_info(address).await;
-            }
-            let on_file = self.track_update_progress(address, total);
-            let _ = self.edx_first(address, needed, peers, staged.as_ref(), on_file).await;
-            if total > 0 {
-                self.set_worker_stats(address, 0, 0, 0).await;
-            }
-
-            // Commit when complete, else defer (kept pending + retried by the
-            // resync tick); either way the node serves a consistent version.
-            let keys = self.alias_keys(&canonical, address).await;
-            let failed: Vec<String> =
-                xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
-            let Some(content) = xite.content else { return Ok(false) };
-            let committed = self
-                .finalize_root_update(&keys, &canonical, &view.storage, content, &bytes, &failed)
+            return self
+                .resync_apply_newer(address, &canonical, &view.storage, bytes, peers.clone())
                 .await;
-            return Ok(committed);
         }
         if !answered {
             return Err("no peer could serve content.json (none reachable)".into());
         }
         Ok(false)
+    }
+
+    /// One resync candidate: bounded dial, fetch content.json over EDX, score
+    /// the peer registry with the outcome. Returns the parsed content.json
+    /// with its raw bytes only when the peer served a valid one; every other
+    /// outcome returns None after scoring and the caller moves on.
+    ///
+    /// Bound each peer attempt so a slow/unresponsive peer doesn't stall the
+    /// whole update; overlay peers get the longer dial deadline (a flat
+    /// clearnet bound meant resync could never fetch content.json from an
+    /// onion/i2p peer). The nested Option separates "dial/handshake failed"
+    /// (outer None) from "connected but the fetch failed" (inner None), and
+    /// `progressed` marks a handshake that succeeded before the deadline
+    /// expired - so each case feeds the registry its own outcome. Without
+    /// this, probe failures taught selection nothing and dead candidates were
+    /// redialed every pass. A reachable-but-unserving peer gets a FileFail
+    /// ONLY (reputation dock): ConnectOk would reset its error count and
+    /// freshen its response time, promoting a useless peer above never-tried
+    /// candidates in the selection tiebreak.
+    async fn resync_probe_peer(
+        self: &Arc<Self>,
+        address: &str,
+        canonical: &str,
+        peer: &PeerAddr,
+    ) -> Option<(Value, Vec<u8>)> {
+        let score = |outcome| self.apply_peer_outcomes(address, vec![(peer.clone(), outcome)]);
+        let progressed = AtomicBool::new(false);
+        let fetched = tokio::time::timeout(peer.connect_timeout(), async {
+            // EDX manifest channel: GetSigned over an EDX link works for any
+            // site. A live link marks `progressed` so a post-handshake
+            // failure scores the peer as alive-but-unserving, not dead.
+            match self.edx_fetch_signed(peer.clone(), canonical, "content.json").await {
+                // Dialed and served the bytes.
+                Some(Ok(Some(bytes))) => {
+                    progressed.store(true, Ordering::Relaxed);
+                    Some(Some(bytes))
+                }
+                // Dialed but no content (alive, unserving).
+                Some(Ok(None)) => {
+                    progressed.store(true, Ordering::Relaxed);
+                    Some(None)
+                }
+                // Dial/link failed, or no fetcher: unreachable.
+                Some(Err(_)) | None => None,
+            }
+        })
+        .await;
+        let bytes = match fetched {
+            Ok(Some(Some(bytes))) => bytes,
+            // Alive but couldn't serve the file (or stalled mid-fetch):
+            // dialable, deprioritized.
+            Ok(Some(None)) => {
+                self.log("DEBUG", format!("resync {address}: {peer} had no content.json")).await;
+                score(epix_worker::PeerOutcome::FileFail).await;
+                return None;
+            }
+            Err(_) if progressed.load(Ordering::Relaxed) => {
+                score(epix_worker::PeerOutcome::FileFail).await;
+                return None;
+            }
+            Ok(None) | Err(_) => {
+                self.log("DEBUG", format!("resync {address}: {peer} unreachable")).await;
+                score(epix_worker::PeerOutcome::ConnectFail).await;
+                return None;
+            }
+        };
+        let Ok(new): std::result::Result<Value, _> = serde_json::from_slice(&bytes) else {
+            // Answered with junk: deprioritize like a failed fetch.
+            score(epix_worker::PeerOutcome::FileFail).await;
+            return None;
+        };
+        // Served a valid content.json: the genuine positive signal.
+        score(epix_worker::PeerOutcome::ConnectOk).await;
+        Some((new, bytes))
+    }
+
+    /// A peer served a NEWER content.json: verify it (full signer/rules
+    /// check, size-limited) and STAGE it in memory only, then sync its
+    /// changed files against the staged version. The stored content.json -
+    /// the completeness marker the html gate keys on - is untouched until
+    /// every declared file lands, so an incomplete sync leaves the node
+    /// serving the previous consistent version instead of a loading screen
+    /// (the "content.json updated but files stale" hang). Returns whether the
+    /// update was committed.
+    async fn resync_apply_newer(
+        self: &Arc<Self>,
+        address: &str,
+        canonical: &str,
+        storage: &XiteStorage,
+        bytes: Vec<u8>,
+        peers: Vec<PeerAddr>,
+    ) -> Result<bool, String> {
+        let mut xite = Xite::new(
+            Address::parse(canonical.to_string()).map_err(|e| e.to_string())?,
+            storage.clone(),
+        );
+        let limit = self.size_limit_bytes(address).await;
+        xite.stage_content_limited(&bytes, limit).map_err(|e| e.to_string())?;
+
+        // EDX-only: pull the changed files over one dial-once session. The
+        // staged content.json is not committed yet, so its NEW b3 is
+        // authoritative for resolution (the committed manifest is stale). A
+        // changed file with no `b3` does not arrive (post-msgpack contract)
+        // and the completeness check below defers the update. edx_first
+        // counts the transferred bytes itself. Worker stats are primed with
+        // the batch and counted down per landed file so the dashboard pill
+        // shows "Updating: N left".
+        let needed = xite.files_needed();
+        let staged = xite.content.clone();
+        let total = needed.len();
+        if total > 0 {
+            self.set_worker_stats(address, total, 1, total).await;
+            self.push_site_info(address).await;
+        }
+        let on_file = self.track_update_progress(address, total);
+        let _ = self.edx_first(address, needed, peers, staged.as_ref(), on_file).await;
+        if total > 0 {
+            self.set_worker_stats(address, 0, 0, 0).await;
+        }
+
+        // Commit when complete, else defer (kept pending + retried by the
+        // resync tick); either way the node serves a consistent version.
+        let keys = self.alias_keys(canonical, address).await;
+        let failed: Vec<String> =
+            xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
+        let Some(content) = xite.content else { return Ok(false) };
+        let committed = self
+            .finalize_root_update(&keys, canonical, storage, content, &bytes, &failed)
+            .await;
+        Ok(committed)
     }
 
     /// Peer counts (connected/connectable/onion/local/total) for the sidebar.
@@ -10742,9 +10747,10 @@ impl AppState {
             self.persist_sites().await;
             if on {
                 self.spawn_optional_download(address, None);
-            } else if !self.optional_fetch_allowed(address).await {
-                // Both toggles now off: the in-flight pass (if any) aborts at
-                // its next check; drop a lingering waiting panel now.
+            } else {
+                // The bulk mandate is BOTH toggles, so switching this one off
+                // withdraws it: the in-flight pass (if any) aborts at its next
+                // check; drop the lingering waiting panel now.
                 self.set_optional_progress(address, None).await;
                 self.push_site_info(address).await;
             }
@@ -10796,12 +10802,11 @@ impl AppState {
                 // Re-arm the one-per-session prompt: switching the toggle off
                 // means a later page request should get to ask again.
                 self.optional_prompts.lock().unwrap().remove(address);
-                // Withdrawn mandate: any in-flight pass aborts at its next
-                // between-files check; drop a lingering waiting panel now.
-                if !self.optional_fetch_allowed(address).await {
-                    self.set_optional_progress(address, None).await;
-                    self.push_site_info(address).await;
-                }
+                // The bulk mandate is BOTH toggles, so this withdraws it: any
+                // in-flight pass aborts at its next between-files check; drop
+                // the lingering waiting panel now.
+                self.set_optional_progress(address, None).await;
+                self.push_site_info(address).await;
             }
         }
         found
@@ -11068,51 +11073,68 @@ impl AppState {
             // Per-xite schedule: (consecutive not-done passes, next check at).
             let mut schedule: HashMap<String, (u32, i64)> = HashMap::new();
             loop {
-                // Dirty addresses bypass their delay this tick.
-                for addr in state.optional_dirty.lock().unwrap().drain() {
-                    schedule.remove(&format!("full:{addr}"));
-                    schedule.remove(&addr);
-                }
-                let flagged = state.optional_retry_flagged().await;
-                for (addr, dirs) in &flagged {
-                    state.retry_optional_candidate(addr, dirs, &mut schedule).await;
-                }
-                // The reader's global full-retention promise rides the same
-                // loop: xites without their own optional promise get the
-                // consent-gated retention pass.
-                let full_watch = state.full_retention_watch().await;
-                for addr in &full_watch {
-                    state.retry_retention_candidate(addr, &mut schedule).await;
-                }
-                // Registered xites whose CORE files never completed - an
-                // interrupted or failed clone (the seeder was offline when
-                // siteAdd/siteDownload ran) - keep resuming the clone with
-                // the same backoff, until it lands or the user deletes the
-                // xite. Without this, one failed resolve left a permanently
-                // empty registered site that only a manual re-add would heal.
-                let core_watch: Vec<String> = {
-                    let xites = state.xites.read().await;
-                    xites
-                        .iter()
-                        .filter(|(_, x)| x.settings.serving && !x.settings.own)
-                        .map(|(a, _)| a.clone())
-                        .collect()
-                };
-                for addr in &core_watch {
-                    state.retry_clone_candidate(addr, &mut schedule).await;
-                }
-                // A xite that was toggled off, paused, or deleted leaves the
-                // watched sets - drop its schedule entries.
-                schedule.retain(|k, _| match k.strip_prefix("core:") {
-                    Some(a) => core_watch.iter().any(|w| w == a),
-                    None => match k.strip_prefix("full:") {
-                        Some(a) => full_watch.iter().any(|w| w == a),
-                        None => flagged.iter().any(|(a, _)| a == k),
-                    },
-                });
+                state.optional_retry_tick(&mut schedule).await;
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
         });
+    }
+
+    /// One tick of the optional retry loop: run every watched scope through
+    /// its candidate check, then prune schedule entries whose scope left the
+    /// watched sets (toggled off, paused, or deleted).
+    async fn optional_retry_tick(self: &Arc<Self>, schedule: &mut HashMap<String, (u32, i64)>) {
+        // Dirty addresses bypass their delay this tick.
+        for addr in self.optional_dirty.lock().unwrap().drain() {
+            schedule.remove(&format!("full:{addr}"));
+            schedule.remove(&addr);
+        }
+        let flagged = self.optional_retry_flagged().await;
+        for (addr, dirs) in &flagged {
+            self.retry_optional_candidate(addr, dirs, schedule).await;
+        }
+        // The reader's global full-retention promise rides the same loop:
+        // xites without their own optional promise get the consent-gated
+        // retention pass.
+        let full_watch = self.full_retention_watch().await;
+        for addr in &full_watch {
+            self.retry_retention_candidate(addr, schedule).await;
+        }
+        // Registered xites whose CORE files never completed - an interrupted
+        // or failed clone (the seeder was offline when siteAdd/siteDownload
+        // ran) - keep resuming the clone with the same backoff, until it
+        // lands or the user deletes the xite. Without this, one failed
+        // resolve left a permanently empty registered site that only a
+        // manual re-add would heal.
+        let core_watch: Vec<String> = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(_, x)| x.settings.serving && !x.settings.own)
+                .map(|(a, _)| a.clone())
+                .collect()
+        };
+        for addr in &core_watch {
+            self.retry_clone_candidate(addr, schedule).await;
+        }
+        schedule.retain(|k, _| Self::retry_key_watched(k, &flagged, &full_watch, &core_watch));
+    }
+
+    /// Whether a schedule key still belongs to a watched scope: `core:` keys
+    /// follow the core clone watch, `full:` keys the retention watch, and
+    /// bare keys the per-xite optional promise.
+    fn retry_key_watched(
+        key: &str,
+        flagged: &[(String, Option<Vec<String>>)],
+        full_watch: &[String],
+        core_watch: &[String],
+    ) -> bool {
+        if let Some(a) = key.strip_prefix("core:") {
+            return core_watch.iter().any(|w| w == a);
+        }
+        if let Some(a) = key.strip_prefix("full:") {
+            return full_watch.iter().any(|w| w == a);
+        }
+        flagged.iter().any(|(a, _)| a == key)
     }
 
     /// One optional-scope candidate per retry tick: gate on its schedule, an
@@ -14739,8 +14761,10 @@ mod tests {
         // Phase setter without a live snapshot must not panic.
         state.set_optional_phase("1Opt", "Announcing…").await;
 
-        // The pass needs a standing mandate or it cancels immediately.
+        // The pass needs a standing mandate - BOTH toggles - or it cancels
+        // immediately.
         state.set_download_optional("1Opt", true, false).await;
+        state.set_autodownloadoptional("1Opt", true).await;
         let (fetched, failed) = state.download_optional_files("1Opt", None).await;
         assert_eq!((fetched, failed), (0, 2), "both files fail, counted once each");
         // Files are still missing and the background loop keeps chasing them,
@@ -14751,17 +14775,12 @@ mod tests {
             progress["status"].as_str().unwrap_or("").contains("retrying in background"),
             "waiting status names the background retry"
         );
-        // Withdrawing the mandate needs BOTH toggles off (the node defaults
-        // seeded autodownloadoptional on); only then does the panel clear.
+        // EITHER toggle going off withdraws the mandate: the pass is a bulk
+        // prefetch, and both switches must read as off switches for it.
         state.set_download_optional("1Opt", false, false).await;
         assert!(
-            !state.site_info("1Opt").await["optional_progress"].is_null(),
-            "help-distribute still on -> mandate stands, panel stays"
-        );
-        state.set_autodownloadoptional("1Opt", false).await;
-        assert!(
             state.site_info("1Opt").await["optional_progress"].is_null(),
-            "panel cleared when the last toggle goes off"
+            "download toggle off -> mandate gone, panel clears"
         );
     }
 
@@ -14782,8 +14801,11 @@ mod tests {
         // Toggle off (and no optionalHelp) -> not watched, even with files missing.
         assert!(state.optional_retry_flagged().await.is_empty());
 
-        // Toggle on -> watched with whole-site scope, and the scope is missing.
+        // Whole-site watching needs BOTH toggles: the prefetch mandate plus
+        // the on-demand download permission. One alone is not enough.
         state.set_download_optional("1Opt", true, false).await;
+        assert!(state.optional_retry_flagged().await.is_empty());
+        state.set_autodownloadoptional("1Opt", true).await;
         let flagged = state.optional_retry_flagged().await;
         assert_eq!(flagged, vec![("1Opt".to_string(), None)]);
         assert!(state.optional_scope_missing("1Opt", &None).await);
@@ -14802,7 +14824,8 @@ mod tests {
         storage.write("a.bin", b"12345").unwrap();
         assert!(!state.optional_scope_missing("1Opt", &None).await);
 
-        // An optionalHelp commitment (toggles off) is watched dir-scoped.
+        // An optionalHelp commitment (whole-site mandate off) is watched
+        // dir-scoped.
         state.set_download_optional("1Opt", false, false).await;
         if let Some(x) = state.xites.write().await.get_mut("1Opt") {
             x.settings.optional_help.insert("data/users/alice".into(), "1".into());
@@ -14821,7 +14844,9 @@ mod tests {
             "files_optional": { "a.bin": { "size": 5, "sha512": "aa" } },
         });
 
-        // Defaults untouched -> both toggles ON for a fresh xite.
+        // Defaults untouched -> download on demand yes, bulk prefetch NO.
+        // Prefetch defaulting on meant opening a multi-GB xite silently
+        // pulled its whole optional set.
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
         state
@@ -14834,14 +14859,14 @@ mod tests {
             let xites = state.xites.read().await;
             let s = &xites.get("1New").unwrap().settings;
             assert!(s.download_optional, "download on by default");
-            assert!(s.autodownloadoptional, "help-distribute on by default");
+            assert!(!s.autodownloadoptional, "prefetch off by default");
         }
         assert!(state.optional_fetch_allowed("1New").await);
 
-        // Operator turned the help-distribute default off but left download on.
+        // Operator turned the prefetch default on.
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
-        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("true")).await;
         state
             .add_xite(
                 "1New",
@@ -14852,13 +14877,14 @@ mod tests {
             let xites = state.xites.read().await;
             let s = &xites.get("1New").unwrap().settings;
             assert!(s.download_optional, "download default still on");
-            assert!(!s.autodownloadoptional, "help-distribute default honored");
+            assert!(s.autodownloadoptional, "prefetch default honored");
         }
 
-        // Help-distribute default ON implies downloading even if the download
+        // Prefetch default ON implies downloading even if the download
         // default was turned off.
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
+        state.config_set("autodownloadoptional_default", Value::from("true")).await;
         state.config_set("download_optional_default", Value::from("false")).await;
         state
             .add_xite(
@@ -14869,7 +14895,7 @@ mod tests {
         {
             let xites = state.xites.read().await;
             let s = &xites.get("1New").unwrap().settings;
-            assert!(s.download_optional, "help-distribute implies download");
+            assert!(s.download_optional, "prefetch implies download");
             assert!(s.autodownloadoptional);
         }
     }
@@ -17045,6 +17071,9 @@ mod tests {
             })
             .await;
         state.add_peers("epix1bulk", [PeerAddr::parse("1.2.3.4:26959").unwrap()]).await;
+        // The pass's mandate is BOTH toggles; prefetch no longer defaults on.
+        state.set_download_optional("epix1bulk", true, false).await;
+        state.set_autodownloadoptional("epix1bulk", true).await;
         let batches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pause_after_first = Arc::new(std::sync::Mutex::new(None));
         state

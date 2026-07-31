@@ -243,13 +243,39 @@ impl UiServer {
                     // A data dir on a network share (SMB/NFS) cannot host a
                     // unix socket; without this fallback every live CLI
                     // command (siteCmd, live sitePublish) silently dies. Bind
-                    // in the temp dir instead and leave the actual path in
+                    // under the temp dir instead and leave the actual path in
                     // admin.sock.path for the CLI to follow.
+                    //
+                    // The temp dir is shared between users, and this socket is
+                    // full node admin, so the socket goes in a private 0700
+                    // subdirectory whose ownership is proven, not assumed:
+                    // set_permissions on a directory another user owns fails,
+                    // so a squatted path is refused instead of bound next to.
                     use std::hash::{Hash, Hasher};
+                    use std::os::unix::fs::DirBuilderExt;
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     path.hash(&mut h);
-                    let fb = std::env::temp_dir()
-                        .join(format!("epix-admin-{:016x}.sock", h.finish()));
+                    let dir = std::env::temp_dir().join(format!("epix-admin-{:016x}", h.finish()));
+                    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+                    let meta = std::fs::symlink_metadata(&dir);
+                    let owned = meta.map(|m| m.is_dir()).unwrap_or(false)
+                        && std::fs::set_permissions(
+                            &dir,
+                            std::fs::Permissions::from_mode(0o700),
+                        )
+                        .is_ok();
+                    if !owned {
+                        ctx.state
+                            .log(
+                                "WARNING",
+                                format!(
+                                    "admin socket {path:?}: {e}; fallback dir {dir:?} is not a directory this user owns"
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
+                    let fb = dir.join("admin.sock");
                     let _ = std::fs::remove_file(&fb);
                     match tokio::net::UnixListener::bind(&fb) {
                         Ok(l) => {
