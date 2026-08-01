@@ -2622,6 +2622,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         address: &str,
         paths: Vec<String>,
         peers: Vec<PeerAddr>,
+        on_item: Option<epix_ui::state::EdxSignedProgress>,
     ) -> HashMap<String, Vec<u8>> {
         // Dial the peers ONCE and GetSigned every path over the reused links,
         // so a forum's N user content.json files cost N requests on live
@@ -2644,6 +2645,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
             let (conn, reg) = (p.conn.clone(), p.reg.clone());
             let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
             let address = address.to_string();
+            let on_item = on_item.clone();
             workers.spawn(async move {
                 loop {
                     let Some(path) = queue.lock().unwrap().pop() else { return };
@@ -2655,6 +2657,9 @@ impl EdxFetcher for RuntimeEdxFetcher {
                     .await
                     {
                         Ok(Ok(bytes)) => {
+                            if let Some(cb) = &on_item {
+                                cb(&path, &bytes);
+                            }
                             out.lock().unwrap().insert(path, bytes);
                         }
                         // This link could not serve it; the second pass tries
@@ -2681,6 +2686,9 @@ impl EdxFetcher for RuntimeEdxFetcher {
                 )
                 .await
                 {
+                    if let Some(cb) = &on_item {
+                        cb(&path, &bytes);
+                    }
                     out.lock().unwrap().insert(path, bytes);
                     break;
                 }
@@ -3775,6 +3783,39 @@ mod tests {
             vec!["movie.bin".to_string(), "index.html".to_string()],
             "staged policy puts first paint ahead of the default small-first ladder"
         );
+    }
+
+    /// `fetch_signed_many` reports each manifest the moment a peer serves it,
+    /// with the exact signed bytes - the hook the sync pass uses to verify
+    /// and ingest per-user content.json files mid-pass instead of after the
+    /// whole level (a dead-silent stretch over Tor). A path nobody serves
+    /// fires nothing.
+    #[tokio::test]
+    async fn a_signed_batch_reports_each_manifest_as_it_lands() {
+        let (address, cb, content, addr) = spawn_many_small_seeder(3).await;
+        let (state, _dir) = client_for(&address, &cb, &content, addr).await;
+
+        let seen: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> = Arc::default();
+        let on_item: epix_ui::state::EdxSignedProgress = {
+            let seen = seen.clone();
+            Arc::new(move |p: &str, b: &[u8]| {
+                seen.lock().unwrap().push((p.to_string(), b.to_vec()));
+            })
+        };
+        let served = state
+            .edx_fetch_signed_many(
+                &address,
+                vec!["content.json".into(), "data/users/nobody/content.json".into()],
+                vec![epix_core::PeerAddr::Ip(addr)],
+                Some(on_item),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.len(), 1, "only the path the peer holds is served");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one callback per served path, none for the unserved");
+        assert_eq!(seen[0].0, "content.json");
+        assert_eq!(seen[0].1, served["content.json"], "callback carries the served bytes");
     }
 
     /// Media seek: a range fetch pulls only the covering bytes (verified),

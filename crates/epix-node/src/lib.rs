@@ -1175,22 +1175,80 @@ async fn sync_included_content(
             // EDX-only: dial the peers once and GetSigned every child manifest
             // over the reused links. A path no peer serves stays absent and
             // falls back to the on-disk copy (if any) below.
-            let mut results = match progress {
-                Some(state) => state
-                    .edx_fetch_signed_many(address, want, peers.to_vec())
-                    .await
-                    .unwrap_or_default(),
-                None => std::collections::HashMap::new(),
-            };
-            for (path, disk) in to_fetch {
-                match results.remove(&path) {
-                    Some(bytes) => fetched.push((path, bytes, true)),
-                    // Unfetchable: fall back to the (stale) disk copy if any.
-                    None => {
-                        if let Some(d) = disk {
-                            fetched.push((path, d, false));
+            //
+            // STREAMED when a state is present: each manifest is verified,
+            // written, and ingested (firing its file_done event) the moment a
+            // peer serves it, while the rest of the level is still in flight.
+            // Waiting out the whole GetSigned pass first meant a fresh forum
+            // clone showed no page activity at all for the pass's duration -
+            // tens of seconds over Tor - before the first topic could appear.
+            let mut streamed: HashSet<String> = HashSet::new();
+            match progress {
+                Some(state) => {
+                    // Announce the pass BEFORE dialing: peers for a fresh site
+                    // take tens of seconds to dial over Tor with no other
+                    // event, and a page indicator keyed on event traffic
+                    // (EpixPost's hub bar) would take itself down mid-dial.
+                    state.push_clone_event(
+                        address,
+                        serde_json::json!(["file_added", want[0].clone()]),
+                        serde_json::json!({}),
+                    );
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+                    let on_item: epix_ui::state::EdxSignedProgress =
+                        Arc::new(move |p: &str, b: &[u8]| {
+                            let _ = tx.send((p.to_string(), b.to_vec()));
+                        });
+                    // `on_item` (the only tx) is dropped when the fetch pass
+                    // returns, which closes the channel and ends the consumer.
+                    let fetch =
+                        state.edx_fetch_signed_many(address, want, peers.to_vec(), Some(on_item));
+                    let consume = async {
+                        while let Some((path, bytes)) = rx.recv().await {
+                            if !streamed.insert(path.clone()) {
+                                continue;
+                            }
+                            let xid_map = resolve_user_signers(&xite, &path).await;
+                            match xite.add_content(&path, &bytes, &xid_map) {
+                                Ok(files) => {
+                                    arrived.push(path.clone());
+                                    // Ingest + file_done NOW (EpixNet fires
+                                    // these as each file is written): the
+                                    // event makes open pages re-query instead
+                                    // of waiting out the pass.
+                                    state.ingest_file(address, &path).await;
+                                    child_files.extend(files);
+                                    // A nested include lands in its own
+                                    // (deeper) level.
+                                    for inc in xite.child_includes(&path) {
+                                        if !seen.contains(&inc) {
+                                            pending
+                                                .entry(inc.matches('/').count())
+                                                .or_default()
+                                                .push((inc, 0.0));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    state
+                                        .log("WARNING", format!("Skipped {path}: {e}"))
+                                        .await;
+                                }
+                            }
                         }
-                    }
+                    };
+                    let _ = tokio::join!(fetch, consume);
+                }
+                None => {}
+            }
+            for (path, disk) in to_fetch {
+                if streamed.contains(&path) {
+                    continue;
+                }
+                // Unfetchable: fall back to the (stale) disk copy if any.
+                if let Some(d) = disk {
+                    fetched.push((path, d, false));
                 }
             }
         }
@@ -1225,13 +1283,40 @@ async fn sync_included_content(
         }
     }
     if let Some(state) = progress {
-        state.fetch_merge_for_changed(address, &arrived).await;
+        state.fetch_merge_for_changed(address, &arrived, &peers).await;
     }
     // Download the declared data files that aren't already present.
-    let needed: Vec<_> = child_files
+    let mut needed: Vec<_> = child_files
         .into_iter()
         .filter(|f| !xite.storage().verify(&f.inner_path, &f.sha512))
         .collect();
+    // A file declared with no `b3` was last signed before the EDX migration
+    // and can never arrive (EDX is the only transfer path). Skip it rather
+    // than count it as pending: retrying it every pass kept these sites
+    // re-dialing peers each resync tick and looking mid-sync forever.
+    if let Some(state) = progress {
+        let mut fetchable = Vec::with_capacity(needed.len());
+        let mut skipped = 0usize;
+        for f in needed {
+            if state.file_has_b3(address, &f.inner_path).await {
+                fetchable.push(f);
+            } else {
+                skipped += 1;
+            }
+        }
+        if skipped > 0 && !fetchable.is_empty() {
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "{skipped} file(s) for {address} have pre-EDX signatures (no b3) \
+                         and cannot be fetched; skipping them"
+                    ),
+                )
+                .await;
+        }
+        needed = fetchable;
+    }
     if needed.is_empty() {
         return (0, arrived);
     }
@@ -1239,6 +1324,13 @@ async fn sync_included_content(
         state
             .log("INFO", format!("Fetching {} user-content file(s) for {address}", needed.len()))
             .await;
+        // Same pre-dial marker as the manifest levels: the data-file session
+        // dials its own peers, and the silence would drop the page's bar.
+        state.push_clone_event(
+            address,
+            serde_json::json!(["file_added", needed[0].inner_path.clone()]),
+            serde_json::json!({}),
+        );
     }
     // EDX-only for the child/user data files: dial the peers ONCE and pull what
     // EDX can, ingesting each landed file so its posts appear one by one. A file

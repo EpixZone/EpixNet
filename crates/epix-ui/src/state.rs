@@ -89,12 +89,14 @@ pub trait EdxFetcher: Send + Sync {
     /// `GetSigned` each path over the reused links. Returns the paths that were
     /// served, mapped to their signed bytes; a path no peer had is simply
     /// absent. The EDX analog of the msgpack `fetch_files_raw` for manifests,
-    /// without its per-file redial.
+    /// without its per-file redial. `on_item` (if any) fires per served path
+    /// the moment it lands, before the pass finishes.
     async fn fetch_signed_many(
         &self,
         address: &str,
         paths: Vec<String>,
         peers: Vec<PeerAddr>,
+        on_item: Option<EdxSignedProgress>,
     ) -> HashMap<String, Vec<u8>>;
 
     /// Fetch just the byte range `[start, start+len)` of `inner_path` over
@@ -246,6 +248,14 @@ pub struct EdxBatch {
 /// so the loading screen can say what the download is actually pulling from
 /// (0 when the file came off local disk or a path that tracks no peer).
 pub type EdxBatchProgress = Arc<dyn Fn(&str, u64, usize) + Send + Sync>;
+
+/// Per-manifest landed callback `(inner_path, signed bytes)` for
+/// [`EdxFetcher::fetch_signed_many`]: fires the moment a peer serves one
+/// signed child content.json, so the caller can verify + ingest it (and fire
+/// its page event) while the rest of the batch is still in flight, instead of
+/// waiting out the whole pass - tens of seconds over Tor for a forum's
+/// dozen-plus per-user manifests.
+pub type EdxSignedProgress = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
 
 /// Read a file's `(b3 ObjId, size)` from a content.json `files` map, so a
 /// staged (uncommitted) update's files resolve against the NEW manifest rather
@@ -6149,6 +6159,19 @@ impl AppState {
         None
     }
 
+    /// Whether a declared file's entry carries an EDX `b3` hash. A file whose
+    /// signer last signed before the EDX migration has none - and EDX is the
+    /// only transfer path, so it can never arrive from peers. Sync passes use
+    /// this to skip such files instead of counting them as pending work
+    /// forever. An undeclared path returns true (let the fetch path produce
+    /// its own error rather than silently skipping).
+    pub async fn file_has_b3(&self, address: &str, inner_path: &str) -> bool {
+        match self.declared_entry(address, inner_path).await {
+            Some((entry, _, _)) => entry.get("b3").is_some(),
+            None => true,
+        }
+    }
+
     /// Info for one declared file - required or optional, found through the
     /// root or its governing child content.json - as a site-relative
     /// [`FileEntry`], plus whether it is optional.
@@ -8700,9 +8723,10 @@ impl AppState {
         address: &str,
         paths: Vec<String>,
         peers: Vec<PeerAddr>,
+        on_item: Option<EdxSignedProgress>,
     ) -> Option<HashMap<String, Vec<u8>>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
-        Some(fetcher.fetch_signed_many(address, paths, peers).await)
+        Some(fetcher.fetch_signed_many(address, paths, peers, on_item).await)
     }
 
     /// Batch EDX fetch via the installed fetcher (one dial-once session over
@@ -10016,7 +10040,17 @@ impl AppState {
     /// pull never brings them; without this a freshly imported user's posts
     /// wait for the next [`Self::resync_merge_files`] sweep (~5 min). Scoped to
     /// the changed dirs so a large xite doesn't re-sweep every user per pull.
-    pub async fn fetch_merge_for_changed(&self, address: &str, changed: &[String]) {
+    ///
+    /// `hint_peers` are the peers the calling pull just fetched from. On a
+    /// fresh clone the peer registry has promoted nothing to connectable yet,
+    /// so without them this returned empty-handed and the first posts a
+    /// visitor sees waited on the next anti-entropy sweep (minutes).
+    pub async fn fetch_merge_for_changed(
+        &self,
+        address: &str,
+        changed: &[String],
+        hint_peers: &[PeerAddr],
+    ) {
         // Per-user content.json is always nested (data/users/<addr>/content.json);
         // ending in "/content.json" naturally skips the root "content.json".
         let content_paths: Vec<&String> =
@@ -10024,7 +10058,15 @@ impl AppState {
         if content_paths.is_empty() || !self.is_serving(address).await {
             return;
         }
-        let peers = self.connectable_peers(address, 8).await;
+        let mut peers = self.connectable_peers(address, 8).await;
+        for p in hint_peers {
+            if peers.len() >= 8 {
+                break;
+            }
+            if !peers.contains(p) {
+                peers.push(p.clone());
+            }
+        }
         if peers.is_empty() {
             return;
         }
@@ -14380,6 +14422,7 @@ mod tests {
                 _: &str,
                 _: Vec<String>,
                 _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
             ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
@@ -14516,6 +14559,7 @@ mod tests {
                 _: &str,
                 _: Vec<String>,
                 _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
             ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
@@ -17787,6 +17831,7 @@ mod tests {
                 _: &str,
                 _: Vec<String>,
                 _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
             ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
