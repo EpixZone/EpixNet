@@ -2156,89 +2156,14 @@ impl RuntimeEdxFetcher {
         batch: &mut EdxBatch,
         now: u64,
     ) -> Vec<Res> {
-        // Unique ids, in caller order (two paths can share identical bytes ->
-        // one id). Order is the request order a peer frames its reply in, and
-        // the caller sorts by the xite's feed policy - newest user content
-        // first - so keeping it is what makes posts stream newest-first.
-        let mut ids: Vec<ObjId> = Vec::with_capacity(small.len());
-        let mut by_id: HashMap<ObjId, Vec<usize>> = HashMap::new();
-        for (i, r) in small.iter().enumerate() {
-            match by_id.entry(r.id) {
-                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(i),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(vec![i]);
-                    ids.push(r.id);
-                }
-            }
-        }
+        let (ids, by_id) = dedup_obj_ids(&small);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ObjId>();
         let fetch = async {
             // Owned by this block, so it drops when the round trips end and the
             // drain below sees the channel close.
             let tx = tx;
-            // Round 1: deal the ids round-robin over the links and pull them
-            // all at once. Interleaved, not sliced in blocks, so the head of
-            // the caller's order - the newest posts, the first-paint shell -
-            // goes out to every link immediately instead of queueing behind
-            // one peer's whole share.
-            let mut round = tokio::task::JoinSet::new();
-            for (i, peer) in session.iter().enumerate() {
-                let mine: Vec<ObjId> = ids
-                    .iter()
-                    .skip(i)
-                    .step_by(session.len())
-                    .copied()
-                    .filter(|id| !store.is_complete(*id).unwrap_or(false))
-                    .collect();
-                if mine.is_empty() {
-                    continue;
-                }
-                let (conn, reg) = (peer.conn.clone(), peer.reg.clone());
-                let (label, serving) = (peer.label.clone(), progress.serving.clone());
-                let (store, tx) = (store.clone(), tx.clone());
-                let address = address.to_string();
-                round.spawn(async move {
-                    let landed = |id: ObjId| {
-                        BatchProgress::note_peer(&serving, &label);
-                        let _ = tx.send(id);
-                    };
-                    reg.note_cmd_sent("GetMany", Some(&address));
-                    for chunk in mine.chunks(epix_edx::server::MAX_MANY_ITEMS) {
-                        let _ = tokio::time::timeout(
-                            EDX_FETCH_TIMEOUT,
-                            epix_edx::fetch::fetch_many(&conn, &store, chunk, now, Some(&landed)),
-                        )
-                        .await;
-                    }
-                });
-            }
-            while round.join_next().await.is_some() {}
-
-            // Round 2: whatever the link that drew it could not serve, asked of
-            // each link in turn - a peer that was dealt none of an object may
-            // still hold it.
-            for peer in session {
-                let want: Vec<ObjId> = ids
-                    .iter()
-                    .copied()
-                    .filter(|id| !store.is_complete(*id).unwrap_or(false))
-                    .collect();
-                if want.is_empty() {
-                    break;
-                }
-                let landed = |id: ObjId| {
-                    BatchProgress::note_peer(&progress.serving, &peer.label);
-                    let _ = tx.send(id);
-                };
-                peer.reg.note_cmd_sent("GetMany", Some(address));
-                for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
-                    let _ = tokio::time::timeout(
-                        EDX_FETCH_TIMEOUT,
-                        epix_edx::fetch::fetch_many(&peer.conn, store, chunk, now, Some(&landed)),
-                    )
-                    .await;
-                }
-            }
+            deal_get_many(session, &ids, store, address, progress, now, &tx).await;
+            sweep_get_many(session, &ids, store, address, progress, now, &tx).await;
         };
         let mut done: HashSet<usize> = HashSet::new();
         let drain = async {
@@ -2256,10 +2181,24 @@ impl RuntimeEdxFetcher {
             }
         };
         tokio::join!(fetch, drain);
-        // Anything the hook did not carry (already complete before this pass,
-        // or a materialize that failed on its first try) gets one more chance;
-        // the rest join the swarm pass, where a peer that lacked the whole
-        // object may still hold its chunks.
+        self.retry_unlanded(address, small, store, progress, batch, now, &done).await
+    }
+
+    /// Anything the landed hook did not carry (already complete before this
+    /// pass, or a materialize that failed on its first try) gets one more
+    /// chance; the rest are returned for the swarm pass, where a peer that
+    /// lacked the whole object may still hold its chunks.
+    #[allow(clippy::too_many_arguments)]
+    async fn retry_unlanded(
+        &self,
+        address: &str,
+        small: Vec<Res>,
+        store: &Arc<Store>,
+        progress: &BatchProgress,
+        batch: &mut EdxBatch,
+        now: u64,
+        done: &HashSet<usize>,
+    ) -> Vec<Res> {
         let mut lacking = Vec::new();
         for (i, r) in small.into_iter().enumerate() {
             if done.contains(&i) {
@@ -2543,6 +2482,163 @@ struct SessionPeer {
     reg: Arc<ConnHandle>,
 }
 
+/// The distinct object ids of a batch's wants, in caller order, plus the want
+/// indices each id belongs to (two paths can share identical bytes -> one id).
+///
+/// Order is the request order a peer frames its reply in, and the caller sorts
+/// by the xite's feed policy - newest user content first - so keeping it is
+/// what makes posts stream newest-first.
+fn dedup_obj_ids(small: &[Res]) -> (Vec<ObjId>, HashMap<ObjId, Vec<usize>>) {
+    let mut ids: Vec<ObjId> = Vec::with_capacity(small.len());
+    let mut by_id: HashMap<ObjId, Vec<usize>> = HashMap::new();
+    for (i, r) in small.iter().enumerate() {
+        by_id
+            .entry(r.id)
+            .or_insert_with(|| {
+                ids.push(r.id);
+                Vec::new()
+            })
+            .push(i);
+    }
+    (ids, by_id)
+}
+
+/// GetMany `ids` over one link, chunked to the wire limit. `landed` fires per
+/// object as its bytes verify into the store.
+async fn pull_many_chunks(
+    conn: &Conn,
+    store: &Arc<Store>,
+    ids: &[ObjId],
+    now: u64,
+    landed: &(dyn Fn(ObjId) + Send + Sync),
+) {
+    for chunk in ids.chunks(epix_edx::server::MAX_MANY_ITEMS) {
+        let _ = tokio::time::timeout(
+            EDX_FETCH_TIMEOUT,
+            epix_edx::fetch::fetch_many(conn, store, chunk, now, Some(landed)),
+        )
+        .await;
+    }
+}
+
+/// Round 1 of a GetMany pass: deal the ids round-robin over the links and pull
+/// them all at once. Interleaved, not sliced in blocks, so the head of the
+/// caller's order - the newest posts, the first-paint shell - goes out to every
+/// link immediately instead of queueing behind one peer's whole share.
+async fn deal_get_many(
+    session: &[SessionPeer],
+    ids: &[ObjId],
+    store: &Arc<Store>,
+    address: &str,
+    progress: &BatchProgress,
+    now: u64,
+    tx: &tokio::sync::mpsc::UnboundedSender<ObjId>,
+) {
+    let mut round = tokio::task::JoinSet::new();
+    for (i, peer) in session.iter().enumerate() {
+        let mine: Vec<ObjId> = ids
+            .iter()
+            .skip(i)
+            .step_by(session.len())
+            .copied()
+            .filter(|id| !store.is_complete(*id).unwrap_or(false))
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let (conn, reg) = (peer.conn.clone(), peer.reg.clone());
+        let (label, serving) = (peer.label.clone(), progress.serving.clone());
+        let (store, tx) = (store.clone(), tx.clone());
+        let address = address.to_string();
+        round.spawn(async move {
+            let landed = move |id: ObjId| {
+                BatchProgress::note_peer(&serving, &label);
+                let _ = tx.send(id);
+            };
+            reg.note_cmd_sent("GetMany", Some(&address));
+            pull_many_chunks(&conn, &store, &mine, now, &landed).await;
+        });
+    }
+    while round.join_next().await.is_some() {}
+}
+
+/// Round 2 of a GetMany pass: whatever the link that drew it could not serve,
+/// asked of each link in turn - a peer that was dealt none of an object may
+/// still hold it.
+async fn sweep_get_many(
+    session: &[SessionPeer],
+    ids: &[ObjId],
+    store: &Arc<Store>,
+    address: &str,
+    progress: &BatchProgress,
+    now: u64,
+    tx: &tokio::sync::mpsc::UnboundedSender<ObjId>,
+) {
+    for peer in session {
+        let want: Vec<ObjId> = ids
+            .iter()
+            .copied()
+            .filter(|id| !store.is_complete(*id).unwrap_or(false))
+            .collect();
+        if want.is_empty() {
+            break;
+        }
+        let landed = |id: ObjId| {
+            BatchProgress::note_peer(&progress.serving, &peer.label);
+            let _ = tx.send(id);
+        };
+        peer.reg.note_cmd_sent("GetMany", Some(address));
+        pull_many_chunks(&peer.conn, store, &want, now, &landed).await;
+    }
+}
+
+/// GetSigned one path over one link, firing `on_item` first when it is served
+/// so the caller can verify and ingest it mid-pass. `None` when this link could
+/// not serve it (dead, or simply does not hold it) - the caller tries another.
+async fn fetch_signed_over_link(
+    conn: &Conn,
+    reg: &ConnHandle,
+    address: &str,
+    path: &str,
+    on_item: Option<&epix_ui::state::EdxSignedProgress>,
+) -> Option<Vec<u8>> {
+    reg.note_cmd_sent("GetSigned", Some(address));
+    let Ok(Ok(bytes)) = tokio::time::timeout(
+        EDX_FETCH_TIMEOUT,
+        epix_edx::fetch::fetch_signed(conn, address, path),
+    )
+    .await
+    else {
+        return None;
+    };
+    if let Some(cb) = on_item {
+        cb(path, &bytes);
+    }
+    Some(bytes)
+}
+
+/// The paths a worker's own link could not serve, walked across the whole
+/// session as the serial loop used to do. Bounded: a path nobody holds ends the
+/// sweep rather than circling the queue.
+async fn sweep_signed_over_session(
+    session: &[SessionPeer],
+    address: &str,
+    paths: Vec<String>,
+    on_item: Option<&epix_ui::state::EdxSignedProgress>,
+    out: &Mutex<HashMap<String, Vec<u8>>>,
+) {
+    for path in paths {
+        for p in session {
+            if let Some(bytes) =
+                fetch_signed_over_link(&p.conn, &p.reg, address, &path, on_item).await
+            {
+                out.lock().unwrap().insert(path, bytes);
+                break;
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl EdxFetcher for RuntimeEdxFetcher {
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
@@ -2649,51 +2745,26 @@ impl EdxFetcher for RuntimeEdxFetcher {
             workers.spawn(async move {
                 loop {
                     let Some(path) = queue.lock().unwrap().pop() else { return };
-                    reg.note_cmd_sent("GetSigned", Some(&address));
-                    match tokio::time::timeout(
-                        EDX_FETCH_TIMEOUT,
-                        epix_edx::fetch::fetch_signed(&conn, &address, &path),
-                    )
-                    .await
+                    match fetch_signed_over_link(&conn, &reg, &address, &path, on_item.as_ref())
+                        .await
                     {
-                        Ok(Ok(bytes)) => {
-                            if let Some(cb) = &on_item {
-                                cb(&path, &bytes);
-                            }
+                        Some(bytes) => {
                             out.lock().unwrap().insert(path, bytes);
                         }
                         // This link could not serve it; the second pass tries
                         // the others. Handing it straight back to the queue
                         // risks this same worker popping it right back.
-                        _ => unserved.lock().unwrap().push(path),
+                        None => unserved.lock().unwrap().push(path),
                     }
                 }
             });
         }
         while workers.join_next().await.is_some() {}
 
-        // Second pass: whatever the link that drew it could not serve, walked
-        // across the whole session as the serial loop used to do. A short list
-        // by now - and bounded, so a path nobody holds ends the pass rather
-        // than circling the queue.
+        // Second pass over whatever the first left unserved - a short list by
+        // now.
         let leftovers = std::mem::take(&mut *unserved.lock().unwrap());
-        for path in leftovers {
-            for p in &session {
-                p.reg.note_cmd_sent("GetSigned", Some(address));
-                if let Ok(Ok(bytes)) = tokio::time::timeout(
-                    EDX_FETCH_TIMEOUT,
-                    epix_edx::fetch::fetch_signed(&p.conn, address, &path),
-                )
-                .await
-                {
-                    if let Some(cb) = &on_item {
-                        cb(&path, &bytes);
-                    }
-                    out.lock().unwrap().insert(path, bytes);
-                    break;
-                }
-            }
-        }
+        sweep_signed_over_session(&session, address, leftovers, on_item.as_ref(), &out).await;
         let served = std::mem::take(&mut *out.lock().unwrap());
         served
     }
