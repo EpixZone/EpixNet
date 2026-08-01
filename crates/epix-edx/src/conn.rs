@@ -185,6 +185,16 @@ impl Conn {
         self.shared.closed.load(Ordering::Relaxed)
     }
 
+    /// How many handles share this link. The reader and writer tasks hold
+    /// `Shared`, never `ConnInner`, so this counts `Conn` clones only: `1`
+    /// means the caller holds the last one. A pool needs this to tell a link
+    /// nobody is using (safe to forget) from one carrying a transfer right now.
+    /// Forgetting the latter frees nothing and only lets the next caller open a
+    /// second link to a peer we are already talking to.
+    pub fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     /// Send a single-response request and await its `Resp`.
     pub async fn request(&self, req: Req) -> std::io::Result<Resp> {
         let mut rx = self.request_stream(req).await?;
@@ -798,6 +808,26 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         assert!(conn.is_closed(), "the write deadline must tear a wedged link down");
+    }
+
+    /// `holders` counts live handles and nothing else. A pool leans on it to
+    /// keep a cached link that a transfer is still running over, so counting
+    /// the reader/writer tasks (which never hold a `Conn`) would make every
+    /// link look busy forever and the pool would never let one go.
+    #[tokio::test]
+    async fn holders_counts_conn_clones_only() {
+        let (a, _b) = tokio::io::duplex(4096);
+        let (conn, _incoming) = Conn::start(Box::pin(a), true);
+        assert_eq!(conn.holders(), 1, "a lone handle is the last holder");
+
+        let second = conn.clone();
+        assert_eq!(conn.holders(), 2, "a clone is another user of the same link");
+        let third = second.clone();
+        assert_eq!(conn.holders(), 3);
+
+        drop(third);
+        drop(second);
+        assert_eq!(conn.holders(), 1, "handles going away releases the link back to its owner");
     }
 
     /// The blocking senders run on spawn_blocking threads from a pool the

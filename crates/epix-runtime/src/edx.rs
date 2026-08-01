@@ -1053,18 +1053,33 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
     Some(es)
 }
 
-/// Per-peer cache of live EDX links for the short control RPCs (PEX, Kad,
-/// Announce, UpdatesSince, GetTrackers). A single DHT lookup or announce fans
-/// the same handful of contacts out many times; without reuse each redials a
-/// full Noise-XX handshake and holds an overlay stream for a whole request
-/// timeout. A pooled `Conn` is multiplexed, so concurrent control ops sharing
-/// one link are correct. The `Arc<ConnHandle>` is kept beside the `Conn` so
-/// the link's diagnostics row lives while it is pooled and so `note_cmd_sent`
-/// can annotate it; only the bulk fetch paths (which open and drain a session)
-/// still dial fresh - those are never pooled.
+/// Per-peer cache of live EDX links, shared by EVERY outbound path: the short
+/// control RPCs (PEX, Kad, Announce, UpdatesSince, GetTrackers), the signed
+/// fetch/list/push RPCs, and the bulk fetch sessions.
+///
+/// One link per peer is what the transport wants. A `Conn` is multiplexed and
+/// its writer drains the priority lane fully before the bulk one, so a control
+/// frame is written ahead of a large transfer sharing the link rather than
+/// behind it - the reason concurrent users of one link are correct rather than
+/// merely tolerable. Dialing per use instead cost a full Noise-XX handshake
+/// each time, and on Tor or I2P a whole fresh circuit: seconds of setup, load
+/// on the overlay, and a pile of duplicate rows for one peer on /Stats. The
+/// shard loop redialing every peer once per chunk is what made that visible.
+///
+/// The `Arc<ConnHandle>` is kept beside the `Conn` so the link's diagnostics
+/// row lives while it is pooled and so `note_cmd_sent` can annotate it, and the
+/// peer's handshake identity rides along because the fetch paths credit peers
+/// by node key and would otherwise have to redial to learn it.
 #[derive(Default)]
-struct ControlPool {
+struct LinkPool {
     conns: Mutex<HashMap<PeerAddr, PooledLink>>,
+    /// One dial in flight per peer. Looking the cache up and then dialing is a
+    /// check-then-act: the announce, PEX and updates loops run on their own
+    /// timers and land on the same contact together, so each would miss the
+    /// cache and open its own link - the duplicate outbound rows on /Stats, and
+    /// on Tor a fresh circuit apiece. Losers of the race wait here and take the
+    /// winner's link.
+    dialing: Mutex<HashMap<PeerAddr, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// One pooled link, plus when it was last handed out. The instant is what
@@ -1072,45 +1087,100 @@ struct ControlPool {
 /// rather than a std one so the sweep can be driven by virtual time in tests.
 struct PooledLink {
     conn: Conn,
+    identity: PeerIdentity,
     reg: Arc<ConnHandle>,
     last_used: tokio::time::Instant,
 }
 
-/// How long a pooled control link may sit unused before it is dropped. A pooled
-/// `Conn` keeps its socket open, so an entry nobody touches makes this node the
-/// peer that never sends FIN: the far end's own idle reaper cannot free its
-/// socket either, and both sides carry a permanent diagnostics row. Short
-/// control RPCs are seconds apart when active, so re-dialing after a quiet
-/// stretch costs one handshake.
-const CONTROL_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+/// What a pooled dial hands back: the multiplexed link, who the peer proved to
+/// be, and the link's row in the diagnostics registry.
+type Link = (Conn, PeerIdentity, Arc<ConnHandle>);
 
-impl ControlPool {
+/// How long a pooled link with no other user may sit unused before it is
+/// dropped. A pooled `Conn` keeps its socket open, so an entry nobody touches
+/// makes this node the peer that never sends FIN: the far end's own idle reaper
+/// cannot free its socket either, and both sides carry a permanent diagnostics
+/// row. Short RPCs are seconds apart when active, so re-dialing after a quiet
+/// stretch costs one handshake.
+const LINK_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl LinkPool {
     /// A live pooled link for `peer`, or None. A closed one is dropped so the
     /// caller redials (reuse-if-not-closed-else-redial, like `epix_edx::Pool`).
     /// Every call also sweeps links that have gone idle, which is what keeps the
     /// pool from pinning sockets (and their Stats rows) open forever.
-    fn live(&self, peer: &PeerAddr) -> Option<(Conn, Arc<ConnHandle>)> {
-        let mut map = self.conns.lock().expect("control pool");
+    ///
+    /// A link someone else still holds is NEVER swept, however long since the
+    /// pool last handed it out: a bulk session can transfer for many minutes
+    /// without asking the pool for anything, and forgetting its link frees
+    /// nothing (the session's own handle keeps the socket) while letting the
+    /// next caller dial a second link to a peer we are mid-transfer with.
+    fn live(&self, peer: &PeerAddr) -> Option<Link> {
+        let mut map = self.conns.lock().expect("link pool");
         let now = tokio::time::Instant::now();
         map.retain(|_, l| {
-            !l.conn.is_closed() && now.saturating_duration_since(l.last_used) < CONTROL_POOL_IDLE
+            !l.conn.is_closed()
+                && (l.conn.holders() > 1
+                    || now.saturating_duration_since(l.last_used) < LINK_POOL_IDLE)
         });
         let link = map.get_mut(peer)?;
         link.last_used = now;
-        Some((link.conn.clone(), link.reg.clone()))
+        Some((link.conn.clone(), link.identity.clone(), link.reg.clone()))
     }
 
-    fn store(&self, peer: PeerAddr, conn: Conn, reg: Arc<ConnHandle>) {
-        self.conns
-            .lock()
-            .expect("control pool")
-            .insert(peer, PooledLink { conn, reg, last_used: tokio::time::Instant::now() });
+    fn store(&self, peer: PeerAddr, conn: Conn, identity: PeerIdentity, reg: Arc<ConnHandle>) {
+        self.conns.lock().expect("link pool").insert(
+            peer,
+            PooledLink { conn, identity, reg, last_used: tokio::time::Instant::now() },
+        );
     }
 
-    /// Drop a peer's cached link (a control op errored on it, so a possibly
-    /// dead link is not handed to the next caller).
+    /// Drop a peer's cached link (an op errored on it, so a possibly dead link
+    /// is not handed to the next caller).
     fn evict(&self, peer: &PeerAddr) {
-        self.conns.lock().expect("control pool").remove(peer);
+        self.conns.lock().expect("link pool").remove(peer);
+    }
+
+    /// A pooled link for `peer`, opening at most one even when callers race.
+    /// Whoever takes the gate dials; the rest wait and use what it cached. A
+    /// dial that fails is not retried by the waiters - piling a second handshake
+    /// onto a peer that just refused one only multiplies the timeout, and the
+    /// caller will try again on its own schedule anyway.
+    ///
+    /// The gate is only ever held across `dial`, which the caller bounds by the
+    /// peer's connect timeout, so a stalled peer cannot park it indefinitely.
+    async fn get_or_dial<F, Fut>(&self, peer: &PeerAddr, dial: F) -> Result<Link, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Link, String>>,
+    {
+        if let Some(hit) = self.live(peer) {
+            return Ok(hit);
+        }
+        let gate = self.dial_gate(peer);
+        let Ok(_held) = gate.try_lock() else {
+            // Another caller is dialing this very peer. Wait it out rather than
+            // opening a second link to the same node.
+            let _queued = gate.lock().await;
+            return self.live(peer).ok_or_else(|| "dial in flight failed".to_string());
+        };
+        // The lookup above and the gate are two steps: a dial may have completed
+        // and cached between them.
+        if let Some(hit) = self.live(peer) {
+            return Ok(hit);
+        }
+        let (conn, identity, reg) = dial().await?;
+        self.store(peer.clone(), conn.clone(), identity.clone(), reg.clone());
+        Ok((conn, identity, reg))
+    }
+
+    /// This peer's dial gate, created on first use. Gates nobody is holding are
+    /// dropped as we pass through, so a long-running node does not keep one for
+    /// every peer it has ever dialed.
+    fn dial_gate(&self, peer: &PeerAddr) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.dialing.lock().expect("link pool");
+        gates.retain(|p, gate| p == peer || Arc::strong_count(gate) > 1);
+        gates.entry(peer.clone()).or_default().clone()
     }
 }
 
@@ -1131,7 +1201,7 @@ struct RuntimeEdxFetcher {
     /// is Arc-shared and cloned per session, so every clone must pool into the
     /// same cache. Built once via [`RuntimeEdxFetcher::new`] so no construction
     /// site (there are many, including tests) can forget to initialize it.
-    control_pool: Arc<ControlPool>,
+    link_pool: Arc<LinkPool>,
     /// Streaming read-ahead bookkeeping, Arc-shared like the fetcher so every
     /// clone sees the same in-flight/anchor/warmed state.
     streaming: Arc<Mutex<Streaming>>,
@@ -1188,7 +1258,7 @@ impl RuntimeEdxFetcher {
             state,
             privatekey,
             choker,
-            control_pool: Arc::default(),
+            link_pool: Arc::default(),
             streaming: Arc::default(),
             peer_cache: Arc::default(),
             claims: Arc::default(),
@@ -1281,17 +1351,20 @@ impl RuntimeEdxFetcher {
         .map_err(|_| "EDX dial timed out".to_string())?
     }
 
-    /// A live EDX link to `peer` for a control RPC, reused from the cache when
-    /// one is still open or dialed and cached otherwise. Returns the multiplexed
-    /// `Conn` plus its registry row so the caller can annotate `last cmd sent`.
-    async fn control_link(&self, peer: &PeerAddr) -> Result<(Conn, Arc<ConnHandle>), String> {
-        if let Some(hit) = self.control_pool.live(peer) {
-            return Ok(hit);
-        }
-        let transport = self.state.transport().await.ok_or("no transport")?;
-        let (conn, _identity, reg) = self.dial(&transport, peer).await?;
-        self.control_pool.store(peer.clone(), conn.clone(), reg.clone());
-        Ok((conn, reg))
+    /// A live EDX link to `peer`: the cached one when it is still open, else a
+    /// fresh dial cached for whoever asks next. THE way to reach a peer - every
+    /// outbound path goes through here so one peer means one link, and one
+    /// overlay circuit, however many things are talking to it at once.
+    ///
+    /// The transport is resolved inside the dial closure so a cache hit does not
+    /// depend on one being installed.
+    async fn link(&self, peer: &PeerAddr) -> Result<Link, String> {
+        self.link_pool
+            .get_or_dial(peer, || async {
+                let transport = self.state.transport().await.ok_or("no transport")?;
+                self.dial(&transport, peer).await
+            })
+            .await
     }
 
     /// Run ONE control-plane request over a cached (or freshly dialed) link to
@@ -1307,16 +1380,16 @@ impl RuntimeEdxFetcher {
         F: FnOnce(Conn) -> Fut,
         Fut: std::future::Future<Output = std::io::Result<T>>,
     {
-        let (conn, reg) = self.control_link(peer).await?;
+        let (conn, _identity, reg) = self.link(peer).await?;
         reg.note_cmd_sent(label, None);
         match tokio::time::timeout(EDX_FETCH_TIMEOUT, f(conn)).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => {
-                self.control_pool.evict(peer);
+                self.link_pool.evict(peer);
                 Err(e.to_string())
             }
             Err(_) => {
-                self.control_pool.evict(peer);
+                self.link_pool.evict(peer);
                 Err("EDX control request timed out".into())
             }
         }
@@ -1348,7 +1421,6 @@ impl RuntimeEdxFetcher {
         let salt = epix_blob::manifest::edx_salt(content)
             .ok_or("no edx_salt (missing viewing material)")?;
         let now = now_secs();
-        let transport = self.state.transport().await.ok_or("no transport")?;
         let peers = self.state.connectable_peers(address, 8).await;
 
         // Fetch each ciphertext shard object into the store, verified by its
@@ -1362,7 +1434,10 @@ impl RuntimeEdxFetcher {
             let mut handles: Vec<PeerHandle> = Vec::new();
             let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
             for peer in &peers {
-                let Ok((conn, identity, reg)) = self.dial(&transport, peer).await else { continue };
+                // Pooled: this loop runs once per chunk over the same peers, so
+                // dialing here meant a handshake (and an overlay circuit) per
+                // chunk per peer.
+                let Ok((conn, identity, reg)) = self.link(peer).await else { continue };
                 reg.note_cmd_sent("GetBitfield", Some(address));
                 if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
@@ -1477,7 +1552,6 @@ impl RuntimeEdxFetcher {
             return Ok(0);
         }
 
-        let transport = self.state.transport().await.ok_or("no transport")?;
         let peers = self.state.connectable_peers(address, 8).await;
         let mut held = 0usize;
         for c in want {
@@ -1486,7 +1560,7 @@ impl RuntimeEdxFetcher {
             if store.ns_bytes(Ns::Shard).map_err(|e| e.to_string())? >= quota {
                 break;
             }
-            if self.pull_shard_chunk(address, store, c, &transport, &peers, now).await? {
+            if self.pull_shard_chunk(address, store, c, &peers, now).await? {
                 held += 1;
             }
         }
@@ -1509,7 +1583,6 @@ impl RuntimeEdxFetcher {
         address: &str,
         store: &Arc<Store>,
         chunk: &epix_blob::manifest::ShardChunk,
-        transport: &Arc<dyn Transport>,
         peers: &[PeerAddr],
         now: u64,
     ) -> Result<bool, String> {
@@ -1520,7 +1593,7 @@ impl RuntimeEdxFetcher {
         // object, then stripe it in. Same swarm path as a normal fetch -
         // a shard is an ordinary content-addressed object - minus the
         // decrypt tail.
-        let (handles, node_pks) = self.dial_bitfield_handles(address, transport, peers, id).await;
+        let (handles, node_pks) = self.dial_bitfield_handles(address, peers, id).await;
         if handles.is_empty() {
             return Ok(false); // no peer holds this shard now; try the next one
         }
@@ -1552,14 +1625,13 @@ impl RuntimeEdxFetcher {
     async fn dial_bitfield_handles(
         &self,
         address: &str,
-        transport: &Arc<dyn Transport>,
         peers: &[PeerAddr],
         id: ObjId,
     ) -> (Vec<PeerHandle>, HashMap<String, Vec<u8>>) {
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for peer in peers {
-            let Ok((conn, identity, reg)) = self.dial(transport, peer).await else { continue };
+            let Ok((conn, identity, reg)) = self.link(peer).await else { continue };
             reg.note_cmd_sent("GetBitfield", Some(address));
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
@@ -1607,7 +1679,6 @@ impl RuntimeEdxFetcher {
         address: &str,
         id: ObjId,
     ) -> Result<(Vec<PeerHandle>, HashMap<String, Vec<u8>>), String> {
-        let transport = self.state.transport().await.ok_or("no transport")?;
         let peers = self.state.connectable_peers(address, 8).await;
         if peers.is_empty() {
             return Err("no peers".into());
@@ -1625,10 +1696,9 @@ impl RuntimeEdxFetcher {
                     while join.len() < SESSION_DIAL_CONCURRENCY {
                         let Some(peer) = pending.next() else { break };
                         let this = this.clone();
-                        let transport = transport.clone();
                         let address = address.clone();
                         join.spawn(async move {
-                            let Ok((conn, identity, reg)) = this.dial(&transport, &peer).await
+                            let Ok((conn, identity, reg)) = this.link(&peer).await
                             else {
                                 return (peer, false, None);
                             };
@@ -1952,13 +2022,11 @@ impl RuntimeEdxFetcher {
     /// sinks and a live one rises - without this the clone kept redialing the
     /// same unranked top-N and gave up while a reachable seeder sat lower.
     async fn open_session(&self, address: &str, peers: &[PeerAddr], cap: usize) -> Vec<SessionPeer> {
-        let Some(transport) = self.state.transport().await else { return Vec::new() };
         let mut join = tokio::task::JoinSet::new();
         for peer in peers.iter().take(cap).cloned() {
             let this = self.clone();
-            let transport = transport.clone();
             join.spawn(async move {
-                let r = this.dial(&transport, &peer).await;
+                let r = this.link(&peer).await;
                 (peer, r)
             });
         }
@@ -2365,12 +2433,11 @@ impl EdxFetcher for RuntimeEdxFetcher {
         address: &str,
         inner_path: &str,
     ) -> Result<Option<Vec<u8>>, String> {
-        let transport = self.state.transport().await.ok_or("no transport")?;
-        // Dial an EDX link and ask for the signed bytes. A dial/handshake
-        // failure is Err (peer unreachable - score ConnectFail); a live peer
-        // that simply does not serve this content answers with an error we
-        // map to Ok(None) (score FileFail), so the caller tries another peer.
-        let (conn, _identity, reg) = self.dial(&transport, &peer).await?;
+        // Take the peer's link and ask for the signed bytes. No link is Err
+        // (peer unreachable - score ConnectFail); a live peer that simply does
+        // not serve this content answers with an error we map to Ok(None)
+        // (score FileFail), so the caller tries another peer.
+        let (conn, _identity, reg) = self.link(&peer).await?;
         reg.note_cmd_sent("GetSigned", Some(address));
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
@@ -2489,10 +2556,8 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // Dial the peer as an EDX link and push the update. A dial/handshake
         // failure means the peer looks unreachable (back it off); a failure
         // after the link is up means it answered but refused (alive).
-        let transport =
-            self.state.transport().await.ok_or_else(|| EdxPushError::Unreachable("no transport".into()))?;
         let (conn, _identity, reg) =
-            self.dial(&transport, &peer).await.map_err(EdxPushError::Unreachable)?;
+            self.link(&peer).await.map_err(EdxPushError::Unreachable)?;
         reg.note_cmd_sent("Update", Some(address));
         // The link is up: from here a timeout is a slow-but-live peer, not an
         // unreachable one (the caller scores it Refused, not a backoff).
@@ -2584,8 +2649,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
     ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
         // Same split as fetch_signed: Err = unreachable (score ConnectFail),
         // Ok(None) = alive but served no list, so try another peer.
-        let transport = self.state.transport().await.ok_or("no transport")?;
-        let (conn, _identity, reg) = self.dial(&transport, &peer).await?;
+        let (conn, _identity, reg) = self.link(&peer).await?;
         reg.note_cmd_sent("ListSigned", Some(address));
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
@@ -2671,8 +2735,9 @@ impl PeerLink for WarmLink {
 #[async_trait::async_trait]
 impl LinkOpener for RuntimeEdxFetcher {
     async fn open_link(&self, peer: PeerAddr) -> Result<Arc<dyn PeerLink>, String> {
-        let transport = self.state.transport().await.ok_or("no transport")?;
-        let (conn, identity, reg) = self.dial(&transport, &peer).await?;
+        // Shares the pool: a peer the warm pool holds open is the same link a
+        // fetch or a control RPC uses, instead of a second one beside it.
+        let (conn, identity, reg) = self.link(&peer).await?;
         Ok(Arc::new(WarmLink { conn, version: identity.version, reg }))
     }
 }
@@ -4302,8 +4367,22 @@ mod tests {
         assert_eq!(row.ping_ms, Some(ms), "the ping is stamped on the row");
         assert!(row.bytes_sent > 0 && row.bytes_recv > 0, "raw link bytes counted");
 
-        // Dropping the link ends its IO tasks, which delists the row.
+        // Letting the warm handle go no longer ends the link: the pool keeps it,
+        // so the next caller to want this peer gets THIS connection instead of
+        // dialing a second one beside it (over Tor, a second circuit).
         drop(link);
+        let again = fetcher.open_link(peer.clone()).await.expect("warm link");
+        let rows: Vec<_> = epix_protocol::registry::snapshot()
+            .into_iter()
+            .filter(|s| s.addr == peer && s.peer.as_ref().is_some_and(|p| p.protocol == "edx"))
+            .collect();
+        assert_eq!(rows.len(), 1, "one peer must mean one link, not a row per caller: {rows:?}");
+        assert_eq!(rows[0].id, row.id, "the second caller reused the link rather than redialing");
+
+        // Kept, but not forever: once the pool lets go and no caller holds it,
+        // the IO tasks end and the row leaves the Stats page.
+        drop(again);
+        fetcher.link_pool.evict(&peer);
         let delisted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if !epix_protocol::registry::snapshot().iter().any(|s| s.addr == peer) {
@@ -4313,7 +4392,7 @@ mod tests {
             }
         })
         .await;
-        assert_eq!(delisted, Ok(true), "a dropped link leaves the Stats page");
+        assert_eq!(delisted, Ok(true), "a link nobody holds leaves the Stats page");
     }
 
     /// The health prober's full arc over a real socket: two peers restored
@@ -4598,6 +4677,17 @@ mod tests {
     }
 
 
+    /// A stand-in for what a handshake established. The pool only carries the
+    /// identity from dial to caller, so its contents do not matter here.
+    fn test_identity() -> PeerIdentity {
+        PeerIdentity {
+            node_pk: vec![7; 32],
+            address: String::new(),
+            caps: 0,
+            version: "test".into(),
+        }
+    }
+
     /// A pooled control link that nobody uses must be dropped, not held for the
     /// life of the process. A pooled Conn keeps its socket open, so a stale
     /// entry makes this node the peer that never sends FIN: the far end's idle
@@ -4610,22 +4700,153 @@ mod tests {
         let (reg, stream) = ConnHandle::new(Direction::Out, peer.clone()).attach(Box::pin(a));
         let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
 
-        let pool = ControlPool::default();
-        pool.store(peer.clone(), conn, reg);
+        let pool = LinkPool::default();
+        pool.store(peer.clone(), conn, test_identity(), reg);
         assert!(pool.live(&peer).is_some(), "a fresh pooled link is reused");
 
         // Still fresh: a sweep must not cut a link that is being used.
-        tokio::time::advance(CONTROL_POOL_IDLE / 2).await;
+        tokio::time::advance(LINK_POOL_IDLE / 2).await;
         assert!(pool.live(&peer).is_some(), "a link used within the window survives");
 
         // `live` above refreshed last_used, so the window restarts from there.
-        tokio::time::advance(CONTROL_POOL_IDLE + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
         assert!(pool.live(&peer).is_none(), "an idle pooled link is swept");
         assert!(
-            pool.conns.lock().expect("control pool").is_empty(),
+            pool.conns.lock().expect("link pool").is_empty(),
             "the sweep must DROP the entry, not just decline to hand it out: the Conn and the \
              Arc<ConnHandle> it holds are what keep the socket and the Stats row alive"
         );
+    }
+
+    /// A pooled control link is opened ONCE however many callers ask for it at
+    /// the same moment. The announce, PEX and updates loops fire on their own
+    /// timers and converge on the same contacts, so a plain check-then-dial let
+    /// each of them open a link to one peer: duplicate outbound rows on /Stats,
+    /// and on Tor a separate circuit for every one of them.
+    #[tokio::test]
+    async fn concurrent_control_callers_share_one_dial() {
+        let peer = PeerAddr::parse("198.51.100.12:26552").unwrap();
+        let pool = Arc::new(LinkPool::default());
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Keep the duplex's far end alive for the length of the test: dropping
+        // it closes the Conn, and a closed link is swept as dead on lookup.
+        let held = Arc::new(Mutex::new(Vec::new()));
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let (pool, dials, held, peer) =
+                (pool.clone(), dials.clone(), held.clone(), peer.clone());
+            set.spawn(async move {
+                pool.get_or_dial(&peer, || async {
+                    dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // A real dial takes a handshake; yield so the racers pile up
+                    // behind this one the way they do against a live peer.
+                    tokio::task::yield_now().await;
+                    let (a, b) = tokio::io::duplex(4096);
+                    held.lock().expect("held").push(b);
+                    let (reg, stream) =
+                        ConnHandle::new(Direction::Out, peer.clone()).attach(Box::pin(a));
+                    let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
+                    Ok((conn, test_identity(), reg))
+                })
+                .await
+                .is_ok()
+            });
+        }
+        let mut served = 0;
+        while let Some(res) = set.join_next().await {
+            if res.expect("task") {
+                served += 1;
+            }
+        }
+
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "eight concurrent control callers must share ONE dial to the peer, not open one each"
+        );
+        assert_eq!(served, 8, "every caller gets a link back");
+        assert_eq!(pool.conns.lock().expect("link pool").len(), 1, "one pooled link per peer");
+    }
+
+    /// A link someone is still transferring over must survive the idle sweep.
+    /// The pool's clock only advances when the pool is ASKED for the peer, and a
+    /// bulk session runs for minutes without asking - so an idle-only rule drops
+    /// the entry mid-transfer, frees nothing (the session still holds the
+    /// socket) and lets the next caller dial a second link to a peer we are
+    /// already talking to.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_still_in_use_survives_the_idle_sweep() {
+        let peer = PeerAddr::parse("198.51.100.14:26552").unwrap();
+        let (a, _b) = tokio::io::duplex(4096);
+        let (reg, stream) = ConnHandle::new(Direction::Out, peer.clone()).attach(Box::pin(a));
+        let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
+
+        let pool = LinkPool::default();
+        pool.store(peer.clone(), conn.clone(), test_identity(), reg);
+        // `conn` here stands in for the session's handle: the pool is not the
+        // only holder.
+        tokio::time::advance(LINK_POOL_IDLE * 3).await;
+        let hit = pool.live(&peer);
+        assert!(hit.is_some(), "a link with another holder is not swept, however long it is idle");
+        drop(hit);
+
+        // The session finishes and drops its handle. Now the pool is the last
+        // holder, so the entry is ordinary idle state and the sweep takes it.
+        drop(conn);
+        tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
+        assert!(pool.live(&peer).is_none(), "once nobody is using it, an idle link is swept");
+    }
+
+    /// A dial that fails must not be retried by everyone queued behind it: each
+    /// retry costs another connect timeout against a peer that just refused, and
+    /// the next control op will try again on its own schedule anyway.
+    #[tokio::test]
+    async fn a_failed_control_dial_is_not_retried_by_the_racers() {
+        let peer = PeerAddr::parse("198.51.100.13:26552").unwrap();
+        let pool = Arc::new(LinkPool::default());
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let (pool, dials, peer) = (pool.clone(), dials.clone(), peer.clone());
+            set.spawn(async move {
+                pool.get_or_dial(&peer, || async {
+                    dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Err::<Link, String>("unreachable".into())
+                })
+                .await
+                .is_ok()
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            assert!(!res.expect("task"), "a failed dial fails every caller");
+        }
+
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the racers must not each re-dial a peer that just failed"
+        );
+        assert!(pool.conns.lock().expect("link pool").is_empty(), "nothing cached on failure");
+    }
+
+    /// The per-peer gates are bookkeeping, not state: a node that dials a lot of
+    /// peers over its life must not keep one around for every peer it ever saw.
+    #[tokio::test]
+    async fn idle_dial_gates_do_not_accumulate() {
+        let pool = LinkPool::default();
+        for i in 0..50u8 {
+            let peer = PeerAddr::parse(&format!("198.51.100.{i}:26552")).unwrap();
+            let _ = pool
+                .get_or_dial(&peer, || async {
+                    Err::<Link, String>("unreachable".into())
+                })
+                .await;
+        }
+        let gates = pool.dialing.lock().expect("link pool").len();
+        assert!(gates <= 1, "gates for peers nobody is dialing must be dropped, found {gates}");
     }
 
     /// A push whose signed content.json did not fit one frame arrives with an
