@@ -9629,21 +9629,22 @@ impl AppState {
             .unwrap_or_else(|| epix_content::make_container(vec![]));
         let before = epix_content::records_of(&existing).len();
         let merged = epix_content::merge_orset(&existing, &incoming, signers, epix_core::now_ms());
+        // A sweep that found nothing new ends here: no write, no re-ingest,
+        // and crucially no file_done event. The anti-entropy pass re-fetches
+        // every merge file, and firing an event per no-op merge kept pages'
+        // "downloading" indicators up long after the real download ended.
+        let after = epix_content::records_of(&merged).len();
+        if after == before {
+            return;
+        }
         if let Ok(out) = serde_json::to_vec(&merged) {
             if storage.write(inner_path, &out).is_ok() {
                 self.ingest_file_from(address, inner_path, None).await;
-                // Log only when the merge actually added records, so the sweep
-                // that re-fetches every merge file each tick stays quiet when
-                // nothing changed (previously this path was fully silent, which
-                // made "imported yet?" impossible to tell from the log).
-                let after = epix_content::records_of(&merged).len();
-                if after != before {
-                    self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
-                        .await;
-                    // New records landed: re-derive the feed cache off the merge
-                    // path (a no-op unless this xite declares feeds). Read-only.
-                    self.recompute_feeds(address).await;
-                }
+                self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
+                    .await;
+                // New records landed: re-derive the feed cache off the merge
+                // path (a no-op unless this xite declares feeds). Read-only.
+                self.recompute_feeds(address).await;
             }
         }
     }
