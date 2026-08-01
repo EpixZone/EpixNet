@@ -2083,10 +2083,40 @@ impl RuntimeEdxFetcher {
         }
 
         // Swarm pass: large files, plus any small file GetMany could not land.
-        for r in remaining {
-            let complete = self
-                .fetch_one_over_session(store, r.id, r.size, session, deadline, now, progress)
-                .await;
+        //
+        // Several objects in flight at once. Each swarm stripes ONE object
+        // across the session, so taking them strictly one after another left
+        // every link idle between objects - measured on a cold clone over Tor,
+        // five large files (stylesheets, jquery, the editor and ethers bundles)
+        // took 22s of a 52s core download that way. A sliding window keeps the
+        // links busy; materializing stays on this task, which owns `batch`.
+        const LARGE_FILE_CONCURRENCY: usize = 4;
+        let session = Arc::new(session.to_vec());
+        let mut queue = remaining.into_iter();
+        let mut fetching: tokio::task::JoinSet<(Res, bool)> = tokio::task::JoinSet::new();
+        let mut spawn_next = |fetching: &mut tokio::task::JoinSet<(Res, bool)>| {
+            let Some(r) = queue.next() else { return false };
+            let this = self.clone();
+            let (store, session) = (store.clone(), session.clone());
+            let serving = progress.serving.clone();
+            fetching.spawn(async move {
+                let complete = this
+                    .fetch_one_over_session(
+                        &store, r.id, r.size, &session, deadline, now, &serving,
+                    )
+                    .await;
+                (r, complete)
+            });
+            true
+        };
+        for _ in 0..LARGE_FILE_CONCURRENCY {
+            if !spawn_next(&mut fetching) {
+                break;
+            }
+        }
+        while let Some(joined) = fetching.join_next().await {
+            spawn_next(&mut fetching);
+            let Ok((r, complete)) = joined else { continue };
             let done = complete
                 && self.materialize_into_batch(address, &r, store, progress, batch, now).await;
             if !done {
@@ -2283,7 +2313,7 @@ impl RuntimeEdxFetcher {
         session: &[SessionPeer],
         deadline: Deadline,
         now: u64,
-        progress: &BatchProgress,
+        serving: &Arc<Mutex<HashSet<String>>>,
     ) -> bool {
         if store.is_complete(id).unwrap_or(false) {
             return true;
@@ -2317,7 +2347,7 @@ impl RuntimeEdxFetcher {
         let mut swarm = Swarm::new(store.clone(), id, size);
         if let Ok(report) = swarm.fetch(&needed, &handles, deadline, now).await {
             for (label, _) in report.by_peer.iter().filter(|(_, groups)| **groups > 0) {
-                BatchProgress::note_peer(&progress.serving, label);
+                BatchProgress::note_peer(serving, label);
             }
             self.credit(&report, &node_pks, now);
         }
@@ -2499,7 +2529,10 @@ struct Res {
 }
 
 /// One peer's reused EDX link for a batch session (dialed once, borrowed by
-/// every file's swarm via a cheap `Conn` clone).
+/// every file's swarm via a cheap `Conn` clone). Clone is cheap for the same
+/// reason - it shares the one underlying stream - so a batch can hand the
+/// whole session to several concurrent object fetches.
+#[derive(Clone)]
 struct SessionPeer {
     conn: Conn,
     class: Class,
