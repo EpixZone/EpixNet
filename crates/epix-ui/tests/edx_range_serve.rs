@@ -45,6 +45,7 @@ impl EdxFetcher for RangeFetcher {
         _: &str,
         _: Vec<String>,
         _: Vec<PeerAddr>,
+        _: Option<epix_ui::state::EdxSignedProgress>,
     ) -> HashMap<String, Vec<u8>> {
         unreachable!()
     }
@@ -78,6 +79,7 @@ impl EdxFetcher for RangeFetcher {
         _: &str,
         _: Vec<EdxWant>,
         _: Vec<PeerAddr>,
+        _: Option<serde_json::Value>,
         _: Option<EdxBatchProgress>,
     ) -> EdxBatch {
         unreachable!()

@@ -455,10 +455,17 @@ pub async fn list_signed(
     }
 }
 
+/// Notified with each object id the moment its bytes verify and land in the
+/// store, so a caller can materialize and report that one file instead of
+/// waiting for the whole batch to finish. Sync (it runs on the receive path),
+/// so a handler that does real work should hand the id off rather than block.
+pub type OnObjLanded<'a> = Option<&'a (dyn Fn(ObjId) + Send + Sync)>;
+
 /// Verify and insert one GetMany frame's items. Charges every item's bytes
 /// against the reply budget (`received`/`cap`), skips ids we did not ask
 /// for, and hash-verifies each kept blob on insert. Returns how many blobs
-/// were inserted; their ids are added to `got`.
+/// were inserted; their ids are added to `got` and reported to `on_obj`.
+#[allow(clippy::too_many_arguments)]
 async fn store_many_items(
     store: &Arc<Store>,
     want: &std::collections::HashSet<ObjId>,
@@ -467,6 +474,7 @@ async fn store_many_items(
     received: &mut u64,
     cap: u64,
     got: &mut std::collections::HashSet<ObjId>,
+    on_obj: OnObjLanded<'_>,
 ) -> std::io::Result<usize> {
     let mut inserted = 0usize;
     for (id, bytes) in items {
@@ -491,6 +499,9 @@ async fn store_many_items(
         if ok.is_ok() {
             got.insert(id);
             inserted += 1;
+            if let Some(cb) = on_obj {
+                cb(id);
+            }
         }
     }
     Ok(inserted)
@@ -499,11 +510,17 @@ async fn store_many_items(
 /// Fetch many small whole blobs in one round trip; each is hash-verified
 /// on insert. Returns (inserted, missing) — missing ids simply weren't
 /// in the response (the peer doesn't have them; try elsewhere).
+///
+/// `on_obj` fires per object as it lands, mid-batch. A batch is a whole
+/// site's small files, so reporting only at the end left the loading bar at
+/// zero for the entire download and a forum's posts invisible until the last
+/// one arrived.
 pub async fn fetch_many(
     conn: &Conn,
     store: &Arc<Store>,
     objs: &[ObjId],
     now: u64,
+    on_obj: OnObjLanded<'_>,
 ) -> std::io::Result<(usize, Vec<ObjId>)> {
     let mut rx = conn.request_stream(Req::GetMany { objs: objs.to_vec() }).await?;
     // Same contract as fetch_ranges: an abandoned or timed-out GetMany must
@@ -526,9 +543,17 @@ pub async fn fetch_many(
                         "peer sent more GetMany frames than the request implies",
                     ));
                 }
-                inserted +=
-                    store_many_items(store, &want, items, now, &mut received, cap, &mut got)
-                        .await?;
+                inserted += store_many_items(
+                    store,
+                    &want,
+                    items,
+                    now,
+                    &mut received,
+                    cap,
+                    &mut got,
+                    on_obj,
+                )
+                .await?;
                 if last {
                     break;
                 }
@@ -896,7 +921,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
-        let (inserted, missing) = fetch_many(&client, &store, &[want_id], 3).await.unwrap();
+        let (inserted, missing) = fetch_many(&client, &store, &[want_id], 3, None).await.unwrap();
         assert_eq!(inserted, 1, "only the requested blob counts");
         assert!(missing.is_empty(), "the requested blob arrived");
         assert!(store.contains(want_id).unwrap(), "the requested blob landed");

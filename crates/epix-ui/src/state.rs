@@ -89,12 +89,14 @@ pub trait EdxFetcher: Send + Sync {
     /// `GetSigned` each path over the reused links. Returns the paths that were
     /// served, mapped to their signed bytes; a path no peer had is simply
     /// absent. The EDX analog of the msgpack `fetch_files_raw` for manifests,
-    /// without its per-file redial.
+    /// without its per-file redial. `on_item` (if any) fires per served path
+    /// the moment it lands, before the pass finishes.
     async fn fetch_signed_many(
         &self,
         address: &str,
         paths: Vec<String>,
         peers: Vec<PeerAddr>,
+        on_item: Option<EdxSignedProgress>,
     ) -> HashMap<String, Vec<u8>>;
 
     /// Fetch just the byte range `[start, start+len)` of `inner_path` over
@@ -138,11 +140,19 @@ pub trait EdxFetcher: Send + Sync {
     /// files landed (verified, on disk) and which EDX could not get - the
     /// exact set for the caller to hand to the msgpack worker fallback. A file
     /// with no `b3` (undeclared for EDX) comes back in `missed`.
+    ///
+    /// `staged` is a content.json that is verified but not yet committed to
+    /// disk, and it is where the shard entries and the `order_policy` tiering
+    /// are read from. A FRESH clone stages the root content.json for the whole
+    /// download (it commits only once the core set is complete), so without it
+    /// the fetcher finds nothing on disk and treats every file as untiered -
+    /// making first-paint ordering inert on exactly the load that needs it.
     async fn fetch_files(
         &self,
         address: &str,
         want: Vec<EdxWant>,
         peers: Vec<PeerAddr>,
+        staged: Option<Value>,
         on_file: Option<EdxBatchProgress>,
     ) -> EdxBatch;
 
@@ -231,9 +241,21 @@ pub struct EdxBatch {
     pub bytes: u64,
 }
 
-/// Per-file materialized callback `(inner_path, size)` - the EDX analog of the
-/// worker's progress hook, so a batch drives the same clone/ingest UI.
-pub type EdxBatchProgress = Arc<dyn Fn(&str, u64) + Send + Sync>;
+/// Per-file materialized callback `(inner_path, size, peers)` - the EDX analog
+/// of the worker's progress hook, so a batch drives the same clone/ingest UI.
+///
+/// `peers` is how many distinct peers have served bytes in this batch so far,
+/// so the loading screen can say what the download is actually pulling from
+/// (0 when the file came off local disk or a path that tracks no peer).
+pub type EdxBatchProgress = Arc<dyn Fn(&str, u64, usize) + Send + Sync>;
+
+/// Per-manifest landed callback `(inner_path, signed bytes)` for
+/// [`EdxFetcher::fetch_signed_many`]: fires the moment a peer serves one
+/// signed child content.json, so the caller can verify + ingest it (and fire
+/// its page event) while the rest of the batch is still in flight, instead of
+/// waiting out the whole pass - tens of seconds over Tor for a forum's
+/// dozen-plus per-user manifests.
+pub type EdxSignedProgress = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
 
 /// Read a file's `(b3 ObjId, size)` from a content.json `files` map, so a
 /// staged (uncommitted) update's files resolve against the NEW manifest rather
@@ -4950,7 +4972,7 @@ impl AppState {
         let state = self.clone();
         let address = address.to_string();
         let left = Arc::new(AtomicUsize::new(total));
-        Some(Arc::new(move |_inner: &str, _bytes: u64| {
+        Some(Arc::new(move |_inner: &str, _bytes: u64, _peers: usize| {
             left.fetch_sub(1, Ordering::Relaxed);
             let state = state.clone();
             let address = address.clone();
@@ -4993,7 +5015,8 @@ impl AppState {
             })
             .collect();
         let total = needed.len();
-        let Some(batch) = self.edx_fetch_files(key, want, peers, on_file).await else {
+        let Some(batch) = self.edx_fetch_files(key, want, peers, staged.cloned(), on_file).await
+        else {
             return needed; // no EDX fetcher: nothing could be fetched
         };
         if batch.bytes > 0 {
@@ -6134,6 +6157,19 @@ impl AppState {
             }
         }
         None
+    }
+
+    /// Whether a declared file's entry carries an EDX `b3` hash. A file whose
+    /// signer last signed before the EDX migration has none - and EDX is the
+    /// only transfer path, so it can never arrive from peers. Sync passes use
+    /// this to skip such files instead of counting them as pending work
+    /// forever. An undeclared path returns true (let the fetch path produce
+    /// its own error rather than silently skipping).
+    pub async fn file_has_b3(&self, address: &str, inner_path: &str) -> bool {
+        match self.declared_entry(address, inner_path).await {
+            Some((entry, _, _)) => entry.get("b3").is_some(),
+            None => true,
+        }
     }
 
     /// Info for one declared file - required or optional, found through the
@@ -8687,9 +8723,10 @@ impl AppState {
         address: &str,
         paths: Vec<String>,
         peers: Vec<PeerAddr>,
+        on_item: Option<EdxSignedProgress>,
     ) -> Option<HashMap<String, Vec<u8>>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
-        Some(fetcher.fetch_signed_many(address, paths, peers).await)
+        Some(fetcher.fetch_signed_many(address, paths, peers, on_item).await)
     }
 
     /// Batch EDX fetch via the installed fetcher (one dial-once session over
@@ -8701,10 +8738,11 @@ impl AppState {
         address: &str,
         want: Vec<EdxWant>,
         peers: Vec<PeerAddr>,
+        staged: Option<Value>,
         on_file: Option<EdxBatchProgress>,
     ) -> Option<EdxBatch> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
-        Some(fetcher.fetch_files(address, want, peers, on_file).await)
+        Some(fetcher.fetch_files(address, want, peers, staged, on_file).await)
     }
 
     /// Fetch a byte range of `inner_path` over EDX via the installed fetcher.
@@ -8952,13 +8990,12 @@ impl AppState {
             // (ingest_file); one site_info refreshes the aggregate counts.
             self.push_site_info(address).await;
         }
-        // A per-user content.json that just arrived may declare merge files
-        // (posts) - which are NOT hash-synced, so the pull above never brings
-        // them. Fetch + merge them now for the dirs that changed, so imported
-        // posts appear immediately instead of waiting for the next
-        // resync_merge_files sweep (~5 min). Runs even when bytes == 0: a dir
-        // can bring only a content.json + merge files, with no plain data file.
-        self.fetch_merge_for_changed(address, &files).await;
+        // Merge files (posts) are not hash-synced, so the pull never brings
+        // them - but it now fetches them itself, per user dir, the moment that
+        // dir's content.json verifies, so records land mid-pull instead of
+        // after it. Nothing left to do here; the periodic
+        // [`Self::resync_merge_files`] sweep remains the safety net.
+        let _ = files;
         bytes
     }
 
@@ -9592,21 +9629,22 @@ impl AppState {
             .unwrap_or_else(|| epix_content::make_container(vec![]));
         let before = epix_content::records_of(&existing).len();
         let merged = epix_content::merge_orset(&existing, &incoming, signers, epix_core::now_ms());
+        // A sweep that found nothing new ends here: no write, no re-ingest,
+        // and crucially no file_done event. The anti-entropy pass re-fetches
+        // every merge file, and firing an event per no-op merge kept pages'
+        // "downloading" indicators up long after the real download ended.
+        let after = epix_content::records_of(&merged).len();
+        if after == before {
+            return;
+        }
         if let Ok(out) = serde_json::to_vec(&merged) {
             if storage.write(inner_path, &out).is_ok() {
                 self.ingest_file_from(address, inner_path, None).await;
-                // Log only when the merge actually added records, so the sweep
-                // that re-fetches every merge file each tick stays quiet when
-                // nothing changed (previously this path was fully silent, which
-                // made "imported yet?" impossible to tell from the log).
-                let after = epix_content::records_of(&merged).len();
-                if after != before {
-                    self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
-                        .await;
-                    // New records landed: re-derive the feed cache off the merge
-                    // path (a no-op unless this xite declares feeds). Read-only.
-                    self.recompute_feeds(address).await;
-                }
+                self.log("INFO", format!("Merged records into {inner_path} ({before} -> {after})"))
+                    .await;
+                // New records landed: re-derive the feed cache off the merge
+                // path (a no-op unless this xite declares feeds). Read-only.
+                self.recompute_feeds(address).await;
             }
         }
     }
@@ -10003,7 +10041,17 @@ impl AppState {
     /// pull never brings them; without this a freshly imported user's posts
     /// wait for the next [`Self::resync_merge_files`] sweep (~5 min). Scoped to
     /// the changed dirs so a large xite doesn't re-sweep every user per pull.
-    async fn fetch_merge_for_changed(&self, address: &str, changed: &[String]) {
+    ///
+    /// `hint_peers` are the peers the calling pull just fetched from. On a
+    /// fresh clone the peer registry has promoted nothing to connectable yet,
+    /// so without them this returned empty-handed and the first posts a
+    /// visitor sees waited on the next anti-entropy sweep (minutes).
+    pub async fn fetch_merge_for_changed(
+        &self,
+        address: &str,
+        changed: &[String],
+        hint_peers: &[PeerAddr],
+    ) {
         // Per-user content.json is always nested (data/users/<addr>/content.json);
         // ending in "/content.json" naturally skips the root "content.json".
         let content_paths: Vec<&String> =
@@ -10011,7 +10059,15 @@ impl AppState {
         if content_paths.is_empty() || !self.is_serving(address).await {
             return;
         }
-        let peers = self.connectable_peers(address, 8).await;
+        let mut peers = self.connectable_peers(address, 8).await;
+        for p in hint_peers {
+            if peers.len() >= 8 {
+                break;
+            }
+            if !peers.contains(p) {
+                peers.push(p.clone());
+            }
+        }
         if peers.is_empty() {
             return;
         }
@@ -12060,7 +12116,9 @@ impl AppState {
                 .iter()
                 .map(|p| EdxWant { inner_path: p.clone(), id: None, size: None })
                 .collect();
-            let Some(batch) = self.edx_fetch_files(address, want, peers.clone(), None).await else {
+            let Some(batch) =
+                self.edx_fetch_files(address, want, peers.clone(), None, None).await
+            else {
                 return;
             };
             if batch.bytes > 0 {
@@ -14365,6 +14423,7 @@ mod tests {
                 _: &str,
                 _: Vec<String>,
                 _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
             ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
@@ -14405,6 +14464,7 @@ mod tests {
                 _: &str,
                 _: Vec<EdxWant>,
                 _: Vec<PeerAddr>,
+                _: Option<Value>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
                 unreachable!()
@@ -14500,6 +14560,7 @@ mod tests {
                 _: &str,
                 _: Vec<String>,
                 _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
             ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
@@ -14530,6 +14591,7 @@ mod tests {
                 _: &str,
                 _: Vec<EdxWant>,
                 _: Vec<PeerAddr>,
+                _: Option<Value>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
                 unreachable!()
@@ -17737,6 +17799,7 @@ mod tests {
                 address: &str,
                 want: Vec<EdxWant>,
                 _: Vec<PeerAddr>,
+                _: Option<Value>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
                 let first = {
@@ -17769,6 +17832,7 @@ mod tests {
                 _: &str,
                 _: Vec<String>,
                 _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
             ) -> HashMap<String, Vec<u8>> {
                 unreachable!()
             }
