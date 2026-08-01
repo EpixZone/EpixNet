@@ -8966,13 +8966,12 @@ impl AppState {
             // (ingest_file); one site_info refreshes the aggregate counts.
             self.push_site_info(address).await;
         }
-        // A per-user content.json that just arrived may declare merge files
-        // (posts) - which are NOT hash-synced, so the pull above never brings
-        // them. Fetch + merge them now for the dirs that changed, so imported
-        // posts appear immediately instead of waiting for the next
-        // resync_merge_files sweep (~5 min). Runs even when bytes == 0: a dir
-        // can bring only a content.json + merge files, with no plain data file.
-        self.fetch_merge_for_changed(address, &files).await;
+        // Merge files (posts) are not hash-synced, so the pull never brings
+        // them - but it now fetches them itself, per user dir, the moment that
+        // dir's content.json verifies, so records land mid-pull instead of
+        // after it. Nothing left to do here; the periodic
+        // [`Self::resync_merge_files`] sweep remains the safety net.
+        let _ = files;
         bytes
     }
 
@@ -10017,7 +10016,7 @@ impl AppState {
     /// pull never brings them; without this a freshly imported user's posts
     /// wait for the next [`Self::resync_merge_files`] sweep (~5 min). Scoped to
     /// the changed dirs so a large xite doesn't re-sweep every user per pull.
-    async fn fetch_merge_for_changed(&self, address: &str, changed: &[String]) {
+    pub async fn fetch_merge_for_changed(&self, address: &str, changed: &[String]) {
         // Per-user content.json is always nested (data/users/<addr>/content.json);
         // ending in "/content.json" naturally skips the root "content.json".
         let content_paths: Vec<&String> =

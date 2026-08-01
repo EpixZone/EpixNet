@@ -1224,6 +1224,9 @@ async fn sync_included_content(
             }
         }
     }
+    if let Some(state) = progress {
+        state.fetch_merge_for_changed(address, &arrived).await;
+    }
     // Download the declared data files that aren't already present.
     let needed: Vec<_> = child_files
         .into_iter()
@@ -1738,15 +1741,22 @@ impl OnDemand {
             // (minutes) shows a working page with an empty forum. Backfill in
             // the background right away; it is one listModified when nothing
             // is missing.
-            let state = self.state.clone();
-            let addr = address.clone();
-            let backfill = bytes == 0 && user_files.is_empty();
-            tokio::spawn(async move {
-                if backfill {
-                    state.sync_user_content(&addr).await;
-                }
-                state.resync_merge_files_for(&addr).await;
-            });
+            //
+            // Only when the clone brought NO user content: one that did has
+            // already pulled those dirs' merge files inline, newest-first as
+            // each verified, and repeating the sweep here would refetch every
+            // record a second time.
+            if user_files.is_empty() {
+                let state = self.state.clone();
+                let addr = address.clone();
+                let backfill = bytes == 0;
+                tokio::spawn(async move {
+                    if backfill {
+                        state.sync_user_content(&addr).await;
+                    }
+                    state.resync_merge_files_for(&addr).await;
+                });
+            }
         }
         // The `.epix` name is display metadata on the address-keyed entry.
         if host != address {
