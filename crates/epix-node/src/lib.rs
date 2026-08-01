@@ -1738,13 +1738,15 @@ impl OnDemand {
             // (minutes) shows a working page with an empty forum. Backfill in
             // the background right away; it is one listModified when nothing
             // is missing.
-            if bytes == 0 && user_files.is_empty() {
-                let state = self.state.clone();
-                let address = address.clone();
-                tokio::spawn(async move {
-                    state.sync_user_content(&address).await;
-                });
-            }
+            let state = self.state.clone();
+            let addr = address.clone();
+            let backfill = bytes == 0 && user_files.is_empty();
+            tokio::spawn(async move {
+                if backfill {
+                    state.sync_user_content(&addr).await;
+                }
+                state.resync_merge_files_for(&addr).await;
+            });
         }
         // The `.epix` name is display metadata on the address-keyed entry.
         if host != address {
