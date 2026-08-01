@@ -2064,7 +2064,7 @@ impl RuntimeEdxFetcher {
         session: &[SessionPeer],
         files: Vec<Res>,
         deadline: Deadline,
-        on_file: &Option<EdxBatchProgress>,
+        progress: &BatchProgress,
         batch: &mut EdxBatch,
         now: u64,
     ) {
@@ -2078,16 +2078,17 @@ impl RuntimeEdxFetcher {
             files.into_iter().partition(|r| r.size > 0 && r.size <= cap);
         if !small.is_empty() {
             let lacking =
-                self.get_many_pass(address, store, session, small, on_file, batch, now).await;
+                self.get_many_pass(address, store, session, small, progress, batch, now).await;
             remaining.extend(lacking);
         }
 
         // Swarm pass: large files, plus any small file GetMany could not land.
         for r in remaining {
-            let complete =
-                self.fetch_one_over_session(store, r.id, r.size, session, deadline, now).await;
+            let complete = self
+                .fetch_one_over_session(store, r.id, r.size, session, deadline, now, progress)
+                .await;
             let done = complete
-                && self.materialize_into_batch(address, &r, store, on_file, batch, now).await;
+                && self.materialize_into_batch(address, &r, store, progress, batch, now).await;
             if !done {
                 // This EDX-eligible file went to the msgpack worker (the 1b
                 // gate); counted once per distinct file across all retries.
@@ -2098,10 +2099,22 @@ impl RuntimeEdxFetcher {
     }
 
     /// Run the GetMany round trips for one tier's small files over the open
-    /// session, then materialize everything they landed. Each session peer is
-    /// asked only for the ids the store still lacks, so a later peer does no
-    /// work an earlier one already did. Returns the files the store STILL
-    /// lacks (plus any whose materialize failed), for the swarm pass.
+    /// session, materializing each file the moment its bytes land. Returns the
+    /// files the store STILL lacks (plus any whose materialize failed), for the
+    /// swarm pass.
+    ///
+    /// The ids are DEALT across the links and pulled from all of them at once,
+    /// so a batch downloads from the whole session in parallel rather than
+    /// draining one peer end to end - and the loading screen can name how many
+    /// peers it is drawing from. Whatever the link that drew it could not serve
+    /// is swept across the others afterwards.
+    ///
+    /// The materialize runs CONCURRENTLY with the round trips, fed by the
+    /// per-object hook: a GetMany batch is a whole site's small files, so
+    /// materializing only after the last one arrived left the clone's loading
+    /// bar pinned at 0 for the entire download and then jumped it to done, and
+    /// kept a forum's posts out of the db (no `file_done`, no re-query) until
+    /// the pass ended.
     #[allow(clippy::too_many_arguments)]
     async fn get_many_pass(
         &self,
@@ -2109,38 +2122,121 @@ impl RuntimeEdxFetcher {
         store: &Arc<Store>,
         session: &[SessionPeer],
         small: Vec<Res>,
-        on_file: &Option<EdxBatchProgress>,
+        progress: &BatchProgress,
         batch: &mut EdxBatch,
         now: u64,
     ) -> Vec<Res> {
-        // Unique ids only (two paths can share identical bytes -> one id).
-        let mut ids: Vec<ObjId> = small.iter().map(|r| r.id).collect();
-        ids.sort();
-        ids.dedup();
-        for peer in session {
-            let want: Vec<ObjId> = ids
-                .iter()
-                .copied()
-                .filter(|id| !store.is_complete(*id).unwrap_or(false))
-                .collect();
-            if want.is_empty() {
-                break;
-            }
-            peer.reg.note_cmd_sent("GetMany", Some(address));
-            for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
-                let _ = tokio::time::timeout(
-                    EDX_FETCH_TIMEOUT,
-                    epix_edx::fetch::fetch_many(&peer.conn, store, chunk, now),
-                )
-                .await;
+        // Unique ids, in caller order (two paths can share identical bytes ->
+        // one id). Order is the request order a peer frames its reply in, and
+        // the caller sorts by the xite's feed policy - newest user content
+        // first - so keeping it is what makes posts stream newest-first.
+        let mut ids: Vec<ObjId> = Vec::with_capacity(small.len());
+        let mut by_id: HashMap<ObjId, Vec<usize>> = HashMap::new();
+        for (i, r) in small.iter().enumerate() {
+            match by_id.entry(r.id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(i),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(vec![i]);
+                    ids.push(r.id);
+                }
             }
         }
-        // Materialize every small file the store now holds; the rest join
-        // the swarm pass (a peer that lacked it may still hold its chunks).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ObjId>();
+        let fetch = async {
+            // Owned by this block, so it drops when the round trips end and the
+            // drain below sees the channel close.
+            let tx = tx;
+            // Round 1: deal the ids round-robin over the links and pull them
+            // all at once. Interleaved, not sliced in blocks, so the head of
+            // the caller's order - the newest posts, the first-paint shell -
+            // goes out to every link immediately instead of queueing behind
+            // one peer's whole share.
+            let mut round = tokio::task::JoinSet::new();
+            for (i, peer) in session.iter().enumerate() {
+                let mine: Vec<ObjId> = ids
+                    .iter()
+                    .skip(i)
+                    .step_by(session.len())
+                    .copied()
+                    .filter(|id| !store.is_complete(*id).unwrap_or(false))
+                    .collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                let (conn, reg) = (peer.conn.clone(), peer.reg.clone());
+                let (label, serving) = (peer.label.clone(), progress.serving.clone());
+                let (store, tx) = (store.clone(), tx.clone());
+                let address = address.to_string();
+                round.spawn(async move {
+                    let landed = |id: ObjId| {
+                        BatchProgress::note_peer(&serving, &label);
+                        let _ = tx.send(id);
+                    };
+                    reg.note_cmd_sent("GetMany", Some(&address));
+                    for chunk in mine.chunks(epix_edx::server::MAX_MANY_ITEMS) {
+                        let _ = tokio::time::timeout(
+                            EDX_FETCH_TIMEOUT,
+                            epix_edx::fetch::fetch_many(&conn, &store, chunk, now, Some(&landed)),
+                        )
+                        .await;
+                    }
+                });
+            }
+            while round.join_next().await.is_some() {}
+
+            // Round 2: whatever the link that drew it could not serve, asked of
+            // each link in turn - a peer that was dealt none of an object may
+            // still hold it.
+            for peer in session {
+                let want: Vec<ObjId> = ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !store.is_complete(*id).unwrap_or(false))
+                    .collect();
+                if want.is_empty() {
+                    break;
+                }
+                let landed = |id: ObjId| {
+                    BatchProgress::note_peer(&progress.serving, &peer.label);
+                    let _ = tx.send(id);
+                };
+                peer.reg.note_cmd_sent("GetMany", Some(address));
+                for chunk in want.chunks(epix_edx::server::MAX_MANY_ITEMS) {
+                    let _ = tokio::time::timeout(
+                        EDX_FETCH_TIMEOUT,
+                        epix_edx::fetch::fetch_many(&peer.conn, store, chunk, now, Some(&landed)),
+                    )
+                    .await;
+                }
+            }
+        };
+        let mut done: HashSet<usize> = HashSet::new();
+        let drain = async {
+            while let Some(id) = rx.recv().await {
+                for i in by_id.get(&id).into_iter().flatten().copied() {
+                    if done.contains(&i)
+                        || !self
+                            .materialize_into_batch(address, &small[i], store, progress, batch, now)
+                            .await
+                    {
+                        continue;
+                    }
+                    done.insert(i);
+                }
+            }
+        };
+        tokio::join!(fetch, drain);
+        // Anything the hook did not carry (already complete before this pass,
+        // or a materialize that failed on its first try) gets one more chance;
+        // the rest join the swarm pass, where a peer that lacked the whole
+        // object may still hold its chunks.
         let mut lacking = Vec::new();
-        for r in small {
+        for (i, r) in small.into_iter().enumerate() {
+            if done.contains(&i) {
+                continue;
+            }
             if store.is_complete(r.id).unwrap_or(false)
-                && self.materialize_into_batch(address, &r, store, on_file, batch, now).await
+                && self.materialize_into_batch(address, &r, store, progress, batch, now).await
             {
                 continue;
             }
@@ -2158,7 +2254,7 @@ impl RuntimeEdxFetcher {
         address: &str,
         r: &Res,
         store: &Arc<Store>,
-        on_file: &Option<EdxBatchProgress>,
+        progress: &BatchProgress,
         batch: &mut EdxBatch,
         now: u64,
     ) -> bool {
@@ -2167,9 +2263,7 @@ impl RuntimeEdxFetcher {
             return false;
         }
         batch.bytes += bytes.len() as u64;
-        if let Some(cb) = on_file {
-            cb(&r.path, bytes.len() as u64);
-        }
+        progress.file(&r.path, bytes.len() as u64);
         batch.done.push(r.path.clone());
         true
     }
@@ -2177,6 +2271,10 @@ impl RuntimeEdxFetcher {
     /// Fetch one object over an already-open session (reused links): learn
     /// which links hold it (one bitfield request each), then stripe it with the
     /// swarm. Returns whether the object is complete in the store afterward.
+    /// Every peer the swarm actually drew groups from joins the batch's serving
+    /// set, so a big file striped across the session reports the same "from N
+    /// peers" the GetMany rounds do.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_one_over_session(
         &self,
         store: &Arc<Store>,
@@ -2185,6 +2283,7 @@ impl RuntimeEdxFetcher {
         session: &[SessionPeer],
         deadline: Deadline,
         now: u64,
+        progress: &BatchProgress,
     ) -> bool {
         if store.is_complete(id).unwrap_or(false) {
             return true;
@@ -2217,6 +2316,9 @@ impl RuntimeEdxFetcher {
         let Ok(needed) = needed_groups(store, id, size) else { return false };
         let mut swarm = Swarm::new(store.clone(), id, size);
         if let Ok(report) = swarm.fetch(&needed, &handles, deadline, now).await {
+            for (label, _) in report.by_peer.iter().filter(|(_, groups)| **groups > 0) {
+                BatchProgress::note_peer(&progress.serving, label);
+            }
             self.credit(&report, &node_pks, now);
         }
         store.is_complete(id).unwrap_or(false)
@@ -2265,14 +2367,14 @@ impl RuntimeEdxFetcher {
         address: &str,
         store: &Arc<Store>,
         plain: Vec<Res>,
-        on_file: &Option<EdxBatchProgress>,
+        progress: &BatchProgress,
         batch: &mut EdxBatch,
         now: u64,
     ) -> Vec<Res> {
         let mut pending: Vec<Res> = Vec::new();
         for r in plain {
             if store.is_complete(r.id).unwrap_or(false)
-                && self.materialize_into_batch(address, &r, store, on_file, batch, now).await
+                && self.materialize_into_batch(address, &r, store, progress, batch, now).await
             {
                 continue;
             }
@@ -2291,7 +2393,7 @@ impl RuntimeEdxFetcher {
         content: &Option<serde_json::Value>,
         paths: Vec<String>,
         store: &Arc<Store>,
-        on_file: &Option<EdxBatchProgress>,
+        progress: &BatchProgress,
         batch: &mut EdxBatch,
     ) {
         for path in paths {
@@ -2305,9 +2407,7 @@ impl RuntimeEdxFetcher {
                 None => false,
             };
             if got {
-                if let Some(cb) = on_file {
-                    cb(&path, 0);
-                }
+                progress.file(&path, 0);
                 batch.done.push(path);
             } else {
                 batch.missed.push(path);
@@ -2331,7 +2431,7 @@ impl RuntimeEdxFetcher {
         session: &[SessionPeer],
         mut pending: Vec<Res>,
         content: &Option<serde_json::Value>,
-        on_file: &Option<EdxBatchProgress>,
+        progress: &BatchProgress,
         batch: &mut EdxBatch,
         now: u64,
     ) {
@@ -2351,7 +2451,40 @@ impl RuntimeEdxFetcher {
                 FetchTier::FirstPaint => Deadline::tight(),
                 _ => Deadline::background(),
             };
-            self.fetch_tier(address, store, session, in_tier, deadline, on_file, batch, now).await;
+            self.fetch_tier(address, store, session, in_tier, deadline, progress, batch, now).await;
+        }
+    }
+}
+
+/// The progress state of one batch fetch: the caller's per-file hook plus the
+/// set of peers that have actually served bytes in it.
+///
+/// Carried as one value rather than threading the hook and the peer set
+/// separately - every stage of the batch already takes the hook, and the peer
+/// set has to ride along with it so a landed file can report how many peers
+/// the download is drawing from. Shared (`Arc` inside) because the GetMany
+/// round fans out to one task per link.
+struct BatchProgress {
+    on_file: Option<EdxBatchProgress>,
+    /// Labels of the peers that have delivered at least one object.
+    serving: Arc<Mutex<HashSet<String>>>,
+}
+
+impl BatchProgress {
+    fn new(on_file: Option<EdxBatchProgress>) -> Self {
+        Self { on_file, serving: Arc::default() }
+    }
+
+    /// Record that `label` served bytes for this batch.
+    fn note_peer(serving: &Arc<Mutex<HashSet<String>>>, label: &str) {
+        serving.lock().unwrap().insert(label.to_string());
+    }
+
+    /// Report one materialized file to the caller's hook, with the live count
+    /// of peers this batch has drawn from.
+    fn file(&self, inner_path: &str, bytes: u64) {
+        if let Some(cb) = &self.on_file {
+            cb(inner_path, bytes, self.serving.lock().unwrap().len());
         }
     }
 }
@@ -2457,15 +2590,56 @@ impl EdxFetcher for RuntimeEdxFetcher {
         paths: Vec<String>,
         peers: Vec<PeerAddr>,
     ) -> HashMap<String, Vec<u8>> {
-        let mut out = HashMap::new();
         // Dial the peers ONCE and GetSigned every path over the reused links,
         // so a forum's N user content.json files cost N requests on live
         // connections, not N dials per peer.
         let session = self.open_session(address, &peers, 8).await;
         if session.is_empty() {
-            return out;
+            return HashMap::new();
         }
-        for path in paths {
+        // First pass: one worker per live link, all pulling from a shared
+        // queue, so the requests overlap instead of running down a single link
+        // end to end. Serially, a forum's dozen-plus per-user manifests cost a
+        // full round trip each - tens of seconds over Tor, minutes when the
+        // peers at the front of the list have to time out first - and the whole
+        // level had to land before ANY of its posts could be read.
+        let queue = Arc::new(Mutex::new(paths));
+        let out = Arc::new(Mutex::new(HashMap::new()));
+        let unserved = Arc::new(Mutex::new(Vec::new()));
+        let mut workers = tokio::task::JoinSet::new();
+        for p in &session {
+            let (conn, reg) = (p.conn.clone(), p.reg.clone());
+            let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
+            let address = address.to_string();
+            workers.spawn(async move {
+                loop {
+                    let Some(path) = queue.lock().unwrap().pop() else { return };
+                    reg.note_cmd_sent("GetSigned", Some(&address));
+                    match tokio::time::timeout(
+                        EDX_FETCH_TIMEOUT,
+                        epix_edx::fetch::fetch_signed(&conn, &address, &path),
+                    )
+                    .await
+                    {
+                        Ok(Ok(bytes)) => {
+                            out.lock().unwrap().insert(path, bytes);
+                        }
+                        // This link could not serve it; the second pass tries
+                        // the others. Handing it straight back to the queue
+                        // risks this same worker popping it right back.
+                        _ => unserved.lock().unwrap().push(path),
+                    }
+                }
+            });
+        }
+        while workers.join_next().await.is_some() {}
+
+        // Second pass: whatever the link that drew it could not serve, walked
+        // across the whole session as the serial loop used to do. A short list
+        // by now - and bounded, so a path nobody holds ends the pass rather
+        // than circling the queue.
+        let leftovers = std::mem::take(&mut *unserved.lock().unwrap());
+        for path in leftovers {
             for p in &session {
                 p.reg.note_cmd_sent("GetSigned", Some(address));
                 if let Ok(Ok(bytes)) = tokio::time::timeout(
@@ -2474,12 +2648,13 @@ impl EdxFetcher for RuntimeEdxFetcher {
                 )
                 .await
                 {
-                    out.insert(path, bytes);
+                    out.lock().unwrap().insert(path, bytes);
                     break;
                 }
             }
         }
-        out
+        let served = std::mem::take(&mut *out.lock().unwrap());
+        served
     }
 
     async fn fetch_range(
@@ -2598,6 +2773,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         address: &str,
         want: Vec<EdxWant>,
         peers: Vec<PeerAddr>,
+        staged: Option<serde_json::Value>,
         on_file: Option<EdxBatchProgress>,
     ) -> EdxBatch {
         let mut batch = EdxBatch { done: Vec::new(), missed: Vec::new(), bytes: 0 };
@@ -2607,17 +2783,25 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return batch;
         };
         let now = now_secs();
-        // Read the content.json once, for shard/salt detection.
-        let content = self
-            .state
-            .read_file(address, "content.json")
-            .await
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        // The content.json this pass reads for shard/salt detection and for the
+        // order policy. The caller's staged copy wins: a fresh clone holds the
+        // verified root in memory for the whole download and commits it only at
+        // the end, so reading disk here would find nothing and drop every file
+        // into one untiered batch - first paint last.
+        let content = match staged {
+            Some(c) => Some(c),
+            None => self
+                .state
+                .read_file(address, "content.json")
+                .await
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()),
+        };
 
+        let progress = BatchProgress::new(on_file);
         let (plain, shard_paths) = self.resolve_wants(address, want, &content, &mut batch).await;
         let pending =
-            self.drain_locally_complete(address, &store, plain, &on_file, &mut batch, now).await;
-        self.fetch_shard_paths(address, &content, shard_paths, &store, &on_file, &mut batch).await;
+            self.drain_locally_complete(address, &store, plain, &progress, &mut batch, now).await;
+        self.fetch_shard_paths(address, &content, shard_paths, &store, &progress, &mut batch).await;
 
         if pending.is_empty() {
             return batch;
@@ -2635,7 +2819,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return batch;
         }
 
-        self.fetch_tiers(address, &store, &session, pending, &content, &on_file, &mut batch, now)
+        self.fetch_tiers(address, &store, &session, pending, &content, &progress, &mut batch, now)
             .await;
         let _ = store.enforce_quota(store_quota());
         batch
@@ -3245,7 +3429,7 @@ mod tests {
             EdxWant::path("not-declared.bin"), // no b3 -> must land in `missed`
         ];
         let peers = vec![epix_core::PeerAddr::Ip(addr)];
-        let batch = state_a.edx_fetch_files(&address, want, peers, None).await.unwrap();
+        let batch = state_a.edx_fetch_files(&address, want, peers, None, None).await.unwrap();
 
         assert!(batch.done.contains(&"index.html".to_string()));
         assert!(batch.done.contains(&"movie.bin".to_string()));
@@ -3306,7 +3490,7 @@ mod tests {
         let (address, cb, content, _movie, addr, _pk) = spawn_seeder().await;
         let (state, _dir) = client_for(&address, &cb, &content, addr).await;
         let peers = vec![epix_core::PeerAddr::Ip(addr)];
-        let batch = state.edx_fetch_files(&address, want(), peers.clone(), None).await.unwrap();
+        let batch = state.edx_fetch_files(&address, want(), peers.clone(), None, None).await.unwrap();
         assert_eq!(
             batch.done,
             vec!["index.html".to_string(), "movie.bin".to_string()],
@@ -3322,11 +3506,241 @@ mod tests {
         assert!(content.get("order_policy").is_some(), "policy rides inside the signed manifest");
         let (state, _dir) = client_for(&address, &cb, &content, addr).await;
         let peers = vec![epix_core::PeerAddr::Ip(addr)];
-        let batch = state.edx_fetch_files(&address, want(), peers, None).await.unwrap();
+        let batch = state.edx_fetch_files(&address, want(), peers, None, None).await.unwrap();
         assert_eq!(
             batch.done,
             vec!["movie.bin".to_string(), "index.html".to_string()],
             "first paint before the prefetch hint"
+        );
+    }
+
+    /// A seeder holding `n` small files (`post-0.json` ...), all inside the
+    /// GetMany size class, so a fetch of the lot rides one batch.
+    async fn spawn_many_small_seeder(
+        n: usize,
+    ) -> (String, Vec<u8>, serde_json::Value, std::net::SocketAddr) {
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(site_dir.path());
+        for i in 0..n {
+            storage.write(&format!("post-{i}.json"), format!("{{\"n\":{i}}}").as_bytes()).unwrap();
+        }
+        let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
+        xite.sign(&privkey, 1000.0).unwrap();
+        let content_bytes = xite.storage.read("content.json").unwrap();
+        let content: serde_json::Value = serde_json::from_slice(&content_bytes).unwrap();
+
+        let state_b = AppState::new("node-b");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        state_b.set_edx_store(store_b.clone()).await;
+        state_b
+            .add_xite(
+                &address,
+                XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None },
+            )
+            .await;
+        assert!(state_b.load_content_from_disk(&address).await);
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state_b.clone(),
+            store_b.clone(),
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            false,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (address, content_bytes, content, addr)
+    }
+
+    /// A SECOND node serving the same xite as [`spawn_many_small_seeder`]:
+    /// same files, same signed manifest, so both hold every object and either
+    /// can answer for any of them. Returns its address.
+    async fn second_seeder_for(
+        address: &str,
+        content_bytes: &[u8],
+        content: &serde_json::Value,
+    ) -> std::net::SocketAddr {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        for (path, _) in content["files"].as_object().unwrap() {
+            let i: usize = path
+                .trim_start_matches("post-")
+                .trim_end_matches(".json")
+                .parse()
+                .expect("only the seeder's post-N.json files");
+            storage.write(path, format!("{{\"n\":{i}}}").as_bytes()).unwrap();
+        }
+        storage.write("content.json", content_bytes).unwrap();
+
+        let state = AppState::new("node-c");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_dir.path()).unwrap());
+        state.set_edx_store(store.clone()).await;
+        state
+            .add_xite(address, XiteEntry { storage, content: None })
+            .await;
+        assert!(state.load_content_from_disk(address).await, "second seeder holds every object");
+        std::mem::forget(dir);
+        std::mem::forget(store_dir);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state.clone(),
+            store,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            false,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        addr
+    }
+
+    /// A GetMany batch reports each file as it lands, not once at the end.
+    /// The whole batch is one round trip, so materializing only after it
+    /// finished pinned the clone's loading bar at zero for the entire
+    /// download and kept a forum's posts out of the db until the last one
+    /// arrived. Asserted by what is ON DISK when each hook fires: the first
+    /// file is materialized while its batch-mates are still missing.
+    #[tokio::test]
+    async fn a_get_many_batch_reports_each_file_as_it_lands() {
+        const N: usize = 6;
+        let (address, cb, content, addr) = spawn_many_small_seeder(N).await;
+        let (state, dir) = client_for(&address, &cb, &content, addr).await;
+
+        // Files materialized (present on disk), and the serving-peer count, at
+        // the moment of each callback.
+        let seen: Arc<std::sync::Mutex<Vec<(String, usize, usize)>>> = Arc::default();
+        let on_file: EdxBatchProgress = {
+            let seen = seen.clone();
+            let root = dir.path().to_path_buf();
+            Arc::new(move |inner: &str, _bytes: u64, serving: usize| {
+                let on_disk =
+                    (0..N).filter(|i| root.join(format!("post-{i}.json")).exists()).count();
+                seen.lock().unwrap().push((inner.to_string(), on_disk, serving));
+            })
+        };
+        let want: Vec<EdxWant> =
+            (0..N).map(|i| EdxWant::path(format!("post-{i}.json"))).collect();
+        let batch = state
+            .edx_fetch_files(&address, want, vec![epix_core::PeerAddr::Ip(addr)], None, Some(on_file))
+            .await
+            .unwrap();
+
+        assert_eq!(batch.done.len(), N, "every file landed");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), N, "one report per file");
+        assert_eq!(seen[0].1, 1, "the first file is reported with only itself on disk");
+        // The bar climbs one file at a time all the way up.
+        for (i, (_, on_disk, serving)) in seen.iter().enumerate() {
+            assert_eq!(*on_disk, i + 1, "report {i} sees {} files on disk", i + 1);
+            assert_eq!(*serving, 1, "the one seeder is reported as the source");
+        }
+    }
+
+    /// A GetMany batch is dealt across every live link and pulled from all of
+    /// them at once, so a download draws on the whole session instead of
+    /// draining the first peer end to end - and the count it reports is the
+    /// peers actually serving, which is what the loading screen shows.
+    #[tokio::test]
+    async fn a_get_many_batch_downloads_from_every_peer_in_the_session() {
+        const N: usize = 8;
+        // Two seeders of the SAME xite: identical files, so both sign the same
+        // manifest and either can serve any object.
+        let (address, cb, content, addr_a) = spawn_many_small_seeder(N).await;
+        let addr_b = second_seeder_for(&address, &cb, &content).await;
+        let (state, _dir) = client_for(&address, &cb, &content, addr_a).await;
+
+        let peak: Arc<std::sync::Mutex<usize>> = Arc::default();
+        let on_file: EdxBatchProgress = {
+            let peak = peak.clone();
+            Arc::new(move |_inner: &str, _bytes: u64, serving: usize| {
+                let mut p = peak.lock().unwrap();
+                *p = (*p).max(serving);
+            })
+        };
+        let want: Vec<EdxWant> =
+            (0..N).map(|i| EdxWant::path(format!("post-{i}.json"))).collect();
+        let batch = state
+            .edx_fetch_files(
+                &address,
+                want,
+                vec![epix_core::PeerAddr::Ip(addr_a), epix_core::PeerAddr::Ip(addr_b)],
+                None,
+                Some(on_file),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(batch.done.len(), N, "every file landed");
+        assert_eq!(*peak.lock().unwrap(), 2, "the batch was served by BOTH peers, not just the first");
+    }
+
+    /// A fresh clone holds its verified content.json in memory (it commits
+    /// only once the core set is on disk), so the fetch pass has to take the
+    /// order policy from the caller's staged copy. Reading disk instead found
+    /// nothing and dropped every file into one untiered batch - first paint
+    /// last, on exactly the load that needs it first.
+    #[tokio::test]
+    async fn a_staged_content_json_still_drives_the_order_policy() {
+        let (address, cb, content, _movie, addr, _pk) = spawn_seeder_declaring(serde_json::json!({
+            "order_policy": { "first_paint": ["movie.bin"], "prefetch": ["index.html"] }
+        }))
+        .await;
+
+        // The client has the manifest ONLY as a staged value: nothing on disk,
+        // exactly like a clone that has not committed content.json yet.
+        let state = AppState::new("node-a");
+        let dir = tempfile::tempdir().unwrap();
+        state
+            .add_xite(
+                &address,
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) },
+            )
+            .await;
+        state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let store_dir = tempfile::tempdir().unwrap();
+        state.set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap())).await;
+        state
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
+            .await;
+        state.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+        assert!(!dir.path().join("content.json").exists(), "manifest is staged, not committed");
+        let _ = cb;
+
+        let want = vec![EdxWant::path("index.html"), EdxWant::path("movie.bin")];
+        let batch = state
+            .edx_fetch_files(
+                &address,
+                want,
+                vec![epix_core::PeerAddr::Ip(addr)],
+                Some(content.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.done,
+            vec!["movie.bin".to_string(), "index.html".to_string()],
+            "staged policy puts first paint ahead of the default small-first ladder"
         );
     }
 

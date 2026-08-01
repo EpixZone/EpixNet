@@ -78,6 +78,7 @@ impl EdxFetcher for RangeFetcher {
         _: &str,
         _: Vec<EdxWant>,
         _: Vec<PeerAddr>,
+        _: Option<serde_json::Value>,
         _: Option<EdxBatchProgress>,
     ) -> EdxBatch {
         unreachable!()

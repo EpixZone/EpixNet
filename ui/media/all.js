@@ -1949,7 +1949,11 @@ if (window.getComputedStyle(document.body).transform) {
         } else if (site_info.event[0] === "file_done") {
           this.loading.printLine(site_info.event[1] + " downloaded");
           if (site_info.started_task_num > 0 && site_info.event[1] !== "content.json") {
-            this.loading.setStage(2, (site_info.started_task_num - site_info.tasks) + " / " + site_info.started_task_num + " files - " + site_info.event[1]);
+            // peers_serving is how many peers the files are actually coming
+            // from, which is not site_info.peers (how many were discovered).
+            var serving = site_info.peers_serving || 0;
+            var from = serving > 0 ? " from " + serving + (serving === 1 ? " peer" : " peers") : "";
+            this.loading.setStage(2, (site_info.started_task_num - site_info.tasks) + " / " + site_info.started_task_num + " files" + from + " - " + site_info.event[1]);
           }
           if (site_info.event[1] === window.file_inner_path) {
             this.loading.setStage(3, "");

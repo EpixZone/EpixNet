@@ -138,11 +138,19 @@ pub trait EdxFetcher: Send + Sync {
     /// files landed (verified, on disk) and which EDX could not get - the
     /// exact set for the caller to hand to the msgpack worker fallback. A file
     /// with no `b3` (undeclared for EDX) comes back in `missed`.
+    ///
+    /// `staged` is a content.json that is verified but not yet committed to
+    /// disk, and it is where the shard entries and the `order_policy` tiering
+    /// are read from. A FRESH clone stages the root content.json for the whole
+    /// download (it commits only once the core set is complete), so without it
+    /// the fetcher finds nothing on disk and treats every file as untiered -
+    /// making first-paint ordering inert on exactly the load that needs it.
     async fn fetch_files(
         &self,
         address: &str,
         want: Vec<EdxWant>,
         peers: Vec<PeerAddr>,
+        staged: Option<Value>,
         on_file: Option<EdxBatchProgress>,
     ) -> EdxBatch;
 
@@ -231,9 +239,13 @@ pub struct EdxBatch {
     pub bytes: u64,
 }
 
-/// Per-file materialized callback `(inner_path, size)` - the EDX analog of the
-/// worker's progress hook, so a batch drives the same clone/ingest UI.
-pub type EdxBatchProgress = Arc<dyn Fn(&str, u64) + Send + Sync>;
+/// Per-file materialized callback `(inner_path, size, peers)` - the EDX analog
+/// of the worker's progress hook, so a batch drives the same clone/ingest UI.
+///
+/// `peers` is how many distinct peers have served bytes in this batch so far,
+/// so the loading screen can say what the download is actually pulling from
+/// (0 when the file came off local disk or a path that tracks no peer).
+pub type EdxBatchProgress = Arc<dyn Fn(&str, u64, usize) + Send + Sync>;
 
 /// Read a file's `(b3 ObjId, size)` from a content.json `files` map, so a
 /// staged (uncommitted) update's files resolve against the NEW manifest rather
@@ -4950,7 +4962,7 @@ impl AppState {
         let state = self.clone();
         let address = address.to_string();
         let left = Arc::new(AtomicUsize::new(total));
-        Some(Arc::new(move |_inner: &str, _bytes: u64| {
+        Some(Arc::new(move |_inner: &str, _bytes: u64, _peers: usize| {
             left.fetch_sub(1, Ordering::Relaxed);
             let state = state.clone();
             let address = address.clone();
@@ -4993,7 +5005,8 @@ impl AppState {
             })
             .collect();
         let total = needed.len();
-        let Some(batch) = self.edx_fetch_files(key, want, peers, on_file).await else {
+        let Some(batch) = self.edx_fetch_files(key, want, peers, staged.cloned(), on_file).await
+        else {
             return needed; // no EDX fetcher: nothing could be fetched
         };
         if batch.bytes > 0 {
@@ -8701,10 +8714,11 @@ impl AppState {
         address: &str,
         want: Vec<EdxWant>,
         peers: Vec<PeerAddr>,
+        staged: Option<Value>,
         on_file: Option<EdxBatchProgress>,
     ) -> Option<EdxBatch> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
-        Some(fetcher.fetch_files(address, want, peers, on_file).await)
+        Some(fetcher.fetch_files(address, want, peers, staged, on_file).await)
     }
 
     /// Fetch a byte range of `inner_path` over EDX via the installed fetcher.
@@ -12060,7 +12074,9 @@ impl AppState {
                 .iter()
                 .map(|p| EdxWant { inner_path: p.clone(), id: None, size: None })
                 .collect();
-            let Some(batch) = self.edx_fetch_files(address, want, peers.clone(), None).await else {
+            let Some(batch) =
+                self.edx_fetch_files(address, want, peers.clone(), None, None).await
+            else {
                 return;
             };
             if batch.bytes > 0 {
@@ -14405,6 +14421,7 @@ mod tests {
                 _: &str,
                 _: Vec<EdxWant>,
                 _: Vec<PeerAddr>,
+                _: Option<Value>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
                 unreachable!()
@@ -14530,6 +14547,7 @@ mod tests {
                 _: &str,
                 _: Vec<EdxWant>,
                 _: Vec<PeerAddr>,
+                _: Option<Value>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
                 unreachable!()
@@ -17737,6 +17755,7 @@ mod tests {
                 address: &str,
                 want: Vec<EdxWant>,
                 _: Vec<PeerAddr>,
+                _: Option<Value>,
                 _: Option<EdxBatchProgress>,
             ) -> EdxBatch {
                 let first = {

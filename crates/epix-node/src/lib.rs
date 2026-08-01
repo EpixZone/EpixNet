@@ -847,14 +847,19 @@ async fn clone_xite_with_progress(
     // emitter the EDX prepass materialized files silently and the bar sat at 0
     // then jumped on well-seeded sites (exactly EDX's target).
     let clone_total = xite.files_needed().len();
-    let emit_done: Option<Arc<dyn Fn(&str) + Send + Sync>> = progress.map(|state| {
+    let emit_done: Option<Arc<dyn Fn(&str, usize) + Send + Sync>> = progress.map(|state| {
         let state = state.clone();
         let addr = address.to_string();
         let peers_n = peer_count.max(1);
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        Arc::new(move |inner: &str| {
+        // The highest serving-peer count any layer has reported, so the
+        // loading screen's "from N peers" never ticks back down when a pass
+        // that drew on fewer links reports after a wider one.
+        let from_peers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move |inner: &str, serving: usize| {
             let d = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let left = clone_total.saturating_sub(d);
+            from_peers.fetch_max(serving, std::sync::atomic::Ordering::SeqCst);
             // The wrapper hides the loading screen on index.html's file_done
             // - and index.html downloads FIRST (priority queue). Firing it
             // mid-sync dropped the user into a half-downloaded site (styles
@@ -869,12 +874,16 @@ async fn clone_xite_with_progress(
                 serde_json::json!(["file_done", inner]),
                 serde_json::json!({
                     "peers": peers_n,
+                    // How many peers the download is actually pulling from,
+                    // as opposed to how many were discovered.
+                    "peers_serving":
+                        from_peers.load(std::sync::atomic::Ordering::SeqCst),
                     "bad_files": left,
                     "tasks": left,
                     "started_task_num": clone_total,
                 }),
             );
-        }) as Arc<dyn Fn(&str) + Send + Sync>
+        }) as Arc<dyn Fn(&str, usize) + Send + Sync>
     });
     // EDX-only streaming clone. Discovery adds every peer it finds to the state
     // registry (also fed over sync_tx, unused here); each pass pulls the
@@ -909,7 +918,7 @@ async fn clone_xite_with_progress(
         empty_waits = 0;
         let staged = xite.content.clone();
         let edx_progress = emit_done.clone().map(|emit| {
-            Arc::new(move |inner: &str, _bytes: u64| emit(inner))
+            Arc::new(move |inner: &str, _bytes: u64, serving: usize| emit(inner, serving))
                 as epix_ui::state::EdxBatchProgress
         });
         // Bound the pass. Inside, every dial and request has its own deadline,
@@ -1238,14 +1247,47 @@ async fn sync_included_content(
     if let Some(state) = progress {
         let before: std::collections::HashSet<String> =
             needed.iter().map(|f| f.inner_path.clone()).collect();
-        let missed = state.edx_first(address, needed, peers.to_vec(), None, None).await;
+        // Ingest each file the moment it lands, not after the pass. EpixNet
+        // fires the db update + `file_done` per written file, and that is what
+        // makes a forum's topics pop into an already-open page one by one;
+        // ingesting only the finished set left the page empty for the whole
+        // pass (minutes on a slow swarm) and then needed a manual reload.
+        //
+        // One consumer task, fed by a channel, so the ingests stay in arrival
+        // order and two of them never race the first db build.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let ingesting = {
+            let state = state.clone();
+            let address = address.to_string();
+            tokio::spawn(async move {
+                let mut ingested = std::collections::HashSet::new();
+                while let Some(path) = rx.recv().await {
+                    state.ingest_file(&address, &path).await;
+                    ingested.insert(path);
+                }
+                ingested
+            })
+        };
+        let on_file: epix_ui::state::EdxBatchProgress =
+            Arc::new(move |inner: &str, _bytes: u64, _serving: usize| {
+                let _ = tx.send(inner.to_string());
+            });
+        // `on_file` is moved in and dropped when the pass returns, which closes
+        // the channel and ends the consumer.
+        let missed = state.edx_first(address, needed, peers.to_vec(), None, Some(on_file)).await;
+        let ingested = ingesting.await.unwrap_or_default();
         let still: std::collections::HashSet<&String> =
             missed.iter().map(|f| &f.inner_path).collect();
         for path in &before {
-            if !still.contains(path) {
-                state.ingest_file(address, path).await;
-                arrived.push(path.clone());
+            if still.contains(path) {
+                continue;
             }
+            // A file that landed by a path with no per-file hook (an encrypted
+            // shard) still has to reach the db.
+            if !ingested.contains(path) {
+                state.ingest_file(address, path).await;
+            }
+            arrived.push(path.clone());
         }
     }
     (0, arrived)

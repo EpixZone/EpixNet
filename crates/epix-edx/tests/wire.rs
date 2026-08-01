@@ -159,7 +159,7 @@ async fn get_many_and_bitfield() {
     // GetMany pulls them all in one round trip, each hash-verified.
     let mut want = ids.clone();
     want.push(ObjId::of(b"not-on-server"));
-    let (inserted, missing) = fetch::fetch_many(&conn, &client_store, &want, 2).await.unwrap();
+    let (inserted, missing) = fetch::fetch_many(&conn, &client_store, &want, 2, None).await.unwrap();
     assert_eq!(inserted, 5);
     assert_eq!(missing, vec![ObjId::of(b"not-on-server")]);
     for (b, id) in blobs.iter().zip(&ids) {
