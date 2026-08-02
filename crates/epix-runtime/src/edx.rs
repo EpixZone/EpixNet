@@ -2029,20 +2029,23 @@ impl RuntimeEdxFetcher {
         for peer in peers.iter().take(cap).cloned() {
             let this = self.clone();
             join.spawn(async move {
+                let started = std::time::Instant::now();
                 let r = this.link(&peer).await;
-                (peer, r)
+                (peer, r, started.elapsed())
             });
         }
         let links: Arc<Mutex<Vec<SessionPeer>>> = Arc::new(Mutex::new(Vec::new()));
         let (growth, watch_rx) = tokio::sync::watch::channel(0usize);
         let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
         // Wait for ONE live link - with none there is nothing to fetch over.
-        // Then keep collecting for SESSION_WIDEN and hand the session back.
-        // Peers that are actually up answer together, so that window costs
-        // nothing and gives the first deal several links to stripe across;
-        // what it never covers is a DEAD peer, whose 15s/45s timeout is the
-        // entire stall this avoids. Anything slower joins the live session
-        // below rather than holding up the start.
+        // Then keep collecting for a widen window and hand the session back.
+        // Peers that are up answer at roughly the same speed as each other, so
+        // the window is scaled off the first dial (see session_widen) instead
+        // of being a flat wait: a pool-warm or LAN-fast link must not cost the
+        // same pause as a Tor rendezvous. What the window never covers is a
+        // DEAD peer, whose 15s/45s timeout is the stall this avoids entirely.
+        // Anything slower joins the live session below rather than holding up
+        // the start.
         let mut widen_until: Option<tokio::time::Instant> = None;
         loop {
             let next = match widen_until {
@@ -2053,7 +2056,7 @@ impl RuntimeEdxFetcher {
                 None => join.join_next().await,
             };
             let Some(res) = next else { break };
-            let Ok((peer, r)) = res else { continue };
+            let Ok((peer, r, took)) = res else { continue };
             match r {
                 Ok((conn, identity, reg)) => {
                     outcomes.push((peer.clone(), true));
@@ -2064,7 +2067,8 @@ impl RuntimeEdxFetcher {
                         node_pk: identity.node_pk,
                         reg,
                     });
-                    widen_until.get_or_insert_with(|| tokio::time::Instant::now() + SESSION_WIDEN);
+                    widen_until
+                        .get_or_insert_with(|| tokio::time::Instant::now() + session_widen(took));
                 }
                 Err(_) => outcomes.push((peer, false)),
             }
@@ -2079,7 +2083,7 @@ impl RuntimeEdxFetcher {
         tokio::spawn(async move {
             let mut late: Vec<(PeerAddr, bool)> = Vec::new();
             while let Some(res) = join.join_next().await {
-                let Ok((peer, r)) = res else { continue };
+                let Ok((peer, r, _)) = res else { continue };
                 match r {
                     Ok((conn, identity, reg)) => {
                         late.push((peer.clone(), true));
@@ -2542,12 +2546,32 @@ struct SessionPeer {
 
 /// How long [`RuntimeEdxFetcher::open_session`] keeps collecting dials after
 /// the FIRST peer answers, so the opening deal has more than one link to
-/// stripe across. Peers that are up complete their handshake within a round
-/// trip or two of each other, so this window catches the live ones and never
-/// waits on a dead peer - which is the point, since a dead peer costs 15s
-/// (clearnet) or 45s (overlay). Slower peers are not lost: they join the
+/// stripe across, given how long that first dial took.
+///
+/// Peers that are up complete their handshake at roughly the same speed as
+/// each other, so the first success dates the cohort and the window tracks it
+/// rather than being a flat pause. That matters because the window can only
+/// end early if EVERY dial has settled, and a session almost always has a
+/// dead onion peer still counting down its 45s: a flat second was therefore
+/// always paid in full, once per session, and a clone opens one per depth
+/// level. Measured on a clean clone, that was 3 of the 5.6s to first posts -
+/// the largest single cost left - while the link that served everything was
+/// pool-warm and answered in ~0ms.
+///
+/// Clamped at both ends: enough to catch a same-speed cohort, never enough to
+/// wait on a dead peer. Slower peers are not lost either way - they join the
 /// [`Session`] while the fetch runs.
-const SESSION_WIDEN: std::time::Duration = std::time::Duration::from_secs(1);
+fn session_widen(first_dial: std::time::Duration) -> std::time::Duration {
+    (first_dial * 3).clamp(
+        std::time::Duration::from_millis(150),
+        std::time::Duration::from_secs(1),
+    )
+}
+
+/// Manifest requests kept in flight per link. Held under the seeder's
+/// `epix_edx::server::MAX_CONCURRENT_SERVES` (8) so a batch never queues
+/// behind its own requests on the serving side.
+const REQUESTS_PER_LINK: usize = 4;
 
 /// A peer session that is usable before it has finished opening.
 ///
@@ -2871,28 +2895,46 @@ impl EdxFetcher for RuntimeEdxFetcher {
         let mut staffed = 0usize;
         loop {
             for p in session.peers().into_iter().skip(staffed) {
-                let (conn, reg) = (p.conn.clone(), p.reg.clone());
-                let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
-                let address = address.to_string();
-                let on_item = on_item.clone();
                 staffed += 1;
-                workers.spawn(async move {
-                    loop {
-                        let Some(path) = queue.lock().unwrap().pop() else { return };
-                        match fetch_signed_over_link(&conn, &reg, &address, &path, on_item.as_ref())
+                // REQUESTS_PER_LINK workers share the link. A Conn is a
+                // multiplexer (each request gets its own stream id) and a
+                // seeder serves MAX_CONCURRENT_SERVES = 8 at once, so issuing
+                // one manifest at a time per link left that capacity unused
+                // and turned a forum's per-user content.json into one strictly
+                // serial round trip each - the whole level costing N * RTT
+                // whenever a single peer is live, which is the normal case for
+                // a fresh xite. Over Tor, where a round trip is a second or
+                // more, that is the difference between a level landing in one
+                // wave and in N.
+                for _ in 0..REQUESTS_PER_LINK {
+                    let (conn, reg) = (p.conn.clone(), p.reg.clone());
+                    let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
+                    let address = address.to_string();
+                    let on_item = on_item.clone();
+                    workers.spawn(async move {
+                        loop {
+                            let Some(path) = queue.lock().unwrap().pop() else { return };
+                            match fetch_signed_over_link(
+                                &conn,
+                                &reg,
+                                &address,
+                                &path,
+                                on_item.as_ref(),
+                            )
                             .await
-                        {
-                            Some(bytes) => {
-                                out.lock().unwrap().insert(path, bytes);
+                            {
+                                Some(bytes) => {
+                                    out.lock().unwrap().insert(path, bytes);
+                                }
+                                // This link could not serve it; the second pass
+                                // tries the others. Handing it straight back to
+                                // the queue risks this same worker popping it
+                                // right back.
+                                None => unserved.lock().unwrap().push(path),
                             }
-                            // This link could not serve it; the second pass
-                            // tries the others. Handing it straight back to
-                            // the queue risks this same worker popping it
-                            // right back.
-                            None => unserved.lock().unwrap().push(path),
                         }
-                    }
-                });
+                    });
+                }
             }
             // Nothing running: either the queue is drained (done) or every
             // link died with work left, in which case a late one can save it.
