@@ -25,6 +25,22 @@ pub type PeerStream = Pin<Box<dyn AsyncReadWrite>>;
 pub trait Transport: Send + Sync {
     fn scheme(&self) -> &'static str;
     async fn dial(&self, addr: &PeerAddr) -> Result<PeerStream>;
+
+    /// Dial `addr` on transfer `lane`.
+    ///
+    /// Lane 0 is the ordinary link every transport already gives, shared by
+    /// the control RPCs. Higher lanes ask for an INDEPENDENT path to the same
+    /// peer where the transport has one to give: over Tor that is a separate
+    /// circuit, which matters because a circuit's throughput is bounded by its
+    /// flow-control window divided by the round trip - about 250 KB/s on a
+    /// six-hop onion path - no matter how fast either end's link is. Striping
+    /// a bulk fetch across several lanes is the only way past that ceiling.
+    ///
+    /// A transport with one physical path (TCP) ignores the lane; its default
+    /// here dials normally, so extra lanes cost nothing and change nothing.
+    async fn dial_lane(&self, addr: &PeerAddr, _lane: u8) -> Result<PeerStream> {
+        self.dial(addr).await
+    }
 }
 
 /// Read the first byte of a stream to route on it, and return it alongside
