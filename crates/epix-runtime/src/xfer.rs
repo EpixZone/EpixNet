@@ -182,6 +182,41 @@ impl FileXfer {
         }
     }
 
+    /// Close out a batch against the peer it was booked onto: release its
+    /// pipeline slot and reserved bytes, and count a fault unless that same
+    /// peer is the one that delivered. A batch someone else had to rescue is
+    /// a strike, exactly as the scheduler scores it.
+    fn close_booking(&mut self, peer: &str, released: Option<u64>, delivered_itself: bool) {
+        let Some(p) = self.peers.get_mut(peer) else { return };
+        p.inflight = p.inflight.saturating_sub(1);
+        if let Some(per) = released {
+            p.inflight_bytes = p.inflight_bytes.saturating_sub(per);
+        }
+        if !delivered_itself {
+            p.failed += 1;
+        }
+    }
+
+    /// Credit `peer` with a delivered batch.
+    fn credit(
+        &mut self,
+        peer: &str,
+        class: Option<Class>,
+        bytes: u64,
+        elapsed: Option<std::time::Duration>,
+        now: u64,
+    ) {
+        let p = self.peers.entry(peer.to_string()).or_default();
+        if class.is_some() {
+            p.class = class;
+        }
+        p.delivered += 1;
+        p.bytes += bytes;
+        p.last_at = now;
+        p.last_ms = elapsed.map(|d| d.as_millis() as u64);
+        p.rate.add(now, bytes);
+    }
+
     /// Drop peers that have been silent long enough to be gone. Keeps the
     /// readout to the peers actually in the session.
     fn prune(&mut self, now: u64) {
@@ -411,6 +446,25 @@ impl Scope {
     fn touch<R>(&self, now: u64, f: impl FnOnce(&mut FileXfer) -> R) -> R {
         self.xfer.with(self.id, &self.address, "", 0, now, f)
     }
+
+    /// Give back one of `peer`'s outstanding bookings, returning the bytes it
+    /// had reserved. `None` when the peer has nothing booked - a duplicate
+    /// that was never booked in the first place resolves through here too.
+    fn release_booking(&self, peer: &str) -> Option<u64> {
+        let mut booked = self.booked.lock().expect("booked");
+        match booked.get_mut(peer) {
+            Some(slot) if slot.0 > 0 => {
+                slot.0 -= 1;
+                // The booking's byte reservation is only approximate once a
+                // batch has been split or raced; release an even share of
+                // what is left rather than tracking each batch's own size.
+                let per = slot.1 / (slot.0 + 1).max(1) as u64;
+                slot.1 = slot.1.saturating_sub(per);
+                Some(per)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl epix_edx::sched::FetchObserver for Scope {
@@ -446,52 +500,20 @@ impl epix_edx::sched::FetchObserver for Scope {
         duplicates: u64,
     ) {
         let now = now_secs();
-        let released = {
-            let mut booked = self.booked.lock().expect("booked");
-            match booked.get_mut(booked_peer) {
-                Some(slot) if slot.0 > 0 => {
-                    slot.0 -= 1;
-                    // The booking's byte reservation is only approximate
-                    // once a batch has been split or raced; release what is
-                    // left rather than tracking each batch's own size.
-                    let per = slot.1 / (slot.0 + 1).max(1) as u64;
-                    slot.1 = slot.1.saturating_sub(per);
-                    Some(per)
-                }
-                _ => None,
-            }
-        };
+        let released = self.release_booking(booked_peer);
         self.touch(now, |f| {
             f.duplicates += duplicates;
             f.inflight = f.inflight.saturating_sub(1);
-            if bytes > 0 {
-                f.fetched += bytes;
-                f.rate_in.add(now, bytes);
-            }
+            f.fetched += bytes;
+            f.rate_in.add(now, bytes);
             if winner.is_none() {
                 f.batch_failures += 1;
             }
-            if let Some(p) = f.peers.get_mut(booked_peer) {
-                p.inflight = p.inflight.saturating_sub(1);
-                if let Some(per) = released {
-                    p.inflight_bytes = p.inflight_bytes.saturating_sub(per);
-                }
-                if winner != Some(booked_peer) {
-                    p.failed += 1;
-                }
-            }
+            f.close_booking(booked_peer, released, winner == Some(booked_peer));
             // Credit whoever actually delivered - on a rescue that is not
             // the peer the batch was booked onto.
             if let Some(w) = winner {
-                let p = f.peers.entry(w.to_string()).or_default();
-                if class.is_some() {
-                    p.class = class;
-                }
-                p.delivered += 1;
-                p.bytes += bytes;
-                p.last_at = now;
-                p.last_ms = elapsed.map(|d| d.as_millis() as u64);
-                p.rate.add(now, bytes);
+                f.credit(w, class, bytes, elapsed, now);
             }
         });
     }
