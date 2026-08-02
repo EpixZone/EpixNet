@@ -3097,6 +3097,20 @@ impl WsCommand for MergerSiteAdd {
                 );
                 state.push_site_info(&merger).await;
             }
+            // The add is over (succeeded or not): say so per target, AFTER the
+            // db rebuild so a page that re-queries on this signal sees the
+            // rows. A merger's progress indicator otherwise has only silence
+            // to go on, and a download's own gaps - a slow file mid-clone, the
+            // dial before the user-content pass - are longer than any sane
+            // idle timeout, so it reads "finished, and empty" while the
+            // download is still running.
+            for target in &targets {
+                state.push_clone_event(
+                    target,
+                    serde_json::json!(["site_done", target]),
+                    serde_json::json!({}),
+                );
+            }
         });
         Ok(Value::from("ok"))
     }
