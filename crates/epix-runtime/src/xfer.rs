@@ -312,7 +312,16 @@ impl Xfer {
     ) {
         self.with(id, address, inner_path, size, now, |f| {
             f.last_range = Some(range);
-            f.last_served_end = range.0.saturating_add(bytes);
+            // A window that ends exactly at EOF is the player probing for the
+            // moov/cues at the tail, not the position it is playing from.
+            // Letting that move the read head parks it at the end of the file,
+            // where nothing is ever "ahead" - which reported a film held whole
+            // on disk as a zero lead. Windows during real playback are capped
+            // well short of EOF, and the ones that do reach it are the last
+            // few seconds of the film, when the lead no longer matters.
+            if range.1 < size || size == 0 {
+                f.last_served_end = range.0.saturating_add(bytes);
+            }
             f.served += bytes;
             if cached {
                 f.served_cached += bytes;
@@ -650,6 +659,21 @@ mod tests {
         );
         xfer.note_readahead(id, "epix1test", 1_002, None);
         assert_eq!(xfer.snapshot(id, 1_002, None)["readahead"], Value::Null);
+    }
+
+    #[test]
+    fn a_tail_probe_does_not_move_the_read_head() {
+        let xfer = Xfer::default();
+        let id = ObjId([5u8; 32]);
+        let size = 100_000_000;
+        // Playback window well short of EOF: this is the read position.
+        xfer.note_serve(id, "epix1test", "video/x.webm", size, 1_000, (0, 4_000_000),
+                        4_000_000, false);
+        assert_eq!(xfer.read_head(id), Some(4_000_000));
+        // The player's metadata probe at the tail must not become the head.
+        xfer.note_serve(id, "epix1test", "video/x.webm", size, 1_001,
+                        (size - 65_536, size), 65_536, true);
+        assert_eq!(xfer.read_head(id), Some(4_000_000));
     }
 
     #[test]
