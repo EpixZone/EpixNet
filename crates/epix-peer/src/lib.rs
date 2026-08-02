@@ -55,6 +55,25 @@ impl DialableNets {
 /// benched together do not re-probe in lockstep. Deliberately capped far
 /// below the dial backoff's hour: the prober's whole point is spotting a
 /// recovered peer within minutes.
+/// How many benched peers [`PeerRegistry::connectable_dialable`] will hand
+/// back when NOTHING is due. Small on purpose: this is the "everything is
+/// backed off" path, so every candidate is one we already know is failing,
+/// and over an overlay each attempt costs a circuit. Enough to recover if the
+/// bench is wrong, few enough that a xite full of dead onions stops churning
+/// circuits.
+const BENCHED_FANOUT: usize = 2;
+
+/// The [`BENCHED_FANOUT`] peers closest to leaving their dial backoff.
+/// Ordering by `retry_after` means the ones benched longest ago (shortest
+/// remaining wait) are retried first, and it is stable across calls, so a pass
+/// does not rotate through the whole dead set one peer at a time.
+fn soonest_due<'a>(peers: impl Iterator<Item = &'a Peer>) -> Vec<&'a Peer> {
+    let mut due: Vec<&Peer> = peers.collect();
+    due.sort_by_key(|p| p.retry_after);
+    due.truncate(BENCHED_FANOUT);
+    due
+}
+
 pub fn probe_cooldown_secs(addr: &PeerAddr, failures: u32) -> i64 {
     let shift = failures.saturating_sub(1).min(5);
     let base = (30i64 << shift).min(600);
@@ -409,10 +428,22 @@ impl Peers {
     ///
     /// Fallback: if the filters leave nothing but connectable peers exist,
     /// degrade gracefully - first drop the backoff filter (all candidates
-    /// backed off: retrying early beats idling), then the network filter (an
-    /// overlay-only xite on a node whose overlay is still warming up must
+    /// backed off: retrying a few early beats idling), then the network filter
+    /// (an overlay-only xite on a node whose overlay is still warming up must
     /// still get candidates rather than starve). A node with any reachable
     /// peer can therefore never regress to an empty list.
+    ///
+    /// Both fallbacks are capped at [`BENCHED_FANOUT`], and take the peers
+    /// CLOSEST TO DUE rather than the whole benched set. Returning all of them
+    /// meant every pass re-dialed every dead peer - and with a xite whose
+    /// peers are all unreachable onions, each of those dials is a Tor circuit
+    /// and a descriptor fetch that fails. Measured on the gateway, that churn
+    /// ran arti's guards up to a 70% circuit failure rate, at which point it
+    /// disables the guard; with its guards disabled the onion service could
+    /// not publish its descriptor (3829 upload timeouts in 24h), so the node
+    /// went unreachable over Tor entirely. Recovery does not depend on this
+    /// path anyway: the background prober re-checks benched peers on their own
+    /// cooldown and lifts the backoff the moment one answers.
     pub fn connectable_dialable(&self, limit: usize, nets: DialableNets, now: i64) -> Vec<PeerAddr> {
         let connectable: Vec<&Peer> =
             self.map.values().filter(|p| p.is_connectable()).collect();
@@ -422,10 +453,10 @@ impl Peers {
             .filter(|p| nets.can_dial(&p.addr) && p.retry_after <= now)
             .collect();
         if peers.is_empty() {
-            peers = connectable.iter().copied().filter(|p| nets.can_dial(&p.addr)).collect();
+            peers = soonest_due(connectable.iter().copied().filter(|p| nets.can_dial(&p.addr)));
         }
         if peers.is_empty() {
-            peers = connectable;
+            peers = soonest_due(connectable.iter().copied());
         }
         // Clearnet first normally (a direct socket beats a circuit) - but in
         // Tor-always mode that inverts: an onion peer is one rendezvous, while
@@ -748,6 +779,39 @@ mod tests {
             .contains(&down));
         peers.set_connected(&down, false, now);
         assert!(peers.probe_candidates(DialableNets::all(), now + 3600, 10).is_empty());
+    }
+
+    /// When every peer is backed off, selection hands back only the few
+    /// closest to due - not the whole dead set. A xite whose peers are all
+    /// unreachable onions otherwise re-dialed all of them on every pass, and
+    /// each of those is a Tor circuit that fails; on the gateway that churn
+    /// pushed arti's guards to a 70% circuit failure rate, it disabled them,
+    /// and the onion service stopped being able to publish its descriptor.
+    #[test]
+    fn an_all_benched_registry_retries_only_the_soonest_due() {
+        let mut peers = Peers::new();
+        let now = 1_000i64;
+        // Six dead peers, benched with increasing remaining wait.
+        for i in 0..6u32 {
+            let a = ip(&format!("10.0.0.{}:26552", i + 1));
+            peers.add(a.clone(), 0);
+            let p = peers.get_mut(&a).unwrap();
+            p.note_connect_fail(now);
+            p.retry_after = now + 100 + i as i64 * 10;
+        }
+        let got = peers.connectable_dialable(10, DialableNets::all(), now);
+        assert_eq!(got.len(), BENCHED_FANOUT, "only a couple retried, not all six: {got:?}");
+
+        // And they are the ones closest to leaving backoff.
+        for (i, addr) in got.iter().enumerate() {
+            let want = format!("10.0.0.{}:26552", i + 1);
+            assert_eq!(addr.to_string(), want, "retry #{i} is the soonest due");
+        }
+
+        // Once one is genuinely due, the normal path returns it and the
+        // capped fallback is not used at all.
+        let due = peers.connectable_dialable(10, DialableNets::all(), now + 105);
+        assert_eq!(due.len(), 1, "only the peer whose backoff expired: {due:?}");
     }
 
     #[test]

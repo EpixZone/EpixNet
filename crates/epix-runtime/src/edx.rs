@@ -1323,6 +1323,19 @@ impl RuntimeEdxFetcher {
             Arc::new(AppStateProvider { state: self.state.clone() });
         let ctx = ServeCtx::new(store, provider, self.privatekey.clone())
             .with_version(epix_protocol::self_advert_version());
+        // An overlay dial is a circuit build (and, for an onion peer, a
+        // descriptor fetch and a rendezvous), so the number in flight at once
+        // is bounded process-wide. Each xite's sync opens its own session, and
+        // with many xites resyncing on the same tick the node asked Tor for
+        // dozens of circuits simultaneously - most of them to peers that never
+        // answer. Arti scores those failures against its guards and, past a
+        // 70% failure rate, disables them; with no usable guard the onion
+        // service cannot publish its descriptor, so the node goes unreachable
+        // over Tor. Clearnet dials are cheap and stay unbounded.
+        let _overlay_slot = match peer.is_overlay() {
+            true => Some(overlay_dial_permit().await),
+            false => None,
+        };
         // Bound the whole handshake: a peer that TCP-accepts then stalls the
         // Noise / client_hello exchange must not hang the fetch forever.
         tokio::time::timeout(peer.connect_timeout(), async {
@@ -2566,6 +2579,23 @@ fn session_widen(first_dial: std::time::Duration) -> std::time::Duration {
         std::time::Duration::from_millis(150),
         std::time::Duration::from_secs(1),
     )
+}
+
+/// Overlay dials allowed in flight process-wide (see the call site in
+/// `dial`). Generous enough that a normal clone still dials its session in
+/// one wave, tight enough that many xites resyncing together cannot hand Tor
+/// a burst of circuit builds it will mostly fail.
+const MAX_CONCURRENT_OVERLAY_DIALS: usize = 8;
+
+/// Wait for one of the [`MAX_CONCURRENT_OVERLAY_DIALS`] slots. The permit is
+/// held for the dial only; once a link is up it costs no slot.
+async fn overlay_dial_permit() -> tokio::sync::SemaphorePermit<'static> {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_OVERLAY_DIALS))
+        .acquire()
+        .await
+        .expect("overlay dial slots are never closed")
 }
 
 /// Manifest requests kept in flight per link. Held under the seeder's
