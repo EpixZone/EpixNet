@@ -2770,6 +2770,68 @@ async fn fetch_signed_over_link(
 /// The paths a worker's own link could not serve, walked across the whole
 /// session as the serial loop used to do. Bounded: a path nobody holds ends the
 /// sweep rather than circling the queue.
+/// The shared work one manifest pass's workers pull from and write into:
+/// paths still to request, the bytes served, and the paths the link that drew
+/// them could not serve (for the sweep over the other links afterwards).
+#[derive(Clone, Default)]
+struct SignedQueue {
+    paths: Arc<Mutex<Vec<String>>>,
+    served: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    unserved: Arc<Mutex<Vec<String>>>,
+}
+
+/// One worker: take paths off the shared queue and GetSigned each over this
+/// link until the queue is empty. Several of these run per link, since a
+/// `Conn` is a multiplexer and the seeder serves several requests at once.
+async fn drain_signed_queue(
+    conn: Conn,
+    reg: Arc<ConnHandle>,
+    address: String,
+    on_item: Option<epix_ui::state::EdxSignedProgress>,
+    work: SignedQueue,
+) {
+    loop {
+        let Some(path) = work.paths.lock().expect("signed queue").pop() else { return };
+        match fetch_signed_over_link(&conn, &reg, &address, &path, on_item.as_ref()).await {
+            Some(bytes) => {
+                work.served.lock().expect("signed queue").insert(path, bytes);
+            }
+            // This link could not serve it; the sweep tries the others.
+            // Handing it straight back to the queue risks this same worker
+            // popping it right back.
+            None => work.unserved.lock().expect("signed queue").push(path),
+        }
+    }
+}
+
+/// Put [`REQUESTS_PER_LINK`] workers on every link that has joined the session
+/// since `staffed`, and return the new staffed count. Called each time round
+/// the pass's loop, which is how a fetch that began on one peer widens onto
+/// the links that finish dialing while it runs.
+fn staff_signed_workers(
+    session: &Session,
+    staffed: usize,
+    workers: &mut tokio::task::JoinSet<()>,
+    address: &str,
+    on_item: &Option<epix_ui::state::EdxSignedProgress>,
+    work: &SignedQueue,
+) -> usize {
+    let mut now_staffed = staffed;
+    for p in session.peers().into_iter().skip(staffed) {
+        now_staffed += 1;
+        for _ in 0..REQUESTS_PER_LINK {
+            workers.spawn(drain_signed_queue(
+                p.conn.clone(),
+                p.reg.clone(),
+                address.to_string(),
+                on_item.clone(),
+                work.clone(),
+            ));
+        }
+    }
+    now_staffed
+}
+
 async fn sweep_signed_over_session(
     session: &[SessionPeer],
     address: &str,
@@ -2884,62 +2946,21 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // peers at the front of the list have to time out first - and the whole
         // level had to land before ANY of its posts could be read.
         //
-        // The pool is STAFFED AS THE SESSION GROWS: it starts on the one peer
-        // that answered first and adds a worker for every link that lands
-        // while the queue is still draining, so manifests start arriving
-        // immediately and the pass widens instead of waiting to be wide.
-        let queue = Arc::new(Mutex::new(paths));
-        let out = Arc::new(Mutex::new(HashMap::new()));
-        let unserved = Arc::new(Mutex::new(Vec::new()));
+        // The pool is STAFFED AS THE SESSION GROWS (see staff_signed_workers):
+        // it starts on the one peer that answered first and adds workers for
+        // every link that lands while the queue is still draining, so
+        // manifests start arriving immediately and the pass widens instead of
+        // waiting to be wide.
+        let work = SignedQueue { paths: Arc::new(Mutex::new(paths)), ..Default::default() };
         let mut workers = tokio::task::JoinSet::new();
         let mut staffed = 0usize;
         loop {
-            for p in session.peers().into_iter().skip(staffed) {
-                staffed += 1;
-                // REQUESTS_PER_LINK workers share the link. A Conn is a
-                // multiplexer (each request gets its own stream id) and a
-                // seeder serves MAX_CONCURRENT_SERVES = 8 at once, so issuing
-                // one manifest at a time per link left that capacity unused
-                // and turned a forum's per-user content.json into one strictly
-                // serial round trip each - the whole level costing N * RTT
-                // whenever a single peer is live, which is the normal case for
-                // a fresh xite. Over Tor, where a round trip is a second or
-                // more, that is the difference between a level landing in one
-                // wave and in N.
-                for _ in 0..REQUESTS_PER_LINK {
-                    let (conn, reg) = (p.conn.clone(), p.reg.clone());
-                    let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
-                    let address = address.to_string();
-                    let on_item = on_item.clone();
-                    workers.spawn(async move {
-                        loop {
-                            let Some(path) = queue.lock().unwrap().pop() else { return };
-                            match fetch_signed_over_link(
-                                &conn,
-                                &reg,
-                                &address,
-                                &path,
-                                on_item.as_ref(),
-                            )
-                            .await
-                            {
-                                Some(bytes) => {
-                                    out.lock().unwrap().insert(path, bytes);
-                                }
-                                // This link could not serve it; the second pass
-                                // tries the others. Handing it straight back to
-                                // the queue risks this same worker popping it
-                                // right back.
-                                None => unserved.lock().unwrap().push(path),
-                            }
-                        }
-                    });
-                }
-            }
+            staffed =
+                staff_signed_workers(&session, staffed, &mut workers, address, &on_item, &work);
             // Nothing running: either the queue is drained (done) or every
             // link died with work left, in which case a late one can save it.
             if workers.is_empty() {
-                let more_to_do = !queue.lock().unwrap().is_empty();
+                let more_to_do = !work.paths.lock().expect("signed queue").is_empty();
                 if !more_to_do || !session.grows_past(staffed).await {
                     break;
                 }
@@ -2961,10 +2982,16 @@ impl EdxFetcher for RuntimeEdxFetcher {
 
         // Second pass over whatever the first left unserved - a short list by
         // now, and over every link the session ended up with.
-        let leftovers = std::mem::take(&mut *unserved.lock().unwrap());
-        sweep_signed_over_session(&session.peers(), address, leftovers, on_item.as_ref(), &out)
-            .await;
-        let served = std::mem::take(&mut *out.lock().unwrap());
+        let leftovers = std::mem::take(&mut *work.unserved.lock().expect("signed queue"));
+        sweep_signed_over_session(
+            &session.peers(),
+            address,
+            leftovers,
+            on_item.as_ref(),
+            &work.served,
+        )
+        .await;
+        let served = std::mem::take(&mut *work.served.lock().expect("signed queue"));
         served
     }
 
