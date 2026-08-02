@@ -2015,13 +2015,16 @@ impl RuntimeEdxFetcher {
     /// redial-per-file cost of calling `fetch_file` in a loop). Object-
     /// independent: the per-object bitfield is fetched later over these links.
     ///
-    /// Dials run CONCURRENTLY: a dead peer must not serialize its full
-    /// connect_timeout ahead of a live one (the whole session would take
-    /// cap * timeout instead of one timeout). Each dial's outcome is fed back
-    /// into `address`'s peer registry (via note_edx_dials), so a dead peer
-    /// sinks and a live one rises - without this the clone kept redialing the
-    /// same unranked top-N and gave up while a reachable seeder sat lower.
-    async fn open_session(&self, address: &str, peers: &[PeerAddr], cap: usize) -> Vec<SessionPeer> {
+    /// Dials run CONCURRENTLY and the session is handed back the moment the
+    /// FIRST peer answers - the remaining dials continue in the background and
+    /// their links join the [`Session`] as they land. See that type for why
+    /// waiting for the last dial is what stalled a clone.
+    ///
+    /// Every dial's outcome is fed back into `address`'s peer registry (via
+    /// note_edx_dials), late ones included, so a dead peer sinks and a live one
+    /// rises - without that the clone kept redialing the same unranked top-N
+    /// and gave up while a reachable seeder sat lower.
+    async fn open_session(&self, address: &str, peers: &[PeerAddr], cap: usize) -> Session {
         let mut join = tokio::task::JoinSet::new();
         for peer in peers.iter().take(cap).cloned() {
             let this = self.clone();
@@ -2030,26 +2033,78 @@ impl RuntimeEdxFetcher {
                 (peer, r)
             });
         }
-        let mut out = Vec::new();
+        let links: Arc<Mutex<Vec<SessionPeer>>> = Arc::new(Mutex::new(Vec::new()));
+        let (growth, watch_rx) = tokio::sync::watch::channel(0usize);
         let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
-        while let Some(res) = join.join_next().await {
+        // Wait for ONE live link - with none there is nothing to fetch over.
+        // Then keep collecting for SESSION_WIDEN and hand the session back.
+        // Peers that are actually up answer together, so that window costs
+        // nothing and gives the first deal several links to stripe across;
+        // what it never covers is a DEAD peer, whose 15s/45s timeout is the
+        // entire stall this avoids. Anything slower joins the live session
+        // below rather than holding up the start.
+        let mut widen_until: Option<tokio::time::Instant> = None;
+        loop {
+            let next = match widen_until {
+                Some(end) => match tokio::time::timeout_at(end, join.join_next()).await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                },
+                None => join.join_next().await,
+            };
+            let Some(res) = next else { break };
             let Ok((peer, r)) = res else { continue };
             match r {
                 Ok((conn, identity, reg)) => {
                     outcomes.push((peer.clone(), true));
-                    out.push(SessionPeer {
+                    links.lock().expect("session").push(SessionPeer {
                         conn,
                         class: Class::of_addr(&peer),
                         label: peer.to_string(),
                         node_pk: identity.node_pk,
                         reg,
                     });
+                    widen_until.get_or_insert_with(|| tokio::time::Instant::now() + SESSION_WIDEN);
                 }
                 Err(_) => outcomes.push((peer, false)),
             }
         }
         self.state.note_edx_dials(address, outcomes).await;
-        out
+
+        // The rest keep dialing; each link that lands joins the live session
+        // and widens the fetch already in progress. Dropping `growth` when
+        // this task ends is what tells a waiter no more are coming.
+        let (state, addr) = (self.state.clone(), address.to_string());
+        let late_links = links.clone();
+        tokio::spawn(async move {
+            let mut late: Vec<(PeerAddr, bool)> = Vec::new();
+            while let Some(res) = join.join_next().await {
+                let Ok((peer, r)) = res else { continue };
+                match r {
+                    Ok((conn, identity, reg)) => {
+                        late.push((peer.clone(), true));
+                        let count = {
+                            let mut held = late_links.lock().expect("session");
+                            held.push(SessionPeer {
+                                conn,
+                                class: Class::of_addr(&peer),
+                                label: peer.to_string(),
+                                node_pk: identity.node_pk,
+                                reg,
+                            });
+                            held.len()
+                        };
+                        let _ = growth.send(count);
+                    }
+                    Err(_) => late.push((peer, false)),
+                }
+            }
+            if !late.is_empty() {
+                state.note_edx_dials(&addr, late).await;
+            }
+        });
+
+        Session { peers: links, growth: watch_rx }
     }
 
     /// Fetch one order-policy tier over the open session: the GetMany fast path
@@ -2061,7 +2116,7 @@ impl RuntimeEdxFetcher {
         &self,
         address: &str,
         store: &Arc<Store>,
-        session: &[SessionPeer],
+        session: &Session,
         files: Vec<Res>,
         deadline: Deadline,
         progress: &BatchProgress,
@@ -2077,8 +2132,9 @@ impl RuntimeEdxFetcher {
         let (small, mut remaining): (Vec<Res>, Vec<Res>) =
             files.into_iter().partition(|r| r.size > 0 && r.size <= cap);
         if !small.is_empty() {
-            let lacking =
-                self.get_many_pass(address, store, session, small, progress, batch, now).await;
+            let lacking = self
+                .get_many_pass(address, store, &session.peers(), small, progress, batch, now)
+                .await;
             remaining.extend(lacking);
         }
 
@@ -2091,13 +2147,15 @@ impl RuntimeEdxFetcher {
         // took 22s of a 52s core download that way. A sliding window keeps the
         // links busy; materializing stays on this task, which owns `batch`.
         const LARGE_FILE_CONCURRENCY: usize = 4;
-        let session = Arc::new(session.to_vec());
         let mut queue = remaining.into_iter();
         let mut fetching: tokio::task::JoinSet<(Res, bool)> = tokio::task::JoinSet::new();
         let mut spawn_next = |fetching: &mut tokio::task::JoinSet<(Res, bool)>| {
             let Some(r) = queue.next() else { return false };
             let this = self.clone();
-            let (store, session) = (store.clone(), session.clone());
+            // Re-read the session per file: peers that finished dialing since
+            // the tier started stripe the objects still queued, so a swarm
+            // that began on one link widens as the rest land.
+            let (store, session) = (store.clone(), Arc::new(session.peers()));
             let serving = progress.serving.clone();
             fetching.spawn(async move {
                 let complete = this
@@ -2397,7 +2455,7 @@ impl RuntimeEdxFetcher {
         &self,
         address: &str,
         store: &Arc<Store>,
-        session: &[SessionPeer],
+        session: &Session,
         mut pending: Vec<Res>,
         content: &Option<serde_json::Value>,
         progress: &BatchProgress,
@@ -2480,6 +2538,74 @@ struct SessionPeer {
     /// The link's diagnostics row, kept so requests issued over this reused
     /// link can stamp `last cmd sent` on it.
     reg: Arc<ConnHandle>,
+}
+
+/// How long [`RuntimeEdxFetcher::open_session`] keeps collecting dials after
+/// the FIRST peer answers, so the opening deal has more than one link to
+/// stripe across. Peers that are up complete their handshake within a round
+/// trip or two of each other, so this window catches the live ones and never
+/// waits on a dead peer - which is the point, since a dead peer costs 15s
+/// (clearnet) or 45s (overlay). Slower peers are not lost: they join the
+/// [`Session`] while the fetch runs.
+const SESSION_WIDEN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A peer session that is usable before it has finished opening.
+///
+/// Dialing continues in the background and each link joins the set as it
+/// lands, so a fetch starts on the FIRST peer that answers and gets faster as
+/// the others arrive - the BitTorrent shape. Waiting for every dial instead
+/// pinned each session to the slowest one: a peer registry is mostly dead
+/// gossip addresses and a dead peer costs its whole connect_timeout (15s
+/// clearnet, 45s overlay), so a clean clone measured a live seeder answering
+/// in 0.0s and then sat 45s behind three dead onion peers before it fetched a
+/// single byte. That wait is the "Connecting to peers..." stall.
+#[derive(Clone)]
+struct Session {
+    /// Links in the order they landed; the first is the peer that let the
+    /// fetch begin.
+    peers: Arc<Mutex<Vec<SessionPeer>>>,
+    /// Carries the link count so a waiter can block until the set grows.
+    /// The sender lives on the dialing task, so a closed channel means every
+    /// dial has settled and no more links are coming.
+    growth: tokio::sync::watch::Receiver<usize>,
+}
+
+impl Session {
+    /// The links available right now. Callers re-read this at points where
+    /// picking up a new peer is cheap (per tier, per queued file), which is
+    /// how a fetch already in flight speeds up.
+    fn peers(&self) -> Vec<SessionPeer> {
+        self.peers.lock().expect("session").clone()
+    }
+
+    fn len(&self) -> usize {
+        self.peers.lock().expect("session").len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether more links may still arrive. The sender lives on the dialing
+    /// task, so a closed channel means every dial has settled.
+    fn dialing(&self) -> bool {
+        self.growth.has_changed().is_ok()
+    }
+
+    /// Wait until the session holds more than `known` links. Returns false
+    /// once dialing is over and no more will come, so a caller that has run
+    /// out of work to hand out can stop waiting.
+    async fn grows_past(&self, known: usize) -> bool {
+        let mut growth = self.growth.clone();
+        loop {
+            if self.len() > known {
+                return true;
+            }
+            if growth.changed().await.is_err() {
+                return self.len() > known;
+            }
+        }
+    }
 }
 
 /// The distinct object ids of a batch's wants, in caller order, plus the want
@@ -2733,38 +2859,69 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // full round trip each - tens of seconds over Tor, minutes when the
         // peers at the front of the list have to time out first - and the whole
         // level had to land before ANY of its posts could be read.
+        //
+        // The pool is STAFFED AS THE SESSION GROWS: it starts on the one peer
+        // that answered first and adds a worker for every link that lands
+        // while the queue is still draining, so manifests start arriving
+        // immediately and the pass widens instead of waiting to be wide.
         let queue = Arc::new(Mutex::new(paths));
         let out = Arc::new(Mutex::new(HashMap::new()));
         let unserved = Arc::new(Mutex::new(Vec::new()));
         let mut workers = tokio::task::JoinSet::new();
-        for p in &session {
-            let (conn, reg) = (p.conn.clone(), p.reg.clone());
-            let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
-            let address = address.to_string();
-            let on_item = on_item.clone();
-            workers.spawn(async move {
-                loop {
-                    let Some(path) = queue.lock().unwrap().pop() else { return };
-                    match fetch_signed_over_link(&conn, &reg, &address, &path, on_item.as_ref())
-                        .await
-                    {
-                        Some(bytes) => {
-                            out.lock().unwrap().insert(path, bytes);
+        let mut staffed = 0usize;
+        loop {
+            for p in session.peers().into_iter().skip(staffed) {
+                let (conn, reg) = (p.conn.clone(), p.reg.clone());
+                let (queue, out, unserved) = (queue.clone(), out.clone(), unserved.clone());
+                let address = address.to_string();
+                let on_item = on_item.clone();
+                staffed += 1;
+                workers.spawn(async move {
+                    loop {
+                        let Some(path) = queue.lock().unwrap().pop() else { return };
+                        match fetch_signed_over_link(&conn, &reg, &address, &path, on_item.as_ref())
+                            .await
+                        {
+                            Some(bytes) => {
+                                out.lock().unwrap().insert(path, bytes);
+                            }
+                            // This link could not serve it; the second pass
+                            // tries the others. Handing it straight back to
+                            // the queue risks this same worker popping it
+                            // right back.
+                            None => unserved.lock().unwrap().push(path),
                         }
-                        // This link could not serve it; the second pass tries
-                        // the others. Handing it straight back to the queue
-                        // risks this same worker popping it right back.
-                        None => unserved.lock().unwrap().push(path),
+                    }
+                });
+            }
+            // Nothing running: either the queue is drained (done) or every
+            // link died with work left, in which case a late one can save it.
+            if workers.is_empty() {
+                let more_to_do = !queue.lock().unwrap().is_empty();
+                if !more_to_do || !session.grows_past(staffed).await {
+                    break;
+                }
+                continue;
+            }
+            tokio::select! {
+                // A worker finished; loop round to see if any are left.
+                _ = workers.join_next() => {}
+                // A new peer joined: staff it into the pass in flight.
+                grew = session.grows_past(staffed), if session.dialing() => {
+                    if !grew {
+                        // Dialing is over. Just drain what is running.
+                        while workers.join_next().await.is_some() {}
+                        break;
                     }
                 }
-            });
+            }
         }
-        while workers.join_next().await.is_some() {}
 
         // Second pass over whatever the first left unserved - a short list by
-        // now.
+        // now, and over every link the session ended up with.
         let leftovers = std::mem::take(&mut *unserved.lock().unwrap());
-        sweep_signed_over_session(&session, address, leftovers, on_item.as_ref(), &out).await;
+        sweep_signed_over_session(&session.peers(), address, leftovers, on_item.as_ref(), &out)
+            .await;
         let served = std::mem::take(&mut *out.lock().unwrap());
         served
     }
@@ -3887,6 +4044,49 @@ mod tests {
         assert_eq!(seen.len(), 1, "one callback per served path, none for the unserved");
         assert_eq!(seen[0].0, "content.json");
         assert_eq!(seen[0].1, served["content.json"], "callback carries the served bytes");
+    }
+
+    /// A session starts on the first peer that ANSWERS instead of waiting for
+    /// every dial to settle. A peer that accepts the socket and then never
+    /// speaks costs a full connect_timeout (15s clearnet, 45s overlay), and a
+    /// registry is mostly dead gossip addresses - holding the fetch behind
+    /// them is the "Connecting to peers..." stall, measured at 45s on a clean
+    /// clone whose seeder had answered in 0.0s. The live seeder is listed
+    /// LAST here, so passing means the fetch really did proceed on the peer
+    /// that answered rather than on list order.
+    #[tokio::test]
+    async fn a_session_fetches_without_waiting_out_a_dead_peer() {
+        let (address, cb, content, addr) = spawn_many_small_seeder(3).await;
+        let (state, _dir) = client_for(&address, &cb, &content, addr).await;
+
+        // Accepts the connection and then never writes, so the dial hangs to
+        // its deadline rather than failing fast the way a refused port would.
+        let blackhole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = blackhole.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = blackhole.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let served = state
+            .edx_fetch_signed_many(
+                &address,
+                vec!["content.json".into()],
+                vec![epix_core::PeerAddr::Ip(dead), epix_core::PeerAddr::Ip(addr)],
+                None,
+            )
+            .await
+            .unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(served.len(), 1, "the live peer served the manifest");
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "must not wait out the dead peer's dial budget, took {took:?}"
+        );
     }
 
     /// Media seek: a range fetch pulls only the covering bytes (verified),
