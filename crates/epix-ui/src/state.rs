@@ -199,6 +199,24 @@ pub trait EdxFetcher: Send + Sync {
         peer: PeerAddr,
         after: u64,
     ) -> Result<(Vec<(String, i64)>, u64), String>;
+
+    /// Live transfer telemetry for one file: which peers are serving it,
+    /// at what rate, what is in flight and what failed. `Value::Null` when
+    /// the file has no EDX entry or nothing has been fetched for it in this
+    /// node's lifetime. Read-only and cheap - it is polled by a player's
+    /// stats panel about once a second.
+    ///
+    /// `offset`, when given, is where the caller is reading from (a play
+    /// head); the reply then also carries how many contiguous bytes past it
+    /// the node already holds.
+    async fn transfer_stats(
+        &self,
+        _address: &str,
+        _inner_path: &str,
+        _offset: Option<u64>,
+    ) -> Value {
+        Value::Null
+    }
 }
 
 /// Carries tracker announces over EDX. `epix-discovery` owns the announce
@@ -8757,6 +8775,18 @@ impl AppState {
     ) -> Option<Result<Option<Vec<u8>>, String>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
         Some(fetcher.fetch_range(address, inner_path, start, len).await)
+    }
+
+    /// Live EDX transfer telemetry for one file (the player's stats panel).
+    /// `Null` with no fetcher installed or nothing tracked for the file.
+    pub async fn edx_transfer_stats(
+        &self,
+        address: &str,
+        inner_path: &str,
+        offset: Option<u64>,
+    ) -> Value {
+        let Some(fetcher) = self.edx_fetcher.read().await.clone() else { return Value::Null };
+        fetcher.transfer_stats(address, inner_path, offset).await
     }
 
     /// `listModified` from one peer over EDX via the installed fetcher.

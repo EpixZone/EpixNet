@@ -547,6 +547,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(FileNeed),
         Arc::new(OptionalFileList),
         Arc::new(OptionalFileInfo),
+        Arc::new(FileTransferStats),
         Arc::new(OptionalFileDelete),
         Arc::new(OptionalFilePin { pin: true }),
         Arc::new(OptionalFilePin { pin: false }),
@@ -2871,6 +2872,47 @@ impl WsCommand for OptionalFileInfo {
         let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileInfo: inner_path required")?;
         let (address, inner_path) = s.resolve_target(inner_path).await?;
         s.state.optional_file_info(&address, &inner_path).await
+    }
+}
+
+/// `fileTransferStats(inner_path)` - the live per-peer picture of how this
+/// node is pulling one file: rates, bytes, requests in flight, failures.
+///
+/// Read-only and site-scoped (`resolve_target` binds it to the caller's own
+/// xite), so a page can show its own transfer without any grant. A media
+/// player polls it to explain a stall - which is the only way, from inside
+/// the page, to tell "no peers" from "one slow onion circuit" from "this
+/// film's bitrate is above what the swarm delivers".
+struct FileTransferStats;
+#[async_trait]
+impl WsCommand for FileTransferStats {
+    fn name(&self) -> &'static str {
+        "fileTransferStats"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path =
+            arg_str(p, "inner_path", 0).ok_or("fileTransferStats: inner_path required")?;
+        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        // Where the caller is reading from, so the reply can say how far
+        // ahead of it the node already holds.
+        let offset = p.get("offset").and_then(|v| v.as_u64());
+        let mut stats = s.state.edx_transfer_stats(&address, &inner_path, offset).await;
+        // Peers known for the xite at all, so "0 peers serving" can be told
+        // apart from "nothing was ever discovered".
+        let known = s.state.connectable_peers(&address, 20).await.len();
+        if let Some(obj) = stats.as_object_mut() {
+            obj.insert("peers_known".into(), json!(known));
+        } else {
+            // Nothing tracked yet (nothing fetched this run): still answer
+            // with the file's identity so the panel has something to show.
+            stats = json!({
+                "address": address,
+                "inner_path": inner_path,
+                "peers": [],
+                "peers_known": known,
+            });
+        }
+        Ok(stats)
     }
 }
 

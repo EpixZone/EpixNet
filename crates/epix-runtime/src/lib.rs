@@ -29,6 +29,7 @@ use tokio::time::{interval, MissedTickBehavior};
 pub mod edx;
 #[cfg(feature = "local-discovery")]
 pub mod local;
+pub mod xfer;
 #[cfg(feature = "inbound-seeding")]
 mod portcheck;
 
