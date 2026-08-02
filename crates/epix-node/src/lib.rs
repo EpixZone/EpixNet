@@ -27,6 +27,22 @@ pub use epix_core::DEFAULT_TRACKERS;
 pub fn default_trackers() -> Vec<epix_xite::Tracker> {
     DEFAULT_TRACKERS.iter().filter_map(|t| epix_xite::Tracker::parse(t)).collect()
 }
+/// Wall-clock trace of a clone's phase boundaries, on when `EPIX_TRACE_CLONE`
+/// is set. A clone is a chain of discovery, dial, fetch, verify and ingest
+/// steps, and only a per-phase timeline shows which one is actually costing
+/// the seconds - reading the code cannot tell you.
+pub(crate) fn trace_clone(t0: std::time::Instant, what: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("EPIX_TRACE_CLONE").is_some()) {
+        eprintln!("[clonetrace] {:>7.2}s {what}", t0.elapsed().as_secs_f64());
+    }
+}
+
+/// [`trace_clone`] with `format!` arguments.
+macro_rules! trace_clone {
+    ($t0:expr, $($arg:tt)*) => { crate::trace_clone($t0, format_args!($($arg)*)) };
+}
+
 /// Epix's default UI port.
 pub const DEFAULT_UI_PORT: u16 = 42222;
 /// Legacy EpixNet UI port, used as a fallback when the default is taken (so a
@@ -578,6 +594,8 @@ async fn clone_xite_with_progress(
     trackers: &[epix_xite::Tracker],
     progress: Option<&Arc<AppState>>,
 ) -> Result<(Option<serde_json::Value>, u64, Vec<String>), String> {
+    let t0 = std::time::Instant::now();
+    trace_clone!(t0, "clone START {address}");
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
     let mut xite = Xite::new(
         Address::parse(address.to_string()).map_err(|e| format!("bad address: {e}"))?,
@@ -694,7 +712,19 @@ async fn clone_xite_with_progress(
     // committed to disk only once the core file set is complete.
     let mut staged_bytes: Option<Vec<u8>> = None;
     if xite.content.is_none() {
-        let mut fetchers: tokio::task::JoinSet<Option<Vec<u8>>> = tokio::task::JoinSet::new();
+        // Race slots are budgeted PER NETWORK CLASS. Discovery hands out peers
+        // in whatever order the trackers answer, and an unreachable onion peer
+        // holds its slot for the full 45s overlay connect_timeout. With one
+        // shared pool the first few onion addresses monopolized the race and a
+        // clearnet seeder discovered a moment later sat in `untried` until one
+        // of them timed out: measured 46.4s to a content.json that the same
+        // gateway served in 0.05s for a xite whose peers happened to arrive
+        // clearnet-first. Separate budgets mean a direct peer is never stuck
+        // behind an overlay dial, and vice versa.
+        const RACE_SLOTS_PER_CLASS: usize = 4;
+        let mut fetchers: tokio::task::JoinSet<(PeerAddr, Option<Vec<u8>>)> =
+            tokio::task::JoinSet::new();
+        let mut in_flight = (0usize, 0usize); // (overlay, direct)
         let mut untried: std::collections::VecDeque<PeerAddr> = std::collections::VecDeque::new();
         let mut channel_open = true;
         let mut got_content = false;
@@ -717,6 +747,9 @@ async fn clone_xite_with_progress(
                         Ok(None) => channel_open = false,
                         Ok(Some(peer)) => {
                             peer_count += 1;
+                            if peer_count <= 3 {
+                                trace_clone!(t0, "discovery: peer #{peer_count} {peer}");
+                            }
                             if let Some(state) = progress {
                                 state.push_clone_event(
                                     address,
@@ -729,8 +762,14 @@ async fn clone_xite_with_progress(
                                 state.add_peers(address, [peer.clone()]).await;
                             }
                             spawn_pex(peer.clone(), pex_tx.clone());
-                            if fetchers.len() < 4 {
-                                fetchers.spawn(fetch_content(
+                            let used = if peer.is_overlay() {
+                                &mut in_flight.0
+                            } else {
+                                &mut in_flight.1
+                            };
+                            if *used < RACE_SLOTS_PER_CLASS {
+                                *used += 1;
+                                fetchers.spawn(race_content(
                                     peer,
                                     address.to_string(),
                                     progress.cloned(),
@@ -742,19 +781,42 @@ async fn clone_xite_with_progress(
                     }
                 }
                 Some(result) = fetchers.join_next(), if !fetchers.is_empty() => {
-                    if let Ok(Some(bytes)) = result {
-                        if xite.stage_content(&bytes).is_ok() {
-                            got_content = true;
-                            staged_bytes = Some(bytes);
+                    if let Ok((done, bytes)) = result {
+                        if done.is_overlay() {
+                            in_flight.0 = in_flight.0.saturating_sub(1);
+                        } else {
+                            in_flight.1 = in_flight.1.saturating_sub(1);
+                        }
+                        if let Some(bytes) = bytes {
+                            if xite.stage_content(&bytes).is_ok() {
+                                got_content = true;
+                                trace_clone!(t0, "content.json verified + staged from {done}");
+                                staged_bytes = Some(bytes);
+                            }
                         }
                     }
+                    // Refill from whichever class now has room, so a freed
+                    // overlay slot cannot be handed to a queued overlay peer
+                    // while a direct one waits (or the other way round).
                     if !got_content {
-                        if let Some(peer) = untried.pop_front() {
-                            fetchers.spawn(fetch_content(
-                                peer,
-                                address.to_string(),
-                                progress.cloned(),
-                            ));
+                        let next = untried.iter().position(|p| {
+                            let used =
+                                if p.is_overlay() { in_flight.0 } else { in_flight.1 };
+                            used < RACE_SLOTS_PER_CLASS
+                        });
+                        if let Some(i) = next {
+                            if let Some(peer) = untried.remove(i) {
+                                if peer.is_overlay() {
+                                    in_flight.0 += 1;
+                                } else {
+                                    in_flight.1 += 1;
+                                }
+                                fetchers.spawn(race_content(
+                                    peer,
+                                    address.to_string(),
+                                    progress.cloned(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -899,12 +961,16 @@ async fn clone_xite_with_progress(
     let mut bytes_recv = 0u64; // EDX bytes are counted by edx_first's add_transfer
     let mut dry = 0u32;
     let mut empty_waits = 0u32;
+    let mut pass_n = 0u32;
     while let Some(state) = progress {
         let before = xite.files_needed();
         if before.is_empty() {
             break;
         }
+        pass_n += 1;
+        trace_clone!(t0, "core pass {pass_n} START, {} file(s) needed", before.len());
         let peers = state.fetch_candidate_peers(address, 50).await;
+        trace_clone!(t0, "core pass {pass_n}: {} candidate peer(s)", peers.len());
         if peers.is_empty() {
             // No peers to dial yet - let discovery turn some up, bounded so a
             // truly peerless clone still terminates.
@@ -934,6 +1000,7 @@ async fn clone_xite_with_progress(
         )
         .await;
         let after = xite.files_needed().len();
+        trace_clone!(t0, "core pass {pass_n} END, {after} file(s) still needed");
         if after == 0 {
             break;
         }
@@ -981,14 +1048,15 @@ async fn clone_xite_with_progress(
     // real data (topics, comments) in INCLUDED and per-user content.json files
     // that the root's `files` map never lists. Fetch those content.json files
     // and their data files so the site's db can populate.
+    trace_clone!(t0, "CORE SET COMPLETE (first paint), starting user content");
     let peers = state_peers(progress, &xite, address).await;
     let mut user_files = Vec::new();
     if !peers.is_empty() {
-        let (bytes, files) =
-            sync_included_content(&xite, &peers, progress, address).await;
+        let (bytes, files) = sync_included_content(&xite, &peers, progress, address, t0).await;
         bytes_recv += bytes;
         user_files = files;
     }
+    trace_clone!(t0, "clone DONE, {} user file(s) arrived", user_files.len());
     Ok((xite.content.clone(), bytes_recv, user_files))
 }
 
@@ -1011,6 +1079,7 @@ async fn sync_included_content(
     peers: &[PeerAddr],
     progress: Option<&Arc<AppState>>,
     address: &str,
+    t0: std::time::Instant,
 ) -> (u64, Vec<String>) {
     use std::collections::HashSet;
     // The owner's signed feed ordering directive, if any (see the sort below).
@@ -1068,6 +1137,7 @@ async fn sync_included_content(
         }
     }
     probes.abort_all();
+    trace_clone!(t0, "listModified race done, {} path(s) known", paths.len());
     // The peer that answered goes FIRST: every fetch below races peers in
     // groups from the front of this list, so a front full of dead peers costs
     // a full timeout per group per file. One known-live peer up front means
@@ -1127,7 +1197,9 @@ async fn sync_included_content(
             }
         }
     }
+    let warm_n = warm.len();
     while warm.join_next().await.is_some() {}
+    trace_clone!(t0, "xID signer pre-warm done for {warm_n} user(s)");
 
     let mut child_files: Vec<epix_xite::FileEntry> = Vec::new();
     let mut arrived: Vec<String> = Vec::new();
@@ -1150,7 +1222,8 @@ async fn sync_included_content(
     for (p, m) in ordered {
         pending.entry(p.matches('/').count()).or_default().push((p, m));
     }
-    while let Some((_, level)) = pending.pop_first() {
+    while let Some((depth, level)) = pending.pop_first() {
+        trace_clone!(t0, "level depth={depth} START, {} path(s)", level.len());
         let mut fetched: Vec<(String, Vec<u8>, bool)> = Vec::new();
         let mut to_fetch: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         for (path, peer_modified) in level {
@@ -1239,6 +1312,11 @@ async fn sync_included_content(
                         }
                     };
                     let _ = tokio::join!(fetch, consume);
+                    trace_clone!(
+                        t0,
+                        "level depth={depth} manifests done, {} streamed",
+                        streamed.len()
+                    );
                 }
                 None => {}
             }
@@ -1282,6 +1360,7 @@ async fn sync_included_content(
             }
         }
     }
+    trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
     if let Some(state) = progress {
         state.fetch_merge_for_changed(address, &arrived, &peers).await;
     }
@@ -1464,6 +1543,17 @@ async fn fetch_list_modified(
 }
 
 /// One bounded attempt to pull content.json from a peer (phase 1 of a clone).
+/// [`fetch_content`] that hands its peer back with the result, so the
+/// content.json race can free that peer's network-class slot when it settles.
+async fn race_content(
+    peer: PeerAddr,
+    address: String,
+    state: Option<Arc<AppState>>,
+) -> (PeerAddr, Option<Vec<u8>>) {
+    let bytes = fetch_content(peer.clone(), address, state).await;
+    (peer, bytes)
+}
+
 async fn fetch_content(
     peer: PeerAddr,
     address: String,
@@ -1633,7 +1723,14 @@ impl epix_ui::ContentSyncer for OnDemand {
         if peers.is_empty() {
             return (0, Vec::new());
         }
-        sync_included_content(&xite, &peers, Some(&self.state), address).await
+        sync_included_content(
+            &xite,
+            &peers,
+            Some(&self.state),
+            address,
+            std::time::Instant::now(),
+        )
+        .await
     }
 }
 
