@@ -1213,6 +1213,10 @@ struct RuntimeEdxFetcher {
     /// Objects with a fetch in flight (see [`ObjClaim`]). Arc-shared like the
     /// rest so every clone of the fetcher sees the same claims.
     claims: ObjClaims,
+    /// Live per-file transfer telemetry for the UI (peers, rates, failures).
+    /// Arc-shared for the same reason as the rest: a serve, its read-ahead and
+    /// the scheduler all report into one picture of the same file.
+    xfer: Arc<crate::xfer::Xfer>,
 }
 
 /// Per-file streaming state guarding read-ahead against firing an unbounded
@@ -1262,6 +1266,7 @@ impl RuntimeEdxFetcher {
             streaming: Arc::default(),
             peer_cache: Arc::default(),
             claims: Arc::default(),
+            xfer: Arc::default(),
         }
     }
 
@@ -1754,6 +1759,7 @@ impl RuntimeEdxFetcher {
                 handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label });
             }
         }
+        self.xfer.note_session(id, address, now_secs(), total as u64, handles.len() as u64);
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
@@ -1885,13 +1891,18 @@ impl RuntimeEdxFetcher {
             Ok(claim) => claim,
             Err(e) => return Some(e.to_string()),
         };
-        let mut swarm = Swarm::new(store.clone(), id, size);
+        let mut swarm =
+            Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
         match swarm.fetch(needed, &handles, Deadline::tight(), now).await {
             Ok(report) => {
                 self.credit(&report, &node_pks, now);
                 None
             }
-            Err(e) => Some(e.to_string()),
+            Err(e) => {
+                let e = e.to_string();
+                self.xfer.note_error(id, address, now, &e);
+                Some(e)
+            }
         }
     }
 
@@ -2003,10 +2014,13 @@ impl RuntimeEdxFetcher {
         let Ok(_claim) = self.claim_object(&store, id, Ns::Plain, size, now) else {
             return;
         };
-        let mut swarm = Swarm::new(store.clone(), id, size);
+        self.xfer.note_readahead(id, address, now, Some((window.start, window.end)));
+        let mut swarm =
+            Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
         if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
             self.credit(&report, &node_pks, now);
         }
+        self.xfer.note_readahead(id, address, now_secs(), None);
         let _ = store.enforce_quota(store_quota());
     }
 
@@ -3030,6 +3044,12 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // when the fetch could not. Read-ahead below is a pure background
         // addition.
         let bytes = if let Ok(bytes) = store.read_range(id, start, end - start, now) {
+            // Whole window already held: the network was not on the critical
+            // path for these bytes, which is exactly what a healthy read-ahead
+            // looks like from the player's side.
+            self.xfer.note_serve(
+                id, address, inner_path, size, now, (start, end), bytes.len() as u64, true,
+            );
             bytes
         } else {
             let present = store.present_bits(id).unwrap_or_default();
@@ -3041,10 +3061,16 @@ impl EdxFetcher for RuntimeEdxFetcher {
             let present = store.present_bits(id).unwrap_or_default();
             let got = present_prefix_len(&present, &served, size);
             if got == 0 {
-                return Err(fetch_err
-                    .unwrap_or_else(|| "no bytes of the requested range are available".into()));
+                let e = fetch_err
+                    .unwrap_or_else(|| "no bytes of the requested range are available".into());
+                self.xfer.note_serve(id, address, inner_path, size, now, (start, end), 0, false);
+                self.xfer.note_error(id, address, now, &e);
+                return Err(e);
             }
             let bytes = store.read_range(id, start, got, now).map_err(|e| e.to_string())?;
+            self.xfer.note_serve(
+                id, address, inner_path, size, now, (start, end), bytes.len() as u64, false,
+            );
             let _ = store.enforce_quota(store_quota());
             bytes
         };
@@ -3228,6 +3254,38 @@ impl EdxFetcher for RuntimeEdxFetcher {
             epix_edx::fetch::updates_since(&conn, after).await
         })
         .await
+    }
+
+    async fn transfer_stats(
+        &self,
+        address: &str,
+        inner_path: &str,
+        offset: Option<u64>,
+    ) -> serde_json::Value {
+        let Ok(Some((id, size))) = self.resolve(address, inner_path).await else {
+            return serde_json::Value::Null;
+        };
+        // What the store holds: in total, and - the number that actually
+        // explains a stall - contiguously past the read position. That
+        // position is where the last serve ended unless the caller names its
+        // own (a seek preview, say); the node's own frontier is exact, where
+        // a caller can only estimate it from playback time.
+        let head = offset.or_else(|| self.xfer.read_head(id));
+        let (have, ahead) = match self.state.edx_store().await {
+            Some(store) => match store.present_bits(id) {
+                Ok(bits) => (
+                    Some(crate::xfer::have_bytes(&bits, size)),
+                    head.map(|o| crate::xfer::contiguous_from(&bits, size, o)),
+                ),
+                Err(_) => (None, None),
+            },
+            None => (None, None),
+        };
+        let mut out = self.xfer.snapshot(id, now_secs(), have);
+        if let (Some(obj), Some(ahead)) = (out.as_object_mut(), ahead) {
+            obj.insert("have_ahead".into(), serde_json::json!(ahead));
+        }
+        out
     }
 }
 

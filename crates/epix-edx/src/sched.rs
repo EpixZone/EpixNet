@@ -119,6 +119,28 @@ impl ClassStats {
     }
 }
 
+/// Live reporting hook for one [`Swarm::fetch`].
+///
+/// The scheduler already knows everything a torrent client's transfer pane
+/// shows - which peer a request went to, how many bytes it delivered, how
+/// long it took, whether it stalled - but that all died with the
+/// [`FetchReport`] when the fetch returned. An observer publishes it as it
+/// happens, so the UI can show a live per-peer picture instead of a summary
+/// nobody ever sees. Reporting must be cheap and must never block: these
+/// fire on the fetch's own task, between batches.
+pub trait FetchObserver: Send + Sync {
+    /// A batch was booked onto `peer` (its request is now in flight).
+    fn on_request(&self, peer: &str, class: Class, bytes: u64);
+    /// A batch completed. `bytes` is what verified into the store from it
+    /// (0 on a total failure), `peer` the label of whoever delivered - which
+    /// is not necessarily the peer the batch was booked onto, since a
+    /// stalled batch is raced onto others. `booked` is that original peer,
+    /// so an in-flight count can be released against the same peer it was
+    /// taken from.
+    fn on_batch(&self, booked: &str, peer: Option<&str>, class: Option<Class>, bytes: u64,
+                elapsed: Option<Duration>, duplicates: u64);
+}
+
 /// A peer available to fetch from: its connection, transport class, and
 /// last-known availability bitfield for the object in question.
 pub struct PeerHandle {
@@ -255,6 +277,8 @@ pub struct Swarm {
     /// Interior-mutable: the in-flight batch futures borrow the swarm
     /// shared while completed outcomes fold their latencies back in.
     stats: Mutex<ClassStats>,
+    /// Live reporting sink, when the caller wants one.
+    observer: Option<Arc<dyn FetchObserver>>,
 }
 
 /// What a completed fetch produced (for metrics/tests).
@@ -331,6 +355,9 @@ impl<'a> Window<'a> {
             self.inflight.add(g..g + 1);
         }
         report.requests_issued += 1;
+        if let Some(obs) = &swarm.observer {
+            obs.on_request(&peers[idx].label, peers[idx].class, swarm.bytes_of(&groups));
+        }
         self.futs.push(Box::pin(swarm.race_batch(batch, groups, idx, peers, deadline, now)));
     }
 
@@ -431,11 +458,23 @@ impl<'a> Window<'a> {
 
 impl Swarm {
     pub fn new(store: Arc<Store>, obj: ObjId, size: u64) -> Self {
-        Self { store, obj, size, stats: Mutex::new(ClassStats::default()) }
+        Self { store, obj, size, stats: Mutex::new(ClassStats::default()), observer: None }
+    }
+
+    /// Report this fetch's per-peer progress to `observer` as it runs.
+    pub fn with_observer(mut self, observer: Arc<dyn FetchObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn stats(&self) -> ClassStats {
         self.stats.lock().expect("stats").clone()
+    }
+
+    /// Bytes the groups of `batch` cover, for the observer's accounting.
+    fn bytes_of(&self, groups: &[u64]) -> u64 {
+        use epix_blob::bitfield::bytes_of_group;
+        groups.iter().map(|g| bytes_of_group(*g, self.size)).map(|r| r.end - r.start).sum()
     }
 
     /// Fetch every group in `needed` from the peer set, striping
@@ -483,7 +522,7 @@ impl Swarm {
                 break; // nothing in flight and nothing left to assign
             };
             window.release(&outcome);
-            this.apply_outcome(outcome, &mut remaining, &mut window.fails, &mut report);
+            this.apply_outcome(outcome, peers, &mut remaining, &mut window.fails, &mut report);
             if remaining.is_empty() {
                 break; // done; dropping `flight` cancels leftover duplicates
             }
@@ -498,10 +537,21 @@ impl Swarm {
     fn apply_outcome(
         &self,
         outcome: BatchOutcome,
+        peers: &[PeerHandle],
         remaining: &mut GroupBits,
         fails: &mut [u32],
         report: &mut FetchReport,
     ) {
+        if let Some(obs) = &self.observer {
+            obs.on_batch(
+                &peers[outcome.primary].label,
+                outcome.winner_label.as_deref(),
+                outcome.winner_class,
+                self.bytes_of(&outcome.landed),
+                outcome.elapsed,
+                outcome.duplicates,
+            );
+        }
         report.duplicates_issued += outcome.duplicates;
         // Fold the winner's measured latency into the class prior, so
         // duplicate-target ordering uses real RTT.
