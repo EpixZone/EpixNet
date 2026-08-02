@@ -1737,84 +1737,7 @@ impl RuntimeEdxFetcher {
         }
         let total = peers.len();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        {
-            let this = self.clone();
-            let address = address.to_string();
-            tokio::spawn(async move {
-                let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
-                let mut join = tokio::task::JoinSet::new();
-                let mut pending = peers.into_iter();
-                loop {
-                    while join.len() < SESSION_DIAL_CONCURRENCY {
-                        let Some(peer) = pending.next() else { break };
-                        let this = this.clone();
-                        let address = address.clone();
-                        let tx = tx.clone();
-                        join.spawn(async move {
-                            // Start the extra lanes' circuit builds NOW, next
-                            // to lane 0's rather than after it. Building them
-                            // afterwards put them a whole circuit build behind
-                            // the session's 2s first-handle grace, so they
-                            // always missed the session that wanted them. In
-                            // parallel they finish alongside lane 0, and lane 0
-                            // still owes a bitfield round trip after that,
-                            // which is the slack they land in.
-                            let mut lanes = this.start_extra_lanes(&peer);
-                            let Ok((conn, identity, reg)) = this.link(&peer).await
-                            else {
-                                // Dead peer: stop its lanes mid-build instead
-                                // of leaving circuits to finish for a node
-                                // that never answered. Circuit churn on dead
-                                // peers is what gets guards disabled.
-                                lanes.abort_all();
-                                let _ = tx.send((peer.clone(), None, true));
-                                return (peer, false);
-                            };
-                            reg.note_cmd_sent("GetBitfield", Some(&address));
-                            let bits = match tokio::time::timeout(
-                                EDX_FETCH_TIMEOUT,
-                                epix_edx::fetch::fetch_bitfield(&conn, id),
-                            )
-                            .await
-                            {
-                                Ok(Ok((_sz, bits))) => bits,
-                                // A quick refusal: reachable, just nothing
-                                // usable for this object.
-                                Ok(Err(_)) => {
-                                    lanes.abort_all();
-                                    let _ = tx.send((peer.clone(), None, true));
-                                    return (peer, true);
-                                }
-                                // Handshook but never answered the bitfield:
-                                // a zombie. Scored as a failed dial so the
-                                // registry backs it off, instead of rewarding
-                                // it as reachable and re-burning this timeout
-                                // at the top of every cold session.
-                                Err(_) => {
-                                    lanes.abort_all();
-                                    let _ = tx.send((peer.clone(), None, true));
-                                    return (peer, false);
-                                }
-                            };
-                            // Lane 0 goes out FIRST so the fetch can start on
-                            // it; the extra lanes follow as they land.
-                            let _ = tx.send((
-                                peer.clone(),
-                                Some((conn, identity.clone(), bits.clone())),
-                                true,
-                            ));
-                            this.collect_extra_lanes(lanes, id, &peer, &identity, &bits, &tx)
-                                .await;
-                            (peer, true)
-                        });
-                    }
-                    let Some(res) = join.join_next().await else { break };
-                    let Ok((peer, dialed)) = res else { continue };
-                    outcomes.push((peer, dialed));
-                }
-                this.state.note_edx_dials(&address, outcomes).await;
-            });
-        }
+        self.spawn_dial_driver(peers, address.to_string(), id, tx);
 
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1867,6 +1790,102 @@ impl RuntimeEdxFetcher {
     ///
     /// Only overlay peers get lanes ([`lanes_for`]); for anything else this
     /// returns without dialing.
+    /// Dial `peers` for a session in the background, reporting every usable
+    /// link on `tx` as it lands and feeding each peer's outcome back to the
+    /// xite's registry when the last one settles.
+    ///
+    /// Detached from the collector on purpose: the session is handed back as
+    /// soon as it has something to fetch over, while this keeps running so a
+    /// dead peer is still SCORED (and backed off) rather than silently
+    /// redialed at the top of the next window.
+    fn spawn_dial_driver(
+        &self,
+        peers: Vec<PeerAddr>,
+        address: String,
+        id: ObjId,
+        tx: tokio::sync::mpsc::UnboundedSender<LaneResult>,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
+            let mut join = tokio::task::JoinSet::new();
+            let mut pending = peers.into_iter();
+            loop {
+                while join.len() < SESSION_DIAL_CONCURRENCY {
+                    let Some(peer) = pending.next() else { break };
+                    let this = this.clone();
+                    let address = address.clone();
+                    let tx = tx.clone();
+                    join.spawn(async move {
+                        this.dial_peer_for_session(peer, address, id, tx).await
+                    });
+                }
+                let Some(res) = join.join_next().await else { break };
+                let Ok((peer, dialed)) = res else { continue };
+                outcomes.push((peer, dialed));
+            }
+            this.state.note_edx_dials(&address, outcomes).await;
+        });
+    }
+
+    /// Dial one peer for a session - lane 0, its bitfield, and its extra
+    /// lanes - reporting each usable link on `tx`. Returns the peer's dial
+    /// outcome for the registry: `true` when it answered at all, whatever it
+    /// then turned out to hold.
+    async fn dial_peer_for_session(
+        &self,
+        peer: PeerAddr,
+        address: String,
+        id: ObjId,
+        tx: tokio::sync::mpsc::UnboundedSender<LaneResult>,
+    ) -> (PeerAddr, bool) {
+        // Start the extra lanes' circuit builds NOW, next to lane 0's rather
+        // than after it. Building them afterwards put them a whole circuit
+        // build behind the session's 2s first-handle grace, so they always
+        // missed the session that wanted them. In parallel they finish
+        // alongside lane 0, and lane 0 still owes a bitfield round trip after
+        // that, which is the slack they land in.
+        let mut lanes = self.start_extra_lanes(&peer);
+        // A peer that cannot be reached, or that answers and then has nothing
+        // for us, takes its half-built lanes down with it: leaving circuits to
+        // finish for a node that is no use to this fetch is exactly the churn
+        // that gets guards disabled.
+        let Ok((conn, identity, reg)) = self.link(&peer).await else {
+            lanes.abort_all();
+            let _ = tx.send((peer.clone(), None, true));
+            return (peer, false);
+        };
+        reg.note_cmd_sent("GetBitfield", Some(&address));
+        let bits = match tokio::time::timeout(
+            EDX_FETCH_TIMEOUT,
+            epix_edx::fetch::fetch_bitfield(&conn, id),
+        )
+        .await
+        {
+            Ok(Ok((_sz, bits))) => bits,
+            // A quick refusal: reachable, just nothing usable for this object.
+            Ok(Err(_)) => {
+                lanes.abort_all();
+                let _ = tx.send((peer.clone(), None, true));
+                return (peer, true);
+            }
+            // Handshook but never answered the bitfield: a zombie. Scored as a
+            // failed dial so the registry backs it off, instead of rewarding it
+            // as reachable and re-burning this timeout at the top of every cold
+            // session.
+            Err(_) => {
+                lanes.abort_all();
+                let _ = tx.send((peer.clone(), None, true));
+                return (peer, false);
+            }
+        };
+        // Lane 0 goes out FIRST so the fetch can start on it; the extra lanes
+        // follow as they land.
+        let _ = tx.send((peer.clone(), Some((conn, identity.clone(), bits.clone())), true));
+        self.collect_extra_lanes(lanes, id, &peer, &identity, &bits, &tx).await;
+        (peer, true)
+    }
+
     fn start_extra_lanes(&self, peer: &PeerAddr) -> tokio::task::JoinSet<Option<Conn>> {
         let mut join = tokio::task::JoinSet::new();
         for lane in 1..lanes_for(peer) {
