@@ -1070,16 +1070,21 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
 /// row lives while it is pooled and so `note_cmd_sent` can annotate it, and the
 /// peer's handshake identity rides along because the fetch paths credit peers
 /// by node key and would otherwise have to redial to learn it.
+/// A pooled link is identified by its peer AND its transfer lane: lane 0 is
+/// the shared control link, higher lanes are the extra transfer paths a bulk
+/// fetch stripes across (see [`Transport::dial_lane`]).
+type LinkKey = (PeerAddr, u8);
+
 #[derive(Default)]
 struct LinkPool {
-    conns: Mutex<HashMap<PeerAddr, PooledLink>>,
-    /// One dial in flight per peer. Looking the cache up and then dialing is a
-    /// check-then-act: the announce, PEX and updates loops run on their own
-    /// timers and land on the same contact together, so each would miss the
-    /// cache and open its own link - the duplicate outbound rows on /Stats, and
-    /// on Tor a fresh circuit apiece. Losers of the race wait here and take the
-    /// winner's link.
-    dialing: Mutex<HashMap<PeerAddr, Arc<tokio::sync::Mutex<()>>>>,
+    conns: Mutex<HashMap<LinkKey, PooledLink>>,
+    /// One dial in flight per peer and lane. Looking the cache up and then
+    /// dialing is a check-then-act: the announce, PEX and updates loops run on
+    /// their own timers and land on the same contact together, so each would
+    /// miss the cache and open its own link - the duplicate outbound rows on
+    /// /Stats, and on Tor a fresh circuit apiece. Losers of the race wait here
+    /// and take the winner's link.
+    dialing: Mutex<HashMap<LinkKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// One pooled link, plus when it was last handed out. The instant is what
@@ -1095,6 +1100,12 @@ struct PooledLink {
 /// What a pooled dial hands back: the multiplexed link, who the peer proved to
 /// be, and the link's row in the diagnostics registry.
 type Link = (Conn, PeerIdentity, Arc<ConnHandle>);
+
+/// One dial result on its way from the session's dial driver to the collector:
+/// the peer, what it yielded (`None` = no usable link), and whether this was
+/// the peer's FIRST lane - the one that counts as its dial outcome.
+type LaneResult =
+    (PeerAddr, Option<(Conn, PeerIdentity, epix_blob::bitfield::GroupBits)>, bool);
 
 /// How long a pooled link with no other user may sit unused before it is
 /// dropped. A pooled `Conn` keeps its socket open, so an entry nobody touches
@@ -1115,7 +1126,7 @@ impl LinkPool {
     /// without asking the pool for anything, and forgetting its link frees
     /// nothing (the session's own handle keeps the socket) while letting the
     /// next caller dial a second link to a peer we are mid-transfer with.
-    fn live(&self, peer: &PeerAddr) -> Option<Link> {
+    fn live(&self, peer: &PeerAddr, lane: u8) -> Option<Link> {
         let mut map = self.conns.lock().expect("link pool");
         let now = tokio::time::Instant::now();
         map.retain(|_, l| {
@@ -1123,22 +1134,30 @@ impl LinkPool {
                 && (l.conn.holders() > 1
                     || now.saturating_duration_since(l.last_used) < LINK_POOL_IDLE)
         });
-        let link = map.get_mut(peer)?;
+        let link = map.get_mut(&(peer.clone(), lane))?;
         link.last_used = now;
         Some((link.conn.clone(), link.identity.clone(), link.reg.clone()))
     }
 
-    fn store(&self, peer: PeerAddr, conn: Conn, identity: PeerIdentity, reg: Arc<ConnHandle>) {
+    fn store(
+        &self,
+        peer: PeerAddr,
+        lane: u8,
+        conn: Conn,
+        identity: PeerIdentity,
+        reg: Arc<ConnHandle>,
+    ) {
         self.conns.lock().expect("link pool").insert(
-            peer,
+            (peer, lane),
             PooledLink { conn, identity, reg, last_used: tokio::time::Instant::now() },
         );
     }
 
-    /// Drop a peer's cached link (an op errored on it, so a possibly dead link
-    /// is not handed to the next caller).
+    /// Drop a peer's cached links (an op errored on it, so a possibly dead
+    /// link is not handed to the next caller). Every lane goes: they share the
+    /// peer, and the failure being scored is the peer's.
     fn evict(&self, peer: &PeerAddr) {
-        self.conns.lock().expect("link pool").remove(peer);
+        self.conns.lock().expect("link pool").retain(|(p, _), _| p != peer);
     }
 
     /// A pooled link for `peer`, opening at most one even when callers race.
@@ -1149,38 +1168,39 @@ impl LinkPool {
     ///
     /// The gate is only ever held across `dial`, which the caller bounds by the
     /// peer's connect timeout, so a stalled peer cannot park it indefinitely.
-    async fn get_or_dial<F, Fut>(&self, peer: &PeerAddr, dial: F) -> Result<Link, String>
+    async fn get_or_dial<F, Fut>(&self, peer: &PeerAddr, lane: u8, dial: F) -> Result<Link, String>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Link, String>>,
     {
-        if let Some(hit) = self.live(peer) {
+        if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
         }
-        let gate = self.dial_gate(peer);
+        let gate = self.dial_gate(peer, lane);
         let Ok(_held) = gate.try_lock() else {
-            // Another caller is dialing this very peer. Wait it out rather than
-            // opening a second link to the same node.
+            // Another caller is dialing this very peer and lane. Wait it out
+            // rather than opening a second link on the same lane.
             let _queued = gate.lock().await;
-            return self.live(peer).ok_or_else(|| "dial in flight failed".to_string());
+            return self.live(peer, lane).ok_or_else(|| "dial in flight failed".to_string());
         };
         // The lookup above and the gate are two steps: a dial may have completed
         // and cached between them.
-        if let Some(hit) = self.live(peer) {
+        if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
         }
         let (conn, identity, reg) = dial().await?;
-        self.store(peer.clone(), conn.clone(), identity.clone(), reg.clone());
+        self.store(peer.clone(), lane, conn.clone(), identity.clone(), reg.clone());
         Ok((conn, identity, reg))
     }
 
-    /// This peer's dial gate, created on first use. Gates nobody is holding are
-    /// dropped as we pass through, so a long-running node does not keep one for
-    /// every peer it has ever dialed.
-    fn dial_gate(&self, peer: &PeerAddr) -> Arc<tokio::sync::Mutex<()>> {
+    /// This peer+lane's dial gate, created on first use. Gates nobody is
+    /// holding are dropped as we pass through, so a long-running node does not
+    /// keep one for every peer it has ever dialed.
+    fn dial_gate(&self, peer: &PeerAddr, lane: u8) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (peer.clone(), lane);
         let mut gates = self.dialing.lock().expect("link pool");
-        gates.retain(|p, gate| p == peer || Arc::strong_count(gate) > 1);
-        gates.entry(peer.clone()).or_default().clone()
+        gates.retain(|k, gate| *k == key || Arc::strong_count(gate) > 1);
+        gates.entry(key).or_default().clone()
     }
 }
 
@@ -1310,6 +1330,7 @@ impl RuntimeEdxFetcher {
         &self,
         transport: &Arc<dyn Transport>,
         peer: &PeerAddr,
+        lane: u8,
     ) -> Result<(Conn, PeerIdentity, Arc<ConnHandle>), String> {
         // A client context: client_hello only reads the key, caps and version;
         // reuse the AppState provider (harmless) and the object store.
@@ -1348,7 +1369,7 @@ impl RuntimeEdxFetcher {
         // Bound the whole handshake: a peer that TCP-accepts then stalls the
         // Noise / client_hello exchange must not hang the fetch forever.
         tokio::time::timeout(peer.connect_timeout(), async {
-            let stream = transport.dial(peer).await.map_err(|e| e.to_string())?;
+            let stream = transport.dial_lane(peer, lane).await.map_err(|e| e.to_string())?;
             let (reg, stream) =
                 ConnHandle::new(Direction::Out, peer.clone()).attach(stream);
             // Clearnet TCP needs Noise; overlays (Tor/I2P/Reticulum) already
@@ -1381,10 +1402,19 @@ impl RuntimeEdxFetcher {
     /// The transport is resolved inside the dial closure so a cache hit does not
     /// depend on one being installed.
     async fn link(&self, peer: &PeerAddr) -> Result<Link, String> {
+        self.link_lane(peer, 0).await
+    }
+
+    /// A live EDX link to `peer` on transfer `lane`. Lane 0 is the shared link
+    /// [`Self::link`] hands out; higher lanes are independent paths a bulk
+    /// fetch stripes across, which over Tor means separate circuits (see
+    /// [`Transport::dial_lane`]). Pooled per lane, so a lane's circuit is
+    /// reused by later windows rather than rebuilt.
+    async fn link_lane(&self, peer: &PeerAddr, lane: u8) -> Result<Link, String> {
         self.link_pool
-            .get_or_dial(peer, || async {
+            .get_or_dial(peer, lane, || async {
                 let transport = self.state.transport().await.ok_or("no transport")?;
-                self.dial(&transport, peer).await
+                self.dial(&transport, peer, lane).await
             })
             .await
     }
@@ -1707,51 +1737,7 @@ impl RuntimeEdxFetcher {
         }
         let total = peers.len();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        {
-            let this = self.clone();
-            let address = address.to_string();
-            tokio::spawn(async move {
-                let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
-                let mut join = tokio::task::JoinSet::new();
-                let mut pending = peers.into_iter();
-                loop {
-                    while join.len() < SESSION_DIAL_CONCURRENCY {
-                        let Some(peer) = pending.next() else { break };
-                        let this = this.clone();
-                        let address = address.clone();
-                        join.spawn(async move {
-                            let Ok((conn, identity, reg)) = this.link(&peer).await
-                            else {
-                                return (peer, false, None);
-                            };
-                            reg.note_cmd_sent("GetBitfield", Some(&address));
-                            match tokio::time::timeout(
-                                EDX_FETCH_TIMEOUT,
-                                epix_edx::fetch::fetch_bitfield(&conn, id),
-                            )
-                            .await
-                            {
-                                Ok(Ok((_sz, bits))) => (peer, true, Some((conn, identity, bits))),
-                                // A quick refusal: reachable, just nothing
-                                // usable for this object.
-                                Ok(Err(_)) => (peer, true, None),
-                                // Handshook but never answered the bitfield:
-                                // a zombie. Scored as a failed dial so the
-                                // registry backs it off, instead of rewarding
-                                // it as reachable and re-burning this timeout
-                                // at the top of every cold session.
-                                Err(_) => (peer, false, None),
-                            }
-                        });
-                    }
-                    let Some(res) = join.join_next().await else { break };
-                    let Ok((peer, dialed, got)) = res else { continue };
-                    outcomes.push((peer.clone(), dialed));
-                    let _ = tx.send((peer, got));
-                }
-                this.state.note_edx_dials(&address, outcomes).await;
-            });
-        }
+        self.spawn_dial_driver(peers, address.to_string(), id, tx);
 
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1765,22 +1751,204 @@ impl RuntimeEdxFetcher {
                 _ = async { tokio::time::sleep_until(grace.unwrap()).await },
                     if grace.is_some() => break,
             };
-            let Some((peer, got)) = next else { break };
-            resolved += 1;
+            let Some((peer, got, primary)) = next else { break };
+            // Only a peer's FIRST lane counts as that peer's dial outcome; the
+            // extra lanes are bonus paths to a peer already resolved.
+            if primary {
+                resolved += 1;
+            }
             if let Some((conn, identity, bits)) = got {
                 if handles.is_empty() {
                     grace = Some(tokio::time::Instant::now() + SESSION_FIRST_HANDLE_GRACE);
                 }
+                // Lanes of one peer share its label, so crediting, upload
+                // accounting and the transfer readout all still see a single
+                // peer - only the scheduler sees several places to put work.
                 let label = peer.to_string();
                 node_pks.insert(label.clone(), identity.node_pk);
                 handles.push(PeerHandle { conn, class: Class::of_addr(&peer), bits, label });
             }
         }
+        // A lane that lands after the grace window is not lost: it stays warm
+        // in the link pool, so the next window of this stream picks it up
+        // without paying for the circuit again.
         self.xfer.note_session(id, address, now_secs(), total as u64, handles.len() as u64);
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
         Ok((handles, node_pks))
+    }
+
+    /// Open this peer's extra transfer lanes and hand each one to the session
+    /// as it lands.
+    ///
+    /// The bitfield is NOT re-fetched per lane: a lane is another path to the
+    /// same node, which holds the same bytes, so asking again would cost a
+    /// round trip per lane to learn what we already know. They dial
+    /// concurrently, and each is announced the moment it is up so the fetch
+    /// widens while the rest are still building.
+    ///
+    /// Only overlay peers get lanes ([`lanes_for`]); for anything else this
+    /// returns without dialing.
+    /// Dial `peers` for a session in the background, reporting every usable
+    /// link on `tx` as it lands and feeding each peer's outcome back to the
+    /// xite's registry when the last one settles.
+    ///
+    /// Detached from the collector on purpose: the session is handed back as
+    /// soon as it has something to fetch over, while this keeps running so a
+    /// dead peer is still SCORED (and backed off) rather than silently
+    /// redialed at the top of the next window.
+    fn spawn_dial_driver(
+        &self,
+        peers: Vec<PeerAddr>,
+        address: String,
+        id: ObjId,
+        tx: tokio::sync::mpsc::UnboundedSender<LaneResult>,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
+            let mut join = tokio::task::JoinSet::new();
+            let mut pending = peers.into_iter();
+            loop {
+                while join.len() < SESSION_DIAL_CONCURRENCY {
+                    let Some(peer) = pending.next() else { break };
+                    let this = this.clone();
+                    let address = address.clone();
+                    let tx = tx.clone();
+                    join.spawn(async move {
+                        this.dial_peer_for_session(peer, address, id, tx).await
+                    });
+                }
+                let Some(res) = join.join_next().await else { break };
+                let Ok((peer, dialed)) = res else { continue };
+                outcomes.push((peer, dialed));
+            }
+            this.state.note_edx_dials(&address, outcomes).await;
+        });
+    }
+
+    /// Dial one peer for a session - lane 0, its bitfield, and its extra
+    /// lanes - reporting each usable link on `tx`. Returns the peer's dial
+    /// outcome for the registry: `true` when it answered at all, whatever it
+    /// then turned out to hold.
+    async fn dial_peer_for_session(
+        &self,
+        peer: PeerAddr,
+        address: String,
+        id: ObjId,
+        tx: tokio::sync::mpsc::UnboundedSender<LaneResult>,
+    ) -> (PeerAddr, bool) {
+        // Start the extra lanes' circuit builds NOW, next to lane 0's rather
+        // than after it. Building them afterwards put them a whole circuit
+        // build behind the session's 2s first-handle grace, so they always
+        // missed the session that wanted them. In parallel they finish
+        // alongside lane 0, and lane 0 still owes a bitfield round trip after
+        // that, which is the slack they land in.
+        let mut lanes = self.start_extra_lanes(&peer);
+        // A peer that cannot be reached, or that answers and then has nothing
+        // for us, takes its half-built lanes down with it: leaving circuits to
+        // finish for a node that is no use to this fetch is exactly the churn
+        // that gets guards disabled.
+        let Ok((conn, identity, reg)) = self.link(&peer).await else {
+            lanes.abort_all();
+            let _ = tx.send((peer.clone(), None, true));
+            return (peer, false);
+        };
+        reg.note_cmd_sent("GetBitfield", Some(&address));
+        let bits = match tokio::time::timeout(
+            EDX_FETCH_TIMEOUT,
+            epix_edx::fetch::fetch_bitfield(&conn, id),
+        )
+        .await
+        {
+            Ok(Ok((_sz, bits))) => bits,
+            // A quick refusal: reachable, just nothing usable for this object.
+            Ok(Err(_)) => {
+                lanes.abort_all();
+                let _ = tx.send((peer.clone(), None, true));
+                return (peer, true);
+            }
+            // Handshook but never answered the bitfield: a zombie. Scored as a
+            // failed dial so the registry backs it off, instead of rewarding it
+            // as reachable and re-burning this timeout at the top of every cold
+            // session.
+            Err(_) => {
+                lanes.abort_all();
+                let _ = tx.send((peer.clone(), None, true));
+                return (peer, false);
+            }
+        };
+        // Lane 0 goes out FIRST so the fetch can start on it; the extra lanes
+        // follow as they land.
+        let _ = tx.send((peer.clone(), Some((conn, identity.clone(), bits.clone())), true));
+        self.collect_extra_lanes(lanes, id, &peer, &identity, &bits, &tx).await;
+        (peer, true)
+    }
+
+    fn start_extra_lanes(&self, peer: &PeerAddr) -> tokio::task::JoinSet<Option<Conn>> {
+        let mut join = tokio::task::JoinSet::new();
+        for lane in 1..lanes_for(peer) {
+            let this = self.clone();
+            let peer = peer.clone();
+            join.spawn(async move { this.link_lane(&peer, lane).await.ok().map(|(c, _, _)| c) });
+        }
+        join
+    }
+
+    /// Hand each opened lane to the session, as it lands.
+    ///
+    /// The bitfield is NOT re-fetched per lane: a lane is another path to the
+    /// same node, which holds the same bytes, so asking again would cost a
+    /// round trip per lane to learn what we already know.
+    ///
+    /// Each lane goes to two places. To the session still forming, which uses
+    /// it if it arrived inside the grace window - the point of dialing lanes
+    /// in parallel with lane 0. And to the object's cached session, which the
+    /// next window and the read-ahead reuse, so a lane that was slow to build
+    /// still joins the transfer moments later instead of idling in the pool
+    /// until the sweep takes it.
+    async fn collect_extra_lanes(
+        &self,
+        mut lanes: tokio::task::JoinSet<Option<Conn>>,
+        id: ObjId,
+        peer: &PeerAddr,
+        identity: &PeerIdentity,
+        bits: &epix_blob::bitfield::GroupBits,
+        tx: &tokio::sync::mpsc::UnboundedSender<LaneResult>,
+    ) {
+        while let Some(res) = lanes.join_next().await {
+            let Ok(Some(conn)) = res else { continue };
+            let handle = PeerHandle {
+                conn: conn.clone(),
+                class: Class::of_addr(peer),
+                bits: bits.clone(),
+                label: peer.to_string(),
+            };
+            self.add_cached_lane(id, handle, identity.node_pk.clone());
+            let _ = tx.send((peer.clone(), Some((conn, identity.clone(), bits.clone())), false));
+        }
+    }
+
+    /// Add a freshly opened lane to `id`'s cached peer session.
+    ///
+    /// A lane is dialed once its peer has answered, which over Tor is a
+    /// circuit build later than the session's first-handle grace - so a lane
+    /// nearly always arrives after the session that asked for it has closed.
+    /// Dropping it there would mean the stripe never forms: the lane would sit
+    /// unused in the link pool until the idle sweep took it, and the next
+    /// window would redial and lose it the same way. Appending to the cached
+    /// session instead means the very next window - the read-ahead, moments
+    /// later - fetches across every lane.
+    fn add_cached_lane(&self, id: ObjId, handle: PeerHandle, node_pk: Vec<u8>) {
+        let now = now_secs();
+        let mut cache = self.peer_cache.lock().expect("peer_cache");
+        let Some(entry) = cache.get_mut(&id) else { return };
+        if now.saturating_sub(entry.at) >= PEER_CACHE_TTL {
+            return; // a stale entry the next fetch will rebuild anyway
+        }
+        entry.node_pks.entry(handle.label.clone()).or_insert(node_pk);
+        entry.handles.push(handle);
     }
 
     /// Revalidate cached session handles for `id`: refresh each link's
@@ -2597,6 +2765,38 @@ fn session_widen(first_dial: std::time::Duration) -> std::time::Duration {
         std::time::Duration::from_millis(150),
         std::time::Duration::from_secs(1),
     )
+}
+
+/// Transfer lanes opened to one OVERLAY peer, i.e. how many independent
+/// circuits a fetch stripes across per seeder.
+///
+/// A Tor circuit carries about 250 KB/s however fast either end's link is:
+/// throughput is its flow-control window (~250 KB in flight) divided by the
+/// round trip, and a six-hop onion path runs near a second. Measured on this
+/// network, one circuit delivered 102-419 KB/s while the seeder was serving
+/// several other peers at once and its own line was idle - the ceiling is the
+/// circuit, not the host. Pipelining more requests down one link cannot beat
+/// it because they all queue behind the same window; only more circuits can.
+///
+/// Three is a deliberate compromise. Each lane is a circuit build, and it is
+/// circuit churn that gets guards blamed for failures and disabled, which is
+/// what takes a node's onion service off the air. Clearnet peers get one lane
+/// (a TCP connection has no such ceiling).
+fn overlay_lanes() -> u8 {
+    std::env::var("EPIX_EDX_ONION_LANES")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(3)
+        .clamp(1, 4)
+}
+
+/// Lanes to open to `peer`: overlay peers stripe, clearnet does not.
+fn lanes_for(peer: &PeerAddr) -> u8 {
+    if peer.is_overlay() {
+        overlay_lanes()
+    } else {
+        1
+    }
 }
 
 /// Overlay dials allowed in flight process-wide (see the call site in
@@ -5246,7 +5446,7 @@ mod tests {
 
         // The handshake advertises the control plane and the release version.
         let transport = state_a.transport().await.unwrap();
-        let (_conn, identity, _reg) = fetcher.dial(&transport, &peer).await.unwrap();
+        let (_conn, identity, _reg) = fetcher.dial(&transport, &peer, 0).await.unwrap();
         assert_eq!(identity.version, "9.9.9", "the HelloAck carries the node version");
         assert!(identity.caps & caps::CONTROL != 0, "the seeder advertises CONTROL");
 
@@ -5656,16 +5856,16 @@ mod tests {
         let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
 
         let pool = LinkPool::default();
-        pool.store(peer.clone(), conn, test_identity(), reg);
-        assert!(pool.live(&peer).is_some(), "a fresh pooled link is reused");
+        pool.store(peer.clone(), 0, conn, test_identity(), reg);
+        assert!(pool.live(&peer, 0).is_some(), "a fresh pooled link is reused");
 
         // Still fresh: a sweep must not cut a link that is being used.
         tokio::time::advance(LINK_POOL_IDLE / 2).await;
-        assert!(pool.live(&peer).is_some(), "a link used within the window survives");
+        assert!(pool.live(&peer, 0).is_some(), "a link used within the window survives");
 
         // `live` above refreshed last_used, so the window restarts from there.
         tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
-        assert!(pool.live(&peer).is_none(), "an idle pooled link is swept");
+        assert!(pool.live(&peer, 0).is_none(), "an idle pooled link is swept");
         assert!(
             pool.conns.lock().expect("link pool").is_empty(),
             "the sweep must DROP the entry, not just decline to hand it out: the Conn and the \
@@ -5692,7 +5892,7 @@ mod tests {
             let (pool, dials, held, peer) =
                 (pool.clone(), dials.clone(), held.clone(), peer.clone());
             set.spawn(async move {
-                pool.get_or_dial(&peer, || async {
+                pool.get_or_dial(&peer, 0, || async {
                     dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // A real dial takes a handshake; yield so the racers pile up
                     // behind this one the way they do against a live peer.
@@ -5738,11 +5938,11 @@ mod tests {
         let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
 
         let pool = LinkPool::default();
-        pool.store(peer.clone(), conn.clone(), test_identity(), reg);
+        pool.store(peer.clone(), 0, conn.clone(), test_identity(), reg);
         // `conn` here stands in for the session's handle: the pool is not the
         // only holder.
         tokio::time::advance(LINK_POOL_IDLE * 3).await;
-        let hit = pool.live(&peer);
+        let hit = pool.live(&peer, 0);
         assert!(hit.is_some(), "a link with another holder is not swept, however long it is idle");
         drop(hit);
 
@@ -5750,7 +5950,7 @@ mod tests {
         // holder, so the entry is ordinary idle state and the sweep takes it.
         drop(conn);
         tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
-        assert!(pool.live(&peer).is_none(), "once nobody is using it, an idle link is swept");
+        assert!(pool.live(&peer, 0).is_none(), "once nobody is using it, an idle link is swept");
     }
 
     /// A dial that fails must not be retried by everyone queued behind it: each
@@ -5766,7 +5966,7 @@ mod tests {
         for _ in 0..5 {
             let (pool, dials, peer) = (pool.clone(), dials.clone(), peer.clone());
             set.spawn(async move {
-                pool.get_or_dial(&peer, || async {
+                pool.get_or_dial(&peer, 0, || async {
                     dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     tokio::task::yield_now().await;
                     Err::<Link, String>("unreachable".into())
@@ -5787,6 +5987,50 @@ mod tests {
         assert!(pool.conns.lock().expect("link pool").is_empty(), "nothing cached on failure");
     }
 
+    /// Lanes are separate links to the SAME peer, so the pool must key on both
+    /// - keying on the peer alone would make lane 1 evict lane 0 on store and
+    /// hand a caller asking for lane 2 whatever link happened to be there,
+    /// collapsing the stripe back onto one circuit.
+    #[tokio::test]
+    async fn the_pool_keeps_one_link_per_lane() {
+        let peer = PeerAddr::parse("198.51.100.12:26552").unwrap();
+        let pool = LinkPool::default();
+        for lane in 0..3u8 {
+            let (a, _b) = tokio::io::duplex(4096);
+            let (reg, stream) = ConnHandle::new(Direction::Out, peer.clone()).attach(Box::pin(a));
+            let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
+            pool.store(peer.clone(), lane, conn, test_identity(), reg);
+        }
+        assert_eq!(pool.conns.lock().expect("link pool").len(), 3);
+        for lane in 0..3u8 {
+            assert!(pool.live(&peer, lane).is_some(), "lane {lane} must have its own link");
+        }
+        assert!(pool.live(&peer, 3).is_none(), "an undialed lane is not somebody else's link");
+
+        // A failure is the PEER's, so eviction takes every lane with it.
+        pool.evict(&peer);
+        assert!(pool.conns.lock().expect("link pool").is_empty());
+    }
+
+    /// Striping only pays where a path has a per-circuit ceiling. A clearnet
+    /// peer has none, and giving it extra lanes would just be extra sockets.
+    #[test]
+    fn only_overlay_peers_get_extra_lanes() {
+        let clearnet = PeerAddr::parse("198.51.100.13:26552").unwrap();
+        assert_eq!(lanes_for(&clearnet), 1);
+
+        let onion = PeerAddr::parse(
+            "onion://23ln3zocykjirek4fzujxrroxh2w5yrouobioeuxyjwbo2izsaduzxad.onion:26552",
+        )
+        .or_else(|_| {
+            PeerAddr::parse("23ln3zocykjirek4fzujxrroxh2w5yrouobioeuxyjwbo2izsaduzxad.onion:26552")
+        })
+        .expect("onion address parses");
+        assert!(onion.is_overlay());
+        assert!(lanes_for(&onion) > 1, "an onion peer stripes across circuits");
+        assert!(lanes_for(&onion) <= 4, "and the stripe stays bounded");
+    }
+
     /// The per-peer gates are bookkeeping, not state: a node that dials a lot of
     /// peers over its life must not keep one around for every peer it ever saw.
     #[tokio::test]
@@ -5795,7 +6039,7 @@ mod tests {
         for i in 0..50u8 {
             let peer = PeerAddr::parse(&format!("198.51.100.{i}:26552")).unwrap();
             let _ = pool
-                .get_or_dial(&peer, || async {
+                .get_or_dial(&peer, 0, || async {
                     Err::<Link, String>("unreachable".into())
                 })
                 .await;

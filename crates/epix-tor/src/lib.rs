@@ -528,6 +528,39 @@ pub struct TorTransport {
     route_all: bool,
 }
 
+/// Lanes we hand out isolation tokens for. Beyond this a lane reuses the
+/// last token, so a caller asking for absurd parallelism degrades to sharing
+/// rather than building an unbounded number of circuits.
+const MAX_ISOLATED_LANES: usize = 8;
+
+/// One stable isolation token per lane index.
+///
+/// Arti shares a circuit between streams whose isolation matches, so without
+/// a token every stream to a peer rides the ONE circuit and inherits its
+/// window-limited throughput. A token per lane splits them onto separate
+/// circuits. The tokens are process-wide and created once, so a lane's
+/// circuit is reused across redials to the same peer instead of building a
+/// fresh one each time - the churn that costs guards. Tokens are per lane and
+/// not per peer because two different onions never share a circuit anyway.
+fn lane_isolation(lane: u8) -> arti_client::IsolationToken {
+    static TOKENS: std::sync::OnceLock<Vec<arti_client::IsolationToken>> =
+        std::sync::OnceLock::new();
+    let tokens = TOKENS.get_or_init(|| {
+        (0..MAX_ISOLATED_LANES).map(|_| arti_client::IsolationToken::new()).collect()
+    });
+    tokens[(lane as usize).min(MAX_ISOLATED_LANES - 1)]
+}
+
+/// Stream preferences for `lane`: lane 0 keeps arti's default (shared with
+/// the control RPCs), higher lanes get their own circuit.
+fn lane_prefs(lane: u8) -> arti_client::StreamPrefs {
+    let mut prefs = arti_client::StreamPrefs::new();
+    if lane > 0 {
+        prefs.set_isolation(lane_isolation(lane));
+    }
+    prefs
+}
+
 #[async_trait]
 impl Transport for TorTransport {
     fn scheme(&self) -> &'static str {
@@ -535,15 +568,20 @@ impl Transport for TorTransport {
     }
 
     async fn dial(&self, addr: &PeerAddr) -> Result<PeerStream> {
+        self.dial_lane(addr, 0).await
+    }
+
+    async fn dial_lane(&self, addr: &PeerAddr, lane: u8) -> Result<PeerStream> {
+        let prefs = lane_prefs(lane);
         let stream: DataStream = match addr {
             PeerAddr::Onion { host, port } => self
                 .client
-                .connect((format!("{host}.onion").as_str(), *port))
+                .connect_with_prefs((format!("{host}.onion").as_str(), *port), &prefs)
                 .await
                 .map_err(|e| Error::Protocol(format!("tor connect {host}.onion:{port}: {e}")))?,
             PeerAddr::Ip(sa) if self.route_all => self
                 .client
-                .connect((sa.ip().to_string().as_str(), sa.port()))
+                .connect_with_prefs((sa.ip().to_string().as_str(), sa.port()), &prefs)
                 .await
                 .map_err(|e| Error::Protocol(format!("tor connect {sa}: {e}")))?,
             PeerAddr::Ip(_) => {
@@ -584,10 +622,16 @@ impl Transport for MixedTransport {
     }
 
     async fn dial(&self, addr: &PeerAddr) -> Result<PeerStream> {
+        self.dial_lane(addr, 0).await
+    }
+
+    async fn dial_lane(&self, addr: &PeerAddr, lane: u8) -> Result<PeerStream> {
         match (addr, &self.tor, self.mode) {
             // Tor-routed: every onion dial, and every dial in Always mode.
-            (PeerAddr::Onion { .. }, Some(tor), _) => tor.dial(addr).await,
-            (_, Some(tor), TorMode::Always) => tor.dial(addr).await,
+            // The lane rides through: only the Tor arms can honour it, which
+            // is also the only place a second path buys anything.
+            (PeerAddr::Onion { .. }, Some(tor), _) => tor.dial_lane(addr, lane).await,
+            (_, Some(tor), TorMode::Always) => tor.dial_lane(addr, lane).await,
             (PeerAddr::Onion { .. }, None, _) => {
                 Err(Error::Protocol("onion peer but Tor is disabled".into()))
             }
