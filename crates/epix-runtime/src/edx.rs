@@ -1751,8 +1751,22 @@ impl RuntimeEdxFetcher {
                         let address = address.clone();
                         let tx = tx.clone();
                         join.spawn(async move {
+                            // Start the extra lanes' circuit builds NOW, next
+                            // to lane 0's rather than after it. Building them
+                            // afterwards put them a whole circuit build behind
+                            // the session's 2s first-handle grace, so they
+                            // always missed the session that wanted them. In
+                            // parallel they finish alongside lane 0, and lane 0
+                            // still owes a bitfield round trip after that,
+                            // which is the slack they land in.
+                            let mut lanes = this.start_extra_lanes(&peer);
                             let Ok((conn, identity, reg)) = this.link(&peer).await
                             else {
+                                // Dead peer: stop its lanes mid-build instead
+                                // of leaving circuits to finish for a node
+                                // that never answered. Circuit churn on dead
+                                // peers is what gets guards disabled.
+                                lanes.abort_all();
                                 let _ = tx.send((peer.clone(), None, true));
                                 return (peer, false);
                             };
@@ -1767,6 +1781,7 @@ impl RuntimeEdxFetcher {
                                 // A quick refusal: reachable, just nothing
                                 // usable for this object.
                                 Ok(Err(_)) => {
+                                    lanes.abort_all();
                                     let _ = tx.send((peer.clone(), None, true));
                                     return (peer, true);
                                 }
@@ -1776,6 +1791,7 @@ impl RuntimeEdxFetcher {
                                 // it as reachable and re-burning this timeout
                                 // at the top of every cold session.
                                 Err(_) => {
+                                    lanes.abort_all();
                                     let _ = tx.send((peer.clone(), None, true));
                                     return (peer, false);
                                 }
@@ -1787,7 +1803,8 @@ impl RuntimeEdxFetcher {
                                 Some((conn, identity.clone(), bits.clone())),
                                 true,
                             ));
-                            this.dial_extra_lanes(id, &peer, &identity, &bits, &tx).await;
+                            this.collect_extra_lanes(lanes, id, &peer, &identity, &bits, &tx)
+                                .await;
                             (peer, true)
                         });
                     }
@@ -1850,44 +1867,48 @@ impl RuntimeEdxFetcher {
     ///
     /// Only overlay peers get lanes ([`lanes_for`]); for anything else this
     /// returns without dialing.
-    async fn dial_extra_lanes(
+    fn start_extra_lanes(&self, peer: &PeerAddr) -> tokio::task::JoinSet<Option<Conn>> {
+        let mut join = tokio::task::JoinSet::new();
+        for lane in 1..lanes_for(peer) {
+            let this = self.clone();
+            let peer = peer.clone();
+            join.spawn(async move { this.link_lane(&peer, lane).await.ok().map(|(c, _, _)| c) });
+        }
+        join
+    }
+
+    /// Hand each opened lane to the session, as it lands.
+    ///
+    /// The bitfield is NOT re-fetched per lane: a lane is another path to the
+    /// same node, which holds the same bytes, so asking again would cost a
+    /// round trip per lane to learn what we already know.
+    ///
+    /// Each lane goes to two places. To the session still forming, which uses
+    /// it if it arrived inside the grace window - the point of dialing lanes
+    /// in parallel with lane 0. And to the object's cached session, which the
+    /// next window and the read-ahead reuse, so a lane that was slow to build
+    /// still joins the transfer moments later instead of idling in the pool
+    /// until the sweep takes it.
+    async fn collect_extra_lanes(
         &self,
+        mut lanes: tokio::task::JoinSet<Option<Conn>>,
         id: ObjId,
         peer: &PeerAddr,
         identity: &PeerIdentity,
         bits: &epix_blob::bitfield::GroupBits,
         tx: &tokio::sync::mpsc::UnboundedSender<LaneResult>,
     ) {
-        let lanes = lanes_for(peer);
-        if lanes <= 1 {
-            return;
+        while let Some(res) = lanes.join_next().await {
+            let Ok(Some(conn)) = res else { continue };
+            let handle = PeerHandle {
+                conn: conn.clone(),
+                class: Class::of_addr(peer),
+                bits: bits.clone(),
+                label: peer.to_string(),
+            };
+            self.add_cached_lane(id, handle, identity.node_pk.clone());
+            let _ = tx.send((peer.clone(), Some((conn, identity.clone(), bits.clone())), false));
         }
-        let mut join = tokio::task::JoinSet::new();
-        for lane in 1..lanes {
-            let this = self.clone();
-            let peer = peer.clone();
-            let identity = identity.clone();
-            let bits = bits.clone();
-            let tx = tx.clone();
-            join.spawn(async move {
-                let Ok((conn, _identity, _reg)) = this.link_lane(&peer, lane).await else {
-                    return;
-                };
-                // Offer it to the session still forming - it only gets in if
-                // it beat the grace window, which a cold circuit build will
-                // not - and to the object's cached session either way, which
-                // is what the next window and the read-ahead actually reuse.
-                let handle = PeerHandle {
-                    conn: conn.clone(),
-                    class: Class::of_addr(&peer),
-                    bits: bits.clone(),
-                    label: peer.to_string(),
-                };
-                this.add_cached_lane(id, handle, identity.node_pk.clone());
-                let _ = tx.send((peer, Some((conn, identity, bits)), false));
-            });
-        }
-        while join.join_next().await.is_some() {}
     }
 
     /// Add a freshly opened lane to `id`'s cached peer session.

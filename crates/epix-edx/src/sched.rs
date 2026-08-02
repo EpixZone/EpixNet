@@ -699,6 +699,7 @@ impl Swarm {
             .enumerate()
             .filter(|(i, p)| {
                 *i != primary
+                    && p.label != peers[primary].label
                     && ok_classes.contains(&p.class)
                     && groups.iter().all(|g| p.bits.contains(*g))
             })
@@ -1246,6 +1247,50 @@ mod tests {
             Some(0),
             "a rescued batch still counts against the stalled primary, or a dead-but-accepting \
              peer is never exhausted"
+        );
+    }
+
+    /// A stalled batch must not be raced onto another LANE of the same peer.
+    /// Lanes are separate paths to ONE node, so a duplicate there asks the
+    /// peer that has already gone quiet to serve the same bytes twice - which
+    /// is how a striped swarm spends the capacity its extra circuits bought.
+    /// The sibling here is a perfectly good server, and the batch must still
+    /// fail rather than lean on it.
+    #[tokio::test]
+    async fn a_duplicate_never_goes_to_a_sibling_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+        store.ensure_sparse(id, epix_blob::Ns::Plain, size, 1).unwrap();
+
+        // Two lanes of ONE peer: the primary goes silent, its sibling would
+        // happily serve. Same label = same node.
+        let peers = vec![
+            PeerHandle {
+                conn: dummy_conn(),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "peer-a".into(),
+            },
+            PeerHandle {
+                conn: serving_conn(&data),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "peer-a".into(),
+            },
+        ];
+
+        let swarm = Swarm::new(store.clone(), id, size);
+        let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
+        let groups = swarm.groups_of(&(0..size));
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
+        assert_eq!(outcome.duplicates, 0, "a sibling lane is not a duplication target");
+        assert_eq!(
+            outcome.winner_label, None,
+            "the batch fails and is rescheduled, rather than doubling the load on the one \
+             peer that is already not delivering"
         );
     }
 
