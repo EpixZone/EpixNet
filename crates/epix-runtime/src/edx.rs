@@ -1332,7 +1332,11 @@ impl RuntimeEdxFetcher {
         // 70% failure rate, disables them; with no usable guard the onion
         // service cannot publish its descriptor, so the node goes unreachable
         // over Tor. Clearnet dials are cheap and stay unbounded.
-        let _overlay_slot = match peer.is_overlay() {
+        // Same condition as connect_timeout: in Tor-always mode an Ip peer is
+        // dialed through an exit circuit, so it costs a circuit too and must
+        // be counted. Gating on the address alone left every clearnet dial
+        // uncapped in exactly the mode where all of them ride Tor.
+        let _circuit_slot = match peer.is_overlay() || epix_core::route_all_via_overlay() {
             true => Some(overlay_dial_permit().await),
             false => None,
         };
@@ -2587,15 +2591,22 @@ fn session_widen(first_dial: std::time::Duration) -> std::time::Duration {
 /// a burst of circuit builds it will mostly fail.
 const MAX_CONCURRENT_OVERLAY_DIALS: usize = 8;
 
-/// Wait for one of the [`MAX_CONCURRENT_OVERLAY_DIALS`] slots. The permit is
-/// held for the dial only; once a link is up it costs no slot.
-async fn overlay_dial_permit() -> tokio::sync::SemaphorePermit<'static> {
+/// The shared overlay-dial slots.
+fn overlay_dial_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SLOTS
-        .get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_OVERLAY_DIALS))
-        .acquire()
-        .await
-        .expect("overlay dial slots are never closed")
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_OVERLAY_DIALS))
+}
+
+/// Wait for one of the [`MAX_CONCURRENT_OVERLAY_DIALS`] slots.
+///
+/// This bounds dials IN FLIGHT, not connections. The permit is released when
+/// the dial finishes, an established link holds none (a pooled link never
+/// reaches `dial`), and every dial is bounded by `connect_timeout`, so slots
+/// always come back. Acquisition is FIFO, so a peer that has to queue is
+/// never starved - it dials a moment later. The cap cannot, therefore, close
+/// a node into a fixed set of peers.
+async fn overlay_dial_permit() -> tokio::sync::SemaphorePermit<'static> {
+    overlay_dial_slots().acquire().await.expect("overlay dial slots are never closed")
 }
 
 /// Manifest requests kept in flight per link. Held under the seeder's
@@ -4143,6 +4154,34 @@ mod tests {
         assert_eq!(seen.len(), 1, "one callback per served path, none for the unserved");
         assert_eq!(seen[0].0, "content.json");
         assert_eq!(seen[0].1, served["content.json"], "callback carries the served bytes");
+    }
+
+    /// The overlay dial cap bounds dials IN FLIGHT, not connections: once a
+    /// dial finishes its slot frees and the next peer dials. The worry it has
+    /// to rule out is a node sealing itself into a fixed set of peers - if the
+    /// cap were a connection limit, N nodes pointing at each other would form
+    /// a closed pool that never reaches anyone else. It cannot: the permit is
+    /// held for the dial only, acquisition is FIFO so a queued peer is never
+    /// starved, and every dial is bounded by connect_timeout so slots always
+    /// come back.
+    #[tokio::test]
+    async fn the_overlay_dial_cap_queues_rather_than_excludes() {
+        let slots = overlay_dial_slots();
+        let held: Vec<_> = (0..MAX_CONCURRENT_OVERLAY_DIALS)
+            .map(|_| slots.try_acquire().expect("cap starts empty"))
+            .collect();
+        assert_eq!(held.len(), MAX_CONCURRENT_OVERLAY_DIALS);
+
+        // Saturated: the next peer waits instead of dialing immediately.
+        assert!(slots.try_acquire().is_err(), "the cap is a real bound");
+        let queued = tokio::time::timeout(std::time::Duration::from_millis(50), overlay_dial_permit()).await;
+        assert!(queued.is_err(), "a 9th dial queues while all slots are busy");
+
+        // One dial finishes: the queued peer goes through. This is the part
+        // that makes a closed pool impossible.
+        drop(held.into_iter().next().expect("a permit"));
+        let now_free = tokio::time::timeout(std::time::Duration::from_secs(5), overlay_dial_permit()).await;
+        assert!(now_free.is_ok(), "a freed slot admits the waiting peer");
     }
 
     /// A session starts on the first peer that ANSWERS instead of waiting for
