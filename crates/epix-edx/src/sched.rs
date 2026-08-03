@@ -190,6 +190,48 @@ impl ClassStats {
     }
 }
 
+/// Smoothed per-PEER service time, measured per group so batches of
+/// different sizes compare directly.
+///
+/// [`ClassStats`] answers "how fast is Tor today", which is the right
+/// question for choosing a duplication target but not for choosing between
+/// two peers of the SAME class: measured live, one onion peer served a group
+/// in ~250 ms while another on the same circuit type took ~2 s, and the class
+/// prior rated them identically. For a streaming deadline that difference is
+/// the whole game - a batch just past the play head handed to the slow one
+/// arrives after the player needed it, however healthy the swarm's aggregate
+/// throughput looks.
+///
+/// A peer with no sample yet has no entry, and picking falls back to its class
+/// prior, so an unmeasured peer is still tried rather than starved by peers
+/// that happen to have gone first.
+#[derive(Clone, Debug, Default)]
+pub struct PeerStats {
+    per_group: HashMap<String, Duration>,
+}
+
+impl PeerStats {
+    /// Fold one delivered batch into the peer's prior. `groups` is the batch's
+    /// group count; a zero-group batch carries no rate information.
+    pub fn observe(&mut self, label: &str, elapsed: Duration, groups: u64) {
+        if groups == 0 {
+            return;
+        }
+        let sample = elapsed / groups as u32;
+        let next = match self.per_group.get(label) {
+            // EWMA: new = 3/4 prior + 1/4 sample, matching ClassStats.
+            Some(prior) => (*prior * 3 + sample) / 4,
+            None => sample,
+        };
+        self.per_group.insert(label.to_string(), next);
+    }
+
+    /// The peer's smoothed per-group service time, if it has delivered.
+    pub fn per_group(&self, label: &str) -> Option<Duration> {
+        self.per_group.get(label).copied()
+    }
+}
+
 /// Live reporting hook for one [`Swarm::fetch`].
 ///
 /// The scheduler already knows everything a torrent client's transfer pane
@@ -237,6 +279,33 @@ pub fn rarest_first_order(needed: &GroupBits, peers: &[PeerHandle]) -> Vec<u64> 
     }
     counts.sort();
     counts.into_iter().map(|(_, g)| g).collect()
+}
+
+/// Order missing groups in play order: lowest index first, skipping any no
+/// peer holds. What a player needs, and NOT what [`rarest_first_order`] gives.
+///
+/// A serve can only hand the player the CONTIGUOUS prefix of its window that
+/// has landed (`present_prefix_len`), so one hole truncates everything behind
+/// it however much of the window arrived: a node holding most of a film still
+/// shows "buffering" if the group at the play head is the one outstanding.
+/// Rarest-first maximises swarm health by spreading which pieces exist, which
+/// is right for a bulk transfer and precisely wrong here - it scatters arrivals
+/// across the window, so the prefix crawls while total throughput looks fine.
+///
+/// Bulk fetches keep rarest-first, so the swarm still gets that property from
+/// every non-streaming transfer; only a fetch feeding a player trades it for
+/// contiguity.
+pub fn sequential_order(needed: &GroupBits, peers: &[PeerHandle]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for run in needed.ranges() {
+        for g in run.clone() {
+            if peers.iter().any(|p| p.bits.contains(g)) {
+                out.push(g);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 /// Group a sorted list of group indices into contiguous request-sized
@@ -353,6 +422,8 @@ pub struct Swarm {
     /// Interior-mutable: the in-flight batch futures borrow the swarm
     /// shared while completed outcomes fold their latencies back in.
     stats: Mutex<ClassStats>,
+    /// Per-peer speed, the signal streaming peer-picking orders on.
+    peer_stats: Mutex<PeerStats>,
     /// Live reporting sink, when the caller wants one.
     observer: Option<Arc<dyn FetchObserver>>,
 }
@@ -460,7 +531,7 @@ impl<'a> Window<'a> {
         report: &mut FetchReport,
     ) -> bool {
         let bgroups = swarm.groups_of(&batch);
-        match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails) {
+        match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails, deadline) {
             Some(idx) => {
                 self.schedule(swarm, batch, bgroups, idx, peers, deadline, now, report);
                 true
@@ -490,7 +561,8 @@ impl<'a> Window<'a> {
         let mut assigned = false;
         for sub in split_by_holder(bgroups, peers, swarm.size, batch_groups) {
             let sgroups = swarm.groups_of(&sub);
-            let Some(idx) = swarm.pick_peer(&sgroups, peers, &self.load, &self.fails) else {
+            let Some(idx) = swarm.pick_peer(&sgroups, peers, &self.load, &self.fails, deadline)
+            else {
                 continue;
             };
             self.schedule(swarm, sub, sgroups, idx, peers, deadline, now, report);
@@ -550,7 +622,14 @@ impl<'a> Window<'a> {
 
 impl Swarm {
     pub fn new(store: Arc<Store>, obj: ObjId, size: u64) -> Self {
-        Self { store, obj, size, stats: Mutex::new(ClassStats::default()), observer: None }
+        Self {
+            store,
+            obj,
+            size,
+            stats: Mutex::new(ClassStats::default()),
+            peer_stats: Mutex::new(PeerStats::default()),
+            observer: None,
+        }
     }
 
     /// Report this fetch's per-peer progress to `observer` as it runs.
@@ -595,7 +674,13 @@ impl Swarm {
         // cursor. Re-counting holders and re-sorting every remaining group
         // on each refill made a whole-object fetch quadratic in object size
         // (a 10 GB object is ~600k groups).
-        let full_order = rarest_first_order(needed, peers);
+        // A player needs contiguity (see `sequential_order`); a bulk transfer
+        // needs swarm health (see `rarest_first_order`).
+        let full_order = if deadline.is_streaming() {
+            sequential_order(needed, peers)
+        } else {
+            rarest_first_order(needed, peers)
+        };
         // One size for the whole call: batches are cut before a peer is
         // picked, so the slowest class present sets it.
         let batch_groups = batch_groups_for(peers);
@@ -653,6 +738,14 @@ impl Swarm {
         // duplicate-target ordering uses real RTT.
         if let (Some(cls), Some(el)) = (outcome.winner_class, outcome.elapsed) {
             self.stats.lock().expect("stats").observe(cls, el);
+            // Same measurement, attributed to the peer rather than its class,
+            // so picking can tell two peers of one class apart.
+            if let Some(label) = outcome.winner_label.as_deref() {
+                self.peer_stats
+                    .lock()
+                    .expect("peer stats")
+                    .observe(label, el, outcome.landed.len() as u64);
+            }
         }
         // Count a failed batch against its peer; a peer that delivered is
         // healthy again, so one bad batch cannot bury it forever.
@@ -685,18 +778,47 @@ impl Swarm {
     /// in `groups`, ties broken by prior failures then class RTT (fast
     /// peers preferred). A peer past PEER_FAIL_LIMIT consecutive failures
     /// is exhausted and never picked.
-    fn pick_peer(&self, groups: &[u64], peers: &[PeerHandle], load: &[u32], fails: &[u32]) -> Option<usize> {
+    /// Choose a peer for `groups`, from those that hold all of it, are not
+    /// exhausted, and have a free pipeline slot.
+    ///
+    /// The ordering depends on what the fetch is for. Background bulk keeps
+    /// spreading work by load, which uses the whole swarm and is what a
+    /// patient transfer wants. A streaming deadline instead orders by measured
+    /// per-peer speed first, because there load-balancing actively hurts: an
+    /// idle slow peer sorts ahead of a busy fast one on load, so the batch just
+    /// past the play head goes to the peer least able to deliver it in time,
+    /// and the contiguous prefix the player consumes stalls while aggregate
+    /// throughput still looks healthy. Ordering by speed lets the fast peers
+    /// fill their pipelines first and leaves a slow peer only the work they
+    /// have no slot for - it still contributes, but never holds up playback.
+    ///
+    /// A peer with no measurement yet falls back to its class prior, so it is
+    /// tried rather than starved by whoever happened to be measured first.
+    fn pick_peer(
+        &self,
+        groups: &[u64],
+        peers: &[PeerHandle],
+        load: &[u32],
+        fails: &[u32],
+        deadline: Deadline,
+    ) -> Option<usize> {
         let stats = self.stats.lock().expect("stats");
-        peers
-            .iter()
-            .enumerate()
-            .filter(|(i, p)| {
-                fails[*i] < PEER_FAIL_LIMIT
-                    && load[*i] < pipeline_depth(p.class)
-                    && groups.iter().all(|g| p.bits.contains(*g))
-            })
-            .min_by_key(|(i, p)| (fails[*i], load[*i], stats.rtt(p.class)))
-            .map(|(i, _)| i)
+        let peer_stats = self.peer_stats.lock().expect("peer stats");
+        let eligible = peers.iter().enumerate().filter(|(i, p)| {
+            fails[*i] < PEER_FAIL_LIMIT
+                && load[*i] < pipeline_depth(p.class)
+                && groups.iter().all(|g| p.bits.contains(*g))
+        });
+        if deadline.is_streaming() {
+            eligible
+                .min_by_key(|(i, p)| {
+                    let cost = peer_stats.per_group(&p.label).unwrap_or_else(|| stats.rtt(p.class));
+                    (fails[*i], cost, load[*i])
+                })
+                .map(|(i, _)| i)
+        } else {
+            eligible.min_by_key(|(i, p)| (fails[*i], load[*i], stats.rtt(p.class))).map(|(i, _)| i)
+        }
     }
 
     /// A failed batch's outcome. The groups whose streamed prefix already
@@ -942,6 +1064,29 @@ impl Deadline {
     pub fn background() -> Self {
         Self { ms: 0, max_wait: Duration::from_secs(120) }
     }
+
+    /// Read-ahead for a player: the fetch that keeps the buffer ahead of the
+    /// play head.
+    ///
+    /// This is streaming work - it decides whether playback stalls a minute
+    /// from now - so it wants play-order scheduling and the fastest peers, like
+    /// [`Self::tight`]. Running it as background bulk (which is what it used to
+    /// be) meant the buffer was built by whichever peer happened to be idle,
+    /// including one too slow to deliver before the play head arrived.
+    ///
+    /// The absolute cap stays patient like background's: nothing is waiting on
+    /// any single one of these batches right now, so a slow-but-moving one
+    /// should finish rather than be cut off and refetched.
+    pub fn prefetch() -> Self {
+        Self { ms: 500, max_wait: Duration::from_secs(120) }
+    }
+
+    /// Whether this tier is serving a player, where a late batch is a visible
+    /// stall rather than a slower transfer. Keyed off the advisory `ms` the
+    /// tier already carries: only the streaming tiers set one.
+    pub fn is_streaming(&self) -> bool {
+        self.ms > 0
+    }
 }
 
 // --- tiny future combinators (avoid pulling futures-util) ---
@@ -1055,6 +1200,100 @@ mod tests {
         // Duplicating a clearnet request may only target clearnet.
         let from_clear = s.faster_or_equal(Class::Clearnet);
         assert_eq!(from_clear, vec![Class::Clearnet]);
+    }
+
+    /// Streaming picks the peer that actually delivers fastest, even when a
+    /// slower one is idle; background keeps spreading by load. The slow peer is
+    /// the same class as the fast one, so only the per-PEER measurement can
+    /// tell them apart.
+    #[tokio::test]
+    async fn streaming_picks_the_fastest_peer_while_background_spreads_load() {
+        let mut bits = GroupBits::new();
+        bits.add(0..4);
+        let peers = vec![
+            PeerHandle {
+                conn: dummy_conn(),
+                class: Class::Tor,
+                bits: bits.clone(),
+                label: "fast".into(),
+            },
+            PeerHandle { conn: dummy_conn(), class: Class::Tor, bits, label: "slow".into() },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let swarm = Swarm::new(store, epix_blob::ObjId([0u8; 32]), 4 * 16 * 1024);
+        {
+            let mut ps = swarm.peer_stats.lock().expect("peer stats");
+            ps.observe("fast", Duration::from_millis(250), 1);
+            ps.observe("slow", Duration::from_secs(4), 1);
+        }
+
+        // "fast" is busy, "slow" is idle. Load-ordering would take the idle
+        // slow peer; a streaming deadline must still take the fast one.
+        let load = [1u32, 0];
+        let fails = [0u32, 0];
+        let groups = [0u64];
+        assert_eq!(
+            swarm.pick_peer(&groups, &peers, &load, &fails, Deadline::tight()),
+            Some(0),
+            "streaming must prefer the measured-fast peer over an idle slow one"
+        );
+        assert_eq!(
+            swarm.pick_peer(&groups, &peers, &load, &fails, Deadline::background()),
+            Some(1),
+            "background still spreads by load"
+        );
+
+        // Once the fast peer's pipeline is full, the slow peer still gets work
+        // rather than the fetch stalling - it contributes, it just never holds
+        // up the play head.
+        let saturated = [pipeline_depth(Class::Tor), 0];
+        assert_eq!(
+            swarm.pick_peer(&groups, &peers, &saturated, &fails, Deadline::tight()),
+            Some(1),
+            "a saturated fast peer must not starve the swarm"
+        );
+    }
+
+    /// A player is served the contiguous prefix of its window, so streaming
+    /// must fetch in play order even when that is the opposite of rarest-first.
+    /// Bulk keeps rarest-first, so the swarm still gets that property.
+    #[tokio::test]
+    async fn streaming_fetches_in_play_order_while_bulk_stays_rarest_first() {
+        // group 0 held by both peers (common), groups 1 and 2 by one each (rare).
+        let mut a = GroupBits::new();
+        a.add(0..2); // 0,1
+        let mut b = GroupBits::new();
+        b.add(0..1); // 0
+        b.add(2..3); // 2
+        let peers = vec![
+            PeerHandle { conn: dummy_conn(), class: Class::Tor, bits: a, label: "a".into() },
+            PeerHandle { conn: dummy_conn(), class: Class::Tor, bits: b, label: "b".into() },
+        ];
+        let mut needed = GroupBits::new();
+        needed.add(0..3);
+
+        // Play order: 0 first, because the player cannot use 1 or 2 until 0 has
+        // landed - exactly the case rarest-first gets wrong.
+        assert_eq!(sequential_order(&needed, &peers), vec![0, 1, 2]);
+        // Rarest-first puts the common group last.
+        assert_eq!(*rarest_first_order(&needed, &peers).last().unwrap(), 0);
+
+        // A group no peer holds is not schedulable in either order.
+        let mut unheld = GroupBits::new();
+        unheld.add(0..1);
+        unheld.add(9..10);
+        assert_eq!(sequential_order(&unheld, &peers), vec![0]);
+    }
+
+    /// The read-ahead tier is streaming (so it gets play-order scheduling and
+    /// speed-ordered peers) while staying patient on the absolute cap.
+    #[test]
+    fn prefetch_is_streaming_but_patient() {
+        assert!(Deadline::prefetch().is_streaming());
+        assert!(Deadline::tight().is_streaming());
+        assert!(!Deadline::background().is_streaming());
+        assert_eq!(Deadline::prefetch().max_wait, Deadline::background().max_wait);
     }
 
     #[tokio::test]

@@ -386,6 +386,23 @@ const MOOV_HEAD_BYTES: u64 = 1024 * 1024;
 /// cheap round trip, never a wrong serve.
 const PEER_CACHE_TTL: u64 = 120;
 
+/// How long a peer session may be reused before it is re-dialed from scratch,
+/// however well it is working.
+///
+/// Reuse re-stamps the TTL, so a session that keeps delivering is never
+/// rebuilt - and `peers_for` only rebuilds when the cached links cannot
+/// SUPPLY the needed groups. One seeder holding the whole file satisfies that
+/// forever, so a stream would pin itself to whichever peers answered first and
+/// never pick up one discovered later, however much faster the swarm had
+/// become. Measured on a 567 MB film: pinned to a single I2P link it drew
+/// 138-358 KB/s against the 795 KB/s the film needed and stalled constantly,
+/// while a freshly dialed session over the same swarm reached 794 KB/s.
+///
+/// Rebuilding periodically costs one concurrent dial round, which the link
+/// pool mostly serves warm, and lets a long stream keep finding capacity.
+/// "Can supply" is not the same as "can supply fast enough".
+const SESSION_MAX_AGE: u64 = 90;
+
 /// How many EDX dials a session opens at once. Dead overlay peers take up to
 /// their whole connect timeout to fail, so dialing serially let one dead
 /// onion stall the serve for 45s per peer; a small cap keeps a dial burst
@@ -1264,8 +1281,12 @@ struct Streaming {
 struct CachedPeers {
     handles: Vec<PeerHandle>,
     node_pks: HashMap<String, Vec<u8>>,
-    /// `now_secs` when built, for the TTL check.
+    /// `now_secs` when last reused, for the TTL check.
     at: u64,
+    /// `now_secs` when the session was first DIALED. Reuse re-stamps `at`,
+    /// so without this a session that keeps working is never rebuilt and can
+    /// never pick up a peer discovered later (see [`SESSION_MAX_AGE`]).
+    built: u64,
 }
 
 /// Clone a peer handle (its `Conn` is a cheap multiplexed clone). `PeerHandle`
@@ -1994,12 +2015,16 @@ impl RuntimeEdxFetcher {
         // here (the only growth path, hit on every store-miss serve) bounds the
         // map to the objects served within one TTL window.
         cache.retain(|_, c| now.saturating_sub(c.at) < PEER_CACHE_TTL);
+        // Re-stamping keeps a working session warm, but the DIAL time is
+        // carried over so `SESSION_MAX_AGE` still forces a periodic rescan.
+        let built = cache.get(&id).map_or(now, |c| c.built);
         cache.insert(
             id,
             CachedPeers {
                 handles: handles.iter().map(clone_handle).collect(),
                 node_pks: node_pks.clone(),
                 at: now,
+                built,
             },
         );
     }
@@ -2027,7 +2052,13 @@ impl RuntimeEdxFetcher {
         let now = now_secs();
         let cached = {
             let cache = self.peer_cache.lock().expect("peer_cache");
-            cache.get(&id).filter(|hit| now.saturating_sub(hit.at) < PEER_CACHE_TTL).map(|hit| {
+            cache
+                .get(&id)
+                .filter(|hit| {
+                    now.saturating_sub(hit.at) < PEER_CACHE_TTL
+                        && now.saturating_sub(hit.built) < SESSION_MAX_AGE
+                })
+                .map(|hit| {
                 (hit.handles.iter().map(clone_handle).collect::<Vec<_>>(), hit.node_pks.clone())
             })
         };
@@ -2202,7 +2233,10 @@ impl RuntimeEdxFetcher {
         self.xfer.note_readahead(id, address, now, Some((window.start, window.end)));
         let mut swarm =
             Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
-        if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
+        // Read-ahead IS streaming work - it decides whether playback stalls a
+        // minute from now - so it fetches in play order over the fastest peers,
+        // not as background bulk spread across whoever is idle.
+        if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::prefetch(), now).await {
             self.credit(&report, &node_pks, now);
         }
         self.xfer.note_readahead(id, address, now_secs(), None);
