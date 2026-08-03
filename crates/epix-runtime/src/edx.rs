@@ -1296,7 +1296,67 @@ fn clone_handle(h: &PeerHandle) -> PeerHandle {
     PeerHandle { conn: h.conn.clone(), class: h.class, bits: h.bits.clone(), label: h.label.clone() }
 }
 
+/// Attempts at the group blocking a window's prefix before the serve gives up,
+/// and how long to wait between them.
+///
+/// Short on purpose: the player is waiting on this response, so the budget is
+/// what a browser will sit through rather than what the swarm might eventually
+/// manage. Failing here is not fatal by itself - the caller answers "not yet"
+/// and the player re-requests - so this only has to cover the common case where
+/// the group is moments away.
+const PREFIX_HEAD_ATTEMPTS: u32 = 3;
+const PREFIX_HEAD_WAIT: std::time::Duration = std::time::Duration::from_millis(700);
+
 impl RuntimeEdxFetcher {
+    /// Attempts at the group blocking a window's prefix before the serve gives
+    /// up, and how long to wait between them.
+    ///
+    /// Short on purpose: the player is waiting on this response, so the budget
+    /// is what a browser will sit through rather than what the swarm might
+    /// eventually manage. Failing here is not fatal by itself - the caller
+    /// answers "not yet" and the player re-requests - so this only has to cover
+    /// the common case where the group is moments away.
+
+    /// Fetch just the one group that is holding up `served`'s contiguous
+    /// prefix, and return the prefix length that results.
+    ///
+    /// Asking for a single group rather than the whole window is the point:
+    /// it is the smallest unit that can turn a zero-length answer into a
+    /// servable one, it cannot be starved by the groups behind it, and every
+    /// peer holding it is a candidate. Returns 0 if it still has not landed,
+    /// which the caller reports as unavailable.
+    async fn retry_prefix_head(
+        &self,
+        address: &str,
+        store: &Arc<Store>,
+        id: ObjId,
+        size: u64,
+        served: &Range<u64>,
+        now: u64,
+    ) -> u64 {
+        for attempt in 0..PREFIX_HEAD_ATTEMPTS {
+            // Re-read each pass: a concurrent read-ahead may have landed it
+            // while we waited, in which case there is nothing left to ask for.
+            let present = store.present_bits(id).unwrap_or_default();
+            let got = present_prefix_len(&present, served, size);
+            if got > 0 {
+                return got;
+            }
+            let missing = missing_groups(&present, served);
+            let Some(head) = missing.ranges().first().map(|r| r.start) else {
+                return 0; // nothing missing yet nothing servable: not ours to fix
+            };
+            let mut one = epix_blob::bitfield::GroupBits::new();
+            one.add(head..head + 1);
+            self.fetch_missing(address, store, id, size, &one, now).await;
+            if attempt + 1 < PREFIX_HEAD_ATTEMPTS {
+                tokio::time::sleep(PREFIX_HEAD_WAIT).await;
+            }
+        }
+        let present = store.present_bits(id).unwrap_or_default();
+        present_prefix_len(&present, served, size)
+    }
+
     /// Build a fetcher with an empty control-link cache.
     fn new(state: Arc<AppState>, privatekey: String, choker: Option<SharedChoker>) -> Self {
         Self {
@@ -3334,10 +3394,29 @@ impl EdxFetcher for RuntimeEdxFetcher {
                 fetch_err = self.fetch_missing(address, &store, id, size, &needed, now).await;
             }
             let present = store.present_bits(id).unwrap_or_default();
-            let got = present_prefix_len(&present, &served, size);
+            let mut got = present_prefix_len(&present, &served, size);
+            // Nothing servable means the group at the START of the window is
+            // the one outstanding: the rest of this path can serve a short
+            // prefix, but a zero-length answer has nowhere to go but an error,
+            // and an error mid-playback tears the stream down. The group
+            // blocking the prefix is worth a second, narrower attempt on its
+            // own - the first pass asked for the whole window, so it competed
+            // with groups the player does not need yet, and read-ahead or a
+            // peer discovered since may have landed it already.
+            if got == 0 {
+                got = self.retry_prefix_head(address, &store, id, size, &served, now).await;
+            }
             if got == 0 {
                 let e = fetch_err
                     .unwrap_or_else(|| "no bytes of the requested range are available".into());
+                // Only the transfer pane used to hear about this, so a stall
+                // that ended a playback left no trace in the log at all.
+                self.state
+                    .log(
+                        "WARN",
+                        format!("EDX range {start}-{end} of {inner_path} unavailable: {e}"),
+                    )
+                    .await;
                 self.xfer.note_serve(id, address, inner_path, size, now, (start, end), 0, false);
                 self.xfer.note_error(id, address, now, &e);
                 return Err(e);

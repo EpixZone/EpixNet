@@ -2405,9 +2405,8 @@ async fn serve_file(
                 // as a shorter 206 - the browser re-requests the remainder -
                 // instead of 404ing bytes we hold. Falls through to the
                 // legacy path on miss/error (zero bytes available).
-                if let Some(Ok(Some(bytes))) =
-                    ctx.state.edx_fetch_range(&address, &path, start, len as u64).await
-                {
+                let edx = ctx.state.edx_fetch_range(&address, &path, start, len as u64).await;
+                if let Some(Ok(Some(bytes))) = &edx {
                     if !bytes.is_empty() {
                         let end = start + bytes.len() as u64 - 1;
                         let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
@@ -2416,7 +2415,7 @@ async fn serve_file(
                         {
                             h.insert(header::CONTENT_RANGE, v);
                         }
-                        return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
+                        return (StatusCode::PARTIAL_CONTENT, h, bytes.clone()).into_response();
                     }
                 }
                 // EDX range missed: serve the covering bytes if they are already
@@ -2428,6 +2427,25 @@ async fn serve_file(
                         h.insert(header::CONTENT_RANGE, v);
                     }
                     return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
+                }
+                // EDX knows the file but cannot supply these bytes YET (the
+                // groups covering the range have not landed). Falling through
+                // would answer 404, which a media element reads as "this
+                // resource is gone": it tears the stream down and the user is
+                // dropped back to the start of the film, for what is really a
+                // "not yet". 503 + Retry-After says the same thing in a form a
+                // player can act on - re-request the same range - and matches
+                // what the rest of this path already assumes, that a short or
+                // missing answer is re-requested rather than fatal.
+                if matches!(edx, Some(Err(_))) {
+                    let mut h = file_headers(&ct, StatusCode::SERVICE_UNAVAILABLE);
+                    h.insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        h,
+                        "range not available yet; retry",
+                    )
+                        .into_response();
                 }
             }
         }
