@@ -82,13 +82,19 @@ search stays an optional indexer/app-view service.
 ## Order + distribution (`epix-blob::policy`)
 
 - **`order_policy`**: `first_paint[]` (tight-deadline shell) + `feed_order`
-  (newest/oldest/pinned/custom) + `prefetch[]`. Feeds the EDX scheduler;
-  the hardcoded ladder is the default when nothing is declared. EpixTalk =
-  newest-first.
+  (newest/oldest/pinned/custom) + `prefetch[]`. Feeds the EDX scheduler.
+  A xite that declares nothing is ordered by file TYPE instead
+  (`policy::default_tier`): markup, styles, scripts and images first,
+  media and archives last. EpixTalk = newest-first.
 - **`distribution`**: per-path `unit` (package | file-refs | feed) +
   `retention` (complete | partial), longest-prefix match. A xite MIXES
   units (forum = package shell + feed + file-refs media). Default is
-  package/partial: stream-first, seed what you viewed, never ambush a data
-  cap. `retention:complete` completion is consent-gated (reuses the
-  existing size-limit prompt). Content-addressing already gives #340's
-  cross-site file-by-reference.
+  package/**complete**: a reader converges on the publisher's whole
+  package rather than only the parts they opened, because a partial copy
+  is also an identifying one (bitfield exchange makes each peer's subset
+  readable, leaving the publisher the only peer holding everything).
+  Completion runs in the BACKGROUND after first paint and is
+  consent-gated on the xite's size limit, so it never ambushes a data
+  cap; an owner who knows a path cannot be completed declares
+  `retention:partial` (a feed) and that wins. Content-addressing already
+  gives #340's cross-site file-by-reference.
