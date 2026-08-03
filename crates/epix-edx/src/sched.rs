@@ -50,6 +50,18 @@ pub const MAX_DUPLICATES: usize = 2;
 pub const PRIMARY_BUDGET_DIVISOR: u32 = 2;
 /// Groups per striped request (16 KiB * 64 = 1 MiB chunks of work).
 pub const GROUPS_PER_REQUEST: u64 = 64;
+/// Groups per request on an overlay link (16 KiB * 16 = 256 KiB).
+///
+/// A Tor/I2P circuit carries a few hundred KB/s, so a 1 MiB batch occupies it
+/// for seconds - measured here, 4 s at 250 KB/s and 32 s on a bad circuit.
+/// That coarseness costs three ways while streaming: a failed batch throws
+/// away a megabyte of circuit time (batch failures ran ~20% on a live overlay
+/// swarm), the stall detector cannot react inside a batch, and the served
+/// contiguous prefix only advances a megabyte at a time, which is what a
+/// player feels as a stall. Quartering the batch quarters all three. The
+/// bytes in flight are unchanged - [`pipeline_depth`] compensates - so this
+/// trades no throughput for the finer granularity.
+pub const GROUPS_PER_REQUEST_OVERLAY: u64 = 16;
 /// A clearnet transfer with no new bytes for this long is stalled.
 pub const STALL_CLEARNET: Duration = Duration::from_secs(4);
 /// Overlay stall window: an onion/I2P circuit legitimately pauses for
@@ -60,9 +72,68 @@ pub const STALL_OVERLAY: Duration = Duration::from_secs(12);
 pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(90);
 /// Batches kept in flight per healthy peer by the sliding window.
 pub const PIPELINE_DEPTH: u32 = 2;
+/// Sliding-window depth on an overlay link.
+///
+/// Pipelining exists to cover the round trip between requests, so the useful
+/// depth is set by the bandwidth-delay product, not by a bytes-in-flight
+/// target: a Tor circuit at ~250 KB/s with a ~500 ms round trip holds about
+/// 125 KB in flight, so one 256 KiB request already saturates it and a couple
+/// more only cover the gap while the next is assigned. Queueing deeper than
+/// that does not add throughput - the circuit's rate is fixed - it just makes
+/// every request wait behind its siblings, which is how a *healthy* link
+/// starts tripping the stall detector (see [`stall_window`]).
+pub const PIPELINE_DEPTH_OVERLAY: u32 = 3;
 /// Consecutive failed batches before a peer is exhausted (dropped from
 /// scheduling for the rest of the fetch); a delivered batch resets it.
 pub const PEER_FAIL_LIMIT: u32 = 3;
+
+/// How much work one request to `class` carries. Overlay links get smaller
+/// batches (see [`GROUPS_PER_REQUEST_OVERLAY`]).
+pub fn groups_per_request(class: Class) -> u64 {
+    match class {
+        Class::Clearnet => GROUPS_PER_REQUEST,
+        Class::I2p | Class::Tor => GROUPS_PER_REQUEST_OVERLAY,
+    }
+}
+
+/// How many batches to `class` stay in flight at once, sized so the bytes in
+/// flight match across classes (see [`PIPELINE_DEPTH_OVERLAY`]).
+pub fn pipeline_depth(class: Class) -> u32 {
+    match class {
+        Class::Clearnet => PIPELINE_DEPTH,
+        Class::I2p | Class::Tor => PIPELINE_DEPTH_OVERLAY,
+    }
+}
+
+/// The batch size for a fetch over `peers`: the smallest any of them wants,
+/// so a session with even one overlay link uses the fine-grained batching
+/// that link needs. Batches are cut before a peer is picked (the pick needs
+/// the batch's groups), so one size has to serve the whole peer set; taking
+/// the minimum keeps a slow circuit from being handed a megabyte, and costs
+/// a fast peer only some request overhead it has the bandwidth to absorb.
+pub fn batch_groups_for(peers: &[PeerHandle]) -> u64 {
+    peers.iter().map(|p| groups_per_request(p.class)).min().unwrap_or(GROUPS_PER_REQUEST)
+}
+
+/// The no-new-bytes window for one request, given how many requests are
+/// already queued on that link.
+///
+/// Stall detection is per-request, but a pipelined link serves its requests
+/// roughly in turn: with `inflight` of them outstanding, a request can wait
+/// its whole share of the link before its first byte arrives, while the link
+/// is working perfectly. Judging it against the bare [`stall_timeout`] made a
+/// healthy overlay link look stalled, and every such "stall" was duplicated
+/// onto another peer - which spent the swarm's scarce bandwidth re-fetching
+/// bytes already on the way, slowing the real transfers and producing more
+/// apparent stalls. Observed live: 242 duplicates against 291 real requests,
+/// with per-peer failure rates of 23-56%.
+///
+/// Scaling the window by the queue depth keeps the detector meaningful (a
+/// link that has genuinely gone silent still trips it, just proportionally
+/// later) while a request merely waiting its turn does not.
+pub fn stall_window(class: Class, inflight: u32) -> Duration {
+    stall_timeout(class) * inflight.max(1)
+}
 
 /// The no-new-bytes window after which a transfer to `class` counts as
 /// stalled (the trigger for duplication and, with nowhere to duplicate,
@@ -170,7 +241,7 @@ pub fn rarest_first_order(needed: &GroupBits, peers: &[PeerHandle]) -> Vec<u64> 
 
 /// Group a sorted list of group indices into contiguous request-sized
 /// byte ranges for an object of `size` bytes.
-pub fn batch_into_ranges(groups: &[u64], size: u64) -> Vec<std::ops::Range<u64>> {
+pub fn batch_into_ranges(groups: &[u64], size: u64, max_groups: u64) -> Vec<std::ops::Range<u64>> {
     use epix_blob::bitfield::bytes_of_group;
     let mut out = Vec::new();
     let mut i = 0;
@@ -180,7 +251,7 @@ pub fn batch_into_ranges(groups: &[u64], size: u64) -> Vec<std::ops::Range<u64>>
         let mut j = i + 1;
         while j < groups.len()
             && groups[j] == end_group + 1
-            && (end_group + 1 - start_group) < GROUPS_PER_REQUEST
+            && (end_group + 1 - start_group) < max_groups
         {
             end_group = groups[j];
             j += 1;
@@ -199,7 +270,12 @@ pub fn batch_into_ranges(groups: &[u64], size: u64) -> Vec<std::ops::Range<u64>>
 /// extended while the intersection of holding peers stays non-empty, so
 /// every emitted range has a common holder (worst case one group per
 /// range). Groups NO peer holds are dropped.
-fn split_by_holder(groups: &[u64], peers: &[PeerHandle], size: u64) -> Vec<std::ops::Range<u64>> {
+fn split_by_holder(
+    groups: &[u64],
+    peers: &[PeerHandle],
+    size: u64,
+    max_groups: u64,
+) -> Vec<std::ops::Range<u64>> {
     use epix_blob::bitfield::bytes_of_group;
     let mut out = Vec::new();
     let mut i = 0;
@@ -220,7 +296,7 @@ fn split_by_holder(groups: &[u64], peers: &[PeerHandle], size: u64) -> Vec<std::
         let mut j = i + 1;
         while j < groups.len()
             && groups[j] == end_group + 1
-            && (end_group + 1 - start_group) < GROUPS_PER_REQUEST
+            && (end_group + 1 - start_group) < max_groups
         {
             // Narrow to holders that also hold the next group; stop when
             // no single peer spans the extended run.
@@ -309,6 +385,9 @@ struct Window<'a> {
     /// routes around it instead of retrying it forever. This is also what
     /// terminates the fetch when nothing is obtainable.
     fails: Vec<u32>,
+    /// Per-peer sliding-window depth, from each peer's class: an overlay
+    /// link runs more, smaller batches than a clearnet one.
+    depth: Vec<u32>,
     /// Groups an in-flight batch is already covering.
     inflight: GroupBits,
     /// Boxed so the window can hold a heterogenous set and drop completed
@@ -317,10 +396,11 @@ struct Window<'a> {
 }
 
 impl<'a> Window<'a> {
-    fn new(peers: usize) -> Self {
+    fn new(peers: &[PeerHandle]) -> Self {
         Self {
-            load: vec![0u32; peers],
-            fails: vec![0u32; peers],
+            load: vec![0u32; peers.len()],
+            fails: vec![0u32; peers.len()],
+            depth: peers.iter().map(|p| pipeline_depth(p.class)).collect(),
             inflight: GroupBits::new(),
             futs: Vec::new(),
         }
@@ -331,8 +411,9 @@ impl<'a> Window<'a> {
         self.load
             .iter()
             .zip(self.fails.iter())
-            .filter(|(_, f)| **f < PEER_FAIL_LIMIT)
-            .map(|(l, _)| PIPELINE_DEPTH.saturating_sub(*l) as usize)
+            .zip(self.depth.iter())
+            .filter(|((_, f), _)| **f < PEER_FAIL_LIMIT)
+            .map(|((l, _), d)| d.saturating_sub(*l) as usize)
             .sum()
     }
 
@@ -358,11 +439,16 @@ impl<'a> Window<'a> {
         if let Some(obs) = &swarm.observer {
             obs.on_request(&peers[idx].label, peers[idx].class, swarm.bytes_of(&groups));
         }
-        self.futs.push(Box::pin(swarm.race_batch(batch, groups, idx, peers, deadline, now)));
+        // `load[idx]` already counts this batch, so it is exactly how many
+        // requests this link is now serving - what the stall window scales on.
+        let queued = self.load[idx];
+        self.futs
+            .push(Box::pin(swarm.race_batch(batch, groups, idx, peers, deadline, now, queued)));
     }
 
     /// Assign one batch to a peer that holds all of it, else split it by
     /// holder. Returns whether anything was scheduled.
+    #[allow(clippy::too_many_arguments)]
     fn assign(
         &mut self,
         swarm: &'a Swarm,
@@ -370,6 +456,7 @@ impl<'a> Window<'a> {
         peers: &'a [PeerHandle],
         deadline: Deadline,
         now: u64,
+        batch_groups: u64,
         report: &mut FetchReport,
     ) -> bool {
         let bgroups = swarm.groups_of(&batch);
@@ -378,7 +465,9 @@ impl<'a> Window<'a> {
                 self.schedule(swarm, batch, bgroups, idx, peers, deadline, now, report);
                 true
             }
-            None => self.assign_split(swarm, &bgroups, peers, deadline, now, report),
+            None => {
+                self.assign_split(swarm, &bgroups, peers, deadline, now, batch_groups, report)
+            }
         }
     }
 
@@ -387,6 +476,7 @@ impl<'a> Window<'a> {
     /// holds all of it. Split into maximal sub-batches each fully held by
     /// some peer instead of skipping it — skipping would strand groups that
     /// ARE available and leave the object stuck.
+    #[allow(clippy::too_many_arguments)]
     fn assign_split(
         &mut self,
         swarm: &'a Swarm,
@@ -394,10 +484,11 @@ impl<'a> Window<'a> {
         peers: &'a [PeerHandle],
         deadline: Deadline,
         now: u64,
+        batch_groups: u64,
         report: &mut FetchReport,
     ) -> bool {
         let mut assigned = false;
-        for sub in split_by_holder(bgroups, peers, swarm.size) {
+        for sub in split_by_holder(bgroups, peers, swarm.size, batch_groups) {
             let sgroups = swarm.groups_of(&sub);
             let Some(idx) = swarm.pick_peer(&sgroups, peers, &self.load, &self.fails) else {
                 continue;
@@ -420,6 +511,7 @@ impl<'a> Window<'a> {
         peers: &'a [PeerHandle],
         deadline: Deadline,
         now: u64,
+        batch_groups: u64,
         report: &mut FetchReport,
     ) {
         loop {
@@ -432,14 +524,14 @@ impl<'a> Window<'a> {
                 cursor,
                 remaining,
                 &self.inflight,
-                free * GROUPS_PER_REQUEST as usize,
+                free * batch_groups as usize,
             );
             if order.is_empty() {
                 break;
             }
             let mut assigned = false;
-            for batch in batch_into_ranges(&order, swarm.size) {
-                assigned |= self.assign(swarm, batch, peers, deadline, now, report);
+            for batch in batch_into_ranges(&order, swarm.size, batch_groups) {
+                assigned |= self.assign(swarm, batch, peers, deadline, now, batch_groups, report);
             }
             if !assigned {
                 break; // nothing schedulable in this window slice
@@ -504,9 +596,12 @@ impl Swarm {
         // on each refill made a whole-object fetch quadratic in object size
         // (a 10 GB object is ~600k groups).
         let full_order = rarest_first_order(needed, peers);
+        // One size for the whole call: batches are cut before a peer is
+        // picked, so the slowest class present sets it.
+        let batch_groups = batch_groups_for(peers);
         let mut cursor = 0usize;
         let this = &*self;
-        let mut window = Window::new(peers.len());
+        let mut window = Window::new(peers);
         loop {
             window.refill(
                 this,
@@ -516,6 +611,7 @@ impl Swarm {
                 peers,
                 deadline,
                 now,
+                batch_groups,
                 &mut report,
             );
             let Some(outcome) = next_ready(&mut window.futs).await else {
@@ -596,7 +692,7 @@ impl Swarm {
             .enumerate()
             .filter(|(i, p)| {
                 fails[*i] < PEER_FAIL_LIMIT
-                    && load[*i] < PIPELINE_DEPTH
+                    && load[*i] < pipeline_depth(p.class)
                     && groups.iter().all(|g| p.bits.contains(*g))
             })
             .min_by_key(|(i, p)| (fails[*i], load[*i], stats.rtt(p.class)))
@@ -632,6 +728,7 @@ impl Swarm {
     /// object store's idempotent verified writes make a late duplicate
     /// harmless, and a failed batch keeps the groups its streamed prefix
     /// landed.
+    #[allow(clippy::too_many_arguments)]
     async fn race_batch(
         &self,
         batch: std::ops::Range<u64>,
@@ -640,12 +737,13 @@ impl Swarm {
         peers: &[PeerHandle],
         deadline: Deadline,
         now: u64,
+        queued: u32,
     ) -> BatchOutcome {
         let cap = deadline.max_wait.min(MAX_BATCH_WAIT);
         // The stall window is capped to a share of the batch budget: a
         // stall detected only near the cap would leave the duplicated race
         // below no time to answer.
-        let stall = stall_timeout(peers[primary].class).min(cap / PRIMARY_BUDGET_DIVISOR);
+        let stall = stall_window(peers[primary].class, queued).min(cap / PRIMARY_BUDGET_DIVISOR);
         // Arc: the fetches' incremental disk commits bump it from the
         // blocking pool, so committing counts as liveness too.
         let progress = Arc::new(AtomicU64::new(0));
@@ -982,15 +1080,77 @@ mod tests {
     #[test]
     fn batching_coalesces_contiguous_groups() {
         let groups: Vec<u64> = (0..5).chain(10..12).collect();
-        let ranges = batch_into_ranges(&groups, 1_000_000);
+        let ranges = batch_into_ranges(&groups, 1_000_000, GROUPS_PER_REQUEST);
         // Two contiguous runs -> two ranges.
         assert_eq!(ranges.len(), 2);
+    }
+
+    /// An overlay link gets smaller requests so a failure or a stall costs a
+    /// fraction of the circuit time, and a shallow queue so a request is not
+    /// left waiting behind its own siblings. Queueing deeper does not raise a
+    /// circuit's fixed rate; it only inflates per-request latency.
+    #[test]
+    fn overlay_links_get_small_requests_and_a_shallow_queue() {
+        for overlay in [Class::Tor, Class::I2p] {
+            assert_eq!(groups_per_request(overlay), GROUPS_PER_REQUEST_OVERLAY);
+            assert!(
+                groups_per_request(overlay) < GROUPS_PER_REQUEST,
+                "{overlay:?} must ask for less per request than clearnet"
+            );
+            assert!(
+                pipeline_depth(overlay) <= 3,
+                "{overlay:?} must not queue deeper than the round trip needs"
+            );
+        }
+        assert_eq!(groups_per_request(Class::Clearnet), GROUPS_PER_REQUEST);
+        assert_eq!(pipeline_depth(Class::Clearnet), PIPELINE_DEPTH);
+    }
+
+    /// A request waiting its turn behind siblings on the same link is not
+    /// stalled: the window grows with the queue, so a healthy pipelined link
+    /// is never duplicated onto another peer (which would spend the swarm's
+    /// scarce bandwidth re-fetching bytes already on the way).
+    #[test]
+    fn the_stall_window_grows_with_the_links_queue() {
+        let base = stall_timeout(Class::Tor);
+        assert_eq!(stall_window(Class::Tor, 0), base, "an empty queue still gets one window");
+        assert_eq!(stall_window(Class::Tor, 1), base);
+        assert_eq!(stall_window(Class::Tor, 3), base * 3);
+        assert!(
+            stall_window(Class::Tor, PIPELINE_DEPTH_OVERLAY) >= base * PIPELINE_DEPTH_OVERLAY,
+            "a full queue must never be judged against a single request's window"
+        );
+    }
+
+    /// Batches are cut before a peer is picked, so one size serves the whole
+    /// set: the slowest class present wins, and a set with no peers falls back
+    /// to the clearnet size rather than zero.
+    #[tokio::test]
+    async fn batch_size_follows_the_slowest_class_in_the_session() {
+        let bits = |n: u64| {
+            let mut b = GroupBits::new();
+            b.add(0..n);
+            b
+        };
+        let peer = |class| PeerHandle {
+            conn: dummy_conn(),
+            class,
+            bits: bits(64),
+            label: format!("{class:?}"),
+        };
+        assert_eq!(batch_groups_for(&[peer(Class::Clearnet)]), GROUPS_PER_REQUEST);
+        assert_eq!(
+            batch_groups_for(&[peer(Class::Clearnet), peer(Class::Tor)]),
+            GROUPS_PER_REQUEST_OVERLAY,
+            "one overlay link sets the size for the session"
+        );
+        assert_eq!(batch_groups_for(&[]), GROUPS_PER_REQUEST);
     }
 
     #[test]
     fn batching_splits_at_request_size() {
         let groups: Vec<u64> = (0..(GROUPS_PER_REQUEST * 2 + 5)).collect();
-        let ranges = batch_into_ranges(&groups, 1 << 40);
+        let ranges = batch_into_ranges(&groups, 1 << 40, GROUPS_PER_REQUEST);
         assert!(ranges.len() >= 3, "a run longer than a request must split");
     }
 
@@ -1197,7 +1357,7 @@ mod tests {
 
         let swarm = Swarm::new(store.clone(), id, size);
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, Deadline::background(), 2).await;
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, Deadline::background(), 2, 1).await;
         assert_eq!(outcome.duplicates, 0, "a moving transfer is never raced");
         assert_eq!(outcome.winner_label.as_deref(), Some("trickle"));
     }
@@ -1235,7 +1395,7 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1).await;
         assert_eq!(outcome.duplicates, 1, "the stalled primary is duplicated onto the other peer");
         assert_eq!(
             outcome.winner_label.as_deref(),
@@ -1285,7 +1445,7 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1).await;
         assert_eq!(outcome.duplicates, 0, "a sibling lane is not a duplication target");
         assert_eq!(
             outcome.winner_label, None,
@@ -1324,7 +1484,7 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::ZERO };
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2).await;
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1).await;
         assert_eq!(outcome.duplicates, 0, "no budget left means no duplicate is issued");
         assert!(outcome.winner_label.is_none(), "nobody can win a zero-length race");
     }
