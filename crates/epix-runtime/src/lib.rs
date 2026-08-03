@@ -1050,6 +1050,10 @@ async fn resync_loop(
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await;
+    // Per shard-file backoff for the volunteer sweep below, so files that
+    // held nothing are not re-dialed every tick. Loop-local: it dies with
+    // the loop, and the sweep is called from nowhere else.
+    let mut volunteer_backoff = std::collections::HashMap::new();
     loop {
         tokio::select! {
             _ = shutdown.notified() => break,
@@ -1102,6 +1106,9 @@ async fn resync_loop(
                 if freed > 0 {
                     state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
                 }
+                // Volunteer role: hold our slice of the encrypted shards of
+                // whatever private content we have manifests for.
+                crate::edx::volunteer_sweep(&state, &mut volunteer_backoff).await;
             }
         }
     }

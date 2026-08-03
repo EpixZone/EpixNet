@@ -1274,6 +1274,12 @@ struct Streaming {
     queued: HashMap<(String, String), Range<u64>>,
     /// Files whose one-time moov head/tail warm-up has been kicked off.
     warmed: HashSet<(String, String)>,
+    /// Objects with a materialize (move into the xite tree) in flight. A
+    /// browser issues Range requests in a burst, and every one of them sees
+    /// the same "complete but not yet extern" window between the last group
+    /// landing and the rename committing; without this each would spawn its
+    /// own blocking move of the same file.
+    materializing: HashSet<ObjId>,
 }
 
 /// A serve's dialed peer session, kept for PEER_CACHE_TTL so consecutive
@@ -2473,7 +2479,7 @@ impl RuntimeEdxFetcher {
             spawn_next(&mut fetching);
             let Ok((r, complete)) = joined else { continue };
             let done = complete
-                && self.materialize_into_batch(address, &r, store, progress, batch, now).await;
+                && self.materialize_into_batch(address, &r, store, progress, batch).await;
             if !done {
                 // This EDX-eligible file went to the msgpack worker (the 1b
                 // gate); counted once per distinct file across all retries.
@@ -2526,7 +2532,7 @@ impl RuntimeEdxFetcher {
                 for i in by_id.get(&id).into_iter().flatten().copied() {
                     if done.contains(&i)
                         || !self
-                            .materialize_into_batch(address, &small[i], store, progress, batch, now)
+                            .materialize_into_batch(address, &small[i], store, progress, batch)
                             .await
                     {
                         continue;
@@ -2536,7 +2542,7 @@ impl RuntimeEdxFetcher {
             }
         };
         tokio::join!(fetch, drain);
-        self.retry_unlanded(address, small, store, progress, batch, now, &done).await
+        self.retry_unlanded(address, small, store, progress, batch, &done).await
     }
 
     /// Anything the landed hook did not carry (already complete before this
@@ -2551,7 +2557,6 @@ impl RuntimeEdxFetcher {
         store: &Arc<Store>,
         progress: &BatchProgress,
         batch: &mut EdxBatch,
-        now: u64,
         done: &HashSet<usize>,
     ) -> Vec<Res> {
         let mut lacking = Vec::new();
@@ -2560,7 +2565,7 @@ impl RuntimeEdxFetcher {
                 continue;
             }
             if store.is_complete(r.id).unwrap_or(false)
-                && self.materialize_into_batch(address, &r, store, progress, batch, now).await
+                && self.materialize_into_batch(address, &r, store, progress, batch).await
             {
                 continue;
             }
@@ -2573,6 +2578,13 @@ impl RuntimeEdxFetcher {
     /// it into `batch` (bytes, progress callback, then `done`). Returns whether
     /// it landed; on a read or materialize failure nothing is counted, so the
     /// caller is free to send the file down another path.
+    ///
+    /// This is the CLONE path - the one that runs for every file of a xite
+    /// you add - so it has to hand big objects over to the xite tree
+    /// ([`Self::materialize`]) rather than copy their bytes out. Reading
+    /// whole files and writing them back left a cloned xite stored twice,
+    /// once as the user's files and once as objects, which on a real node
+    /// meant the object store matching the data directory byte for byte.
     async fn materialize_into_batch(
         &self,
         address: &str,
@@ -2580,14 +2592,16 @@ impl RuntimeEdxFetcher {
         store: &Arc<Store>,
         progress: &BatchProgress,
         batch: &mut EdxBatch,
-        now: u64,
     ) -> bool {
-        let Ok(bytes) = store.read_bytes(r.id, now) else { return false };
-        if self.state.edx_materialize_file(address, &r.path, &bytes).await.is_err() {
+        let size = match store.info(r.id) {
+            Ok(Some((size, _))) => size,
+            _ => return false,
+        };
+        if self.materialize(address, &r.path, r.id, size, store).await.is_err() {
             return false;
         }
-        batch.bytes += bytes.len() as u64;
-        progress.file(&r.path, bytes.len() as u64);
+        batch.bytes += size;
+        progress.file(&r.path, size);
         batch.done.push(r.path.clone());
         true
     }
@@ -2693,12 +2707,11 @@ impl RuntimeEdxFetcher {
         plain: Vec<Res>,
         progress: &BatchProgress,
         batch: &mut EdxBatch,
-        now: u64,
     ) -> Vec<Res> {
         let mut pending: Vec<Res> = Vec::new();
         for r in plain {
             if store.is_complete(r.id).unwrap_or(false)
-                && self.materialize_into_batch(address, &r, store, progress, batch, now).await
+                && self.materialize_into_batch(address, &r, store, progress, batch).await
             {
                 continue;
             }
@@ -2745,8 +2758,14 @@ impl RuntimeEdxFetcher {
     /// Each tier runs its own complete GetMany+swarm pass before the next
     /// one starts, so a large first-paint file still beats a small prefetch
     /// file (a single sorted pass would not - GetMany batches all the small
-    /// files ahead of every large one). A xite that declares nothing has one
-    /// tier, so its fetch order is byte-for-byte what it is today.
+    /// files ahead of every large one).
+    ///
+    /// A xite that declares NOTHING is sorted by file type instead
+    /// (`policy::default_tier`): markup, styles, scripts and images first,
+    /// media and archives last. It used to land in a single tier, which is
+    /// how a 1.21 GB site could finish downloading its index.html and still
+    /// not draw - the page's own assets were queued behind a gigabyte of
+    /// video nobody was waiting for.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_tiers(
         &self,
@@ -2777,6 +2796,148 @@ impl RuntimeEdxFetcher {
             };
             self.fetch_tier(address, store, session, in_tier, deadline, progress, batch, now).await;
         }
+    }
+
+    /// If a streamed object has just become complete, move it into the xite
+    /// tree in the background.
+    ///
+    /// This is what closes the gap between "the bytes are on this machine"
+    /// and "the user has the file". A range-fetched video used to live only
+    /// as a hash-named blob in the object store: not in the xite directory,
+    /// not copyable, not re-publishable, and evictable as cache. Once it is
+    /// extern it is an ordinary file the user owns.
+    ///
+    /// Cheap on the serve path: two indexed lookups, and a spawn only on the
+    /// single request that observes the transition.
+    async fn maybe_materialize_complete(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: ObjId,
+        size: u64,
+        store: &Arc<Store>,
+    ) {
+        // Small objects are packed in shared slabs and are materialized by
+        // the batch path that fetched them; only whole-file objects move.
+        if epix_blob::bundle::is_bundleable(size) {
+            return;
+        }
+        if !store.is_complete(id).unwrap_or(false) || store.is_extern(id).unwrap_or(false) {
+            return;
+        }
+        {
+            let mut s = self.streaming.lock().expect("streaming");
+            if !s.materializing.insert(id) {
+                return; // another Range request is already moving it
+            }
+        }
+        // Released from a Drop guard, not a trailing statement: a panic
+        // anywhere in the task would otherwise leak the entry and block this
+        // object's materialize until restart.
+        struct Claim {
+            streaming: Arc<Mutex<Streaming>>,
+            id: ObjId,
+        }
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                if let Ok(mut s) = self.streaming.lock() {
+                    s.materializing.remove(&self.id);
+                }
+            }
+        }
+        let claim = Claim { streaming: self.streaming.clone(), id };
+        let this = self.clone();
+        let address = address.to_string();
+        let inner_path = inner_path.to_string();
+        tokio::spawn(async move {
+            let _claim = claim;
+            if let Err(e) = this.state.edx_materialize_object(&address, &inner_path, id).await {
+                // Not fatal: the bytes are still served from the store, and
+                // the next completed range retries the move.
+                this.state
+                    .log("WARN", format!("materialize {address}/{inner_path}: {e}"))
+                    .await;
+            }
+        });
+    }
+
+    /// The body behind both [`EdxFetcher::fetch_file`] entries: resolve,
+    /// fetch what the store lacks at `deadline`, materialize. The deadline is
+    /// the ONLY difference between the interactive and background variants -
+    /// keeping one body means they can never drift apart in anything else.
+    async fn fetch_file_at(
+        &self,
+        address: &str,
+        inner_path: &str,
+        deadline: Deadline,
+    ) -> Result<bool, String> {
+        let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        // Encrypted-shard file: fetch the ciphertext shards and decrypt.
+        let content_bytes =
+            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
+        let content: serde_json::Value =
+            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
+        if let Some(shard) = epix_blob::manifest::edx_shard_entry(&content, inner_path) {
+            return self.fetch_shard_file(address, inner_path, &content, shard, &store).await;
+        }
+        let Some((id, size)) = self.resolve(address, inner_path).await? else {
+            return Err("no edx entry for file".into());
+        };
+        let now = now_secs();
+
+        // Already complete in the store: just materialize it.
+        if store.is_complete(id).unwrap_or(false) {
+            self.materialize(address, inner_path, id, size, &store).await?;
+            return Ok(true);
+        }
+
+        let (handles, node_pks) = self.build_peers(address, id).await?;
+        // Reserve the sparse record only now that a peer can serve it, and drop
+        // it again if nothing lands (see `ObjClaim`): a manifest entry a
+        // visitor touches once must not leave an index row and a sparse/.obao
+        // file pair behind forever.
+        let _claim =
+            self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
+        let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let report = match swarm.fetch(&needed, &handles, deadline, now).await {
+            Ok(report) => report,
+            Err(e) => return Err(e.to_string()),
+        };
+        self.credit(&report, &node_pks, now);
+        if !store.is_complete(id).unwrap_or(false) {
+            return Err("fetch did not complete".into());
+        }
+
+        self.materialize(address, inner_path, id, size, &store).await?;
+        // Cached content grows the store; keep it under quota (own content is
+        // pinned, so only cached-from-others objects are evicted).
+        let _ = store.enforce_quota(store_quota());
+        Ok(true)
+    }
+
+    /// Turn a completed object into the xite's file on disk.
+    ///
+    /// Small objects live packed in a slab shared with other files, so their
+    /// bytes are read out and written (they are small by definition - the
+    /// bundle cutoff). Everything else MOVES: the object store hands the
+    /// file over to the xite tree and keeps only the outboard, so the user
+    /// ends up with one copy at a path they own rather than a second copy
+    /// under a hash name. This is the difference between "you streamed a
+    /// video" and "you have the video".
+    async fn materialize(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: ObjId,
+        size: u64,
+        store: &Arc<Store>,
+    ) -> Result<(), String> {
+        if epix_blob::bundle::is_bundleable(size) {
+            let bytes = store.read_bytes(id, now_secs()).map_err(|e| e.to_string())?;
+            return self.state.edx_materialize_file(address, inner_path, &bytes).await;
+        }
+        self.state.edx_materialize_object(address, inner_path, id).await
     }
 }
 
@@ -3203,51 +3364,22 @@ async fn sweep_signed_over_session(
 #[async_trait::async_trait]
 impl EdxFetcher for RuntimeEdxFetcher {
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        let store = self.state.edx_store().await.ok_or("no EDX store")?;
-        // Encrypted-shard file: fetch the ciphertext shards and decrypt.
-        let content_bytes =
-            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
-        let content: serde_json::Value =
-            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
-        if let Some(shard) = epix_blob::manifest::edx_shard_entry(&content, inner_path) {
-            return self.fetch_shard_file(address, inner_path, &content, shard, &store).await;
-        }
-        let Some((id, size)) = self.resolve(address, inner_path).await? else {
-            return Err("no edx entry for file".into());
-        };
-        let now = now_secs();
+        // Tight, not background: this is the on-demand path, so something is
+        // waiting on these bytes RIGHT NOW - the page the user has open asked
+        // for this file. Running it as background bulk meant the visible page
+        // queued behind whatever the scheduler was already doing, which is the
+        // other half of "the page you are viewing should jump the queue"
+        // (the first half is the type ladder in `fetch_tiers`).
+        self.fetch_file_at(address, inner_path, Deadline::tight()).await
+    }
 
-        // Already complete in the store: just materialize it.
-        if store.is_complete(id).unwrap_or(false) {
-            let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
-            self.state.edx_materialize_file(address, inner_path, &bytes).await?;
-            return Ok(true);
-        }
-
-        let (handles, node_pks) = self.build_peers(address, id).await?;
-        // Reserve the sparse record only now that a peer can serve it, and drop
-        // it again if nothing lands (see `ObjClaim`): a manifest entry a
-        // visitor touches once must not leave an index row and a sparse/.obao
-        // file pair behind forever.
-        let _claim =
-            self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
-        let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
-        let mut swarm = Swarm::new(store.clone(), id, size);
-        let report = match swarm.fetch(&needed, &handles, Deadline::background(), now).await {
-            Ok(report) => report,
-            Err(e) => return Err(e.to_string()),
-        };
-        self.credit(&report, &node_pks, now);
-        if !store.is_complete(id).unwrap_or(false) {
-            return Err("fetch did not complete".into());
-        }
-
-        let bytes = store.read_bytes(id, now).map_err(|e| e.to_string())?;
-        self.state.edx_materialize_file(address, inner_path, &bytes).await?;
-        // Cached content grows the store; keep it under quota (own content is
-        // pinned, so only cached-from-others objects are evicted).
-        let _ = store.enforce_quota(store_quota());
-        Ok(true)
+    async fn fetch_file_background(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        // Patient: nothing is waiting, so a slow-but-moving onion transfer
+        // should finish rather than be raced and abandoned. This is what the
+        // retention completion pass and the optional retry loop use - work
+        // that runs behind an already-painted page must never compete at
+        // first-paint urgency, nor pay first-paint impatience.
+        self.fetch_file_at(address, inner_path, Deadline::background()).await
     }
 
     async fn fetch_signed(
@@ -3421,13 +3553,37 @@ impl EdxFetcher for RuntimeEdxFetcher {
                 self.xfer.note_error(id, address, now, &e);
                 return Err(e);
             }
-            let bytes = store.read_range(id, start, got, now).map_err(|e| e.to_string())?;
+            let bytes = match store.read_range(id, start, got, now) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // The bits said these groups are present and the read
+                    // still failed: the record and the disk disagree. For an
+                    // extern object that is a deleted/altered xite file; for
+                    // a sparse one, a file lost to a crash. Either way the
+                    // next request must not hit the same wall - revalidate
+                    // shrinks or retires the record so it refetches. In the
+                    // background: it can re-hash a whole file, and this
+                    // response is already an error.
+                    let vstore = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = vstore.revalidate(id);
+                    });
+                    self.xfer.note_error(id, address, now, &e.to_string());
+                    return Err(e.to_string());
+                }
+            };
             self.xfer.note_serve(
                 id, address, inner_path, size, now, (start, end), bytes.len() as u64, false,
             );
             let _ = store.enforce_quota(store_quota());
             bytes
         };
+
+        // The last group of a streamed file just landed: hand the bytes over
+        // to the xite tree so what the user watched is now a file they have.
+        // Background, and it can never error into this response - the bytes
+        // above are already served either way.
+        self.maybe_materialize_complete(address, inner_path, id, size, &store).await;
 
         // Arm the background read-ahead of the next window. Does not block this
         // response and can never error into it.
@@ -3518,7 +3674,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         let progress = BatchProgress::new(on_file);
         let (plain, shard_paths) = self.resolve_wants(address, want, &content, &mut batch).await;
         let pending =
-            self.drain_locally_complete(address, &store, plain, &progress, &mut batch, now).await;
+            self.drain_locally_complete(address, &store, plain, &progress, &mut batch).await;
         self.fetch_shard_paths(address, &content, shard_paths, &store, &progress, &mut batch).await;
 
         if pending.is_empty() {
@@ -3711,7 +3867,14 @@ pub async fn enable_serving(
         state.log("WARN", format!("EDX store dir {}: {e}", path.display())).await;
         return None;
     }
-    let store = match Store::open(&path) {
+    // The xite tree is where a completed object's bytes actually live (see
+    // `Loc::Extern`), so the store needs to know where that tree is before
+    // it can adopt or materialize anything.
+    let cfg = epix_blob::store::StoreConfig {
+        xite_root: Some(data_dir.join("data")),
+        ..Default::default()
+    };
+    let store = match Store::open_with(&path, cfg) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             state.log("WARN", format!("EDX store open {}: {e}", path.display())).await;
@@ -3731,11 +3894,91 @@ pub async fn enable_serving(
     Some(store)
 }
 
+/// Hold our responsible shards of every private file every served xite
+/// declares. This is what makes the volunteer role actually run: the
+/// machinery underneath it (self-encryption, the responsibility predicate,
+/// the donated-byte budget) has been in place for a while with nothing
+/// driving it, so no node ever held a shard.
+///
+/// Driven off the resync tick rather than a content-update hook because it
+/// has to cover the xites a node ALREADY had when the user turned
+/// volunteering on, not only the ones whose manifests arrive afterwards.
+/// Every gate lives in [`RuntimeEdxFetcher::volunteer_hold_file`], so a node
+/// with `volunteer_quota_bytes` at 0 does nothing here beyond the walk.
+///
+/// The publisher side needs no separate push: signing already inserts an
+/// owner's own shards into `Ns::Shard`, and content.json reaches peers
+/// through ordinary propagation, so a fresh publish becomes holdable by
+/// volunteers as soon as they see the manifest.
+/// Per shard-file backoff for [`volunteer_sweep`]: how many consecutive
+/// unproductive passes a file has had, and when it is worth trying again.
+/// Owned by the resync loop (the sweep's only caller), so it needs no home
+/// in AppState and dies with the loop.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VolunteerBackoff {
+    /// `now_secs` before which the file is skipped.
+    next_try: u64,
+    /// Consecutive passes that held nothing new.
+    streak: u32,
+}
+
+/// When to retry after `streak` unproductive passes: one skipped tick per
+/// doubling, capped at an hour. A pass that holds nothing usually means
+/// either "nothing missing" (a no-op we can cheaply not repeat) or "no
+/// reachable peer had the shards" - and redialing up to 8 peers for the
+/// same missing shards every 5-minute tick, forever, is exactly the kind
+/// of circuit churn Tor punishes. The cap keeps a config change (a raised
+/// quota widens responsibility) effective within the hour.
+fn volunteer_retry_delay(streak: u32) -> u64 {
+    const BASE: u64 = 600; // 10 min: skip at least the next tick
+    const CAP: u64 = 3600;
+    (BASE << streak.saturating_sub(1).min(3)).min(CAP)
+}
+
+pub async fn volunteer_sweep(
+    state: &Arc<AppState>,
+    backoff: &mut std::collections::HashMap<(String, String), VolunteerBackoff>,
+) {
+    if state.volunteer_quota_bytes().await == 0 {
+        return; // not volunteering
+    }
+    let files = state.shard_files().await;
+    // Drop backoff rows for files no manifest declares any more (a removed
+    // or re-signed xite), or the map grows for the life of the process.
+    let live: std::collections::HashSet<&(String, String)> = files.iter().collect();
+    backoff.retain(|k, _| live.contains(k));
+    let now = now_secs();
+    let mut held = 0usize;
+    for key in files {
+        if backoff.get(&key).is_some_and(|b| now < b.next_try) {
+            continue;
+        }
+        let (address, inner_path) = &key;
+        let n = match volunteer_hold(state, address, inner_path).await {
+            Ok(n) => n,
+            // A xite whose peers are all offline right now is not an error,
+            // but it earns the same backoff as an empty pass.
+            Err(_) => 0,
+        };
+        if n > 0 {
+            held += n;
+            backoff.remove(&key);
+        } else {
+            let b = backoff.entry(key).or_default();
+            b.streak = b.streak.saturating_add(1);
+            b.next_try = now.saturating_add(volunteer_retry_delay(b.streak));
+        }
+    }
+    if held > 0 {
+        state
+            .log("INFO", format!("Volunteer cache: holding {held} new encrypted shard(s)"))
+            .await;
+    }
+}
+
 /// Hold this node's responsible encrypted shards of `address`/`inner_path`,
-/// read from its already-verified signed content.json. Public entry point
-/// for the volunteer role: a future DHT discovery / roster-run driver (that
-/// piece is deferred) calls this per private file it learns about. Returns
-/// the number of shards newly held, or 0 when the node is not volunteering
+/// read from its already-verified signed content.json. Returns the number of
+/// shards newly held, or 0 when the node is not volunteering
 /// (`volunteer_quota_bytes` = 0) or the path is not a shard file.
 ///
 /// The node's persisted identity key backs the responsibility predicate, so
@@ -3781,6 +4024,19 @@ mod tests {
         std::env::set_var("EPIX_EDX_KILLSWITCH_TEST", "1");
         assert!(env_on("EPIX_EDX_KILLSWITCH_TEST"), "1 stays on");
         std::env::remove_var("EPIX_EDX_KILLSWITCH_TEST");
+    }
+
+    /// An unproductive volunteer pass skips at least the next 5-minute tick
+    /// and backs off doubling to an hour, so shards nobody reachable holds
+    /// stop re-dialing 8 peers every tick - while a raised quota still
+    /// widens responsibility within the hour.
+    #[test]
+    fn volunteer_backoff_doubles_to_an_hour() {
+        assert_eq!(volunteer_retry_delay(1), 600);
+        assert_eq!(volunteer_retry_delay(2), 1200);
+        assert_eq!(volunteer_retry_delay(3), 2400);
+        assert_eq!(volunteer_retry_delay(4), 3600, "capped");
+        assert_eq!(volunteer_retry_delay(30), 3600, "a long streak never overflows");
     }
 
     /// GetSigned serves signed content only: the content.json files and the
@@ -3920,6 +4176,27 @@ mod tests {
         }
     }
 
+    /// An object store that knows which xite tree its objects live in.
+    ///
+    /// A store adopts big files where they lie and materializes downloads
+    /// into the tree rather than keeping a second copy, so it has to be told
+    /// the tree's root. Production wires this in [`enable_serving`]
+    /// (`<data_dir>/data`); tests put the store and the xite in unrelated
+    /// temp dirs, so they say it explicitly. A store built without one still
+    /// works for everything else - it just has no extern objects (see
+    /// `StoreConfig::xite_root`), which is why the bare `Store::open` calls
+    /// below, for clients that only receive slices, are left alone.
+    fn test_store(store_dir: &std::path::Path, xite_root: &std::path::Path) -> Store {
+        Store::open_with(
+            store_dir,
+            epix_blob::store::StoreConfig {
+                xite_root: Some(xite_root.to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
     /// Bring up a seeder node serving an EDX xite (index.html + a 400 KB
     /// movie.bin) on a real TCP port. Returns its address, the signed
     /// content.json bytes + value, the movie bytes, and the socket address.
@@ -3949,7 +4226,7 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
@@ -4039,7 +4316,7 @@ mod tests {
 
         let state_b = AppState::new("uploader");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
@@ -4125,7 +4402,7 @@ mod tests {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
         state_a.set_transport(transport).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
         state_a.set_edx_store(a_store).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -4140,7 +4417,7 @@ mod tests {
         assert!(XiteStorage::new(a_dir.path()).read("movie.bin").is_err());
 
         // Fetch it over EDX through the injected fetcher.
-        let result = state_a.edx_fetch_file(&address, "movie.bin").await;
+        let result = state_a.edx_fetch_file(&address, "movie.bin", false).await;
         assert!(matches!(result, Some(Ok(true))), "edx fetch result: {result:?}");
 
         // It is now materialized on node A's disk, byte-for-byte.
@@ -4164,7 +4441,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -4212,7 +4489,7 @@ mod tests {
             .await;
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let store_dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap())).await;
+        state.set_edx_store(Arc::new(test_store(store_dir.path(), dir.path()))).await;
         std::mem::forget(store_dir);
         state
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -4225,6 +4502,69 @@ mod tests {
         (state, dir)
     }
 
+    /// The user deletes a materialized file. The extern record then claims
+    /// bytes no file backs; a fetch must notice, retire, and REFETCH -
+    /// not report success forever with nothing on disk (the eternal
+    /// "complete but fileless" loop this regression pins).
+    #[tokio::test]
+    async fn a_deleted_materialized_file_is_retired_and_refetched() {
+        let (address, cb, content, movie, addr, _pk) = spawn_seeder().await;
+        let (state, dir) = client_for(&address, &cb, &content, addr).await;
+
+        // Whole-file fetch materializes the movie into the xite tree.
+        state.edx_fetch_file(&address, "movie.bin", false).await.unwrap().unwrap();
+        let path = dir.path().join("movie.bin");
+        assert_eq!(std::fs::read(&path).unwrap(), movie);
+
+        // The user deletes their file out from under the record.
+        std::fs::remove_file(&path).unwrap();
+
+        // The next fetch must not claim success: it notices the lie and
+        // retires the record...
+        let first = state.edx_fetch_file(&address, "movie.bin", false).await.unwrap();
+        assert!(first.is_err(), "a fileless 'complete' must not report success: {first:?}");
+
+        // ...so the one after starts clean and actually restores the file.
+        assert!(state.edx_fetch_file(&address, "movie.bin", false).await.unwrap().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), movie, "refetched, byte-for-byte");
+    }
+
+    /// Same recovery on the STREAMING path: a range serve against a deleted
+    /// extern file errors once, the wired background revalidate retires the
+    /// record, and the next range request refetches from the swarm.
+    #[tokio::test]
+    async fn a_deleted_streamed_file_recovers_on_the_range_path() {
+        let (address, cb, content, movie, addr, _pk) = spawn_seeder().await;
+        let (state, dir) = client_for(&address, &cb, &content, addr).await;
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        let store = state.edx_store().await.unwrap();
+
+        state.edx_fetch_file(&address, "movie.bin", false).await.unwrap().unwrap();
+        assert!(store.is_extern(id).unwrap());
+        std::fs::remove_file(dir.path().join("movie.bin")).unwrap();
+
+        // First range request fails - the bits claimed present, the disk
+        // disagreed - and arms the background revalidate.
+        let first = state.edx_fetch_range(&address, "movie.bin", 100_000, 50_000).await.unwrap();
+        assert!(first.is_err(), "no silent success on a gone file: {first:?}");
+
+        // The revalidate runs off-thread; wait for the retire.
+        for _ in 0..100 {
+            if !store.contains(id).unwrap() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!store.contains(id).unwrap(), "the stale record was retired");
+
+        // The next request refetches the covering groups and serves.
+        let bytes = match state.edx_fetch_range(&address, "movie.bin", 100_000, 50_000).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range after retire: {other:?}"),
+        };
+        assert_eq!(bytes, movie[100_000..150_000], "served fresh from the swarm");
+    }
+
     /// The owner-signed `order_policy` reorders OUR fetching: the declared
     /// first-paint file lands before everything else even though the default
     /// ladder would have taken the small files first, and a xite that declares
@@ -4235,8 +4575,8 @@ mod tests {
             vec![EdxWant::path("index.html"), EdxWant::path("movie.bin")]
         };
 
-        // No policy: the default ladder runs GetMany over the small files
-        // first, so the 5 KB index.html lands before the 400 KB movie.
+        // No policy: the type ladder puts the page's own markup first and the
+        // movie last, so the 5 KB index.html lands before the 400 KB movie.
         let (address, cb, content, _movie, addr, _pk) = spawn_seeder().await;
         let (state, _dir) = client_for(&address, &cb, &content, addr).await;
         let peers = vec![epix_core::PeerAddr::Ip(addr)];
@@ -4264,6 +4604,68 @@ mod tests {
         );
     }
 
+    /// The default ladder sorts by TYPE, and that has to beat sorting by
+    /// size - otherwise it is not doing anything the old GetMany batching
+    /// did not already do.
+    ///
+    /// This is mx5kevin's case in miniature: a xite that declares nothing,
+    /// whose renderable asset is BIG and whose bulk download is SMALL. Under
+    /// small-first the manual would come down before the stylesheet and the
+    /// page would sit unstyled waiting on it.
+    #[tokio::test]
+    async fn the_default_ladder_beats_small_first_when_they_disagree() {
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let site_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(site_dir.path());
+        // Renderable but large, vs bulk but small.
+        storage.write("css/all.css", &vec![b'c'; 400_000]).unwrap();
+        storage.write("docs/manual.pdf", &vec![b'p'; 5_000]).unwrap();
+        let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
+        xite.sign(&privkey, 1000.0).unwrap();
+        let content_bytes = xite.storage.read("content.json").unwrap();
+        let content: serde_json::Value = serde_json::from_slice(&content_bytes).unwrap();
+        assert!(content.get("order_policy").is_none(), "the xite declares no order");
+
+        let state_b = AppState::new("node-b");
+        let store_dir = tempfile::tempdir().unwrap();
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        state_b.set_edx_store(store_b.clone()).await;
+        state_b
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .await;
+        assert!(state_b.load_content_from_disk(&address).await);
+        std::mem::forget(site_dir);
+        std::mem::forget(store_dir);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state_b.clone(),
+            store_b,
+            epix_crypt::new_seed(),
+            None,
+            ControlHandles::detached(),
+            false,
+            None,
+        ));
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+
+        let (state, _dir) = client_for(&address, &content_bytes, &content, addr).await;
+        let want = vec![EdxWant::path("docs/manual.pdf"), EdxWant::path("css/all.css")];
+        let batch = state
+            .edx_fetch_files(&address, want, vec![epix_core::PeerAddr::Ip(addr)], None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.done,
+            vec!["css/all.css".to_string(), "docs/manual.pdf".to_string()],
+            "the stylesheet the page needs comes down before the document it does not"
+        );
+    }
+
     /// A seeder holding `n` small files (`post-0.json` ...), all inside the
     /// GetMany size class, so a fetch of the lot rides one batch.
     async fn spawn_many_small_seeder(
@@ -4283,7 +4685,7 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
             .add_xite(
@@ -4334,7 +4736,7 @@ mod tests {
 
         let state = AppState::new("node-c");
         let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store = Arc::new(test_store(store_dir.path(), dir.path()));
         state.set_edx_store(store.clone()).await;
         state
             .add_xite(address, XiteEntry { storage, content: None })
@@ -4464,7 +4866,7 @@ mod tests {
             .await;
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let store_dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap())).await;
+        state.set_edx_store(Arc::new(test_store(store_dir.path(), dir.path()))).await;
         state
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state.clone(),
@@ -4612,7 +5014,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
         state_a.set_edx_store(a_store.clone()).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -4652,7 +5054,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
         state_a.set_edx_store(a_store.clone()).await;
         let choker: SharedChoker = Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS)));
         state_a
@@ -4709,7 +5111,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
         state_a.set_edx_store(a_store.clone()).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -4852,7 +5254,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
         state_a.set_edx_store(a_store.clone()).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -4956,12 +5358,13 @@ mod tests {
         let state = AppState::new("volunteer");
         let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let site_dir = tempfile::tempdir().unwrap();
+        let site_path = site_dir.path().to_path_buf();
         state
-            .add_xite(&addr, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(&addr, XiteEntry { storage: XiteStorage::new(&site_path), content: None })
             .await;
         std::mem::forget(site_dir);
         let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store = Arc::new(test_store(store_dir.path(), &site_path));
         std::mem::forget(store_dir);
         state.set_edx_store(store.clone()).await;
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
@@ -5101,7 +5504,7 @@ mod tests {
         // Node B: load (registers the root AND the child file) and serve.
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
@@ -5142,7 +5545,7 @@ mod tests {
         assert!(state_a.load_content_from_disk(&address).await);
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -5152,7 +5555,7 @@ mod tests {
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
-        let result = state_a.edx_fetch_file(&address, "data/users/alice/data.json").await;
+        let result = state_a.edx_fetch_file(&address, "data/users/alice/data.json", false).await;
         assert!(matches!(result, Some(Ok(true))), "child-file fetch: {result:?}");
         let got = XiteStorage::new(a_dir.path()).read("data/users/alice/data.json").unwrap();
         assert_eq!(got, post, "per-user file transferred over EDX");
@@ -5262,7 +5665,7 @@ mod tests {
             .add_xite(&site_addr, XiteEntry { storage: XiteStorage::new(&b_path), content: Some(root) })
             .await;
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), b_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         let prop_b = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
         state_b.set_prop_store(prop_b.clone());
@@ -5378,7 +5781,7 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
@@ -5411,7 +5814,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -5422,7 +5825,7 @@ mod tests {
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
         // Fetch the shard file: fetch ciphertext shards over EDX, decrypt.
-        let result = state_a.edx_fetch_file(&address, "private/secret.txt").await;
+        let result = state_a.edx_fetch_file(&address, "private/secret.txt", false).await;
         assert!(matches!(result, Some(Ok(true))), "shard fetch: {result:?}");
         let got = XiteStorage::new(a_dir.path()).read("private/secret.txt").unwrap();
         assert_eq!(got, secret, "decrypted plaintext matches");
@@ -5443,7 +5846,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
         // Reciprocity on: the fetcher holds the shared choker.
@@ -5456,7 +5859,7 @@ mod tests {
             )))
             .await;
 
-        assert!(state_a.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
+        assert!(state_a.edx_fetch_file(&address, "movie.bin", false).await.unwrap().is_ok());
 
         // The seeder earned reciprocity credit for the bytes it served us.
         let credit = choker.lock().unwrap().credit_of(&server_pk);
@@ -5528,7 +5931,7 @@ mod tests {
         };
 
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         std::mem::forget(site_dir);
         std::mem::forget(store_dir);
@@ -5822,7 +6225,7 @@ mod tests {
                 .await;
             state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
             let sd = tempfile::tempdir().unwrap();
-            state.set_edx_store(Arc::new(Store::open(sd.path()).unwrap())).await;
+            state.set_edx_store(Arc::new(test_store(sd.path(), dir.path()))).await;
             state
                 .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                     state.clone(),
@@ -5840,7 +6243,7 @@ mod tests {
         // small index.html (5 KB).
         let c1 = mk_client().await;
         let t = Instant::now();
-        assert!(c1.edx_fetch_file(&address, "index.html").await.unwrap().is_ok());
+        assert!(c1.edx_fetch_file(&address, "index.html", false).await.unwrap().is_ok());
         let first_paint = t.elapsed();
 
         // Cold media seek: a fresh client fetches a 50 KB mid-file range.
@@ -5853,7 +6256,7 @@ mod tests {
         // Full 400 KB fetch.
         let c3 = mk_client().await;
         let t = Instant::now();
-        assert!(c3.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
+        assert!(c3.edx_fetch_file(&address, "movie.bin", false).await.unwrap().is_ok());
         let full = t.elapsed();
 
         eprintln!(
@@ -6212,7 +6615,7 @@ mod tests {
             .add_xite(&site_addr, XiteEntry { storage: XiteStorage::new(p_dir.path()), content: None })
             .await;
         let p_store_dir = tempfile::tempdir().unwrap();
-        let p_store = Arc::new(Store::open(p_store_dir.path()).unwrap());
+        let p_store = Arc::new(test_store(p_store_dir.path(), p_dir.path()));
         state_p.set_edx_store(p_store.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let p_addr = listener.local_addr().unwrap();
@@ -6247,7 +6650,7 @@ mod tests {
             .await;
         state_r.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let r_store_dir = tempfile::tempdir().unwrap();
-        state_r.set_edx_store(Arc::new(Store::open(r_store_dir.path()).unwrap())).await;
+        state_r.set_edx_store(Arc::new(test_store(r_store_dir.path(), r_dir.path()))).await;
         state_r
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_r.clone(),
@@ -6337,7 +6740,7 @@ mod tests {
             )
             .await;
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
+        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         std::mem::forget(site_dir);
         std::mem::forget(store_dir);
@@ -6402,7 +6805,7 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        let a_store = Arc::new(Store::open(a_store_dir.path()).unwrap());
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
         state_a.set_edx_store(a_store.clone()).await;
         std::mem::forget(a_dir);
         std::mem::forget(a_store_dir);

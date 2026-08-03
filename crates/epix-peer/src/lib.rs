@@ -99,13 +99,40 @@ pub struct ProbeCandidate {
     pub probe_after: i64,
 }
 
+/// How long a peer has been known, as a coarse bucket: brand new, around for
+/// a day, a week, or longer. Used only to break ties in peer selection.
+///
+/// Coarse on purpose. The signal we want is "has this peer stuck around",
+/// which is a question about orders of magnitude, not seconds; comparing raw
+/// timestamps would order every peer by discovery time and quietly turn a
+/// tiebreak into the dominant term. A peer with no stamp (a fresh entry, or
+/// one restored from a pre-durability `peers.json`) reads as brand new,
+/// which is the honest answer.
+fn durability_bucket(p: &Peer, now: i64) -> u8 {
+    const DAY: i64 = 24 * 3600;
+    if p.time_found <= 0 {
+        return 0;
+    }
+    match now.saturating_sub(p.time_found) {
+        d if d >= 30 * DAY => 3,
+        d if d >= 7 * DAY => 2,
+        d if d >= DAY => 1,
+        _ => 0,
+    }
+}
+
 /// One known peer of a xite.
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub addr: PeerAddr,
     /// Reputation; higher = preferred. Adjusted by success/failure.
     pub reputation: i32,
-    /// Unix time the peer was first seen.
+    /// Unix time the peer was first seen. Locally persisted (`peers.json`),
+    /// because how LONG a peer has been around is the only durability signal
+    /// there is: a node that has served this xite for months is a better bet
+    /// than one discovered a minute ago, and resetting it on every restart
+    /// made every peer look equally new forever. Never sent to peers - a
+    /// self-reported age would just be claimed by whoever benefits from it.
     pub time_found: i64,
     /// Unix time of the last successful response (0 = never).
     pub time_response: i64,
@@ -477,6 +504,14 @@ impl Peers {
                 .cmp(&a.reputation)
                 .then(net_rank(a).cmp(&net_rank(b)))
                 .then(a.connection_errors.cmp(&b.connection_errors))
+                // Among peers that are otherwise equally good, prefer the one
+                // that has been around longest. Content survives because
+                // somebody keeps seeding it, and the peers most likely to
+                // still be there in a month are the ones that were already
+                // there last month. Bucketed rather than raw so it breaks
+                // ties without becoming a ranking of its own - a peer found
+                // an hour ago must not outrank a healthier one found now.
+                .then(durability_bucket(b, now).cmp(&durability_bucket(a, now)))
                 .then(b.time_response.cmp(&a.time_response))
         });
         if peers.len() <= limit {
@@ -1007,5 +1042,59 @@ mod tests {
             vec![ip("3.3.3.3:1"), ip("4.4.4.4:1"), ip("1.1.1.1:1"), ip("2.2.2.2:1")],
             "reputation first, then fewer errors, then most recent response"
         );
+    }
+
+    #[test]
+    fn a_long_held_peer_wins_a_tie_but_never_outranks_a_healthier_one() {
+        const DAY: i64 = 24 * 3600;
+        let now = 60 * DAY;
+        let mut peers = Peers::new();
+        // Identical on every existing criterion; only their age differs.
+        for (a, found) in [("1.1.1.1:1", now - 60), ("2.2.2.2:1", now - 40 * DAY)] {
+            peers.add(ip(a), 0);
+            let p = peers.get_mut(&ip(a)).unwrap();
+            p.reputation = 5;
+            p.time_response = 90;
+            p.time_found = found;
+        }
+        assert_eq!(
+            peers.connectable_dialable(10, DialableNets::all(), now),
+            vec![ip("2.2.2.2:1"), ip("1.1.1.1:1")],
+            "the peer that has been seeding for a month goes first"
+        );
+
+        // But durability is a TIEBREAK: a fresher peer with better standing
+        // still wins, or "old" would become its own ranking.
+        peers.add(ip("3.3.3.3:1"), 0);
+        let p = peers.get_mut(&ip("3.3.3.3:1")).unwrap();
+        p.reputation = 9;
+        p.time_response = 90;
+        p.time_found = now;
+        assert_eq!(
+            peers.connectable_dialable(10, DialableNets::all(), now)[0],
+            ip("3.3.3.3:1"),
+            "reputation still dominates age"
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_future_age_reads_as_brand_new() {
+        const DAY: i64 = 24 * 3600;
+        let now = 60 * DAY;
+        let mut peers = Peers::new();
+        peers.add(ip("1.1.1.1:1"), 0);
+        let p = peers.get_mut(&ip("1.1.1.1:1")).unwrap();
+        p.time_found = 0; // restored from a peers.json that had no stamp
+        assert_eq!(durability_bucket(p, now), 0);
+
+        peers.add(ip("2.2.2.2:1"), 0);
+        let p = peers.get_mut(&ip("2.2.2.2:1")).unwrap();
+        p.time_found = now + 10 * DAY; // clock skew, or an edited file
+        assert_eq!(durability_bucket(p, now), 0, "a future stamp buys nothing");
+
+        peers.add(ip("3.3.3.3:1"), 0);
+        let p = peers.get_mut(&ip("3.3.3.3:1")).unwrap();
+        p.time_found = now - 8 * DAY;
+        assert_eq!(durability_bucket(p, now), 2);
     }
 }

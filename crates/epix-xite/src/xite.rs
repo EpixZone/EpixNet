@@ -982,9 +982,11 @@ impl Xite {
     }
 
     /// Register one local file as the object `id` and pin it: small files
-    /// insert into slabs, files >= the bundle cutoff adopt in place. Returns
-    /// whether it was registered - a `false` is a missing/mismatched local
-    /// file, which simply stays fetchable from the swarm instead.
+    /// insert into slabs, files >= the bundle cutoff are adopted where they
+    /// lie (the file in the xite tree IS the object's bytes - nothing is
+    /// copied or linked). Returns whether it was registered - a `false` is a
+    /// missing/mismatched local file, which simply stays fetchable from the
+    /// swarm instead.
     fn register_entry(
         &self,
         store: &epix_blob::store::Store,
@@ -1005,10 +1007,15 @@ impl Xite {
                 .map(|_| ())
         } else {
             self.storage.path(path).and_then(|p| {
-                store
-                    .adopt_file(id, epix_blob::Ns::Plain, &p, now)
-                    .map(|_| ())
-                    .map_err(Error::Io)
+                let fresh = store.adopt_extern(id, epix_blob::Ns::Plain, &p, now).map_err(Error::Io)?;
+                if !fresh {
+                    // A record already existed. If it is a store-side copy of
+                    // this same file - what every materialized download used
+                    // to leave behind - hand the space back and read through
+                    // to the tree instead. No-op for anything else.
+                    let _ = store.reclaim_duplicate(id, &p, now);
+                }
+                Ok(())
             })
         };
         match res {

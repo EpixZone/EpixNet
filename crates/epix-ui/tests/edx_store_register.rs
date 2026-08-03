@@ -32,9 +32,19 @@ fn sign_edx_xite() -> (String, tempfile::TempDir, serde_json::Value) {
 async fn loading_a_xite_registers_its_files_into_the_edx_store() {
     let (address, dir, content) = sign_edx_xite();
 
-    // A node with an EDX store installed.
+    // A node with an EDX store installed. Big files are adopted where they
+    // lie rather than copied in, so the store is told which tree that is.
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(store_dir.path()).unwrap());
+    let store = Arc::new(
+        Store::open_with(
+            store_dir.path(),
+            epix_blob::store::StoreConfig {
+                xite_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
     let state = AppState::new("test");
     state.set_edx_store(store.clone()).await;
 
