@@ -648,3 +648,124 @@ fn a_store_without_a_xite_root_simply_has_no_extern_objects() {
     let small = test_data(900);
     assert!(store.insert_bytes(oid(&small), Ns::Plain, &small, 1).unwrap());
 }
+
+#[test]
+fn a_second_path_with_the_same_bytes_still_gets_its_file() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    // Xite A holds the canonical copy.
+    let data = test_data(150_000);
+    let id = oid(&data);
+    let a = tree.path().join("xiteA").join("movie.bin");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::write(&a, &data).unwrap();
+    store.adopt_extern(id, Ns::Plain, &a, 1).unwrap();
+
+    // Xite B declares the SAME bytes (cross-xite dedup). Materializing B's
+    // path used to be a silent no-op: reported done, file never created,
+    // fetch loop forever satisfied.
+    let b = tree.path().join("xiteB").join("movie.bin");
+    store.materialize(id, &b, 2).unwrap();
+    assert_eq!(std::fs::read(&b).unwrap(), data, "B's tree is self-contained");
+    assert_eq!(std::fs::read(&a).unwrap(), data, "A's copy is untouched");
+    assert!(store.is_extern(id).unwrap(), "the record keeps its one canonical path");
+    assert_eq!(store.read_range(id, 0, 100, 3).unwrap(), data[..100], "still serves via A");
+}
+
+#[test]
+fn an_altered_canonical_copy_is_never_handed_to_another_path() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(120_000);
+    let id = oid(&data);
+    let a = tree.path().join("xiteA").join("orig.bin");
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    std::fs::write(&a, &data).unwrap();
+    store.adopt_extern(id, Ns::Plain, &a, 1).unwrap();
+
+    // The user edits their copy under A. Copying it out to B would hand B
+    // bytes that fail B's manifest - so the record retires instead, and the
+    // caller refetches from the swarm.
+    let mut edited = data.clone();
+    edited[60_000] ^= 0xff;
+    std::fs::write(&a, &edited).unwrap();
+
+    let b = tree.path().join("xiteB").join("orig.bin");
+    assert!(store.materialize(id, &b, 2).is_err());
+    assert!(!b.exists(), "no altered copy handed out");
+    assert!(!store.contains(id).unwrap(), "retired for a clean refetch");
+    assert!(a.exists(), "the user's edit survives");
+}
+
+#[test]
+fn a_missing_backing_file_retires_instead_of_lying() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(100_000);
+    let id = oid(&data);
+    let file = tree.path().join("xite1").join("gone.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &data).unwrap();
+    store.adopt_extern(id, Ns::Plain, &file, 1).unwrap();
+
+    // The user deletes the file. materialize used to return Ok anyway,
+    // which made every fetch report success with nothing on disk, forever.
+    std::fs::remove_file(&file).unwrap();
+    assert!(store.materialize(id, &file, 2).is_err(), "a gone backing is not a success");
+    assert!(!store.contains(id).unwrap(), "retired so is_complete stops lying");
+
+    // A clean refetch works: the object comes back as a normal download and
+    // materializes again.
+    let (id2, size, slice) = slice_for(&data, &[0..100_000]);
+    assert_eq!(id, id2);
+    store.ensure_sparse(id, Ns::Plain, size, 3).unwrap();
+    store.write_slice(id, &[0..100_000], &slice[..], 3).unwrap();
+    store.materialize(id, &file, 4).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), data, "the file is back");
+}
+
+#[test]
+fn revalidate_heals_a_sparse_record_whose_file_is_gone() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(80_000);
+    let (id, size, slice) = slice_for(&data, &[0..80_000]);
+    store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    store.write_slice(id, &[0..80_000], &slice[..], 1).unwrap();
+    assert!(store.is_complete(id).unwrap());
+
+    // The crash window: a materialize's rename moved the file but the record
+    // commit never landed (or the store dir was hand-pruned). The bits claim
+    // groups no file backs.
+    std::fs::remove_file(store_dir.path().join("sparse").join(id.to_string())).unwrap();
+    assert!(store.is_complete(id).unwrap(), "the stale record still claims completeness");
+
+    // revalidate drops the record instead of erroring, so the next fetch
+    // starts clean rather than reading against a ghost forever.
+    assert!(store.revalidate(id).unwrap().is_empty());
+    assert!(!store.contains(id).unwrap());
+}
+
+#[test]
+fn adoption_rejects_a_path_that_escapes_the_root_lexically() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(50_000);
+    let id = oid(&data);
+    // Lexically under the root, resolves outside it: strip_prefix alone
+    // would wave this through with a leading `..` in the stored rel.
+    let sneaky = tree.path().join("..").join("outside.bin");
+    std::fs::write(&sneaky, &data).unwrap();
+    assert!(store.adopt_extern(id, Ns::Plain, &sneaky, 1).is_err());
+    assert!(!store.contains(id).unwrap());
+}

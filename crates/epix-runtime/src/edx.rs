@@ -2771,10 +2771,26 @@ impl RuntimeEdxFetcher {
                 return; // another Range request is already moving it
             }
         }
+        // Released from a Drop guard, not a trailing statement: a panic
+        // anywhere in the task would otherwise leak the entry and block this
+        // object's materialize until restart.
+        struct Claim {
+            streaming: Arc<Mutex<Streaming>>,
+            id: ObjId,
+        }
+        impl Drop for Claim {
+            fn drop(&mut self) {
+                if let Ok(mut s) = self.streaming.lock() {
+                    s.materializing.remove(&self.id);
+                }
+            }
+        }
+        let claim = Claim { streaming: self.streaming.clone(), id };
         let this = self.clone();
         let address = address.to_string();
         let inner_path = inner_path.to_string();
         tokio::spawn(async move {
+            let _claim = claim;
             if let Err(e) = this.state.edx_materialize_object(&address, &inner_path, id).await {
                 // Not fatal: the bytes are still served from the store, and
                 // the next completed range retries the move.
@@ -2782,8 +2798,62 @@ impl RuntimeEdxFetcher {
                     .log("WARN", format!("materialize {address}/{inner_path}: {e}"))
                     .await;
             }
-            this.streaming.lock().expect("streaming").materializing.remove(&id);
         });
+    }
+
+    /// The body behind both [`EdxFetcher::fetch_file`] entries: resolve,
+    /// fetch what the store lacks at `deadline`, materialize. The deadline is
+    /// the ONLY difference between the interactive and background variants -
+    /// keeping one body means they can never drift apart in anything else.
+    async fn fetch_file_at(
+        &self,
+        address: &str,
+        inner_path: &str,
+        deadline: Deadline,
+    ) -> Result<bool, String> {
+        let store = self.state.edx_store().await.ok_or("no EDX store")?;
+        // Encrypted-shard file: fetch the ciphertext shards and decrypt.
+        let content_bytes =
+            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
+        let content: serde_json::Value =
+            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
+        if let Some(shard) = epix_blob::manifest::edx_shard_entry(&content, inner_path) {
+            return self.fetch_shard_file(address, inner_path, &content, shard, &store).await;
+        }
+        let Some((id, size)) = self.resolve(address, inner_path).await? else {
+            return Err("no edx entry for file".into());
+        };
+        let now = now_secs();
+
+        // Already complete in the store: just materialize it.
+        if store.is_complete(id).unwrap_or(false) {
+            self.materialize(address, inner_path, id, size, &store).await?;
+            return Ok(true);
+        }
+
+        let (handles, node_pks) = self.build_peers(address, id).await?;
+        // Reserve the sparse record only now that a peer can serve it, and drop
+        // it again if nothing lands (see `ObjClaim`): a manifest entry a
+        // visitor touches once must not leave an index row and a sparse/.obao
+        // file pair behind forever.
+        let _claim =
+            self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
+        let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let report = match swarm.fetch(&needed, &handles, deadline, now).await {
+            Ok(report) => report,
+            Err(e) => return Err(e.to_string()),
+        };
+        self.credit(&report, &node_pks, now);
+        if !store.is_complete(id).unwrap_or(false) {
+            return Err("fetch did not complete".into());
+        }
+
+        self.materialize(address, inner_path, id, size, &store).await?;
+        // Cached content grows the store; keep it under quota (own content is
+        // pinned, so only cached-from-others objects are evicted).
+        let _ = store.enforce_quota(store_quota());
+        Ok(true)
     }
 
     /// Turn a completed object into the xite's file on disk.
@@ -3234,55 +3304,22 @@ async fn sweep_signed_over_session(
 #[async_trait::async_trait]
 impl EdxFetcher for RuntimeEdxFetcher {
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        let store = self.state.edx_store().await.ok_or("no EDX store")?;
-        // Encrypted-shard file: fetch the ciphertext shards and decrypt.
-        let content_bytes =
-            self.state.read_file(address, "content.json").await.ok_or("no content.json")?;
-        let content: serde_json::Value =
-            serde_json::from_slice(&content_bytes).map_err(|e| e.to_string())?;
-        if let Some(shard) = epix_blob::manifest::edx_shard_entry(&content, inner_path) {
-            return self.fetch_shard_file(address, inner_path, &content, shard, &store).await;
-        }
-        let Some((id, size)) = self.resolve(address, inner_path).await? else {
-            return Err("no edx entry for file".into());
-        };
-        let now = now_secs();
-
-        // Already complete in the store: just materialize it.
-        if store.is_complete(id).unwrap_or(false) {
-            self.materialize(address, inner_path, id, size, &store).await?;
-            return Ok(true);
-        }
-
-        let (handles, node_pks) = self.build_peers(address, id).await?;
-        // Reserve the sparse record only now that a peer can serve it, and drop
-        // it again if nothing lands (see `ObjClaim`): a manifest entry a
-        // visitor touches once must not leave an index row and a sparse/.obao
-        // file pair behind forever.
-        let _claim =
-            self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
-        let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
-        let mut swarm = Swarm::new(store.clone(), id, size);
         // Tight, not background: this is the on-demand path, so something is
         // waiting on these bytes RIGHT NOW - the page the user has open asked
         // for this file. Running it as background bulk meant the visible page
         // queued behind whatever the scheduler was already doing, which is the
         // other half of "the page you are viewing should jump the queue"
         // (the first half is the type ladder in `fetch_tiers`).
-        let report = match swarm.fetch(&needed, &handles, Deadline::tight(), now).await {
-            Ok(report) => report,
-            Err(e) => return Err(e.to_string()),
-        };
-        self.credit(&report, &node_pks, now);
-        if !store.is_complete(id).unwrap_or(false) {
-            return Err("fetch did not complete".into());
-        }
+        self.fetch_file_at(address, inner_path, Deadline::tight()).await
+    }
 
-        self.materialize(address, inner_path, id, size, &store).await?;
-        // Cached content grows the store; keep it under quota (own content is
-        // pinned, so only cached-from-others objects are evicted).
-        let _ = store.enforce_quota(store_quota());
-        Ok(true)
+    async fn fetch_file_background(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        // Patient: nothing is waiting, so a slow-but-moving onion transfer
+        // should finish rather than be raced and abandoned. This is what the
+        // retention completion pass and the optional retry loop use - work
+        // that runs behind an already-painted page must never compete at
+        // first-paint urgency, nor pay first-paint impatience.
+        self.fetch_file_at(address, inner_path, Deadline::background()).await
     }
 
     async fn fetch_signed(
@@ -3437,7 +3474,25 @@ impl EdxFetcher for RuntimeEdxFetcher {
                 self.xfer.note_error(id, address, now, &e);
                 return Err(e);
             }
-            let bytes = store.read_range(id, start, got, now).map_err(|e| e.to_string())?;
+            let bytes = match store.read_range(id, start, got, now) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // The bits said these groups are present and the read
+                    // still failed: the record and the disk disagree. For an
+                    // extern object that is a deleted/altered xite file; for
+                    // a sparse one, a file lost to a crash. Either way the
+                    // next request must not hit the same wall - revalidate
+                    // shrinks or retires the record so it refetches. In the
+                    // background: it can re-hash a whole file, and this
+                    // response is already an error.
+                    let vstore = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = vstore.revalidate(id);
+                    });
+                    self.xfer.note_error(id, address, now, &e.to_string());
+                    return Err(e.to_string());
+                }
+            };
             self.xfer.note_serve(
                 id, address, inner_path, size, now, (start, end), bytes.len() as u64, false,
             );
@@ -3776,17 +3831,63 @@ pub async fn enable_serving(
 /// owner's own shards into `Ns::Shard`, and content.json reaches peers
 /// through ordinary propagation, so a fresh publish becomes holdable by
 /// volunteers as soon as they see the manifest.
-pub async fn volunteer_sweep(state: &Arc<AppState>) {
+/// Per shard-file backoff for [`volunteer_sweep`]: how many consecutive
+/// unproductive passes a file has had, and when it is worth trying again.
+/// Owned by the resync loop (the sweep's only caller), so it needs no home
+/// in AppState and dies with the loop.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VolunteerBackoff {
+    /// `now_secs` before which the file is skipped.
+    next_try: u64,
+    /// Consecutive passes that held nothing new.
+    streak: u32,
+}
+
+/// When to retry after `streak` unproductive passes: one skipped tick per
+/// doubling, capped at an hour. A pass that holds nothing usually means
+/// either "nothing missing" (a no-op we can cheaply not repeat) or "no
+/// reachable peer had the shards" - and redialing up to 8 peers for the
+/// same missing shards every 5-minute tick, forever, is exactly the kind
+/// of circuit churn Tor punishes. The cap keeps a config change (a raised
+/// quota widens responsibility) effective within the hour.
+fn volunteer_retry_delay(streak: u32) -> u64 {
+    const BASE: u64 = 600; // 10 min: skip at least the next tick
+    const CAP: u64 = 3600;
+    (BASE << streak.saturating_sub(1).min(3)).min(CAP)
+}
+
+pub async fn volunteer_sweep(
+    state: &Arc<AppState>,
+    backoff: &mut std::collections::HashMap<(String, String), VolunteerBackoff>,
+) {
     if state.volunteer_quota_bytes().await == 0 {
         return; // not volunteering
     }
+    let files = state.shard_files().await;
+    // Drop backoff rows for files no manifest declares any more (a removed
+    // or re-signed xite), or the map grows for the life of the process.
+    let live: std::collections::HashSet<&(String, String)> = files.iter().collect();
+    backoff.retain(|k, _| live.contains(k));
+    let now = now_secs();
     let mut held = 0usize;
-    for (address, inner_path) in state.shard_files().await {
-        match volunteer_hold(state, &address, &inner_path).await {
-            Ok(n) => held += n,
-            // A xite whose peers are all offline right now is not an error;
-            // the next tick tries again.
-            Err(_) => continue,
+    for key in files {
+        if backoff.get(&key).is_some_and(|b| now < b.next_try) {
+            continue;
+        }
+        let (address, inner_path) = &key;
+        let n = match volunteer_hold(state, address, inner_path).await {
+            Ok(n) => n,
+            // A xite whose peers are all offline right now is not an error,
+            // but it earns the same backoff as an empty pass.
+            Err(_) => 0,
+        };
+        if n > 0 {
+            held += n;
+            backoff.remove(&key);
+        } else {
+            let b = backoff.entry(key).or_default();
+            b.streak = b.streak.saturating_add(1);
+            b.next_try = now.saturating_add(volunteer_retry_delay(b.streak));
         }
     }
     if held > 0 {
@@ -3844,6 +3945,19 @@ mod tests {
         std::env::set_var("EPIX_EDX_KILLSWITCH_TEST", "1");
         assert!(env_on("EPIX_EDX_KILLSWITCH_TEST"), "1 stays on");
         std::env::remove_var("EPIX_EDX_KILLSWITCH_TEST");
+    }
+
+    /// An unproductive volunteer pass skips at least the next 5-minute tick
+    /// and backs off doubling to an hour, so shards nobody reachable holds
+    /// stop re-dialing 8 peers every tick - while a raised quota still
+    /// widens responsibility within the hour.
+    #[test]
+    fn volunteer_backoff_doubles_to_an_hour() {
+        assert_eq!(volunteer_retry_delay(1), 600);
+        assert_eq!(volunteer_retry_delay(2), 1200);
+        assert_eq!(volunteer_retry_delay(3), 2400);
+        assert_eq!(volunteer_retry_delay(4), 3600, "capped");
+        assert_eq!(volunteer_retry_delay(30), 3600, "a long streak never overflows");
     }
 
     /// GetSigned serves signed content only: the content.json files and the
@@ -4224,7 +4338,7 @@ mod tests {
         assert!(XiteStorage::new(a_dir.path()).read("movie.bin").is_err());
 
         // Fetch it over EDX through the injected fetcher.
-        let result = state_a.edx_fetch_file(&address, "movie.bin").await;
+        let result = state_a.edx_fetch_file(&address, "movie.bin", false).await;
         assert!(matches!(result, Some(Ok(true))), "edx fetch result: {result:?}");
 
         // It is now materialized on node A's disk, byte-for-byte.
@@ -4307,6 +4421,69 @@ mod tests {
             .await;
         state.add_peers(address, [epix_core::PeerAddr::Ip(addr)]).await;
         (state, dir)
+    }
+
+    /// The user deletes a materialized file. The extern record then claims
+    /// bytes no file backs; a fetch must notice, retire, and REFETCH -
+    /// not report success forever with nothing on disk (the eternal
+    /// "complete but fileless" loop this regression pins).
+    #[tokio::test]
+    async fn a_deleted_materialized_file_is_retired_and_refetched() {
+        let (address, cb, content, movie, addr, _pk) = spawn_seeder().await;
+        let (state, dir) = client_for(&address, &cb, &content, addr).await;
+
+        // Whole-file fetch materializes the movie into the xite tree.
+        state.edx_fetch_file(&address, "movie.bin", false).await.unwrap().unwrap();
+        let path = dir.path().join("movie.bin");
+        assert_eq!(std::fs::read(&path).unwrap(), movie);
+
+        // The user deletes their file out from under the record.
+        std::fs::remove_file(&path).unwrap();
+
+        // The next fetch must not claim success: it notices the lie and
+        // retires the record...
+        let first = state.edx_fetch_file(&address, "movie.bin", false).await.unwrap();
+        assert!(first.is_err(), "a fileless 'complete' must not report success: {first:?}");
+
+        // ...so the one after starts clean and actually restores the file.
+        assert!(state.edx_fetch_file(&address, "movie.bin", false).await.unwrap().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), movie, "refetched, byte-for-byte");
+    }
+
+    /// Same recovery on the STREAMING path: a range serve against a deleted
+    /// extern file errors once, the wired background revalidate retires the
+    /// record, and the next range request refetches from the swarm.
+    #[tokio::test]
+    async fn a_deleted_streamed_file_recovers_on_the_range_path() {
+        let (address, cb, content, movie, addr, _pk) = spawn_seeder().await;
+        let (state, dir) = client_for(&address, &cb, &content, addr).await;
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        let store = state.edx_store().await.unwrap();
+
+        state.edx_fetch_file(&address, "movie.bin", false).await.unwrap().unwrap();
+        assert!(store.is_extern(id).unwrap());
+        std::fs::remove_file(dir.path().join("movie.bin")).unwrap();
+
+        // First range request fails - the bits claimed present, the disk
+        // disagreed - and arms the background revalidate.
+        let first = state.edx_fetch_range(&address, "movie.bin", 100_000, 50_000).await.unwrap();
+        assert!(first.is_err(), "no silent success on a gone file: {first:?}");
+
+        // The revalidate runs off-thread; wait for the retire.
+        for _ in 0..100 {
+            if !store.contains(id).unwrap() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!store.contains(id).unwrap(), "the stale record was retired");
+
+        // The next request refetches the covering groups and serves.
+        let bytes = match state.edx_fetch_range(&address, "movie.bin", 100_000, 50_000).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range after retire: {other:?}"),
+        };
+        assert_eq!(bytes, movie[100_000..150_000], "served fresh from the swarm");
     }
 
     /// The owner-signed `order_policy` reorders OUR fetching: the declared
@@ -5299,7 +5476,7 @@ mod tests {
             .await;
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
-        let result = state_a.edx_fetch_file(&address, "data/users/alice/data.json").await;
+        let result = state_a.edx_fetch_file(&address, "data/users/alice/data.json", false).await;
         assert!(matches!(result, Some(Ok(true))), "child-file fetch: {result:?}");
         let got = XiteStorage::new(a_dir.path()).read("data/users/alice/data.json").unwrap();
         assert_eq!(got, post, "per-user file transferred over EDX");
@@ -5569,7 +5746,7 @@ mod tests {
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
         // Fetch the shard file: fetch ciphertext shards over EDX, decrypt.
-        let result = state_a.edx_fetch_file(&address, "private/secret.txt").await;
+        let result = state_a.edx_fetch_file(&address, "private/secret.txt", false).await;
         assert!(matches!(result, Some(Ok(true))), "shard fetch: {result:?}");
         let got = XiteStorage::new(a_dir.path()).read("private/secret.txt").unwrap();
         assert_eq!(got, secret, "decrypted plaintext matches");
@@ -5603,7 +5780,7 @@ mod tests {
             )))
             .await;
 
-        assert!(state_a.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
+        assert!(state_a.edx_fetch_file(&address, "movie.bin", false).await.unwrap().is_ok());
 
         // The seeder earned reciprocity credit for the bytes it served us.
         let credit = choker.lock().unwrap().credit_of(&server_pk);
@@ -5987,7 +6164,7 @@ mod tests {
         // small index.html (5 KB).
         let c1 = mk_client().await;
         let t = Instant::now();
-        assert!(c1.edx_fetch_file(&address, "index.html").await.unwrap().is_ok());
+        assert!(c1.edx_fetch_file(&address, "index.html", false).await.unwrap().is_ok());
         let first_paint = t.elapsed();
 
         // Cold media seek: a fresh client fetches a 50 KB mid-file range.
@@ -6000,7 +6177,7 @@ mod tests {
         // Full 400 KB fetch.
         let c3 = mk_client().await;
         let t = Instant::now();
-        assert!(c3.edx_fetch_file(&address, "movie.bin").await.unwrap().is_ok());
+        assert!(c3.edx_fetch_file(&address, "movie.bin", false).await.unwrap().is_ok());
         let full = t.elapsed();
 
         eprintln!(

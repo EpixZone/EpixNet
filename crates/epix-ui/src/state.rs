@@ -84,7 +84,21 @@ pub trait EdxFetcher: Send + Sync {
     /// `b3` root, and write it into the xite's storage. `Ok(true)` when the
     /// file is present afterward; `Err` when the EDX fetch could not complete
     /// (the caller may fall back to the legacy path).
+    ///
+    /// This is the INTERACTIVE entry: something (usually the open page) is
+    /// waiting on these bytes right now, so an implementation may race slow
+    /// peers at a tight deadline.
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String>;
+
+    /// [`Self::fetch_file`] for work nothing is waiting on - the retention
+    /// completion pass, the optional-file retry loop. Same contract; an
+    /// implementation should fetch patiently rather than race slow peers
+    /// (over an onion circuit a tight deadline abandons transfers that were
+    /// making progress, and background work should never pay that). The
+    /// default just delegates, which is fine for mocks.
+    async fn fetch_file_background(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        self.fetch_file(address, inner_path).await
+    }
 
     /// Fetch a signed inner_path (content.json - the manifest, or a child
     /// content.json) of `address` from a single `peer` over an EDX link, via
@@ -6282,7 +6296,34 @@ impl AppState {
 
     /// Download a file (required or optional) on demand from peers, verifying
     /// its hash before writing. `fileNeed`. Returns true if present after.
+    ///
+    /// The INTERACTIVE entry: the open page (or the user's click) is waiting,
+    /// so the fetch runs at the tight deadline. Background work uses
+    /// [`Self::file_need_background`].
     pub async fn file_need(&self, address: &str, inner_path: &str) -> Result<bool, String> {
+        self.file_need_at(address, inner_path, false).await
+    }
+
+    /// [`Self::file_need`] for work nothing is waiting on: the retention
+    /// completion pass and the optional-file retry loop. Identical contract
+    /// and coalescing; the only difference is the fetcher runs patiently
+    /// instead of racing slow peers - background work behind an
+    /// already-painted page should neither compete at first-paint urgency
+    /// nor abandon an onion transfer that was making progress.
+    pub async fn file_need_background(
+        &self,
+        address: &str,
+        inner_path: &str,
+    ) -> Result<bool, String> {
+        self.file_need_at(address, inner_path, true).await
+    }
+
+    async fn file_need_at(
+        &self,
+        address: &str,
+        inner_path: &str,
+        background: bool,
+    ) -> Result<bool, String> {
         let (entry, _, _optional) = self
             .declared_entry(address, inner_path)
             .await
@@ -6343,7 +6384,7 @@ impl AppState {
                 const ATTEMPTS: usize = 3;
                 let mut last = String::new();
                 for attempt in 0..ATTEMPTS {
-                    match self.edx_fetch_file(address, inner_path).await {
+                    match self.edx_fetch_file(address, inner_path, background).await {
                         Some(Ok(true)) => return Ok(true),
                         Some(Ok(false)) => {
                             last = format!("EDX could not complete {inner_path}")
@@ -8840,9 +8881,18 @@ impl AppState {
     /// Fetch `inner_path` of `address` over EDX via the installed fetcher.
     /// `Ok(None)` when no fetcher is installed (fall back to the legacy path);
     /// otherwise the fetcher's result.
-    pub async fn edx_fetch_file(&self, address: &str, inner_path: &str) -> Option<Result<bool, String>> {
+    pub async fn edx_fetch_file(
+        &self,
+        address: &str,
+        inner_path: &str,
+        background: bool,
+    ) -> Option<Result<bool, String>> {
         let fetcher = self.edx_fetcher.read().await.clone()?;
-        Some(fetcher.fetch_file(address, inner_path).await)
+        Some(if background {
+            fetcher.fetch_file_background(address, inner_path).await
+        } else {
+            fetcher.fetch_file(address, inner_path).await
+        })
     }
 
     /// Fetch a signed inner_path (content.json) of `address` from `peer` over
@@ -12055,7 +12105,7 @@ impl AppState {
             round,
             rounds,
         );
-        let result = self.file_need(address, path).await;
+        let result = self.file_need_background(address, path).await;
         sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = sampler.await;
         result
@@ -12602,7 +12652,7 @@ impl AppState {
                 break;
             }
             attempted += 1;
-            let _ = self.file_need(address, &path).await;
+            let _ = self.file_need_background(address, &path).await;
         }
         attempted
     }

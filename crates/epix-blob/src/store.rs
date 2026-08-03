@@ -439,6 +439,21 @@ impl Store {
                 format!("{} is outside the xite root {}", path.display(), root.display()),
             )
         })?;
+        // strip_prefix is lexical, so `root/../elsewhere` passes it with a
+        // leading `..` that would resolve back OUT of the root when joined.
+        // Every production caller already routes through XiteStorage::path,
+        // which rejects traversal - this makes the store safe on its own
+        // terms rather than by courtesy of its callers.
+        use std::path::Component;
+        if rel
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} escapes the xite root {}", path.display(), root.display()),
+            ));
+        }
         rel.to_str()
             .map(str::to_string)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 xite path"))
@@ -756,9 +771,15 @@ impl Store {
         let rel = self.rel_of(dst)?;
         let rec = self.required(id)?;
         match rec.loc {
-            // Already materialized (a concurrent fetch won the race, or the
-            // caller retried): nothing to move.
-            Loc::Extern => return Ok(()),
+            // Already extern somewhere. That is NOT automatically "nothing to
+            // do": the record points at ONE canonical path, and the caller may
+            // be materializing a DIFFERENT declared path with the same bytes
+            // (two identical files in a xite, or the same movie in two xites -
+            // cross-xite dedup). An early unconditional Ok here left every
+            // such second path a phantom: reported materialized, never on
+            // disk. And if the user deleted the canonical file, Ok was a lie
+            // outright - the record must retire so the caller refetches.
+            Loc::Extern => return self.materialize_from_extern(id, &rec, dst),
             Loc::Slab { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -800,6 +821,55 @@ impl Store {
         Ok(())
     }
 
+    /// Materialize `dst` for an object that is ALREADY extern at its
+    /// canonical path. Three cases:
+    ///
+    /// - `dst` IS the canonical path and the file is there: idempotent no-op
+    ///   (a concurrent fetch won the race, or the caller retried).
+    /// - `dst` is a different path and the canonical file still verifies:
+    ///   copy it out, so the second xite's tree is self-contained too. The
+    ///   record keeps pointing at the one canonical path; the copy is an
+    ///   ordinary tree file like any other. Verified before copying because
+    ///   the canonical file is user-editable - handing xite B a file the
+    ///   user edited under xite A would give B bytes that fail its manifest.
+    /// - The canonical file is missing or no longer matches: retire the
+    ///   record and return NotFound, so the caller's error path leads to a
+    ///   real refetch instead of an eternal "complete but fileless" loop.
+    fn materialize_from_extern(
+        &self,
+        id: ObjId,
+        rec: &ObjRecord,
+        dst: &std::path::Path,
+    ) -> io::Result<()> {
+        let cur = self.extern_path(id)?;
+        if cur == dst {
+            // The canonical path itself: cheap existence check, not a full
+            // re-hash - this is the hot idempotent-retry case, and an edited
+            // file at its own path is revalidate's job, as it always was.
+            if cur.is_file() {
+                return Ok(());
+            }
+        } else if self.extern_still_matches(id, rec).unwrap_or(false) {
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let copied = fs::copy(&cur, dst)?;
+            if copied != rec.size {
+                let _ = fs::remove_file(dst);
+                return Err(io::Error::other(format!(
+                    "short copy of extern {id}: {copied} of {} bytes",
+                    rec.size
+                )));
+            }
+            return Ok(());
+        }
+        self.retire_extern(id)?;
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("extern backing for {id} at {} is gone or altered; retired for refetch", cur.display()),
+        ))
+    }
+
     /// Commit the record + path row for an extern object in one txn, so a
     /// reader can never see `Loc::Extern` without a path to resolve it.
     fn commit_extern(
@@ -811,6 +881,7 @@ impl Store {
         now: u64,
     ) -> io::Result<bool> {
         let txn = self.db.begin_write().map_err(db_err)?;
+        let prev_loc;
         {
             let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
             // Preserve a refcount/LRU stamp another path committed while we
@@ -820,6 +891,25 @@ impl Store {
                 Some(g) => Some(dec(g.value())?),
                 None => None,
             };
+            prev_loc = prev.as_ref().map(|r| r.loc);
+            // A racer can have landed the same bytes as a slab object between
+            // our record check and this txn (adopt vs a concurrent small-file
+            // insert). Overwriting its loc is correct - the bytes are
+            // identical, hash-addressed - but the slab range it occupied must
+            // be booked dead, exactly as `delete_object` books it, or the
+            // space is never compacted away.
+            if let Some(Loc::Slab { slab, .. }) = prev_loc {
+                let mut slabs = txn.open_table(SLABS).map_err(db_err)?;
+                let meta: Option<SlabMeta> = slabs
+                    .get(slab)
+                    .map_err(db_err)?
+                    .map(|g| dec::<SlabMeta>(g.value()))
+                    .transpose()?;
+                if let Some(mut m) = meta {
+                    m.dead += prev.as_ref().map(|r| r.size).unwrap_or(0);
+                    slabs.insert(slab, enc(&m).as_slice()).map_err(db_err)?;
+                }
+            }
             let rec = ObjRecord {
                 size,
                 ns: ns_to_u8(ns),
@@ -832,6 +922,19 @@ impl Store {
             Self::put_extern_in(&txn, id, Some(rel))?;
         }
         txn.commit().map_err(db_err)?;
+        // Same race, sparse flavor (adopt vs a concurrent ensure_sparse): the
+        // record is extern now, so nothing would ever unlink the orphaned
+        // sparse data file. A materialize's own rename has already moved it -
+        // the remove is then a no-op ENOENT. Skipped while a decode is
+        // writing into the file (same courtesy every delete path extends);
+        // that leaks the orphan in an already-vanishing race window, which
+        // beats yanking a file out from under a verified write.
+        if let Some(Loc::Sparse) = prev_loc {
+            let writers = self.sparse_writers.lock().expect("sparse_writers");
+            if !writers.contains_key(&id) {
+                let _ = fs::remove_file(self.sparse_path(id));
+            }
+        }
         Ok(true)
     }
 
@@ -1541,9 +1644,22 @@ impl Store {
         if claimed.is_empty() {
             return Ok(claimed);
         }
-        let obao_bytes = fs::read(self.obao_path(id))?;
+        // A sparse record whose file pair is GONE is the crash window between
+        // a materialize's rename and its record commit (or an outside rm of
+        // the store dir). The record claims groups no file backs, so every
+        // read fails while nothing refetches - the bits say present. Drop the
+        // record (via `remove`, which respects in-flight decodes) and report
+        // nothing held; the next fetch starts clean with `ensure_sparse`.
+        let (obao_bytes, data) =
+            match (fs::read(self.obao_path(id)), File::open(self.sparse_path(id))) {
+                (Ok(ob), Ok(f)) => (ob, f),
+                (Err(e), _) | (_, Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    self.remove(id)?;
+                    return Ok(GroupBits::new());
+                }
+                (Err(e), _) | (_, Err(e)) => return Err(e),
+            };
         let ob = OutboardBytes { root: id, size: rec.size, data: obao_bytes };
-        let data = File::open(self.sparse_path(id))?;
         let valid = verified::valid_ranges(&ob, &data, &claimed.to_chunk_ranges_clamped(rec.size))?;
 
         // Intersect: keep only claimed groups whose chunks all verified.
