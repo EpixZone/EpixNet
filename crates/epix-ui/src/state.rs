@@ -6670,6 +6670,16 @@ impl AppState {
         if let Ok(path) = storage.path(inner_path) {
             let _ = std::fs::remove_file(path);
         }
+        // Drop the bytes themselves. An EDX-served file (a streamed video, a
+        // big download) is never materialized in the tree, so removing the
+        // path above frees nothing: the payload sits in the shared object
+        // store, refcounted out of reach of quota eviction. Deleting still
+        // reported success while the file went on playing from cache.
+        if let Some((id, _size)) = self.edx_resolve(address, inner_path).await {
+            if let Some(store) = self.edx_store().await {
+                let _ = store.remove(id);
+            }
+        }
         let mut changed_pin = false;
         if let Some(x) = self.xites.write().await.get_mut(address) {
             if optional {
@@ -12486,6 +12496,7 @@ impl AppState {
     pub async fn remove_xite(&self, address: &str) -> bool {
         let mut roots = Vec::new();
         let mut removed_keys = Vec::new();
+        let mut objects: Vec<epix_blob::ObjId> = Vec::new();
         let canonical;
         {
             let mut xites = self.xites.write().await;
@@ -12502,6 +12513,9 @@ impl AppState {
                 if let Some(x) = xites.remove(&key) {
                     let root = x.storage.root().to_path_buf();
                     if !roots.contains(&root) {
+                        // Read the manifests while the tree is still there:
+                        // the object ids are only recoverable from it.
+                        objects.extend(declared_object_ids(&x.storage, x.content.as_ref()));
                         roots.push(root);
                     }
                     // The site's user data may be keyed by the display name in
@@ -12518,6 +12532,20 @@ impl AppState {
         // stays deleted across restarts.
         for root in roots {
             let _ = std::fs::remove_dir_all(&root);
+        }
+        // The tree is gone, but EDX-served files (video, big downloads) never
+        // lived in it - their bytes are in the shared object store, refcounted
+        // so quota eviction will not reclaim them either. Without this a
+        // deleted xite left its whole payload on disk forever.
+        if !objects.is_empty() {
+            if let Some(store) = self.edx_store().await {
+                let freed = objects.iter().filter(|id| store.remove(**id).is_ok()).count();
+                self.log(
+                    "INFO",
+                    format!("Deleted {freed} EDX object(s) of {canonical}"),
+                )
+                .await;
+            }
         }
         // The derived feed artifacts hold the whole record set in memory; a
         // deleted site's copy would stay resident until restart.
@@ -12906,6 +12934,44 @@ fn cmp_field(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::String(x), Value::String(y)) => x.cmp(y),
         _ => std::cmp::Ordering::Equal,
     }
+}
+
+/// Collect the EDX object ids of one `files` / `files_optional` map.
+fn collect_object_ids(files: Option<&Value>, out: &mut Vec<epix_blob::ObjId>) {
+    let Some(files) = files.and_then(|f| f.as_object()) else { return };
+    for info in files.values() {
+        let id = info.get("b3").and_then(|v| v.as_str()).and_then(epix_blob::ObjId::from_hex);
+        if let Some(id) = id {
+            out.push(id);
+        }
+    }
+}
+
+/// Every EDX object a xite declares, from the root content.json and each
+/// child/per-user one, `files` and `files_optional` alike.
+///
+/// The xite tree holds no bytes for EDX-served files - a streamed video is
+/// never materialized as `video/x.webm`, it lives only in the shared object
+/// store - so deleting the tree alone leaves the payload behind. This is how
+/// a delete finds it.
+fn declared_object_ids(storage: &XiteStorage, content: Option<&Value>) -> Vec<epix_blob::ObjId> {
+    let mut out = Vec::new();
+    for key in ["files", "files_optional"] {
+        collect_object_ids(content.and_then(|c| c.get(key)), &mut out);
+    }
+    for child in storage.list_files() {
+        if !child.ends_with("/content.json") || child == "content.json" {
+            continue;
+        }
+        let Ok(bytes) = storage.read(&child) else { continue };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        for key in ["files", "files_optional"] {
+            collect_object_ids(json.get(key), &mut out);
+        }
+    }
+    out.sort_by_key(|id| id.0);
+    out.dedup_by_key(|id| id.0);
+    out
 }
 
 /// Every `content.json` under `root`, as site-relative inner_paths.
@@ -13837,6 +13903,44 @@ mod tests {
     /// connectable_peers, which would also drop them for dialability and mask a
     /// broken arm). Phase 4 announces i2p/rns self-claims to the DHT that echo
     /// straight back, so these arms are the only guard against self-dialing.
+    /// A xite's EDX payload is found from its manifests, root and per-user
+    /// alike, across both `files` and `files_optional`. Deleting a xite has to
+    /// walk these: an EDX-served file (a streamed video) is never materialized
+    /// in the tree, so the tree carries no trace of the bytes to remove.
+    #[test]
+    fn declared_object_ids_covers_child_manifests_and_both_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let id = |b: u8| format!("{:02x}", b).repeat(32);
+
+        let root = json!({
+            "files": { "index.html": { "b3": id(1), "size": 10 } },
+            // A streamed video: declared, never written into the tree.
+            "files_optional": { "video/a.webm": { "b3": id(2), "size": 99 } },
+        });
+        storage.write("content.json", root.to_string().as_bytes()).unwrap();
+        let child = json!({
+            "files": { "data.json": { "b3": id(3), "size": 5 } },
+            // Same bytes as the root's video - one object, not two.
+            "files_optional": { "clip.webm": { "b3": id(2), "size": 99 } },
+        });
+        storage.write("data/users/bob/content.json", child.to_string().as_bytes()).unwrap();
+
+        let ids = declared_object_ids(&storage, Some(&root));
+        let hexes: Vec<String> = ids
+            .iter()
+            .map(|i| i.0.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            .collect();
+        for (want, what) in [
+            (id(1), "a root `files` entry"),
+            (id(2), "a root `files_optional` entry (never materialized)"),
+            (id(3), "a child manifest's entry"),
+        ] {
+            assert!(hexes.contains(&want), "{what} must be found");
+        }
+        assert_eq!(ids.len(), 3, "a shared object is listed once: {hexes:?}");
+    }
+
     #[tokio::test]
     /// Loopback on our own fileserver port is this node, so it never enters the
     /// peer table: a publish that reached only ourselves used to report a peer
