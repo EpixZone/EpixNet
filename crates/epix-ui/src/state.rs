@@ -3302,80 +3302,75 @@ impl AppState {
         let now = now_secs();
         map.get(canonical)
             .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|entry| {
-                        let (addr_str, saved) = match entry {
-                            Value::String(s) => (s.as_str(), None),
-                            Value::Object(o) => (o.get("addr")?.as_str()?, Some(o)),
-                            _ => return None,
-                        };
-                        let addr = PeerAddr::parse(addr_str).ok()?;
-                        if !addr.is_wellformed() {
-                            return None;
-                        }
-                        let mut peer = Peer::new(addr, now);
-                        if let Some(o) = saved {
-                            // Saturate out-of-range values (a hand-edited or
-                            // foreign peers.json) instead of `as`-wrapping
-                            // them into nonsense reputations/counters.
-                            peer.reputation = o
-                                .get("rep")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or(0)
-                                .clamp(i32::MIN as i64, i32::MAX as i64)
-                                as i32;
-                            peer.connection_errors =
-                                o.get("errors").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64)
-                                    as u32;
-                            peer.time_response =
-                                o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
-                            // How long we have known this peer, which is the
-                            // durability tiebreak in peer selection. Clamped
-                            // to now: a future stamp (clock skew, an edited
-                            // file) must not mint an unbeatably "old" peer.
-                            // Absent -> Peer::new's `now`, i.e. brand new,
-                            // which is what a pre-durability peers.json
-                            // honestly tells us.
-                            if let Some(found) = o.get("found").and_then(|v| v.as_i64()) {
-                                peer.time_found = found.clamp(0, now);
-                            }
-                            // Restore the dial/probe backoff. Without it every
-                            // restart handed each dead peer a fresh dial slot:
-                            // a node that restarts often re-burned its whole
-                            // publish budget on the same unreachable addresses
-                            // and never reached the live ones. Stamps are
-                            // absolute, so a long downtime still expires them
-                            // naturally - which is the wanted behaviour.
-                            //
-                            // Cap against the ceilings the in-memory backoff
-                            // uses (dial 1h, probe ~10min) so a hand-edited or
-                            // corrupt file can't bench a peer forever.
-                            let cap = |v: Option<&Value>, max: i64| {
-                                v.and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now + max)
-                            };
-                            peer.retry_after = cap(o.get("retry_after"), 3600);
-                            peer.probe_after = cap(o.get("probe_after"), 600);
-                            peer.probe_failures = o
-                                .get("probe_failures")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                                .min(u32::MAX as u64)
-                                as u32;
-                            peer.benched_since =
-                                o.get("benched_since").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-                            // Pre-backoff files carry no stamp, so a peer
-                            // restored mid-streak would read as benched since
-                            // the epoch. The restore is the bench start we know.
-                            if peer.benched_since == 0 && peer.connection_errors > 0 {
-                                peer.benched_since = now;
-                            }
-                        }
-                        Some(peer)
-                    })
-                    .collect()
-            })
+            .map(|a| a.iter().filter_map(|entry| Self::restore_peer(entry, now)).collect())
             .unwrap_or_default()
+    }
+
+    /// One peers.json entry back into a [`Peer`]: a bare address string (the
+    /// legacy format) becomes a fresh peer, an `{addr, ...}` object also gets
+    /// its learned state back. `None` drops a malformed or ill-formed entry.
+    /// The read-side mirror of [`Self::persisted_peer`].
+    fn restore_peer(entry: &Value, now: i64) -> Option<Peer> {
+        let (addr_str, saved) = match entry {
+            Value::String(s) => (s.as_str(), None),
+            Value::Object(o) => (o.get("addr")?.as_str()?, Some(o)),
+            _ => return None,
+        };
+        let addr = PeerAddr::parse(addr_str).ok()?;
+        if !addr.is_wellformed() {
+            return None;
+        }
+        let mut peer = Peer::new(addr, now);
+        if let Some(o) = saved {
+            Self::restore_learned_state(&mut peer, o, now);
+        }
+        Some(peer)
+    }
+
+    /// Copy a persisted entry's learned selection state onto `peer`.
+    /// Everything here came off disk, so it is clamped like hostile input:
+    /// saturate out-of-range values (a hand-edited or foreign peers.json)
+    /// instead of `as`-wrapping them into nonsense reputations/counters.
+    fn restore_learned_state(peer: &mut Peer, o: &serde_json::Map<String, Value>, now: i64) {
+        peer.reputation = o
+            .get("rep")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        peer.connection_errors =
+            o.get("errors").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
+        peer.time_response = o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
+        // How long we have known this peer, which is the durability tiebreak
+        // in peer selection. Clamped to now: a future stamp (clock skew, an
+        // edited file) must not mint an unbeatably "old" peer. Absent ->
+        // Peer::new's `now`, i.e. brand new, which is what a pre-durability
+        // peers.json honestly tells us.
+        if let Some(found) = o.get("found").and_then(|v| v.as_i64()) {
+            peer.time_found = found.clamp(0, now);
+        }
+        // Restore the dial/probe backoff. Without it every restart handed
+        // each dead peer a fresh dial slot: a node that restarts often
+        // re-burned its whole publish budget on the same unreachable
+        // addresses and never reached the live ones. Stamps are absolute, so
+        // a long downtime still expires them naturally - which is the wanted
+        // behaviour.
+        //
+        // Cap against the ceilings the in-memory backoff uses (dial 1h,
+        // probe ~10min) so a hand-edited or corrupt file can't bench a peer
+        // forever.
+        let cap =
+            |v: Option<&Value>, max: i64| v.and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now + max);
+        peer.retry_after = cap(o.get("retry_after"), 3600);
+        peer.probe_after = cap(o.get("probe_after"), 600);
+        peer.probe_failures =
+            o.get("probe_failures").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
+        peer.benched_since = o.get("benched_since").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+        // Pre-backoff files carry no stamp, so a peer restored mid-streak
+        // would read as benched since the epoch. The restore is the bench
+        // start we know.
+        if peer.benched_since == 0 && peer.connection_errors > 0 {
+            peer.benched_since = now;
+        }
     }
 
     /// Persist every served xite's peers to `peers.json` (keyed by signed content
