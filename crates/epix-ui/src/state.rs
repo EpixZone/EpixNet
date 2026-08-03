@@ -22,6 +22,22 @@ use tokio::sync::RwLock;
 /// site past 10 MB out of the box.
 pub const DEFAULT_SIZE_LIMIT_MB: i64 = 1000;
 
+/// Disk donated to the encrypted-shard cache by default.
+///
+/// Non-zero on desktop because a volunteer cache with no volunteers is not a
+/// cache: the shards a publisher's private content is split into have to
+/// live SOMEWHERE other than the publisher, or the content dies with them
+/// and the publisher is the one peer holding it all. What a volunteer holds
+/// is ciphertext addressed by hash, with no record tying it to any xite, so
+/// donating is cheap in every sense except disk.
+///
+/// Zero on phones: storage is small, and a background hold competes with the
+/// user's own data plan and battery for no benefit they can see.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub const DEFAULT_VOLUNTEER_QUOTA: &str = "0";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub const DEFAULT_VOLUNTEER_QUOTA: &str = "2147483648"; // 2 GiB
+
 /// Resolves + clones a `.epix` host that isn't served yet, so the browser can
 /// open any name by typing it. Implemented by the node (which has the chain
 /// resolver + download worker); the UI server calls it via
@@ -530,7 +546,7 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "Storage",
         "volunteer_quota_bytes",
         "Donate disk to hold encrypted shards you cannot read (0 = off)",
-        "0",
+        DEFAULT_VOLUNTEER_QUOTA,
         "text",
     ),
     // --- Performance
@@ -1681,17 +1697,46 @@ impl AppState {
     }
 
     /// Bytes of disk the operator donates to hold encrypted shards it cannot
-    /// read (the `volunteer_quota_bytes` config key). 0 (the default, and the
-    /// only value that parses to nothing) means not volunteering: the node
-    /// neither advertises `caps::SHARDS` nor runs the volunteer pull. The
-    /// Config page persists it as a string, so both a JSON number and a
-    /// numeric string are accepted. Read once at serve setup; a live toggle
-    /// (re-advertise the cap without a restart) is a deferred follow-up.
+    /// read (the `volunteer_quota_bytes` config key). 0 (the only value that
+    /// parses to nothing, and the default on mobile) means not volunteering:
+    /// the node neither advertises `caps::SHARDS` nor runs the volunteer
+    /// pull. The Config page persists it as a string, so both a JSON number
+    /// and a numeric string are accepted. Read once at serve setup; a live
+    /// toggle (re-advertise the cap without a restart) is a deferred
+    /// follow-up.
     pub async fn volunteer_quota_bytes(&self) -> u64 {
         self.config_get("volunteer_quota_bytes")
             .await
             .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
-            .unwrap_or(0)
+            .unwrap_or_else(|| DEFAULT_VOLUNTEER_QUOTA.parse().unwrap_or(0))
+    }
+
+    /// Every `(xite address, inner_path)` naming an encrypted-shard file in a
+    /// served xite's verified content.json - the work list for the volunteer
+    /// cache.
+    ///
+    /// Reading the manifest is all a volunteer ever learns: `files_shard`
+    /// carries ciphertext addresses and sizes, and holding one of those
+    /// shards records nothing linking it back to this xite. Which of them
+    /// this node is actually responsible for is decided later, locally, from
+    /// its own account and quota.
+    pub async fn shard_files(&self) -> Vec<(String, String)> {
+        let xites = self.xites.read().await;
+        let mut out = Vec::new();
+        for (address, x) in xites.iter() {
+            if !x.settings.serving {
+                continue;
+            }
+            let Some(files) =
+                x.content.as_ref().and_then(|c| c.get("files_shard")).and_then(|f| f.as_object())
+            else {
+                continue;
+            };
+            for inner in files.keys() {
+                out.push((address.clone(), inner.clone()));
+            }
+        }
+        out
     }
 
     // --- NoNewSites: refuse to clone/add new sites when set -----------------
@@ -3285,6 +3330,16 @@ impl AppState {
                                     as u32;
                             peer.time_response =
                                 o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
+                            // How long we have known this peer, which is the
+                            // durability tiebreak in peer selection. Clamped
+                            // to now: a future stamp (clock skew, an edited
+                            // file) must not mint an unbeatably "old" peer.
+                            // Absent -> Peer::new's `now`, i.e. brand new,
+                            // which is what a pre-durability peers.json
+                            // honestly tells us.
+                            if let Some(found) = o.get("found").and_then(|v| v.as_i64()) {
+                                peer.time_found = found.clamp(0, now);
+                            }
                             // Restore the dial/probe backoff. Without it every
                             // restart handed each dead peer a fresh dial slot:
                             // a node that restarts often re-burned its whole
@@ -3415,6 +3470,11 @@ impl AppState {
         o.insert("rep".into(), json!(p.reputation));
         o.insert("errors".into(), json!(p.connection_errors));
         o.insert("seen".into(), json!(p.time_response));
+        // When we first saw this peer. Unconditional, unlike the backoff
+        // stamps below: a peer's age only means anything if it accumulates
+        // across restarts, and dropping it for brand-new peers would keep
+        // resetting the very clock we want to run.
+        o.insert("found".into(), json!(p.time_found));
         for (key, value) in [
             ("retry_after", (p.retry_after > now).then_some(p.retry_after)),
             ("probe_after", (p.probe_after > now).then_some(p.probe_after)),
@@ -6690,11 +6750,12 @@ impl AppState {
         if let Ok(path) = storage.path(inner_path) {
             let _ = std::fs::remove_file(path);
         }
-        // Drop the bytes themselves. An EDX-served file (a streamed video, a
-        // big download) is never materialized in the tree, so removing the
-        // path above frees nothing: the payload sits in the shared object
-        // store, refcounted out of reach of quota eviction. Deleting still
-        // reported success while the file went on playing from cache.
+        // Retire the object too. For an extern object the unlink above WAS
+        // the byte removal and this just drops the record and outboard; for
+        // anything still held in the store (a partial stream, a slab-packed
+        // small file) it is what actually frees the payload. Without it,
+        // deleting reported success while the file went on playing from
+        // cache.
         if let Some((id, _size)) = self.edx_resolve(address, inner_path).await {
             if let Some(store) = self.edx_store().await {
                 let _ = store.remove(id);
@@ -6768,11 +6829,21 @@ impl AppState {
     /// Enforce the optional-files cap (`OptionalManager`): if downloaded optional
     /// files exceed the limit, delete the oldest un-pinned ones until back under.
     /// Returns the bytes freed. Called periodically by the runtime.
+    ///
+    /// This cap governs CACHE - files fetched incidentally because you opened
+    /// them. It deliberately does not govern content held under a retention
+    /// commitment: deleting one of those would only make the background
+    /// completion pass fetch it again, so the two would fight in a loop
+    /// (complete, evict, complete). The bound on committed content is the
+    /// xite's own `size_limit` and its consent prompt, not this.
     pub async fn enforce_optional_limit(&self) -> i64 {
         let limit = self.optional_limit_bytes().await;
         if limit <= 0 {
             return 0;
         }
+        // Read once, outside the lock: the reader override makes every path
+        // of every xite complete-retention, so it decides the same question.
+        let reader_keeps_everything = self.config_bool("full_retention", false).await;
         // One scan of all downloaded optional files. "Downloaded" is judged by
         // the on-disk file matching the declared size (cheaper than re-hashing).
         // `used` counts every downloaded optional file; `candidates` are the
@@ -6795,12 +6866,26 @@ impl AppState {
                 else {
                     continue;
                 };
+                // Per PATH, not per xite: a xite legitimately mixes units - a
+                // package shell that is held complete alongside a feed that
+                // can never be.
+                let policy = match (reader_keeps_everything, x.content.as_ref()) {
+                    (true, _) => epix_blob::policy::DistributionPolicy::complete_everything(),
+                    (false, Some(c)) => epix_blob::policy::DistributionPolicy::from_content(c),
+                    (false, None) => epix_blob::policy::DistributionPolicy::default(),
+                };
                 for (inner, meta) in files_opt {
                     let size = meta.get("size").and_then(|v| v.as_i64()).unwrap_or(0);
                     let Ok(path) = x.storage.path(inner) else { continue };
                     let Ok(md) = std::fs::metadata(&path) else { continue };
                     if md.len() as i64 != size {
                         continue; // not fully downloaded
+                    }
+                    // Committed content, not cache: exempt, and not charged
+                    // against the cache budget either (same stance as own /
+                    // autodownloadoptional above).
+                    if policy.wants_complete(inner) {
+                        continue;
                     }
                     used += size;
                     if x.pinned.contains(inner) {
@@ -7929,11 +8014,29 @@ impl AppState {
             let now = now_secs().max(0) as u64;
             let result = tokio::task::spawn_blocking(move || {
                 let paths = xite.edx_object_paths();
-                xite.edx_register(&store, now).map(|counts| (counts, paths))
+                // Registering adopts the tree's files as the objects' bytes
+                // and reclaims any pre-extern duplicate copies, so the held
+                // total before/after is what that gave back.
+                let before = store.total_bytes().unwrap_or(0);
+                let counts = xite.edx_register(&store, now)?;
+                let after = store.total_bytes().unwrap_or(before);
+                Ok::<_, epix_core::Error>((counts, paths, before.saturating_sub(after)))
             })
             .await;
             match result {
-                Ok(Ok((_, paths))) => self.set_edx_object_paths(address, paths),
+                Ok(Ok((_, paths, reclaimed))) => {
+                    self.set_edx_object_paths(address, paths);
+                    if reclaimed > 0 {
+                        self.log(
+                            "INFO",
+                            format!(
+                                "{address}: reclaimed {reclaimed} duplicated byte(s) - its files \
+                                 now serve straight from the xite directory"
+                            ),
+                        )
+                        .await;
+                    }
+                }
                 Ok(Err(e)) => {
                     self.log("WARN", format!("edx_register {address}: {e}")).await;
                 }
@@ -8903,7 +9006,9 @@ impl AppState {
 
     /// Write EDX-fetched bytes into a xite's storage as `inner_path`, so the
     /// existing file readers/serve path see a normal on-disk file. Used by
-    /// the EDX fetcher to materialize a completed object.
+    /// the EDX fetcher for SMALL objects, whose bytes it already holds in
+    /// memory (a slab read, a bundle slice). A large object never travels
+    /// through a `Vec` at all — see [`Self::edx_materialize_object`].
     pub async fn edx_materialize_file(
         &self,
         address: &str,
@@ -8918,12 +9023,53 @@ impl AppState {
             .map(|x| x.storage.clone())
             .ok_or("unknown xite")?;
         storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
+        self.note_materialized(address, inner_path).await;
+        Ok(())
+    }
+
+    /// Materialize a COMPLETE object by moving it out of the object store
+    /// and into the xite tree as `inner_path`, then pointing the store's
+    /// record back at that file (`Loc::Extern`).
+    ///
+    /// This is how a download becomes a file the user owns: one physical
+    /// copy, at a path they can open, copy or edit, still serving verified
+    /// ranges to peers. It replaces a read-whole-file-into-memory-then-write
+    /// round trip, so materializing a 1 GB video no longer needs 1 GB of RAM.
+    pub async fn edx_materialize_object(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: epix_blob::ObjId,
+    ) -> Result<(), String> {
+        let storage = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.storage.clone())
+            .ok_or("unknown xite")?;
+        let store = self.edx_store().await.ok_or("no EDX store")?;
+        let path = storage.path(inner_path).map_err(|e| e.to_string())?;
+        let now = now_secs().max(0) as u64;
+        // Blocking: a cross-device materialize copies the whole file.
+        tokio::task::spawn_blocking(move || store.materialize(id, &path, now))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        self.note_materialized(address, inner_path).await;
+        Ok(())
+    }
+
+    /// The bookkeeping every materialized file needs, however its bytes got
+    /// there: an optional file has to advertise in our hashfield and count
+    /// toward the optional-storage total, or it lands on disk invisible to
+    /// the swarm and never seeds.
+    async fn note_materialized(&self, address: &str, inner_path: &str) {
         if let Some((entry, _dir, optional)) = self.declared_entry(address, inner_path).await {
             if optional {
                 self.note_optional_materialized(address, inner_path, &entry).await;
             }
         }
-        Ok(())
     }
 
     /// Optional-file bookkeeping: mirror fetch_file_from_peers so an
@@ -11435,6 +11581,16 @@ impl AppState {
             return;
         }
         let reader = self.config_bool("full_retention", false).await;
+        // Whose policy is asking matters to the wording: the owner's declared
+        // one, the reader's global setting, or the plain default that keeps a
+        // whole copy of whatever you visit. Claiming "this xite asks" when it
+        // declared nothing would be a lie about who wants the download.
+        let declared = self
+            .content(address)
+            .await
+            .as_ref()
+            .and_then(|c| c.get("distribution"))
+            .is_some();
         let mb = bytes as f64 / (1024.0 * 1024.0);
         let body = if reader {
             format!(
@@ -11444,11 +11600,19 @@ impl AppState {
                  Enable optional file downloads for this xite? (Turning the \
                  setting off in Config stops these requests.)"
             )
-        } else {
+        } else if declared {
             format!(
                 "This xite asks to be kept complete: {files} file(s) ({mb:.1} MB) \
                  still missing, more than its current size limit allows.<br>\
                  Enable optional file downloads for this xite?"
+            )
+        } else {
+            format!(
+                "Keep a complete copy of this xite? {files} file(s) ({mb:.1} MB) \
+                 are still missing, more than its current size limit allows.<br>\
+                 A complete copy works offline, keeps the content alive if the \
+                 publisher goes away, and makes you look like every other peer \
+                 rather than someone who only holds the parts they opened."
             )
         };
         if self.confirm(address, &body, "Download").await {
@@ -15036,7 +15200,9 @@ mod tests {
         assert!(state.set_autodownloadoptional(addr, true).await);
         assert!(state.optional_fetch_allowed(addr).await);
 
-        // A xite declaring no distribution policy completes nothing at all.
+        // A xite declaring no distribution policy is still replicated whole:
+        // completing is the default, so the reader ends up with the same
+        // package the publisher has rather than only the parts they opened.
         let bare_dir = tempdir().unwrap();
         let bare = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         state
@@ -15051,9 +15217,10 @@ mod tests {
                 },
             )
             .await;
-        assert!(
-            state.retention_completion_plan(bare).await.paths.is_empty(),
-            "no declared retention -> partial default, nothing to complete"
+        assert_eq!(
+            state.retention_completion_plan(bare).await.paths,
+            vec!["big.bin".to_string()],
+            "no declared policy -> the default completes the package"
         );
     }
 
@@ -15144,6 +15311,58 @@ mod tests {
             .expect("full_retention must be in CONFIG_SCHEMA");
         assert_eq!(row.3, "false", "full replication must be opt-in");
         assert_eq!(row.4, "bool");
+    }
+
+    /// A volunteer cache with no volunteers holds nothing, so desktop nodes
+    /// donate disk by default. Phones do not: small storage, metered data.
+    #[tokio::test]
+    async fn desktop_donates_shard_disk_by_default() {
+        let row = CONFIG_SCHEMA
+            .iter()
+            .find(|(_, key, ..)| *key == "volunteer_quota_bytes")
+            .expect("volunteer_quota_bytes must be in CONFIG_SCHEMA");
+        assert_eq!(row.3, DEFAULT_VOLUNTEER_QUOTA, "the schema and the reader must agree");
+
+        // The accessor's fallback has to match the schema, or the Config page
+        // would show one number while the node used another.
+        let state = AppState::new("test");
+        let expected: u64 = DEFAULT_VOLUNTEER_QUOTA.parse().unwrap();
+        assert_eq!(state.volunteer_quota_bytes().await, expected);
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            assert_eq!(expected, 0, "phones donate nothing");
+        } else {
+            assert!(expected > 0, "desktop volunteers by default");
+        }
+
+        // And it stays operator-controlled.
+        state.config_set("volunteer_quota_bytes", Value::from("0")).await;
+        assert_eq!(state.volunteer_quota_bytes().await, 0);
+    }
+
+    /// A peer's age is the durability signal peer selection breaks ties on,
+    /// so it has to survive a restart. It used to be reset to `now` on every
+    /// boot, which made every peer permanently look brand new.
+    #[test]
+    fn a_peers_age_survives_a_restart() {
+        // Past 40 days, so the age being tested is actually positive.
+        let now = 100_000_000i64;
+        let mut peer = Peer::new(PeerAddr::parse("1.2.3.4:26552").unwrap(), now - 40 * 86_400);
+        peer.reputation = 3;
+        peer.time_response = now - 100;
+
+        let entry = AppState::persisted_peer(&peer, now);
+        assert_eq!(entry["found"], json!(now - 40 * 86_400), "first-seen is written");
+
+        // Restoring reads it back rather than stamping a fresh `now`.
+        let restored = entry["found"].as_i64().unwrap().clamp(0, now);
+        assert_eq!(restored, now - 40 * 86_400);
+
+        // A future stamp (clock skew, a hand-edited file) cannot mint an
+        // unbeatably old peer.
+        let mut future = peer.clone();
+        future.time_found = now + 86_400;
+        let skewed = AppState::persisted_peer(&future, now)["found"].as_i64().unwrap().clamp(0, now);
+        assert_eq!(skewed, now, "clamped to the present");
     }
 
     /// The consent gate charges bytes ALREADY held against the size limit:
@@ -15948,17 +16167,20 @@ mod tests {
         assert!(state.site_info("1Opt").await["optional_progress"].is_null());
     }
 
-    #[tokio::test]
-    async fn optional_limit_evicts_oldest_unpinned_and_keeps_pinned() {
-        let dir = tempdir().unwrap();
-        let storage = XiteStorage::new(dir.path());
-        // Three 1000-byte optional files.
+    /// Build a xite of three 1000-byte optional files, with `retention` as
+    /// the declared policy for all of them.
+    async fn optional_cache_xite(
+        dir: &std::path::Path,
+        retention: &str,
+    ) -> (Arc<AppState>, &'static str) {
+        let storage = XiteStorage::new(dir);
         for name in ["a.bin", "b.bin", "c.bin"] {
             storage.write(name, &vec![0u8; 1000]).unwrap();
         }
         let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let content = json!({
             "address": addr,
+            "distribution": { "default": {"unit": "package", "retention": retention} },
             "files": {},
             "files_optional": {
                 "a.bin": { "size": 1000, "sha512": "a" },
@@ -15968,6 +16190,15 @@ mod tests {
         });
         let state = AppState::new("test");
         state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        (state, addr)
+    }
+
+    #[tokio::test]
+    async fn optional_limit_evicts_oldest_unpinned_and_keeps_pinned() {
+        let dir = tempdir().unwrap();
+        // Declared `partial`: files fetched because you opened them, which is
+        // exactly what this cap governs.
+        let (state, addr) = optional_cache_xite(dir.path(), "partial").await;
         state.set_pin(addr, "a.bin", true).await;
 
         // ~2791-byte cap: 3000 downloaded > cap, so eviction runs.
@@ -15986,6 +16217,42 @@ mod tests {
             .count() as i64
             * 1000;
         assert!(remaining <= limit, "remaining {remaining} > limit {limit}");
+    }
+
+    /// The cache cap governs CACHE. Content held under a retention
+    /// commitment - which, since completing became the default, is most
+    /// content - is not cache, and deleting it would only make the
+    /// background completion pass fetch it straight back: the two would
+    /// fight forever over the same files.
+    #[tokio::test]
+    async fn the_optional_cap_never_evicts_content_held_on_purpose() {
+        let dir = tempdir().unwrap();
+        let (state, _addr) = optional_cache_xite(dir.path(), "complete").await;
+
+        // The same cap that evicted two files above.
+        state.set_optional_limit("0.0000026").await;
+        assert!(state.optional_limit_bytes().await < 3000);
+
+        assert_eq!(state.enforce_optional_limit().await, 0, "committed content is not cache");
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            assert!(dir.path().join(name).exists(), "{name} survives the cache cap");
+        }
+    }
+
+    /// The same exemption via the reader's global setting rather than the
+    /// owner's declaration: turning "keep a full copy" on must not leave the
+    /// cache cap deleting the copies it is busy making.
+    #[tokio::test]
+    async fn full_retention_also_exempts_a_xite_that_declared_partial() {
+        let dir = tempdir().unwrap();
+        let (state, _addr) = optional_cache_xite(dir.path(), "partial").await;
+        state.config_set("full_retention", Value::from("true")).await;
+
+        state.set_optional_limit("0.0000026").await;
+        assert_eq!(state.enforce_optional_limit().await, 0, "the reader chose to hold these");
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            assert!(dir.path().join(name).exists());
+        }
     }
 
     #[tokio::test]

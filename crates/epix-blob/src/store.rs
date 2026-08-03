@@ -38,6 +38,10 @@ use crate::{Ns, ObjId};
 const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 const SLABS: TableDefinition<u32, &[u8]> = TableDefinition::new("slabs");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// Where a [`Loc::Extern`] object's bytes live, RELATIVE to
+/// [`StoreConfig::xite_root`] (`<address>/<inner_path>`). Relative, not
+/// absolute, so relocating the data directory does not orphan every object.
+const EXTERN: TableDefinition<&[u8], &str> = TableDefinition::new("extern");
 
 const SCHEMA_VERSION: u64 = 1;
 
@@ -61,12 +65,29 @@ pub const MAX_OBJECT_BYTES: u64 = 64 << 30;
 pub const MAX_RESERVED_BYTES: u64 = 2 * MAX_OBJECT_BYTES;
 
 /// Where an object's bytes live.
+///
+/// Variants are serialized by postcard as a varint discriminant, so a new
+/// one may only be APPENDED: inserting ahead of `Slab` would silently
+/// reinterpret every record an older build wrote. That is also why adding
+/// `Extern` needed no [`SCHEMA_VERSION`] bump — indices 0 and 1 still mean
+/// what they always meant, and no existing record carries index 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Loc {
     /// Its own (possibly partial) file pair under `sparse/`.
     Sparse,
     /// A byte range of a slab packfile; always complete.
     Slab { slab: u32, off: u64 },
+    /// A COMPLETE file in the xite tree, which is the canonical copy of
+    /// those bytes: the store keeps only the `.obao` beside it (~0.4% of
+    /// the data) and reads through to the file. The path lives in the
+    /// [`EXTERN`] table rather than in this variant, so `Loc` stays `Copy`
+    /// and `ObjRecord`'s postcard layout is untouched.
+    ///
+    /// This is what makes a downloaded xite an ordinary directory of
+    /// ordinary files instead of a hash-named cache the user has to export
+    /// from, and it is why a completed download is no longer counted as
+    /// evictable cache (see [`ObjRecord::held`] and [`Store::evict_lru`]).
+    Extern,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,21 +180,31 @@ fn fully_covered_groups(mut written: Vec<Range<u64>>, size: u64) -> GroupBits {
 impl ObjRecord {
     fn bits(&self) -> GroupBits {
         match self.loc {
-            Loc::Slab { .. } => GroupBits::complete(self.size),
+            // Both are complete by construction: a slab object is only ever
+            // inserted whole, and an object only becomes Extern once every
+            // group has landed and verified.
+            Loc::Slab { .. } | Loc::Extern => GroupBits::complete(self.size),
             Loc::Sparse => bits_from_local(&self.present),
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(self.loc, Loc::Slab { .. }) || self.bits().is_complete(self.size)
+        matches!(self.loc, Loc::Slab { .. } | Loc::Extern) || self.bits().is_complete(self.size)
     }
 
     /// Bytes actually held on disk. The quota charges this and never
     /// `size`: `size` is a declared value from an untrusted manifest, so
     /// a record for an object nobody ever sent must charge nothing.
+    ///
+    /// An `Extern` object charges NOTHING either, for a different reason:
+    /// its bytes are the user's own file in the xite tree, accounted by
+    /// that xite's size, not cache this store is free to reclaim. Charging
+    /// it would make the cache quota evict the user's downloads to make
+    /// room for someone else's.
     fn held(&self) -> u64 {
         match self.loc {
             Loc::Slab { .. } => self.size,
+            Loc::Extern => 0,
             Loc::Sparse => {
                 let mut held = 0u64;
                 for r in self.bits().ranges() {
@@ -196,18 +227,25 @@ struct SlabMeta {
 }
 
 /// Tuning knobs (tests shrink these radically).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StoreConfig {
     /// A slab is sealed once it reaches this size and a new one opens.
     pub slab_seal_bytes: u64,
     /// A sealed slab with more than this fraction dead (in 1/256ths) is
     /// compacted on the next eviction pass.
     pub compact_dead_num: u64,
+    /// The xite data root (`<data_dir>/data`), which [`Loc::Extern`] paths
+    /// are relative to. `None` disables extern objects entirely:
+    /// [`Store::adopt_extern`] and [`Store::materialize`] fail, and nothing
+    /// else changes. Tools that open a bare store (`examples/export.rs`)
+    /// and most unit tests leave it unset.
+    pub xite_root: Option<PathBuf>,
 }
 
 impl Default for StoreConfig {
     fn default() -> Self {
-        Self { slab_seal_bytes: 1 << 30, compact_dead_num: 128 } // 1 GiB, 50%
+        // 1 GiB, 50%
+        Self { slab_seal_bytes: 1 << 30, compact_dead_num: 128, xite_root: None }
     }
 }
 
@@ -326,8 +364,9 @@ impl Store {
                     (next, 0)
                 }
             };
-            // Make sure OBJECTS exists even in an empty store.
+            // Make sure OBJECTS and EXTERN exist even in an empty store.
             txn.open_table(OBJECTS).map_err(db_err)?;
+            txn.open_table(EXTERN).map_err(db_err)?;
         }
         txn.commit().map_err(db_err)?;
 
@@ -368,6 +407,83 @@ impl Store {
         self.root.join("sparse").join(format!("{id}.obao"))
     }
 
+    /// The relative path recorded for an [`Loc::Extern`] object, if any.
+    fn extern_rel(&self, id: ObjId) -> io::Result<Option<String>> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        // A store that has never held an extern object has no table yet;
+        // that is "no path", not an error.
+        let Ok(table) = txn.open_table(EXTERN) else { return Ok(None) };
+        Ok(table.get(id.0.as_slice()).map_err(db_err)?.map(|g| g.value().to_string()))
+    }
+
+    /// The configured xite data root, or an error naming why extern
+    /// objects are unavailable.
+    fn xite_root(&self) -> io::Result<&std::path::Path> {
+        self.cfg.xite_root.as_deref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "no xite_root configured for extern objects")
+        })
+    }
+
+    /// `path` expressed relative to the xite root, which is what the
+    /// [`EXTERN`] table stores. Rejects anything outside the root: an
+    /// object's bytes must live in a xite tree, never at an arbitrary
+    /// path this store would then read through to.
+    ///
+    /// The stored string is OS-native and purely local — it is an index
+    /// detail, never transmitted, and never part of any signed manifest.
+    fn rel_of(&self, path: &std::path::Path) -> io::Result<String> {
+        let root = self.xite_root()?;
+        let rel = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is outside the xite root {}", path.display(), root.display()),
+            )
+        })?;
+        rel.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 xite path"))
+    }
+
+    /// Resolve an extern relative path against the configured xite root.
+    fn extern_path(&self, id: ObjId) -> io::Result<PathBuf> {
+        let root = self.xite_root()?;
+        let rel = self.extern_rel(id)?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no extern path for {id}"))
+        })?;
+        Ok(root.join(rel))
+    }
+
+    /// Where this record's DATA bytes are: the sparse file, or the xite
+    /// file an extern object reads through to. Slab objects have no
+    /// standalone data file and are read via [`Self::read_slab`].
+    fn data_path(&self, id: ObjId, rec: &ObjRecord) -> io::Result<PathBuf> {
+        match rec.loc {
+            Loc::Sparse => Ok(self.sparse_path(id)),
+            Loc::Extern => self.extern_path(id),
+            Loc::Slab { .. } => {
+                Err(io::Error::new(io::ErrorKind::InvalidInput, "slab object has no data file"))
+            }
+        }
+    }
+
+    /// Record (or clear) an object's extern path inside `txn`.
+    fn put_extern_in(
+        txn: &redb::WriteTransaction,
+        id: ObjId,
+        rel: Option<&str>,
+    ) -> io::Result<()> {
+        let mut table = txn.open_table(EXTERN).map_err(db_err)?;
+        match rel {
+            Some(rel) => {
+                table.insert(id.0.as_slice(), rel).map_err(db_err)?;
+            }
+            None => {
+                table.remove(id.0.as_slice()).map_err(db_err)?;
+            }
+        }
+        Ok(())
+    }
+
     fn slab_path(&self, slab: u32) -> PathBuf {
         self.root.join("slabs").join(format!("{slab}.slab"))
     }
@@ -381,6 +497,12 @@ impl Store {
         }
     }
 
+    /// Overwrite a record wholesale. Only the tests plant records this way
+    /// now — every production path either inserts inside its own txn
+    /// (`insert_bytes`, `commit_extern`) or read-modify-writes through
+    /// [`Self::update_record_with`], which folds in concurrent updates
+    /// instead of clobbering them with a stale snapshot.
+    #[cfg(test)]
     fn put_record(&self, id: ObjId, rec: &ObjRecord) -> io::Result<()> {
         let txn = self.db.begin_write().map_err(db_err)?;
         {
@@ -460,6 +582,13 @@ impl Store {
         Ok(self.get_record(id)?.map(|r| r.is_complete()).unwrap_or(false))
     }
 
+    /// Whether this object's bytes are already the xite's own file
+    /// ([`Loc::Extern`]) rather than a copy in the store. Callers use it to
+    /// skip a materialize that has already happened.
+    pub fn is_extern(&self, id: ObjId) -> io::Result<bool> {
+        Ok(self.get_record(id)?.map(|r| matches!(r.loc, Loc::Extern)).unwrap_or(false))
+    }
+
     /// (size, complete) for an indexed object, `None` if unknown.
     pub fn info(&self, id: ObjId) -> io::Result<Option<(u64, bool)>> {
         Ok(self.get_record(id)?.map(|r| (r.size, r.is_complete())))
@@ -531,24 +660,32 @@ impl Store {
         Ok(true)
     }
 
-    /// Adopt a COMPLETE file already on disk (the migration pass: existing
-    /// xite files become EDX objects with no re-download and no second
-    /// copy). The data is hard-linked into the store when possible (one
-    /// physical copy, two names) and copied only as a fallback; the
-    /// outboard is computed by streaming the file. Returns false if the
-    /// object is already in the store.
+    /// Adopt a COMPLETE file already in the xite tree as this object: the
+    /// file stays exactly where it is and becomes the object's canonical
+    /// bytes, and the store keeps only the outboard computed by streaming
+    /// it. `rel` is relative to [`StoreConfig::xite_root`]
+    /// (`<address>/<inner_path>`). Returns false if the object is already
+    /// in the store.
     ///
-    /// If the original file is later edited in place, the linked object's
-    /// bytes change under us — that is caught by validated serving and
-    /// [`Self::revalidate`], never served silently. Re-signing a xite
-    /// re-adopts under the file's new id.
-    pub fn adopt_file(
+    /// This is both the migration pass (a xite's existing files become EDX
+    /// objects with no re-download) and what the publisher's own content
+    /// uses, so an author's directory is byte-for-byte what every
+    /// downloader ends up with.
+    ///
+    /// Nothing is linked or copied. An earlier version hard-linked the file
+    /// into `sparse/`, which meant editing your own file silently changed
+    /// the object under the store; now an edit simply makes the file stop
+    /// matching, which [`Self::read_range`] and [`Self::revalidate`] catch
+    /// and turn into a refetch. Re-signing a xite re-adopts under the
+    /// file's new id.
+    pub fn adopt_extern(
         &self,
         id: ObjId,
         ns: Ns,
         path: &std::path::Path,
         now: u64,
     ) -> io::Result<bool> {
+        let rel = self.rel_of(path)?;
         if let Some(rec) = self.get_record(id)? {
             if rec.last_access < now {
                 self.touch(id, now)?;
@@ -556,31 +693,145 @@ impl Store {
             return Ok(false);
         }
         let size = fs::metadata(path)?.len();
-        let dst = self.sparse_path(id);
-        let _ = fs::remove_file(&dst);
-        if fs::hard_link(path, &dst).is_err() {
-            fs::copy(path, &dst)?;
-        }
-        let ob = OutboardBytes::from_reader(io::BufReader::new(File::open(&dst)?), size)?;
+        let ob = OutboardBytes::from_reader(io::BufReader::new(File::open(path)?), size)?;
         if ob.root != id {
-            let _ = fs::remove_file(&dst);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("{} does not hash to {id}", path.display()),
             ));
         }
         fs::write(self.obao_path(id), &ob.data)?;
-        self.put_record(
-            id,
-            &ObjRecord {
+        self.commit_extern(id, ns, size, &rel, now)
+    }
+
+    /// One-time reclaim for stores written before extern objects existed:
+    /// if this object is a COMPLETE sparse copy of a file that is already
+    /// sitting in the xite tree, adopt the tree's copy and delete the
+    /// store's. Returns the bytes reclaimed (0 when there was nothing to do).
+    ///
+    /// Every materialized file used to be stored twice - once as the xite's
+    /// file, once as the object - which on a real node meant the object
+    /// store matching the data directory byte for byte. This gives that
+    /// space back on the next start, with no re-download: the outboard is
+    /// already correct for those bytes, so adopting is just a record swap
+    /// after re-verifying the tree copy really is the object.
+    pub fn reclaim_duplicate(&self, id: ObjId, path: &std::path::Path, now: u64) -> io::Result<u64> {
+        let rel = self.rel_of(path)?;
+        let Some(rec) = self.get_record(id)? else { return Ok(0) };
+        if !matches!(rec.loc, Loc::Sparse) || !rec.is_complete() {
+            return Ok(0);
+        }
+        if fs::metadata(path)?.len() != rec.size {
+            return Ok(0);
+        }
+        // Re-verify the TREE copy against the object id before trusting it:
+        // the sparse copy is the one we know verified, and the file may have
+        // been edited since it was written.
+        let ob = OutboardBytes::from_reader(io::BufReader::new(File::open(path)?), rec.size)?;
+        if ob.root != id {
+            return Ok(0);
+        }
+        let freed = rec.held();
+        // Guarded like `materialize`: no delete path may unlink the sparse
+        // file between the swap and our own removal of it.
+        let _writing = SparseWriteGuard::register(self, id);
+        self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now)?;
+        let _ = fs::remove_file(self.sparse_path(id));
+        Ok(freed)
+    }
+
+    /// Turn a COMPLETE sparse object into an extern one by MOVING its bytes
+    /// into the xite tree at `rel`: the download stops being a hash-named
+    /// blob in the cache and becomes the user's file, stored once.
+    ///
+    /// This is the step that makes a streamed video an actual file. The
+    /// outboard stays in the store beside it, so the object goes on serving
+    /// verified ranges to peers with no re-hash and no second copy.
+    ///
+    /// A rename within one filesystem is atomic, so the file never appears
+    /// half-written to anything watching the tree (`enforce_optional_limit`
+    /// judges "downloaded" by size). Both paths normally live under the same
+    /// data directory; a cross-device move falls back to copy-then-unlink.
+    pub fn materialize(&self, id: ObjId, dst: &std::path::Path, now: u64) -> io::Result<()> {
+        let rel = self.rel_of(dst)?;
+        let rec = self.required(id)?;
+        match rec.loc {
+            // Already materialized (a concurrent fetch won the race, or the
+            // caller retried): nothing to move.
+            Loc::Extern => return Ok(()),
+            Loc::Slab { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "slab objects materialize by writing their bytes, not by moving",
+                ))
+            }
+            Loc::Sparse => {}
+        }
+        if !rec.is_complete() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{id} is incomplete; only a whole object becomes a file"),
+            ));
+        }
+        // Registered for the same reason `write_slice` does: from here to
+        // the record swap the delete paths must leave this object alone,
+        // or an eviction could unlink the sparse file mid-move.
+        let _writing = SparseWriteGuard::register(self, id);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let src = self.sparse_path(id);
+        if fs::rename(&src, dst).is_err() {
+            // Cross-device (a xite tree on another volume): copy, fsync, and
+            // only then drop the source, so a crash mid-copy leaves the
+            // sparse object intact rather than losing the bytes entirely.
+            let copied = fs::copy(&src, dst)?;
+            File::open(dst)?.sync_all()?;
+            if copied != rec.size {
+                let _ = fs::remove_file(dst);
+                return Err(io::Error::other(format!(
+                    "short copy materializing {id}: {copied} of {} bytes",
+                    rec.size
+                )));
+            }
+            fs::remove_file(&src)?;
+        }
+        self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now)?;
+        Ok(())
+    }
+
+    /// Commit the record + path row for an extern object in one txn, so a
+    /// reader can never see `Loc::Extern` without a path to resolve it.
+    fn commit_extern(
+        &self,
+        id: ObjId,
+        ns: Ns,
+        size: u64,
+        rel: &str,
+        now: u64,
+    ) -> io::Result<bool> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
+            // Preserve a refcount/LRU stamp another path committed while we
+            // were hashing or moving bytes; only `loc` and `present` are ours
+            // to decide here.
+            let prev: Option<ObjRecord> = match objects.get(id.0.as_slice()).map_err(db_err)? {
+                Some(g) => Some(dec(g.value())?),
+                None => None,
+            };
+            let rec = ObjRecord {
                 size,
                 ns: ns_to_u8(ns),
-                loc: Loc::Sparse,
+                loc: Loc::Extern,
                 present: GroupBits::complete(size).to_wire(),
-                refcount: 0,
-                last_access: now,
-            },
-        )?;
+                refcount: prev.as_ref().map(|r| r.refcount).unwrap_or(0),
+                last_access: prev.as_ref().map(|r| r.last_access.max(now)).unwrap_or(now),
+            };
+            objects.insert(id.0.as_slice(), enc(&rec).as_slice()).map_err(db_err)?;
+            Self::put_extern_in(&txn, id, Some(rel))?;
+        }
+        txn.commit().map_err(db_err)?;
         Ok(true)
     }
 
@@ -759,8 +1010,12 @@ impl Store {
             }
         }
         match rec.loc {
-            Loc::Sparse => {
-                let data = File::open(self.sparse_path(id))?;
+            // Extern serves straight out of the xite file, with the outboard
+            // still beside it in the store - which is the whole point: the
+            // bytes a peer downloads from us are the same bytes the user
+            // sees in their own directory, stored once.
+            Loc::Sparse | Loc::Extern => {
+                let data = File::open(self.data_path(id, &rec)?)?;
                 let obao = File::open(self.obao_path(id))?;
                 verified::encode_slice_from(&data, &obao, id, rec.size, byte_ranges, out)?;
             }
@@ -807,7 +1062,7 @@ impl Store {
                 }
                 b
             }
-            Loc::Sparse => fs::read(self.sparse_path(id))?,
+            Loc::Sparse | Loc::Extern => fs::read(self.data_path(id, &rec)?)?,
         };
         if rec.last_access < now {
             self.touch(id, now)?;
@@ -837,7 +1092,7 @@ impl Store {
                 }
                 b[start as usize..end as usize].to_vec()
             }
-            Loc::Sparse => {
+            Loc::Sparse | Loc::Extern => {
                 let groups = crate::bitfield::groups_for_bytes(&(start..end));
                 if !rec.bits().contains_all(&groups) {
                     return Err(io::Error::new(
@@ -845,7 +1100,12 @@ impl Store {
                         format!("{id} range [{start},{end}) not present"),
                     ));
                 }
-                let f = File::open(self.sparse_path(id))?;
+                // An extern object reads through to the xite file. If the
+                // user deleted or replaced it, this open (or the short read
+                // below) fails, the caller refetches, and `revalidate`
+                // retires the stale record - the same stance a sparse file
+                // torn by a crash gets.
+                let f = File::open(self.data_path(id, &rec)?)?;
                 let mut buf = vec![0u8; (end - start) as usize];
                 positioned_io::ReadAt::read_exact_at(&f, start, &mut buf)?;
                 buf
@@ -910,11 +1170,24 @@ impl Store {
                     slabs.insert(slab, enc(&m).as_slice()).map_err(db_err)?;
                 }
             }
+            if let Loc::Extern = rec.loc {
+                Self::put_extern_in(&txn, id, None)?;
+            }
         }
         txn.commit().map_err(db_err)?;
-        if let Loc::Sparse = rec.loc {
-            let _ = fs::remove_file(self.sparse_path(id));
-            let _ = fs::remove_file(self.obao_path(id));
+        match rec.loc {
+            Loc::Sparse => {
+                let _ = fs::remove_file(self.sparse_path(id));
+                let _ = fs::remove_file(self.obao_path(id));
+            }
+            // The data file belongs to the XITE, not to this cache: only the
+            // outboard is ours to drop. Callers that really mean to delete
+            // the content (optionalFileDelete, removing a xite) unlink the
+            // tree themselves.
+            Loc::Extern => {
+                let _ = fs::remove_file(self.obao_path(id));
+            }
+            Loc::Slab { .. } => {}
         }
         Ok(())
     }
@@ -941,7 +1214,11 @@ impl Store {
                 None => None,
             };
             match cur {
-                Some(rec) if rec.refcount == 0 => {
+                // An extern object is the user's own file, not reclaimable
+                // cache, so eviction must never take it. `evict_lru` already
+                // skips it; this is the second gate, on the path that
+                // actually deletes.
+                Some(rec) if rec.refcount == 0 && !matches!(rec.loc, Loc::Extern) => {
                     objects.remove(id.0.as_slice()).map_err(db_err)?;
                     if let Loc::Slab { slab, .. } = rec.loc {
                         let mut slabs = txn.open_table(SLABS).map_err(db_err)?;
@@ -1093,7 +1370,11 @@ impl Store {
             for row in table.iter().map_err(db_err)? {
                 let (k, v) = row.map_err(db_err)?;
                 let rec: ObjRecord = dec(v.value())?;
-                if rec.refcount == 0 {
+                // Extern objects are the user's downloaded files, not cache.
+                // They charge nothing (`held()` is 0), so evicting one frees
+                // nothing anyway - but without this the record would still be
+                // dropped and the file would stop serving.
+                if rec.refcount == 0 && !matches!(rec.loc, Loc::Extern) {
                     let mut id = [0u8; 32];
                     id.copy_from_slice(k.value());
                     candidates.push((rec.last_access, ObjId(id)));
@@ -1235,8 +1516,24 @@ impl Store {
     /// Re-verify a sparse object's held bytes against its outboard and
     /// shrink the present set to what actually verifies (used after a
     /// crash or a failed serve — distrust, don't repair).
+    ///
+    /// An extern object is re-verified too, and is all-or-nothing: its bytes
+    /// are a file the user can rename, edit or delete at will, so anything
+    /// short of a full match retires the record (see
+    /// [`Self::retire_extern`]) and the next fetch starts over as a normal
+    /// download. A partial present-set is not an option there — the store
+    /// does not own those bytes and must not write into them.
     pub fn revalidate(&self, id: ObjId) -> io::Result<GroupBits> {
         let rec = self.required(id)?;
+        if let Loc::Extern = rec.loc {
+            return match self.extern_still_matches(id, &rec) {
+                Ok(true) => Ok(GroupBits::complete(rec.size)),
+                _ => {
+                    self.retire_extern(id)?;
+                    Ok(GroupBits::new())
+                }
+            };
+        }
         let Loc::Sparse = rec.loc else {
             return Ok(GroupBits::complete(rec.size));
         };
@@ -1276,6 +1573,36 @@ impl Store {
         Ok(updated.bits())
     }
 
+    /// Whether an extern object's file is still exactly the bytes it was
+    /// adopted as: right size, and every chunk group verifies against the
+    /// stored outboard.
+    fn extern_still_matches(&self, id: ObjId, rec: &ObjRecord) -> io::Result<bool> {
+        let path = self.extern_path(id)?;
+        if fs::metadata(&path)?.len() != rec.size {
+            return Ok(false);
+        }
+        let ob = OutboardBytes { root: id, size: rec.size, data: fs::read(self.obao_path(id))? };
+        let all = GroupBits::complete(rec.size);
+        let want = all.to_chunk_ranges_clamped(rec.size);
+        let data = File::open(&path)?;
+        Ok(verified::valid_ranges(&ob, &data, &want)?.is_superset(&want))
+    }
+
+    /// Drop an extern object's record and outboard, leaving the user's file
+    /// exactly where it is. The object simply becomes unknown to the store,
+    /// so the next fetch re-downloads it as a normal sparse object.
+    fn retire_extern(&self, id: ObjId) -> io::Result<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
+            objects.remove(id.0.as_slice()).map_err(db_err)?;
+            Self::put_extern_in(&txn, id, None)?;
+        }
+        txn.commit().map_err(db_err)?;
+        let _ = fs::remove_file(self.obao_path(id));
+        Ok(())
+    }
+
     /// Total bytes of all indexed objects (present or claimed).
     pub fn indexed_bytes(&self) -> io::Result<u64> {
         let txn = self.db.begin_read().map_err(db_err)?;
@@ -1305,6 +1632,18 @@ fn ns_to_u8(ns: Ns) -> u8 {
     match ns {
         Ns::Plain => 0,
         Ns::Shard => 1,
+    }
+}
+
+/// Inverse of [`ns_to_u8`], for paths that rewrite an existing record and
+/// must carry its namespace forward. An unknown byte reads as `Plain`: the
+/// field is ours, so this only fires on a corrupt record, and treating it
+/// as plain content is the conservative choice (shards are the namespace
+/// with the deniability property to protect).
+fn u8_to_ns(v: u8) -> Ns {
+    match v {
+        1 => Ns::Shard,
+        _ => Ns::Plain,
     }
 }
 
@@ -1433,7 +1772,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Tiny slabs so slab 0 seals quickly and compaction has to move its
         // objects into a later one.
-        let cfg = StoreConfig { slab_seal_bytes: 8 << 10, compact_dead_num: 128 };
+        let cfg = StoreConfig { slab_seal_bytes: 8 << 10, ..Default::default() };
         let store = Store::open_with(dir.path(), cfg).unwrap();
 
         let mut ids = Vec::new();

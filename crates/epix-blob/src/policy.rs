@@ -96,9 +96,14 @@ impl OrderPolicy {
     }
 
     /// Which fetch tier `inner_path` belongs to. First paint wins if a path is
-    /// (nonsensically) in both lists. An undeclared path lands in
-    /// [`FetchTier::Default`], so a xite with no `order_policy` puts every path
-    /// in one tier and the scheduler's existing ladder is unchanged.
+    /// (nonsensically) in both lists.
+    ///
+    /// A xite that declared NOTHING falls back to [`default_tier`], which
+    /// sorts by file type: the markup, styling and images a page needs to
+    /// render go first, and the big media and archives nothing is waiting on
+    /// go last. Without that fallback every path landed in one tier, so a
+    /// 1 GB video competed with the HTML for the same slots and a page whose
+    /// index.html had already arrived still would not draw.
     ///
     /// This orders OUR OWN fetching only. The policy is owner-signed, so it is
     /// authentic, but "authentic" is not "trusted with someone else's
@@ -110,7 +115,12 @@ impl OrderPolicy {
             FetchTier::FirstPaint
         } else if self.is_prefetch(inner_path) {
             FetchTier::Prefetch
+        } else if self.is_empty() {
+            default_tier(inner_path)
         } else {
+            // The owner declared an order and left this path out of it. That
+            // is a decision, not an omission, so their "everything else"
+            // stays one tier rather than being re-sorted underneath them.
             FetchTier::Default
         }
     }
@@ -132,6 +142,44 @@ pub enum FetchTier {
     Default,
     /// Declared prefetch hints: after first paint, background deadline.
     Prefetch,
+}
+
+/// Which tier a path falls in when the owner declared no `order_policy` at
+/// all, decided from its file extension.
+///
+/// Three tiers rather than a finer html-then-css-then-image ladder on
+/// purpose: the scheduler runs a full request round per non-empty tier, and
+/// within a tier small files are already batched ahead of large ones. A
+/// finer ladder would buy ordering the batching mostly gives us anyway, and
+/// pay for it in round trips - which over an onion circuit is the expensive
+/// part.
+///
+/// An unknown extension stays [`FetchTier::Default`]: guessing wrong about
+/// an unfamiliar file should cost it nothing, and the middle tier is the
+/// one where nothing is starved.
+pub fn default_tier(inner_path: &str) -> FetchTier {
+    let ext = inner_path
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        // What a page needs before it can draw anything.
+        "html" | "htm" | "css" | "js" | "mjs" | "json" | "wasm" | "svg" | "png" | "jpg"
+        | "jpeg" | "gif" | "webp" | "avif" | "ico" | "woff" | "woff2" | "ttf" | "otf" => {
+            FetchTier::FirstPaint
+        }
+        // Big by nature and nothing renders without it: video, audio,
+        // documents, archives, disk images, installers. These are what
+        // starved the page in mx5kevin's 1.21 GB test.
+        "mp4" | "webm" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg"
+        | "mp3" | "m4a" | "wav" | "flac" | "ogg" | "opus" | "oga" | "pdf" | "epub" | "mobi"
+        | "zip" | "rar" | "7z" | "gz" | "bz2" | "xz" | "tar" | "iso" | "img" | "dmg" | "exe"
+        | "msi" | "apk" | "deb" | "rpm" | "bin" | "torrent" | "doc" | "docx" | "xls" | "xlsx"
+        | "ppt" | "pptx" | "odt" | "ods" | "odp" | "psd" | "swf" | "bak" => FetchTier::Prefetch,
+        _ => FetchTier::Default,
+    }
 }
 
 /// How a path is distributed (issue #340's creator-chosen unit).
@@ -233,6 +281,13 @@ impl DistributionPolicy {
     /// a READER choosing to hold more than the owner asked for breaks no
     /// commitment. Consent is unchanged: the caller still gates an over-limit
     /// plan on the same optional-download prompt.
+    ///
+    /// Since completing is now the default ([`Self::resolve`]), this differs
+    /// from an undeclared xite in exactly one way: it overrides an owner's
+    /// explicit `partial` carve-outs too, including feeds. That is the
+    /// setting's whole purpose, and also why it stays opt-in - a feed is
+    /// partial because it CANNOT be completed, not because the owner was
+    /// being frugal.
     pub fn complete_everything() -> Self {
         Self {
             rules: Vec::new(),
@@ -244,8 +299,21 @@ impl DistributionPolicy {
     }
 
     /// The policy governing `inner_path` (longest declared prefix wins;
-    /// else the default; else package/partial — stream-first, seed what
-    /// you viewed, the universal safe behavior).
+    /// else the default; else package/**complete**).
+    ///
+    /// Completing is the default because partial retention is not just
+    /// inconvenient, it is identifying: every peer ends up holding a
+    /// different subset shaped by what they happened to open, and bitfield
+    /// exchange makes that subset readable. The publisher is then the only
+    /// peer holding everything. When every reader converges on the same
+    /// complete copy, the publisher is distinguishable only by holding the
+    /// signing key — and the content survives them going offline.
+    ///
+    /// This is a floor, not an ambush: nothing here fetches anything. It
+    /// only marks a path as one a BACKGROUND pass may finish after first
+    /// paint, and [`Self::completion_plan`] still gates the total against
+    /// the xite's size limit. An owner who knows a path cannot be completed
+    /// (a feed) declares that and wins.
     pub fn resolve(&self, inner_path: &str) -> PathPolicy {
         for (prefix, policy) in &self.rules {
             if inner_path.starts_with(prefix.as_str()) {
@@ -254,7 +322,7 @@ impl DistributionPolicy {
         }
         self.default.unwrap_or(PathPolicy {
             unit: DistributionUnit::Package,
-            retention: Retention::Partial,
+            retention: Retention::Complete,
         })
     }
 
@@ -360,12 +428,33 @@ mod tests {
     }
 
     #[test]
-    fn absent_distribution_is_stream_first_partial() {
+    fn absent_distribution_completes_by_default() {
         let d = DistributionPolicy::from_content(&json!({}));
         let p = d.resolve("anything");
         assert_eq!(p.unit, DistributionUnit::Package);
-        assert_eq!(p.retention, Retention::Partial, "default never ambushes a data cap");
-        assert!(!d.wants_complete("anything"));
+        assert_eq!(
+            p.retention,
+            Retention::Complete,
+            "a xite that declares nothing is still replicated whole"
+        );
+        assert!(d.wants_complete("anything"));
+
+        // Completing is planned, never ambushed: the size limit still gates
+        // the total, so "complete by default" cannot silently eat a data cap.
+        let missing = vec![("big.iso".to_string(), 5_000_000_000u64)];
+        assert!(d.completion_plan(&missing, 1_000_000_000).needs_consent);
+    }
+
+    #[test]
+    fn an_owner_declared_feed_still_stays_partial() {
+        // The one thing the default must not override: a feed cannot be
+        // completed (you can't hold 100M posts), so a declared carve-out wins.
+        let content = json!({
+            "distribution": { "paths": { "data/feed/": {"unit": "feed", "retention": "partial"} } }
+        });
+        let d = DistributionPolicy::from_content(&content);
+        assert!(!d.wants_complete("data/feed/seg1"), "declared partial wins over the default");
+        assert!(d.wants_complete("index.html"), "everything else still completes");
     }
 
     #[test]
@@ -387,13 +476,49 @@ mod tests {
             "first paint first, prefetch last, undeclared order preserved"
         );
 
-        // Nothing declared -> one tier, so a stable sort is a no-op and the
-        // caller's existing ladder survives untouched.
+        // Nothing declared -> the type-based fallback ladder decides, so the
+        // page's own assets go first and the film goes last. An extension
+        // nobody classified keeps its place in the middle.
         let none = OrderPolicy::from_content(&json!({}));
         assert!(none.is_empty());
-        let mut same = vec!["b", "a", "c"];
-        same.sort_by_key(|p2| none.tier(p2));
-        assert_eq!(same, vec!["b", "a", "c"], "no policy -> no reorder");
+        let mut fallback =
+            vec!["movie.mp4", "data/db.sqlite", "index.html", "archive.zip", "css/all.css"];
+        fallback.sort_by_key(|p2| none.tier(p2));
+        assert_eq!(
+            fallback,
+            vec!["index.html", "css/all.css", "data/db.sqlite", "movie.mp4", "archive.zip"],
+            "renderable assets first, bulk last, unknown types in between"
+        );
+    }
+
+    #[test]
+    fn the_default_ladder_reads_the_extension_not_the_path() {
+        // mx5kevin's case: a xite that declares nothing at all must still
+        // render before its gigabyte of media lands.
+        assert_eq!(default_tier("index.html"), FetchTier::FirstPaint);
+        assert_eq!(default_tier("css/all.css"), FetchTier::FirstPaint);
+        assert_eq!(default_tier("img/logo.PNG"), FetchTier::FirstPaint, "case-insensitive");
+        assert_eq!(default_tier("video/film.mp4"), FetchTier::Prefetch);
+        assert_eq!(default_tier("dl/archive.zip"), FetchTier::Prefetch);
+        assert_eq!(default_tier("docs/manual.pdf"), FetchTier::Prefetch);
+
+        // No extension, or one nobody classified: neither hurried nor starved.
+        assert_eq!(default_tier("LICENSE"), FetchTier::Default);
+        assert_eq!(default_tier("data/users.db"), FetchTier::Default);
+        // A dot in a DIRECTORY name is not an extension.
+        assert_eq!(default_tier("my.files/README"), FetchTier::Default);
+    }
+
+    #[test]
+    fn a_declared_policy_is_never_second_guessed_by_the_ladder() {
+        // The owner listed a first-paint set and left the video out of it.
+        // That is their call: the fallback ladder must not then demote it, or
+        // an owner who deliberately front-loads media loses to our guess.
+        let content = json!({ "order_policy": { "first_paint": ["index.html"] } });
+        let p = OrderPolicy::from_content(&content);
+        assert_eq!(p.tier("index.html"), FetchTier::FirstPaint);
+        assert_eq!(p.tier("intro.mp4"), FetchTier::Default, "declared order wins");
+        assert_eq!(p.tier("css/all.css"), FetchTier::Default);
     }
 
     #[test]
@@ -430,9 +555,13 @@ mod tests {
         let gated = d.completion_plan(&missing, 1_000_000);
         assert!(gated.needs_consent, "over the size limit -> consent required");
 
-        // No declared distribution -> nothing to complete at all.
+        // No declared distribution -> everything is planned (completing is
+        // the default), but a zero budget means it asks first rather than
+        // starting a 95 MB download nobody agreed to.
         let bare = DistributionPolicy::from_content(&json!({}));
-        assert!(bare.completion_plan(&missing, 0).paths.is_empty());
+        let plan = bare.completion_plan(&missing, 0);
+        assert_eq!(plan.paths.len(), 3, "an undeclared xite completes whole");
+        assert!(plan.needs_consent);
     }
 
     #[test]

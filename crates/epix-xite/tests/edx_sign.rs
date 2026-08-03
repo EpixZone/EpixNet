@@ -144,10 +144,28 @@ fn edx_register_populates_the_store_without_refetch() {
     let content = signed_content(&xite);
 
     let store_dir = tempfile::tempdir().unwrap();
-    let store = Store::open(store_dir.path()).unwrap();
+    // The store adopts big files where they lie instead of copying them in,
+    // so it has to know which tree they are allowed to live in.
+    let store = Store::open_with(
+        store_dir.path(),
+        epix_blob::store::StoreConfig {
+            xite_root: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let (registered, skipped) = xite.edx_register(&store, 1).unwrap();
     // 4 files (content.json isn't in files) + 1 bundle.
     assert_eq!((registered, skipped), (5, 0));
+
+    // The big file was adopted in place: one copy, in the xite tree, with
+    // only its outboard kept beside it in the store.
+    let big_entry = manifest::edx_entry(&content, "big.bin").unwrap();
+    assert!(store.is_extern(big_entry.b3).unwrap(), "big.bin reads through to the tree");
+    assert!(
+        !store_dir.path().join("sparse").join(big_entry.b3.to_string()).exists(),
+        "no second copy of the bytes under sparse/"
+    );
 
     // Every declared object is now present and complete.
     for path in ["index.html", "css/all.css", "js/app.js", "big.bin"] {

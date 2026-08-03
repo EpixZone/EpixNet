@@ -205,7 +205,7 @@ fn refcount_evict_fuzz_against_model() {
 #[test]
 fn slab_sealing_and_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig { slab_seal_bytes: 4096, compact_dead_num: 128 };
+    let cfg = StoreConfig { slab_seal_bytes: 4096, ..Default::default() };
     let store = Store::open_with(dir.path(), cfg).unwrap();
 
     // Fill several slabs with 1 KiB objects.
@@ -392,4 +392,259 @@ fn quota_evicts_unpinned_but_keeps_pinned() {
     assert!(freed >= 40_000, "freed {freed}");
     assert!(store.contains(own_id).unwrap(), "pinned own content survives");
     assert!(!store.contains(cached_id).unwrap(), "unpinned cache evicted");
+}
+
+// --- Extern objects: the xite tree holds the bytes ------------------------
+
+/// A store whose extern objects resolve under `xite_root`.
+fn store_rooted(store_dir: &std::path::Path, xite_root: &std::path::Path) -> Store {
+    Store::open_with(
+        store_dir,
+        StoreConfig { xite_root: Some(xite_root.to_path_buf()), ..Default::default() },
+    )
+    .unwrap()
+}
+
+#[test]
+fn adopting_a_file_stores_no_second_copy_and_still_serves_slices() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(200_000);
+    let id = oid(&data);
+    let file = tree.path().join("xite1").join("big.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &data).unwrap();
+
+    assert!(store.adopt_extern(id, Ns::Plain, &file, 1).unwrap());
+    assert!(store.is_extern(id).unwrap());
+    assert!(store.is_complete(id).unwrap());
+
+    // The bytes were never copied into the store: only the outboard is ours.
+    assert!(!store_dir.path().join("sparse").join(id.to_string()).exists());
+    assert!(store_dir.path().join("sparse").join(format!("{id}.obao")).exists());
+
+    // It still serves a verified slice and reads ranges, straight from the
+    // file the user can see.
+    let mut slice = Vec::new();
+    store.encode_slice(id, &[50_000..60_000], &mut slice, 2).unwrap();
+    assert!(!slice.is_empty());
+    assert_eq!(store.read_range(id, 1000, 500, 3).unwrap(), data[1000..1500]);
+
+    // And it charges the cache quota nothing: it is the user's file.
+    assert_eq!(store.total_bytes().unwrap(), 0);
+}
+
+#[test]
+fn materialize_moves_a_completed_download_into_the_tree() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    // Fetch a whole object the way the swarm does.
+    let data = test_data(120_000);
+    let (id, size, slice) = slice_for(&data, &[0..120_000]);
+    store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    store.write_slice(id, &[0..120_000], &slice[..], 1).unwrap();
+    assert!(store.is_complete(id).unwrap());
+    assert!(!store.is_extern(id).unwrap());
+    assert_eq!(store.total_bytes().unwrap(), 120_000, "still cache at this point");
+
+    // Materializing hands it to the xite tree.
+    let dst = tree.path().join("xite1").join("video.mp4");
+    store.materialize(id, &dst, 2).unwrap();
+
+    assert_eq!(std::fs::read(&dst).unwrap(), data, "the user has the file");
+    assert!(!store_dir.path().join("sparse").join(id.to_string()).exists(), "stored once");
+    assert!(store.is_extern(id).unwrap());
+    assert_eq!(store.read_bytes(id, 3).unwrap(), data, "and it still serves");
+    assert_eq!(store.total_bytes().unwrap(), 0, "no longer charged as cache");
+
+    // Idempotent: a second Range request that raced the first is a no-op.
+    store.materialize(id, &dst, 4).unwrap();
+    assert!(store.is_extern(id).unwrap());
+}
+
+#[test]
+fn materialize_refuses_an_incomplete_object() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(120_000);
+    let (id, size, slice) = slice_for(&data, &[0..16_384]);
+    store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    store.write_slice(id, &[0..16_384], &slice[..], 1).unwrap();
+
+    let dst = tree.path().join("xite1").join("partial.bin");
+    assert!(store.materialize(id, &dst, 2).is_err(), "half a file is not a file");
+    assert!(!dst.exists());
+}
+
+#[test]
+fn extern_paths_must_stay_inside_the_xite_root() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(100_000);
+    let id = oid(&data);
+    let outside = elsewhere.path().join("passwd");
+    std::fs::write(&outside, &data).unwrap();
+
+    // The store must never be talked into reading through to an arbitrary
+    // path: an object's bytes live in a xite tree or nowhere.
+    assert!(store.adopt_extern(id, Ns::Plain, &outside, 1).is_err());
+    assert!(!store.contains(id).unwrap());
+}
+
+#[test]
+fn eviction_never_reclaims_the_users_own_downloads() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    // One extern object (a completed download) and one cached object.
+    let mine = test_data(60_000);
+    let mine_id = oid(&mine);
+    let file = tree.path().join("xite1").join("mine.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &mine).unwrap();
+    store.adopt_extern(mine_id, Ns::Plain, &file, 1).unwrap();
+
+    let cached: Vec<u8> = (0..50_000u32).map(|i| (i / 3) as u8).collect();
+    let cached_id = ObjId::of(&cached);
+    store.insert_bytes(cached_id, Ns::Plain, &cached, 2).unwrap();
+
+    // Squeeze the quota to nothing. The cache goes; the download stays, and
+    // the file itself is untouched.
+    store.enforce_quota(0).unwrap();
+    assert!(!store.contains(cached_id).unwrap(), "cache is evictable");
+    assert!(store.contains(mine_id).unwrap(), "a download is not cache");
+    assert!(store.is_complete(mine_id).unwrap());
+    assert_eq!(std::fs::read(&file).unwrap(), mine);
+}
+
+#[test]
+fn removing_an_extern_object_leaves_the_users_file_alone() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(80_000);
+    let id = oid(&data);
+    let file = tree.path().join("xite1").join("keep.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &data).unwrap();
+    store.adopt_extern(id, Ns::Plain, &file, 1).unwrap();
+
+    store.remove(id).unwrap();
+    assert!(!store.contains(id).unwrap(), "the record is gone");
+    assert!(
+        !store_dir.path().join("sparse").join(format!("{id}.obao")).exists(),
+        "and so is the outboard we owned"
+    );
+    assert!(file.exists(), "but the xite's file is not the store's to delete");
+}
+
+#[test]
+fn an_edited_file_is_retired_rather_than_served_wrong() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    let data = test_data(70_000);
+    let id = oid(&data);
+    let file = tree.path().join("xite1").join("editable.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &data).unwrap();
+    store.adopt_extern(id, Ns::Plain, &file, 1).unwrap();
+    assert!(store.revalidate(id).unwrap().is_complete(70_000));
+
+    // The whole point of extern objects is that the user may edit their own
+    // files. Doing so must retire the object, never serve altered bytes
+    // under the original hash.
+    let mut edited = data.clone();
+    edited[40_000] ^= 0xff;
+    std::fs::write(&file, &edited).unwrap();
+
+    assert!(store.revalidate(id).unwrap().is_empty());
+    assert!(!store.contains(id).unwrap(), "retired, so the next fetch refetches");
+    assert!(file.exists(), "the user's edit survives");
+}
+
+#[test]
+fn reclaim_converts_a_pre_extern_duplicate_and_gives_the_space_back() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    let store = store_rooted(store_dir.path(), tree.path());
+
+    // Exactly the shape an older build left behind: the bytes in the store
+    // AND the same bytes materialized in the xite tree.
+    let data = test_data(90_000);
+    let (id, size, slice) = slice_for(&data, &[0..90_000]);
+    store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+    store.write_slice(id, &[0..90_000], &slice[..], 1).unwrap();
+    let file = tree.path().join("xite1").join("dup.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &data).unwrap();
+    assert_eq!(store.total_bytes().unwrap(), 90_000);
+
+    let freed = store.reclaim_duplicate(id, &file, 2).unwrap();
+    assert_eq!(freed, 90_000);
+    assert!(store.is_extern(id).unwrap());
+    assert!(!store_dir.path().join("sparse").join(id.to_string()).exists());
+    assert_eq!(store.total_bytes().unwrap(), 0);
+    assert_eq!(store.read_bytes(id, 3).unwrap(), data, "still serves, from the tree");
+
+    // A tree file that is NOT this object must never be adopted as it.
+    let other = test_data(90_000).iter().map(|b| b ^ 1).collect::<Vec<u8>>();
+    let (other_id, other_size, other_slice) = slice_for(&other, &[0..90_000]);
+    store.ensure_sparse(other_id, Ns::Plain, other_size, 4).unwrap();
+    store.write_slice(other_id, &[0..90_000], &other_slice[..], 4).unwrap();
+    assert_eq!(store.reclaim_duplicate(other_id, &file, 5).unwrap(), 0, "wrong bytes, no swap");
+    assert!(!store.is_extern(other_id).unwrap());
+}
+
+#[test]
+fn extern_survives_a_reopen_without_a_schema_migration() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+
+    let data = test_data(75_000);
+    let id = oid(&data);
+    let file = tree.path().join("xite1").join("persist.bin");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, &data).unwrap();
+    {
+        let store = store_rooted(store_dir.path(), tree.path());
+        store.adopt_extern(id, Ns::Plain, &file, 1).unwrap();
+    }
+
+    // Reopening an index that now contains a Loc::Extern record must not
+    // trip the schema check - the variant was appended, so old records keep
+    // their meaning and no migration is owed.
+    let store = store_rooted(store_dir.path(), tree.path());
+    assert!(store.is_extern(id).unwrap());
+    assert_eq!(store.read_range(id, 0, 100, 2).unwrap(), data[..100]);
+}
+
+#[test]
+fn a_store_without_a_xite_root_simply_has_no_extern_objects() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let tree = tempfile::tempdir().unwrap();
+    // `Store::open` (tools, exports, most tests) leaves xite_root unset.
+    let store = Store::open(store_dir.path()).unwrap();
+
+    let data = test_data(50_000);
+    let id = oid(&data);
+    let file = tree.path().join("x.bin");
+    std::fs::write(&file, &data).unwrap();
+
+    assert!(store.adopt_extern(id, Ns::Plain, &file, 1).is_err());
+    // Everything else about the store is unaffected.
+    let small = test_data(900);
+    assert!(store.insert_bytes(oid(&small), Ns::Plain, &small, 1).unwrap());
 }

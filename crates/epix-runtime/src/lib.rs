@@ -1102,6 +1102,9 @@ async fn resync_loop(
                 if freed > 0 {
                     state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
                 }
+                // Volunteer role: hold our slice of the encrypted shards of
+                // whatever private content we have manifests for.
+                crate::edx::volunteer_sweep(&state).await;
             }
         }
     }
