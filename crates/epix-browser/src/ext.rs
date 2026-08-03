@@ -1105,6 +1105,28 @@ mod tests {
         assert!(m["dark_theme"]["colors"].is_object());
     }
 
+    /// Whether the patched icon-size list still sits immediately before the
+    /// wallet's status-colour map, i.e. we rewrote the right `[16,48]`.
+    ///
+    /// Matches the SHAPE `[48],<ident>={off:` rather than the identifier
+    /// itself. Both bindings are minifier output (`M`/`U` in one wallet
+    /// build, `y`/`v` in the next), so pinning the letters means this test
+    /// fails on every wallet pin bump for a rename that changes nothing.
+    /// What actually matters is that the list we shortened is the one the
+    /// status colours belong to - and `patch_wallet_icon_sizes` keys off
+    /// `[16,48]`, which is content, not a name.
+    fn patched_before_status_colors(js: &str) -> bool {
+        js.match_indices("[48],").any(|(i, m)| {
+            let rest = &js[i + m.len()..];
+            // ASCII-only, so the char count is also the byte offset.
+            let ident_len = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                .count();
+            ident_len > 0 && rest[ident_len..].starts_with("={off:")
+        })
+    }
+
     // The wallet XPI ships the Epix-branded toolbar icons in place of the
     // wallet's own, so its canvas draws our badge (with its status light on
     // top), and its icon-size list is patched to a single 48px render.
@@ -1132,7 +1154,7 @@ mod tests {
             let mut s = String::new();
             if zip.by_name(name).unwrap().read_to_string(&mut s).is_ok() {
                 assert!(!s.contains("[16,48]"), "old size list should be gone in {name}");
-                if s.contains("[48],U={off:") {
+                if patched_before_status_colors(&s) {
                     found_patch = true;
                 }
             }
@@ -1220,6 +1242,31 @@ mod tests {
         assert!(patch_wallet_icon_sizes(b"no sizes here").is_none());
         // Ambiguous (more than one) -> untouched, to avoid mis-patching.
         assert!(patch_wallet_icon_sizes(b"[16,48] and [16,48]").is_none());
+    }
+
+    // The XPI check locates the patched list by what FOLLOWS it, and must not
+    // care what the minifier called things this build.
+    #[test]
+    fn patched_before_status_colors_ignores_minified_names() {
+        // The two wallet builds seen so far, and a longer identifier.
+        for js in [
+            r##"D=1.2,M=[48],U={off:"#64748b",boot:"#f5c450"}"##,
+            r##"D=1.2,y=[48],v={off:"#64748b",boot:"#f5c450"}"##,
+            r##"D=1.2,sizes=[48],$c1={off:"#64748b"}"##,
+        ] {
+            assert!(patched_before_status_colors(js), "should match: {js}");
+        }
+
+        // It still has to be the status-colour map, and still has to be
+        // patched - an unpatched or unrelated `[48]` proves nothing.
+        for js in [
+            r##"y=[48],v={on:"#64748b"}"##,   // a different map
+            r##"y=[48],={off:"#64748b"}"##,   // no binding at all
+            r##"y=[16,48],v={off:"#aaa"}"##,  // never patched
+            r##"const pad=[48];v={off:1}"##,  // not adjacent
+        ] {
+            assert!(!patched_before_status_colors(js), "should not match: {js}");
+        }
     }
 
     // The spin patch injects a dot-less spin controller before `o` that starts at
