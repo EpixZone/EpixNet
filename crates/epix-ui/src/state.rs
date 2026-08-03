@@ -38,6 +38,45 @@ pub const DEFAULT_VOLUNTEER_QUOTA: &str = "0";
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const DEFAULT_VOLUNTEER_QUOTA: &str = "2147483648"; // 2 GiB
 
+/// What a boot-time registration pass actually did
+/// ([`AppState::edx_register_all_loaded`]).
+///
+/// Counts OBJECTS, not just xites. A pass that walks every xite and stores
+/// nothing is the failure mode worth seeing - it means the node is serving
+/// none of that content to peers - and a xite count cannot distinguish it
+/// from a healthy pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterTally {
+    /// Xites whose manifest could be read and walked.
+    pub xites: usize,
+    /// Objects now in the store because of this pass (or already there).
+    pub registered: usize,
+    /// Declared files that could not be registered: missing locally, or on
+    /// disk but no longer matching their declared hash.
+    pub skipped: usize,
+    /// Xites whose content.json could not be loaded at all.
+    pub unreadable: usize,
+}
+
+impl std::fmt::Display for RegisterTally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} object(s) from {} xite(s)", self.registered, self.xites)?;
+        if self.skipped > 0 {
+            write!(f, ", {} file(s) skipped", self.skipped)?;
+        }
+        if self.unreadable > 0 {
+            write!(f, ", {} xite(s) unreadable", self.unreadable)?;
+        }
+        // The case that hid a real problem: xites walked, nothing stored.
+        // Almost always pre-EDX manifests that have not been re-signed, and
+        // it means none of those files can be served.
+        if self.registered == 0 && self.xites > 0 {
+            write!(f, " - nothing to serve yet (manifests carry no b3; re-sign to publish over EDX)")?;
+        }
+        Ok(())
+    }
+}
+
 /// Resolves + clones a `.epix` host that isn't served yet, so the browser can
 /// open any name by typing it. Implemented by the node (which has the chain
 /// resolver + download worker); the UI server calls it via
@@ -4918,7 +4957,59 @@ impl AppState {
         for k in keys {
             self.update_content(k, Some(content.clone())).await;
         }
+        self.register_new_manifest_objects(canonical, &content).await;
         true
+    }
+
+    /// After a new root manifest lands, adopt any objects it declares that the
+    /// store does not have yet.
+    ///
+    /// Registration otherwise only runs at startup, which leaves a real hole:
+    /// a manifest can start declaring `b3` for files whose BYTES never
+    /// changed - exactly what happens when a xite is re-signed from a pre-EDX
+    /// manifest to an EDX one. Nothing needs downloading, so no fetch path
+    /// registers them, and the node cannot serve those files to anyone until
+    /// someone restarts it. Measured on a real node: 8 xites went from 0 to
+    /// 507 `b3` entries on a re-sign, and all 19 of their large files stayed
+    /// unservable until the next restart.
+    ///
+    /// The gate is index lookups only - no file reads, no hashing - so the
+    /// common case (an ordinary update whose changed files the fetch path
+    /// already materialized) costs a handful of redb gets and stops. Only a
+    /// manifest that actually introduced unknown objects pays for a
+    /// registration pass, and that pass runs on the blocking pool.
+    async fn register_new_manifest_objects(self: &AppState, canonical: &str, content: &Value) {
+        let Some(store) = self.edx_store().await else { return };
+        // Cheap: does this manifest declare anything we do not already hold?
+        let mut missing = 0usize;
+        for key in ["files", "files_optional"] {
+            let Some(entries) = content.get(key).and_then(Value::as_object) else { continue };
+            for entry in entries.values() {
+                let Some(id) = entry
+                    .get("b3")
+                    .and_then(Value::as_str)
+                    .and_then(epix_blob::ObjId::from_hex)
+                else {
+                    continue; // pre-EDX entry: nothing to register
+                };
+                if !store.contains(id).unwrap_or(false) {
+                    missing += 1;
+                }
+            }
+        }
+        if missing == 0 {
+            return;
+        }
+        if let Some((registered, skipped)) = self.edx_register_xite(canonical).await {
+            self.log(
+                "INFO",
+                format!(
+                    "{canonical}: new manifest declared {missing} object(s) we did not hold; \
+                     registered {registered} (skipped {skipped}) so they serve without a restart"
+                ),
+            )
+            .await;
+        }
     }
 
     /// The defer half of [`Self::finalize_root_update`]: record the missing
@@ -9150,16 +9241,28 @@ impl AppState {
 
     /// Register every currently-loaded xite's files into the EDX store, so a
     /// store installed after xites already loaded still serves them (load
-    /// order independence). Returns the number of xites registered.
-    pub async fn edx_register_all_loaded(&self) -> usize {
+    /// order independence).
+    ///
+    /// Returns a [`RegisterTally`] rather than a xite count. The count alone
+    /// reads identically whether the pass stored 500 objects or none - a
+    /// node whose xites all carry pre-EDX manifests reports the same
+    /// "17 xites" as one that registered everything - and that is exactly
+    /// what hid a whole node's worth of unservable files until someone
+    /// thought to audit the store by hand.
+    pub async fn edx_register_all_loaded(&self) -> RegisterTally {
         let addresses: Vec<String> = self.xites.read().await.keys().cloned().collect();
-        let mut n = 0;
+        let mut tally = RegisterTally::default();
         for address in addresses {
-            if self.edx_register_xite(&address).await.is_some() {
-                n += 1;
+            match self.edx_register_xite(&address).await {
+                Some((registered, skipped)) => {
+                    tally.xites += 1;
+                    tally.registered += registered;
+                    tally.skipped += skipped;
+                }
+                None => tally.unreadable += 1,
             }
         }
-        n
+        tally
     }
 
     /// Register a xite's local files (and the bundles its manifest declares)
@@ -15192,6 +15295,150 @@ mod tests {
     /// completion set is computed as a background plan over what is still
     /// missing - and it honours the xite's size limit through the same
     /// optional-download consent the rest of the node uses.
+    /// The boot log has to distinguish "walked 17 xites and stored 500
+    /// objects" from "walked 17 xites and stored nothing". The old line
+    /// counted xites only, so both read `17 xite(s) registered` - which is
+    /// how a node serving none of its content looked perfectly healthy.
+    #[test]
+    fn the_register_tally_reports_objects_not_just_xites() {
+        let healthy = RegisterTally { xites: 17, registered: 507, skipped: 0, unreadable: 0 };
+        assert_eq!(healthy.to_string(), "507 object(s) from 17 xite(s)");
+
+        // The failure that hid: every xite walked, nothing stored.
+        let pre_edx = RegisterTally { xites: 17, registered: 0, skipped: 0, unreadable: 0 };
+        let s = pre_edx.to_string();
+        assert!(s.starts_with("0 object(s) from 17 xite(s)"), "{s}");
+        assert!(s.contains("nothing to serve yet"), "says so plainly: {s}");
+        assert!(s.contains("re-sign"), "and names the fix: {s}");
+
+        // Partial trouble is visible without drowning the healthy case.
+        let partial = RegisterTally { xites: 3, registered: 40, skipped: 2, unreadable: 1 };
+        assert_eq!(
+            partial.to_string(),
+            "40 object(s) from 3 xite(s), 2 file(s) skipped, 1 xite(s) unreadable"
+        );
+
+        // An empty node says nothing alarming.
+        assert_eq!(RegisterTally::default().to_string(), "0 object(s) from 0 xite(s)");
+    }
+
+    /// A re-signed manifest that starts declaring `b3` for files whose BYTES
+    /// never changed must become servable immediately, not at the next
+    /// restart.
+    ///
+    /// This is the pre-EDX -> EDX re-sign, and it is invisible to every other
+    /// path: nothing needs downloading (the files are already correct on
+    /// disk), so no fetch registers them, and registration otherwise only
+    /// runs at boot. Measured on a real node, 8 xites went from 0 to 507 b3
+    /// entries on a re-sign and none of their large files could be served
+    /// until someone restarted it.
+    #[tokio::test]
+    async fn a_resigned_manifest_registers_its_objects_without_a_restart() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        // A file big enough to be an extern object, already on disk.
+        let big = vec![b'x'; 200 * 1024];
+        storage.write("assets/big.js", &big).unwrap();
+        let b3 = epix_blob::ObjId::of(&big);
+
+        // The OLD manifest is pre-EDX: it declares the file with no b3, so
+        // registration has nothing to store for it.
+        let pre_edx = json!({
+            "address": addr, "modified": 1.0,
+            "files": { "assets/big.js": {
+                "size": big.len(), "sha512": XiteStorage::hash_bytes(&big) } },
+        });
+        storage.write("content.json", &serde_json::to_vec(&pre_edx).unwrap()).unwrap();
+
+        let state = AppState::new("test");
+        let store_dir = tempdir().unwrap();
+        let store = Arc::new(
+            epix_blob::store::Store::open_with(
+                store_dir.path(),
+                epix_blob::store::StoreConfig {
+                    xite_root: Some(dir.path().parent().unwrap().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        state.set_edx_store(store.clone()).await;
+        state
+            .add_xite(addr, XiteEntry { storage: storage.clone(), content: Some(pre_edx) })
+            .await;
+        assert!(!store.contains(b3).unwrap(), "pre-EDX manifest registers nothing");
+
+        // The re-signed manifest lands: same bytes on disk, now with a b3.
+        let edx = json!({
+            "address": addr, "modified": 2.0, "edx": 1,
+            "files": { "assets/big.js": {
+                "size": big.len(),
+                "sha512": XiteStorage::hash_bytes(&big),
+                "b3": b3.to_string() } },
+        });
+        let bytes = serde_json::to_vec(&edx).unwrap();
+        state
+            .commit_root_update(&[addr.to_string()], addr, &storage, edx, &bytes)
+            .await;
+
+        // Servable now, with no restart - and adopted in place, so the bytes
+        // are still the one copy in the xite tree.
+        assert!(store.contains(b3).unwrap(), "the re-signed manifest's object registered");
+        assert!(store.is_extern(b3).unwrap(), "adopted in place, not copied into the store");
+        assert!(
+            !store_dir.path().join("sparse").join(b3.to_string()).exists(),
+            "no second copy of the bytes"
+        );
+    }
+
+    /// The gate is cheap and quiet: an ordinary update that declares nothing
+    /// new must not trigger a registration pass (it re-reads and re-hashes
+    /// every declared file).
+    #[tokio::test]
+    async fn an_update_declaring_nothing_new_skips_the_registration_pass() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let body = vec![b'y'; 200 * 1024];
+        storage.write("assets/big.js", &body).unwrap();
+        let b3 = epix_blob::ObjId::of(&body);
+        let content = json!({
+            "address": addr, "modified": 1.0, "edx": 1,
+            "files": { "assets/big.js": {
+                "size": body.len(),
+                "sha512": XiteStorage::hash_bytes(&body),
+                "b3": b3.to_string() } },
+        });
+
+        let state = AppState::new("test");
+        let store_dir = tempdir().unwrap();
+        let store = Arc::new(
+            epix_blob::store::Store::open_with(
+                store_dir.path(),
+                epix_blob::store::StoreConfig {
+                    xite_root: Some(dir.path().parent().unwrap().to_path_buf()),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        state.set_edx_store(store.clone()).await;
+        state
+            .add_xite(addr, XiteEntry { storage: storage.clone(), content: Some(content.clone()) })
+            .await;
+        // Already held (the boot pass, or the fetch that brought it).
+        store.adopt_extern(b3, epix_blob::Ns::Plain, &storage.path("assets/big.js").unwrap(), 1).unwrap();
+        assert!(store.is_extern(b3).unwrap());
+
+        // Landing the same manifest again is a no-op, and must not disturb it.
+        let bytes = serde_json::to_vec(&content).unwrap();
+        state
+            .commit_root_update(&[addr.to_string()], addr, &storage, content, &bytes)
+            .await;
+        assert!(store.is_extern(b3).unwrap(), "still extern, untouched");
+    }
+
     #[tokio::test]
     async fn package_unit_completes_after_first_paint_within_the_size_limit() {
         let dir = tempdir().unwrap();
