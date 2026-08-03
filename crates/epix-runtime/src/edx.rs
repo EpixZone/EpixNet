@@ -3890,7 +3890,7 @@ pub async fn enable_serving(
     // Register any xites already loaded before the store was installed, so
     // serving does not depend on load order.
     let n = state.edx_register_all_loaded().await;
-    state.log("INFO", format!("EDX object store enabled ({n} xite(s) registered)")).await;
+    state.log("INFO", format!("EDX object store enabled: registered {n}")).await;
     Some(store)
 }
 
