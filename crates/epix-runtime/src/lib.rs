@@ -1544,6 +1544,32 @@ const ONION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// gone bad, and the rebuild is disruptive enough to be worth confirming.
 #[cfg(feature = "tor")]
 const ONION_FAILURES_BEFORE_RESET: u32 = 3;
+/// Shortest gap between two client rebuilds, doubled per repeat up to
+/// [`ONION_REBUILD_MAX_BACKOFF_SECS`].
+///
+/// A rebuild that is followed within minutes by the same failure did not help:
+/// the cause is outside the guard sample (a hostile or throttled link), and
+/// rebuilding again just adds another bootstrap plus descriptor republish, with
+/// the client fully down in between. Rate-limiting the *rebuild* while leaving
+/// the current client running keeps whatever partial service it still provides.
+#[cfg(feature = "tor")]
+const ONION_REBUILD_BACKOFF_SECS: i64 = 15 * 60;
+#[cfg(feature = "tor")]
+const ONION_REBUILD_MAX_BACKOFF_SECS: i64 = 2 * 60 * 60;
+/// A generation that served this long before failing means the previous rebuild
+/// worked, so the next failure starts the escalation over rather than inheriting
+/// a backoff earned hours earlier.
+#[cfg(feature = "tor")]
+const ONION_REBUILD_ESCALATION_RESET_SECS: i64 = 60 * 60;
+
+/// Seconds since the Unix epoch.
+#[cfg(feature = "tor")]
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Resolve once onion transport has been unreachable for
 /// `ONION_FAILURES_BEFORE_RESET` consecutive probes - the signal that arti's
@@ -1555,21 +1581,30 @@ const ONION_FAILURES_BEFORE_RESET: u32 = 3;
 /// fetch from us and we cannot reach them. Probing is the only way to see it.
 /// Pends forever when there is no onion service to probe (nothing to check, and
 /// nothing that a rebuild would fix).
+///
+/// `earliest_rebuild` (unix seconds) rate-limits the rebuild, not the probing:
+/// while the threshold is met but the gap has not elapsed, the current client
+/// keeps running and is re-probed each interval, so a client that recovers on
+/// its own is never torn down and one that stays broken is rebuilt as soon as
+/// the gap passes.
 #[cfg(feature = "tor")]
 async fn await_onion_failure(
     state: &AppState,
     tor: &epix_tor::Tor,
     onion: Option<(String, u16)>,
+    earliest_rebuild: i64,
 ) {
     let Some((host, port)) = onion else {
         std::future::pending::<()>().await;
         return;
     };
     let mut failures = 0u32;
+    let mut held_off = false;
     loop {
         tokio::time::sleep(ONION_HEALTH_INTERVAL).await;
         if tor.onion_reachable(&host, port, ONION_PROBE_TIMEOUT).await {
             failures = 0;
+            held_off = false;
             continue;
         }
         failures += 1;
@@ -1582,8 +1617,28 @@ async fn await_onion_failure(
                 ),
             )
             .await;
-        if failures >= ONION_FAILURES_BEFORE_RESET {
+        if failures < ONION_FAILURES_BEFORE_RESET {
+            continue;
+        }
+        let now = unix_now();
+        if now >= earliest_rebuild {
             return;
+        }
+        // Stay armed at the threshold so the rebuild happens on the first probe
+        // after the gap, without re-running the whole confirmation streak.
+        failures = ONION_FAILURES_BEFORE_RESET;
+        if !held_off {
+            held_off = true;
+            state
+                .log(
+                    "WARNING",
+                    format!(
+                        "Tor: onion still unreachable, but the last rebuild did not help; \
+                         keeping this client and retrying the rebuild in {}m",
+                        (earliest_rebuild - now).max(0) / 60
+                    ),
+                )
+                .await;
         }
     }
 }
@@ -1608,7 +1663,13 @@ async fn tor_loop(
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
+    // Repeated rebuilds that do not help are throttled (see
+    // ONION_REBUILD_BACKOFF_SECS); a generation that serves well before failing
+    // clears the escalation.
+    let mut consecutive_rebuilds = 0u32;
+    let mut earliest_rebuild = 0i64;
     loop {
+        let started = unix_now();
         let end = run_tor_generation(
             state.clone(),
             data_dir.clone(),
@@ -1618,11 +1679,20 @@ async fn tor_loop(
             tor_use_bridges,
             edx_cell.clone(),
             shutdown.clone(),
+            earliest_rebuild,
         )
         .await;
         match end {
             TorGenerationEnd::Shutdown => break,
             TorGenerationEnd::Unhealthy => {
+                if unix_now().saturating_sub(started) >= ONION_REBUILD_ESCALATION_RESET_SECS {
+                    consecutive_rebuilds = 0;
+                }
+                consecutive_rebuilds += 1;
+                let backoff = ONION_REBUILD_BACKOFF_SECS
+                    .saturating_mul(1 << (consecutive_rebuilds - 1).min(3))
+                    .min(ONION_REBUILD_MAX_BACKOFF_SECS);
+                earliest_rebuild = unix_now().saturating_add(backoff);
                 // Fail closed while no client is routed: in Always mode a
                 // transport without Tor must never fall through to clearnet.
                 state.set_transport(Arc::new(epix_tor::MixedTransport::new(None, mode))).await;
@@ -1633,8 +1703,10 @@ async fn tor_loop(
                         "WARNING",
                         format!(
                             "Tor: onion transport was dead; {}re-bootstrapping \
-                             (the .onion address is unchanged)",
-                            if cleared { "cleared the guard sample and " } else { "" }
+                             (the .onion address is unchanged; rebuild {consecutive_rebuilds}, \
+                             next one no sooner than {}m from now)",
+                            if cleared { "cleared the guard sample and " } else { "" },
+                            backoff / 60
                         ),
                     )
                     .await;
@@ -1661,6 +1733,7 @@ async fn run_tor_generation(
     tor_use_bridges: bool,
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
+    earliest_rebuild: i64,
 ) -> TorGenerationEnd {
     // Cancels this generation's spawned tasks (onion accept loop, SOCKS).
     let (generation, _) = tokio::sync::watch::channel(false);
@@ -1808,7 +1881,7 @@ async fn run_tor_generation(
     let end = {
         let tor_config_changed = state.tor_config_changed();
         let mut snowflake_guard = snowflake_guard;
-        let health = await_onion_failure(&state, &tor, onion_probe);
+        let health = await_onion_failure(&state, &tor, onion_probe, earliest_rebuild);
         tokio::pin!(health);
         loop {
             tokio::select! {
@@ -1825,7 +1898,7 @@ async fn run_tor_generation(
         let _ = snowflake_guard;
         tokio::select! {
             _ = shutdown.notified() => TorGenerationEnd::Shutdown,
-            _ = await_onion_failure(&state, &tor, onion_probe) => TorGenerationEnd::Unhealthy,
+            _ = await_onion_failure(&state, &tor, onion_probe, earliest_rebuild) => TorGenerationEnd::Unhealthy,
         }
     };
 

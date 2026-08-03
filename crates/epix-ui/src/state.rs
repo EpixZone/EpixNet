@@ -3367,7 +3367,27 @@ impl AppState {
             return;
         }
         let Some(path) = &self.peers_path else { return };
-        let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
+        // Start from what is already saved, so a xite that happens to hold no
+        // peers in memory right now keeps the ones it learned before. Rebuilding
+        // the file from scratch ERASED them: a xite whose discovery is cold at
+        // this instant (a fresh clone, an announce that returned nothing) was
+        // simply skipped, so every restart wiped its peer list and it could
+        // never accumulate one - leaving a stream to whichever single peer it
+        // happened to rediscover.
+        let mut map: serde_json::Map<String, Value> = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        // Entries for xites this node no longer serves are not carried over;
+        // otherwise a deleted xite's peers would live in the file forever.
+        let served: std::collections::HashSet<String> = self
+            .xites
+            .read()
+            .await
+            .iter()
+            .map(|(key, x)| canonical_address(x.content.as_ref(), key))
+            .collect();
+        map.retain(|k, _| served.contains(k));
         for (key, x) in self.xites.read().await.iter() {
             let canonical = canonical_address(x.content.as_ref(), key);
             if x.peers.len() == 0 {
