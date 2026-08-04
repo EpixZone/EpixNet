@@ -1274,6 +1274,12 @@ struct Streaming {
     queued: HashMap<(String, String), Range<u64>>,
     /// Files whose one-time moov head/tail warm-up has been kicked off.
     warmed: HashSet<(String, String)>,
+    /// Objects with a full-file completion pass in flight - at most one per
+    /// object, so a browser's burst of Range requests cannot fan out into
+    /// duplicate whole-file fetches. Entries are removed when the pass EXITS
+    /// (Drop guard), complete or not, so the next Range serve re-arms a
+    /// completion that gave up; bounded by the number of concurrent passes.
+    completing: HashSet<ObjId>,
     /// Objects with a materialize (move into the xite tree) in flight. A
     /// browser issues Range requests in a burst, and every one of them sees
     /// the same "complete but not yet extern" window between the last group
@@ -2210,6 +2216,122 @@ impl RuntimeEdxFetcher {
             this.run_readahead(&key.0, id, size, tail).await;
             this.run_readahead(&key.0, id, size, head).await;
         });
+    }
+
+    /// On a touch of a large media file, ensure the one-per-object background
+    /// download of the COMPLETE file is running.
+    ///
+    /// Full-file download is the DEFAULT goal for media: playback may start
+    /// long before it finishes (the tight-deadline range serves and the
+    /// play-order read-ahead race ahead of it), and a seek is still served on
+    /// demand the same way, but the whole file keeps downloading regardless of
+    /// where the play head is or whether the player pauses. The windowed
+    /// read-ahead alone left a paused or seeked-around video permanently
+    /// partial: it only ever fetches FORWARD of the play head, so bytes
+    /// skipped by a seek were never backfilled and an abandoned player froze
+    /// the file mid-download.
+    ///
+    /// Runs at [`Deadline::background`]: rarest-first, patient, and ordered
+    /// behind the streaming tiers by every peer's deadline-aware serving, so
+    /// it soaks up idle swarm capacity instead of competing with the bytes
+    /// the player needs next. Overlap with the concurrent serves/read-ahead
+    /// is reconciled by the store's idempotent verified writes, and each pass
+    /// recomputes what is still missing, so nothing already landed is asked
+    /// for again.
+    ///
+    /// Gated by SIZE like the moov warm-up (the content type is not reliably
+    /// known here): below the threshold the very first read-ahead window
+    /// already spans the file. A file too big for the store quota stays
+    /// windowed - completing it could only evict itself or everything else.
+    /// `EPIX_EDX_COMPLETE_MEDIA=0` opts a bandwidth/disk-conscious node out,
+    /// reverting to fetch-what-you-view.
+    fn maybe_complete_file(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: ObjId,
+        size: u64,
+        store: &Arc<Store>,
+    ) {
+        if size < MOOV_MIN_SIZE || size > store_quota() || !env_on("EPIX_EDX_COMPLETE_MEDIA") {
+            return;
+        }
+        if store.is_complete(id).unwrap_or(false) {
+            return; // nothing left to complete (fully cached or extern)
+        }
+        {
+            let mut s = self.streaming.lock().expect("streaming");
+            if !s.completing.insert(id) {
+                return; // a completion pass is already running for this object
+            }
+        }
+        // Released from a Drop guard, not a trailing statement: a panic
+        // anywhere in the task would otherwise leak the entry and block this
+        // object's completion until restart. Removing on EXIT rather than
+        // keeping the entry as a done-marker is what re-arms an unfinished
+        // completion - the next Range request retries it, so an actively
+        // watched file keeps pulling while an abandoned one stops costing
+        // anything (no serves, no re-arms).
+        struct Gate {
+            streaming: Arc<Mutex<Streaming>>,
+            id: ObjId,
+        }
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                if let Ok(mut s) = self.streaming.lock() {
+                    s.completing.remove(&self.id);
+                }
+            }
+        }
+        let gate = Gate { streaming: self.streaming.clone(), id };
+        let this = self.clone();
+        let address = address.to_string();
+        let inner_path = inner_path.to_string();
+        tokio::spawn(async move {
+            let _gate = gate;
+            this.run_completion(&address, &inner_path, id, size).await;
+        });
+    }
+
+    /// Pull every group of `id` the store still lacks, in passes, until the
+    /// object is complete or a pass lands nothing (no dialable peer can
+    /// supply what is left - the next Range serve re-arms via
+    /// [`Self::maybe_complete_file`]). Each pass recomputes the missing set,
+    /// so groups the concurrent serves and read-ahead landed in the meantime
+    /// are never refetched, and redials through `peers_for`, whose
+    /// SESSION_MAX_AGE rebuild lets a long download pick up peers discovered
+    /// after it started. Silent on failure: completion is a background goal
+    /// and must never surface an error into a serve.
+    async fn run_completion(&self, address: &str, inner_path: &str, id: ObjId, size: u64) {
+        let Some(store) = self.state.edx_store().await else { return };
+        loop {
+            let now = now_secs();
+            let Ok(needed) = needed_groups(&store, id, size) else { return };
+            if needed.is_empty() {
+                break;
+            }
+            let Ok((handles, node_pks)) = self.peers_for(address, id, &needed).await else {
+                return;
+            };
+            // Reserve only once a holder is known (see `run_readahead`); the
+            // claim keeps this pass and the concurrent serves of the same
+            // object from dropping the record out from under each other.
+            let Ok(_claim) = self.claim_object(&store, id, Ns::Plain, size, now) else { return };
+            let mut swarm =
+                Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
+            let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await
+            else {
+                return;
+            };
+            self.credit(&report, &node_pks, now);
+            let _ = store.enforce_quota(store_quota());
+            if report.groups_fetched == 0 {
+                return; // no progress: nothing left that any dialable peer holds
+            }
+        }
+        // Complete: the file the user has been watching becomes a file they
+        // HAVE, without waiting for a further Range request to notice.
+        self.maybe_materialize_complete(address, inner_path, id, size, &store).await;
     }
 
     /// After serving a range, arm the background read-ahead of the NEXT window.
@@ -3499,10 +3621,17 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // background; failures never reach this response.
         self.maybe_warm_moov(address, inner_path, id, size);
 
+        // Full-file download is the default goal for a large media file: keep
+        // the whole-object background pull running while this serve and the
+        // read-ahead race ahead of it at streaming deadlines. Pure background;
+        // failures never reach this response (see `maybe_complete_file`).
+        self.maybe_complete_file(address, inner_path, id, size, &store);
+
         // Serve straight from the store if the covering range is already
         // present; otherwise fetch just the covering chunk groups the store
-        // still lacks (a seek, never the whole file, and never a group we
-        // already hold). A fetch that fell short of the whole window serves
+        // still lacks (a seek fetches on demand - the whole file is the
+        // background completion's job above, never this foreground fetch's -
+        // and never a group we already hold). A fetch that fell short serves
         // the contiguous prefix that DID land as a shorter range - the
         // browser re-requests the remainder - instead of failing bytes we
         // hold. That includes the case where no peer is currently dialable
@@ -4211,12 +4340,22 @@ mod tests {
     async fn spawn_seeder_declaring(
         extra: serde_json::Value,
     ) -> (String, Vec<u8>, serde_json::Value, Vec<u8>, std::net::SocketAddr, Vec<u8>) {
+        spawn_seeder_sized(extra, 400_000).await
+    }
+
+    /// [`spawn_seeder_declaring`], but with a movie of `movie_len` bytes, so a
+    /// test can cross the size gates (MOOV_MIN_SIZE) that a 400 KB file stays
+    /// under.
+    async fn spawn_seeder_sized(
+        extra: serde_json::Value,
+        movie_len: usize,
+    ) -> (String, Vec<u8>, serde_json::Value, Vec<u8>, std::net::SocketAddr, Vec<u8>) {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
         let site_dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(site_dir.path());
         storage.write("index.html", &vec![b'h'; 5_000]).unwrap();
-        let movie: Vec<u8> = (0..400_000usize).map(|i| (i % 251) as u8).collect();
+        let movie: Vec<u8> = (0..movie_len).map(|i| (i % 251) as u8).collect();
         storage.write("movie.bin", &movie).unwrap();
         let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
         xite.content = Some(extra);
@@ -5292,6 +5431,72 @@ mod tests {
             other => panic!("re-fetch: {other:?}"),
         };
         assert_eq!(seek, movie[300_000..340_000], "re-fetched range is byte-exact");
+    }
+
+    /// Full-file download is the default for a large media file: ONE Range
+    /// serve in the middle of the file must eventually complete the whole
+    /// object in the store with no further requests - including the bytes
+    /// BEHIND the served offset, which nothing else covers (the read-ahead
+    /// only fetches forward of the play head, and the moov warm-up only the
+    /// head and tail spans). A seeked-into video must not stay holey.
+    #[tokio::test]
+    async fn a_range_serve_arms_the_full_file_download() {
+        // Past the media size gate, with a gap between the 1 MiB moov head
+        // warm and the served offset that only the completion pass can fill.
+        let movie_len = (MOOV_MIN_SIZE + 512 * 1024) as usize;
+        let (address, content_bytes, content, movie, addr, _pk) =
+            spawn_seeder_sized(serde_json::json!({}), movie_len).await;
+
+        let state_a = AppState::new("node-a");
+        let a_dir = tempfile::tempdir().unwrap();
+        XiteStorage::new(a_dir.path()).write("content.json", &content_bytes).unwrap();
+        state_a
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(a_dir.path()), content: Some(content.clone()) })
+            .await;
+        state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
+        let a_store_dir = tempfile::tempdir().unwrap();
+        let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
+        state_a.set_edx_store(a_store.clone()).await;
+        state_a
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state_a.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
+            .await;
+        state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
+        std::mem::forget(a_dir);
+        std::mem::forget(a_store_dir);
+
+        // A single serve at 2 MiB - a seek, as a player that opened mid-film
+        // would issue. Between the head warm (ends at 1 MiB) and this offset
+        // lies a region no serve, read-ahead or warm-up will ever ask for.
+        let (start, len) = (2 * 1024 * 1024u64, 20_000u64);
+        let served = match state_a.edx_fetch_range(&address, "movie.bin", start, len).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("range fetch: {other:?}"),
+        };
+        assert_eq!(served, movie[start as usize..(start + len) as usize], "served range is byte-exact");
+
+        // The background completion pulls the ENTIRE file, holes included.
+        // Poll for it - the serve did not wait on it.
+        let id = epix_blob::manifest::edx_entry(&content, "movie.bin").unwrap().b3;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !a_store.is_complete(id).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "full-file completion never finished the object"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Bytes from inside the hole behind the play head are byte-exact and
+        // served from the store.
+        let hole = match state_a.edx_fetch_range(&address, "movie.bin", 1_500_000, 40_000).await {
+            Some(Ok(Some(b))) => b,
+            other => panic!("hole re-read: {other:?}"),
+        };
+        assert_eq!(hole, movie[1_500_000..1_540_000], "backfilled bytes are byte-exact");
     }
 
     /// A ShardEntry (data-map) for `plaintext`'s convergent encryption: the
