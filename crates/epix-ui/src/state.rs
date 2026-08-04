@@ -997,6 +997,13 @@ pub struct AppState {
     /// downloads, so a retrying `<video>` tag can't spam the wrapper confirm.
     /// Cleared when the toggle is switched off, so a later request re-asks.
     optional_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Xites whose over-budget `retention:complete` prompt the user ACCEPTED
+    /// (see [`Self::retention_fetch_allowed`]). Consent for a whole-xite
+    /// completion is recorded here rather than inferred from a file toggle,
+    /// because the toggles mean something much narrower. Session-scoped on
+    /// purpose: a multi-gigabyte completion is re-offered after a restart
+    /// instead of resuming from a decision the user may not remember making.
+    retention_consents: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Live UI connections bound to each xite address (`session.id`s). Pushed
     /// confirms/prompts route to a bound connection; when NONE is bound the
     /// broadcast reaches nobody and the dialog is lost - the "prompt only
@@ -1488,6 +1495,7 @@ impl AppState {
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            retention_consents: std::sync::Mutex::new(std::collections::HashSet::new()),
             bound_conns: std::sync::Mutex::new(HashMap::new()),
             pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
@@ -1635,6 +1643,7 @@ impl AppState {
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            retention_consents: std::sync::Mutex::new(std::collections::HashSet::new()),
             bound_conns: std::sync::Mutex::new(HashMap::new()),
             pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
@@ -11623,6 +11632,10 @@ impl AppState {
 
     /// Whether optional files may be fetched for this xite: either toggle -
     /// "Download optional files" or "Help distribute all files" - grants it.
+    ///
+    /// This is the ON-DEMAND permission: it answers "may I fetch the optional
+    /// file this page just asked for". It is NOT consent to fetch a whole
+    /// xite - see [`Self::retention_fetch_allowed`] for that.
     pub async fn optional_fetch_allowed(&self, address: &str) -> bool {
         self.xites
             .read()
@@ -11630,6 +11643,78 @@ impl AppState {
             .get(address)
             .map(|x| x.settings.download_optional || x.settings.autodownloadoptional)
             .unwrap_or(false)
+    }
+
+    /// Whether a `retention:complete` pass may fetch what the user never
+    /// opened, once the plan has outgrown the xite's size limit.
+    ///
+    /// Deliberately NOT [`Self::optional_fetch_allowed`]. That predicate is
+    /// satisfied by "Download files I open", which defaults to ON and means
+    /// only "fetch the file this page asked for" - its own prompt path fetches
+    /// exactly the one file that raised it. Reading it as standing consent let
+    /// a xite that declared no distribution policy (so the package/complete
+    /// floor applied) pull every optional file it had: measured live, 430
+    /// files and 3.75 GB against a 1000 MB limit, with no prompt, on a xite
+    /// whose author had explicitly opted out of prefetch-by-default. The
+    /// size-limit gate computed `needs_consent` correctly and then deferred to
+    /// a flag the user had never touched.
+    ///
+    /// Consent for a whole-xite download has to be the broad toggle or a
+    /// deliberate yes:
+    /// - "Pre-download everything" (`autodownloadoptional`) is exactly that
+    ///   promise, so it stands on its own; or
+    /// - the user accepted this xite's completion prompt, which records
+    ///   [`Self::retention_consents`] - and that consent is paired with
+    ///   "Download files I open" still being on, so unticking EITHER box
+    ///   remains an off switch mid-pass (the property
+    ///   `optional_pass_should_continue` already promises for the bulk pass).
+    async fn retention_fetch_allowed(&self, address: &str) -> bool {
+        let Some((auto, on_demand)) = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| (x.settings.autodownloadoptional, x.settings.download_optional))
+        else {
+            return false;
+        };
+        auto || (on_demand && self.retention_consents.lock().unwrap().contains(address))
+    }
+
+    /// Whether the xite's own content.json sets `autodownloadoptional_default:
+    /// false` - the author saying "do not bulk-download my files by default".
+    ///
+    /// It is the only lever a publisher has here, and it is a veto, never a
+    /// grant. [`Self::add_xite`] and the fresh-clone commit already honour it
+    /// for the "Pre-download everything" default; a completion pass that
+    /// ignored it would download the very thing the author asked us not to.
+    /// A DELIBERATE user opt-in still wins (see
+    /// [`Self::retention_author_veto_holds`]) - the author sets a default, not
+    /// a prohibition on the person running the node.
+    async fn author_opts_out_of_prefetch(&self, address: &str) -> bool {
+        self.content(address)
+            .await
+            .as_ref()
+            .and_then(|c| c.get("autodownloadoptional_default"))
+            .and_then(|v| v.as_bool())
+            == Some(false)
+    }
+
+    /// Whether the author's opt-out blocks a completion pass: it does unless
+    /// the user deliberately asked for everything, either for this xite
+    /// ("Pre-download everything") or globally (`full_retention`).
+    async fn retention_author_veto_holds(&self, address: &str, reader: bool) -> bool {
+        if reader {
+            return false; // the user's own global "keep a full copy" wins
+        }
+        let auto = self
+            .xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.settings.autodownloadoptional)
+            .unwrap_or(false);
+        !auto && self.author_opts_out_of_prefetch(address).await
     }
 
     /// Set a xite's optional-downloads flag (`siteSetDownloadoptional`, the
@@ -11665,6 +11750,11 @@ impl AppState {
                 // Re-arm the one-per-session prompt: switching the toggle off
                 // means a later page request should get to ask again.
                 self.optional_prompts.lock().unwrap().remove(address);
+                // Switching off REVOKES a completion consent rather than
+                // parking it: without this, turning the toggle back on later
+                // would silently revive a multi-gigabyte yes from earlier in
+                // the session instead of asking again.
+                self.retention_consents.lock().unwrap().remove(address);
                 // The bulk mandate is BOTH toggles, so this withdraws it: any
                 // in-flight pass aborts at its next between-files check; drop
                 // the lingering waiting panel now.
@@ -11765,6 +11855,11 @@ impl AppState {
         };
         if self.confirm(address, &body, "Download").await {
             self.set_download_optional(address, true, false).await;
+            // Record the yes BEFORE re-spawning: the pass's gate is
+            // `retention_fetch_allowed`, which no longer accepts the
+            // on-demand toggle alone, so without this the re-spawn would find
+            // no consent and prompt again - forever, on every pass.
+            self.retention_consents.lock().unwrap().insert(address.to_string());
             self.spawn_retention_completion(address);
         }
     }
@@ -12707,11 +12802,19 @@ impl AppState {
             // One snapshot of the override decides BOTH the plan's scope and
             // the pass's mandate class - see retention_completion_plan_as.
             let reader = state.config_bool("full_retention", false).await;
+            // The author's opt-out is checked before the plan is even costed:
+            // a xite that asked not to be bulk-downloaded is not completed at
+            // ANY size, quietly or by prompt, unless the user deliberately
+            // overrode it. Under-budget completion is silent by design, so
+            // without this the veto would only ever apply to large xites.
+            if state.retention_author_veto_holds(&address, reader).await {
+                return;
+            }
             let plan = state.retention_completion_plan_as(&address, reader).await;
             if plan.paths.is_empty() {
                 return;
             }
-            if plan.needs_consent && !state.optional_fetch_allowed(&address).await {
+            if plan.needs_consent && !state.retention_fetch_allowed(&address).await {
                 // Over the budget and no standing consent: ask once per xite
                 // per session, scoped to what would ACTUALLY happen (file
                 // count, total bytes, and on whose behalf), and stop.
@@ -12786,7 +12889,7 @@ impl AppState {
         if reader_driven && !self.config_bool("full_retention", false).await {
             return false;
         }
-        if consented && !self.optional_fetch_allowed(address).await {
+        if consented && !self.retention_fetch_allowed(address).await {
             return false;
         }
         true
@@ -15516,6 +15619,123 @@ mod tests {
         );
     }
 
+    /// An over-budget completion is NOT authorized by "Download files I open".
+    ///
+    /// That toggle defaults to ON and means only "fetch the file this page
+    /// asked for". Accepting it as standing consent is what let a xite pull
+    /// 430 files / 3.75 GB against a 1000 MB limit with no prompt. Consent for
+    /// a whole-xite download is the broad toggle, or a recorded yes.
+    #[tokio::test]
+    async fn completing_a_xite_needs_more_than_the_on_demand_toggle() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({
+                        "address": addr, "modified": 1.0,
+                        "files_optional": { "video/big.webm": { "size": 4_000_000_000u64, "sha512": "aa" } }
+                    })),
+                },
+            )
+            .await;
+        // The shipped defaults: on-demand ON, pre-download everything OFF.
+        state.set_download_optional(addr, true, false).await;
+        assert!(state.optional_fetch_allowed(addr).await, "on-demand fetching is allowed");
+        assert!(
+            !state.retention_fetch_allowed(addr).await,
+            "...but that is NOT consent to complete the whole xite"
+        );
+        assert!(
+            state.retention_completion_plan(addr).await.needs_consent,
+            "4 GB against the default 1000 MB limit needs consent"
+        );
+
+        // The broad toggle IS that consent, on its own.
+        assert!(state.set_autodownloadoptional(addr, true).await);
+        assert!(state.retention_fetch_allowed(addr).await, "'Pre-download everything' grants it");
+
+        // So is an accepted prompt, recorded explicitly - and it is paired
+        // with the on-demand toggle, so unticking EITHER box still stops a
+        // pass in flight.
+        assert!(state.set_autodownloadoptional(addr, false).await);
+        state.retention_consents.lock().unwrap().insert(addr.to_string());
+        assert!(state.retention_fetch_allowed(addr).await, "an accepted prompt grants it");
+        state.set_download_optional(addr, false, false).await;
+        assert!(
+            !state.retention_fetch_allowed(addr).await,
+            "unticking 'Download files I open' revokes it"
+        );
+        // ...and revokes it for good: re-ticking must ask again rather than
+        // silently reviving the earlier yes.
+        state.set_download_optional(addr, true, false).await;
+        assert!(
+            !state.retention_fetch_allowed(addr).await,
+            "switching off revoked the consent; re-enabling re-asks"
+        );
+    }
+
+    /// A publisher's `autodownloadoptional_default: false` vetoes completion at
+    /// ANY size - the under-budget path completes silently, so a veto that only
+    /// applied above the limit would not be a veto at all. A deliberate user
+    /// opt-in still overrides it: the author sets a default, not a prohibition.
+    #[tokio::test]
+    async fn an_author_opt_out_vetoes_completion_until_the_user_overrides() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                addr,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(json!({
+                        "address": addr, "modified": 1.0,
+                        "autodownloadoptional_default": false,
+                        "files_optional": { "video/big.webm": { "size": 500_000_000u64, "sha512": "aa" } }
+                    })),
+                },
+            )
+            .await;
+        assert!(state.author_opts_out_of_prefetch(addr).await);
+        // Well under the 1000 MB limit, so this is the path that would
+        // otherwise complete with no prompt at all.
+        assert!(!state.retention_completion_plan(addr).await.needs_consent);
+        assert!(
+            state.retention_author_veto_holds(addr, false).await,
+            "the author's opt-out blocks the quiet path too"
+        );
+
+        // The user asking for everything, per xite or globally, overrides it.
+        assert!(state.set_autodownloadoptional(addr, true).await);
+        assert!(
+            !state.retention_author_veto_holds(addr, false).await,
+            "'Pre-download everything' is a deliberate override"
+        );
+        assert!(state.set_autodownloadoptional(addr, false).await);
+        assert!(
+            !state.retention_author_veto_holds(addr, true).await,
+            "the global 'keep a full copy' setting is too"
+        );
+
+        // A xite that says nothing is unaffected: no veto, business as usual.
+        let quiet_dir = tempdir().unwrap();
+        let quiet = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state
+            .add_xite(
+                quiet,
+                XiteEntry {
+                    storage: XiteStorage::new(quiet_dir.path()),
+                    content: Some(json!({ "address": quiet, "modified": 1.0 })),
+                },
+            )
+            .await;
+        assert!(!state.retention_author_veto_holds(quiet, false).await);
+    }
+
     /// The global `full_retention` setting makes a reader replicate every xite
     /// fully: the plan covers ALL missing declared files, including the
     /// owner's `retention:partial` carve-outs and xites that declared no
@@ -15892,7 +16112,13 @@ mod tests {
         assert!(state.retention_pass_should_continue(addr, true, false).await);
         // A consented plan stops once consent is withdrawn.
         assert!(!state.retention_pass_should_continue(addr, true, true).await);
+        // The on-demand toggle alone is NOT that consent: it means "fetch the
+        // file this page asked for", and reading it as a mandate to complete a
+        // whole xite is the bug this pairing exists to prevent.
         assert!(state.set_download_optional(addr, true, false).await);
+        assert!(!state.retention_pass_should_continue(addr, true, true).await);
+        // The broad toggle is.
+        assert!(state.set_autodownloadoptional(addr, true).await);
         assert!(state.retention_pass_should_continue(addr, true, true).await);
         // Pausing withdraws every mandate.
         assert!(state.set_serving(addr, false).await);
