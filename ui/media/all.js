@@ -1931,8 +1931,11 @@ if (window.getComputedStyle(document.body).transform) {
       var ref, ref1, ref2, ref3;
       if (site_info.event != null) {
         if (site_info.event[0] === "file_added" && site_info.bad_files) {
-          // Only the required core downloads before the page loads; optional
-          // files (site_info.optional_files/size_optional) fetch on demand.
+          // Only the required core downloads before the page loads. The
+          // optional set is deliberately NOT mentioned here: "+ 1,157 optional
+          // files (234.3 GB)" on a first-visit screen reads as what is about
+          // to be downloaded, when those files only ever fetch on demand. The
+          // sidebar still shows the full size breakdown for whoever asks.
           var fmtSize = function (bytes) {
             if (!bytes && bytes !== 0) return "";
             if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
@@ -1942,9 +1945,6 @@ if (window.getComputedStyle(document.body).transform) {
           var needed_line = site_info.bad_files + " files needed to load";
           if (site_info.size_needed) needed_line = site_info.bad_files + " files (" + fmtSize(site_info.size_needed) + ") needed to load";
           this.loading.printLine(needed_line);
-          if (site_info.optional_files) {
-            this.loading.printLine("+ " + site_info.optional_files + " optional files (" + fmtSize(site_info.size_optional) + ") download on demand");
-          }
           this.loading.setStage(2, "0 / " + site_info.bad_files + " files");
         } else if (site_info.event[0] === "file_done") {
           this.loading.printLine(site_info.event[1] + " downloaded");
