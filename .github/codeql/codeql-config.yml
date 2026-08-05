@@ -6,12 +6,14 @@ name: "EpixNet CodeQL config"
 # Scanning these produced 24 critical "hard-coded cryptographic value" alerts
 # with no production reachability.
 #
-# This covers integration tests and benchmarks, which live in their own files.
-# Unit tests inside a `#[cfg(test)]` module share a file with the production
-# code around them, so they cannot be excluded by path without losing real
-# coverage of that file; those alerts are dismissed individually as
-# "used in tests" instead.
+# This covers integration tests and benchmarks, which live in their own files,
+# plus unit-test modules that a crate keeps in `src/tests.rs` (declared as
+# `#[cfg(test)] mod tests;`). Unit tests written inline in the same file as
+# production code cannot be excluded by path without losing real coverage of
+# that file; either move them to `src/tests.rs` or dismiss those alerts
+# individually as "used in tests".
 paths-ignore:
   - "**/tests/**"
   - "**/benches/**"
   - "**/examples/**"
+  - "**/src/tests.rs"
