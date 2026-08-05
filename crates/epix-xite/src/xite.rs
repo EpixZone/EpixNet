@@ -95,6 +95,47 @@ fn stat_size_mtime(storage: &XiteStorage, inner: &str) -> Option<(u64, i64)> {
     Some((meta.len(), mtime))
 }
 
+/// The cached hashes for `rel`, when they may be trusted: the stat matches
+/// the cache and the file's bytes are not needed anyway (bundle-eligible
+/// required files always read - the bundle builder wants them, and they are
+/// the cheap kilobytes of a sign).
+fn reuse_cached(
+    rel: &str,
+    stat: Option<(u64, i64)>,
+    is_optional: bool,
+    cache: Option<&SignCache>,
+) -> Option<CachedHash> {
+    let (size, mtime_ns) = stat?;
+    if !is_optional && epix_blob::bundle::is_bundleable(size) {
+        return None;
+    }
+    let c = cache?.get(rel)?;
+    (c.size == size && c.mtime_ns == mtime_ns).then(|| c.clone())
+}
+
+/// Hash `bytes` into a manifest entry (`b3` is the EDX per-file BLAKE3 root,
+/// docs/edx-manifest.md; `sha512` stays alongside for the migration window),
+/// recording the result in `fresh` when the pre-read stat still describes
+/// these bytes.
+fn hash_entry(
+    rel: &str,
+    bytes: &[u8],
+    stat: Option<(u64, i64)>,
+    fresh: &mut SignCache,
+) -> Value {
+    let sha512 = XiteStorage::hash_bytes(bytes);
+    let b3 = epix_blob::ObjId::of(bytes).to_string();
+    if let Some((size, mtime_ns)) = stat {
+        if size == bytes.len() as u64 {
+            fresh.insert(
+                rel.to_string(),
+                CachedHash { size, mtime_ns, sha512: sha512.clone(), b3: b3.clone() },
+            );
+        }
+    }
+    json!({ "size": bytes.len(), "sha512": sha512, "b3": b3 })
+}
+
 fn skip_hashing(rel: &str) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);
     base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
@@ -652,59 +693,30 @@ impl Xite {
             ) else {
                 continue;
             };
-            // Stat BEFORE any read (see stat_size_mtime for why). A cached
-            // entry whose (size, mtime_ns) still matches skips the read
-            // entirely - EXCEPT bundle-eligible required files, whose bytes
-            // the bundle builder below needs anyway; reading those is the
-            // cheap part of a sign and keeps the bundles honest.
+            // Stat BEFORE any read (see stat_size_mtime for why).
             let stat = stat_size_mtime(&self.storage, &inner);
-            if let (Some((size, mtime_ns)), Some(cache)) = (stat, cache) {
-                let reusable = is_optional || !epix_blob::bundle::is_bundleable(size);
-                if reusable {
-                    if let Some(c) = cache.get(&rel) {
-                        if c.size == size && c.mtime_ns == mtime_ns {
-                            let entry = json!({
-                                "size": size,
-                                "sha512": c.sha512,
-                                "b3": c.b3,
-                            });
-                            fresh_cache.insert(rel.clone(), c.clone());
-                            if is_optional {
-                                files_optional.insert(rel, entry);
-                            } else {
-                                files.insert(rel, entry);
-                            }
-                            continue;
-                        }
+            let entry = match reuse_cached(&rel, stat, is_optional, cache) {
+                Some(hit) => {
+                    let entry = json!({ "size": hit.size, "sha512": hit.sha512, "b3": hit.b3 });
+                    fresh_cache.insert(rel.clone(), hit);
+                    entry
+                }
+                None => {
+                    let bytes = self.storage.read(&inner)?;
+                    let entry = hash_entry(&rel, &bytes, stat, &mut fresh_cache);
+                    // Only bundle-eligible required files are worth keeping:
+                    // the bundle builder needs their bytes, and an
+                    // optional-heavy xite must not pay for a cache nothing
+                    // reads.
+                    if !is_optional && epix_blob::bundle::is_bundleable(bytes.len() as u64) {
+                        hashed_bytes.insert(rel.clone(), bytes);
                     }
+                    entry
                 }
-            }
-            let bytes = self.storage.read(&inner)?;
-            // `b3` is the EDX per-file BLAKE3 root (docs/edx-manifest.md);
-            // `sha512` stays alongside it for the migration window.
-            let sha512 = XiteStorage::hash_bytes(&bytes);
-            let b3 = epix_blob::ObjId::of(&bytes).to_string();
-            if let Some((size, mtime_ns)) = stat {
-                if size == bytes.len() as u64 {
-                    fresh_cache.insert(
-                        rel.clone(),
-                        CachedHash { size, mtime_ns, sha512: sha512.clone(), b3: b3.clone() },
-                    );
-                }
-            }
-            let entry = json!({
-                "size": bytes.len(),
-                "sha512": sha512,
-                "b3": b3,
-            });
+            };
             if is_optional {
                 files_optional.insert(rel, entry);
             } else {
-                // Only required files bundle, so only they are worth keeping:
-                // an optional-heavy xite must not pay for a cache nothing reads.
-                if epix_blob::bundle::is_bundleable(bytes.len() as u64) {
-                    hashed_bytes.insert(rel.clone(), bytes);
-                }
                 files.insert(rel, entry);
             }
         }
