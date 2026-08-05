@@ -910,6 +910,39 @@ async fn clone_xite_with_progress(
     drop(pex_tx);
     drop(sync_tx);
 
+    // Social records (comments, likes, per-user data) are kilobytes and their
+    // governing content.json units are fetched by their own pass, so there is
+    // no reason for them to queue behind every image in the core set - on an
+    // overlay-only node that ordering made a five-minute clone show a finished
+    // page whose likes and comments trailed in minutes later. Start the pass
+    // now, on the same peer registry (and so the same cached links) the core
+    // download is using; it is joined below so callers still get the
+    // arrived-file list.
+    let user_task = progress.map(|state| {
+        let view = Xite {
+            address: xite.address.clone(),
+            storage: xite.storage.clone(),
+            content: xite.content.clone(),
+        };
+        let state = state.clone();
+        let address = address.to_string();
+        tokio::spawn(async move {
+            // The registry fills as discovery reports in; wait for the first
+            // usable peers rather than sampling an empty set and giving up.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            let mut peers = Vec::new();
+            while std::time::Instant::now() < deadline {
+                peers = state.connectable_peers(&address, 20).await;
+                if !peers.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            trace_clone!(t0, "user content START ({} peer(s), concurrent with core)", peers.len());
+            sync_included_content(&view, &peers, Some(&state), &address, t0).await
+        })
+    });
+
     // Per-file progress: each finished file advances the loading bar. Every
     // fetch layer shares ONE emitter and ONE done-counter, with the denominator
     // pinned to the pre-fetch core total - so the bar climbs monotonically
@@ -1054,15 +1087,28 @@ async fn clone_xite_with_progress(
 
     // Recursive content: user_contents sites (EpixTalk, EpixPost, ...) keep their
     // real data (topics, comments) in INCLUDED and per-user content.json files
-    // that the root's `files` map never lists. Fetch those content.json files
-    // and their data files so the site's db can populate.
-    trace_clone!(t0, "CORE SET COMPLETE (first paint), starting user content");
-    let peers = state_peers(progress, &xite, address).await;
+    // that the root's `files` map never lists. The concurrent pass spawned at
+    // content-staging time has usually finished by now; join it. Without a
+    // progress state (an offline import) there is no peer registry, so run
+    // the pass inline with whatever the caller seeded.
+    trace_clone!(t0, "CORE SET COMPLETE (first paint)");
     let mut user_files = Vec::new();
-    if !peers.is_empty() {
-        let (bytes, files) = sync_included_content(&xite, &peers, progress, address, t0).await;
-        bytes_recv += bytes;
-        user_files = files;
+    match user_task {
+        Some(handle) => {
+            if let Ok((bytes, files)) = handle.await {
+                bytes_recv += bytes;
+                user_files = files;
+            }
+        }
+        None => {
+            let peers = state_peers(progress, &xite, address).await;
+            if !peers.is_empty() {
+                let (bytes, files) =
+                    sync_included_content(&xite, &peers, progress, address, t0).await;
+                bytes_recv += bytes;
+                user_files = files;
+            }
+        }
     }
     trace_clone!(t0, "clone DONE, {} user file(s) arrived", user_files.len());
     Ok((xite.content.clone(), bytes_recv, user_files))
