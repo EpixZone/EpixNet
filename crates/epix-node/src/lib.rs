@@ -1257,6 +1257,11 @@ async fn sync_included_content(
 
     let mut child_files: Vec<epix_xite::FileEntry> = Vec::new();
     let mut arrived: Vec<String> = Vec::new();
+    // Manifests that failed verification, kept with their bytes for a retry:
+    // an xID chain resolve over cold circuits (mid-clone Tor) answers empty,
+    // verification sees 0/N valid signs, and the manifest would otherwise be
+    // dropped until the next resync tick minutes later.
+    let mut retry: Vec<(String, Vec<u8>)> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     // Process content.json one depth level at a time: a level's files are
     // fetched together (the slow network I/O), then verified sequentially
@@ -1361,6 +1366,7 @@ async fn sync_included_content(
                                     state
                                         .log("WARNING", format!("Skipped {path}: {e}"))
                                         .await;
+                                    retry.push((path, bytes));
                                 }
                             }
                         }
@@ -1410,9 +1416,50 @@ async fn sync_included_content(
                     if let Some(state) = progress {
                         state.log("WARNING", format!("Skipped {path}: {e}")).await;
                     }
+                    if was_fetched {
+                        retry.push((path, bytes));
+                    }
                 }
             }
         }
+    }
+    // Retry what failed, parent-first (a parent that recovers un-blocks its
+    // children) with FRESH signer resolution - failed chain lookups are not
+    // cached, so each round re-queries. A genuinely bad signature just fails
+    // again and is dropped for good after the last round.
+    if !retry.is_empty() {
+        retry.sort_by_key(|(p, _)| p.matches('/').count());
+        let mut recovered = 0usize;
+        for round in 0..3u32 {
+            if retry.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let mut still = Vec::new();
+            for (path, bytes) in std::mem::take(&mut retry) {
+                let xid_map = resolve_user_signers(&xite, &path).await;
+                match xite.add_content(&path, &bytes, &xid_map) {
+                    Ok(files) => {
+                        recovered += 1;
+                        arrived.push(path.clone());
+                        if let Some(state) = progress {
+                            state.ingest_file(address, &path).await;
+                        }
+                        child_files.extend(files);
+                    }
+                    Err(e) if round == 2 => {
+                        if let Some(state) = progress {
+                            state
+                                .log("WARNING", format!("Skipped {path} after retries: {e}"))
+                                .await;
+                        }
+                    }
+                    Err(_) => still.push((path, bytes)),
+                }
+            }
+            retry = still;
+        }
+        trace_clone!(t0, "verify retries done, {recovered} manifest(s) recovered");
     }
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
     if let Some(state) = progress {
