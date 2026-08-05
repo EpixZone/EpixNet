@@ -9397,6 +9397,17 @@ impl AppState {
             .unwrap_or(0.0);
             self.bump_modified(address, modified).await;
         }
+        // A changed dbschema.json obsoletes the built db: its maps and tables
+        // no longer match what pages query, and the map ingest below cannot
+        // help (dbschema.json is no map's target). Rebuild from the new
+        // schema, which re-ingests every mapped file on disk. Without this a
+        // peer that already held the xite keeps the old tables until restart,
+        // and every query against the new schema dies with "no such table".
+        if inner_path == "dbschema.json" {
+            self.rebuild_xite_db(address).await;
+            self.push_site_info_file_done(address, inner_path, origin).await;
+            return;
+        }
         // Snapshot the db handle out of the lock; file + SQL work runs unlocked.
         let mut build_first = false;
         let own: Option<(Database, DbSchema)> = {
@@ -14898,6 +14909,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    /// A xite that ships a NEW dbschema.json to a peer that already built its
+    /// db must get the new tables on arrival, not on the next restart. The
+    /// media xite hit this: it added a `rating` table, synced peers kept the
+    /// old schema, and every page query died with "no such table: rating".
+    #[tokio::test]
+    async fn a_new_dbschema_rebuilds_an_already_built_db() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"db.db","version":2,
+                     "maps": { "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
+                     "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage
+            .write("data/alice/data.json", br#"{ "posts": [ {"post_id":1,"title":"Hello"} ] }"#)
+            .unwrap();
+
+        let addr = "1BlogAddress";
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage: storage.clone(), content: None }).await;
+
+        // Build the db against the old schema, as a long-running peer has.
+        state.db_query(addr, "SELECT post_id FROM post", &Value::Null).await.unwrap();
+        let err = state.db_query(addr, "SELECT stars FROM rating", &Value::Null).await;
+        assert!(err.is_err(), "old schema has no rating table");
+
+        // The xite publishes a schema with a new table and a peer syncs it.
+        storage
+            .write(
+                "dbschema.json",
+                br#"{ "db_name":"Blog","db_file":"db.db","version":2,
+                     "maps": {
+                       "data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] },
+                       "data/.*/ratings.json": { "to_table": [{"node":"post","table":"rating"}] } },
+                     "tables": {
+                       "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] },
+                       "rating": { "cols": [["key","TEXT"],["stars","INTEGER"],["json_id","INTEGER"]] } } }"#,
+            )
+            .unwrap();
+        storage
+            .write("data/alice/ratings.json", br#"{ "post": [ {"key":"k1","stars":5} ] }"#)
+            .unwrap();
+        state.ingest_file_from(addr, "dbschema.json", None).await;
+
+        // The new table exists, filled from what is already on disk, and the
+        // old rows survived the rebuild.
+        let stars =
+            state.db_query(addr, "SELECT stars FROM rating", &Value::Null).await.unwrap();
+        assert_eq!(stars.len(), 1);
+        assert_eq!(stars[0]["stars"], 5);
+        let posts =
+            state.db_query(addr, "SELECT title FROM post", &Value::Null).await.unwrap();
+        assert_eq!(posts[0]["title"], "Hello");
     }
 
     /// A data file arriving mid-sync is queryable the moment `ingest_file`
