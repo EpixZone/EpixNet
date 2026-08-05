@@ -1004,6 +1004,16 @@ pub struct AppState {
     /// purpose: a multi-gigabyte completion is re-offered after a restart
     /// instead of resuming from a decision the user may not remember making.
     retention_consents: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per-xite scan cache for [`Self::list_modified_files`]: for each
+    /// declared file, the (size, mtime) it had when last hashed, the declared
+    /// hash it was judged against, and the verdict. A file whose metadata and
+    /// declared hash are both unchanged keeps its verdict without being
+    /// re-read, so repeat scans are one stat per file instead of a full
+    /// read + sha512 of the whole site. The declared hash is part of the key
+    /// because a re-sign changes the judgement without touching the file.
+    modified_scan_cache: std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, ((u64, i64), String, bool)>>,
+    >,
     /// Live UI connections bound to each xite address (`session.id`s). Pushed
     /// confirms/prompts route to a bound connection; when NONE is bound the
     /// broadcast reaches nobody and the dialog is lost - the "prompt only
@@ -1496,6 +1506,7 @@ impl AppState {
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             retention_consents: std::sync::Mutex::new(std::collections::HashSet::new()),
+            modified_scan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             bound_conns: std::sync::Mutex::new(HashMap::new()),
             pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
@@ -1644,6 +1655,7 @@ impl AppState {
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             retention_consents: std::sync::Mutex::new(std::collections::HashSet::new()),
+            modified_scan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             bound_conns: std::sync::Mutex::new(HashMap::new()),
             pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
@@ -4503,6 +4515,35 @@ impl AppState {
             }
         };
         let Some(content) = content else { return Vec::new() };
+        // The scan reads (worst case) every declared file. The wrapper asks on
+        // EVERY page open, and on a cold file cache those opens are real disk
+        // round-trips: a thousand-file site is ~10s of blocking syscalls. Run
+        // it on the blocking pool - a runtime worker pinned that long stalls
+        // every session's commands, which shows up as the whole page (films,
+        // likes, comments) arriving in one late burst.
+        let cached = self.modified_scan_cache.lock().unwrap().get(address).cloned();
+        let addr = address.to_string();
+        let scanned = tokio::task::spawn_blocking(move || {
+            Self::scan_modified_files(&storage, &content, cached.unwrap_or_default())
+        })
+        .await
+        .unwrap_or_default();
+        let (out, cache) = scanned;
+        self.modified_scan_cache.lock().unwrap().insert(addr, cache);
+        out
+    }
+
+    /// The blocking half of [`Self::list_modified_files`]: compare every
+    /// declared file against its signed size + hash, reusing `cache` verdicts
+    /// for files whose (size, mtime) has not moved since they were last
+    /// hashed. First scan reads everything once; after that a scan is one
+    /// stat per file, so the wrapper's per-open call stays cheap even cold.
+    #[allow(clippy::type_complexity)]
+    fn scan_modified_files(
+        storage: &XiteStorage,
+        content: &Value,
+        cache: std::collections::HashMap<String, ((u64, i64), String, bool)>,
+    ) -> (Vec<String>, std::collections::HashMap<String, ((u64, i64), String, bool)>) {
         let include_dirs: Vec<String> = content
             .get("includes")
             .and_then(|v| v.as_object())
@@ -4513,6 +4554,7 @@ impl AppState {
             })
             .unwrap_or_default();
         let mut out = Vec::new();
+        let mut fresh = std::collections::HashMap::new();
         if let Some(files) = content.get("files").and_then(|v| v.as_object()) {
             for (rel, info) in files {
                 if include_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
@@ -4520,19 +4562,47 @@ impl AppState {
                 }
                 let declared_size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
                 let declared_hash = info.get("sha512").and_then(|v| v.as_str()).unwrap_or("");
-                match storage.read(rel) {
-                    Err(_) => out.push(rel.clone()), // missing = modified
-                    Ok(bytes) => {
-                        if bytes.len() as i64 != declared_size
-                            || XiteStorage::hash_bytes(&bytes) != declared_hash
-                        {
-                            out.push(rel.clone());
-                        }
+                let meta = storage
+                    .path(rel)
+                    .ok()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| {
+                        let mtime = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(0);
+                        (m.len(), mtime)
+                    });
+                let Some(meta) = meta else {
+                    out.push(rel.clone()); // missing = modified; nothing to cache
+                    continue;
+                };
+                // A size that disagrees with the manifest is modified with no
+                // read; a (size, mtime) the cache already judged keeps its
+                // verdict. Only genuinely new or touched files get hashed.
+                let cached = cache
+                    .get(rel)
+                    .filter(|(m, h, _)| *m == meta && h == declared_hash)
+                    .map(|(_, _, v)| *v);
+                let modified = if meta.0 as i64 != declared_size {
+                    true
+                } else if let Some(verdict) = cached {
+                    verdict
+                } else {
+                    match storage.read(rel) {
+                        Err(_) => true,
+                        Ok(bytes) => XiteStorage::hash_bytes(&bytes) != declared_hash,
                     }
+                };
+                fresh.insert(rel.clone(), (meta, declared_hash.to_string(), modified));
+                if modified {
+                    out.push(rel.clone());
                 }
             }
         }
-        out
+        (out, fresh)
     }
 
     /// Set the one per-site settings key EpixNet lets a page change
@@ -14909,6 +14979,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(one[0]["title"], "World");
+    }
+
+    /// The modified-files scan must not re-read the world on every call: the
+    /// wrapper asks on every page open, and the first cold scan of a
+    /// thousand-file site is seconds of IO. Verdicts are cached per
+    /// (size, mtime, declared hash); an edit re-hashes, a re-sign re-judges.
+    #[tokio::test]
+    async fn modified_scan_caches_verdicts_and_sees_edits() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        storage.write("index.html", b"hello").unwrap();
+        let content = json!({
+            "files": {
+                "index.html": {
+                    "size": 5,
+                    "sha512": XiteStorage::hash_bytes(b"hello"),
+                }
+            }
+        });
+        storage.write("content.json", content.to_string().as_bytes()).unwrap();
+
+        let addr = "1ScanAddress";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: storage.clone(), content: Some(content) })
+            .await;
+
+        assert!(state.list_modified_files(addr).await.is_empty(), "clean site scans clean");
+        {
+            let cache = state.modified_scan_cache.lock().unwrap();
+            let per_file = cache.get(addr).expect("scan populated the cache");
+            assert!(!per_file.get("index.html").expect("file cached").2, "verdict cached clean");
+        }
+
+        // Same metadata + same declared hash: the cached verdict is reused.
+        assert!(state.list_modified_files(addr).await.is_empty());
+
+        // An edit (same size, new bytes) must be re-hashed and detected. Push
+        // the mtime forward explicitly: a same-second write can otherwise
+        // collide with the cached mtime and hide the edit on coarse
+        // filesystems.
+        storage.write("index.html", b"HELLO").unwrap();
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        let f = std::fs::File::options()
+            .append(true)
+            .open(storage.path("index.html").unwrap())
+            .unwrap();
+        f.set_modified(bumped).unwrap();
+        assert_eq!(
+            state.list_modified_files(addr).await,
+            vec!["index.html".to_string()],
+            "edited file detected despite the cache"
+        );
     }
 
     /// A xite that ships a NEW dbschema.json to a peer that already built its
