@@ -597,12 +597,20 @@ async fn clone_xite_with_progress(
     let t0 = std::time::Instant::now();
     trace_clone!(t0, "clone START {address}");
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create xite dir: {e}"))?;
-    let mut xite = Xite::new(
-        Address::parse(address.to_string()).map_err(|e| format!("bad address: {e}"))?,
-        XiteStorage::new(data_dir),
-    );
-
-    let complete = xite.load_content().unwrap_or(false) && xite.files_needed().is_empty();
+    let addr = Address::parse(address.to_string()).map_err(|e| format!("bad address: {e}"))?;
+    // The short-circuit reads and hashes every declared file. On a cold file
+    // cache that is seconds of blocking syscalls, and this runs on a runtime
+    // worker for every on-demand open - park it on the blocking pool so the
+    // node keeps answering while it checks.
+    let storage = XiteStorage::new(data_dir);
+    let (xite, complete) = tokio::task::spawn_blocking(move || {
+        let mut xite = Xite::new(addr, storage);
+        let complete = xite.load_content().unwrap_or(false) && xite.files_needed().is_empty();
+        (xite, complete)
+    })
+    .await
+    .map_err(|e| format!("completeness check failed: {e}"))?;
+    let mut xite = xite;
     if complete {
         return Ok((xite.content.clone(), 0, Vec::new()));
     }
