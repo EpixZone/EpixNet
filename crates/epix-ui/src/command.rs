@@ -2001,7 +2001,7 @@ impl WsCommand for SiteSign {
             .unwrap_or("content.json");
         // Merger sites sign into their merged site (`merged-…/` paths).
         let (address, inner_path) = s.resolve_target(inner_path).await?;
-        sign_for(s, &address, &inner_path, sign_privatekey(p)).await?;
+        sign_for(s, &address, &inner_path, sign_privatekey(p), sign_full(p)).await?;
         // Push fresh siteInfo so the page re-renders with the new signed state -
         // EpixNet's `updateWebsocket(file_done=…)` after actionSiteSign. Without
         // it the sidebar keeps showing the pre-sign modified-files/sign panel.
@@ -2092,6 +2092,7 @@ async fn sign_for(
     address: &str,
     inner_path: &str,
     privatekey: Option<String>,
+    full: bool,
 ) -> Result<String, String> {
     // `"stored"` is EpixNet's sentinel for "use the site key saved in
     // users.json" (the sidebar and wrapper infopanel send it when
@@ -2115,11 +2116,20 @@ async fn sign_for(
                 .await
                 .ok_or("siteSign: privatekey required")?,
         };
-        s.state.sign_xite(address, &key).await?;
+        s.state.sign_xite_with(address, &key, full).await?;
     } else {
         s.state.sign_user_content(address, &content_path, privatekey, Some(s.id)).await?;
     }
     Ok(content_path)
+}
+
+/// The `full` flag of a sign command: re-hash every file instead of trusting
+/// the stat cache. Object key `full`, or positional after inner_path.
+fn sign_full(p: &Value) -> bool {
+    p.get("full")
+        .or_else(|| p.as_array().and_then(|a| a.get(2)))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON

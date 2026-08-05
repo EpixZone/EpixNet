@@ -711,11 +711,12 @@ impl Xite {
         Ok((files, files_optional, hashed_bytes, fresh_cache))
     }
 
-    /// The sign cache from the xite root, or empty. `EPIX_SIGN_FULL` ignores
-    /// it for one honest full re-hash (the escape hatch when a deploy is
-    /// suspected of preserving mtimes over changed bytes).
-    fn load_sign_cache(&self) -> SignCache {
-        if std::env::var_os("EPIX_SIGN_FULL").is_some() {
+    /// The sign cache from the xite root, or empty when `full` asks for an
+    /// honest full re-hash (the escape hatch when a deploy is suspected of
+    /// preserving mtimes over changed bytes). Either way the sign REBUILDS
+    /// the cache, so one --full pass also repairs a stale cache for good.
+    fn load_sign_cache(&self, full: bool) -> SignCache {
+        if full {
             return SignCache::new();
         }
         self.storage
@@ -752,6 +753,13 @@ impl Xite {
     /// The key must own the xite (its address must equal the xite address),
     /// otherwise the resulting signature wouldn't verify.
     pub fn sign(&mut self, privatekey: &str, modified: f64) -> Result<()> {
+        self.sign_with(privatekey, modified, false)
+    }
+
+    /// [`Self::sign`] with `full` forcing a re-read of every file instead of
+    /// trusting the stat cache - a per-invocation choice (siteSign --full),
+    /// not process state.
+    pub fn sign_with(&mut self, privatekey: &str, modified: f64, full: bool) -> Result<()> {
         // The underlying failure is a base58check/curve detail (checksum byte
         // arrays and the like). This message reaches the user as a notification,
         // and there is nothing actionable in the detail: the key is unusable.
@@ -786,7 +794,7 @@ impl Xite {
         let optional = path_pattern(content.get("optional"));
         // Files matching the `shard` pattern are self-encrypted (private).
         let shard = path_pattern(content.get("shard"));
-        let sign_cache = self.load_sign_cache();
+        let sign_cache = self.load_sign_cache(full);
         let (files, files_optional, hashed_bytes, fresh_cache) =
             self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional, Some(&sign_cache))?;
         // Best-effort: a failed cache write only means the next sign re-reads.
@@ -1522,9 +1530,19 @@ mod tests {
             "unchanged (size, mtime) reuses the cached hash without reading"
         );
 
-        // Now touch the mtime: the third sign re-reads and sees the new bytes.
+        // A --full sign ignores the cache and reads the truth even though the
+        // stat still matches - the per-invocation escape hatch.
+        xite.sign_with(&pk, 1002.0, true).unwrap();
+        let full = xite.content.clone().unwrap();
+        assert_eq!(
+            full["files_optional"]["video/movie.bin"]["b3"],
+            serde_json::json!(epix_blob::ObjId::of(&swapped).to_string()),
+            "--full re-reads regardless of the stat"
+        );
+
+        // Now touch the mtime: a normal sign re-reads changed files by itself.
         f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
-        xite.sign(&pk, 1002.0).unwrap();
+        xite.sign(&pk, 1003.0).unwrap();
         let third = xite.content.clone().unwrap();
         assert_ne!(
             first["files_optional"]["video/movie.bin"]["b3"],

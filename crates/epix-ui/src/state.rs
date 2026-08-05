@@ -9918,6 +9918,17 @@ impl AppState {
     /// + settings. Returns the signed content.json bytes. The key must own the
     /// xite. This is `siteSign`.
     pub async fn sign_xite(&self, address: &str, privatekey: &str) -> Result<Vec<u8>, String> {
+        self.sign_xite_with(address, privatekey, false).await
+    }
+
+    /// [`Self::sign_xite`] with `full` bypassing the sign stat cache for one
+    /// complete re-hash of every declared file.
+    pub async fn sign_xite_with(
+        &self,
+        address: &str,
+        privatekey: &str,
+        full: bool,
+    ) -> Result<Vec<u8>, String> {
         let (storage, content) = {
             let x = self.xites.read().await;
             let e = x.get(address).ok_or("unknown xite")?;
@@ -9948,7 +9959,7 @@ impl AppState {
             .unwrap_or(0.0);
         let modified = (now_secs() as f64).max(prev + 1.0);
 
-        xite.sign(privatekey, modified).map_err(|e| e.to_string())?;
+        xite.sign_with(privatekey, modified, full).map_err(|e| e.to_string())?;
         let signed = xite.content.clone();
         let bytes = xite.storage.read("content.json").map_err(|e| e.to_string())?;
 
