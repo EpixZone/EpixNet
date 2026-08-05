@@ -61,6 +61,81 @@ impl VerifyContext for ChildCtx<'_> {
 
 /// Files signing never hashes into a content.json (EpixNet's `hashFiles`):
 /// hidden dot-files and the `-old`/`-new` publish-diff snapshots.
+/// The local sign cache at the xite root. A dotfile, so [`skip_hashing`]
+/// keeps it out of every signed manifest; it never syncs to peers.
+const SIGN_CACHE: &str = ".sign-cache.json";
+
+/// One file's cached hashes, trusted only while its (size, mtime_ns) is
+/// unchanged - the same stat contract git's index uses. The cache exists
+/// because a sign otherwise re-reads and double-hashes every declared byte:
+/// on a media xite that is hundreds of gigabytes and the better part of an
+/// hour per sign, for files that have not moved since the last one.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CachedHash {
+    size: u64,
+    mtime_ns: i64,
+    sha512: String,
+    b3: String,
+}
+
+type SignCache = std::collections::HashMap<String, CachedHash>;
+
+/// A file's (size, mtime_ns), or `None` when it cannot be stat'd. Taken
+/// BEFORE the read on the hashing path, so a write racing the sign leaves a
+/// stale mtime with fresh hashes and the NEXT sign re-reads - never the
+/// reverse, which would freeze a wrong hash into the manifest.
+fn stat_size_mtime(storage: &XiteStorage, inner: &str) -> Option<(u64, i64)> {
+    let meta = storage.path(inner).ok().and_then(|p| std::fs::metadata(p).ok())?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Some((meta.len(), mtime))
+}
+
+/// The cached hashes for `rel`, when they may be trusted: the stat matches
+/// the cache and the file's bytes are not needed anyway (bundle-eligible
+/// required files always read - the bundle builder wants them, and they are
+/// the cheap kilobytes of a sign).
+fn reuse_cached(
+    rel: &str,
+    stat: Option<(u64, i64)>,
+    is_optional: bool,
+    cache: Option<&SignCache>,
+) -> Option<CachedHash> {
+    let (size, mtime_ns) = stat?;
+    if !is_optional && epix_blob::bundle::is_bundleable(size) {
+        return None;
+    }
+    let c = cache?.get(rel)?;
+    (c.size == size && c.mtime_ns == mtime_ns).then(|| c.clone())
+}
+
+/// Hash `bytes` into a manifest entry (`b3` is the EDX per-file BLAKE3 root,
+/// docs/edx-manifest.md; `sha512` stays alongside for the migration window),
+/// recording the result in `fresh` when the pre-read stat still describes
+/// these bytes.
+fn hash_entry(
+    rel: &str,
+    bytes: &[u8],
+    stat: Option<(u64, i64)>,
+    fresh: &mut SignCache,
+) -> Value {
+    let sha512 = XiteStorage::hash_bytes(bytes);
+    let b3 = epix_blob::ObjId::of(bytes).to_string();
+    if let Some((size, mtime_ns)) = stat {
+        if size == bytes.len() as u64 {
+            fresh.insert(
+                rel.to_string(),
+                CachedHash { size, mtime_ns, sha512: sha512.clone(), b3: b3.clone() },
+            );
+        }
+    }
+    json!({ "size": bytes.len(), "sha512": sha512, "b3": b3 })
+}
+
 fn skip_hashing(rel: &str) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);
     base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
@@ -584,10 +659,12 @@ impl Xite {
         declared_merged: &serde_json::Map<String, Value>,
         ignore: &Option<fancy_regex::Regex>,
         optional: &Option<fancy_regex::Regex>,
+        cache: Option<&SignCache>,
     ) -> Result<(
         serde_json::Map<String, Value>,
         serde_json::Map<String, Value>,
         std::collections::BTreeMap<String, Vec<u8>>,
+        SignCache,
     )> {
         let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
         let listing = self.storage.list_files();
@@ -601,6 +678,7 @@ impl Xite {
         let mut files = serde_json::Map::new();
         let mut files_optional = serde_json::Map::new();
         let mut hashed_bytes = std::collections::BTreeMap::new();
+        let mut fresh_cache: SignCache = std::collections::HashMap::new();
         for inner in listing {
             let Some(rel) = inner.strip_prefix(prefix.as_str()).map(str::to_string) else {
                 continue;
@@ -615,26 +693,49 @@ impl Xite {
             ) else {
                 continue;
             };
-            let bytes = self.storage.read(&inner)?;
-            // `b3` is the EDX per-file BLAKE3 root (docs/edx-manifest.md);
-            // `sha512` stays alongside it for the migration window.
-            let entry = json!({
-                "size": bytes.len(),
-                "sha512": XiteStorage::hash_bytes(&bytes),
-                "b3": epix_blob::ObjId::of(&bytes).to_string(),
-            });
+            // Stat BEFORE any read (see stat_size_mtime for why).
+            let stat = stat_size_mtime(&self.storage, &inner);
+            let entry = match reuse_cached(&rel, stat, is_optional, cache) {
+                Some(hit) => {
+                    let entry = json!({ "size": hit.size, "sha512": hit.sha512, "b3": hit.b3 });
+                    fresh_cache.insert(rel.clone(), hit);
+                    entry
+                }
+                None => {
+                    let bytes = self.storage.read(&inner)?;
+                    let entry = hash_entry(&rel, &bytes, stat, &mut fresh_cache);
+                    // Only bundle-eligible required files are worth keeping:
+                    // the bundle builder needs their bytes, and an
+                    // optional-heavy xite must not pay for a cache nothing
+                    // reads.
+                    if !is_optional && epix_blob::bundle::is_bundleable(bytes.len() as u64) {
+                        hashed_bytes.insert(rel.clone(), bytes);
+                    }
+                    entry
+                }
+            };
             if is_optional {
                 files_optional.insert(rel, entry);
             } else {
-                // Only required files bundle, so only they are worth keeping:
-                // an optional-heavy xite must not pay for a cache nothing reads.
-                if epix_blob::bundle::is_bundleable(bytes.len() as u64) {
-                    hashed_bytes.insert(rel.clone(), bytes);
-                }
                 files.insert(rel, entry);
             }
         }
-        Ok((files, files_optional, hashed_bytes))
+        Ok((files, files_optional, hashed_bytes, fresh_cache))
+    }
+
+    /// The sign cache from the xite root, or empty when `full` asks for an
+    /// honest full re-hash (the escape hatch when a deploy is suspected of
+    /// preserving mtimes over changed bytes). Either way the sign REBUILDS
+    /// the cache, so one --full pass also repairs a stale cache for good.
+    fn load_sign_cache(&self, full: bool) -> SignCache {
+        if full {
+            return SignCache::new();
+        }
+        self.storage
+            .read(SIGN_CACHE)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
     }
 
     /// Merge `files_optional` rebuilt by [`hash_unit_files`](Self::hash_unit_files)
@@ -664,6 +765,13 @@ impl Xite {
     /// The key must own the xite (its address must equal the xite address),
     /// otherwise the resulting signature wouldn't verify.
     pub fn sign(&mut self, privatekey: &str, modified: f64) -> Result<()> {
+        self.sign_with(privatekey, modified, false)
+    }
+
+    /// [`Self::sign`] with `full` forcing a re-read of every file instead of
+    /// trusting the stat cache - a per-invocation choice (siteSign --full),
+    /// not process state.
+    pub fn sign_with(&mut self, privatekey: &str, modified: f64, full: bool) -> Result<()> {
         // The underlying failure is a base58check/curve detail (checksum byte
         // arrays and the like). This message reaches the user as a notification,
         // and there is nothing actionable in the detail: the key is unusable.
@@ -698,8 +806,13 @@ impl Xite {
         let optional = path_pattern(content.get("optional"));
         // Files matching the `shard` pattern are self-encrypted (private).
         let shard = path_pattern(content.get("shard"));
-        let (files, files_optional, hashed_bytes) =
-            self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional)?;
+        let sign_cache = self.load_sign_cache(full);
+        let (files, files_optional, hashed_bytes, fresh_cache) =
+            self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional, Some(&sign_cache))?;
+        // Best-effort: a failed cache write only means the next sign re-reads.
+        if let Ok(bytes) = serde_json::to_vec(&fresh_cache) {
+            let _ = self.storage.write(SIGN_CACHE, &bytes);
+        }
 
         let map = content.as_object_mut().ok_or_else(|| {
             Error::Protocol("content.json is not a JSON object".into())
@@ -1278,8 +1391,8 @@ impl Xite {
         let ignore = path_pattern(map.get("ignore"));
         let optional = path_pattern(map.get("optional"));
         // Child units are not EDX-bundled, so the hashed bytes are dropped.
-        let (files, files_optional, _) =
-            self.hash_unit_files(dir, &declared_optional, &declared_merged, &ignore, &optional)?;
+        let (files, files_optional, _, _) =
+            self.hash_unit_files(dir, &declared_optional, &declared_merged, &ignore, &optional, None)?;
         map.insert("files".into(), Value::Object(files));
         Self::merge_files_optional(map, files_optional, declared_optional);
         if modified.fract() == 0.0 {
@@ -1376,6 +1489,82 @@ mod tests {
         assert!(
             bare.add_content("data/users/content.json", &include, &xid_map).is_err(),
             "an undeclared include must not verify"
+        );
+    }
+
+    /// A re-sign must not re-read what has not changed: the sign cache
+    /// carries (size, mtime, hashes) per file, and a second sign of an
+    /// untouched xite produces the identical manifest from stats alone.
+    /// Touching a file (new mtime) re-hashes it; the cache itself is a
+    /// dotfile and never appears in the signed manifest.
+    #[test]
+    fn resign_reuses_cached_hashes_and_rehashes_touched_files() {
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let mut xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        // One optional file over the bundle cutoff (the cacheable class) and
+        // one small required file (always read, it feeds the bundles).
+        let movie = vec![9u8; 200_000];
+        storage.write("video/movie.bin", &movie).unwrap();
+        storage.write("index.html", b"<h1>hi</h1>").unwrap();
+        xite.content = Some(serde_json::json!({ "optional": "video/.*" }));
+        xite.sign(&pk, 1000.0).unwrap();
+        let first = xite.content.clone().unwrap();
+        assert!(storage.exists(SIGN_CACHE), "sign leaves its cache behind");
+        assert!(
+            first.get("files").and_then(|f| f.get(SIGN_CACHE)).is_none()
+                && first.get("files_optional").and_then(|f| f.get(SIGN_CACHE)).is_none(),
+            "the cache never enters the manifest"
+        );
+
+        // Corrupt the on-disk movie WITHOUT changing size or mtime: a second
+        // sign must trust the cache (prove it reused rather than re-read).
+        let mtime = std::fs::metadata(storage.path("video/movie.bin").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        let mut swapped = movie.clone();
+        swapped[0] = 1;
+        storage.write("video/movie.bin", &swapped).unwrap();
+        let f = std::fs::File::options()
+            .append(true)
+            .open(storage.path("video/movie.bin").unwrap())
+            .unwrap();
+        f.set_modified(mtime).unwrap();
+        xite.sign(&pk, 1001.0).unwrap();
+        let second = xite.content.clone().unwrap();
+        assert_eq!(
+            first["files_optional"]["video/movie.bin"]["b3"],
+            second["files_optional"]["video/movie.bin"]["b3"],
+            "unchanged (size, mtime) reuses the cached hash without reading"
+        );
+
+        // A --full sign ignores the cache and reads the truth even though the
+        // stat still matches - the per-invocation escape hatch.
+        xite.sign_with(&pk, 1002.0, true).unwrap();
+        let full = xite.content.clone().unwrap();
+        assert_eq!(
+            full["files_optional"]["video/movie.bin"]["b3"],
+            serde_json::json!(epix_blob::ObjId::of(&swapped).to_string()),
+            "--full re-reads regardless of the stat"
+        );
+
+        // Now touch the mtime: a normal sign re-reads changed files by itself.
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        xite.sign(&pk, 1003.0).unwrap();
+        let third = xite.content.clone().unwrap();
+        assert_ne!(
+            first["files_optional"]["video/movie.bin"]["b3"],
+            third["files_optional"]["video/movie.bin"]["b3"],
+            "a touched file is re-hashed"
+        );
+        assert_eq!(
+            third["files_optional"]["video/movie.bin"]["b3"],
+            serde_json::json!(epix_blob::ObjId::of(&swapped).to_string()),
+            "and the manifest now carries the real bytes' hash"
         );
     }
 
@@ -1678,8 +1867,8 @@ mod tests {
         storage.write("small.txt", b"small").unwrap();
         storage.write("big.bin", &vec![7u8; 200_000]).unwrap();
         let none = serde_json::Map::new();
-        let (files, _optional, hashed) =
-            xite.hash_unit_files("", &none, &none, &None, &None).unwrap();
+        let (files, _optional, hashed, _cache) =
+            xite.hash_unit_files("", &none, &none, &None, &None, None).unwrap();
 
         assert_eq!(hashed.get("small.txt").map(|b| b.as_slice()), Some(&b"small"[..]));
         assert!(!hashed.contains_key("big.bin"), "over the bundle cutoff: never bundled");
@@ -1702,8 +1891,8 @@ mod tests {
         storage.write("a.txt", b"AAA").unwrap();
         storage.write("small.txt", b"small").unwrap();
         let none = serde_json::Map::new();
-        let (files, _optional, hashed) =
-            xite.hash_unit_files("", &none, &none, &None, &None).unwrap();
+        let (files, _optional, hashed, _cache) =
+            xite.hash_unit_files("", &none, &none, &None, &None, None).unwrap();
 
         // Rewrite between the two passes, keeping the length identical.
         storage.write("small.txt", b"DIRTY").unwrap();
