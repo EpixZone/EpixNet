@@ -29,6 +29,13 @@ impl VerifyContext for RootCtx {
 struct ChildCtx<'a> {
     address: String,
     storage: &'a XiteStorage,
+    /// The in-memory root content.json, consulted when the on-disk copy is
+    /// absent. During a clone the root is STAGED (committed to disk only once
+    /// the core set completes) while includes are already arriving; without
+    /// this fallback every one of them failed rules resolution ("No rules
+    /// for this file") and the user-content pass could not run concurrently
+    /// with the core download. Disk still wins when present.
+    root: Option<&'a Value>,
     xid_map: &'a std::collections::HashMap<String, Vec<String>>,
 }
 impl VerifyContext for ChildCtx<'_> {
@@ -36,8 +43,13 @@ impl VerifyContext for ChildCtx<'_> {
         &self.address
     }
     fn loaded_content(&self, inner_path: &str) -> Option<Value> {
-        let bytes = self.storage.read(inner_path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        if let Ok(bytes) = self.storage.read(inner_path) {
+            return serde_json::from_slice(&bytes).ok();
+        }
+        if inner_path == "content.json" {
+            return self.root.cloned();
+        }
+        None
     }
     fn resolve_xid(&self, name: &str) -> Vec<String> {
         self.xid_map.get(name).cloned().unwrap_or_default()
@@ -253,6 +265,7 @@ impl Xite {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
             storage: &self.storage,
+            root: self.content.as_ref(),
             xid_map,
         };
         epix_content::verify::get_rules(inner_path, content, &ctx)
@@ -286,6 +299,7 @@ impl Xite {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
             storage: &self.storage,
+            root: self.content.as_ref(),
             xid_map,
         };
         epix_content::verify_content_file(inner_path, &json, bytes.len() as i64, &ctx)
@@ -540,6 +554,7 @@ impl Xite {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
             storage: &self.storage,
+            root: self.content.as_ref(),
             xid_map,
         };
         epix_content::verify::valid_signers(content_inner_path, &content, &ctx)
@@ -1233,6 +1248,7 @@ impl Xite {
             let ctx = ChildCtx {
                 address: self.address.as_str().to_string(),
                 storage: &self.storage,
+                root: self.content.as_ref(),
                 xid_map,
             };
             if let Some(rules) = epix_content::verify::get_rules(inner_path, &content, &ctx) {
@@ -1312,6 +1328,55 @@ mod tests {
     fn signed(mut content: Value, privkey: &str) -> Vec<u8> {
         epix_content::sign(&mut content, privkey).unwrap();
         serde_json::to_vec(&content).unwrap()
+    }
+
+    /// During a clone the root content.json is staged in memory and only
+    /// committed to disk once the core set completes - but the user-content
+    /// pass runs concurrently and its includes must verify against the root's
+    /// rules. Rules resolution has to fall back to the in-memory root when no
+    /// disk copy exists, or every include fails with "No rules for this file"
+    /// and comments/likes cannot arrive until after the whole core set.
+    #[test]
+    fn add_content_verifies_includes_against_a_staged_root() {
+        let privkey = epix_crypt::new_seed();
+        let site = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let mut xite = Xite::new(Address::parse(site.clone()).unwrap(), storage);
+
+        // The include, signed by the xite key.
+        let include = signed(
+            json!({
+                "address": site,
+                "inner_path": "data/users/content.json",
+                "files": {},
+                "modified": 1000,
+                "user_contents": { "permission_rules": {}, "permissions": {} },
+            }),
+            &privkey,
+        );
+
+        // Root staged in memory only - nothing on disk, exactly mid-clone.
+        xite.content = Some(json!({
+            "address": site,
+            "files": {},
+            "includes": { "data/users/content.json": { "signers": [], "signers_required": 1 } },
+        }));
+        let xid_map = std::collections::HashMap::new();
+        xite.add_content("data/users/content.json", &include, &xid_map)
+            .expect("include verifies against the staged in-memory root");
+
+        // And a root on disk still wins over the memory copy: stage a root
+        // WITHOUT the include declared and the same file must now fail.
+        let bare = Xite {
+            address: xite.address.clone(),
+            storage: xite.storage.clone(),
+            content: Some(json!({ "address": site, "files": {}, "includes": {} })),
+        };
+        assert!(
+            bare.add_content("data/users/content.json", &include, &xid_map).is_err(),
+            "an undeclared include must not verify"
+        );
     }
 
     /// The upload-accounting reverse map covers everything served by object
