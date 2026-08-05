@@ -4555,54 +4555,67 @@ impl AppState {
             .unwrap_or_default();
         let mut out = Vec::new();
         let mut fresh = std::collections::HashMap::new();
-        if let Some(files) = content.get("files").and_then(|v| v.as_object()) {
-            for (rel, info) in files {
-                if include_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
-                    continue;
-                }
-                let declared_size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
-                let declared_hash = info.get("sha512").and_then(|v| v.as_str()).unwrap_or("");
-                let meta = storage
-                    .path(rel)
-                    .ok()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| {
-                        let mtime = m
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_nanos() as i64)
-                            .unwrap_or(0);
-                        (m.len(), mtime)
-                    });
-                let Some(meta) = meta else {
-                    out.push(rel.clone()); // missing = modified; nothing to cache
-                    continue;
-                };
-                // A size that disagrees with the manifest is modified with no
-                // read; a (size, mtime) the cache already judged keeps its
-                // verdict. Only genuinely new or touched files get hashed.
-                let cached = cache
-                    .get(rel)
-                    .filter(|(m, h, _)| *m == meta && h == declared_hash)
-                    .map(|(_, _, v)| *v);
-                let modified = if meta.0 as i64 != declared_size {
-                    true
-                } else if let Some(verdict) = cached {
-                    verdict
-                } else {
-                    match storage.read(rel) {
-                        Err(_) => true,
-                        Ok(bytes) => XiteStorage::hash_bytes(&bytes) != declared_hash,
+        let files = content.get("files").and_then(|v| v.as_object());
+        for (rel, info) in files.into_iter().flatten() {
+            if include_dirs.iter().any(|d| rel.starts_with(d.as_str())) {
+                continue;
+            }
+            match Self::judge_file(storage, rel, info, &cache) {
+                // Missing on disk = modified, and nothing worth caching.
+                None => out.push(rel.clone()),
+                Some(entry) => {
+                    if entry.2 {
+                        out.push(rel.clone());
                     }
-                };
-                fresh.insert(rel.clone(), (meta, declared_hash.to_string(), modified));
-                if modified {
-                    out.push(rel.clone());
+                    fresh.insert(rel.clone(), entry);
                 }
             }
         }
         (out, fresh)
+    }
+
+    /// One file's modified verdict for [`Self::scan_modified_files`], plus
+    /// the (size, mtime, declared hash) it was judged against so the next
+    /// scan can reuse it. `None` when the file is missing on disk. A size
+    /// that disagrees with the manifest is modified with no read; a cached
+    /// verdict for the same metadata and declared hash is reused; only
+    /// genuinely new or touched files get read and hashed.
+    fn judge_file(
+        storage: &XiteStorage,
+        rel: &str,
+        info: &Value,
+        cache: &std::collections::HashMap<String, ((u64, i64), String, bool)>,
+    ) -> Option<((u64, i64), String, bool)> {
+        let declared_size = info.get("size").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let declared_hash = info.get("sha512").and_then(|v| v.as_str()).unwrap_or("");
+        let meta = Self::file_size_mtime(storage, rel)?;
+        let cached = cache
+            .get(rel)
+            .filter(|(m, h, _)| *m == meta && h == declared_hash)
+            .map(|(_, _, v)| *v);
+        let modified = if meta.0 as i64 != declared_size {
+            true
+        } else if let Some(verdict) = cached {
+            verdict
+        } else {
+            storage
+                .read(rel)
+                .map(|bytes| XiteStorage::hash_bytes(&bytes) != declared_hash)
+                .unwrap_or(true)
+        };
+        Some((meta, declared_hash.to_string(), modified))
+    }
+
+    /// A stored file's (size, mtime-in-nanos), or `None` if it is absent.
+    fn file_size_mtime(storage: &XiteStorage, rel: &str) -> Option<(u64, i64)> {
+        let meta = storage.path(rel).ok().and_then(|p| std::fs::metadata(p).ok())?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        Some((meta.len(), mtime))
     }
 
     /// Set the one per-site settings key EpixNet lets a page change
