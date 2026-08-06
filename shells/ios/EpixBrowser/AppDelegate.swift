@@ -27,13 +27,39 @@ import WebKit
 class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     WKScriptMessageHandler
 {
+    /// One open tab: its web view and the KVO subscription that keeps the
+    /// address bar current while it is the visible tab.
+    final class BrowserTab {
+        let webView: WKWebView
+        var urlObservation: NSKeyValueObservation?
+        init(webView: WKWebView) { self.webView = webView }
+    }
+
     var window: UIWindow?
     let node = EpixNode()
-    var webView: WKWebView?
+    /// Open tabs, in creation order. Never empty once the chrome is built.
+    var tabs: [BrowserTab] = []
+    var currentTabIndex = 0
+    var currentTab: BrowserTab? {
+        tabs.indices.contains(currentTabIndex) ? tabs[currentTabIndex] : nil
+    }
+    /// The visible tab's web view (the pre-tabs code paths all read this).
+    var webView: WKWebView? { currentTab?.webView }
+    /// The visible tab's web view fills this; switching tabs swaps the child.
+    var webContainer: UIView?
+    var backButton: UIButton?
+    var forwardButton: UIButton?
+    var tabsButton: UIButton?
+    /// Scroll-away chrome: the address-bar top and toolbar bottom constraints
+    /// slide off screen while the user scrolls down, back while scrolling up.
+    var topBarConstraint: NSLayoutConstraint?
+    var toolbarBottomConstraint: NSLayoutConstraint?
+    var chromeHidden = false
+    var panLastY: CGFloat = 0
+    var panAccum: CGFloat = 0
     var addressBar: UITextField?
     var torBadge: UIView?
     var torTimer: Timer?
-    var urlObservation: NSKeyValueObservation?
     var currentDisplay = ""
     /// Full-screen loading splash (spinning white Epix mark) shown over the
     /// chrome while the node boots and the first page paints; removed on the
@@ -104,6 +130,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                     self.showWallet()
                 }
             }
+            // Same idea for navigation: SIMCTL_CHILD_EPIX_NAV=<input> runs the
+            // input through navigate() (the address bar's path) once serving.
+            if let nav = ProcessInfo.processInfo.environment["EPIX_NAV"], !nav.isEmpty {
+                Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
+                    guard let self, self.node.state() == .serving else { return }
+                    t.invalidate()
+                    self.navigate(nav)
+                }
+            }
         #endif
         return true
     }
@@ -169,32 +204,39 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         button.addSubview(badge)
         self.torBadge = badge
 
-        let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
-        webView.navigationDelegate = self
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        // Dark behind the page: WKWebView paints white before content arrives
-        // (the node may still be booting on a cold start).
-        webView.isOpaque = false
-        webView.backgroundColor = Self.chromeBg
-        webView.scrollView.backgroundColor = Self.chromeBg
-        container.addSubview(webView)
+        let webContainer = UIView()
+        webContainer.backgroundColor = Self.chromeBg
+        webContainer.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(webContainer)
+        self.webContainer = webContainer
+
+        let toolbar = buildToolbar()
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(toolbar)
         container.addSubview(field)
         container.addSubview(button)
-        self.webView = webView
-        // Apply the saved clearnet-through-Tor routing before the first load.
-        applyClearnetRouting()
 
-        // Show `talk.epix/…` in the bar, not the local node plumbing.
-        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] _, change in
-            guard let self, let url = change.newValue ?? nil else { return }
-            if self.addressBar?.isFirstResponder != true {
-                self.addressBar?.text = self.friendlyUrl(url.absoluteString)
-            }
-        }
+        // The first tab (also applies the saved clearnet-through-Tor routing).
+        makeTab()
+
+        // Scroll-away chrome, the way phone browsers give the page the whole
+        // screen: dragging up hides the address bar and toolbar, dragging
+        // down brings them back. Driven by the pan gesture rather than the
+        // page's scroll position, because xites scroll inside the wrapper's
+        // iframe (or their own panels) where the scroll view reports nothing.
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handleChromePan(_:)))
+        pan.cancelsTouchesInView = false
+        pan.delegate = self
+        webContainer.addGestureRecognizer(pan)
 
         let safe = container.safeAreaLayoutGuide
+        let fieldTop = field.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6)
+        let toolbarBottom = toolbar.bottomAnchor.constraint(equalTo: safe.bottomAnchor)
+        topBarConstraint = fieldTop
+        toolbarBottomConstraint = toolbarBottom
         NSLayoutConstraint.activate([
-            field.topAnchor.constraint(equalTo: safe.topAnchor, constant: 6),
+            fieldTop,
+            toolbarBottom,
             field.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
             field.heightAnchor.constraint(equalToConstant: 36),
             button.leadingAnchor.constraint(equalTo: field.trailingAnchor, constant: 4),
@@ -206,12 +248,216 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             badge.heightAnchor.constraint(equalToConstant: 12),
             badge.bottomAnchor.constraint(equalTo: button.bottomAnchor, constant: -5),
             badge.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -5),
-            webView.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 6),
-            webView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            webContainer.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 6),
+            webContainer.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            webContainer.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            webContainer.bottomAnchor.constraint(equalTo: toolbar.topAnchor),
+            toolbar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            toolbar.heightAnchor.constraint(equalToConstant: 44),
         ])
         return container
+    }
+
+    /// Accumulate the drag; a direction flip starts a fresh measurement.
+    @objc private func handleChromePan(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began:
+            panLastY = 0
+            panAccum = 0
+        case .changed:
+            let y = g.translation(in: g.view).y
+            let dy = y - panLastY
+            panLastY = y
+            if (dy < 0) != (panAccum < 0) { panAccum = 0 }
+            panAccum += dy
+            if panAccum < -48 {
+                setChromeHidden(true)
+                panAccum = 0
+            } else if panAccum > 48 {
+                setChromeHidden(false)
+                panAccum = 0
+            }
+        default:
+            break
+        }
+    }
+
+    /// Slide the chrome off screen (or back); the page gets the freed space.
+    func setChromeHidden(_ hidden: Bool) {
+        guard hidden != chromeHidden, let root = window?.rootViewController?.view else { return }
+        // Not while typing an address.
+        if hidden && addressBar?.isFirstResponder == true { return }
+        chromeHidden = hidden
+        topBarConstraint?.constant = hidden ? -(root.safeAreaInsets.top + 48) : 6
+        toolbarBottomConstraint?.constant = hidden ? 44 + root.safeAreaInsets.bottom : 0
+        UIView.animate(withDuration: 0.2) { root.layoutIfNeeded() }
+    }
+
+    /// The bottom toolbar: back, forward, reload, and the tab switcher.
+    private func buildToolbar() -> UIView {
+        func glyphButton(_ symbol: String, _ label: String, _ action: Selector) -> UIButton {
+            let b = UIButton(type: .system)
+            b.setImage(UIImage(systemName: symbol), for: .normal)
+            b.tintColor = Self.fieldText
+            b.accessibilityLabel = label
+            b.addTarget(self, action: action, for: .touchUpInside)
+            return b
+        }
+        let back = glyphButton("chevron.backward", "Back", #selector(goBackTapped))
+        let forward = glyphButton("chevron.forward", "Forward", #selector(goForwardTapped))
+        let reload = glyphButton("arrow.clockwise", "Reload", #selector(reloadTapped))
+        back.alpha = 0.35
+        forward.alpha = 0.35
+        backButton = back
+        forwardButton = forward
+
+        // The tab button: the open-tab count in a rounded square, like every
+        // mobile browser's switcher button.
+        let tabsB = UIButton(type: .system)
+        tabsB.setTitle("1", for: .normal)
+        tabsB.setTitleColor(Self.fieldText, for: .normal)
+        tabsB.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+        tabsB.layer.borderColor = Self.fieldText.cgColor
+        tabsB.layer.borderWidth = 2
+        tabsB.layer.cornerRadius = 6
+        tabsB.accessibilityLabel = "Tabs"
+        tabsB.addTarget(self, action: #selector(showTabSwitcher), for: .touchUpInside)
+        tabsButton = tabsB
+        // A fixed-size square centered in its equal-width slot.
+        let tabsHolder = UIView()
+        tabsB.translatesAutoresizingMaskIntoConstraints = false
+        tabsHolder.addSubview(tabsB)
+        NSLayoutConstraint.activate([
+            tabsB.centerXAnchor.constraint(equalTo: tabsHolder.centerXAnchor),
+            tabsB.centerYAnchor.constraint(equalTo: tabsHolder.centerYAnchor),
+            tabsB.widthAnchor.constraint(equalToConstant: 26),
+            tabsB.heightAnchor.constraint(equalToConstant: 26),
+        ])
+
+        let bar = UIStackView(arrangedSubviews: [back, forward, reload, tabsHolder])
+        bar.axis = .horizontal
+        bar.distribution = .fillEqually
+        bar.backgroundColor = Self.chromeBg
+        return bar
+    }
+
+    @objc private func goBackTapped() { webView?.goBack() }
+    @objc private func goForwardTapped() { webView?.goForward() }
+    @objc private func reloadTapped() { webView?.reload() }
+
+    /// Reflect the visible tab in the toolbar (history state, tab count).
+    func syncToolbar() {
+        backButton?.alpha = (webView?.canGoBack ?? false) ? 1 : 0.35
+        forwardButton?.alpha = (webView?.canGoForward ?? false) ? 1 : 0.35
+        tabsButton?.setTitle(String(tabs.count), for: .normal)
+    }
+
+    /// Create a tab, wire it up, and (by default) select it. Pass the
+    /// configuration WebKit hands to createWebViewWith for target=_blank
+    /// popups - those must be built from it.
+    @discardableResult
+    func makeTab(configuration: WKWebViewConfiguration? = nil, select: Bool = true) -> BrowserTab {
+        let web = WKWebView(frame: .zero, configuration: configuration ?? WKWebViewConfiguration())
+        web.navigationDelegate = self
+        web.uiDelegate = self
+        web.allowsBackForwardNavigationGestures = true
+        // Dark behind the page: WKWebView paints white before content arrives
+        // (the node may still be booting on a cold start).
+        web.isOpaque = false
+        web.backgroundColor = Self.chromeBg
+        web.scrollView.backgroundColor = Self.chromeBg
+        let tab = BrowserTab(webView: web)
+        // Show `talk.epix/…` in the bar, not the local node plumbing.
+        tab.urlObservation = web.observe(\.url, options: [.new]) { [weak self] wv, change in
+            guard let self else { return }
+            if self.currentTab?.webView === wv, self.addressBar?.isFirstResponder != true,
+                let url = change.newValue ?? nil
+            {
+                self.addressBar?.text = self.friendlyUrl(url.absoluteString)
+            }
+            self.syncToolbar()
+        }
+        tabs.append(tab)
+        applyClearnetRouting()
+        if select {
+            showTab(tabs.count - 1)
+        } else {
+            syncToolbar()
+        }
+        return tab
+    }
+
+    /// Put tab `index` on screen and sync the chrome to it.
+    func showTab(_ index: Int) {
+        guard tabs.indices.contains(index), let container = webContainer else { return }
+        currentTabIndex = index
+        setChromeHidden(false)
+        let web = tabs[index].webView
+        container.subviews.forEach { $0.removeFromSuperview() }
+        web.frame = container.bounds
+        web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(web)
+        if addressBar?.isFirstResponder != true {
+            addressBar?.text = friendlyUrl(web.url?.absoluteString ?? "")
+        }
+        syncToolbar()
+    }
+
+    /// Close tab `index`. The browser always keeps at least one tab.
+    func closeTab(_ index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        if tabs.count == 1 {
+            // Last tab: reuse it for a fresh dashboard rather than going blank.
+            currentDisplay = "dashboard.epix"
+            load(display: currentDisplay)
+            return
+        }
+        let tab = tabs.remove(at: index)
+        tab.urlObservation = nil
+        tab.webView.removeFromSuperview()
+        let next = currentTabIndex >= index && currentTabIndex > 0
+            ? currentTabIndex - 1 : currentTabIndex
+        showTab(min(next, tabs.count - 1))
+    }
+
+    /// The tab's display name for the switcher: title, else `talk.epix/…`.
+    private func tabName(_ tab: BrowserTab) -> String {
+        if let t = tab.webView.title, !t.isEmpty { return t }
+        var rest = tab.webView.url?.absoluteString ?? ""
+        if rest.hasPrefix("\(nodeBase)/") { rest = String(rest.dropFirst(nodeBase.count + 1)) }
+        while rest.hasSuffix("/") { rest = String(rest.dropLast()) }
+        return rest.isEmpty ? "New tab" : rest
+    }
+
+    /// The tab list: pick a tab, open a new one, or close the current one.
+    @objc private func showTabSwitcher() {
+        let sheet = UIAlertController(title: "Tabs", message: nil, preferredStyle: .actionSheet)
+        for (i, tab) in tabs.enumerated() {
+            let name = tabName(tab)
+            let title = i == currentTabIndex ? "● \(name)" : name
+            sheet.addAction(UIAlertAction(title: title, style: .default) { [weak self] _ in
+                self?.showTab(i)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "New tab", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.makeTab()
+            self.currentDisplay = "dashboard.epix"
+            self.load(display: self.currentDisplay)
+        })
+        if tabs.count > 1 {
+            sheet.addAction(UIAlertAction(title: "Close this tab", style: .destructive) { [weak self] _ in
+                guard let self else { return }
+                self.closeTab(self.currentTabIndex)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        if let pop = sheet.popoverPresentationController, let anchor = tabsButton {
+            pop.sourceView = anchor
+            pop.sourceRect = anchor.bounds
+        }
+        window?.rootViewController?.present(sheet, animated: true)
     }
 
     /// Go: turn what the user typed into somewhere to go.
@@ -286,10 +532,31 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         return true
     }
 
+    /// Mark the node data as browser-hosted: serverInfo reports `epix_browser`
+    /// (and the clearnet-through-Tor state) from this file, and xite pages use
+    /// that to know xite links can be followed instead of warning that the
+    /// Epix Browser is missing (EpixTalk's link guard). The desktop native
+    /// host writes the same file next to the node data.
+    private func writeBrowserSettings() {
+        let url = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("browser-settings.json")
+        var obj =
+            (try? Data(contentsOf: url))
+            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+        obj["tor_clearnet"] = torClearnet
+        if let data = try? JSONSerialization.data(withJSONObject: obj) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
     /// Boot the Rust node off the main thread, then load the local URL.
     private func bootNode(target: String) {
         DispatchQueue.global(qos: .userInitiated).async {
             let dataDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].path
+            try? FileManager.default.createDirectory(
+                atPath: dataDir, withIntermediateDirectories: true)
+            self.writeBrowserSettings()
             self.stageWalletUi(dataDir: dataDir)
             let config = { (uiAddr: String) in
                 NodeConfig(
@@ -777,6 +1044,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         if torClearnet == on { return }
         torClearnet = on
         UserDefaults.standard.set(on, forKey: Self.prefTorClearnet)
+        DispatchQueue.global(qos: .utility).async { self.writeBrowserSettings() }
         applyClearnetRouting()
         torBadge?.backgroundColor = on ? Self.torRouted : Self.torReady
     }
@@ -787,18 +1055,19 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// xites keep loading directly. This is the runtime equivalent of the
     /// desktop launcher's file PAC. iOS 17+ only (WKWebsiteDataStore proxy).
     private func applyClearnetRouting() {
-        guard #available(iOS 17.0, *), let store = webView?.configuration.websiteDataStore else {
-            return
-        }
-        if torClearnet {
-            let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.socksPort)!)
-            var config = ProxyConfiguration(socksv5Proxy: endpoint)
-            // Never proxy the node's own loopback: the UI and .epix pages load
-            // from 127.0.0.1 and Tor would refuse a private address anyway.
-            config.excludedDomains = ["127.0.0.1", "localhost"]
-            store.proxyConfigurations = [config]
-        } else {
-            store.proxyConfigurations = []
+        guard #available(iOS 17.0, *) else { return }
+        for tab in tabs {
+            let store = tab.webView.configuration.websiteDataStore
+            if torClearnet {
+                let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.socksPort)!)
+                var config = ProxyConfiguration(socksv5Proxy: endpoint)
+                // Never proxy the node's own loopback: the UI and .epix pages load
+                // from 127.0.0.1 and Tor would refuse a private address anyway.
+                config.excludedDomains = ["127.0.0.1", "localhost"]
+                store.proxyConfigurations = [config]
+            } else {
+                store.proxyConfigurations = []
+            }
         }
     }
 
@@ -875,16 +1144,64 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
 /// Drops the loading splash once the first page settles - whether it painted
 /// (didFinish) or errored out (the node's own error page still shows). The
-/// splash is idempotent, so extra navigations are harmless.
+/// splash is idempotent, so extra navigations are harmless. Also intercepts
+/// navigations only EpixNet can resolve and reroutes them to the local node.
 extension AppDelegate: WKNavigationDelegate {
+    /// The loopback path-form URL for a link only EpixNet resolves: an
+    /// `epix://` link, a `https://….epix` host, or a bare `epix1…` address
+    /// host. The desktop Epix Browser follows these through its PAC; here the
+    /// node serves the same xite in path form off loopback, so rewrite
+    /// `https://talk.epix/some/page` to `http://127.0.0.1:…/talk.epix/some/page`.
+    /// Nil for ordinary URLs.
+    func xiteRewrite(_ url: URL) -> URL? {
+        let scheme = url.scheme?.lowercased() ?? ""
+        var host: String?
+        if scheme == "epix" {
+            host = url.host ?? url.absoluteString
+                .replacingOccurrences(of: "epix://", with: "")
+                .components(separatedBy: "/").first
+        } else if scheme == "http" || scheme == "https" {
+            if let h = url.host?.lowercased(),
+                h.hasSuffix(".epix")
+                    || h.range(of: "^epix1[a-z0-9]{20,}$", options: .regularExpression) != nil
+            {
+                host = h
+            }
+        }
+        guard let host, !host.isEmpty else { return nil }
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var path = comps?.percentEncodedPath ?? "/"
+        if path.isEmpty { path = "/" }
+        let query = (comps?.percentEncodedQuery).map { "?\($0)" } ?? ""
+        let fragment = (comps?.percentEncodedFragment).map { "#\($0)" } ?? ""
+        return URL(string: "\(nodeBase)/\(host)\(path)\(query)\(fragment)")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if let url = navigationAction.request.url, let rewritten = xiteRewrite(url) {
+            decisionHandler(.cancel)
+            // Load top-level even when the click came from the wrapper's
+            // content iframe: another xite is a page change.
+            webView.load(URLRequest(url: rewritten))
+            return
+        }
+        decisionHandler(.allow)
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         hideSplash()
+        syncToolbar()
     }
 
     func webView(
         _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
     ) {
         hideSplash()
+        syncToolbar()
     }
 
     func webView(
@@ -892,6 +1209,38 @@ extension AppDelegate: WKNavigationDelegate {
         withError error: Error
     ) {
         hideSplash()
+        syncToolbar()
+    }
+}
+
+/// The chrome pan must observe alongside the web view's own scrolling, not
+/// steal from it.
+extension AppDelegate: UIGestureRecognizerDelegate {
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool {
+        true
+    }
+}
+
+/// Browser-tab popups: target=_blank / window.open become new tabs, and a
+/// script closing its own window closes that tab. (The wallet sheet has its
+/// own WalletUIDelegate; this delegate serves only the browser tabs.)
+extension AppDelegate: WKUIDelegate {
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        makeTab(configuration: configuration).webView
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        if let i = tabs.firstIndex(where: { $0.webView === webView }) {
+            closeTab(i)
+        }
     }
 }
 
