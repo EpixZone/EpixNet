@@ -317,7 +317,7 @@ impl Store {
         let db = Database::create(root.join("index.redb")).map_err(db_err)?;
 
         let txn = db.begin_write().map_err(db_err)?;
-        let open_slab;
+        let mut open_slab;
         // (slab id, tracked len) for every slab, so torn appends that left
         // a slab file longer than its indexed len can be truncated back.
         let mut slab_lens: Vec<(u32, u64)> = Vec::new();
@@ -378,16 +378,51 @@ impl Store {
         // any over-long slab back to its tracked len. A file shorter than
         // its tracked len means lost committed bytes, so leave it be and let
         // reads fail loudly instead of silently extending with zeros.
+        let mut damaged_open = false;
         for (slab, len) in slab_lens {
             let path = root.join("slabs").join(format!("{slab}.slab"));
-            match fs::metadata(&path) {
-                Ok(m) if m.len() > len => {
-                    let f = OpenOptions::new().write(true).open(&path)?;
-                    f.set_len(len)?;
-                    f.sync_all()?;
-                }
-                _ => {}
+            let actual = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if actual > len {
+                let f = OpenOptions::new().write(true).open(&path)?;
+                f.set_len(len)?;
+                f.sync_all()?;
+            } else if actual < len && slab == open_slab.0 {
+                damaged_open = true;
             }
+        }
+        // The open slab is SHORTER than its committed len: committed bytes
+        // are gone (lost fs writes on a hard kill). O_APPEND writes land at
+        // the PHYSICAL end while records use the tracked offset, so every
+        // future insert into this slab would be recorded at an address its
+        // bytes never reach - each one an unreadable object, and the store
+        // poisons itself a little more with every fetch. Seal the damaged
+        // slab and append into a fresh one; the lost records' reads still
+        // fail loudly and revalidate retires them.
+        if damaged_open {
+            let txn = db.begin_write().map_err(db_err)?;
+            let fresh;
+            {
+                let mut slabs = txn.open_table(SLABS).map_err(db_err)?;
+                let mut m: SlabMeta = slabs
+                    .get(open_slab.0)
+                    .map_err(db_err)?
+                    .map(|g| dec(g.value()))
+                    .transpose()?
+                    .unwrap_or_default();
+                m.sealed = true;
+                slabs.insert(open_slab.0, enc(&m).as_slice()).map_err(db_err)?;
+                fresh = slabs
+                    .iter()
+                    .map_err(db_err)?
+                    .last()
+                    .transpose()
+                    .map_err(db_err)?
+                    .map(|(k, _)| k.value() + 1)
+                    .unwrap_or(0);
+                slabs.insert(fresh, enc(&SlabMeta::default()).as_slice()).map_err(db_err)?;
+            }
+            txn.commit().map_err(db_err)?;
+            open_slab = (fresh, 0);
         }
 
         Ok(Self {
@@ -1661,6 +1696,30 @@ impl Store {
                 }
             };
         }
+        // A slab record used to be trusted blindly here, so a torn append (a
+        // hard-killed process mid-write) left a "complete" record whose bytes
+        // could never be read - and, because the record existed, never
+        // refetched: the object was a permanent black hole and every clone
+        // needing it failed with "landed 0/N". Verify the bytes and retire
+        // the record when they are gone or wrong; the next fetch starts clean.
+        if let Loc::Slab { slab, off } = rec.loc {
+            let ok = self
+                .read_slab(slab, off, rec.size)
+                .map(|b| verified::verify_whole(&b, id))
+                .unwrap_or(false);
+            if ok {
+                return Ok(GroupBits::complete(rec.size));
+            }
+            if let Err(e) = self.remove(id) {
+                // The record delete commits before slab compaction runs, and
+                // compaction may choke on the very slab we just distrusted.
+                // As long as the record is gone the retire did its job.
+                if self.get_record(id)?.is_some() {
+                    return Err(e);
+                }
+            }
+            return Ok(GroupBits::new());
+        }
         let Loc::Sparse = rec.loc else {
             return Ok(GroupBits::complete(rec.size));
         };
@@ -1826,6 +1885,40 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn revalidate_retires_a_torn_slab_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let data = test_data(4_000);
+        let ob = OutboardBytes::from_slice(&data);
+        let id = ob.root;
+        assert!(store.insert_bytes(id, Ns::Plain, &data, 1).unwrap());
+
+        // A hard kill that loses fs writes leaves the slab file shorter than
+        // its committed len: the record points at bytes that are not there.
+        let Loc::Slab { slab, .. } = store.get_record(id).unwrap().unwrap().loc else {
+            panic!("small insert must land in a slab");
+        };
+        let slab_file = store.slab_path(slab);
+        drop(store);
+        std::fs::write(&slab_file, b"garbage").unwrap();
+
+        // Reopen (the crashed process restarting): the damaged open slab must
+        // be sealed with a fresh one opened for appends, or every future
+        // insert is recorded at an offset its bytes never reach.
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.read_bytes(id, 2).is_err(), "corrupt slab read must fail");
+
+        // Revalidate must retire the record instead of trusting Loc::Slab,
+        // so the object stops being a black hole and refetches cleanly.
+        let bits = store.revalidate(id).unwrap();
+        assert!(bits.is_empty());
+        assert!(store.get_record(id).unwrap().is_none(), "record retired");
+        assert!(store.insert_bytes(id, Ns::Plain, &data, 3).unwrap(), "refetch lands");
+        assert_eq!(store.read_bytes(id, 4).unwrap(), data);
     }
 
     #[test]
