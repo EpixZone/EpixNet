@@ -2797,6 +2797,9 @@ fn content_type(path: &str) -> &'static str {
         "pdf" => "application/pdf",
         "mp4" => "video/mp4",
         "webm" => "video/webm",
+        // Gecko refuses <track> caption files served with any other type, so
+        // without this captions silently never show.
+        "vtt" => "text/vtt; charset=utf-8",
         "mp3" => "audio/mpeg",
         "ogg" => "application/ogg",
         "oga" => "audio/ogg",
