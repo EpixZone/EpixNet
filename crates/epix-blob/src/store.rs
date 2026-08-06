@@ -623,10 +623,25 @@ impl Store {
             ));
         }
         if let Some(rec) = self.get_record(id)? {
-            if rec.last_access < now {
-                self.touch(id, now)?;
+            if rec.is_complete() {
+                if rec.last_access < now {
+                    self.touch(id, now)?;
+                }
+                return Ok(false);
             }
-            return Ok(false);
+            // An incomplete record must not black-hole the object: this early
+            // return used to discard the verified bytes, the swarm pass then
+            // skipped the groups the stale record claims present, and
+            // materialize failed "incomplete" forever - a fetch killed
+            // mid-write left a xite permanently uncloneable on that node. We
+            // hold the complete verified bytes: retire the stale record and
+            // store them.
+            self.remove(id)?;
+            if self.get_record(id)?.is_some() {
+                // A live sparse decode is registering this object right now;
+                // let it finish rather than fight over the record.
+                return Ok(false);
+            }
         }
 
         let mut open = self.open_slab.lock().expect("slab lock");
@@ -702,10 +717,19 @@ impl Store {
     ) -> io::Result<bool> {
         let rel = self.rel_of(path)?;
         if let Some(rec) = self.get_record(id)? {
-            if rec.last_access < now {
-                self.touch(id, now)?;
+            if rec.is_complete() {
+                if rec.last_access < now {
+                    self.touch(id, now)?;
+                }
+                return Ok(false);
             }
-            return Ok(false);
+            // Same black-hole guard as insert_bytes: an incomplete record
+            // must not stop the xite's own complete file from being adopted,
+            // or this node can never serve the object it visibly holds.
+            self.remove(id)?;
+            if self.get_record(id)?.is_some() {
+                return Ok(false);
+            }
         }
         let size = fs::metadata(path)?.len();
         let ob = OutboardBytes::from_reader(io::BufReader::new(File::open(path)?), size)?;
@@ -1802,6 +1826,30 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn insert_bytes_replaces_an_incomplete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        // A fetch killed mid-write leaves a sparse record with a partial (or
+        // empty) group set. Delivering the complete verified bytes later must
+        // fill the object, not be discarded as a dedup hit - that discard
+        // made a xite permanently uncloneable on the node.
+        let data = test_data(50_000);
+        let ob = OutboardBytes::from_slice(&data);
+        let id = ob.root;
+        store.ensure_sparse(id, Ns::Plain, ob.size, 1).unwrap();
+        assert!(!store.is_complete(id).unwrap(), "sparse record starts incomplete");
+
+        let wrote = store.insert_bytes(id, Ns::Plain, &data, 2).unwrap();
+        assert!(wrote, "complete bytes must replace the stale incomplete record");
+        assert!(store.is_complete(id).unwrap());
+        assert_eq!(store.read_bytes(id, 3).unwrap(), data, "bytes readable after repair");
+
+        // A COMPLETE record still dedups.
+        assert!(!store.insert_bytes(id, Ns::Plain, &data, 4).unwrap());
     }
 
     #[test]

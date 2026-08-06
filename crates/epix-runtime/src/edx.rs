@@ -2807,7 +2807,24 @@ impl RuntimeEdxFetcher {
             Ok(Some((size, _))) => size,
             _ => return false,
         };
-        if self.materialize(address, &r.path, r.id, size, store).await.is_err() {
+        if let Err(e) = self.materialize(address, &r.path, r.id, size, store).await {
+            // A record whose bytes cannot be read back (torn write from a
+            // killed process, disk/record disagreement) would fail this same
+            // way on every retry while the fetch pass skips groups the
+            // record claims present. Revalidate in the background - it
+            // shrinks or retires the record - so the NEXT pass refetches
+            // instead of looping. Mirrors the range-serve path.
+            self.state
+                .log(
+                    "DEBUG",
+                    format!("EDX materialize {}/{} failed: {e}; revalidating", address, r.path),
+                )
+                .await;
+            let vstore = store.clone();
+            let id = r.id;
+            tokio::task::spawn_blocking(move || {
+                let _ = vstore.revalidate(id);
+            });
             return false;
         }
         batch.bytes += size;
@@ -3907,6 +3924,19 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // complete) goes to `missed` for the worker.
         let session = self.open_session(address, &peers, 8).await;
         if session.is_empty() {
+            // This was silent, and a whole failed clone looked identical to
+            // one that never tried the network. Say what happened.
+            self.state
+                .log(
+                    "DEBUG",
+                    format!(
+                        "EDX {address}: no session peer answered ({} candidate(s)); \
+                         {} file(s) to the worker",
+                        peers.len(),
+                        pending.len()
+                    ),
+                )
+                .await;
             for r in pending {
                 epix_ui::state::note_edx_fallback_path(address, &r.path);
                 batch.missed.push(r.path);
@@ -3916,6 +3946,21 @@ impl EdxFetcher for RuntimeEdxFetcher {
 
         self.fetch_tiers(address, &store, &session, pending, &content, &progress, &mut batch, now)
             .await;
+        if !batch.missed.is_empty() {
+            // Name the session that failed: without this a fetch that landed
+            // nothing from N live links was indistinguishable from an empty
+            // session or an unresolvable manifest.
+            self.state
+                .log(
+                    "DEBUG",
+                    format!(
+                        "EDX {address}: {} file(s) missed over {} session peer(s)",
+                        batch.missed.len(),
+                        session.peers().len()
+                    ),
+                )
+                .await;
+        }
         let _ = store.enforce_quota(store_quota());
         batch
     }
