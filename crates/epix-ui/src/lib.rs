@@ -2395,8 +2395,18 @@ async fn serve_file(
                 None => ctx.state.edx_size(&address, &path).await,
             },
         };
-        if let (Some(total), Some((start, end))) = (total, parse_range(range)) {
-            if start < total {
+        if let Some(total) = total {
+            if let Some((start, end)) = parse_range(range, total) {
+                if start >= total {
+                    // Unsatisfiable range: 416 with the real length (RFC 9110),
+                    // not 404 - native players treat 404 as the resource being
+                    // gone and tear the stream down.
+                    let mut h = file_headers(&ct, StatusCode::RANGE_NOT_SATISFIABLE);
+                    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes */{total}")) {
+                        h.insert(header::CONTENT_RANGE, v);
+                    }
+                    return (StatusCode::RANGE_NOT_SATISFIABLE, h, "").into_response();
+                }
                 let end = end
                     .unwrap_or(total - 1)
                     .min(total - 1)
@@ -2424,33 +2434,39 @@ async fn serve_file(
                 }
                 // EDX range missed: serve the covering bytes if they are already
                 // on disk (a legacy file present locally); otherwise this range
-                // is unavailable (msgpack range fetch retired).
+                // is unavailable (msgpack range fetch retired). A short read
+                // gets its Content-Range recomputed from the bytes actually
+                // read - advertising the requested end over a shorter body
+                // desyncs strict players.
                 if let Some(bytes) = ctx.state.read_file_range(&address, &path, start, len).await {
-                    let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
-                    if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
-                        h.insert(header::CONTENT_RANGE, v);
+                    if !bytes.is_empty() {
+                        let end = start + bytes.len() as u64 - 1;
+                        let mut h = file_headers(&ct, StatusCode::PARTIAL_CONTENT);
+                        if let Ok(v) = header::HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                            h.insert(header::CONTENT_RANGE, v);
+                        }
+                        return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
                     }
-                    return (StatusCode::PARTIAL_CONTENT, h, bytes).into_response();
                 }
-                // EDX knows the file but cannot supply these bytes YET (the
-                // groups covering the range have not landed). Falling through
-                // would answer 404, which a media element reads as "this
-                // resource is gone": it tears the stream down and the user is
-                // dropped back to the start of the film, for what is really a
-                // "not yet". 503 + Retry-After says the same thing in a form a
-                // player can act on - re-request the same range - and matches
-                // what the rest of this path already assumes, that a short or
-                // missing answer is re-requested rather than fatal.
-                if matches!(edx, Some(Err(_))) {
-                    let mut h = file_headers(&ct, StatusCode::SERVICE_UNAVAILABLE);
-                    h.insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        h,
-                        "range not available yet; retry",
-                    )
-                        .into_response();
-                }
+                // The file is declared and the range is satisfiable, but the
+                // bytes are not here YET - the EDX groups covering the range
+                // have not landed (or a legacy bigfile is still filling in via
+                // the whole-file path). Falling through would answer 404,
+                // which a media element reads as "this resource is gone": it
+                // tears the stream down and the user is dropped back to the
+                // start of the film, for what is really a "not yet". 503 +
+                // Retry-After says the same thing in a form a player can act
+                // on - re-request the same range - and matches what the rest
+                // of this path already assumes, that a short or missing answer
+                // is re-requested rather than fatal.
+                let mut h = file_headers(&ct, StatusCode::SERVICE_UNAVAILABLE);
+                h.insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    h,
+                    "range not available yet; retry",
+                )
+                    .into_response();
             }
         }
     }
@@ -2571,8 +2587,18 @@ fn rfind_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// Parse an HTTP `Range: bytes=start-end` (single range). `end` is optional.
-fn parse_range(header: &str) -> Option<(u64, Option<u64>)> {
-    let spec = header.trim().strip_prefix("bytes=")?;
+/// The suffix form `bytes=-N` (last N bytes) resolves against `total`; native
+/// media players (AVFoundation and friends) fetch an mp4's trailing moov atom
+/// this way, so refusing it breaks seeking outright.
+fn parse_range(header: &str, total: u64) -> Option<(u64, Option<u64>)> {
+    let spec = header.trim().strip_prefix("bytes=")?.trim();
+    if let Some(n) = spec.strip_prefix('-') {
+        let n: u64 = n.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(n), None));
+    }
     let (start, end) = spec.split_once('-')?;
     let start: u64 = start.trim().parse().ok()?;
     let end = end.trim();
@@ -3167,6 +3193,35 @@ mod gateway_tests {
         let banner_at = out.find("epix-gateway-banner").unwrap();
         assert!(banner_at < out.rfind("</body>").unwrap());
         assert!(banner_at > out.find("<h1>site</h1>").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::parse_range;
+
+    #[test]
+    fn plain_and_open_ended_forms() {
+        assert_eq!(parse_range("bytes=0-99", 1000), Some((0, Some(99))));
+        assert_eq!(parse_range("bytes=500-", 1000), Some((500, None)));
+        assert_eq!(parse_range(" bytes=42-43 ", 1000), Some((42, Some(43))));
+    }
+
+    #[test]
+    fn suffix_form_resolves_against_total() {
+        // Native players fetch an mp4's trailing moov atom this way.
+        assert_eq!(parse_range("bytes=-100", 1000), Some((900, None)));
+        // Asking for more than the file holds means "the whole file".
+        assert_eq!(parse_range("bytes=-5000", 1000), Some((0, None)));
+        assert_eq!(parse_range("bytes=-0", 1000), None);
+    }
+
+    #[test]
+    fn malformed_forms_are_rejected() {
+        assert_eq!(parse_range("bytes=", 1000), None);
+        assert_eq!(parse_range("bytes=abc-", 1000), None);
+        assert_eq!(parse_range("items=0-99", 1000), None);
+        assert_eq!(parse_range("bytes=0-99,200-299", 1000), None);
     }
 }
 

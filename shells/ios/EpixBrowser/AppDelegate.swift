@@ -169,7 +169,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         button.addSubview(badge)
         self.torBadge = badge
 
-        let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webConfig = WKWebViewConfiguration()
+        // Keep <video playsinline> in WebKit's own media path. The iPhone
+        // default (false) hands playback to the fullscreen AVFoundation
+        // player, whose loader treats the node's "bytes not here yet"
+        // 503 on a cold seek as a fatal asset error with no retry.
+        webConfig.allowsInlineMediaPlayback = true
+        webConfig.mediaTypesRequiringUserActionForPlayback = []
+        let webView = WKWebView(frame: .zero, configuration: webConfig)
         webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
         // Dark behind the page: WKWebView paints white before content arrives
