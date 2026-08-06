@@ -1298,6 +1298,22 @@ struct Streaming {
 /// seek from waiting behind a two-hour film's remainder.
 const COMPLETION_BATCH_GROUPS: u64 = 1024;
 
+/// The first [`COMPLETION_BATCH_GROUPS`] of `needed`, so one completion pass
+/// stays bounded.
+fn completion_batch(needed: &epix_blob::bitfield::GroupBits) -> epix_blob::bitfield::GroupBits {
+    let mut batch = epix_blob::bitfield::GroupBits::new();
+    let mut left = COMPLETION_BATCH_GROUPS;
+    for r in needed.ranges() {
+        if left == 0 {
+            break;
+        }
+        let take = (r.end - r.start).min(left);
+        batch.add(r.start..r.start + take);
+        left -= take;
+    }
+    batch
+}
+
 /// RAII marker for one foreground range fetch; see
 /// `Streaming::foreground_fetches`.
 struct ForegroundFetch {
@@ -2376,16 +2392,7 @@ impl RuntimeEdxFetcher {
                 Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
             // Bounded batch per pass (16 MiB), so a seek arriving mid-download
             // waits out one batch at most, not the whole remaining file.
-            let mut batch = epix_blob::bitfield::GroupBits::new();
-            let mut left = COMPLETION_BATCH_GROUPS;
-            for r in needed.ranges() {
-                if left == 0 {
-                    break;
-                }
-                let take = (r.end - r.start).min(left);
-                batch.add(r.start..r.start + take);
-                left -= take;
-            }
+            let batch = completion_batch(&needed);
             let Ok(report) = swarm.fetch(&batch, &handles, Deadline::background(), now).await
             else {
                 return;
