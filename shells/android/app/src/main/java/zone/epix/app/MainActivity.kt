@@ -66,6 +66,11 @@ class MainActivity : AppCompatActivity() {
     private val node = EpixNode()
     private val scope = CoroutineScope(Dispatchers.Main)
 
+    /// Held only while LAN peer discovery is on, so the Wi-Fi stack stops
+    /// filtering the broadcast replies AnnounceLocal needs. Null otherwise -
+    /// the lock costs battery, so a node with discovery off never takes it.
+    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+
     /** One open tab: its Gecko session and the per-tab navigation state. */
     private class Tab(val session: GeckoSession) {
         var url: String = ""
@@ -180,6 +185,14 @@ class MainActivity : AppCompatActivity() {
                 delay(5_000)
             }
         }
+    }
+
+    override fun onDestroy() {
+        // Not reference-counted, so this is safe even if the lock was never
+        // taken (discovery off) or the activity is recreated.
+        runCatching { multicastLock?.release() }
+        multicastLock = null
+        super.onDestroy()
     }
 
     /**
@@ -942,6 +955,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Hold a Wi-Fi MulticastLock while LAN peer discovery is on.
+     *
+     * The Wi-Fi stack filters packets not addressed to this device, so without
+     * the lock the node broadcasts its DiscoverRequest but never hears the
+     * replies - the feature compiles and runs and still finds nobody. The lock
+     * keeps the radio listening, which costs battery, so it is taken only when
+     * the node's own `local_discovery` config key is on.
+     *
+     * Reading the key from config.json (rather than an FFI call) is exact here:
+     * `local_discovery` is a restart-level key, so its value at node start is
+     * the value the node is running with, and a change only takes effect after
+     * an app restart that re-runs this.
+     */
+    private fun acquireMulticastLockIfDiscovering() {
+        if (multicastLock != null) return
+        val enabled = runCatching {
+            val file = java.io.File(java.io.File(filesDir, "private"), "config.json")
+            val v = JSONObject(file.readText()).opt("local_discovery")
+            v == true || v == "true" || v == "on"
+        }.getOrDefault(false)
+        if (!enabled) return
+        runCatching {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+            multicastLock = wifi.createMulticastLock("epixnet-announce-local").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.onFailure { android.util.Log.w("EpixNode", "MulticastLock unavailable; LAN discovery may not receive replies", it) }
+    }
+
     /** Boot the node off the main thread; return the display name to open. */
     private suspend fun bootNode(target: String): String? = withContext(Dispatchers.IO) {
         writeBrowserSettings()
@@ -954,6 +998,7 @@ class MainActivity : AppCompatActivity() {
                 version = BuildConfig.VERSION_NAME,
             )
             node.start(config)
+            acquireMulticastLockIfDiscovering()
             if (node.state() == NodeState.SERVING) target else null
         } catch (e: Exception) {
             // Field reports of a blank first screen were undiagnosable while

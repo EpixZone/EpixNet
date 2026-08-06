@@ -43,6 +43,9 @@ tor = ["epix-runtime/tor"]
 # default; forwards to the runtime and activates the Config-page toggle.
 bridges = ["tor", "epix-runtime/bridges", "epix-ui/bridges"]
 i2p = ["epix-runtime/i2p"]
+# Reticulum mesh. Compiled into every build, phones included; the `mesh` config
+# key gates it and defaults to disable, so an unconfigured node spawns no mesh
+# task, binds no socket and writes no identity file.
 mesh = ["epix-runtime/mesh"]
 # BitTorrent bridge (desktop + Android). NOT in the mobile FFI default; the
 # Android build turns it on explicitly, the iOS build never passes it, so the
@@ -54,8 +57,12 @@ bittorrent = ["epix-runtime/bittorrent", "epix-ui/bittorrent", "dep:epix-bt"]
 # (it stays reachable over its onion/i2p service, which the `tor`/`i2p`
 # features host independently).
 inbound-seeding = ["epix-runtime/inbound-seeding"]
-# LAN peer discovery over UDP broadcast. Off on mobile (no LAN-broadcast on a
-# phone; it is battery/radio + a presence-leak with no benefit).
+# LAN peer discovery over UDP broadcast. Compiled into EVERY build, phones
+# included, so an isolated/air-gapped LAN needs no custom build. It is not on
+# by default anywhere: the `local_discovery` config key gates it and defaults
+# to off, because a participating node answers any stranger's discovery request
+# with the hashes of every xite it serves (and on a phone, wakes the radio on a
+# 5-minute tick). Operators turn it on per network.
 local-discovery = ["epix-runtime/local-discovery"]
 # i2p-embedded implies i2p, so the node's own #[cfg(feature = "i2p")] code
 # (config read, RuntimeConfig field) is compiled, not just the runtime's.

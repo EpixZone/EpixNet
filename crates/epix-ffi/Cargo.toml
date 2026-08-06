@@ -32,8 +32,26 @@ thiserror = "2"
 # footprint (~20 MB, low CPU), which is why it's on by default on a phone too.
 # The embedded router cross-compiles to mobile because emissary's reseeder can
 # use rustls instead of OpenSSL. Users can still switch it off in Config.
-default = ["tor", "i2p-embedded"]
+#
+# `mesh` and `local-discovery` are in the default too, so a phone carries the
+# two transports that work with no internet at all (an isolated LAN, an
+# air-gapped mesh). Both are inert until switched on in Config - `mesh`
+# defaults to disable and `local_discovery` to false, so an unconfigured phone
+# spawns no task and binds no socket for either. They cost ~12 crates
+# (`reticulum`, `tonic`, `prost` and support) on top of the hyper/tower stack
+# reqwest and arti already pull in.
+#
+# NOTE for the mobile shells: `local_discovery` also needs platform permission
+# to do anything. iOS drops local-network traffic without
+# NSLocalNetworkUsageDescription in Info.plist, and Android must hold a
+# WifiManager.MulticastLock to RECEIVE broadcast replies. Both are wired in
+# their shells; dropping either makes the feature compile but stay dead.
+default = ["tor", "i2p-embedded", "mesh", "local-discovery"]
 tor = ["epix-node/tor"]
+# Reticulum mesh transport (config-gated, default disable).
+mesh = ["epix-node/mesh"]
+# LAN peer discovery over UDP broadcast (config-gated, default off).
+local-discovery = ["epix-node/local-discovery"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. NOT in
 # `default`: only opted-in builds carry the IPtProxy (Go) dependency. Android
 # and iOS opt in via their build scripts once the artifact is vendored.

@@ -517,27 +517,6 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "7656",
         "text",
     ),
-    (
-        "Network",
-        "mesh",
-        "Reticulum mesh (reach and host peers over mesh links)",
-        "disable",
-        "select:Disable=disable|Enable=enable",
-    ),
-    (
-        "Network",
-        "mesh_peers",
-        "Mesh TCP interfaces to join (host:port, one per line)",
-        "",
-        "textarea",
-    ),
-    (
-        "Network",
-        "mesh_listen",
-        "Mesh TCP listen address (blank = do not accept mesh links over IP)",
-        "",
-        "text",
-    ),
     ("Network", "trackers", "Trackers", "145.223.69.23:26959", "textarea"),
     ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
     (
@@ -560,6 +539,41 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "Act as a tracker (answer other nodes' announces, incl. onion/i2p peers)",
         "enable",
         "select:Enable=enable|Disable=disable",
+    ),
+    // --- Offline & Mesh: the two transports that need no internet at all, kept
+    // in their own section because they are the answer to one question ("can
+    // this work with no connection?") and were previously lost among the Tor /
+    // I2P / tracker keys. Both are compiled into every build and default to
+    // off; the entries must stay CONTIGUOUS, since the Config page opens a new
+    // block each time the section name changes (a split would render the
+    // heading twice).
+    (
+        "Offline & Mesh",
+        "local_discovery",
+        "Find peers on the local network (UDP broadcast; needs no internet, tracker or DNS). Off by default: while on, this node answers anyone on the network with the list of xites it serves",
+        "false",
+        "bool",
+    ),
+    (
+        "Offline & Mesh",
+        "mesh",
+        "Reticulum mesh (reach and host peers over mesh links)",
+        "disable",
+        "select:Disable=disable|Enable=enable",
+    ),
+    (
+        "Offline & Mesh",
+        "mesh_peers",
+        "Mesh TCP interfaces to join (host:port, one per line) - only used when the mesh is enabled",
+        "",
+        "textarea",
+    ),
+    (
+        "Offline & Mesh",
+        "mesh_listen",
+        "Mesh TCP listen address (blank = do not accept mesh links over IP)",
+        "",
+        "text",
     ),
     // --- Optional Files: node-wide DEFAULTS for newly downloaded xites. Each
     // xite's own sidebar toggles override these per xite afterwards; changing
@@ -633,6 +647,7 @@ pub const CONFIG_RESTART_KEYS: &[&str] = &[
     "tor",
     "i2p",
     "i2p_sam_port",
+    "local_discovery",
     "mesh",
     "mesh_peers",
     "mesh_listen",
@@ -1042,6 +1057,15 @@ pub struct AppState {
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The per-run token that authorizes state-changing UI requests (config
+    /// saves, plugin toggles, restart). It is rendered into the mutating forms
+    /// and must come back on the POST. A hostile page can navigate the browser
+    /// anywhere, but the same-origin policy stops it READING a page it is not
+    /// allowed to read - so it cannot learn this value and cannot forge the
+    /// request. Not one-time (unlike a wrapper nonce): the settings pages are
+    /// re-submitted repeatedly, and rotating per render would break the back
+    /// button. Regenerated each run, so it does not persist to disk.
+    ui_csrf: std::sync::OnceLock<String>,
     /// Hosts allowed as WebSocket `Origin`s (a wrapper's Host is added when
     /// served), so a cross-origin page can't drive the local WS API.
     allowed_ws_origins: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1514,6 +1538,7 @@ impl AppState {
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            ui_csrf: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
             data_root: None,
@@ -1663,6 +1688,7 @@ impl AppState {
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            ui_csrf: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
             // The served-xite registry lives where Python's SiteManager keeps
@@ -13291,6 +13317,25 @@ impl AppState {
         self.wrapper_nonces.lock().unwrap().remove(nonce)
     }
 
+    /// This run's CSRF token, generated on first use. Rendered into every
+    /// state-changing UI form; [`Self::ui_csrf_valid`] checks it coming back.
+    pub fn ui_csrf_token(&self) -> &str {
+        self.ui_csrf.get_or_init(|| random_hex(32))
+    }
+
+    /// Whether `token` matches this run's CSRF token. Compared in constant
+    /// time: the comparison runs against attacker-supplied input, and an
+    /// early-exit `==` leaks how long a shared prefix was, which is enough to
+    /// recover the token byte by byte given enough attempts.
+    pub fn ui_csrf_valid(&self, token: &str) -> bool {
+        let expected = self.ui_csrf_token().as_bytes();
+        let got = token.as_bytes();
+        if expected.len() != got.len() {
+            return false;
+        }
+        expected.iter().zip(got).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    }
+
     /// Record a wrapper's Host as an allowed WebSocket origin (EpixNet adds
     /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
     pub fn allow_ws_origin(&self, host: &str) {
@@ -17898,6 +17943,56 @@ mod tests {
         let list = s.config_list().await;
         assert_eq!(list["offline"]["pending"], true);
         assert_eq!(list["language"]["pending"], false);
+    }
+
+    /// The offline-capable transports are compiled into every build (mobile
+    /// included), so what keeps them inert is their config default. Both must
+    /// stay off: a node that joins the LAN unasked answers any stranger's
+    /// discovery request with the hashes of every xite it serves.
+    #[test]
+    fn offline_capable_transports_default_to_off() {
+        let default_for = |key: &str| {
+            CONFIG_SCHEMA
+                .iter()
+                .find(|(_, k, ..)| *k == key)
+                .unwrap_or_else(|| panic!("{key} missing from CONFIG_SCHEMA"))
+                .3
+        };
+        assert_eq!(default_for("local_discovery"), "false");
+        assert_eq!(default_for("mesh"), "disable");
+        // Both are read once at boot, so a change must offer a restart.
+        for key in ["local_discovery", "mesh"] {
+            assert!(CONFIG_RESTART_KEYS.contains(&key), "{key} must be a restart key");
+        }
+        // Both must be reachable from the Config page, or "turn it on" means
+        // hand-editing config.json.
+        for key in ["local_discovery", "mesh", "mesh_peers", "mesh_listen"] {
+            assert!(
+                CONFIG_SCHEMA.iter().any(|(_, k, ..)| k == &key),
+                "{key} must be on the Config page"
+            );
+        }
+    }
+
+    /// The Config page opens a new block every time the section name changes,
+    /// so a section whose entries are not contiguous renders its heading twice
+    /// and splits the group in the UI.
+    #[test]
+    fn config_schema_sections_are_contiguous() {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut current = "";
+        for (section, ..) in CONFIG_SCHEMA {
+            if *section == current {
+                continue;
+            }
+            assert!(
+                !seen.contains(section),
+                "section {section:?} appears in two separate runs of CONFIG_SCHEMA - the \
+                 Config page would render its heading twice; keep each section's keys together"
+            );
+            seen.push(section);
+            current = section;
+        }
     }
 
     #[tokio::test]

@@ -73,6 +73,13 @@ pub struct RuntimeConfig {
     /// External I2P router's SAM TCP port (only used in `external` mode).
     #[cfg(feature = "i2p")]
     pub i2p_sam_port: u16,
+    /// LAN peer discovery over UDP broadcast (AnnounceLocal). Off by default:
+    /// the node answers discovery requests with the hashes of every xite it
+    /// serves, so participating is a presence disclosure to everyone on the
+    /// network - an opt-in, not a background default. Ignored without the
+    /// `local-discovery` feature.
+    #[cfg(feature = "local-discovery")]
+    pub local_discovery: bool,
     /// Reticulum mesh enable. Ignored without the `mesh` feature.
     #[cfg(feature = "mesh")]
     pub mesh_enabled: bool,
@@ -103,6 +110,8 @@ impl Default for RuntimeConfig {
             i2p_mode: "disable".to_string(),
             #[cfg(feature = "i2p")]
             i2p_sam_port: 7656,
+            #[cfg(feature = "local-discovery")]
+            local_discovery: false,
             #[cfg(feature = "mesh")]
             mesh_enabled: false,
             #[cfg(feature = "mesh")]
@@ -396,13 +405,19 @@ impl NodeRuntime {
         )));
         // AnnounceLocal: discover peers on the LAN over UDP broadcast. When the
         // file server is up, advertise its port so discovered peers can reach us.
+        // Opt-in (`local_discovery`): with it off nothing is spawned and no
+        // socket is bound, so the node is silent on the LAN rather than merely
+        // quiet - answering a stranger's discovery request would disclose which
+        // xites we serve.
         #[cfg(feature = "local-discovery")]
-        self.handles.push(tokio::spawn(local::local_discovery_loop(
-            self.state.clone(),
-            self.config.fileserver_port.unwrap_or(0),
-            self.shutdown.clone(),
-            Duration::from_secs(5 * 60),
-        )));
+        if self.config.local_discovery {
+            self.handles.push(tokio::spawn(local::local_discovery_loop(
+                self.state.clone(),
+                self.config.fileserver_port.unwrap_or(0),
+                self.shutdown.clone(),
+                Duration::from_secs(5 * 60),
+            )));
+        }
     }
 
     /// Signal the loops to stop and wait for them.

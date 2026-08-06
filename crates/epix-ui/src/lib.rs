@@ -124,8 +124,8 @@ impl UiServer {
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
             .route("/uimedia/{*path}", get(serve_uimedia))
-            .route("/Plugins", get(serve_plugins_page))
-            .route("/Config", get(serve_config_page))
+            .route("/Plugins", get(serve_plugins_page).post(serve_plugins_post))
+            .route("/Config", get(serve_config_page).post(serve_config_post))
             .route("/Stats", get(serve_stats_page))
             .route("/StatsJson", get(serve_stats_json))
             // The Backup & Restore wizard. Mutations are POSTed (passwords and
@@ -189,7 +189,7 @@ impl UiServer {
         #[cfg(feature = "ui-password")]
         let router = router
             .route("/Login", get(serve_login).post(serve_login_post))
-            .route("/Logout", get(serve_logout))
+            .route("/Logout", get(serve_logout_confirm).post(serve_logout))
             .layer(axum::middleware::from_fn_with_state(
                 self.ctx.clone(),
                 ui_password_gate,
@@ -437,6 +437,21 @@ Add it to the ui_host config key, or access the UI                  by IP."
             .into_response();
     }
 
+    // Unsafe methods must be same-origin, ALWAYS - this check is deliberately
+    // not behind `ui_check_cors`, which defaults off for a non-loopback bind
+    // and would leave a LAN-bound node with no protection at all.
+    //
+    // Browsers send `Origin` on every POST, including cross-origin form posts,
+    // and a page cannot forge or suppress it. Checking it here covers every
+    // mutating route (config, plugins, backup, logout) in one place, ahead of
+    // the per-handler CSRF token - so a route that forgets its token check is
+    // still not reachable from a hostile page.
+    if !matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS)
+        && !unsafe_method_is_same_origin(req.headers(), &host_raw)
+    {
+        return (StatusCode::FORBIDDEN, "Cross-origin write blocked").into_response();
+    }
+
     if ctx.state.ui_check_cors().await
         && is_cross_origin_request(&ctx, req.headers(), req.uri().path(), &host_raw).await
     {
@@ -444,6 +459,24 @@ Add it to the ui_host config key, or access the UI                  by IP."
     }
 
     next.run(req).await
+}
+
+/// Whether a state-changing request came from this node's own UI.
+///
+/// `Sec-Fetch-Site` is the primary signal (a browser sets it itself and script
+/// cannot override it); `Origin` is the fallback for clients that do not send
+/// it. A request carrying neither is accepted only because non-browser clients
+/// (the desktop shell's own fetches, curl, the admin socket) have no ambient
+/// credentials to abuse - the browser-driven attack this blocks always carries
+/// at least one of the two.
+fn unsafe_method_is_same_origin(headers: &header::HeaderMap, host: &str) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return site == "same-origin" || site == "none";
+    }
+    match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some(origin) => url_is_same_host(origin, host),
+        None => true,
+    }
 }
 
 /// EpixNet's `isHostAllowed`. The `.epix` wildcard covers transparent-proxy
@@ -1273,39 +1306,55 @@ async fn render_wrapper(
         .into_response()
 }
 
-/// `GET /Plugins` - the plugin manager page. Toggles are staged on the page
-/// and applied together via `?save=1&<name>=on|off` (the floating save bar);
-/// `?toggle=<name>` still flips one directly as the no-JS fallback. Either
-/// way the change takes effect on the next page load, no restart.
-async fn serve_plugins_page(
+/// `POST /Plugins` - apply staged toggles (`<name>=on|off`), or flip a single
+/// plugin (`toggle=<name>`, the no-JS fallback). Takes effect on the next page
+/// load, no restart.
+///
+/// POST-only for the same reason as [`serve_config_post`]: as a GET, any page
+/// could have navigated a hidden iframe at `/Plugins?save=1&UiConfig=off` and
+/// silently disabled this node's plugins, including the security-relevant ones.
+async fn serve_plugins_post(
     State(ctx): State<Ctx>,
-    Query(q): Query<std::collections::HashMap<String, String>>,
+    axum::extract::Form(q): axum::extract::Form<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Turning UiPluginManager off removes the page, not just its dashboard
-    // link: navigating straight to /Plugins (or its toggle/save query) is
-    // refused, so the only way back is server-side.
     if !ctx.state.plugin_enabled("UiPluginManager").await {
         return (StatusCode::FORBIDDEN, "The plugin manager is disabled on this node")
             .into_response();
+    }
+    if !q.get("csrf").is_some_and(|t| ctx.state.ui_csrf_valid(t)) {
+        return (StatusCode::FORBIDDEN, "Invalid or missing CSRF token").into_response();
     }
     if let Some(name) = q.get("toggle") {
         let enabled = ctx.state.plugin_enabled(name).await;
         ctx.state.set_plugin_enabled(name, !enabled).await;
         return Redirect::to("/Plugins").into_response();
     }
-    if q.contains_key("save") {
-        let known = ctx.state.plugin_states().await;
-        for (name, val) in &q {
-            if known.iter().any(|(n, _, _)| n == name) {
-                ctx.state.set_plugin_enabled(name, val == "on").await;
-            }
+    let known = ctx.state.plugin_states().await;
+    for (name, val) in &q {
+        if known.iter().any(|(n, _, _)| n == name) {
+            ctx.state.set_plugin_enabled(name, val == "on").await;
         }
-        return Redirect::to("/Plugins").into_response();
+    }
+    Redirect::to("/Plugins").into_response()
+}
+
+/// `GET /Plugins` - render the plugin manager page. Read-only: every toggle
+/// goes through [`serve_plugins_post`].
+async fn serve_plugins_page(State(ctx): State<Ctx>) -> Response {
+    // Turning UiPluginManager off removes the page, not just its dashboard
+    // link: navigating straight to /Plugins is refused, so the only way back
+    // is server-side.
+    if !ctx.state.plugin_enabled("UiPluginManager").await {
+        return (StatusCode::FORBIDDEN, "The plugin manager is disabled on this node")
+            .into_response();
     }
     let states = ctx.state.plugin_states().await;
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     let theme = ctx.state.theme_class().await;
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_plugins_page(&states, &homepage, &theme))
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        render_plugins_page(&states, &homepage, &theme, ctx.state.ui_csrf_token()),
+    )
         .into_response()
 }
 
@@ -1345,35 +1394,50 @@ fn plugin_description(name: &str) -> &'static str {
 /// plugin). With JS a click only stages the change and a floating save bar
 /// applies them together; the link href (`/Plugins?toggle=…`) stays as the
 /// no-JS fallback where each click applies directly.
-fn render_plugins_page(states: &[(String, bool, bool)], homepage: &str, theme: &str) -> String {
+fn render_plugins_page(
+    states: &[(String, bool, bool)],
+    homepage: &str,
+    theme: &str,
+    csrf: &str,
+) -> String {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let mut rows = String::new();
     for (name, enabled, default_enabled) in states {
         let checked = if *enabled { "checked" } else { "" };
         let default_txt = if *default_enabled { "enabled" } else { "disabled" };
+        // Each toggle is its own POST form (the no-JS path); the page script
+        // intercepts the click and stages the change instead. It used to be a
+        // plain link, which meant any page could flip a plugin off by pointing
+        // an iframe at it.
         rows.push_str(&format!(
             "<div class='plugin' data-name='{name}' data-enabled='{on}'>\
                <div class='title'><h3>{name}</h3>\
                  <div class='description'>{descr} <span class='default'>(default: {default_txt})</span></div></div>\
-               <a class='value value-right checkbox {checked}' href='/Plugins?toggle={name}' \
-                  title='Toggle {name}'><div class='checkbox-skin'></div></a>\
+               <form method='post' action='/Plugins' class='inline-form'>\
+                 <input type='hidden' name='csrf' value='{csrf}'>\
+                 <input type='hidden' name='toggle' value='{name}'>\
+                 <button class='value value-right checkbox {checked}' type='submit' \
+                    title='Toggle {name}'><div class='checkbox-skin'></div></button>\
+               </form>\
              </div>",
             name = esc(name),
             on = if *enabled { "1" } else { "0" },
             descr = esc(plugin_description(name)),
+            csrf = esc(csrf),
         ));
     }
     if rows.is_empty() {
         rows.push_str("<div class='description'>No plugins loaded.</div>");
     }
     let body = format!(
-        "<div class='plugins'>{rows}</div>\
+        "<div class='plugins' id='plugins-root' data-csrf='{csrf}'>{rows}</div>\
          <div class='bottom bottom-save' id='bottom-save'>\
            <div class='bottom-content'>\
              <div class='title'><span><span id='save-count'>0</span> <span id='save-what'>plugins</span> changed</span></div>\
              <a class='button button-submit' id='save-btn' href='#save'>Save changes</a>\
            </div>\
-         </div>{PLUGINS_PAGE_JS}"
+         </div>{PLUGINS_PAGE_JS}",
+        csrf = esc(csrf),
     );
     page_shell("Plugins", "Plugins", "", &body, homepage, theme)
 }
@@ -1391,7 +1455,7 @@ document.getElementById('save-what').textContent=n===1?'plugin':'plugins';\
 document.getElementById('bottom-save').classList.toggle('visible',n>0);\
 }\
 rows.forEach(function(row){\
-var a=row.querySelector('a.checkbox');if(!a)return;\
+var a=row.querySelector('button.checkbox');if(!a)return;\
 a.addEventListener('click',function(e){\
 e.preventDefault();\
 a.classList.toggle('checked');\
@@ -1404,25 +1468,38 @@ apply();\
 });\
 document.getElementById('save-btn').addEventListener('click',function(e){\
 e.preventDefault();\
-var q=Object.keys(changed).map(function(k){return encodeURIComponent(k)+'='+(changed[k]?'on':'off');});\
-if(q.length){location.href='/Plugins?save=1&'+q.join('&');}\
+var keys=Object.keys(changed);if(!keys.length)return;\
+var f=document.createElement('form');\
+f.method='post';f.action='/Plugins';\
+function add(n,v){var i=document.createElement('input');i.type='hidden';i.name=n;i.value=v;f.appendChild(i);}\
+add('csrf',document.getElementById('plugins-root').getAttribute('data-csrf'));\
+keys.forEach(function(k){add(k,changed[k]?'on':'off');});\
+document.body.appendChild(f);f.submit();\
 });\
 })();</script>";
 
-/// `GET /Config` - the node settings page. `?save=1&<key>=<value>` persists the
-/// changed keys (via configSet) and redirects back.
-async fn serve_config_page(
+/// `POST /Config` - persist changed keys (via configSet), or run an action
+/// button, then redirect back.
+///
+/// This is POST-only on purpose. It used to be `GET /Config?save=1&...`, which
+/// any page on the internet could trigger by navigating a hidden iframe at the
+/// node: that let a hostile page turn Tor off (deanonymizing a Tor-Always
+/// node), move the data directory, or restart the node in a loop, with no
+/// interaction beyond visiting the page. A GET is now inert, and the write
+/// needs both a same-origin request (checked in [`security_gate`]) and this
+/// run's CSRF token, which a foreign page cannot read.
+async fn serve_config_post(
     State(ctx): State<Ctx>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    axum::extract::Form(params): axum::extract::Form<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Turning UiConfig off removes the page, not just its dashboard link:
-    // navigating straight to /Config (or its action/save query) is refused, so
-    // node config can only be changed server-side.
     if !ctx.state.plugin_enabled("UiConfig").await {
         return (StatusCode::FORBIDDEN, "The configuration page is disabled on this node")
             .into_response();
     }
-    // Action buttons (e.g. Clear xID Cache) come back as `?action=<name>`.
+    if !params.get("csrf").is_some_and(|t| ctx.state.ui_csrf_valid(t)) {
+        return (StatusCode::FORBIDDEN, "Invalid or missing CSRF token").into_response();
+    }
+    // Action buttons (e.g. Clear xID Cache) come back as `action=<name>`.
     if let Some(action) = params.get("action") {
         if action == "xidClearCache" {
             // Drop the on-disk resolve cache, the display-name bindings, and
@@ -1444,38 +1521,52 @@ async fn serve_config_page(
         }
         return Redirect::to("/Config").into_response();
     }
-    if params.contains_key("save") {
-        // data_dir is special: it persists to epixnet.conf and copies the data
-        // to the new location, so its outcome is reported back on the page.
-        let mut flash: Option<(bool, String)> = None;
-        if let Some(dir) = params.get("data_dir") {
-            if dir.trim() != ctx.state.data_dir_value() {
-                flash = Some(match ctx.state.set_data_dir(dir).await {
-                    Ok(msg) => (true, msg),
-                    Err(e) => (false, e),
-                });
-            }
+    // data_dir is special: it persists to epixnet.conf and copies the data
+    // to the new location, so its outcome is reported back on the page.
+    let mut flash: Option<(bool, String)> = None;
+    if let Some(dir) = params.get("data_dir") {
+        if dir.trim() != ctx.state.data_dir_value() {
+            flash = Some(match ctx.state.set_data_dir(dir).await {
+                Ok(msg) => (true, msg),
+                Err(e) => (false, e),
+            });
         }
-        for (_section, key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
-            // Disabled ("coming soon") controls and action buttons aren't saved.
-            if *key == "data_dir" || kind.starts_with("soon:") || crate::state::is_config_action(kind) {
-                continue;
-            }
-            if *kind == "bool" {
-                // An unchecked checkbox isn't submitted, so absence means false.
-                let on = params.get(*key).map(|v| v == "on" || v == "true").unwrap_or(false);
-                ctx.state.config_set(key, Value::from(if on { "true" } else { "false" })).await;
-            } else if let Some(val) = params.get(*key) {
-                ctx.state.config_set(key, Value::from(val.as_str())).await;
-            }
+    }
+    for (_section, key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
+        // Disabled ("coming soon") controls and action buttons aren't saved.
+        if *key == "data_dir" || kind.starts_with("soon:") || crate::state::is_config_action(kind) {
+            continue;
         }
-        let to = match &flash {
-            Some((ok, msg)) => {
-                format!("/Config?{}={}", if *ok { "done" } else { "error" }, url_encode(msg))
-            }
-            None => "/Config".to_string(),
-        };
-        return Redirect::to(&to).into_response();
+        if *kind == "bool" {
+            // An unchecked checkbox isn't submitted, so absence means false.
+            let on = params.get(*key).map(|v| v == "on" || v == "true").unwrap_or(false);
+            ctx.state.config_set(key, Value::from(if on { "true" } else { "false" })).await;
+        } else if let Some(val) = params.get(*key) {
+            ctx.state.config_set(key, Value::from(val.as_str())).await;
+        }
+    }
+    let to = match &flash {
+        Some((ok, msg)) => {
+            format!("/Config?{}={}", if *ok { "done" } else { "error" }, url_encode(msg))
+        }
+        None => "/Config".to_string(),
+    };
+    Redirect::to(&to).into_response()
+}
+
+/// `GET /Config` - render the node settings page. Read-only: every mutation
+/// goes through [`serve_config_post`]. The query string is only ever a flash
+/// message (`?done=` / `?error=` / `?cleared=`) from that redirect.
+async fn serve_config_page(
+    State(ctx): State<Ctx>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // Turning UiConfig off removes the page, not just its dashboard link:
+    // navigating straight to /Config is refused, so node config can only be
+    // changed server-side.
+    if !ctx.state.plugin_enabled("UiConfig").await {
+        return (StatusCode::FORBIDDEN, "The configuration page is disabled on this node")
+            .into_response();
     }
     let mut values = Vec::new();
     for (section, key, label, default, kind) in crate::state::CONFIG_SCHEMA {
@@ -1507,7 +1598,15 @@ async fn serve_config_page(
     let theme = ctx.state.theme_class().await;
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        render_config_page(&values, &pending, can_restart, flash, &homepage, &theme),
+        render_config_page(
+            &values,
+            &pending,
+            can_restart,
+            flash,
+            &homepage,
+            &theme,
+            ctx.state.ui_csrf_token(),
+        ),
     )
         .into_response()
 }
@@ -1619,6 +1718,7 @@ fn render_config_page(
     flash: Option<(bool, String)>,
     homepage: &str,
     theme: &str,
+    csrf: &str,
 ) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;")
@@ -1672,9 +1772,15 @@ fn render_config_page(
         } else if let Some(opts) = kind.strip_prefix("select:") {
             render_select(key, opts, val, coming_soon)
         } else if let Some(action) = kind.strip_prefix("button:") {
-            // A standalone action link, not a stored value.
+            // An action, not a stored value. A submit button carrying
+            // `action=<name>` rather than a link: the action mutates state, so
+            // it must ride the settings form's POST (and its CSRF token). It
+            // cannot be its own <form> - this is rendered inside that form, and
+            // nested forms are invalid HTML. The handler branches on `action`
+            // before saving, so pressing it runs the action without also
+            // committing unsaved edits, exactly as the old link did.
             format!(
-                "<a class='button' href='/Config?action={action}'>{label}</a>",
+                "<button class='button' type='submit' name='action' value='{action}'>{label}</button>",
                 action = esc(action),
                 label = esc(label),
             )
@@ -1776,11 +1882,19 @@ fn render_config_page(
     // Without a registered relauncher (the mobile apps, where the node is a
     // library in the app process) there is no button - the bar just says the
     // change applies on the next start.
+    // Restarting is a state change, so it is a POST carrying the token, not a
+    // link - a link is reachable from any page that can navigate the browser.
+    // This bar sits outside the settings form, so it needs its own.
+    let restart_form = format!(
+        "<form method='post' action='/Config' class='inline-form'>\
+           <input type='hidden' name='csrf' value='{csrf}'>\
+           <input type='hidden' name='action' value='restart'>\
+           <button class='button button-submit' id='restart-btn' type='submit'>Restart EpixNet</button>\
+         </form>",
+        csrf = esc(csrf),
+    );
     let (restart_title, restart_button) = if can_restart {
-        (
-            "Some changed settings need a restart to apply",
-            "<a class='button button-submit' id='restart-btn' href='/Config?action=restart'>Restart EpixNet</a>",
-        )
+        ("Some changed settings need a restart to apply", restart_form.as_str())
     } else {
         ("Some changed settings apply after EpixNet restarts - close and reopen the app", "")
     };
@@ -1795,9 +1909,9 @@ fn render_config_page(
         data = if pending.is_empty() { "" } else { " data-pending='1'" },
     );
     let body = format!(
-        "{flash}<form method='get' action='/Config'>\
+        "{flash}<form method='post' action='/Config'>\
            {sections}\
-           <input type='hidden' name='save' value='1'>\
+           <input type='hidden' name='csrf' value='{csrf}'>\
            <noscript><button class='button button-submit' type='submit'>Save</button></noscript>\
            <div class='bottom bottom-save' id='bottom-save'>\
              <div class='bottom-content'>\
@@ -1805,7 +1919,8 @@ fn render_config_page(
                <button class='button button-submit' type='submit'>Save settings</button>\
              </div>\
            </div>\
-         </form>{restart_bar}{CONFIG_PAGE_JS}"
+         </form>{restart_bar}{CONFIG_PAGE_JS}",
+        csrf = esc(csrf),
     );
     page_shell("Configuration", "Configuration", "", &body, homepage, theme)
 }
@@ -3102,9 +3217,40 @@ async fn serve_login_post(State(ctx): State<Ctx>, body: String) -> Response {
     }
 }
 
-/// `GET /Logout` - drop the current session and clear the cookie.
+/// `GET /Logout` - a confirmation form, not the logout itself.
+///
+/// Ending the session is a state change, so it cannot ride a GET: any page
+/// could otherwise log the operator out by pointing an image or iframe at this
+/// URL. Nothing in the UI links here (it is a typed URL), so rather than answer
+/// a navigation with 405 we render the button that POSTs.
 #[cfg(feature = "ui-password")]
-async fn serve_logout(headers: header::HeaderMap) -> Response {
+async fn serve_logout_confirm(State(ctx): State<Ctx>) -> Response {
+    let theme = ctx.state.theme_class().await;
+    let body = format!(
+        "<form method='post' action='/Logout'>\
+           <input type='hidden' name='csrf' value='{csrf}'>\
+           <p class='sub'>End this session on the node?</p>\
+           <button class='button button-submit' type='submit'>Log out</button>\
+         </form>",
+        csrf = ctx.state.ui_csrf_token(),
+    );
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        page_shell("Log out", "Log out", "", &body, "", &theme),
+    )
+        .into_response()
+}
+
+/// `POST /Logout` - drop the current session and clear the cookie.
+#[cfg(feature = "ui-password")]
+async fn serve_logout(
+    State(ctx): State<Ctx>,
+    headers: header::HeaderMap,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !form.get("csrf").is_some_and(|t| ctx.state.ui_csrf_valid(t)) {
+        return (StatusCode::FORBIDDEN, "Invalid or missing CSRF token").into_response();
+    }
     let cookie = headers.get(header::COOKIE).and_then(|v| v.to_str().ok());
     uipassword::session_delete(&uipassword::cookie_session_id(cookie));
     (
@@ -3182,6 +3328,86 @@ async fn serve_benchmark(Query(q): Query<BenchmarkQuery>) -> Response {
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], report).into_response()
 }
 
+
+/// The CSRF gate. These pin the fix for a real hole: `/Config?save=1&...` and
+/// `/Plugins?save=1&...` used to be state-changing GETs, so any page on the
+/// internet could point a hidden iframe at the node and silently turn Tor off,
+/// move the data directory, disable plugins, or restart the node in a loop.
+#[cfg(test)]
+mod csrf_tests {
+    use super::unsafe_method_is_same_origin;
+    use axum::http::header::{HeaderMap, HeaderName, HeaderValue};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn a_hostile_pages_form_post_is_rejected() {
+        // The classic CSRF shape: a form on evil.example auto-submitting to the
+        // node. The browser sets Origin itself and script cannot forge it.
+        let h = headers(&[("origin", "https://evil.example")]);
+        assert!(!unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        // Sec-Fetch-Site is decisive even when an Origin looks plausible.
+        let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "http://127.0.0.1:42222")]);
+        assert!(!unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+    }
+
+    #[test]
+    fn the_nodes_own_pages_still_post() {
+        let h = headers(&[("sec-fetch-site", "same-origin")]);
+        assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        // Older browsers send no Sec-Fetch-Site; Origin carries it instead.
+        let h = headers(&[("origin", "http://127.0.0.1:42222")]);
+        assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        // A LAN bind is the same case with a different host.
+        let h = headers(&[("origin", "http://192.168.1.9:42222")]);
+        assert!(unsafe_method_is_same_origin(&h, "192.168.1.9:42222"));
+    }
+
+    #[test]
+    fn non_browser_clients_are_not_locked_out() {
+        // curl / the desktop shell / the admin socket send neither header and
+        // carry no ambient cookie for a hostile page to ride.
+        assert!(unsafe_method_is_same_origin(&headers(&[]), "127.0.0.1:42222"));
+        // A browser-initiated top-level POST to a typed URL reports "none".
+        let h = headers(&[("sec-fetch-site", "none")]);
+        assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+    }
+}
+
+#[cfg(test)]
+mod csrf_token_tests {
+    use crate::AppState;
+
+    #[test]
+    fn the_token_is_unguessable_stable_and_compared_exactly() {
+        let s = AppState::new("test");
+        let token = s.ui_csrf_token().to_string();
+        // 32 random bytes, hex - not a counter a caller could predict.
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        // Stable within a run, so a form stays submittable.
+        assert_eq!(s.ui_csrf_token(), token);
+        assert!(s.ui_csrf_valid(&token));
+        // A near-miss, an empty string, and a prefix all fail.
+        assert!(!s.ui_csrf_valid(""));
+        assert!(!s.ui_csrf_valid(&token[..63]));
+        let mut wrong = token.clone();
+        wrong.pop();
+        wrong.push(if token.ends_with('a') { 'b' } else { 'a' });
+        assert!(!s.ui_csrf_valid(&wrong));
+        // Distinct per node (per run).
+        assert_ne!(AppState::new("test").ui_csrf_token(), token);
+    }
+}
 
 #[cfg(test)]
 mod gateway_tests {
