@@ -60,13 +60,33 @@ import uniffi.epix_ffi.TorStatus
 class MainActivity : AppCompatActivity() {
 
     private lateinit var geckoView: GeckoView
-    private lateinit var session: GeckoSession
     private lateinit var addressBar: EditText
     private lateinit var torBadge: GradientDrawable
     private lateinit var runtime: GeckoRuntime
     private val node = EpixNode()
     private val scope = CoroutineScope(Dispatchers.Main)
-    private var canGoBack = false
+
+    /** One open tab: its Gecko session and the per-tab navigation state. */
+    private class Tab(val session: GeckoSession) {
+        var url: String = ""
+        var title: String = ""
+        var canGoBack = false
+        var canGoForward = false
+    }
+
+    /// Open tabs, in creation order. Never empty once onCreate has run.
+    private val tabs = mutableListOf<Tab>()
+    private var currentTabIndex = 0
+    private val currentTab: Tab get() = tabs[currentTabIndex]
+    private lateinit var backButton: TextView
+    private lateinit var forwardButton: TextView
+    private lateinit var tabCountView: TextView
+    /// The address-bar row and bottom toolbar, for scroll-away chrome.
+    private lateinit var topBar: View
+    private lateinit var bottomBar: View
+    private var chromeHidden = false
+    private var lastTouchY = 0f
+    private var touchAccum = 0f
     private var currentDisplay: String = ""
     /// Route clearnet browsing through the node's Tor SOCKS listener. Default
     /// on (opt-out), like the desktop extension. Persisted across launches.
@@ -119,7 +139,58 @@ class MainActivity : AppCompatActivity() {
 
         runtime = GeckoRuntime.getDefault(this)
         installWallet()
-        session = GeckoSession().apply { open(runtime) }
+        newTab(GeckoSession().apply { open(runtime) })
+        // The page, not the address bar, starts focused - otherwise the
+        // keyboard pops over the app on every launch.
+        geckoView.requestFocus()
+
+        // The xite to open: from an epix:// launch intent, else the dashboard.
+        val target = intentTarget(intent) ?: "dashboard.epix"
+
+        scope.launch {
+            // Apply the saved clearnet-through-Tor routing before the first page
+            // load, so clearnet requests are proxied from the start. Loopback
+            // (the dashboard and every .epix page) is exempt, so this is safe to
+            // set before the node is up.
+            applyClearnetRouting()
+            val display = bootNode(target)
+            // Load the dashboard even if boot reported a problem: the node
+            // serves its own loading/error wrapper on loopback, which is more
+            // useful than a blank page and lets the user retry.
+            currentDisplay = display ?: target
+            // Don't hand GeckoView the URL until loopback actually accepts
+            // (the desktop launcher's wait_for_port): a refused first
+            // connection renders as a silent blank page. The node now binds
+            // before start() returns, so this passes immediately - it guards
+            // the boot-failed path and anything else that delays the bind.
+            // From here the next page-stop is a real page, so let it drop the
+            // splash (about:blank already came and went).
+            nodePageRequested = true
+            if (awaitUiPort()) {
+                currentTab.session.loadUri(nodeUrl(currentDisplay))
+            } else {
+                currentTab.session.loadUri(errorPage())
+            }
+        }
+
+        // Reflect the Tor state in the icon's badge, at the extension's cadence.
+        scope.launch {
+            while (true) {
+                torStatus()?.let { torBadge.setColor(colorFor(it)) }
+                delay(5_000)
+            }
+        }
+    }
+
+    /**
+     * Create a tab around `session`, wire its delegates, and select it.
+     *
+     * `session` may be open (a user-created tab) or not yet open (a session
+     * returned from onNewSession, which the engine opens itself after we
+     * return it).
+     */
+    private fun newTab(session: GeckoSession, select: Boolean = true): Tab {
+        val tab = Tab(session)
         session.navigationDelegate = object : GeckoSession.NavigationDelegate {
             override fun onLocationChange(
                 session: GeckoSession,
@@ -127,13 +198,54 @@ class MainActivity : AppCompatActivity() {
                 perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>,
                 hasUserGesture: Boolean,
             ) {
-                if (url != null && !addressBar.hasFocus()) {
+                if (url == null) return
+                tab.url = url
+                if (tab === currentTab && !addressBar.hasFocus()) {
                     addressBar.setText(friendlyUrl(url))
                 }
             }
 
             override fun onCanGoBack(session: GeckoSession, value: Boolean) {
-                canGoBack = value
+                tab.canGoBack = value
+                if (tab === currentTab) backButton.alpha = if (value) 1f else DISABLED_ALPHA
+            }
+
+            override fun onCanGoForward(session: GeckoSession, value: Boolean) {
+                tab.canGoForward = value
+                if (tab === currentTab) forwardButton.alpha = if (value) 1f else DISABLED_ALPHA
+            }
+
+            override fun onLoadRequest(
+                session: GeckoSession,
+                request: GeckoSession.NavigationDelegate.LoadRequest,
+            ): GeckoResult<org.mozilla.geckoview.AllowOrDeny>? {
+                val rewritten = xiteRewrite(request.uri) ?: return null
+                session.loadUri(rewritten)
+                return GeckoResult.deny()
+            }
+
+            override fun onSubframeLoadRequest(
+                session: GeckoSession,
+                request: GeckoSession.NavigationDelegate.LoadRequest,
+            ): GeckoResult<org.mozilla.geckoview.AllowOrDeny>? {
+                // A frame (the wrapper's content iframe) navigating to another
+                // xite is a page change: send the whole tab there.
+                val rewritten = xiteRewrite(request.uri) ?: return null
+                session.loadUri(rewritten)
+                return GeckoResult.deny()
+            }
+
+            override fun onNewSession(
+                session: GeckoSession,
+                uri: String,
+            ): GeckoResult<GeckoSession> {
+                // target=_blank / window.open: a new tab. The returned session
+                // must not be open - the engine opens it after this returns,
+                // so attach it to the view a beat later.
+                val popup = GeckoSession()
+                newTab(popup, select = false)
+                geckoView.post { showTab(tabs.size - 1) }
+                return GeckoResult.fromValue(popup)
             }
 
             override fun onLoadError(
@@ -175,47 +287,107 @@ class MainActivity : AppCompatActivity() {
         // confirms). WKWebView handles these natively on iOS; this is the
         // Android equivalent, backed by plain AlertDialogs.
         session.promptDelegate = buildPromptDelegate()
-        geckoView.setSession(session)
-        // The page, not the address bar, starts focused - otherwise the
-        // keyboard pops over the app on every launch.
-        geckoView.requestFocus()
+        session.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onTitleChange(session: GeckoSession, title: String?) {
+                tab.title = title ?: ""
+            }
 
-        // The xite to open: from an epix:// launch intent, else the dashboard.
-        val target = intentTarget(intent) ?: "dashboard.epix"
-
-        scope.launch {
-            // Apply the saved clearnet-through-Tor routing before the first page
-            // load, so clearnet requests are proxied from the start. Loopback
-            // (the dashboard and every .epix page) is exempt, so this is safe to
-            // set before the node is up.
-            applyClearnetRouting()
-            val display = bootNode(target)
-            // Load the dashboard even if boot reported a problem: the node
-            // serves its own loading/error wrapper on loopback, which is more
-            // useful than a blank page and lets the user retry.
-            currentDisplay = display ?: target
-            // Don't hand GeckoView the URL until loopback actually accepts
-            // (the desktop launcher's wait_for_port): a refused first
-            // connection renders as a silent blank page. The node now binds
-            // before start() returns, so this passes immediately - it guards
-            // the boot-failed path and anything else that delays the bind.
-            // From here the next page-stop is a real page, so let it drop the
-            // splash (about:blank already came and went).
-            nodePageRequested = true
-            if (awaitUiPort()) {
-                session.loadUri(nodeUrl(currentDisplay))
-            } else {
-                session.loadUri(errorPage())
+            override fun onCloseRequest(session: GeckoSession) {
+                // window.close() from a script-opened tab.
+                closeTab(tabs.indexOf(tab))
             }
         }
+        tabs.add(tab)
+        tabCountView.text = tabs.size.toString()
+        if (select) showTab(tabs.size - 1)
+        return tab
+    }
 
-        // Reflect the Tor state in the icon's badge, at the extension's cadence.
-        scope.launch {
-            while (true) {
-                torStatus()?.let { torBadge.setColor(colorFor(it)) }
-                delay(5_000)
-            }
+    /** Put tab `index` on screen and sync the chrome to it. */
+    private fun showTab(index: Int) {
+        if (index !in tabs.indices) return
+        currentTabIndex = index
+        setChromeHidden(false)
+        val tab = currentTab
+        if (geckoView.session !== tab.session) {
+            geckoView.releaseSession()
+            geckoView.setSession(tab.session)
         }
+        if (!addressBar.hasFocus()) addressBar.setText(friendlyUrl(tab.url))
+        backButton.alpha = if (tab.canGoBack) 1f else DISABLED_ALPHA
+        forwardButton.alpha = if (tab.canGoForward) 1f else DISABLED_ALPHA
+        tabCountView.text = tabs.size.toString()
+    }
+
+    /** Close tab `index`. The browser always keeps at least one tab. */
+    private fun closeTab(index: Int) {
+        if (index !in tabs.indices) return
+        val tab = tabs[index]
+        if (tabs.size == 1) {
+            // Last tab: reuse it for a fresh dashboard rather than exiting.
+            currentDisplay = "dashboard.epix"
+            tab.session.loadUri(nodeUrl(currentDisplay))
+            return
+        }
+        if (geckoView.session === tab.session) geckoView.releaseSession()
+        tabs.removeAt(index)
+        tab.session.close()
+        val next = if (currentTabIndex >= index && currentTabIndex > 0) {
+            currentTabIndex - 1
+        } else {
+            currentTabIndex
+        }
+        showTab(next.coerceIn(0, tabs.size - 1))
+    }
+
+    /** The tab list: tap a row to switch, its ✕ to close, or open a new tab. */
+    private fun showTabSwitcher() {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+        lateinit var dialog: AlertDialog
+        tabs.forEachIndexed { i, tab ->
+            val name = tab.title.ifEmpty {
+                tab.url.removePrefix("$NODE_BASE/").trimEnd('/').ifEmpty { "New tab" }
+            }
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(
+                label(if (i == currentTabIndex) "● $name" else name).apply {
+                    isSingleLine = true
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setOnClickListener {
+                        dialog.dismiss()
+                        showTab(i)
+                    }
+                },
+                LinearLayout.LayoutParams(0, -2, 1f),
+            )
+            row.addView(
+                label("✕").apply {
+                    setPadding(dp(16), dp(4), dp(4), dp(4))
+                    contentDescription = "Close tab"
+                    setOnClickListener {
+                        dialog.dismiss()
+                        closeTab(i)
+                    }
+                },
+            )
+            layout.addView(row)
+        }
+        dialog = AlertDialog.Builder(this)
+            .setTitle("Tabs")
+            .setView(layout)
+            .setPositiveButton("New tab") { _, _ ->
+                currentDisplay = "dashboard.epix"
+                newTab(GeckoSession().apply { open(runtime) })
+                currentTab.session.loadUri(nodeUrl(currentDisplay))
+            }
+            .setNegativeButton("Close", null)
+            .show()
     }
 
     /** Content prompt UI (selects, alert/confirm/prompt) over AlertDialogs. */
@@ -427,18 +599,66 @@ class MainActivity : AppCompatActivity() {
         }
     }.getOrNull()
 
+    /**
+     * Scroll-away chrome, the way phone browsers give the page the whole
+     * screen: dragging up (the page scrolling down) hides the address bar and
+     * toolbar, dragging down brings them back. Driven by the raw touch stream
+     * rather than the page's scroll position, because xites scroll inside the
+     * wrapper's iframe (or their own panels) where the engine reports nothing.
+     */
+    override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
+        // Not while booting (the splash swallows taps) or typing an address.
+        if (splashOverlay != null || addressBar.hasFocus()) {
+            return super.dispatchTouchEvent(ev)
+        }
+        when (ev.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                lastTouchY = ev.rawY
+                touchAccum = 0f
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                val dy = ev.rawY - lastTouchY
+                lastTouchY = ev.rawY
+                // A direction flip starts a fresh gesture measurement.
+                if ((dy < 0f) != (touchAccum < 0f)) touchAccum = 0f
+                touchAccum += dy
+                if (touchAccum < -dp(48)) {
+                    setChromeHidden(true)
+                    touchAccum = 0f
+                } else if (touchAccum > dp(48)) {
+                    setChromeHidden(false)
+                    touchAccum = 0f
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    /** Slide the chrome away (or back); the page gets the freed space. */
+    private fun setChromeHidden(hidden: Boolean) {
+        if (chromeHidden == hidden) return
+        chromeHidden = hidden
+        val visibility = if (hidden) View.GONE else View.VISIBLE
+        topBar.visibility = visibility
+        bottomBar.visibility = visibility
+    }
+
     /** Hardware/gesture back navigates the page history first. */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        if (canGoBack) session.goBack() else @Suppress("DEPRECATION") super.onBackPressed()
+        if (currentTab.canGoBack) {
+            currentTab.session.goBack()
+        } else {
+            @Suppress("DEPRECATION") super.onBackPressed()
+        }
     }
 
-    /** A second epix:// link while running: navigate the existing session. */
+    /** A second epix:// link while running: navigate the current tab. */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         val target = intentTarget(intent) ?: return
         currentDisplay = target
-        session.loadUri(nodeUrl(target))
+        currentTab.session.loadUri(nodeUrl(target))
     }
 
     /** The browser chrome: address bar + Epix icon on top, the page below. */
@@ -447,6 +667,8 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             fitsSystemWindows = true
             setBackgroundColor(COLOR_CHROME_BG)
+            // Animates the chrome sliding away/back (setChromeHidden).
+            layoutTransition = android.animation.LayoutTransition()
         }
 
         val bar = LinearLayout(this).apply {
@@ -518,13 +740,68 @@ class MainActivity : AppCompatActivity() {
         }
         bar.addView(holder, LinearLayout.LayoutParams(dp(44), dp(44)))
 
+        topBar = bar
         root.addView(bar, LinearLayout.LayoutParams(-1, -2))
         geckoView = GeckoView(this)
         // Dark until the page's first paint; GeckoView otherwise flashes
         // white while the node boots and the page loads.
         geckoView.coverUntilFirstPaint(COLOR_CHROME_BG)
         root.addView(geckoView, LinearLayout.LayoutParams(-1, 0, 1f))
+        bottomBar = buildToolbar()
+        root.addView(bottomBar, LinearLayout.LayoutParams(-1, -2))
         return root
+    }
+
+    /** The bottom toolbar: back, forward, reload, and the tab switcher. */
+    private fun buildToolbar(): View {
+        fun button(glyph: String, description: String, onTap: () -> Unit): TextView =
+            TextView(this).apply {
+                text = glyph
+                textSize = 22f
+                setTextColor(COLOR_TEXT)
+                gravity = Gravity.CENTER
+                contentDescription = description
+                setPadding(0, dp(6), 0, dp(10))
+                setOnClickListener { onTap() }
+            }
+
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(COLOR_CHROME_BG)
+        }
+        backButton = button("‹", "Back") {
+            if (currentTab.canGoBack) currentTab.session.goBack()
+        }
+        forwardButton = button("›", "Forward") {
+            if (currentTab.canGoForward) currentTab.session.goForward()
+        }
+        val reload = button("⟳", "Reload") { currentTab.session.reload() }
+        backButton.alpha = DISABLED_ALPHA
+        forwardButton.alpha = DISABLED_ALPHA
+        // The tab button: the open-tab count in a rounded square, like every
+        // mobile browser's switcher button.
+        tabCountView = TextView(this).apply {
+            text = "1"
+            textSize = 13f
+            setTextColor(COLOR_TEXT)
+            gravity = Gravity.CENTER
+            contentDescription = "Tabs"
+            background = GradientDrawable().apply {
+                cornerRadius = dp(6).toFloat()
+                setStroke(dp(2), COLOR_TEXT)
+            }
+            setOnClickListener { showTabSwitcher() }
+        }
+        for (b in listOf(backButton, forwardButton, reload)) {
+            bar.addView(b, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        val holder = FrameLayout(this).apply {
+            addView(tabCountView, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
+            setPadding(0, dp(6), 0, dp(10))
+        }
+        bar.addView(holder, LinearLayout.LayoutParams(0, -2, 1f))
+        return bar
     }
 
     /**
@@ -604,7 +881,7 @@ class MainActivity : AppCompatActivity() {
             // Everything else - bare words, phrases - searches DuckDuckGo.
             else -> searchUrl(t)
         }
-        session.loadUri(url)
+        currentTab.session.loadUri(url)
         addressBar.clearFocus()
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(addressBar.windowToken, 0)
@@ -623,8 +900,51 @@ class MainActivity : AppCompatActivity() {
         return rest
     }
 
+    /**
+     * The loopback path-form URL for a link only EpixNet can resolve: an
+     * `epix://` link, a `https://….epix` host, or a bare `epix1…` address
+     * host. The desktop Epix Browser follows these through its PAC; here the
+     * node serves the same xite in path form off loopback, so rewrite
+     * `https://talk.epix/some/page` to `http://127.0.0.1:…/talk.epix/some/page`.
+     * Null for ordinary URLs.
+     */
+    private fun xiteRewrite(uri: String?): String? {
+        if (uri == null) return null
+        val parsed = Uri.parse(uri)
+        val host = when (parsed.scheme?.lowercase()) {
+            "epix" -> parsed.host ?: uri.removePrefix("epix://").substringBefore('/')
+            "http", "https" -> {
+                val h = parsed.host?.lowercase() ?: return null
+                if (h.endsWith(".epix") || XITE_ADDRESS.matches(h)) h else return null
+            }
+            else -> return null
+        }
+        if (host.isEmpty()) return null
+        val path = parsed.encodedPath.orEmpty().ifEmpty { "/" }
+        val query = parsed.encodedQuery?.let { "?$it" }.orEmpty()
+        val fragment = parsed.encodedFragment?.let { "#$it" }.orEmpty()
+        return "$NODE_BASE/$host$path$query$fragment"
+    }
+
+    /**
+     * Mark the node data as browser-hosted: serverInfo reports `epix_browser`
+     * (and the clearnet-through-Tor state) from this file, and xite pages use
+     * that to know xite links can be followed instead of warning that the
+     * Epix Browser is missing (EpixTalk's link guard). The desktop native
+     * host writes the same file next to the node data.
+     */
+    private fun writeBrowserSettings() {
+        runCatching {
+            val file = java.io.File(filesDir, "browser-settings.json")
+            val current = runCatching { JSONObject(file.readText()) }.getOrNull() ?: JSONObject()
+            current.put("tor_clearnet", torClearnet)
+            file.writeText(current.toString())
+        }
+    }
+
     /** Boot the node off the main thread; return the display name to open. */
     private suspend fun bootNode(target: String): String? = withContext(Dispatchers.IO) {
+        writeBrowserSettings()
         try {
             val config = NodeConfig(
                 dataDir = filesDir.absolutePath,
@@ -880,7 +1200,7 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     walletDialog?.dismiss()
                     currentDisplay = "Config"
-                    session.loadUri("$NODE_BASE/Config")
+                    currentTab.session.loadUri("$NODE_BASE/Config")
                 }
                 JSONObject().put("ok", true)
             }
@@ -1096,6 +1416,7 @@ class MainActivity : AppCompatActivity() {
         if (torClearnet == on) return
         torClearnet = on
         getPreferences(Context.MODE_PRIVATE).edit().putBoolean(PREF_TOR_CLEARNET, on).apply()
+        scope.launch(Dispatchers.IO) { writeBrowserSettings() }
         applyClearnetRouting()
         // The badge reflects the new routing state at once, not on the next poll.
         torBadge.setColor(if (on) COLOR_ROUTED else COLOR_READY)
@@ -1172,6 +1493,12 @@ class MainActivity : AppCompatActivity() {
         // How many failed loads of the node's own UI are retried (each retry
         // first waits for the port) before the inline error page shows.
         private const val MAX_NODE_LOAD_RETRIES = 5
+
+        // A bare bech32 xite address used as a hostname
+        private val XITE_ADDRESS = Regex("^epix1[a-z0-9]{20,}$")
+
+        // Toolbar buttons dim to this when their action is unavailable.
+        private const val DISABLED_ALPHA = 0.35f
 
         // Where address-bar searches go. Clearnet, so it follows the
         // clearnet-through-Tor routing like any other non-.epix page.
