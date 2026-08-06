@@ -210,14 +210,14 @@ mod tests {
     }
 
     #[test]
-    fn sign_keeps_declared_optional_entries_for_absent_files() {
+    fn sign_prunes_absent_optional_entries_unless_told_to_keep() {
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let mut xite = Xite::new(Address::parse(address).unwrap(), XiteStorage::new(dir.path()));
-        // gone.jpg is declared optional but was never downloaded; new.jpg is a
-        // fresh match on disk.
+        // gone.jpg is declared optional but not on disk (deleted, or never
+        // downloaded); new.jpg is a fresh match on disk.
         xite.storage.write("new.jpg", b"NEW").unwrap();
         let content = serde_json::to_vec(&json!({
             "optional": ".*jpg",
@@ -227,13 +227,25 @@ mod tests {
         xite.storage.write("content.json", &content).unwrap();
         xite.content = Some(serde_json::from_slice(&content).unwrap());
 
-        xite.sign(priv_hex, 1777992698.0).unwrap();
-
-        let content = xite.content.clone().unwrap();
-        let optional = content["files_optional"].as_object().unwrap();
+        // A signer that does not hold every optional file keeps the entry
+        // with --keep-missing.
+        xite.sign_opts(
+            priv_hex,
+            1777992698.0,
+            SignOpts { keep_missing_optional: true, ..Default::default() },
+        )
+        .unwrap();
+        let kept = xite.content.clone().unwrap();
+        let optional = kept["files_optional"].as_object().unwrap();
         assert_eq!(optional["gone.jpg"], json!({ "size": 3, "sha512": "aa" }));
         assert_eq!(optional["new.jpg"]["sha512"], XiteStorage::hash_bytes(b"NEW"));
-        assert!(content["files"].as_object().unwrap().is_empty());
+        assert!(kept["files"].as_object().unwrap().is_empty());
+
+        // A plain sign prunes it: the deletion leaves the manifest.
+        xite.sign(priv_hex, 1777992699.0).unwrap();
+        let pruned = xite.content.clone().unwrap();
+        assert!(pruned["files_optional"].get("gone.jpg").is_none());
+        assert!(pruned["files_optional"].get("new.jpg").is_some());
     }
 
     #[test]

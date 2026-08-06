@@ -80,14 +80,15 @@ struct CachedHash {
 
 type SignCache = std::collections::HashMap<String, CachedHash>;
 
-/// Per-invocation sign options (`siteSign --full`, `--prune-optional`).
+/// Per-invocation sign options (`siteSign --full`, `--keep-missing`).
 #[derive(Clone, Copy, Default)]
 pub struct SignOpts {
     /// Re-read every file instead of trusting the stat cache.
     pub full: bool,
-    /// Drop declared optional entries whose file is gone from disk, so a
-    /// deletion actually leaves the manifest.
-    pub prune_missing_optional: bool,
+    /// Keep declared optional entries whose file is gone from disk instead
+    /// of pruning them (the default). For signers that deliberately do not
+    /// hold every optional file, e.g. a node whose eviction wiped some.
+    pub keep_missing_optional: bool,
 }
 
 /// A file's (size, mtime_ns), or `None` when it cannot be stat'd. Taken
@@ -803,20 +804,21 @@ impl Xite {
 
         // Files already declared optional stay optional; new files matching the
         // content's `optional` pattern sign as optional; everything else on
-        // disk (minus content.json units) becomes a required file. Carrying
-        // absent entries forward is deliberate - a signer need not HOLD every
-        // optional file - but it also means a deletion never leaves the
-        // manifest, and every peer that once held the file re-queues a
-        // download nobody can serve (the media xite purged 13 films and its
-        // own seeder sat at "updating: 13 left" forever). `prune_missing
-        // optional` drops declared entries whose file is gone from disk - an
-        // explicit owner action (siteSign --prune-optional), never a default.
+        // disk (minus content.json units) becomes a required file. A declared
+        // optional entry whose file is gone from disk is pruned by default,
+        // so a deletion actually leaves the manifest - carrying it forward
+        // meant every peer that once held the file re-queued a download
+        // nobody could serve (the media xite purged 13 films and its own
+        // seeder sat at "updating: 13 left" forever). A signer that
+        // deliberately does not hold every optional file (e.g. eviction wiped
+        // some) opts out with `keep_missing_optional` (siteSign
+        // --keep-missing).
         let mut declared_optional: serde_json::Map<String, Value> = content
             .get("files_optional")
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
-        if opts.prune_missing_optional {
+        if !opts.keep_missing_optional {
             declared_optional.retain(|rel, _| self.storage.exists(rel));
         }
         // Declared merge files (posts.json) are re-emitted untouched (`sign`
@@ -1593,12 +1595,12 @@ mod tests {
         );
     }
 
-    /// A deleted optional file stays declared by default (a signer need not
-    /// hold every optional file), so peers that once held it re-queue a
-    /// download nobody can serve. --prune-optional is the owner's way to make
-    /// a deletion real: the entry leaves the manifest.
+    /// A deleted optional file leaves the manifest on the next sign by
+    /// default - carrying it forward meant peers that once held it re-queued
+    /// a download nobody could serve. --keep-missing is the opt-out for a
+    /// signer that deliberately does not hold every optional file.
     #[test]
-    fn prune_optional_lets_a_deletion_leave_the_manifest() {
+    fn a_sign_prunes_deleted_optional_files_unless_kept() {
         let pk = epix_crypt::new_seed();
         let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1611,18 +1613,18 @@ mod tests {
         xite.content = Some(serde_json::json!({ "optional": "video/.*" }));
         xite.sign(&pk, 1000.0).unwrap();
 
-        // Delete one film. A plain re-sign carries its entry forward.
+        // Delete one film. A keep-missing sign carries its entry forward.
         std::fs::remove_file(storage.path("video/purged.bin").unwrap()).unwrap();
-        xite.sign(&pk, 1001.0).unwrap();
+        xite.sign_opts(&pk, 1001.0, SignOpts { keep_missing_optional: true, ..Default::default() })
+            .unwrap();
         let carried = xite.content.clone().unwrap();
         assert!(
             carried["files_optional"].get("video/purged.bin").is_some(),
-            "default sign keeps the declared entry (a signer need not hold it)"
+            "--keep-missing keeps the declared entry (a signer need not hold it)"
         );
 
-        // A prune sign drops it, and keeps what is still on disk.
-        xite.sign_opts(&pk, 1002.0, SignOpts { prune_missing_optional: true, ..Default::default() })
-            .unwrap();
+        // A plain sign drops it, and keeps what is still on disk.
+        xite.sign(&pk, 1002.0).unwrap();
         let pruned = xite.content.clone().unwrap();
         assert!(pruned["files_optional"].get("video/purged.bin").is_none(), "pruned");
         assert!(pruned["files_optional"].get("video/keep.bin").is_some(), "kept");

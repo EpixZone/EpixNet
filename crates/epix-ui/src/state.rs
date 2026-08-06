@@ -9922,8 +9922,8 @@ impl AppState {
     }
 
     /// [`Self::sign_xite`] with explicit [`epix_xite::SignOpts`] (`--full`
-    /// bypasses the stat cache; `--prune-optional` lets deletions leave the
-    /// manifest).
+    /// bypasses the stat cache; `--keep-missing` keeps deleted optional
+    /// entries in the manifest instead of the default pruning).
     pub async fn sign_xite_with(
         &self,
         address: &str,

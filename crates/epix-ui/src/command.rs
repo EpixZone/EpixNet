@@ -2125,7 +2125,8 @@ async fn sign_for(
 
 /// The sign options of a sign command: `full` re-hashes every file instead
 /// of trusting the stat cache (object key, or positional after inner_path);
-/// `prune_optional` drops declared optional entries whose file is gone.
+/// `keep_missing` keeps declared optional entries whose file is gone (the
+/// default prunes them).
 fn sign_opts(p: &Value) -> epix_xite::SignOpts {
     let flag = |key: &str, pos: usize| {
         p.get(key)
@@ -2135,7 +2136,7 @@ fn sign_opts(p: &Value) -> epix_xite::SignOpts {
     };
     epix_xite::SignOpts {
         full: flag("full", 2),
-        prune_missing_optional: flag("prune_optional", 3),
+        keep_missing_optional: flag("keep_missing", 3),
     }
 }
 

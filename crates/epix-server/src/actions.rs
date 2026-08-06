@@ -67,15 +67,16 @@ async fn dispatch(
         "siteSign" => {
             // Flags may appear anywhere among the arguments: `--full`
             // re-hashes every file instead of trusting the sign cache;
-            // `--prune-optional` drops declared optional entries whose file
-            // is gone from disk, so a deletion actually leaves the manifest.
+            // `--keep-missing` keeps declared optional entries whose file is
+            // gone from disk (the default prunes them, so a deletion leaves
+            // the manifest).
             let full = args.iter().any(|a| a == "--full");
-            let prune = args.iter().any(|a| a == "--prune-optional");
+            let keep = args.iter().any(|a| a == "--keep-missing");
             let args: Vec<String> =
                 args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
             let [address, rest @ ..] = args.as_slice() else {
                 return Err(
-                    "usage: siteSign <address> [privatekey] [inner_path] [--full] [--prune-optional]"
+                    "usage: siteSign <address> [privatekey] [inner_path] [--full] [--keep-missing]"
                         .into(),
                 );
             };
@@ -87,7 +88,7 @@ async fn dispatch(
             // version and peers get "file(s) not yet available" until restart.
             let live_params = serde_json::json!({
                 "inner_path": inner_path, "privatekey": privatekey,
-                "full": full, "prune_optional": prune,
+                "full": full, "keep_missing": keep,
             });
             if admin_call(data_root, "siteSign", Some(address), live_params).await?.is_some() {
                 println!("{inner_path} signed via the running node [live]");
@@ -110,7 +111,7 @@ async fn dispatch(
                     .sign_xite_with(
                         address,
                         &key,
-                        epix_ui::SignOpts { full, prune_missing_optional: prune },
+                        epix_ui::SignOpts { full, keep_missing_optional: keep },
                     )
                     .await?;
             } else {
