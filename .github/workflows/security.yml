@@ -94,7 +94,7 @@ jobs:
           --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage
           --exclude-rule rust.lang.security.current-exe.current-exe
           --error --sarif --output semgrep.sarif crates || true
-      - uses: github/codeql-action/upload-sarif@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+      - uses: github/codeql-action/upload-sarif@d1ba80a13dd99fba24a470575428917156a28b43 # v4.37.5
         if: always()
         with:
           sarif_file: semgrep.sarif
