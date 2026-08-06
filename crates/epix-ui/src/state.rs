@@ -8093,6 +8093,12 @@ impl AppState {
     /// `file_failed` ("download failed" / "No peers found"). `fields` merges
     /// extra keys (e.g. `peers`, `bad_files`) over the minimal shape the
     /// wrapper JS reads.
+    ///
+    /// Progress-bar contract: the wrapper only moves the loading bar for
+    /// events with `started_task_num > 0` (the clone's file_done stream) and
+    /// treats the `0` defaults here as "no task info". Don't emit
+    /// `started_task_num > 0` with a made-up total from any other path, or
+    /// the bar regresses when streams interleave.
     pub fn push_clone_event(&self, address: &str, event: Value, fields: Value) {
         // Once content.json has been verified mid-clone, the title is known:
         // carry it so the dashboard's "Connecting sites" row shows the xite's

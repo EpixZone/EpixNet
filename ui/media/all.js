@@ -22,13 +22,15 @@
       fn();
       return limits[fn] = setTimeout((function () {
         if (call_after_interval[fn]) {
-          fn();
+          // Run the most recent suppressed call, not the first one of the
+          // window (closures with identical source share one key here).
+          call_after_interval[fn]();
         }
         delete limits[fn];
         return delete call_after_interval[fn];
       }), interval);
     } else {
-      return call_after_interval[fn] = true;
+      return call_after_interval[fn] = fn;
     }
   };
 
@@ -647,21 +649,31 @@ if (window.getComputedStyle(document.body).transform) {
     }
 
     Loading.prototype.setProgress = function (percent) {
+      var _this = this;
       if (this.timer_hide) {
-        clearInterval(this.timer_hide);
+        clearTimeout(this.timer_hide);
+        this.timer_hide = null;
       }
+      if (percent < (this.progress_percent || 0)) {
+        return; // never step backwards (events can arrive out of order)
+      }
+      this.progress_percent = percent;
+      this.progress_hidden = false;
       return this.timer_set = RateLimit(500, function () {
+        if (_this.progress_hidden) {
+          return;
+        }
         return $(".progressbar").css({
-          "transform": "scaleX(" + (parseInt(percent * 100) / 100) + ")"
+          "transform": "scaleX(" + (parseInt(_this.progress_percent * 100) / 100) + ")"
         }).css("opacity", "1").css("display", "block");
       });
     };
 
     Loading.prototype.hideProgress = function () {
       this.log("hideProgress");
-      if (this.timer_set) {
-        clearInterval(this.timer_set);
-      }
+      // Leave the RateLimit timer alone; the pending call checks this flag.
+      this.progress_hidden = true;
+      this.progress_percent = 0;
       return this.timer_hide = setTimeout(((function (_this) {
         return function () {
           return $(".progressbar").css({
@@ -2136,7 +2148,12 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.updateProgress = function (site_info) {
-      if (site_info.tasks > 0 && site_info.started_task_num > 0) {
+      if (!site_info || !(site_info.started_task_num > 0)) {
+        // Events with no task info (peer additions, announces) say nothing
+        // about download progress - leave the bar where it is.
+        return;
+      }
+      if (site_info.tasks > 0) {
         return this.loading.setProgress(1 - (Math.max(site_info.tasks, site_info.bad_files) / site_info.started_task_num));
       } else {
         return this.loading.hideProgress();
