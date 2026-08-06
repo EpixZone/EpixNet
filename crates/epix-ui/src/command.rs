@@ -2001,7 +2001,7 @@ impl WsCommand for SiteSign {
             .unwrap_or("content.json");
         // Merger sites sign into their merged site (`merged-…/` paths).
         let (address, inner_path) = s.resolve_target(inner_path).await?;
-        sign_for(s, &address, &inner_path, sign_privatekey(p), sign_full(p)).await?;
+        sign_for(s, &address, &inner_path, sign_privatekey(p), sign_opts(p)).await?;
         // Push fresh siteInfo so the page re-renders with the new signed state -
         // EpixNet's `updateWebsocket(file_done=…)` after actionSiteSign. Without
         // it the sidebar keeps showing the pre-sign modified-files/sign panel.
@@ -2092,7 +2092,7 @@ async fn sign_for(
     address: &str,
     inner_path: &str,
     privatekey: Option<String>,
-    full: bool,
+    opts: epix_xite::SignOpts,
 ) -> Result<String, String> {
     // `"stored"` is EpixNet's sentinel for "use the site key saved in
     // users.json" (the sidebar and wrapper infopanel send it when
@@ -2116,20 +2116,28 @@ async fn sign_for(
                 .await
                 .ok_or("siteSign: privatekey required")?,
         };
-        s.state.sign_xite_with(address, &key, full).await?;
+        s.state.sign_xite_with(address, &key, opts).await?;
     } else {
         s.state.sign_user_content(address, &content_path, privatekey, Some(s.id)).await?;
     }
     Ok(content_path)
 }
 
-/// The `full` flag of a sign command: re-hash every file instead of trusting
-/// the stat cache. Object key `full`, or positional after inner_path.
-fn sign_full(p: &Value) -> bool {
-    p.get("full")
-        .or_else(|| p.as_array().and_then(|a| a.get(2)))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+/// The sign options of a sign command: `full` re-hashes every file instead
+/// of trusting the stat cache (object key, or positional after inner_path);
+/// `keep_missing` keeps declared optional entries whose file is gone (the
+/// default prunes them).
+fn sign_opts(p: &Value) -> epix_xite::SignOpts {
+    let flag = |key: &str, pos: usize| {
+        p.get(key)
+            .or_else(|| p.as_array().and_then(|a| a.get(pos)))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    epix_xite::SignOpts {
+        full: flag("full", 2),
+        keep_missing_optional: flag("keep_missing", 3),
+    }
 }
 
 /// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON
