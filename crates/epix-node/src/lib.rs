@@ -1711,34 +1711,40 @@ impl epix_ui::OnDemandResolver for OnDemand {
         {
             return Ok(());
         }
-        // Coalesce concurrent clones of the same name: the first does the work,
-        // the rest wait briefly for it to land.
+        // In Always mode, resolving a name that has no cache entry hits the
+        // chain, which is gated until Tor is up. Wait for Tor first so the
+        // resolve rides it (and never falls back to clearnet) - this is the path
+        // a deferred launch name takes on first open. Cached names and raw
+        // addresses need no chain query, so they skip the wait.
+        if self.tor_always.load(std::sync::atomic::Ordering::Relaxed)
+            && needs_chain_resolve(&self.data_root, host)
+            && !self.await_tor_ready().await
+        {
+            return Err(
+                "Tor is not available and Always mode forbids clearnet, so this site \
+                 cannot be resolved right now"
+                    .to_string(),
+            );
+        }
+        let address = resolve_host(&self.data_root, host)
+            .await
+            .ok_or_else(|| format!("could not resolve {host}"))?;
+        // Coalesce concurrent clones on the RESOLVED address: the first does
+        // the work, the rest wait briefly for it to land. Keying on the raw
+        // host string let a clone opened as `name.epix` and one opened as its
+        // epix1… address run twice in parallel, interleaving two independent
+        // progress streams on the loading screen - the N/M file counter
+        // visibly bounced and each stream's completion reset the bar.
         {
             let mut inflight = self.in_flight.lock().await;
-            if inflight.contains(host) {
+            if inflight.contains(&address) {
                 drop(inflight);
-                // The wrapper's inner file request blocks on this while the
-                // loading screen shows, so wait as long as a clone can take.
-                for _ in 0..600 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let key = self.state.canonical_key(host).await;
-                    if self.state.has_xite(&key).await {
-                        return Ok(());
-                    }
-                    if !self.in_flight.lock().await.contains(host) {
-                        break; // the working clone finished (or failed)
-                    }
-                }
-                let key = self.state.canonical_key(host).await;
-                if self.state.has_xite(&key).await {
-                    return Ok(());
-                }
-                return Err("timed out waiting for a concurrent clone".into());
+                return self.wait_for_inflight(&address).await;
             }
-            inflight.insert(host.to_string());
+            inflight.insert(address.clone());
         }
-        let result = self.do_ensure(host).await;
-        self.in_flight.lock().await.remove(host);
+        let result = self.do_ensure(host, &address).await;
+        self.in_flight.lock().await.remove(&address);
         result
     }
 
@@ -1891,29 +1897,30 @@ impl OnDemand {
         !always
     }
 
-    async fn do_ensure(&self, host: &str) -> Result<(), String> {
-        // In Always mode, resolving a name that has no cache entry hits the
-        // chain, which is gated until Tor is up. Wait for Tor first so the
-        // resolve rides it (and never falls back to clearnet) - this is the path
-        // a deferred launch name takes on first open. Cached names and raw
-        // addresses need no chain query, so they skip the wait.
-        if self.tor_always.load(std::sync::atomic::Ordering::Relaxed)
-            && needs_chain_resolve(&self.data_root, host)
-            && !self.await_tor_ready().await
-        {
-            return Err(
-                "Tor is not available and Always mode forbids clearnet, so this site \
-                 cannot be resolved right now"
-                    .to_string(),
-            );
+    /// Wait for the clone another caller is already running for `address` to
+    /// register the xite (or give up).
+    async fn wait_for_inflight(&self, address: &str) -> Result<(), String> {
+        // The wrapper's inner file request blocks on this while the
+        // loading screen shows, so wait as long as a clone can take.
+        for _ in 0..600 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if self.state.has_xite(address).await {
+                return Ok(());
+            }
+            if !self.in_flight.lock().await.contains(address) {
+                break; // the working clone finished (or failed)
+            }
         }
-        // Resolve the name to a xite address (unless it's already one): the
-        // on-disk cache first; the chain only on a miss or an expired entry.
-        // An expired entry still serves if the chain is unreachable.
-        let address = resolve_host(&self.data_root, host)
-            .await
-            .ok_or_else(|| format!("could not resolve {host}"))?;
+        if self.state.has_xite(address).await {
+            return Ok(());
+        }
+        Err("timed out waiting for a concurrent clone".into())
+    }
 
+    /// The clone/resume work behind [`Self::ensure`], which resolved `host`
+    /// to `address` and holds the in-flight slot for it.
+    async fn do_ensure(&self, host: &str, address: &str) -> Result<(), String> {
+        let address = address.to_string();
         let data_dir = self.data_root.join("data").join(&address);
         // Clone when the address isn't served yet, or resume when it is served
         // but its core files are incomplete (an interrupted earlier clone).

@@ -1965,7 +1965,12 @@ if (window.getComputedStyle(document.body).transform) {
             // from, which is not site_info.peers (how many were discovered).
             var serving = site_info.peers_serving || 0;
             var from = serving > 0 ? " from " + serving + (serving === 1 ? " peer" : " peers") : "";
-            this.loading.setStage(2, (site_info.started_task_num - site_info.tasks) + " / " + site_info.started_task_num + " files" + from + " - " + site_info.event[1]);
+            var files_done = site_info.started_task_num - site_info.tasks;
+            // Never step backwards (events can arrive out of order).
+            if (files_done >= (this.max_files_done || 0)) {
+              this.max_files_done = files_done;
+              this.loading.setStage(2, files_done + " / " + site_info.started_task_num + " files" + from + " - " + site_info.event[1]);
+            }
           }
           if (site_info.event[1] === window.file_inner_path) {
             this.loading.setStage(3, "");
