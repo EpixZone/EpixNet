@@ -69,6 +69,9 @@ class MainActivity : AppCompatActivity() {
     /// Held only while LAN peer discovery is on, so the Wi-Fi stack stops
     /// filtering the broadcast replies AnnounceLocal needs. Null otherwise -
     /// the lock costs battery, so a node with discovery off never takes it.
+    /// Volatile: taken on the IO thread that boots the node, released on the
+    /// main thread in onDestroy.
+    @Volatile
     private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
 
     /** One open tab: its Gecko session and the per-tab navigation state. */
