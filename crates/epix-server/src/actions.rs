@@ -65,12 +65,19 @@ async fn dispatch(
             Ok(())
         }
         "siteSign" => {
-            // `--full` re-hashes every file instead of trusting the sign
-            // cache; it may appear anywhere among the arguments.
+            // Flags may appear anywhere among the arguments: `--full`
+            // re-hashes every file instead of trusting the sign cache;
+            // `--prune-optional` drops declared optional entries whose file
+            // is gone from disk, so a deletion actually leaves the manifest.
             let full = args.iter().any(|a| a == "--full");
-            let args: Vec<String> = args.iter().filter(|a| *a != "--full").cloned().collect();
+            let prune = args.iter().any(|a| a == "--prune-optional");
+            let args: Vec<String> =
+                args.iter().filter(|a| !a.starts_with("--")).cloned().collect();
             let [address, rest @ ..] = args.as_slice() else {
-                return Err("usage: siteSign <address> [privatekey] [inner_path] [--full]".into());
+                return Err(
+                    "usage: siteSign <address> [privatekey] [inner_path] [--full] [--prune-optional]"
+                        .into(),
+                );
             };
             let privatekey = rest.first().filter(|k| !k.is_empty()).cloned();
             let inner_path = rest.get(1).cloned().unwrap_or_else(|| "content.json".to_string());
@@ -79,7 +86,8 @@ async fn dispatch(
             // offline sign next to a running node leaves the store on the old
             // version and peers get "file(s) not yet available" until restart.
             let live_params = serde_json::json!({
-                "inner_path": inner_path, "privatekey": privatekey, "full": full,
+                "inner_path": inner_path, "privatekey": privatekey,
+                "full": full, "prune_optional": prune,
             });
             if admin_call(data_root, "siteSign", Some(address), live_params).await?.is_some() {
                 println!("{inner_path} signed via the running node [live]");
@@ -98,7 +106,13 @@ async fn dispatch(
                         .await
                         .ok_or("No saved private key for this site; pass one")?,
                 };
-                state.sign_xite_with(address, &key, full).await?;
+                state
+                    .sign_xite_with(
+                        address,
+                        &key,
+                        epix_ui::SignOpts { full, prune_missing_optional: prune },
+                    )
+                    .await?;
             } else {
                 state.sign_user_content(address, &content_path, privatekey, None).await?;
             }

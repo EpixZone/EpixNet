@@ -80,6 +80,16 @@ struct CachedHash {
 
 type SignCache = std::collections::HashMap<String, CachedHash>;
 
+/// Per-invocation sign options (`siteSign --full`, `--prune-optional`).
+#[derive(Clone, Copy, Default)]
+pub struct SignOpts {
+    /// Re-read every file instead of trusting the stat cache.
+    pub full: bool,
+    /// Drop declared optional entries whose file is gone from disk, so a
+    /// deletion actually leaves the manifest.
+    pub prune_missing_optional: bool,
+}
+
 /// A file's (size, mtime_ns), or `None` when it cannot be stat'd. Taken
 /// BEFORE the read on the hashing path, so a write racing the sign leaves a
 /// stale mtime with fresh hashes and the NEXT sign re-reads - never the
@@ -765,13 +775,18 @@ impl Xite {
     /// The key must own the xite (its address must equal the xite address),
     /// otherwise the resulting signature wouldn't verify.
     pub fn sign(&mut self, privatekey: &str, modified: f64) -> Result<()> {
-        self.sign_with(privatekey, modified, false)
+        self.sign_opts(privatekey, modified, SignOpts::default())
     }
 
     /// [`Self::sign`] with `full` forcing a re-read of every file instead of
     /// trusting the stat cache - a per-invocation choice (siteSign --full),
     /// not process state.
     pub fn sign_with(&mut self, privatekey: &str, modified: f64, full: bool) -> Result<()> {
+        self.sign_opts(privatekey, modified, SignOpts { full, ..Default::default() })
+    }
+
+    /// [`Self::sign`] with explicit options.
+    pub fn sign_opts(&mut self, privatekey: &str, modified: f64, opts: SignOpts) -> Result<()> {
         // The underlying failure is a base58check/curve detail (checksum byte
         // arrays and the like). This message reaches the user as a notification,
         // and there is nothing actionable in the detail: the key is unusable.
@@ -788,12 +803,22 @@ impl Xite {
 
         // Files already declared optional stay optional; new files matching the
         // content's `optional` pattern sign as optional; everything else on
-        // disk (minus content.json units) becomes a required file.
-        let declared_optional: serde_json::Map<String, Value> = content
+        // disk (minus content.json units) becomes a required file. Carrying
+        // absent entries forward is deliberate - a signer need not HOLD every
+        // optional file - but it also means a deletion never leaves the
+        // manifest, and every peer that once held the file re-queues a
+        // download nobody can serve (the media xite purged 13 films and its
+        // own seeder sat at "updating: 13 left" forever). `prune_missing
+        // optional` drops declared entries whose file is gone from disk - an
+        // explicit owner action (siteSign --prune-optional), never a default.
+        let mut declared_optional: serde_json::Map<String, Value> = content
             .get("files_optional")
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
+        if opts.prune_missing_optional {
+            declared_optional.retain(|rel, _| self.storage.exists(rel));
+        }
         // Declared merge files (posts.json) are re-emitted untouched (`sign`
         // only overwrites `files`/`files_optional`) and skipped by the hasher.
         let declared_merged: serde_json::Map<String, Value> = content
@@ -806,7 +831,7 @@ impl Xite {
         let optional = path_pattern(content.get("optional"));
         // Files matching the `shard` pattern are self-encrypted (private).
         let shard = path_pattern(content.get("shard"));
-        let sign_cache = self.load_sign_cache(full);
+        let sign_cache = self.load_sign_cache(opts.full);
         let (files, files_optional, hashed_bytes, fresh_cache) =
             self.hash_unit_files("", &declared_optional, &declared_merged, &ignore, &optional, Some(&sign_cache))?;
         // Best-effort: a failed cache write only means the next sign re-reads.
@@ -1566,6 +1591,41 @@ mod tests {
             serde_json::json!(epix_blob::ObjId::of(&swapped).to_string()),
             "and the manifest now carries the real bytes' hash"
         );
+    }
+
+    /// A deleted optional file stays declared by default (a signer need not
+    /// hold every optional file), so peers that once held it re-queue a
+    /// download nobody can serve. --prune-optional is the owner's way to make
+    /// a deletion real: the entry leaves the manifest.
+    #[test]
+    fn prune_optional_lets_a_deletion_leave_the_manifest() {
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let mut xite = Xite::new(Address::parse(addr).unwrap(), storage.clone());
+
+        storage.write("video/keep.bin", &vec![1u8; 4096]).unwrap();
+        storage.write("video/purged.bin", &vec![2u8; 4096]).unwrap();
+        storage.write("index.html", b"<h1>hi</h1>").unwrap();
+        xite.content = Some(serde_json::json!({ "optional": "video/.*" }));
+        xite.sign(&pk, 1000.0).unwrap();
+
+        // Delete one film. A plain re-sign carries its entry forward.
+        std::fs::remove_file(storage.path("video/purged.bin").unwrap()).unwrap();
+        xite.sign(&pk, 1001.0).unwrap();
+        let carried = xite.content.clone().unwrap();
+        assert!(
+            carried["files_optional"].get("video/purged.bin").is_some(),
+            "default sign keeps the declared entry (a signer need not hold it)"
+        );
+
+        // A prune sign drops it, and keeps what is still on disk.
+        xite.sign_opts(&pk, 1002.0, SignOpts { prune_missing_optional: true, ..Default::default() })
+            .unwrap();
+        let pruned = xite.content.clone().unwrap();
+        assert!(pruned["files_optional"].get("video/purged.bin").is_none(), "pruned");
+        assert!(pruned["files_optional"].get("video/keep.bin").is_some(), "kept");
     }
 
     /// The upload-accounting reverse map covers everything served by object

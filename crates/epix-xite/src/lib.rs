@@ -14,7 +14,7 @@ pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, OptionalFileStat, XiteSettings};
 pub use piecefield::Piecefield;
 pub use piecemap::{build_piecemap, hash_bigfile, parse_piecemap, BigfileHash};
-pub use xite::{FileEntry, Xite};
+pub use xite::{FileEntry, SignOpts, Xite};
 pub use storage::XiteStorage;
 
 #[cfg(test)]

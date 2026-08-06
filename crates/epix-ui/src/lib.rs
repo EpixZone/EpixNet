@@ -16,6 +16,10 @@ pub mod feed;
 pub mod geoip;
 pub mod paths;
 pub mod state;
+
+/// Re-exported for callers (the CLI) that hold sign options without a
+/// direct epix-xite dependency.
+pub use epix_xite::SignOpts;
 pub mod tracker;
 #[cfg(feature = "ui-password")]
 pub mod uipassword;
