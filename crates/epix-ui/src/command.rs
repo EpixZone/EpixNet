@@ -2875,7 +2875,55 @@ impl WsCommand for OptionalFileList {
         let orderby =
             p.get("orderby").and_then(|v| v.as_str()).unwrap_or("time_downloaded DESC");
         let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // The dashboard's Files tab asks for every site at once (the legacy
+        // `address: "all"` contract; only admins get past the gate with it).
+        // Answering an error here crashed the tab outright - the page maps
+        // over the rows unchecked. Aggregate the per-site lists, tag each row
+        // with its site, and order and trim the union.
+        if address == "all" {
+            let mut rows = Vec::new();
+            for addr in s.state.xite_addresses().await {
+                let Ok(mut list) = s.state.optional_file_list(&addr, filter, orderby, 0).await
+                else {
+                    continue;
+                };
+                for r in &mut list {
+                    if let Value::Object(o) = r {
+                        o.insert("address".into(), Value::from(addr.clone()));
+                    }
+                }
+                rows.extend(list);
+            }
+            sort_optional_rows(&mut rows, orderby);
+            if limit > 0 {
+                rows.truncate(limit);
+            }
+            return Ok(Value::Array(rows));
+        }
         Ok(Value::Array(s.state.optional_file_list(&address, filter, orderby, limit).await?))
+    }
+}
+
+/// Order an aggregated optional-file list by the first `orderby` clause
+/// (`field [DESC]`) - the per-site lists come back sorted, but the union
+/// needs one more pass.
+fn sort_optional_rows(rows: &mut [Value], orderby: &str) {
+    let mut parts = orderby.split_whitespace();
+    let Some(field) = parts.next() else { return };
+    let desc = parts.next().is_some_and(|d| d.eq_ignore_ascii_case("DESC"));
+    let key = |v: &Value| -> (i64, String) {
+        match v.get(field) {
+            Some(Value::Number(n)) => (
+                n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
+                String::new(),
+            ),
+            Some(Value::String(t)) => (0, t.clone()),
+            _ => (0, String::new()),
+        }
+    };
+    rows.sort_by(|a, b| key(a).cmp(&key(b)));
+    if desc {
+        rows.reverse();
     }
 }
 
