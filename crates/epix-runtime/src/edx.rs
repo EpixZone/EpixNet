@@ -1286,6 +1286,46 @@ struct Streaming {
     /// landing and the rename committing; without this each would spawn its
     /// own blocking move of the same file.
     materializing: HashSet<ObjId>,
+    /// Foreground (player-blocking) range fetches currently on the network.
+    /// Background completion yields between batches while this is non-zero,
+    /// so a seek is not stuck behind the whole-file pull sharing the same few
+    /// links (worst on mobile, which has fewer peer paths).
+    foreground_fetches: usize,
+}
+
+/// Groups per background-completion batch: 1024 x 16 KiB = 16 MiB, a few
+/// seconds over a warm session, so the yield check between batches keeps a
+/// seek from waiting behind a two-hour film's remainder.
+const COMPLETION_BATCH_GROUPS: u64 = 1024;
+
+/// The first [`COMPLETION_BATCH_GROUPS`] of `needed`, so one completion pass
+/// stays bounded.
+fn completion_batch(needed: &epix_blob::bitfield::GroupBits) -> epix_blob::bitfield::GroupBits {
+    let mut batch = epix_blob::bitfield::GroupBits::new();
+    let mut left = COMPLETION_BATCH_GROUPS;
+    for r in needed.ranges() {
+        if left == 0 {
+            break;
+        }
+        let take = (r.end - r.start).min(left);
+        batch.add(r.start..r.start + take);
+        left -= take;
+    }
+    batch
+}
+
+/// RAII marker for one foreground range fetch; see
+/// `Streaming::foreground_fetches`.
+struct ForegroundFetch {
+    streaming: Arc<Mutex<Streaming>>,
+}
+
+impl Drop for ForegroundFetch {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.streaming.lock() {
+            s.foreground_fetches = s.foreground_fetches.saturating_sub(1);
+        }
+    }
 }
 
 /// A serve's dialed peer session, kept for PEER_CACHE_TTL so consecutive
@@ -2245,6 +2285,32 @@ impl RuntimeEdxFetcher {
     /// windowed - completing it could only evict itself or everything else.
     /// `EPIX_EDX_COMPLETE_MEDIA=0` opts a bandwidth/disk-conscious node out,
     /// reverting to fetch-what-you-view.
+    /// Mark a foreground (player-blocking) range fetch as on the network for
+    /// the guard's lifetime; `run_completion` yields while any is live.
+    fn note_foreground_fetch(&self) -> ForegroundFetch {
+        if let Ok(mut s) = self.streaming.lock() {
+            s.foreground_fetches += 1;
+        }
+        ForegroundFetch { streaming: self.streaming.clone() }
+    }
+
+    /// Wait until no foreground range fetch is on the network. Polling is
+    /// fine here: only the background completion waits, and 200ms of extra
+    /// quiet costs it nothing.
+    async fn wait_foreground_idle(&self) {
+        loop {
+            let busy = self
+                .streaming
+                .lock()
+                .map(|s| s.foreground_fetches > 0)
+                .unwrap_or(false);
+            if !busy {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
     fn maybe_complete_file(
         &self,
         address: &str,
@@ -2305,6 +2371,11 @@ impl RuntimeEdxFetcher {
     async fn run_completion(&self, address: &str, inner_path: &str, id: ObjId, size: u64) {
         let Some(store) = self.state.edx_store().await else { return };
         loop {
+            // Yield to any player-blocking fetch before starting the next
+            // batch: the deadline tiers order work WITHIN a peer's serving,
+            // but this pull still occupies the same few links/circuits a
+            // seek needs to dial through.
+            self.wait_foreground_idle().await;
             let now = now_secs();
             let Ok(needed) = needed_groups(&store, id, size) else { return };
             if needed.is_empty() {
@@ -2319,14 +2390,31 @@ impl RuntimeEdxFetcher {
             let Ok(_claim) = self.claim_object(&store, id, Ns::Plain, size, now) else { return };
             let mut swarm =
                 Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
-            let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await
+            // Bounded batch per pass (16 MiB), so a seek arriving mid-download
+            // waits out one batch at most, not the whole remaining file.
+            let batch = completion_batch(&needed);
+            let Ok(report) = swarm.fetch(&batch, &handles, Deadline::background(), now).await
             else {
                 return;
             };
             self.credit(&report, &node_pks, now);
             let _ = store.enforce_quota(store_quota());
             if report.groups_fetched == 0 {
-                return; // no progress: nothing left that any dialable peer holds
+                if batch.count() >= needed.count() {
+                    return; // no progress: nothing left that any dialable peer holds
+                }
+                // The head batch landed nothing; those groups may just not be
+                // held anywhere right now. Sweep the full remaining set once
+                // before concluding no dialable peer has anything left.
+                let Ok(rest) = swarm.fetch(&needed, &handles, Deadline::background(), now).await
+                else {
+                    return;
+                };
+                self.credit(&rest, &node_pks, now);
+                let _ = store.enforce_quota(store_quota());
+                if rest.groups_fetched == 0 {
+                    return;
+                }
             }
         }
         // Complete: the file the user has been watching becomes a file they
@@ -2719,7 +2807,24 @@ impl RuntimeEdxFetcher {
             Ok(Some((size, _))) => size,
             _ => return false,
         };
-        if self.materialize(address, &r.path, r.id, size, store).await.is_err() {
+        if let Err(e) = self.materialize(address, &r.path, r.id, size, store).await {
+            // A record whose bytes cannot be read back (torn write from a
+            // killed process, disk/record disagreement) would fail this same
+            // way on every retry while the fetch pass skips groups the
+            // record claims present. Revalidate in the background - it
+            // shrinks or retires the record - so the NEXT pass refetches
+            // instead of looping. Mirrors the range-serve path.
+            self.state
+                .log(
+                    "DEBUG",
+                    format!("EDX materialize {}/{} failed: {e}; revalidating", address, r.path),
+                )
+                .await;
+            let vstore = store.clone();
+            let id = r.id;
+            tokio::task::spawn_blocking(move || {
+                let _ = vstore.revalidate(id);
+            });
             return false;
         }
         batch.bytes += size;
@@ -3648,6 +3753,10 @@ impl EdxFetcher for RuntimeEdxFetcher {
             );
             bytes
         } else {
+            // The player is blocked on these bytes and they must come off the
+            // network: keep the background completion out of the way for the
+            // duration (dropped at the end of this branch).
+            let _fg = self.note_foreground_fetch();
             let present = store.present_bits(id).unwrap_or_default();
             let needed = missing_groups(&present, &served);
             let mut fetch_err: Option<String> = None;
@@ -3815,6 +3924,19 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // complete) goes to `missed` for the worker.
         let session = self.open_session(address, &peers, 8).await;
         if session.is_empty() {
+            // This was silent, and a whole failed clone looked identical to
+            // one that never tried the network. Say what happened.
+            self.state
+                .log(
+                    "DEBUG",
+                    format!(
+                        "EDX {address}: no session peer answered ({} candidate(s)); \
+                         {} file(s) to the worker",
+                        peers.len(),
+                        pending.len()
+                    ),
+                )
+                .await;
             for r in pending {
                 epix_ui::state::note_edx_fallback_path(address, &r.path);
                 batch.missed.push(r.path);
@@ -3824,6 +3946,21 @@ impl EdxFetcher for RuntimeEdxFetcher {
 
         self.fetch_tiers(address, &store, &session, pending, &content, &progress, &mut batch, now)
             .await;
+        if !batch.missed.is_empty() {
+            // Name the session that failed: without this a fetch that landed
+            // nothing from N live links was indistinguishable from an empty
+            // session or an unresolvable manifest.
+            self.state
+                .log(
+                    "DEBUG",
+                    format!(
+                        "EDX {address}: {} file(s) missed over {} session peer(s)",
+                        batch.missed.len(),
+                        session.peers().len()
+                    ),
+                )
+                .await;
+        }
         let _ = store.enforce_quota(store_quota());
         batch
     }

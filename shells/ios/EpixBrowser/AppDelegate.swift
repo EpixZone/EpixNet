@@ -358,7 +358,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// popups - those must be built from it.
     @discardableResult
     func makeTab(configuration: WKWebViewConfiguration? = nil, select: Bool = true) -> BrowserTab {
-        let web = WKWebView(frame: .zero, configuration: configuration ?? WKWebViewConfiguration())
+        let config = configuration ?? WKWebViewConfiguration()
+        // Keep <video playsinline> in WebKit's own media path. The iPhone
+        // default (false) hands playback to the fullscreen AVFoundation
+        // player, whose loader treats the node's "bytes not here yet"
+        // 503 on a cold seek as a fatal asset error with no retry.
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = self
         web.uiDelegate = self
         web.allowsBackForwardNavigationGestures = true

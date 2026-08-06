@@ -168,7 +168,7 @@ export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/<version>
 #    off in Config). The embedded router cross-compiles here because our
 #    emissary fork's reseeder uses rustls, not OpenSSL - see crates/epix-i2p.
 cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
-    build -p epix-ffi --release
+    build -p epix-ffi --release --features bittorrent
 
 # 2. Generate the Kotlin bindings from the built library:
 cargo run -p epix-ffi --features cli --bin uniffi-bindgen -- generate \

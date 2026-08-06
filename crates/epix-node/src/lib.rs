@@ -1711,34 +1711,40 @@ impl epix_ui::OnDemandResolver for OnDemand {
         {
             return Ok(());
         }
-        // Coalesce concurrent clones of the same name: the first does the work,
-        // the rest wait briefly for it to land.
+        // In Always mode, resolving a name that has no cache entry hits the
+        // chain, which is gated until Tor is up. Wait for Tor first so the
+        // resolve rides it (and never falls back to clearnet) - this is the path
+        // a deferred launch name takes on first open. Cached names and raw
+        // addresses need no chain query, so they skip the wait.
+        if self.tor_always.load(std::sync::atomic::Ordering::Relaxed)
+            && needs_chain_resolve(&self.data_root, host)
+            && !self.await_tor_ready().await
+        {
+            return Err(
+                "Tor is not available and Always mode forbids clearnet, so this site \
+                 cannot be resolved right now"
+                    .to_string(),
+            );
+        }
+        let address = resolve_host(&self.data_root, host)
+            .await
+            .ok_or_else(|| format!("could not resolve {host}"))?;
+        // Coalesce concurrent clones on the RESOLVED address: the first does
+        // the work, the rest wait briefly for it to land. Keying on the raw
+        // host string let a clone opened as `name.epix` and one opened as its
+        // epix1… address run twice in parallel, interleaving two independent
+        // progress streams on the loading screen - the N/M file counter
+        // visibly bounced and each stream's completion reset the bar.
         {
             let mut inflight = self.in_flight.lock().await;
-            if inflight.contains(host) {
+            if inflight.contains(&address) {
                 drop(inflight);
-                // The wrapper's inner file request blocks on this while the
-                // loading screen shows, so wait as long as a clone can take.
-                for _ in 0..600 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let key = self.state.canonical_key(host).await;
-                    if self.state.has_xite(&key).await {
-                        return Ok(());
-                    }
-                    if !self.in_flight.lock().await.contains(host) {
-                        break; // the working clone finished (or failed)
-                    }
-                }
-                let key = self.state.canonical_key(host).await;
-                if self.state.has_xite(&key).await {
-                    return Ok(());
-                }
-                return Err("timed out waiting for a concurrent clone".into());
+                return self.wait_for_inflight(&address).await;
             }
-            inflight.insert(host.to_string());
+            inflight.insert(address.clone());
         }
-        let result = self.do_ensure(host).await;
-        self.in_flight.lock().await.remove(host);
+        let result = self.do_ensure(host, &address).await;
+        self.in_flight.lock().await.remove(&address);
         result
     }
 
@@ -1891,169 +1897,191 @@ impl OnDemand {
         !always
     }
 
-    async fn do_ensure(&self, host: &str) -> Result<(), String> {
-        // In Always mode, resolving a name that has no cache entry hits the
-        // chain, which is gated until Tor is up. Wait for Tor first so the
-        // resolve rides it (and never falls back to clearnet) - this is the path
-        // a deferred launch name takes on first open. Cached names and raw
-        // addresses need no chain query, so they skip the wait.
-        if self.tor_always.load(std::sync::atomic::Ordering::Relaxed)
-            && needs_chain_resolve(&self.data_root, host)
-            && !self.await_tor_ready().await
-        {
-            return Err(
-                "Tor is not available and Always mode forbids clearnet, so this site \
-                 cannot be resolved right now"
-                    .to_string(),
-            );
+    /// Wait for the clone another caller is already running for `address` to
+    /// register the xite (or give up).
+    async fn wait_for_inflight(&self, address: &str) -> Result<(), String> {
+        // The wrapper's inner file request blocks on this while the
+        // loading screen shows, so wait as long as a clone can take.
+        for _ in 0..600 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if self.state.has_xite(address).await {
+                return Ok(());
+            }
+            if !self.in_flight.lock().await.contains(address) {
+                break; // the working clone finished (or failed)
+            }
         }
-        // Resolve the name to a xite address (unless it's already one): the
-        // on-disk cache first; the chain only on a miss or an expired entry.
-        // An expired entry still serves if the chain is unreachable.
-        let address = resolve_host(&self.data_root, host)
-            .await
-            .ok_or_else(|| format!("could not resolve {host}"))?;
+        if self.state.has_xite(address).await {
+            return Ok(());
+        }
+        Err("timed out waiting for a concurrent clone".into())
+    }
 
-        let data_dir = self.data_root.join("data").join(&address);
+    /// The clone/resume work behind [`Self::ensure`], which resolved `host`
+    /// to `address` and holds the in-flight slot for it.
+    async fn do_ensure(&self, host: &str, address: &str) -> Result<(), String> {
+        let data_dir = self.data_root.join("data").join(address);
         // Clone when the address isn't served yet, or resume when it is served
         // but its core files are incomplete (an interrupted earlier clone).
         // Owned sites never re-clone: local edits stay.
-        let was_registered = self.state.has_xite(&address).await;
+        let was_registered = self.state.has_xite(address).await;
         if was_registered && host != address {
-            self.state.set_display(&address, host).await;
+            self.state.set_display(address, host).await;
         }
         let resume = was_registered
-            && !self.state.xite_owned(&address).await
-            && !self.state.xite_core_complete(&address).await;
+            && !self.state.xite_owned(address).await
+            && !self.state.xite_core_complete(address).await;
         if !was_registered || resume {
-            if !was_registered {
-                // Register the xite empty BEFORE the download (EpixNet's
-                // SiteManager.need): siteInfo/dbQuery/permissions are real for the
-                // page the moment it renders progressively, peers accumulate on
-                // the live entry, and the dashboard shows the row mid-clone.
-                self.state
-                    .add_xite(
-                        &address,
-                        XiteEntry { storage: XiteStorage::new(&data_dir), content: None },
-                    )
-                    .await;
-                if host != address {
-                    self.state.set_display(&address, host).await;
-                }
-            }
-            // Onion-seeded sites are only reachable once Tor is up. On a cold
-            // start the plain TCP transport is still installed, so wait for the
-            // onion-capable transport before dialing - otherwise a fresh
-            // install's first open fails every peer and shows "index.html
-            // download failed". No-op once Tor is up (the steady state). In
-            // Always mode, if Tor never comes up, abort rather than clone over
-            // clearnet and leak the real IP.
-            if !self.await_tor_ready().await {
-                return Err(
-                    "Tor is not available and Always mode forbids clearnet, so this site \
-                     cannot be fetched right now"
-                        .to_string(),
-                );
-            }
-            // Mark the download in flight: the html serving gate holds the
-            // page document back until the core set is on disk.
-            self.state.begin_clone(&address);
-            // Announce to the full tracker set (shared + Beacon-discovered), not
-            // just the bootstrap list, so a peer registered only on a shared
-            // tracker (e.g. an onion-only seeder) is discovered.
-            let trackers = self.state.all_trackers(&self.trackers).await;
-            // content.json discovery is best-effort per attempt: a single
-            // announce round can return only dead/unreachable peers this second
-            // while the node's background announce loop keeps turning up live
-            // seeders. Retry a few times - each attempt re-announces and
-            // re-seeds from the node's grown peer set - so a thinly seeded site
-            // (the dashboard has few seeders) isn't doomed by one unlucky round.
-            // Cheap when it works: a live peer makes the first try land.
-            const CLONE_ATTEMPTS: usize = 4;
-            let mut cloned =
-                clone_xite_with_progress(&address, &data_dir, &trackers, Some(&self.state)).await;
-            for attempt in 1..CLONE_ATTEMPTS {
-                if cloned.is_ok() {
-                    break;
-                }
-                self.state
-                    .log(
-                        "INFO",
-                        format!(
-                            "content.json fetch failed for {address}; \
-                             retry {attempt}/{} after finding more peers",
-                            CLONE_ATTEMPTS - 1
-                        ),
-                    )
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                cloned =
-                    clone_xite_with_progress(&address, &data_dir, &trackers, Some(&self.state))
-                        .await;
-            }
-            self.state.end_clone(&address);
-            let (content, bytes, user_files) = match cloned {
-                Ok(r) => r,
-                Err(e) => {
-                    // Tell the loading screen ("index.html download failed",
-                    // "No peers found" when none). Keep the xite registered
-                    // even on a first-load failure: add_xite already persisted
-                    // it to sites.json, so it survives a restart and resumes on
-                    // a later visit (the resume path re-attempts an incomplete
-                    // clone). Dropping it here used to lose a freshly-added site
-                    // whose first load failed - e.g. no peers online yet.
-                    self.state.push_clone_event(
-                        &address,
-                        serde_json::json!(["file_failed", "index.html"]),
-                        serde_json::json!({}),
-                    );
-                    return Err(e);
-                }
-            };
-            self.state.update_content(&address, content.clone()).await;
-            self.state.add_transfer(&address, bytes, 0).await;
-            // Rebuild the db now that the included / per-user data files are on
-            // disk, so a user_contents site's topics/comments are queryable.
-            self.state.rebuild_xite_db(&address).await;
-            // A merged site (e.g. a Git Epix repo) also feeds its merger's db.
-            if content.as_ref().and_then(|c| c.get("merged_type")).is_some() {
-                self.state.rebuild_merger_dbs().await;
-            }
-            self.state.push_site_info(&address).await;
-            // file_done per user-content file already fired as each file
-            // landed (ingest_file), with the db updated first - the page,
-            // served progressively, re-queried and showed each one live.
-            //
-            // A complete-on-disk core short-circuits the clone WITHOUT the
-            // user-content pass - but "core complete" says nothing about the
-            // per-user files. An interrupted earlier clone (crash, restart)
-            // leaves exactly that state, and waiting for the next resync tick
-            // (minutes) shows a working page with an empty forum. Backfill in
-            // the background right away; it is one listModified when nothing
-            // is missing.
-            //
-            // Only when the clone brought NO user content: one that did has
-            // already pulled those dirs' merge files inline, newest-first as
-            // each verified, and repeating the sweep here would refetch every
-            // record a second time.
-            if user_files.is_empty() {
-                let state = self.state.clone();
-                let addr = address.clone();
-                let backfill = bytes == 0;
-                tokio::spawn(async move {
-                    if backfill {
-                        state.sync_user_content(&addr).await;
-                    }
-                    state.resync_merge_files_for(&addr).await;
-                });
-            }
+            self.clone_or_resume(host, address, &data_dir, was_registered).await?;
         }
         // The `.epix` name is display metadata on the address-keyed entry.
         if host != address {
-            self.state.set_display(&address, host).await;
+            self.state.set_display(address, host).await;
         }
         self.state.log("INFO", format!("On-demand cloned {host} -> {address}")).await;
         Ok(())
+    }
+
+    /// Run the actual download for [`Self::do_ensure`]: register the entry,
+    /// wait for Tor, clone with retries, and settle the db/user-content state.
+    async fn clone_or_resume(
+        &self,
+        host: &str,
+        address: &str,
+        data_dir: &std::path::Path,
+        was_registered: bool,
+    ) -> Result<(), String> {
+        if !was_registered {
+            // Register the xite empty BEFORE the download (EpixNet's
+            // SiteManager.need): siteInfo/dbQuery/permissions are real for the
+            // page the moment it renders progressively, peers accumulate on
+            // the live entry, and the dashboard shows the row mid-clone.
+            self.state
+                .add_xite(
+                    address,
+                    XiteEntry { storage: XiteStorage::new(data_dir), content: None },
+                )
+                .await;
+            if host != address {
+                self.state.set_display(address, host).await;
+            }
+        }
+        // Onion-seeded sites are only reachable once Tor is up. On a cold
+        // start the plain TCP transport is still installed, so wait for the
+        // onion-capable transport before dialing - otherwise a fresh
+        // install's first open fails every peer and shows "index.html
+        // download failed". No-op once Tor is up (the steady state). In
+        // Always mode, if Tor never comes up, abort rather than clone over
+        // clearnet and leak the real IP.
+        if !self.await_tor_ready().await {
+            return Err(
+                "Tor is not available and Always mode forbids clearnet, so this site \
+                 cannot be fetched right now"
+                    .to_string(),
+            );
+        }
+        // Mark the download in flight: the html serving gate holds the
+        // page document back until the core set is on disk.
+        self.state.begin_clone(address);
+        let cloned = self.clone_with_retries(address, data_dir).await;
+        self.state.end_clone(address);
+        let (content, bytes, user_files) = match cloned {
+            Ok(r) => r,
+            Err(e) => {
+                // Tell the loading screen ("index.html download failed",
+                // "No peers found" when none). Keep the xite registered
+                // even on a first-load failure: add_xite already persisted
+                // it to sites.json, so it survives a restart and resumes on
+                // a later visit (the resume path re-attempts an incomplete
+                // clone). Dropping it here used to lose a freshly-added site
+                // whose first load failed - e.g. no peers online yet.
+                self.state.push_clone_event(
+                    address,
+                    serde_json::json!(["file_failed", "index.html"]),
+                    serde_json::json!({}),
+                );
+                return Err(e);
+            }
+        };
+        self.state.update_content(address, content.clone()).await;
+        self.state.add_transfer(address, bytes, 0).await;
+        // Rebuild the db now that the included / per-user data files are on
+        // disk, so a user_contents site's topics/comments are queryable.
+        self.state.rebuild_xite_db(address).await;
+        // A merged site (e.g. a Git Epix repo) also feeds its merger's db.
+        if content.as_ref().and_then(|c| c.get("merged_type")).is_some() {
+            self.state.rebuild_merger_dbs().await;
+        }
+        self.state.push_site_info(address).await;
+        // file_done per user-content file already fired as each file
+        // landed (ingest_file), with the db updated first - the page,
+        // served progressively, re-queried and showed each one live.
+        //
+        // A complete-on-disk core short-circuits the clone WITHOUT the
+        // user-content pass - but "core complete" says nothing about the
+        // per-user files. An interrupted earlier clone (crash, restart)
+        // leaves exactly that state, and waiting for the next resync tick
+        // (minutes) shows a working page with an empty forum. Backfill in
+        // the background right away; it is one listModified when nothing
+        // is missing.
+        //
+        // Only when the clone brought NO user content: one that did has
+        // already pulled those dirs' merge files inline, newest-first as
+        // each verified, and repeating the sweep here would refetch every
+        // record a second time.
+        if user_files.is_empty() {
+            let state = self.state.clone();
+            let addr = address.to_string();
+            let backfill = bytes == 0;
+            tokio::spawn(async move {
+                if backfill {
+                    state.sync_user_content(&addr).await;
+                }
+                state.resync_merge_files_for(&addr).await;
+            });
+        }
+        Ok(())
+    }
+
+    /// Announce and clone, retrying a few times.
+    ///
+    /// content.json discovery is best-effort per attempt: a single announce
+    /// round can return only dead/unreachable peers this second while the
+    /// node's background announce loop keeps turning up live seeders. Each
+    /// attempt re-announces and re-seeds from the node's grown peer set, so a
+    /// thinly seeded site (the dashboard has few seeders) isn't doomed by one
+    /// unlucky round. Cheap when it works: a live peer makes the first try
+    /// land. Announces go to the full tracker set (shared +
+    /// Beacon-discovered), not just the bootstrap list, so a peer registered
+    /// only on a shared tracker (e.g. an onion-only seeder) is discovered.
+    async fn clone_with_retries(
+        &self,
+        address: &str,
+        data_dir: &std::path::Path,
+    ) -> Result<(Option<serde_json::Value>, u64, Vec<String>), String> {
+        const CLONE_ATTEMPTS: usize = 4;
+        let trackers = self.state.all_trackers(&self.trackers).await;
+        let mut cloned =
+            clone_xite_with_progress(address, data_dir, &trackers, Some(&self.state)).await;
+        for attempt in 1..CLONE_ATTEMPTS {
+            if cloned.is_ok() {
+                break;
+            }
+            self.state
+                .log(
+                    "INFO",
+                    format!(
+                        "content.json fetch failed for {address}; \
+                         retry {attempt}/{} after finding more peers",
+                        CLONE_ATTEMPTS - 1
+                    ),
+                )
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            cloned =
+                clone_xite_with_progress(address, data_dir, &trackers, Some(&self.state)).await;
+        }
+        cloned
     }
 }
 
