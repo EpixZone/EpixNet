@@ -94,6 +94,20 @@ pub const PIPELINE_DEPTH_OVERLAY: u32 = 6;
 /// Consecutive failed batches before a peer is exhausted (dropped from
 /// scheduling for the rest of the fetch); a delivered batch resets it.
 pub const PEER_FAIL_LIMIT: u32 = 3;
+/// How long a peer that answered BUSY sits out of scheduling. A BUSY is the
+/// seeder's choker refusing us, not a failure: the peer is alive and serving
+/// others, so it must not count toward [`PEER_FAIL_LIMIT`] (three refusals
+/// used to strike out a fetch's only seeder). But without a cooldown the
+/// scheduler would re-pick the same sole peer the moment the reply landed
+/// and hammer it at RTT rate. Half the choker's 30s optimistic-slot
+/// rotation, so a refused leecher re-asks about twice per rotation.
+pub const BUSY_COOLDOWN: Duration = Duration::from_secs(15);
+/// Consecutive BUSY answers (no delivery between them) before the peer is
+/// dropped for this fetch anyway. Bounds the patience: a seeder that
+/// refuses for BUSY_LIMIT cooldowns' worth of rotations is not about to
+/// grant us a slot, and retries on that timescale belong to the caller's
+/// round mechanism, not a parked fetch.
+pub const BUSY_LIMIT: u32 = 8;
 
 /// How much work one request to `class` carries. Overlay links get smaller
 /// batches (see [`GROUPS_PER_REQUEST_OVERLAY`]).
@@ -488,6 +502,14 @@ struct Window<'a> {
     depth: Vec<u32>,
     /// Groups an in-flight batch is already covering.
     inflight: GroupBits,
+    /// Consecutive BUSY answers per peer (a delivery resets it); at
+    /// [`BUSY_LIMIT`] the peer is dropped for this fetch.
+    busy: Vec<u32>,
+    /// A peer sits out of scheduling until this instant (the BUSY cooldown
+    /// or the last-peer probe breather). Cleared by a delivery.
+    cooldown: Vec<Option<tokio::time::Instant>>,
+    /// Whether the one last-peer probe retry was already spent on this peer.
+    probed: Vec<bool>,
     /// Boxed so the window can hold a heterogenous set and drop completed
     /// slots one at a time.
     futs: Vec<BatchFut<'a>>,
@@ -500,19 +522,42 @@ impl<'a> Window<'a> {
             fails: vec![0u32; peers.len()],
             depth: peers.iter().map(|p| pipeline_depth(p.class)).collect(),
             inflight: GroupBits::new(),
+            busy: vec![0u32; peers.len()],
+            cooldown: vec![None; peers.len()],
+            probed: vec![false; peers.len()],
             futs: Vec::new(),
         }
     }
 
+    /// Whether peer `i` may be handed work right now: not exhausted and not
+    /// sitting out a cooldown.
+    fn schedulable(&self, i: usize, now: tokio::time::Instant) -> bool {
+        self.fails[i] < PEER_FAIL_LIMIT && self.cooldown[i].is_none_or(|t| t <= now)
+    }
+
     /// Free pipeline slots across the peers still worth scheduling.
     fn free_slots(&self) -> usize {
-        self.load
+        let now = tokio::time::Instant::now();
+        (0..self.load.len())
+            .filter(|&i| self.schedulable(i, now))
+            .map(|i| self.depth[i].saturating_sub(self.load[i]) as usize)
+            .sum()
+    }
+
+    /// The earliest instant a cooling-down, non-exhausted peer becomes
+    /// schedulable again; None when nothing is merely cooling (every
+    /// cooldown expired, or every cooling peer is exhausted anyway). The
+    /// fetch loop waits this out instead of aborting when it is the only
+    /// reason nothing is schedulable.
+    fn next_retry(&self) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        self.cooldown
             .iter()
             .zip(self.fails.iter())
-            .zip(self.depth.iter())
-            .filter(|((_, f), _)| **f < PEER_FAIL_LIMIT)
-            .map(|((l, _), d)| d.saturating_sub(*l) as usize)
-            .sum()
+            .filter(|(_, f)| **f < PEER_FAIL_LIMIT)
+            .filter_map(|(c, _)| *c)
+            .filter(|t| *t > now)
+            .min()
     }
 
     /// Book one batch onto peer `idx`: take its pipeline slot, reserve its
@@ -581,7 +626,7 @@ impl<'a> Window<'a> {
         report: &mut FetchReport,
     ) -> bool {
         let bgroups = swarm.groups_of(&batch);
-        match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails, deadline) {
+        match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails, &self.cooldown, deadline) {
             Some(idx) => {
                 self.schedule(swarm, batch, bgroups, idx, peers, deadline, now, report);
                 true
@@ -611,7 +656,8 @@ impl<'a> Window<'a> {
         let mut assigned = false;
         for sub in split_by_holder(bgroups, peers, swarm.size, batch_groups) {
             let sgroups = swarm.groups_of(&sub);
-            let Some(idx) = swarm.pick_peer(&sgroups, peers, &self.load, &self.fails, deadline)
+            let Some(idx) =
+                swarm.pick_peer(&sgroups, peers, &self.load, &self.fails, &self.cooldown, deadline)
             else {
                 continue;
             };
@@ -751,10 +797,25 @@ impl Swarm {
                 &mut report,
             );
             let Some(outcome) = next_ready(&mut window.futs).await else {
-                break; // nothing in flight and nothing left to assign
+                // Nothing in flight and nothing schedulable. When the only
+                // reason is a cooldown (a BUSY seeder sitting out, or the
+                // last-peer probe breather) a patient fetch waits it out and
+                // reschedules: aborting here would abandon the fetch on a
+                // seeder that is alive and merely refusing right now. The
+                // wait is bounded (each peer gets at most BUSY_LIMIT
+                // cooldowns and one probe). A streaming fetch cannot afford
+                // it: it returns what landed and lets the HTTP layer's own
+                // retry cadence come back.
+                if !deadline.is_streaming() {
+                    if let Some(until) = window.next_retry() {
+                        tokio::time::sleep_until(until).await;
+                        continue;
+                    }
+                }
+                break;
             };
             window.release(&outcome);
-            this.apply_outcome(outcome, peers, &mut remaining, &mut window.fails, &mut report);
+            this.apply_outcome(outcome, peers, &mut remaining, &mut window, &mut report);
             if remaining.is_empty() {
                 break; // done; dropping `flight` cancels leftover duplicates
             }
@@ -764,14 +825,15 @@ impl Swarm {
     }
 
     /// Fold one batch outcome into the running state: the class RTT
-    /// priors, the per-peer failure counts, the remaining bitfield and the
-    /// report. Landed groups count whether the batch won or failed partway.
+    /// priors, the per-peer failure/busy counts and cooldowns, the
+    /// remaining bitfield and the report. Landed groups count whether the
+    /// batch won or failed partway.
     fn apply_outcome(
         &self,
         outcome: BatchOutcome,
         peers: &[PeerHandle],
         remaining: &mut GroupBits,
-        fails: &mut [u32],
+        window: &mut Window<'_>,
         report: &mut FetchReport,
     ) {
         if let Some(obs) = &self.observer {
@@ -798,17 +860,46 @@ impl Swarm {
                     .observe(label, el, outcome.landed.len() as u64);
             }
         }
+        // A BUSY answer is refusal, not failure: no strike, but a cooldown
+        // so the refused peer is not re-picked at RTT rate (which would
+        // hammer the seeder that just told us it is full). A peer that does
+        // nothing but refuse is still dropped after BUSY_LIMIT answers.
+        if let Some(p) = outcome.busy_peer {
+            window.busy[p] = window.busy[p].saturating_add(1);
+            if window.busy[p] >= BUSY_LIMIT {
+                window.fails[p] = PEER_FAIL_LIMIT;
+            } else {
+                window.cooldown[p] = Some(tokio::time::Instant::now() + BUSY_COOLDOWN);
+            }
+        }
         // Count a failed batch against its peer; a peer that delivered is
         // healthy again, so one bad batch cannot bury it forever.
         if let Some(p) = outcome.failed_peer {
-            if let Some(f) = fails.get_mut(p) {
+            if let Some(f) = window.fails.get_mut(p) {
                 *f = f.saturating_add(1);
+            }
+            // The LAST remaining peer of a fetch is never exhausted without
+            // one probe retry after a breather: a sole seeder's onion
+            // circuit legitimately goes dark for a few stall windows and
+            // recovers, and exhausting it mid-file used to abort the whole
+            // fetch. One bounded second chance per peer - a peer that
+            // fails its probe too is out for good.
+            if window.fails[p] >= PEER_FAIL_LIMIT
+                && !window.probed[p]
+                && window.fails.iter().enumerate().all(|(j, f)| j == p || *f >= PEER_FAIL_LIMIT)
+            {
+                window.probed[p] = true;
+                window.fails[p] = PEER_FAIL_LIMIT - 1;
+                window.cooldown[p] =
+                    Some(tokio::time::Instant::now() + stall_timeout(peers[p].class));
             }
         }
         if let Some(w) = outcome.winner {
-            if let Some(f) = fails.get_mut(w) {
+            if let Some(f) = window.fails.get_mut(w) {
                 *f = 0;
             }
+            window.busy[w] = 0;
+            window.cooldown[w] = None;
         }
         for g in &outcome.landed {
             remaining.remove(*g..*g + 1);
@@ -828,9 +919,10 @@ impl Swarm {
     /// Least-loaded peer with a free pipeline slot that holds every group
     /// in `groups`, ties broken by prior failures then class RTT (fast
     /// peers preferred). A peer past PEER_FAIL_LIMIT consecutive failures
-    /// is exhausted and never picked.
+    /// is exhausted and never picked; one inside a cooldown (a BUSY answer,
+    /// the last-peer probe breather) is skipped until it expires.
     /// Choose a peer for `groups`, from those that hold all of it, are not
-    /// exhausted, and have a free pipeline slot.
+    /// exhausted or cooling down, and have a free pipeline slot.
     ///
     /// The ordering depends on what the fetch is for. Background bulk keeps
     /// spreading work by load, which uses the whole swarm and is what a
@@ -851,12 +943,15 @@ impl Swarm {
         peers: &[PeerHandle],
         load: &[u32],
         fails: &[u32],
+        cooldown: &[Option<tokio::time::Instant>],
         deadline: Deadline,
     ) -> Option<usize> {
+        let now = tokio::time::Instant::now();
         let stats = self.stats.lock().expect("stats");
         let peer_stats = self.peer_stats.lock().expect("peer stats");
         let eligible = peers.iter().enumerate().filter(|(i, p)| {
             fails[*i] < PEER_FAIL_LIMIT
+                && cooldown[*i].is_none_or(|t| t <= now)
                 && load[*i] < pipeline_depth(p.class)
                 && groups.iter().all(|g| p.bits.contains(*g))
         });
@@ -890,7 +985,18 @@ impl Swarm {
             winner_class: None,
             elapsed: None,
             failed_peer: Some(primary),
+            busy_peer: None,
         }
+    }
+
+    /// [`Self::batch_failed`], but the primary REFUSED the request (BUSY /
+    /// quota) rather than failing it: no strike, a cooldown instead
+    /// (`apply_outcome`).
+    fn batch_busy(&self, groups: Vec<u64>, primary: usize, duplicates: u64) -> BatchOutcome {
+        let mut out = self.batch_failed(groups, primary, duplicates);
+        out.failed_peer = None;
+        out.busy_peer = Some(primary);
+        out
     }
 
     /// Fetch `batch` from peer `primary`, progress-based: the primary is
@@ -950,6 +1056,9 @@ impl Swarm {
         // async fn must never be polled again (that panics "async fn
         // resumed after completion"), so a fast primary error must not fall
         // through to a re-await.
+        // A BUSY/quota refusal is remembered apart from real errors: the
+        // peer gets a cooldown, never a strike (`batch_busy`).
+        let mut primary_busy = false;
         let primary_errored = tokio::select! {
             res = &mut primary_fut => match res {
                 Ok(_) => {
@@ -958,7 +1067,10 @@ impl Swarm {
                         groups, primary, primary, peers[primary].label.clone(), 0, cls, start.elapsed(),
                     );
                 }
-                Err(_) => true,
+                Err(e) => {
+                    primary_busy = e.kind() == std::io::ErrorKind::QuotaExceeded;
+                    true
+                }
             },
             _ = stalled(&progress, stall) => false,
             _ = tokio::time::sleep(cap) => {
@@ -999,7 +1111,11 @@ impl Swarm {
             // cap. Dropping the primary cancels its stream; whatever its
             // prefix landed stays and the remainder is rescheduled.
             drop(primary_fut);
-            return self.batch_failed(groups, primary, 0);
+            return if primary_busy {
+                self.batch_busy(groups, primary, 0)
+            } else {
+                self.batch_failed(groups, primary, 0)
+            };
         }
 
         type BoxFut<'a> =
@@ -1041,12 +1157,18 @@ impl Swarm {
                 // never moves, pick_peer keeps assigning it, and every one
                 // of its batches eats a stall window plus a duplicate —
                 // PEER_FAIL_LIMIT exhaustion would never engage against a
-                // peer that accepts requests but sends nothing.
+                // peer that accepts requests but sends nothing. A primary
+                // that REFUSED (BUSY) gets a cooldown instead of the strike.
                 if w != primary {
-                    out.failed_peer = Some(primary);
+                    if primary_busy {
+                        out.busy_peer = Some(primary);
+                    } else {
+                        out.failed_peer = Some(primary);
+                    }
                 }
                 out
             }
+            None if primary_busy => self.batch_busy(groups, primary, dups),
             None => self.batch_failed(groups, primary, dups),
         }
     }
@@ -1074,6 +1196,9 @@ struct BatchOutcome {
     /// worse, bytes that failed verification), so scheduling deprioritizes
     /// and eventually exhausts it.
     failed_peer: Option<usize>,
+    /// The peer index that answered BUSY (the seeder's choker refusing us):
+    /// alive and serving others, so it gets a cooldown, not a strike.
+    busy_peer: Option<usize>,
 }
 
 impl BatchOutcome {
@@ -1097,6 +1222,7 @@ impl BatchOutcome {
             winner_class: Some(class),
             elapsed: Some(elapsed),
             failed_peer: None,
+            busy_peer: None,
         }
     }
 }
@@ -1292,13 +1418,14 @@ mod tests {
         let load = [1u32, 0];
         let fails = [0u32, 0];
         let groups = [0u64];
+        let cool = [None, None];
         assert_eq!(
-            swarm.pick_peer(&groups, &peers, &load, &fails, Deadline::tight()),
+            swarm.pick_peer(&groups, &peers, &load, &fails, &cool, Deadline::tight()),
             Some(0),
             "streaming must prefer the measured-fast peer over an idle slow one"
         );
         assert_eq!(
-            swarm.pick_peer(&groups, &peers, &load, &fails, Deadline::background()),
+            swarm.pick_peer(&groups, &peers, &load, &fails, &cool, Deadline::background()),
             Some(1),
             "background still spreads by load"
         );
@@ -1308,7 +1435,7 @@ mod tests {
         // up the play head.
         let saturated = [pipeline_depth(Class::Tor), 0];
         assert_eq!(
-            swarm.pick_peer(&groups, &peers, &saturated, &fails, Deadline::tight()),
+            swarm.pick_peer(&groups, &peers, &saturated, &fails, &cool, Deadline::tight()),
             Some(1),
             "a saturated fast peer must not starve the swarm"
         );
@@ -2063,6 +2190,271 @@ mod tests {
         assert!(
             starts[2] < ends[1],
             "the third batch must be issued while the second is still being served"
+        );
+    }
+
+    /// A peer inside a cooldown is not schedulable; the cooldown expiring
+    /// makes it schedulable again, with no strike recorded on the way.
+    #[tokio::test(start_paused = true)]
+    async fn pick_peer_skips_a_cooling_peer_until_the_cooldown_expires() {
+        let mut bits = GroupBits::new();
+        bits.add(0..4);
+        let peers =
+            vec![PeerHandle { conn: dummy_conn(), class: Class::Tor, bits, label: "only".into() }];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let swarm = Swarm::new(store, ObjId([0u8; 32]), 4 * 16 * 1024);
+        let load = [0u32];
+        let fails = [0u32];
+        let groups = [0u64];
+        let cooling = [Some(tokio::time::Instant::now() + BUSY_COOLDOWN)];
+        assert_eq!(
+            swarm.pick_peer(&groups, &peers, &load, &fails, &cooling, Deadline::background()),
+            None,
+            "a cooling peer must not be re-picked at RTT rate"
+        );
+        tokio::time::sleep(BUSY_COOLDOWN).await;
+        assert_eq!(
+            swarm.pick_peer(&groups, &peers, &load, &fails, &cooling, Deadline::background()),
+            Some(0),
+            "an expired cooldown makes the peer schedulable again"
+        );
+    }
+
+    /// A BUSY answer must never move the fail count (three refusals used to
+    /// strike out a fetch's sole seeder), but it does cool the peer down,
+    /// and a peer that does nothing but refuse is still dropped at
+    /// BUSY_LIMIT. A delivery clears the ledger.
+    #[tokio::test]
+    async fn a_busy_answer_cools_the_peer_down_instead_of_striking_it() {
+        let size = 4 * 16 * 1024;
+        let peers = vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Tor,
+            bits: GroupBits::complete(size),
+            label: "seed".into(),
+        }];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let swarm = Swarm::new(store, ObjId([0u8; 32]), size);
+        let mut window = Window::new(&peers);
+        let mut remaining = GroupBits::new();
+        remaining.add(0..4);
+        let mut report = FetchReport::default();
+        for i in 1..BUSY_LIMIT {
+            let outcome = swarm.batch_busy(vec![0], 0, 0);
+            swarm.apply_outcome(outcome, &peers, &mut remaining, &mut window, &mut report);
+            assert_eq!(window.fails[0], 0, "a refusal is never a strike");
+            assert_eq!(window.busy[0], i);
+            assert!(window.cooldown[0].is_some(), "but it does cool the peer down");
+            assert!(window.next_retry().is_some(), "and the fetch can wait the cooldown out");
+        }
+        let won = BatchOutcome::won(
+            vec![0], 0, 0, "seed".into(), 0, Class::Tor, Duration::from_millis(1),
+        );
+        swarm.apply_outcome(won, &peers, &mut remaining, &mut window, &mut report);
+        assert_eq!(window.busy[0], 0, "a delivery resets the refusal streak");
+        assert!(window.cooldown[0].is_none());
+        for _ in 0..BUSY_LIMIT {
+            let outcome = swarm.batch_busy(vec![0], 0, 0);
+            swarm.apply_outcome(outcome, &peers, &mut remaining, &mut window, &mut report);
+        }
+        assert!(
+            window.fails[0] >= PEER_FAIL_LIMIT,
+            "a refuse-only peer is bounded, not retried forever"
+        );
+        assert!(window.next_retry().is_none(), "nothing left to wait for");
+    }
+
+    /// The last remaining peer of a fetch gets exactly one probe retry (after
+    /// a breather) before exhaustion; a peer that strikes out while another
+    /// is still viable is exhausted outright.
+    #[tokio::test]
+    async fn the_last_peer_gets_one_probe_retry_before_exhaustion() {
+        let size = 4 * 16 * 1024;
+        let bits = GroupBits::complete(size);
+        let peer = |label: &str| PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Tor,
+            bits: bits.clone(),
+            label: label.into(),
+        };
+        let peers = vec![peer("a"), peer("b")];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let swarm = Swarm::new(store, ObjId([0u8; 32]), size);
+        let mut window = Window::new(&peers);
+        let mut remaining = GroupBits::new();
+        remaining.add(0..4);
+        let mut report = FetchReport::default();
+        for _ in 0..PEER_FAIL_LIMIT {
+            let o = swarm.batch_failed(vec![0], 0, 0);
+            swarm.apply_outcome(o, &peers, &mut remaining, &mut window, &mut report);
+        }
+        assert_eq!(
+            window.fails[0], PEER_FAIL_LIMIT,
+            "with another viable peer there is no probe: exhausted outright"
+        );
+        assert!(!window.probed[0]);
+        for _ in 0..PEER_FAIL_LIMIT {
+            let o = swarm.batch_failed(vec![0], 1, 0);
+            swarm.apply_outcome(o, &peers, &mut remaining, &mut window, &mut report);
+        }
+        assert_eq!(
+            window.fails[1],
+            PEER_FAIL_LIMIT - 1,
+            "the fetch's last peer is probed, not exhausted"
+        );
+        assert!(window.probed[1]);
+        assert!(window.cooldown[1].is_some(), "after a breather");
+        assert!(window.next_retry().is_some(), "which the fetch waits out");
+        let o = swarm.batch_failed(vec![0], 1, 0);
+        swarm.apply_outcome(o, &peers, &mut remaining, &mut window, &mut report);
+        assert_eq!(window.fails[1], PEER_FAIL_LIMIT, "a failed probe exhausts for good");
+    }
+
+    /// Like [`serving_conn`], but the first `busies` GetRanges are refused
+    /// with the choker's BUSY before it starts serving.
+    fn busy_then_serving_conn(data: &[u8], busies: u32) -> Conn {
+        use crate::msg::{err, Frame, FrameBody, Req, Resp};
+        use epix_blob::verified::{encode_slice, OutboardBytes};
+
+        let ob = OutboardBytes::from_slice(data);
+        let ranges = vec![0..data.len() as u64];
+        let mut slice = Vec::new();
+        encode_slice(data, &ob, &ranges, &mut slice).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+        tokio::spawn(async move {
+            let mut left = busies;
+            while let Some(inc) = server_in.recv().await {
+                if !matches!(inc.req, Req::GetRange { .. }) {
+                    continue;
+                }
+                if left > 0 {
+                    left -= 1;
+                    let body = FrameBody::Resp {
+                        last: true,
+                        resp: Resp::Err { code: err::BUSY, msg: "busy".into() },
+                    };
+                    if server.send(Frame { stream: inc.stream, body }).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let mut off = 0usize;
+                while off < slice.len() {
+                    let end = (off + 60_000).min(slice.len());
+                    let last = end == slice.len();
+                    let body = FrameBody::Data { last, bytes: slice[off..end].to_vec() };
+                    if server.send(Frame { stream: inc.stream, body }).await.is_err() {
+                        return;
+                    }
+                    off = end;
+                }
+            }
+        });
+        client
+    }
+
+    /// A sole seeder that refuses twice and then serves: the fetch must wait
+    /// out one cooldown per refusal and complete, where BUSY-as-a-strike
+    /// used to exhaust the peer and abort - and BUSY-without-a-cooldown
+    /// would have re-asked at RTT rate.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_seeder_is_waited_out_not_struck_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let peers = vec![PeerHandle {
+            conn: busy_then_serving_conn(&data, 2),
+            class: Class::Tor,
+            bits: GroupBits::complete(size),
+            label: "choked".into(),
+        }];
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let start = tokio::time::Instant::now();
+        let report = swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+        assert!(store.is_complete(id).unwrap(), "two refusals then served must complete");
+        assert_eq!(report.requests_issued, 3, "one ask per refusal plus the served one");
+        assert!(
+            start.elapsed() >= BUSY_COOLDOWN * 2,
+            "each refusal costs a cooldown, not an instant re-ask"
+        );
+        assert_eq!(report.groups_fetched, 3, "40 KB is three groups");
+    }
+
+    /// A seeder that refuses every request fails the fetch out after
+    /// BUSY_LIMIT asks: the patience is bounded, and retries beyond it
+    /// belong to the caller's round mechanism.
+    #[tokio::test(start_paused = true)]
+    async fn a_refuse_only_seeder_fails_out_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let peers = vec![PeerHandle {
+            conn: busy_then_serving_conn(&data, u32::MAX),
+            class: Class::Tor,
+            bits: GroupBits::complete(size),
+            label: "wall".into(),
+        }];
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let report = tokio::time::timeout(
+            Duration::from_secs(600),
+            swarm.fetch(&needed, &peers, Deadline::background(), 2),
+        )
+        .await
+        .expect("a refuse-only seeder must not park the fetch forever")
+        .unwrap();
+        assert_eq!(report.groups_fetched, 0);
+        assert_eq!(
+            report.requests_issued,
+            BUSY_LIMIT as u64,
+            "one ask per allowed refusal, then the fetch fails out"
+        );
+    }
+
+    /// End to end: a background fetch from one silent peer issues
+    /// PEER_FAIL_LIMIT batches, waits the probe breather, and issues exactly
+    /// one more before giving up - never exhausting the last peer untried.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_peer_probe_grants_one_extra_attempt_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let peers = vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size),
+            label: "silent".into(),
+        }];
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let report = tokio::time::timeout(
+            Duration::from_secs(600),
+            swarm.fetch(&needed, &peers, Deadline::background(), 2),
+        )
+        .await
+        .expect("the probe must not turn a dead seeder into an endless loop")
+        .unwrap();
+        assert_eq!(report.groups_fetched, 0);
+        assert_eq!(
+            report.requests_issued,
+            PEER_FAIL_LIMIT as u64 + 1,
+            "PEER_FAIL_LIMIT strikes, one probe after the breather, then out"
         );
     }
 

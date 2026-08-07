@@ -6414,9 +6414,23 @@ impl AppState {
                 // still had most of its deadline left. Partial groups persist
                 // in the store, so each attempt RESUMES rather than restarting,
                 // and the caller's timeout bounds the whole loop.
+                //
+                // An attempt that MOVED bytes does not burn the retry budget:
+                // a multi-GB file over tor loses its peer mid-transfer many
+                // times, and requeueing it to a later round (60-600s backoff)
+                // on the third such loss threw away a live resume for a cold
+                // restart. Only consecutive no-progress attempts count toward
+                // giving up, with a hard total so genuinely dead content
+                // still fails out to the round mechanism.
                 const ATTEMPTS: usize = 3;
+                const MAX_ATTEMPTS: usize = 10;
                 let mut last = String::new();
-                for attempt in 0..ATTEMPTS {
+                let mut no_progress = 0usize;
+                let mut have =
+                    edx_live_progress(&self.edx_transfer_stats(address, inner_path, None).await)
+                        .map(|(h, _)| h)
+                        .unwrap_or(0);
+                for attempt in 1..=MAX_ATTEMPTS {
                     match self.edx_fetch_file(address, inner_path, background).await {
                         Some(Ok(true)) => return Ok(true),
                         Some(Ok(false)) => {
@@ -6427,11 +6441,22 @@ impl AppState {
                         // would just burn the caller's deadline.
                         None => return Err("no EDX fetcher installed".into()),
                     }
-                    if attempt + 1 < ATTEMPTS {
-                        // Let the just-scored dial outcomes settle so the next
-                        // pass draws a different (better) peer set.
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let now_have =
+                        edx_live_progress(&self.edx_transfer_stats(address, inner_path, None).await)
+                            .map(|(h, _)| h)
+                            .unwrap_or(0);
+                    if now_have > have {
+                        no_progress = 0;
+                    } else {
+                        no_progress += 1;
                     }
+                    have = have.max(now_have);
+                    if no_progress >= ATTEMPTS || attempt >= MAX_ATTEMPTS {
+                        break;
+                    }
+                    // Let the just-scored dial outcomes settle so the next
+                    // pass draws a different (better) peer set.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(last)
             }
