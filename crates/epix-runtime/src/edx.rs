@@ -1859,11 +1859,23 @@ impl RuntimeEdxFetcher {
     /// still feeds the xite's peer registry via note_edx_dials — a dead (or
     /// zombie: handshakes, never answers the bitfield) peer sinks (backoff)
     /// instead of being redialed at the top of the list on every window.
+    ///
+    /// The third return is the dial channel, STILL OPEN: peers and lanes
+    /// that resolve after the grace keep landing on it. The bulk path feeds
+    /// them into its running fetch (`spawn_late_link_feed`); a caller with
+    /// no use for them drops the receiver, which is the old behavior.
     async fn build_peers(
         &self,
         address: &str,
         id: ObjId,
-    ) -> Result<(Vec<PeerHandle>, HashMap<String, Vec<u8>>), String> {
+    ) -> Result<
+        (
+            Vec<PeerHandle>,
+            HashMap<String, Vec<u8>>,
+            tokio::sync::mpsc::UnboundedReceiver<LaneResult>,
+        ),
+        String,
+    > {
         let peers = self.state.connectable_peers(address, 8).await;
         if peers.is_empty() {
             return Err("no peers".into());
@@ -1903,13 +1915,14 @@ impl RuntimeEdxFetcher {
             }
         }
         // A lane that lands after the grace window is not lost: it stays warm
-        // in the link pool, so the next window of this stream picks it up
-        // without paying for the circuit again.
+        // in the link pool, it reaches the object's cached session via
+        // add_cached_lane, and the bulk path joins it into the running fetch
+        // through the returned channel.
         self.xfer.note_session(id, address, now_secs(), total as u64, handles.len() as u64);
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
-        Ok((handles, node_pks))
+        Ok((handles, node_pks, rx))
     }
 
     /// Open this peer's extra transfer lanes and hand each one to the session
@@ -2084,6 +2097,45 @@ impl RuntimeEdxFetcher {
         entry.handles.push(handle);
     }
 
+    /// Feed a session's late dial results into a running bulk fetch: every
+    /// lane and peer that resolves after the first-handle grace becomes a
+    /// swarm joiner (`Swarm::fetch_growable`) instead of a warm link
+    /// nothing reads. Late whole peers - their lane 0 carries a fresh
+    /// bitfield - are also appended to the object's cached session, exactly
+    /// as `collect_extra_lanes` already does for extra lanes, so a retry
+    /// and the read-ahead see them too. Ends when the dial driver settles
+    /// every peer (the channel closes) or the fetch returns (the send
+    /// fails); dropping `join_tx` then tells the fetch no more are coming.
+    fn spawn_late_link_feed(
+        &self,
+        mut late: tokio::sync::mpsc::UnboundedReceiver<LaneResult>,
+        id: ObjId,
+        address: String,
+        node_pks: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        join_tx: tokio::sync::mpsc::UnboundedSender<PeerHandle>,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            while let Some((peer, got, primary)) = late.recv().await {
+                let Some((conn, identity, bits)) = got else { continue };
+                let label = peer.to_string();
+                let handle =
+                    PeerHandle { conn, class: Class::of_addr(&peer), bits, label: label.clone() };
+                node_pks.lock().expect("node pks").insert(label, identity.node_pk.clone());
+                if primary {
+                    // Extra lanes reach the cache via add_cached_lane on
+                    // the dial path already; adding them here too would
+                    // duplicate the handle in the cached session.
+                    this.add_cached_lane(id, clone_handle(&handle), identity.node_pk);
+                }
+                if join_tx.send(handle).is_err() {
+                    break; // fetch over; the dial driver still scores the rest
+                }
+                this.xfer.note_session_join(id, &address, now_secs());
+            }
+        });
+    }
+
     /// Revalidate cached session handles for `id`: refresh each link's
     /// bitfield (the peer may hold more groups than when it was dialed) and
     /// drop handles whose connection died or stopped answering - the
@@ -2185,7 +2237,10 @@ impl RuntimeEdxFetcher {
                 return Ok((live, node_pks));
             }
         }
-        let (handles, node_pks) = self.build_peers(address, id).await?;
+        // The dial channel is dropped: a streaming window is over in
+        // seconds, and late lanes reach the NEXT window through the cached
+        // session (add_cached_lane) as they always have.
+        let (handles, node_pks, _late) = self.build_peers(address, id).await?;
         self.cache_peers(id, &handles, &node_pks);
         Ok((handles, node_pks))
     }
@@ -2665,10 +2720,11 @@ impl RuntimeEdxFetcher {
         let mut spawn_next = |fetching: &mut tokio::task::JoinSet<(Res, bool)>| {
             let Some(r) = queue.next() else { return false };
             let this = self.clone();
-            // Re-read the session per file: peers that finished dialing since
-            // the tier started stripe the objects still queued, so a swarm
-            // that began on one link widens as the rest land.
-            let (store, session) = (store.clone(), Arc::new(session.peers()));
+            // The session is handed down live, not snapshotted: each file
+            // starts on the links dialed so far and keeps joining the ones
+            // that land while it runs (fetch_one_over_session), so a swarm
+            // that began on one link widens as the rest arrive.
+            let (store, session) = (store.clone(), session.clone());
             let serving = progress.serving.clone();
             let address = address.to_string();
             fetching.spawn(async move {
@@ -2840,6 +2896,10 @@ impl RuntimeEdxFetcher {
     /// Every peer the swarm actually drew groups from joins the batch's serving
     /// set, so a big file striped across the session reports the same "from N
     /// peers" the GetMany rounds do.
+    ///
+    /// Links that finish dialing while THIS file runs join its swarm with a
+    /// fresh bitfield (`spawn_session_link_feed`) rather than waiting for
+    /// the next file - a clone's large files span the whole dial phase.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_one_over_session(
         &self,
@@ -2847,7 +2907,7 @@ impl RuntimeEdxFetcher {
         store: &Arc<Store>,
         id: ObjId,
         size: u64,
-        session: &[SessionPeer],
+        session: &Session,
         deadline: Deadline,
         now: u64,
         serving: &Arc<Mutex<HashSet<String>>>,
@@ -2855,9 +2915,10 @@ impl RuntimeEdxFetcher {
         if store.is_complete(id).unwrap_or(false) {
             return true;
         }
+        let snapshot = session.peers();
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
-        for p in session {
+        for p in &snapshot {
             p.reg.note_cmd_sent("GetBitfield", None);
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&p.conn, id))
@@ -2883,11 +2944,14 @@ impl RuntimeEdxFetcher {
         let Ok(needed) = needed_groups(store, id, size) else { return false };
         let mut swarm =
             Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
-        if let Ok(report) = swarm.fetch(&needed, &handles, deadline, now).await {
+        let node_pks = Arc::new(Mutex::new(node_pks));
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        spawn_session_link_feed(session.clone(), snapshot.len(), id, node_pks.clone(), join_tx);
+        if let Ok(report) = swarm.fetch_growable(&needed, handles, joiners, deadline, now).await {
             for (label, _) in report.by_peer.iter().filter(|(_, groups)| **groups > 0) {
                 BatchProgress::note_peer(serving, label);
             }
-            self.credit(&report, &node_pks, now);
+            self.credit(&report, &node_pks.lock().expect("node pks"), now);
         }
         store.is_complete(id).unwrap_or(false)
     }
@@ -3121,7 +3185,15 @@ impl RuntimeEdxFetcher {
             return Ok(true);
         }
 
-        let (handles, node_pks) = self.build_peers(address, id).await?;
+        let (handles, node_pks, late) = self.build_peers(address, id).await?;
+        // Register the session in the peer cache BEFORE fetching. This is
+        // what lets add_cached_lane land the extra overlay lanes still
+        // dialing - over Tor they nearly always finish after the
+        // first-handle grace, and with no cache entry they were silently
+        // dropped, which is how a multi-GB file rode ONE circuit for its
+        // whole life. It also hands a retry of this file a warm session
+        // instead of a redial.
+        self.cache_peers(id, &handles, &node_pks);
         // Reserve the sparse record only now that a peer can serve it, and drop
         // it again if nothing lands (see `ObjClaim`): a manifest entry a
         // visitor touches once must not leave an index row and a sparse/.obao
@@ -3131,7 +3203,13 @@ impl RuntimeEdxFetcher {
         let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
         let mut swarm =
             Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
-        let report = match swarm.fetch(&needed, &handles, deadline, now).await {
+        // Links that finish dialing after the grace join the RUNNING fetch:
+        // the extra lanes and the slow circuits used to warm a pool nothing
+        // read while the fetch stayed frozen on whatever made the 2s cut.
+        let node_pks = Arc::new(Mutex::new(node_pks));
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        self.spawn_late_link_feed(late, id, address.to_string(), node_pks.clone(), join_tx);
+        let report = match swarm.fetch_growable(&needed, handles, joiners, deadline, now).await {
             Ok(report) => report,
             Err(e) => {
                 let e = e.to_string();
@@ -3141,7 +3219,7 @@ impl RuntimeEdxFetcher {
                 return Err(e);
             }
         };
-        self.credit(&report, &node_pks, now);
+        self.credit(&report, &node_pks.lock().expect("node pks"), now);
         if !store.is_complete(id).unwrap_or(false) {
             // The scheduler's silent-exhaustion path (peers ran out of
             // strikes): name it in the telemetry, not just the round log.
@@ -3380,6 +3458,43 @@ impl Session {
             }
         }
     }
+}
+
+/// Turn session links that finish dialing while one file's swarm runs into
+/// joiners for it: fetch the newcomer's bitfield for this object and hand
+/// the handle to the fetch. The first `staffed` links are the fetch's entry
+/// set. Ends when the session stops growing (dialing settled) or the fetch
+/// returns (the send fails); dropping `join_tx` then tells the fetch no
+/// more are coming.
+fn spawn_session_link_feed(
+    session: Session,
+    mut staffed: usize,
+    id: ObjId,
+    node_pks: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    join_tx: tokio::sync::mpsc::UnboundedSender<PeerHandle>,
+) {
+    tokio::spawn(async move {
+        while session.grows_past(staffed).await {
+            for p in session.peers().into_iter().skip(staffed) {
+                staffed += 1;
+                p.reg.note_cmd_sent("GetBitfield", None);
+                let Ok(Ok((_sz, bits))) = tokio::time::timeout(
+                    EDX_FETCH_TIMEOUT,
+                    epix_edx::fetch::fetch_bitfield(&p.conn, id),
+                )
+                .await
+                else {
+                    continue;
+                };
+                node_pks.lock().expect("node pks").insert(p.label.clone(), p.node_pk.clone());
+                let handle =
+                    PeerHandle { conn: p.conn, class: p.class, bits, label: p.label };
+                if join_tx.send(handle).is_err() {
+                    return; // the fetch is over
+                }
+            }
+        }
+    });
 }
 
 /// The distinct object ids of a batch's wants, in caller order, plus the want

@@ -382,6 +382,15 @@ impl Xfer {
         });
     }
 
+    /// A late link joined the session mid-fetch, so the connected count in
+    /// the transfer readout tracks the growing swarm.
+    pub fn note_session_join(&self, id: ObjId, address: &str, now: u64) {
+        self.with(id, address, "", 0, now, |f| {
+            f.connected += 1;
+            f.session_at = now;
+        });
+    }
+
     /// A read-ahead started on `window`, or (with `None`) one finished.
     pub fn note_readahead(&self, id: ObjId, address: &str, now: u64, window: Option<(u64, u64)>) {
         self.with(id, address, "", 0, now, |f| match window {

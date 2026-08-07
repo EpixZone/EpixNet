@@ -136,8 +136,8 @@ pub fn pipeline_depth(class: Class) -> u32 {
 /// megabyte. Cutting at the session minimum instead collapsed every
 /// clearnet peer's batches to the overlay size the moment one overlay link
 /// joined the session. Single-class sessions see one size either way.
-pub fn batch_groups_for(peers: &[PeerHandle]) -> u64 {
-    peers.iter().map(|p| groups_per_request(p.class)).max().unwrap_or(GROUPS_PER_REQUEST)
+pub fn batch_groups_for<P: std::borrow::Borrow<PeerHandle>>(peers: &[P]) -> u64 {
+    peers.iter().map(|p| groups_per_request(p.borrow().class)).max().unwrap_or(GROUPS_PER_REQUEST)
 }
 
 /// The no-new-bytes window for one request, given how many requests are
@@ -296,7 +296,9 @@ pub trait FetchObserver: Send + Sync {
 }
 
 /// A peer available to fetch from: its connection, transport class, and
-/// last-known availability bitfield for the object in question.
+/// last-known availability bitfield for the object in question. Clone is
+/// cheap: the `Conn` is a shared handle to one underlying stream.
+#[derive(Clone)]
 pub struct PeerHandle {
     pub conn: Conn,
     pub class: Class,
@@ -305,14 +307,56 @@ pub struct PeerHandle {
     pub label: String,
 }
 
+/// Peers that join a fetch mid-flight ride this channel (see
+/// [`Swarm::fetch_growable`]). The sender side lives with whatever is
+/// still dialing - late session dials, extra overlay lanes, a re-announce.
+/// Senders MUST be dropped once their dialing settles: an idle fetch with
+/// nothing schedulable waits on this channel, and every sender dropping is
+/// what tells it no more peers are coming.
+pub type Joiners = tokio::sync::mpsc::UnboundedReceiver<PeerHandle>;
+
+/// The peer roster of one fetch: append-only Arc slots.
+///
+/// The window's ledgers (`load`/`fails`/...) and [`BatchOutcome`]'s
+/// `primary`/`winner` are peer INDICES, and in-flight `race_batch` futures
+/// carry them across awaits, so a mid-fetch join must never move or
+/// reindex an existing entry: slots are Arc'd, the vec only grows, and an
+/// index handed out once stays valid for the fetch's whole life. Snapshots
+/// are a handful of Arc clones; `race_batch` re-snapshots at duplicate
+/// time, so a joiner can rescue a batch booked before it arrived.
+struct Roster {
+    slots: Mutex<Vec<Arc<PeerHandle>>>,
+}
+
+impl Roster {
+    fn new(peers: Vec<PeerHandle>) -> Self {
+        Self { slots: Mutex::new(peers.into_iter().map(Arc::new).collect()) }
+    }
+
+    fn snapshot(&self) -> Vec<Arc<PeerHandle>> {
+        self.slots.lock().expect("roster").clone()
+    }
+
+    fn get(&self, i: usize) -> Arc<PeerHandle> {
+        self.slots.lock().expect("roster")[i].clone()
+    }
+
+    fn push(&self, handle: PeerHandle) {
+        self.slots.lock().expect("roster").push(Arc::new(handle));
+    }
+}
+
 /// Order missing groups rarest-first: for each needed group, count how
 /// many peers hold it; schedule the least-held groups first. Returns
 /// group indices in scheduling order (only groups at least one peer has).
-pub fn rarest_first_order(needed: &GroupBits, peers: &[PeerHandle]) -> Vec<u64> {
+pub fn rarest_first_order<P: std::borrow::Borrow<PeerHandle>>(
+    needed: &GroupBits,
+    peers: &[P],
+) -> Vec<u64> {
     let mut counts: Vec<(u64, u64)> = Vec::new(); // (holders, group)
     for run in needed.ranges() {
         for g in run.clone() {
-            let holders = peers.iter().filter(|p| p.bits.contains(g)).count() as u64;
+            let holders = peers.iter().filter(|p| p.borrow().bits.contains(g)).count() as u64;
             if holders > 0 {
                 counts.push((holders, g));
             }
@@ -336,11 +380,14 @@ pub fn rarest_first_order(needed: &GroupBits, peers: &[PeerHandle]) -> Vec<u64> 
 /// Bulk fetches keep rarest-first, so the swarm still gets that property from
 /// every non-streaming transfer; only a fetch feeding a player trades it for
 /// contiguity.
-pub fn sequential_order(needed: &GroupBits, peers: &[PeerHandle]) -> Vec<u64> {
+pub fn sequential_order<P: std::borrow::Borrow<PeerHandle>>(
+    needed: &GroupBits,
+    peers: &[P],
+) -> Vec<u64> {
     let mut out = Vec::new();
     for run in needed.ranges() {
         for g in run.clone() {
-            if peers.iter().any(|p| p.bits.contains(g)) {
+            if peers.iter().any(|p| p.borrow().bits.contains(g)) {
                 out.push(g);
             }
         }
@@ -382,7 +429,7 @@ pub fn batch_into_ranges(groups: &[u64], size: u64, max_groups: u64) -> Vec<std:
 /// range). Groups NO peer holds are dropped.
 fn split_by_holder(
     groups: &[u64],
-    peers: &[PeerHandle],
+    peers: &[Arc<PeerHandle>],
     size: u64,
     max_groups: u64,
 ) -> Vec<std::ops::Range<u64>> {
@@ -455,6 +502,43 @@ fn next_unassigned(
     order
 }
 
+/// Admit one mid-fetch joiner (see [`Swarm::fetch_growable`]): a roster
+/// slot, fresh window ledgers at its own class's depth, and - the part a
+/// bare push would miss - any still-needed groups NO existing peer holds
+/// appended to the scheduling order. Both order builders exclude
+/// zero-holder groups, so a joiner that is their first holder could never
+/// be assigned them and the fetch would end incomplete with a capable peer
+/// connected. Appended in index order after the existing order: extending
+/// beats the quadratic re-sort the one-shot order build exists to avoid
+/// (and a sole-holder group has no rarest-first rank to contest anyway).
+/// The batch CUT size is re-derived at the coarsest class present, so a
+/// clearnet joiner in an overlay session takes full-size batches -
+/// `Window::schedule` still trims every batch to the picked peer's own
+/// request size.
+fn admit_joiner(
+    handle: PeerHandle,
+    roster: &Roster,
+    window: &mut Window<'_>,
+    full_order: &mut Vec<u64>,
+    remaining: &GroupBits,
+    batch_groups: &mut u64,
+) {
+    if handle.conn.is_closed() {
+        return; // a link that died while queued would only eat strikes
+    }
+    let peers = roster.snapshot();
+    for run in remaining.ranges() {
+        for g in run.clone() {
+            if handle.bits.contains(g) && !peers.iter().any(|p| p.bits.contains(g)) {
+                full_order.push(g);
+            }
+        }
+    }
+    *batch_groups = (*batch_groups).max(groups_per_request(handle.class));
+    window.grow(handle.class);
+    roster.push(handle);
+}
+
 /// The fetch driver for one object across a peer set.
 pub struct Swarm {
     store: Arc<Store>,
@@ -467,6 +551,10 @@ pub struct Swarm {
     peer_stats: Mutex<PeerStats>,
     /// Live reporting sink, when the caller wants one.
     observer: Option<Arc<dyn FetchObserver>>,
+    /// Freeze the peer set at fetch entry (never admit joiners),
+    /// overriding the `EPIX_EDX_FROZEN_SESSION` env default. Tests pin it
+    /// so they are immune to the process environment.
+    frozen_session: Option<bool>,
 }
 
 /// What a completed fetch produced (for metrics/tests).
@@ -516,7 +604,7 @@ struct Window<'a> {
 }
 
 impl<'a> Window<'a> {
-    fn new(peers: &[PeerHandle]) -> Self {
+    fn new(peers: &[Arc<PeerHandle>]) -> Self {
         Self {
             load: vec![0u32; peers.len()],
             fails: vec![0u32; peers.len()],
@@ -527,6 +615,18 @@ impl<'a> Window<'a> {
             probed: vec![false; peers.len()],
             futs: Vec::new(),
         }
+    }
+
+    /// Ledger slots for a peer that joined mid-fetch: clean fail/busy
+    /// history and its own class's pipeline depth. Always appended - the
+    /// roster is append-only, so slot `i` here is slot `i` there.
+    fn grow(&mut self, class: Class) {
+        self.load.push(0);
+        self.fails.push(0);
+        self.depth.push(pipeline_depth(class));
+        self.busy.push(0);
+        self.cooldown.push(None);
+        self.probed.push(false);
     }
 
     /// Whether peer `i` may be handed work right now: not exhausted and not
@@ -569,7 +669,8 @@ impl<'a> Window<'a> {
         mut batch: std::ops::Range<u64>,
         mut groups: Vec<u64>,
         idx: usize,
-        peers: &'a [PeerHandle],
+        peers: &[Arc<PeerHandle>],
+        roster: &'a Roster,
         deadline: Deadline,
         now: u64,
         report: &mut FetchReport,
@@ -608,7 +709,7 @@ impl<'a> Window<'a> {
         let queued = self.load[idx]
             .max(link_queue_depth(peers[idx].class, peers[idx].conn.queued_fetch_bytes()));
         self.futs.push(Box::pin(
-            swarm.race_batch(batch, groups, idx, peers, deadline, now, queued, charge),
+            swarm.race_batch(batch, groups, idx, roster, deadline, now, queued, charge),
         ));
     }
 
@@ -619,7 +720,8 @@ impl<'a> Window<'a> {
         &mut self,
         swarm: &'a Swarm,
         batch: std::ops::Range<u64>,
-        peers: &'a [PeerHandle],
+        peers: &[Arc<PeerHandle>],
+        roster: &'a Roster,
         deadline: Deadline,
         now: u64,
         batch_groups: u64,
@@ -628,12 +730,19 @@ impl<'a> Window<'a> {
         let bgroups = swarm.groups_of(&batch);
         match swarm.pick_peer(&bgroups, peers, &self.load, &self.fails, &self.cooldown, deadline) {
             Some(idx) => {
-                self.schedule(swarm, batch, bgroups, idx, peers, deadline, now, report);
+                self.schedule(swarm, batch, bgroups, idx, peers, roster, deadline, now, report);
                 true
             }
-            None => {
-                self.assign_split(swarm, &bgroups, peers, deadline, now, batch_groups, report)
-            }
+            None => self.assign_split(
+                swarm,
+                &bgroups,
+                peers,
+                roster,
+                deadline,
+                now,
+                batch_groups,
+                report,
+            ),
         }
     }
 
@@ -647,7 +756,8 @@ impl<'a> Window<'a> {
         &mut self,
         swarm: &'a Swarm,
         bgroups: &[u64],
-        peers: &'a [PeerHandle],
+        peers: &[Arc<PeerHandle>],
+        roster: &'a Roster,
         deadline: Deadline,
         now: u64,
         batch_groups: u64,
@@ -661,7 +771,7 @@ impl<'a> Window<'a> {
             else {
                 continue;
             };
-            self.schedule(swarm, sub, sgroups, idx, peers, deadline, now, report);
+            self.schedule(swarm, sub, sgroups, idx, peers, roster, deadline, now, report);
             assigned = true;
         }
         assigned
@@ -676,7 +786,8 @@ impl<'a> Window<'a> {
         full_order: &[u64],
         cursor: &mut usize,
         remaining: &GroupBits,
-        peers: &'a [PeerHandle],
+        peers: &[Arc<PeerHandle>],
+        roster: &'a Roster,
         deadline: Deadline,
         now: u64,
         batch_groups: u64,
@@ -699,7 +810,8 @@ impl<'a> Window<'a> {
             }
             let mut assigned = false;
             for batch in batch_into_ranges(&order, swarm.size, batch_groups) {
-                assigned |= self.assign(swarm, batch, peers, deadline, now, batch_groups, report);
+                assigned |=
+                    self.assign(swarm, batch, peers, roster, deadline, now, batch_groups, report);
             }
             if !assigned {
                 break; // nothing schedulable in this window slice
@@ -725,6 +837,7 @@ impl Swarm {
             stats: Mutex::new(ClassStats::default()),
             peer_stats: Mutex::new(PeerStats::default()),
             observer: None,
+            frozen_session: None,
         }
     }
 
@@ -750,6 +863,10 @@ impl Swarm {
     /// are present locally or no schedulable peer can supply a remaining
     /// group.
     ///
+    /// The peer set is FROZEN at entry for this call; a caller whose
+    /// session is still dialing uses [`Swarm::fetch_growable`] so links
+    /// that land later join the fetch instead of idling in a pool.
+    ///
     /// `deadline` bounds a batch's absolute wait: a tight (streaming)
     /// deadline caps how long one batch may hold its groups.
     pub async fn fetch(
@@ -759,69 +876,158 @@ impl Swarm {
         deadline: Deadline,
         now: u64,
     ) -> std::io::Result<FetchReport> {
+        // A join channel nobody can ever send on: the growable core sees it
+        // closed and runs the frozen-set behavior.
+        let (_closed, joiners) = tokio::sync::mpsc::unbounded_channel();
+        drop(_closed);
+        self.fetch_growable(needed, peers.to_vec(), joiners, deadline, now).await
+    }
+
+    /// [`Swarm::fetch`] whose peer set GROWS mid-fetch: every handle sent
+    /// on `joiners` is admitted into the running schedule, with its own
+    /// pipeline depth and request size, groups only it holds appended to
+    /// the scheduling order, and in-flight stalls duplicated onto it. A
+    /// multi-GB background fetch outlives its session's dial phase many
+    /// times over, and with a frozen set every link that landed after the
+    /// first (extra overlay lanes, slow circuits, a re-announce) warmed a
+    /// pool nothing read while the whole file rode one circuit.
+    ///
+    /// With nothing in flight and nothing schedulable, a non-streaming
+    /// fetch waits for a joiner while the channel has senders - the late
+    /// circuit is often the ONLY usable peer an all-overlay fetch ever
+    /// gets - so callers must drop their sender once their dialing
+    /// settles; that close is what bounds the wait.
+    ///
+    /// `EPIX_EDX_FROZEN_SESSION=1` restores the frozen-set behavior
+    /// (joiners are never admitted): the field escape hatch.
+    pub async fn fetch_growable(
+        &mut self,
+        needed: &GroupBits,
+        peers: Vec<PeerHandle>,
+        mut joiners: Joiners,
+        deadline: Deadline,
+        now: u64,
+    ) -> std::io::Result<FetchReport> {
         let mut report = FetchReport::default();
         let mut remaining = needed.clone();
 
         // Ensure the sparse object exists before writing slices.
         self.store.ensure_sparse(self.obj, epix_blob::Ns::Plain, self.size, now)?;
+        if remaining.is_empty() {
+            return Ok(report);
+        }
 
-        // The peer set and their bitfields are fixed for this call, so the
-        // rarest-first order never changes: build it once and walk it with a
-        // cursor. Re-counting holders and re-sorting every remaining group
-        // on each refill made a whole-object fetch quadratic in object size
-        // (a 10 GB object is ~600k groups).
-        // A player needs contiguity (see `sequential_order`); a bulk transfer
-        // needs swarm health (see `rarest_first_order`).
-        let full_order = if deadline.is_streaming() {
-            sequential_order(needed, peers)
+        let mut joining = !self.session_frozen();
+        // Append-only Arc slots: the window's ledgers and BatchOutcome
+        // carry peer indices across in-flight futures, so a join may only
+        // ever push, never move or reindex (see [`Roster`]).
+        let roster = Roster::new(peers);
+        let entry_peers = roster.snapshot();
+
+        // The scheduling order is built ONCE, from the entry set, and
+        // walked with a cursor: re-counting holders and re-sorting every
+        // remaining group on each refill made a whole-object fetch
+        // quadratic in object size (a 10 GB object is ~600k groups). A
+        // join does not rebuild it either - a joiner serves the existing
+        // order through pick_peer, and only the groups no earlier peer
+        // held (excluded as unschedulable) are appended (`admit_joiner`).
+        // A player needs contiguity (see `sequential_order`); a bulk
+        // transfer needs swarm health (see `rarest_first_order`).
+        let mut full_order = if deadline.is_streaming() {
+            sequential_order(needed, &entry_peers)
         } else {
-            rarest_first_order(needed, peers)
+            rarest_first_order(needed, &entry_peers)
         };
-        // One CUT size for the whole call (batches are cut before a peer is
-        // picked): the coarsest class present, trimmed to the picked peer's
-        // own request size in `Window::schedule`.
-        let batch_groups = batch_groups_for(peers);
+        // One CUT size at a time (batches are cut before a peer is
+        // picked): the coarsest class present, trimmed to the picked
+        // peer's own request size in `Window::schedule`. Re-derived when a
+        // joiner brings a coarser class into the session.
+        let mut batch_groups = batch_groups_for(&entry_peers);
         let mut cursor = 0usize;
         let this = &*self;
-        let mut window = Window::new(peers);
+        let mut window = Window::new(&entry_peers);
         loop {
+            let peers = roster.snapshot();
             window.refill(
                 this,
                 &full_order,
                 &mut cursor,
                 &remaining,
-                peers,
+                &peers,
+                &roster,
                 deadline,
                 now,
                 batch_groups,
                 &mut report,
             );
-            let Some(outcome) = next_ready(&mut window.futs).await else {
+            if window.futs.is_empty() {
                 // Nothing in flight and nothing schedulable. When the only
                 // reason is a cooldown (a BUSY seeder sitting out, or the
                 // last-peer probe breather) a patient fetch waits it out and
                 // reschedules: aborting here would abandon the fetch on a
                 // seeder that is alive and merely refusing right now. The
                 // wait is bounded (each peer gets at most BUSY_LIMIT
-                // cooldowns and one probe). A streaming fetch cannot afford
-                // it: it returns what landed and lets the HTTP layer's own
-                // retry cadence come back.
-                if !deadline.is_streaming() {
-                    if let Some(until) = window.next_retry() {
-                        tokio::time::sleep_until(until).await;
-                        continue;
+                // cooldowns and one probe). A session still dialing may
+                // likewise yet produce a joiner, and the join channel
+                // closes when its dials settle, so that wait is bounded
+                // too. A streaming fetch cannot afford either: it returns
+                // what landed and lets the HTTP layer's own retry cadence
+                // come back.
+                if deadline.is_streaming() {
+                    break;
+                }
+                let until = window.next_retry();
+                if until.is_none() && !joining {
+                    break;
+                }
+                match join_or_retry(&mut joiners, joining, until).await {
+                    Some(Some(handle)) => admit_joiner(
+                        handle,
+                        &roster,
+                        &mut window,
+                        &mut full_order,
+                        &remaining,
+                        &mut batch_groups,
+                    ),
+                    Some(None) => joining = false,
+                    None => {} // a cooldown expired: reschedule
+                }
+                continue;
+            }
+            let wake = tokio::select! {
+                outcome = next_ready(&mut window.futs) => {
+                    Wake::Batch(outcome.expect("the window was not empty"))
+                }
+                joined = joiners.recv(), if joining => Wake::Join(joined),
+            };
+            match wake {
+                Wake::Batch(outcome) => {
+                    window.release(&outcome);
+                    this.apply_outcome(outcome, &peers, &mut remaining, &mut window, &mut report);
+                    if remaining.is_empty() {
+                        break; // done; dropping the window cancels leftover duplicates
                     }
                 }
-                break;
-            };
-            window.release(&outcome);
-            this.apply_outcome(outcome, peers, &mut remaining, &mut window, &mut report);
-            if remaining.is_empty() {
-                break; // done; dropping `flight` cancels leftover duplicates
+                Wake::Join(Some(handle)) => admit_joiner(
+                    handle,
+                    &roster,
+                    &mut window,
+                    &mut full_order,
+                    &remaining,
+                    &mut batch_groups,
+                ),
+                Wake::Join(None) => joining = false,
             }
         }
 
         Ok(report)
+    }
+
+    /// Whether this fetch runs with its peer set frozen at entry. The env
+    /// flag is the operational escape hatch; the field pins it for tests.
+    fn session_frozen(&self) -> bool {
+        self.frozen_session
+            .unwrap_or_else(|| frozen_env(std::env::var("EPIX_EDX_FROZEN_SESSION").ok().as_deref()))
     }
 
     /// Fold one batch outcome into the running state: the class RTT
@@ -831,7 +1037,7 @@ impl Swarm {
     fn apply_outcome(
         &self,
         outcome: BatchOutcome,
-        peers: &[PeerHandle],
+        peers: &[Arc<PeerHandle>],
         remaining: &mut GroupBits,
         window: &mut Window<'_>,
         report: &mut FetchReport,
@@ -940,7 +1146,7 @@ impl Swarm {
     fn pick_peer(
         &self,
         groups: &[u64],
-        peers: &[PeerHandle],
+        peers: &[Arc<PeerHandle>],
         load: &[u32],
         fails: &[u32],
         cooldown: &[Option<tokio::time::Instant>],
@@ -999,21 +1205,21 @@ impl Swarm {
         out
     }
 
-    /// Fetch `batch` from peer `primary`, progress-based: the primary is
-    /// duplicated onto up to MAX_DUPLICATES faster-or-equal peers only when
-    /// it STALLS (no new bytes for its class's stall window), never merely
-    /// for being slow; the batch fails only when nobody moves bytes for a
-    /// stall window or the absolute cap runs out. First success wins; the
-    /// object store's idempotent verified writes make a late duplicate
-    /// harmless, and a failed batch keeps the groups its streamed prefix
-    /// landed.
+    /// Fetch `batch` from peer `primary` (a roster index), progress-based:
+    /// the primary is duplicated onto up to MAX_DUPLICATES faster-or-equal
+    /// peers only when it STALLS (no new bytes for its class's stall
+    /// window), never merely for being slow; the batch fails only when
+    /// nobody moves bytes for a stall window or the absolute cap runs out.
+    /// First success wins; the object store's idempotent verified writes
+    /// make a late duplicate harmless, and a failed batch keeps the groups
+    /// its streamed prefix landed.
     #[allow(clippy::too_many_arguments)]
     async fn race_batch(
         &self,
         batch: std::ops::Range<u64>,
         groups: Vec<u64>,
         primary: usize,
-        peers: &[PeerHandle],
+        roster: &Roster,
         deadline: Deadline,
         now: u64,
         queued: u32,
@@ -1021,6 +1227,9 @@ impl Swarm {
         // queued-bytes counter on completion and cancellation alike.
         _charge: crate::conn::FetchCharge,
     ) -> BatchOutcome {
+        // The slot's Arc keeps the primary's handle valid however the
+        // roster grows while this batch is in flight.
+        let prim = roster.get(primary);
         // The cap is a per-request budget scaled by the link's queue depth:
         // a batch behind `queued` requests' worth of bytes on the circuit
         // needs that many shares of it just to drain. A fixed cap turned a
@@ -1030,26 +1239,22 @@ impl Swarm {
         // The stall window is capped to a share of the batch budget: a
         // stall detected only near the cap would leave the duplicated race
         // below no time to answer.
-        let stall = stall_window(peers[primary].class, queued).min(cap / PRIMARY_BUDGET_DIVISOR);
+        let stall = stall_window(prim.class, queued).min(cap / PRIMARY_BUDGET_DIVISOR);
         // Arc: the fetches' incremental disk commits bump it from the
         // blocking pool, so committing counts as liveness too.
         let progress = Arc::new(AtomicU64::new(0));
         let ranges = [batch.clone()];
-        let fetch_from = |i: usize| {
-            fetch::fetch_ranges_observed(
-                &peers[i].conn,
-                &self.store,
-                self.obj,
-                self.size,
-                &ranges,
-                deadline.ms,
-                now,
-                &progress,
-            )
+        let fetch_from = |p: Arc<PeerHandle>| {
+            let (ranges, progress) = (&ranges, &progress);
+            let (store, obj, size, ms) = (&self.store, self.obj, self.size, deadline.ms);
+            async move {
+                fetch::fetch_ranges_observed(&p.conn, store, obj, size, ranges, ms, now, progress)
+                    .await
+            }
         };
 
         let start = std::time::Instant::now();
-        let mut primary_fut = Box::pin(fetch_from(primary));
+        let mut primary_fut = Box::pin(fetch_from(prim.clone()));
 
         // Run the primary until it finishes, stalls, or eats the whole cap.
         // Record whether it already COMPLETED with an error: a completed
@@ -1062,9 +1267,9 @@ impl Swarm {
         let primary_errored = tokio::select! {
             res = &mut primary_fut => match res {
                 Ok(_) => {
-                    let cls = peers[primary].class;
+                    let cls = prim.class;
                     return BatchOutcome::won(
-                        groups, primary, primary, peers[primary].label.clone(), 0, cls, start.elapsed(),
+                        groups, primary, primary, prim.label.clone(), 0, cls, start.elapsed(),
                     );
                 }
                 Err(e) => {
@@ -1082,15 +1287,17 @@ impl Swarm {
             }
         };
 
-        // Duplicate onto faster-or-equal peers holding the groups.
-        let ok_classes =
-            self.stats.lock().expect("stats").faster_or_equal(peers[primary].class);
+        // Duplicate onto faster-or-equal peers holding the groups. The
+        // roster is re-read HERE, at race time, so a peer that joined after
+        // this batch was booked is a rescue candidate too.
+        let ok_classes = self.stats.lock().expect("stats").faster_or_equal(prim.class);
+        let peers = roster.snapshot();
         let targets: Vec<usize> = peers
             .iter()
             .enumerate()
             .filter(|(i, p)| {
                 *i != primary
-                    && p.label != peers[primary].label
+                    && p.label != prim.label
                     && ok_classes.contains(&p.class)
                     && groups.iter().all(|g| p.bits.contains(*g))
             })
@@ -1122,7 +1329,8 @@ impl Swarm {
             std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<usize>> + Send + 'a>>;
         let mut racers: Vec<BoxFut<'_>> = Vec::new();
         for &t in &targets {
-            racers.push(Box::pin(async move { fetch_from(t).await.map(|_| t) }));
+            let handle = peers[t].clone();
+            racers.push(Box::pin(async move { fetch_from(handle).await.map(|_| t) }));
         }
         // Only re-race the primary if it is still pending; a completed
         // (errored) primary must not be polled again.
@@ -1137,7 +1345,7 @@ impl Swarm {
         let race_stall = targets
             .iter()
             .map(|&t| stall_timeout(peers[t].class))
-            .chain((!primary_errored).then(|| stall_timeout(peers[primary].class)))
+            .chain((!primary_errored).then(|| stall_timeout(prim.class)))
             .max()
             .unwrap_or(stall);
         let winner = tokio::select! {
@@ -1274,6 +1482,43 @@ impl Deadline {
     }
 }
 
+/// What woke the fetch loop while batches were in flight: one landed, or
+/// the join channel spoke (`Join(None)` = closed, no more joiners coming).
+enum Wake {
+    Batch(BatchOutcome),
+    Join(Option<PeerHandle>),
+}
+
+/// Parse `EPIX_EDX_FROZEN_SESSION`: "1" freezes every fetch's peer set at
+/// entry (the pre-growable behavior); anything else, and unset, grows.
+fn frozen_env(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Wait, with nothing in flight, for whichever comes first: the earliest
+/// cooldown expiry (`None`) or join-channel activity (`Some(joiner)`, or
+/// `Some(None)` = closed). At least one arm can always fire - the caller
+/// breaks out before waiting when neither could.
+async fn join_or_retry(
+    joiners: &mut Joiners,
+    joining: bool,
+    until: Option<tokio::time::Instant>,
+) -> Option<Option<PeerHandle>> {
+    tokio::select! {
+        _ = sleep_until_maybe(until) => None,
+        joined = joiners.recv(), if joining => Some(joined),
+    }
+}
+
+/// Sleep until `t`; pend forever on `None` (the select around it has
+/// another arm that can still fire).
+async fn sleep_until_maybe(t: Option<tokio::time::Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 // --- tiny future combinators (avoid pulling futures-util) ---
 
 /// Resolves when `progress` stops advancing for `stall` (checked at that
@@ -1395,7 +1640,7 @@ mod tests {
     async fn streaming_picks_the_fastest_peer_while_background_spreads_load() {
         let mut bits = GroupBits::new();
         bits.add(0..4);
-        let peers = vec![
+        let peers = arced(vec![
             PeerHandle {
                 conn: dummy_conn(),
                 class: Class::Tor,
@@ -1403,7 +1648,7 @@ mod tests {
                 label: "fast".into(),
             },
             PeerHandle { conn: dummy_conn(), class: Class::Tor, bits, label: "slow".into() },
-        ];
+        ]);
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let swarm = Swarm::new(store, epix_blob::ObjId([0u8; 32]), 4 * 16 * 1024);
@@ -1642,7 +1887,7 @@ mod tests {
             GROUPS_PER_REQUEST,
             "one overlay link must not collapse the clearnet peers' batches"
         );
-        assert_eq!(batch_groups_for(&[]), GROUPS_PER_REQUEST);
+        assert_eq!(batch_groups_for::<PeerHandle>(&[]), GROUPS_PER_REQUEST);
     }
 
     /// Captures on_request bookings so a test can see the per-peer batch
@@ -1669,7 +1914,7 @@ mod tests {
         let total_groups = 512u64;
         let size = total_groups * GROUP_BYTES;
         let bits = GroupBits::complete(size);
-        let peers = vec![
+        let roster = Roster::new(vec![
             PeerHandle {
                 conn: dummy_conn(),
                 class: Class::Clearnet,
@@ -1677,7 +1922,8 @@ mod tests {
                 label: "clear".into(),
             },
             PeerHandle { conn: dummy_conn(), class: Class::Tor, bits, label: "tor".into() },
-        ];
+        ]);
+        let peers = roster.snapshot();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let log = Arc::new(RequestLog::default());
@@ -1698,6 +1944,7 @@ mod tests {
             &mut cursor,
             &needed,
             &peers,
+            &roster,
             Deadline::background(),
             2,
             batch_groups,
@@ -1747,6 +1994,12 @@ mod tests {
         std::mem::forget(_b);
         let (c, _in) = Conn::start(a, true);
         c
+    }
+
+    /// Wrap plain handles the way a fetch's roster snapshot delivers them,
+    /// for tests that drive the window internals directly.
+    fn arced(peers: Vec<PeerHandle>) -> Vec<Arc<PeerHandle>> {
+        peers.into_iter().map(Arc::new).collect()
     }
 
     /// A connection whose peer end is gone: any fetch errors almost
@@ -1928,8 +2181,10 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let groups = swarm.groups_of(&(0..size));
         let charge = peers[0].conn.charge_fetch(size);
-        let outcome =
-            swarm.race_batch(0..size, groups, 0, &peers, Deadline::background(), 2, 1, charge).await;
+        let roster = Roster::new(peers);
+        let outcome = swarm
+            .race_batch(0..size, groups, 0, &roster, Deadline::background(), 2, 1, charge)
+            .await;
         assert_eq!(outcome.duplicates, 0, "a moving transfer is never raced");
         assert_eq!(outcome.winner_label.as_deref(), Some("trickle"));
     }
@@ -1968,7 +2223,8 @@ mod tests {
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
         let groups = swarm.groups_of(&(0..size));
         let charge = peers[0].conn.charge_fetch(size);
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1, charge).await;
+        let roster = Roster::new(peers);
+        let outcome = swarm.race_batch(0..size, groups, 0, &roster, deadline, 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 1, "the stalled primary is duplicated onto the other peer");
         assert_eq!(
             outcome.winner_label.as_deref(),
@@ -2019,7 +2275,8 @@ mod tests {
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
         let groups = swarm.groups_of(&(0..size));
         let charge = peers[0].conn.charge_fetch(size);
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1, charge).await;
+        let roster = Roster::new(peers);
+        let outcome = swarm.race_batch(0..size, groups, 0, &roster, deadline, 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 0, "a sibling lane is not a duplication target");
         assert_eq!(
             outcome.winner_label, None,
@@ -2059,7 +2316,8 @@ mod tests {
         let deadline = Deadline { ms: 0, max_wait: Duration::ZERO };
         let groups = swarm.groups_of(&(0..size));
         let charge = peers[0].conn.charge_fetch(size);
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1, charge).await;
+        let roster = Roster::new(peers);
+        let outcome = swarm.race_batch(0..size, groups, 0, &roster, deadline, 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 0, "no budget left means no duplicate is issued");
         assert!(outcome.winner_label.is_none(), "nobody can win a zero-length race");
     }
@@ -2199,8 +2457,12 @@ mod tests {
     async fn pick_peer_skips_a_cooling_peer_until_the_cooldown_expires() {
         let mut bits = GroupBits::new();
         bits.add(0..4);
-        let peers =
-            vec![PeerHandle { conn: dummy_conn(), class: Class::Tor, bits, label: "only".into() }];
+        let peers = arced(vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Tor,
+            bits,
+            label: "only".into(),
+        }]);
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let swarm = Swarm::new(store, ObjId([0u8; 32]), 4 * 16 * 1024);
@@ -2228,12 +2490,12 @@ mod tests {
     #[tokio::test]
     async fn a_busy_answer_cools_the_peer_down_instead_of_striking_it() {
         let size = 4 * 16 * 1024;
-        let peers = vec![PeerHandle {
+        let peers = arced(vec![PeerHandle {
             conn: dummy_conn(),
             class: Class::Tor,
             bits: GroupBits::complete(size),
             label: "seed".into(),
-        }];
+        }]);
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let swarm = Swarm::new(store, ObjId([0u8; 32]), size);
@@ -2279,7 +2541,7 @@ mod tests {
             bits: bits.clone(),
             label: label.into(),
         };
-        let peers = vec![peer("a"), peer("b")];
+        let peers = arced(vec![peer("a"), peer("b")]);
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path()).unwrap());
         let swarm = Swarm::new(store, ObjId([0u8; 32]), size);
@@ -2496,5 +2758,223 @@ mod tests {
         let needed = needed_groups(&store, id2, size2).unwrap();
         let _ = swarm.fetch(&needed, &peers, Deadline::background(), 2).await;
         assert_eq!(peers[0].conn.queued_fetch_bytes(), 0, "a failed fetch refunds its charges");
+    }
+
+    /// `admit_joiner` appends ONLY the still-needed groups no existing peer
+    /// holds (a second joiner with the same coverage appends nothing),
+    /// grows the ledgers in place - existing slots keep their indices - and
+    /// re-derives the batch cut for the coarsest class present.
+    #[tokio::test]
+    async fn admit_joiner_extends_the_order_and_ledgers_without_reindexing() {
+        let mut held = GroupBits::new();
+        held.add(0..2);
+        let roster = Roster::new(vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Tor,
+            bits: held,
+            label: "entry".into(),
+        }]);
+        let entry_peers = roster.snapshot();
+        let mut needed = GroupBits::new();
+        needed.add(0..4);
+        let mut full_order = rarest_first_order(&needed, &entry_peers);
+        assert_eq!(full_order.len(), 2, "zero-holder groups are excluded at entry");
+        let mut batch_groups = batch_groups_for(&entry_peers);
+        assert_eq!(batch_groups, GROUPS_PER_REQUEST_OVERLAY);
+        let mut window = Window::new(&entry_peers);
+        window.fails[0] = 1; // an existing ledger a join must not disturb
+
+        let joiner = |class, bits, label: &str| PeerHandle {
+            conn: dummy_conn(),
+            class,
+            bits,
+            label: label.into(),
+        };
+        admit_joiner(
+            joiner(Class::Clearnet, GroupBits::complete(4 * 16 * 1024), "first"),
+            &roster,
+            &mut window,
+            &mut full_order,
+            &needed,
+            &mut batch_groups,
+        );
+        assert_eq!(&full_order[2..], &[2, 3], "the joiner's sole-holder groups are appended");
+        assert_eq!(
+            batch_groups, GROUPS_PER_REQUEST,
+            "the cut is re-derived at the coarsest class present"
+        );
+        assert_eq!(roster.snapshot().len(), 2);
+        assert_eq!(window.load.len(), 2);
+        assert_eq!(window.fails[0], 1, "existing slots keep their ledgers and indices");
+        assert_eq!(window.depth[1], PIPELINE_DEPTH, "the joiner gets its own class's depth");
+
+        let mut tail = GroupBits::new();
+        tail.add(2..4);
+        admit_joiner(
+            joiner(Class::Tor, tail, "second"),
+            &roster,
+            &mut window,
+            &mut full_order,
+            &needed,
+            &mut batch_groups,
+        );
+        assert_eq!(full_order.len(), 4, "groups already ordered are never appended again");
+        assert_eq!(window.load.len(), 3);
+        assert_eq!(
+            batch_groups, GROUPS_PER_REQUEST,
+            "a finer-class joiner never shrinks the cut back down"
+        );
+    }
+
+    /// A joiner holding groups nobody in the entry set had must still get
+    /// them scheduled: both order builders exclude zero-holder groups, so
+    /// without the join-time append this fetch would end incomplete with a
+    /// capable peer connected. The entry peer here holds NOTHING - the
+    /// fetch is idle from the first refill and must wait for the joiner
+    /// rather than abort.
+    #[tokio::test]
+    async fn a_joiner_with_groups_nobody_held_gets_them_scheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let entry = vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Clearnet,
+            bits: GroupBits::new(),
+            label: "empty".into(),
+        }];
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        join_tx
+            .send(PeerHandle {
+                conn: serving_conn(&data),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "late".into(),
+            })
+            .unwrap();
+        drop(join_tx); // dialing over: no more joiners coming
+
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        swarm.frozen_session = Some(false); // immune to the process env
+        let needed = needed_groups(&store, id, size).unwrap();
+        let report = swarm
+            .fetch_growable(&needed, entry, joiners, Deadline::background(), 2)
+            .await
+            .unwrap();
+        assert!(store.is_complete(id).unwrap(), "the joiner supplied what nobody else held");
+        assert_eq!(
+            report.by_peer.get("late").copied(),
+            Some(3),
+            "40 KB is three groups, all from the joiner"
+        );
+    }
+
+    /// EPIX_EDX_FROZEN_SESSION freezes the peer set at entry: the same
+    /// joiner that saves the fetch above is never admitted, and the fetch
+    /// returns incomplete immediately instead of waiting on the channel.
+    #[tokio::test]
+    async fn the_frozen_session_flag_ignores_joiners() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let entry = vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Clearnet,
+            bits: GroupBits::new(),
+            label: "empty".into(),
+        }];
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        join_tx
+            .send(PeerHandle {
+                conn: serving_conn(&data),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "late".into(),
+            })
+            .unwrap();
+        // The sender stays alive: a frozen fetch must not even wait on the
+        // channel, let alone admit from it.
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        swarm.frozen_session = Some(true);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let report = swarm
+            .fetch_growable(&needed, entry, joiners, Deadline::background(), 2)
+            .await
+            .unwrap();
+        assert_eq!(report.groups_fetched, 0, "a frozen fetch never admits the joiner");
+        assert!(!store.is_complete(id).unwrap());
+        drop(join_tx);
+
+        // The env value that freezes is exactly "1".
+        assert!(frozen_env(Some("1")));
+        assert!(!frozen_env(Some("0")));
+        assert!(!frozen_env(None));
+    }
+
+    /// Records batch completions: who each batch was booked on and who
+    /// delivered it.
+    #[derive(Default)]
+    struct BatchLog(std::sync::Mutex<Vec<(String, Option<String>)>>);
+    impl FetchObserver for BatchLog {
+        fn on_request(&self, _peer: &str, _class: Class, _bytes: u64) {}
+        fn on_batch(&self, booked: &str, peer: Option<&str>, _class: Option<Class>, _bytes: u64,
+                    _elapsed: Option<Duration>, _duplicates: u64) {
+            self.0.lock().unwrap().push((booked.to_string(), peer.map(str::to_string)));
+        }
+    }
+
+    // Real time: the stall detector and race run against a real serving
+    // conn with blocking decode work.
+    #[tokio::test]
+    async fn a_mid_flight_join_keeps_indices_stable_and_can_rescue() {
+        // A batch booked on the entry peer BEFORE the join must still
+        // strike and credit the right slots after the roster grew - and
+        // race_batch re-reads the roster at duplicate time, so the joiner
+        // rescues a batch booked before it arrived.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let entry = vec![PeerHandle {
+            conn: dummy_conn(), // accepts the request, never answers
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size),
+            label: "silent".into(),
+        }];
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        join_tx
+            .send(PeerHandle {
+                conn: serving_conn(&data),
+                class: Class::Clearnet,
+                bits: GroupBits::complete(size),
+                label: "rescue".into(),
+            })
+            .unwrap();
+        drop(join_tx);
+
+        let log = Arc::new(BatchLog::default());
+        let mut swarm = Swarm::new(store.clone(), id, size).with_observer(log.clone());
+        swarm.frozen_session = Some(false);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let report = swarm
+            .fetch_growable(&needed, entry, joiners, Deadline::background(), 2)
+            .await
+            .unwrap();
+        assert!(store.is_complete(id).unwrap());
+        assert_eq!(report.by_peer.get("rescue").copied(), Some(3), "the joiner delivered");
+        assert_eq!(report.duplicates_issued, 1, "as the rescue of the silent primary's batch");
+        let rows = log.0.lock().unwrap().clone();
+        assert!(
+            rows.iter().any(|(booked, won)| booked == "silent" && won.as_deref() == Some("rescue")),
+            "the pre-join batch resolved against the right slots: {rows:?}"
+        );
     }
 }
