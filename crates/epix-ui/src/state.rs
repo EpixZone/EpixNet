@@ -1280,20 +1280,86 @@ fn spawn_relauncher(argv: &[String]) {
     }
 }
 
+/// The parts of an [`AppState`] that differ between an in-memory node and one
+/// backed by a data root: the values read off disk, and the paths they are
+/// written back to. Everything else - 66 of the 83 fields - is identical in
+/// both cases, which is why the two public constructors now differ only in how
+/// they fill this in and share [`AppState::build`] for the rest.
+struct Persistence {
+    user: User,
+    user_path: Option<PathBuf>,
+    filters: Value,
+    filters_path: Option<PathBuf>,
+    grants: HashMap<String, Vec<String>>,
+    grants_path: Option<PathBuf>,
+    chart: crate::chart::ChartDb,
+    optional_limit: String,
+    optional_limit_path: Option<PathBuf>,
+    config: serde_json::Map<String, Value>,
+    config_path: Option<PathBuf>,
+    peers_path: Option<PathBuf>,
+    pins_path: Option<PathBuf>,
+    data_root: Option<PathBuf>,
+    sites_path: Option<PathBuf>,
+    #[cfg(feature = "multiuser")]
+    multi_users: HashMap<String, User>,
+    #[cfg(feature = "multiuser")]
+    multi_users_path: Option<PathBuf>,
+}
+
+impl Persistence {
+    /// Nothing on disk: a generated identity, empty stores, no paths. Writes
+    /// that check for a path are no-ops on a node built from this.
+    fn in_memory() -> Self {
+        Self {
+            user: User::generate(),
+            user_path: None,
+            filters: empty_filters(),
+            filters_path: None,
+            grants: HashMap::new(),
+            grants_path: None,
+            chart: crate::chart::ChartDb::memory().expect("in-memory chart db"),
+            optional_limit: "10%".to_string(),
+            optional_limit_path: None,
+            config: serde_json::Map::new(),
+            config_path: None,
+            peers_path: None,
+            pins_path: None,
+            data_root: None,
+            sites_path: None,
+            // No store to load and nowhere to write it: unlike the data-dir
+            // case this is NOT seeded with the active user, matching what the
+            // in-memory constructor has always done.
+            #[cfg(feature = "multiuser")]
+            multi_users: HashMap::new(),
+            #[cfg(feature = "multiuser")]
+            multi_users_path: None,
+        }
+    }
+}
+
 impl AppState {
     /// In-memory node with a freshly generated user identity.
     pub fn new(version: impl Into<String>) -> Arc<Self> {
+        Self::build(version, Persistence::in_memory())
+    }
+
+    /// Fill the fields that do not depend on where (or whether) the node
+    /// persists. Both public constructors funnel through here, so a field
+    /// added to `AppState` is initialized once instead of in two places that
+    /// have to be kept in step.
+    fn build(version: impl Into<String>, persist: Persistence) -> Arc<Self> {
         Arc::new(Self {
             version: version.into(),
             rev: RwLock::new("0".to_string()),
             ui_port: RwLock::new(42222),
             xites: RwLock::new(HashMap::new()),
             feed_cache: RwLock::new(HashMap::new()),
-            user: RwLock::new(User::generate()),
-            user_path: None,
+            user: RwLock::new(persist.user),
+            user_path: persist.user_path,
             nonce_counter: AtomicU64::new(1),
-            filters: RwLock::new(empty_filters()),
-            filters_path: None,
+            filters: RwLock::new(persist.filters),
+            filters_path: persist.filters_path,
             transport: RwLock::new(None),
             base_transport: RwLock::new(None),
             i2p_transport: RwLock::new(None),
@@ -1309,22 +1375,22 @@ impl AppState {
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
             tracker_backoff: RwLock::new(HashMap::new()),
-            grants: RwLock::new(HashMap::new()),
-            grants_path: None,
-            chart: Arc::new(crate::chart::ChartDb::memory().expect("in-memory chart db")),
-            optional_limit: RwLock::new("10%".to_string()),
-            optional_limit_path: None,
+            grants: RwLock::new(persist.grants),
+            grants_path: persist.grants_path,
+            chart: Arc::new(persist.chart),
+            optional_limit: RwLock::new(persist.optional_limit),
+            optional_limit_path: persist.optional_limit_path,
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
             events: tokio::sync::broadcast::channel(4096).0,
-            config: RwLock::new(serde_json::Map::new()),
-            config_path: None,
+            config: RwLock::new(persist.config),
+            config_path: persist.config_path,
             boot_config: std::sync::Mutex::new(None),
             restart_argv: std::sync::Mutex::new(None),
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
-            peers_path: None,
+            peers_path: persist.peers_path,
             fileserver_port: RwLock::new(0),
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
@@ -1337,7 +1403,7 @@ impl AppState {
             bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
             rns_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
-            pins_path: None,
+            pins_path: persist.pins_path,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1357,8 +1423,8 @@ impl AppState {
             ui_csrf: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
-            data_root: None,
-            sites_path: None,
+            data_root: persist.data_root,
+            sites_path: persist.sites_path,
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
             gossip_trackers: RwLock::new(Vec::new()),
@@ -1366,9 +1432,9 @@ impl AppState {
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
-            multi_users: RwLock::new(HashMap::new()),
+            multi_users: RwLock::new(persist.multi_users),
             #[cfg(feature = "multiuser")]
-            multi_users_path: None,
+            multi_users_path: persist.multi_users_path,
         })
     }
 
@@ -1433,92 +1499,24 @@ impl AppState {
             m.insert(user.master_address.clone(), user.clone());
             m
         };
-        Arc::new(Self {
-            version: version.into(),
-            rev: RwLock::new("0".to_string()),
-            ui_port: RwLock::new(42222),
-            xites: RwLock::new(HashMap::new()),
-            feed_cache: RwLock::new(HashMap::new()),
-            user: RwLock::new(user),
+        Self::build(version, Persistence {
+            user,
             user_path: Some(user_path),
-            nonce_counter: AtomicU64::new(1),
-            filters: RwLock::new(filters),
+            filters,
             filters_path: Some(filters_path),
-            transport: RwLock::new(None),
-            base_transport: RwLock::new(None),
-            i2p_transport: RwLock::new(None),
-            rns_transport: RwLock::new(None),
-            i2p_status: RwLock::new(json!({})),
-            on_demand: RwLock::new(None),
-            peer_finder: RwLock::new(None),
-            content_syncer: RwLock::new(None),
-            edx_store: RwLock::new(None),
-            edx_paths: std::sync::RwLock::new(HashMap::new()),
-            edx_fetcher: RwLock::new(None),
-            link_opener: RwLock::new(None),
-            prop_store: std::sync::OnceLock::new(),
-            tracker_stats: RwLock::new(HashMap::new()),
-            tracker_backoff: RwLock::new(HashMap::new()),
-            grants: RwLock::new(grants),
+            grants,
             grants_path: Some(grants_path),
-            chart: Arc::new(chart),
-            optional_limit: RwLock::new(optional_limit),
+            chart,
+            optional_limit,
             optional_limit_path: Some(optional_limit_path),
-            geoip: RwLock::new(None),
-            conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
-            events: tokio::sync::broadcast::channel(4096).0,
-            config: RwLock::new(config),
+            config,
             config_path: Some(config_path),
-            boot_config: std::sync::Mutex::new(None),
-            restart_argv: std::sync::Mutex::new(None),
-            plugins: RwLock::new(Vec::new()),
-            logs: RwLock::new(std::collections::VecDeque::new()),
-            log_streams: RwLock::new(Vec::new()),
             peers_path: Some(dir.join("peers.json")),
             pins_path: Some(dir.join("pins.json")),
-            fileserver_port: RwLock::new(0),
-            port_opened: RwLock::new(false),
-            ip_external: RwLock::new(None),
-            tor_enabled: RwLock::new(false),
-            tor_status: RwLock::new("Disabled".to_string()),
-            onion_address: RwLock::new(None),
-            onion_signer: RwLock::new(None),
-            i2p_address: RwLock::new(None),
-            ui_loopback: RwLock::new(false),
-            bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
-            rns_address: RwLock::new(None),
-            tracker: crate::tracker::TrackerDb::new(),
-            updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            pending_updates: std::sync::Mutex::new(HashMap::new()),
-            site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
-            optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
-            optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
-            retention_consents: std::sync::Mutex::new(std::collections::HashSet::new()),
-            modified_scan_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            bound_conns: std::sync::Mutex::new(HashMap::new()),
-            pending_prompts: std::sync::Mutex::new(HashMap::new()),
-            file_need_locks: std::sync::Mutex::new(HashMap::new()),
-            callbacks: std::sync::Mutex::new(HashMap::new()),
-            log_file: std::sync::Mutex::new(None),
-            bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
-            wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
-            ui_csrf: std::sync::OnceLock::new(),
-            allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
-            launch_homepage: std::sync::Mutex::new(None),
-            // The served-xite registry lives where Python's SiteManager keeps
-            // it, so an EpixNet install's site list carries over as-is.
             sites_path: Some(dir.join("sites.json")),
             data_root: Some(data_root),
-            data_dir_conf: std::sync::Mutex::new(None),
-            extra_trackers: RwLock::new(Vec::new()),
-            gossip_trackers: RwLock::new(Vec::new()),
-            bootstrap_trackers: RwLock::new(Vec::new()),
-            trackers_changed: Arc::new(tokio::sync::Notify::new()),
-            tor_config_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
-            multi_users: RwLock::new(multi_users),
+            multi_users,
             #[cfg(feature = "multiuser")]
             multi_users_path: Some(dir.join("users_multi.json")),
         })
