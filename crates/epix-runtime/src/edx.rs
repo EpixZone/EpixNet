@@ -1254,7 +1254,20 @@ struct RuntimeEdxFetcher {
     /// Arc-shared for the same reason as the rest: a serve, its read-ahead and
     /// the scheduler all report into one picture of the same file.
     xfer: Arc<crate::xfer::Xfer>,
+    /// Bounds concurrent materialize copies for POOLED bulk fetches (see
+    /// [`MATERIALIZE_CONCURRENCY`]). Arc-shared so every clone of the
+    /// fetcher queues on the same gate.
+    materialize_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent materialize copies a bulk worker pool may run at once. The
+/// copy is GB-scale when the xite tree sits on another filesystem (an SMB
+/// mount is the motivating case), runs on the blocking pool, and competes
+/// with encode slots and store IO there - while the network fetch it used
+/// to serialize behind gains nothing from it. Two, not more: on a network
+/// mount concurrent copies mostly serialize against each other anyway.
+/// Interactive fetches (a page waiting on the file) bypass the gate.
+const MATERIALIZE_CONCURRENCY: usize = 2;
 
 /// Per-file streaming state guarding read-ahead against firing an unbounded
 /// task per browser Range request.
@@ -1420,6 +1433,7 @@ impl RuntimeEdxFetcher {
             peer_cache: Arc::default(),
             claims: Arc::default(),
             xfer: Arc::default(),
+            materialize_gate: Arc::new(tokio::sync::Semaphore::new(MATERIALIZE_CONCURRENCY)),
         }
     }
 
@@ -3164,6 +3178,7 @@ impl RuntimeEdxFetcher {
         address: &str,
         inner_path: &str,
         deadline: Deadline,
+        on_fetched: Option<epix_ui::state::EdxFetchedHook>,
     ) -> Result<bool, String> {
         let store = self.state.edx_store().await.ok_or("no EDX store")?;
         // Encrypted-shard file: fetch the ciphertext shards and decrypt.
@@ -3181,7 +3196,8 @@ impl RuntimeEdxFetcher {
 
         // Already complete in the store: just materialize it.
         if store.is_complete(id).unwrap_or(false) {
-            self.materialize(address, inner_path, id, size, &store).await?;
+            self.materialize_gated(address, inner_path, id, size, &store, on_fetched.as_ref())
+                .await?;
             return Ok(true);
         }
 
@@ -3227,11 +3243,53 @@ impl RuntimeEdxFetcher {
             return Err("fetch did not complete".into());
         }
 
-        self.materialize(address, inner_path, id, size, &store).await?;
+        self.materialize_gated(address, inner_path, id, size, &store, on_fetched.as_ref()).await?;
         // Cached content grows the store; keep it under quota (own content is
         // pinned, so only cached-from-others objects are evicted).
         let _ = store.enforce_quota(store_quota());
         Ok(true)
+    }
+
+    /// [`Self::materialize`] with the pool handoff around it: hold the
+    /// completed object against quota eviction, tell the worker pool the
+    /// network phase is over (`on_fetched`), and only then run the copy -
+    /// pooled callers queue it on the bounded materialize gate.
+    ///
+    /// The hold closes a real window: a complete-but-not-yet-materialized
+    /// object is refcount-0 (`ObjClaim` guards record removal by sibling
+    /// claims, not quota eviction), and every OTHER completing file runs
+    /// `enforce_quota` - at quota, the LRU pass would take exactly the bytes
+    /// this file just spent an hour fetching, and a gate queue makes that
+    /// window minutes wide. In-memory on purpose: after a crash the holds
+    /// are gone, the object is ordinary cache again, and the file re-checks
+    /// as missing and refetches (completing instantly if it survived).
+    async fn materialize_gated(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: ObjId,
+        size: u64,
+        store: &Arc<Store>,
+        on_fetched: Option<&epix_ui::state::EdxFetchedHook>,
+    ) -> Result<(), String> {
+        let _hold = store.hold_eviction(id);
+        let _permit = match on_fetched {
+            Some(fetched) => {
+                // Hold taken first: the freed slot's next file can complete
+                // and run enforce_quota before our copy starts.
+                fetched();
+                Some(
+                    self.materialize_gate
+                        .acquire()
+                        .await
+                        .expect("materialize gate is never closed"),
+                )
+            }
+            // Interactive/streaming callers: something is waiting on the
+            // file, so never queue it behind bulk copies.
+            None => None,
+        };
+        self.materialize(address, inner_path, id, size, store).await
     }
 
     /// Turn a completed object into the xite's file on disk.
@@ -3725,7 +3783,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // queued behind whatever the scheduler was already doing, which is the
         // other half of "the page you are viewing should jump the queue"
         // (the first half is the type ladder in `fetch_tiers`).
-        self.fetch_file_at(address, inner_path, Deadline::tight()).await
+        self.fetch_file_at(address, inner_path, Deadline::tight(), None).await
     }
 
     async fn fetch_file_background(&self, address: &str, inner_path: &str) -> Result<bool, String> {
@@ -3734,7 +3792,19 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // retention completion pass and the optional retry loop use - work
         // that runs behind an already-painted page must never compete at
         // first-paint urgency, nor pay first-paint impatience.
-        self.fetch_file_at(address, inner_path, Deadline::background()).await
+        self.fetch_file_at(address, inner_path, Deadline::background(), None).await
+    }
+
+    async fn fetch_file_pooled(
+        &self,
+        address: &str,
+        inner_path: &str,
+        fetched: epix_ui::state::EdxFetchedHook,
+    ) -> Result<bool, String> {
+        // Background patience, plus the slot handoff: `fetched` fires once
+        // the object is complete in the store, and the materialize copy
+        // then queues on the bounded gate instead of the caller's pool.
+        self.fetch_file_at(address, inner_path, Deadline::background(), Some(fetched)).await
     }
 
     async fn fetch_signed(
