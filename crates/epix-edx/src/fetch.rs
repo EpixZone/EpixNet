@@ -52,6 +52,29 @@ fn remote_err(code: u16, msg: &str) -> std::io::Error {
     std::io::Error::new(kind, format!("peer: {code} {msg}"))
 }
 
+/// A typed BUSY (`Resp::Busy`): the peer refused right now and said when
+/// to come back. Carried as the payload of a `QuotaExceeded` io::Error so
+/// every existing BUSY path treats it exactly like the legacy refusal;
+/// the scheduler downcasts to it and sets its per-peer cooldown to the
+/// server's hint (bounded there) instead of guessing.
+#[derive(Debug)]
+pub struct RetryAfter(pub std::time::Duration);
+
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer busy, retry after {:?}", self.0)
+    }
+}
+
+impl std::error::Error for RetryAfter {}
+
+fn busy_err(retry_after_ms: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::QuotaExceeded,
+        RetryAfter(std::time::Duration::from_millis(retry_after_ms as u64)),
+    )
+}
+
 /// Fires a best-effort `Conn::cancel_now` for its stream when dropped while
 /// still armed, so an abandoned in-flight fetch stops the peer's encode
 /// (see `fetch_many`; the range path uses [`RangeGuard`], which also
@@ -324,6 +347,9 @@ pub async fn fetch_ranges_observed(
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
                 return Err(remote_err(code, &msg));
             }
+            Some(FrameBody::Resp { resp: Resp::Busy { retry_after_ms }, .. }) => {
+                return Err(busy_err(retry_after_ms));
+            }
             Some(other) => return Err(proto_err(format!("unexpected frame {other:?}"))),
             None => {
                 return Err(std::io::Error::new(
@@ -560,6 +586,9 @@ pub async fn fetch_many(
             }
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
                 return Err(remote_err(code, &msg));
+            }
+            Some(FrameBody::Resp { resp: Resp::Busy { retry_after_ms }, .. }) => {
+                return Err(busy_err(retry_after_ms));
             }
             Some(other) => return Err(proto_err(format!("unexpected frame {other:?}"))),
             None => {

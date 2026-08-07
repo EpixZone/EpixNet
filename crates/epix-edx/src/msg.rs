@@ -31,6 +31,11 @@ pub mod caps {
     /// embedded fetcher, a test fixture) leaves this clear and answers
     /// those requests UNSUPPORTED.
     pub const CONTROL: u32 = 1 << 2;
+    /// Understands the typed [`super::Resp::Busy`] refusal (an appended
+    /// variant). A server may only send it to a peer that advertised this
+    /// bit; everyone else keeps receiving the legacy `Err { BUSY }`, which
+    /// older nodes can decode.
+    pub const RETRY_AFTER: u32 = 1 << 3;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -193,6 +198,14 @@ pub enum Resp {
     /// ceil(addrs.len()/8). Packed to one bit per shard so a large private
     /// file's probe stays small.
     ShardMask { bits: Vec<u8> },
+    // --- OVERLAY-SWARM serving appends only below this line ---
+    /// Typed BUSY: refused right now, come back in `retry_after_ms`. Sent
+    /// in place of `Err { BUSY }` ONLY to peers that advertised
+    /// [`caps::RETRY_AFTER`] (postcard cannot grow `Resp::Err` in place —
+    /// fields are positional — so the retry hint has to be a new appended
+    /// variant). The receiver sets its per-peer cooldown to this value
+    /// instead of guessing, bounded on the client side.
+    Busy { retry_after_ms: u32 },
 }
 
 /// Error codes for `Resp::Err`.
@@ -350,6 +363,11 @@ mod tests {
                 stream: 14,
                 body: FrameBody::Resp { last: true, resp: Resp::ShardMask { bits: vec![0b0000_0101] } },
             },
+            // Overlay-swarm serving.
+            Frame {
+                stream: 15,
+                body: FrameBody::Resp { last: true, resp: Resp::Busy { retry_after_ms: 15_000 } },
+            },
         ];
         for f in &frames {
             assert_eq!(&round_trip(f), f);
@@ -435,6 +453,8 @@ mod tests {
             (Resp::Payload { bytes: vec![] }, 11),
             // Encrypted-shard volunteer role.
             (Resp::ShardMask { bits: vec![] }, 12),
+            // Overlay-swarm serving.
+            (Resp::Busy { retry_after_ms: 0 }, 13),
         ];
         for (resp, disc) in resps {
             let bytes = postcard::to_stdvec(&Frame {

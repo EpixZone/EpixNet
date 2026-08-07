@@ -526,9 +526,14 @@ pub fn env_on(var: &str) -> bool {
 
 /// The shared upload governor. On by default (reciprocity: seed -> faster
 /// service); `EPIX_EDX_RECIPROCITY=0` disables it and serves everything
-/// ungoverned. One instance is shared between serving and fetching.
+/// ungoverned. One instance is shared between serving and fetching. The
+/// bulk-lane pacer is armed with the same cap: the choker decides WHO is
+/// served, the pacer smooths admitted bulk onto the wire at this rate
+/// (whole-request refusal at the per-second bucket is first-paint only
+/// now). Ungoverned nodes leave the pacer off too.
 pub fn make_choker() -> Option<SharedChoker> {
     if env_on("EPIX_EDX_RECIPROCITY") {
+        epix_edx::pace::bulk().set_rate(EDX_UPLOAD_CAP_BPS);
         Some(Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS))))
     } else {
         None

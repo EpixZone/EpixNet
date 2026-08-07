@@ -345,9 +345,9 @@ async fn a_failing_peer_is_routed_around() {
 }
 
 #[tokio::test]
-async fn governed_server_chokes_bulk_but_serves_first_paint() {
+async fn governed_server_serves_a_connected_zero_credit_overlay_leecher() {
     use epix_edx::choke::{Choker, Reach};
-    use epix_edx::msg::{err, Req, Resp};
+    use epix_edx::msg::{Req, Resp};
     use std::sync::Mutex;
 
     let net = sim::SimNet::new();
@@ -361,12 +361,12 @@ async fn governed_server_chokes_bulk_but_serves_first_paint() {
     server_store.insert_bytes(small_id, Ns::Plain, &small, 1).unwrap();
     server_store.insert_bytes(big_id, Ns::Plain, &big, 1).unwrap();
 
-    // Governed server: choker with slots filled by phantom high
-    // contributors (more than the unchoke slots) so our client (zero
-    // contribution) is choked for bulk. The client reaches us over the sim
-    // link (no Noise) => Reach::Overlay, so the phantom competitors are
-    // overlay too — otherwise the client would grab a reserved overlay
-    // slot and never be choked.
+    // Governed server whose choker carries credited accounts from past
+    // sessions — more of them than there are slots, but none connected.
+    // The client is an unreachable overlay leecher: permanent zero credit
+    // (we can never dial it back). Ranked slots run over CONNECTED peers,
+    // so those absent accounts must not freeze it out — this used to
+    // answer BUSY forever.
     let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
     {
         let mut c = choker.lock().unwrap();
@@ -411,14 +411,34 @@ async fn governed_server_chokes_bulk_but_serves_first_paint() {
     let first = rx.recv().await.unwrap();
     assert!(matches!(first, epix_edx::msg::FrameBody::Data { .. }), "first-paint served, got {first:?}");
 
-    // Bulk object from the same choked freeloader: refused BUSY.
-    let resp = conn
-        .request(Req::GetRange { obj: big_id, size: big.len() as u64, ranges: vec![(0, 4_000_000)], deadline_ms: 0 })
+    // Bulk from the connected zero-credit leecher: SERVED. Its own Hello
+    // admitted it to the slot ranking (connected + this request's
+    // activity), and reciprocity only prioritizes among peers actually
+    // competing for slots.
+    let mut rx = conn
+        .request_stream(Req::GetRange { obj: big_id, size: big.len() as u64, ranges: vec![(0, 64 * 1024)], deadline_ms: 0 })
         .await
         .unwrap();
-    match resp {
-        Resp::Err { code, .. } => assert_eq!(code, err::BUSY, "bulk from a freeloader is choked"),
-        other => panic!("expected BUSY, got {other:?}"),
+    let first = rx.recv().await.unwrap();
+    assert!(
+        matches!(first, epix_edx::msg::FrameBody::Data { .. }),
+        "bulk for the only connected leecher is served, got {first:?}"
+    );
+    // Drain so the serve finishes cleanly.
+    loop {
+        match rx.recv().await {
+            Some(epix_edx::msg::FrameBody::Data { last, .. }) => {
+                if last {
+                    break;
+                }
+            }
+            Some(other) => panic!("expected Data, got {other:?}"),
+            None => break,
+        }
+    }
+    match conn.request(Req::GetBitfield { obj: big_id }).await.unwrap() {
+        Resp::Bitfield { size, .. } => assert_eq!(size, big.len() as u64),
+        other => panic!("expected Bitfield, got {other:?}"),
     }
 }
 

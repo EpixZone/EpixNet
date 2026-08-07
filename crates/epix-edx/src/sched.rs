@@ -102,6 +102,13 @@ pub const PEER_FAIL_LIMIT: u32 = 3;
 /// and hammer it at RTT rate. Half the choker's 30s optimistic-slot
 /// rotation, so a refused leecher re-asks about twice per rotation.
 pub const BUSY_COOLDOWN: Duration = Duration::from_secs(15);
+/// Bounds on a server-provided retry-after (the typed `Resp::Busy`). The
+/// hint is honored — the seeder knows when its next unchoke rotation or
+/// queue drain is — but only within reason: a floor so a zero cannot
+/// re-enable the RTT-rate hammer the cooldown exists to stop, and a
+/// ceiling so a hostile seeder cannot park a fetch for an hour.
+pub const BUSY_RETRY_MIN: Duration = Duration::from_secs(1);
+pub const BUSY_RETRY_MAX: Duration = Duration::from_secs(120);
 /// Consecutive BUSY answers (no delivery between them) before the peer is
 /// dropped for this fetch anyway. Bounds the patience: a seeder that
 /// refuses for BUSY_LIMIT cooldowns' worth of rotations is not about to
@@ -1068,14 +1075,21 @@ impl Swarm {
         }
         // A BUSY answer is refusal, not failure: no strike, but a cooldown
         // so the refused peer is not re-picked at RTT rate (which would
-        // hammer the seeder that just told us it is full). A peer that does
-        // nothing but refuse is still dropped after BUSY_LIMIT answers.
+        // hammer the seeder that just told us it is full). A typed refusal
+        // carries the seeder's own comeback hint (its next unchoke
+        // rotation / queue drain), honored within [BUSY_RETRY_MIN,
+        // BUSY_RETRY_MAX]. A peer that does nothing but refuse is still
+        // dropped after BUSY_LIMIT answers.
         if let Some(p) = outcome.busy_peer {
             window.busy[p] = window.busy[p].saturating_add(1);
             if window.busy[p] >= BUSY_LIMIT {
                 window.fails[p] = PEER_FAIL_LIMIT;
             } else {
-                window.cooldown[p] = Some(tokio::time::Instant::now() + BUSY_COOLDOWN);
+                let wait = outcome
+                    .retry_after
+                    .map(|d| d.clamp(BUSY_RETRY_MIN, BUSY_RETRY_MAX))
+                    .unwrap_or(BUSY_COOLDOWN);
+                window.cooldown[p] = Some(tokio::time::Instant::now() + wait);
             }
         }
         // Count a failed batch against its peer; a peer that delivered is
@@ -1192,16 +1206,24 @@ impl Swarm {
             elapsed: None,
             failed_peer: Some(primary),
             busy_peer: None,
+            retry_after: None,
         }
     }
 
     /// [`Self::batch_failed`], but the primary REFUSED the request (BUSY /
     /// quota) rather than failing it: no strike, a cooldown instead
-    /// (`apply_outcome`).
-    fn batch_busy(&self, groups: Vec<u64>, primary: usize, duplicates: u64) -> BatchOutcome {
+    /// (`apply_outcome`), sized by the server's own hint when it sent one.
+    fn batch_busy(
+        &self,
+        groups: Vec<u64>,
+        primary: usize,
+        duplicates: u64,
+        retry_after: Option<Duration>,
+    ) -> BatchOutcome {
         let mut out = self.batch_failed(groups, primary, duplicates);
         out.failed_peer = None;
         out.busy_peer = Some(primary);
+        out.retry_after = retry_after;
         out
     }
 
@@ -1262,8 +1284,11 @@ impl Swarm {
         // resumed after completion"), so a fast primary error must not fall
         // through to a re-await.
         // A BUSY/quota refusal is remembered apart from real errors: the
-        // peer gets a cooldown, never a strike (`batch_busy`).
+        // peer gets a cooldown, never a strike (`batch_busy`). A typed
+        // refusal (`fetch::RetryAfter` inside the error) also carries the
+        // server's own comeback hint, which sizes that cooldown.
         let mut primary_busy = false;
+        let mut primary_retry: Option<Duration> = None;
         let primary_errored = tokio::select! {
             res = &mut primary_fut => match res {
                 Ok(_) => {
@@ -1274,6 +1299,7 @@ impl Swarm {
                 }
                 Err(e) => {
                     primary_busy = e.kind() == std::io::ErrorKind::QuotaExceeded;
+                    primary_retry = retry_after_of(&e);
                     true
                 }
             },
@@ -1319,7 +1345,7 @@ impl Swarm {
             // prefix landed stays and the remainder is rescheduled.
             drop(primary_fut);
             return if primary_busy {
-                self.batch_busy(groups, primary, 0)
+                self.batch_busy(groups, primary, 0, primary_retry)
             } else {
                 self.batch_failed(groups, primary, 0)
             };
@@ -1370,13 +1396,14 @@ impl Swarm {
                 if w != primary {
                     if primary_busy {
                         out.busy_peer = Some(primary);
+                        out.retry_after = primary_retry;
                     } else {
                         out.failed_peer = Some(primary);
                     }
                 }
                 out
             }
-            None if primary_busy => self.batch_busy(groups, primary, dups),
+            None if primary_busy => self.batch_busy(groups, primary, dups, primary_retry),
             None => self.batch_failed(groups, primary, dups),
         }
     }
@@ -1407,6 +1434,9 @@ struct BatchOutcome {
     /// The peer index that answered BUSY (the seeder's choker refusing us):
     /// alive and serving others, so it gets a cooldown, not a strike.
     busy_peer: Option<usize>,
+    /// The comeback hint a typed BUSY carried (`fetch::RetryAfter`), raw
+    /// as the server sent it; `apply_outcome` bounds it before use.
+    retry_after: Option<Duration>,
 }
 
 impl BatchOutcome {
@@ -1431,6 +1461,7 @@ impl BatchOutcome {
             elapsed: Some(elapsed),
             failed_peer: None,
             busy_peer: None,
+            retry_after: None,
         }
     }
 }
@@ -1517,6 +1548,12 @@ async fn sleep_until_maybe(t: Option<tokio::time::Instant>) {
         Some(t) => tokio::time::sleep_until(t).await,
         None => std::future::pending().await,
     }
+}
+
+/// The comeback hint inside a typed BUSY error, when it carries one (see
+/// [`crate::fetch::RetryAfter`]). Raw server value; the caller bounds it.
+fn retry_after_of(e: &std::io::Error) -> Option<Duration> {
+    e.get_ref().and_then(|inner| inner.downcast_ref::<crate::fetch::RetryAfter>()).map(|r| r.0)
 }
 
 // --- tiny future combinators (avoid pulling futures-util) ---
@@ -2504,7 +2541,7 @@ mod tests {
         remaining.add(0..4);
         let mut report = FetchReport::default();
         for i in 1..BUSY_LIMIT {
-            let outcome = swarm.batch_busy(vec![0], 0, 0);
+            let outcome = swarm.batch_busy(vec![0], 0, 0, None);
             swarm.apply_outcome(outcome, &peers, &mut remaining, &mut window, &mut report);
             assert_eq!(window.fails[0], 0, "a refusal is never a strike");
             assert_eq!(window.busy[0], i);
@@ -2518,7 +2555,7 @@ mod tests {
         assert_eq!(window.busy[0], 0, "a delivery resets the refusal streak");
         assert!(window.cooldown[0].is_none());
         for _ in 0..BUSY_LIMIT {
-            let outcome = swarm.batch_busy(vec![0], 0, 0);
+            let outcome = swarm.batch_busy(vec![0], 0, 0, None);
             swarm.apply_outcome(outcome, &peers, &mut remaining, &mut window, &mut report);
         }
         assert!(
@@ -2526,6 +2563,52 @@ mod tests {
             "a refuse-only peer is bounded, not retried forever"
         );
         assert!(window.next_retry().is_none(), "nothing left to wait for");
+    }
+
+    /// A typed BUSY's comeback hint sizes the cooldown — the seeder knows
+    /// its own rotation — but only within [BUSY_RETRY_MIN, BUSY_RETRY_MAX]:
+    /// a zero must not re-enable the RTT-rate hammer and a huge value must
+    /// not let a hostile seeder park the fetch.
+    #[tokio::test(start_paused = true)]
+    async fn a_server_retry_hint_sizes_the_cooldown_within_bounds() {
+        let size = 4 * 16 * 1024;
+        let peers = arced(vec![PeerHandle {
+            conn: dummy_conn(),
+            class: Class::Tor,
+            bits: GroupBits::complete(size),
+            label: "seed".into(),
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let swarm = Swarm::new(store, ObjId([0u8; 32]), size);
+        let mut remaining = GroupBits::new();
+        remaining.add(0..4);
+        let mut report = FetchReport::default();
+
+        let mut cooldown_after = |hint: Option<Duration>| {
+            let mut window = Window::new(&peers);
+            let outcome = swarm.batch_busy(vec![0], 0, 0, hint);
+            swarm.apply_outcome(outcome, &peers, &mut remaining, &mut window, &mut report);
+            window.cooldown[0].expect("a refusal cools the peer down")
+                - tokio::time::Instant::now()
+        };
+
+        // An in-range hint is honored as sent.
+        assert_eq!(cooldown_after(Some(Duration::from_secs(40))), Duration::from_secs(40));
+        // Out-of-range hints clamp; no hint keeps the default.
+        assert_eq!(cooldown_after(Some(Duration::ZERO)), BUSY_RETRY_MIN);
+        assert_eq!(cooldown_after(Some(Duration::from_secs(10_000))), BUSY_RETRY_MAX);
+        assert_eq!(cooldown_after(None), BUSY_COOLDOWN);
+
+        // And the wire error carries the hint end to end: a QuotaExceeded
+        // io::Error with a RetryAfter payload downcasts back out.
+        let e = std::io::Error::new(
+            std::io::ErrorKind::QuotaExceeded,
+            crate::fetch::RetryAfter(Duration::from_secs(40)),
+        );
+        assert_eq!(retry_after_of(&e), Some(Duration::from_secs(40)));
+        let plain = std::io::Error::new(std::io::ErrorKind::QuotaExceeded, "peer: 429 choked");
+        assert_eq!(retry_after_of(&plain), None, "a legacy BUSY has no hint");
     }
 
     /// The last remaining peer of a fetch gets exactly one probe retry (after
