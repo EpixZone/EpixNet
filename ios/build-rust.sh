@@ -41,8 +41,14 @@ rustup target add "$TRIPLE" >/dev/null 2>&1 || true
 # 5.2.3). Magnet-referenced media plays from HTTPS web seeds instead. Do NOT
 # add `bittorrent` here - the Android build (docs/install/android.md) is where
 # it belongs. CI's "Assert no BitTorrent in the iOS profile" step enforces this.
+#
+# `mesh` and `local-discovery` are included: they are the only transports that
+# work with no internet, and both are config-gated off, so the shipped app
+# spawns neither until the user enables it in Config. `local-discovery` also
+# needs NSLocalNetworkUsageDescription in Info.plist or iOS silently drops the
+# broadcasts.
 cargo build -p epix-ffi --release --target "$TRIPLE" \
-  --no-default-features --features tor,i2p-embedded,bridges
+  --no-default-features --features tor,i2p-embedded,bridges,mesh,local-discovery
 
 # Swift bindings, generated from the metadata baked into the built library.
 cargo run -q -p epix-ffi --features cli --bin uniffi-bindgen -- \

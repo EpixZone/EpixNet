@@ -17,8 +17,17 @@
 //!    requester then adds the responder as a peer for every site hash they both
 //!    serve.
 //!
-//! Feature-gated (`local-discovery`), off on mobile. Works even though this node
-//! may not accept inbound P2P connections - it still learns local peers to dial.
+//! Compiled into every build (`local-discovery`), phones included, so an
+//! isolated or air-gapped LAN works without a custom build - this is the one
+//! discovery path that needs no internet, no tracker and no DHT. It is off
+//! until the `local_discovery` config key turns it on: a participating node
+//! answers any stranger's request with the hashes of every xite it serves.
+//! Works even though this node may not accept inbound P2P connections - it
+//! still learns local peers to dial.
+//!
+//! Two switches, deliberately: `local_discovery` (config, restart) decides
+//! whether this loop exists at all, and the `AnnounceLocal` plugin toggle is
+//! the live pause - it stops both our broadcasts and our replies.
 
 use epix_core::PeerAddr;
 use epix_discovery::address_hash;
@@ -122,6 +131,13 @@ pub async fn local_discovery_loop(
         let mut known: HashMap<String, i64> = HashMap::new();
         let mut buf = vec![0u8; 8192];
         while let Ok((n, from)) = recv_sock.recv_from(&mut buf).await {
+            // The AnnounceLocal toggle silences inbound handling too, not just
+            // our own broadcasts: answering a DiscoverRequest/SiteListRequest
+            // hands the asker our served-xite hashes, so a node with the plugin
+            // off must not reply either. Drop the datagram unread.
+            if !recv_state.plugin_enabled("AnnounceLocal").await {
+                continue;
+            }
             handle_message(&recv_state, &recv_sock, &recv_id, &mut known, &buf[..n], from).await;
         }
     });

@@ -464,180 +464,11 @@ const EDX_BULK_OPTIONAL_CHUNK: usize = 32;
 /// list comes from the pushing peer, so it cannot be walked in full.
 const PUSH_REFETCH_PEERS: usize = 4;
 
-/// Editable node config keys shown on the Config page:
-/// `(section, key, label, default, kind)`, grouped into the same sections
-/// EpixNet's Config page uses (Web Interface / Network / Performance / Epix
-/// Chain Config). `kind` drives the input widget:
-///   - `"text"` / `"textarea"` - free text
-///   - `"bool"` - checkbox
-///   - `"select:Label=value|Label2=value2"` - dropdown (label defaults to value
-///     when there's no `=`)
-///   - `"button:actionName"` - an action button (not a stored config key)
-///   - `"soon:<inner>"` - render `<inner>` disabled with a "coming soon" note,
-///     for keys whose backend (Tor transport, SOCKS proxy) isn't built yet.
-pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
-    // --- Web Interface
-    ("Web Interface", "open_browser", "Open web browser on EpixNet startup", "true", "bool"),
-    ("Web Interface", "language", "Interface language", "en", "text"),
-    // --- Network
-    ("Network", "offline", "Offline mode", "false", "bool"),
-    (
-        "Network",
-        "fileserver_ip_type",
-        "File server network",
-        "ipv4",
-        "select:IPv4=ipv4|IPv6=ipv6|Dual (IPv4 & IPv6)=dual",
-    ),
-    ("Network", "fileserver_port", "File server port (0 to disable seeding)", "26552", "text"),
-    ("Network", "ip_external", "File server external ip (blank = auto-detect via UPnP)", "", "textarea"),
-    (
-        "Network",
-        "tor",
-        "Tor (Always private routes all peer traffic over Tor/I2P only; restart EpixNet to apply)",
-        "enable",
-        "select:Disable=disable|Enable=enable|Always private (Tor/I2P only)=always",
-    ),
-    // Active only in a bridges-enabled build (Snowflake linked); otherwise shown
-    // disabled with a coming-soon note, as before.
-    #[cfg(feature = "bridges")]
-    ("Network", "tor_use_bridges", "Use Tor bridges (Snowflake; for censored networks; also auto-enables if Tor is blocked)", "false", "bool"),
-    #[cfg(not(feature = "bridges"))]
-    ("Network", "tor_use_bridges", "Use Tor bridges", "false", "soon:bool"),
-    (
-        "Network",
-        "i2p",
-        "I2P (reach and host peers over I2P; the embedded router boots in the background)",
-        "disable",
-        "select:Disable=disable|Embedded router=embedded|External router=external",
-    ),
-    (
-        "Network",
-        "i2p_sam_port",
-        "I2P external router SAM port (only used with External)",
-        "7656",
-        "text",
-    ),
-    (
-        "Network",
-        "mesh",
-        "Reticulum mesh (reach and host peers over mesh links)",
-        "disable",
-        "select:Disable=disable|Enable=enable",
-    ),
-    (
-        "Network",
-        "mesh_peers",
-        "Mesh TCP interfaces to join (host:port, one per line)",
-        "",
-        "textarea",
-    ),
-    (
-        "Network",
-        "mesh_listen",
-        "Mesh TCP listen address (blank = do not accept mesh links over IP)",
-        "",
-        "text",
-    ),
-    ("Network", "trackers", "Trackers", "145.223.69.23:26959", "textarea"),
-    ("Network", "trackers_file", "Trackers files (one path per line)", "", "textarea"),
-    (
-        "Network",
-        "trackers_xite",
-        "Announcer list xite (optional: <address>/<inner path> of a published tracker list)",
-        "",
-        "text",
-    ),
-    (
-        "Network",
-        "trackers_proxy",
-        "Proxy for tracker connections",
-        "disable",
-        "soon:select:Custom=custom|Tor=tor|Disable=disable",
-    ),
-    (
-        "Network",
-        "tracker",
-        "Act as a tracker (answer other nodes' announces, incl. onion/i2p peers)",
-        "enable",
-        "select:Enable=enable|Disable=disable",
-    ),
-    // --- Optional Files: node-wide DEFAULTS for newly downloaded xites. Each
-    // xite's own sidebar toggles override these per xite afterwards; changing
-    // a default never touches xites you already have.
-    (
-        "Optional Files",
-        "download_optional_default",
-        "Allow new xites to fetch optional files you open (images, video you play)",
-        "true",
-        "bool",
-    ),
-    (
-        "Optional Files",
-        "autodownloadoptional_default",
-        "Pre-download EVERY optional file on new xites, including ones you never open (you already share whatever you have downloaded - this is not needed to seed)",
-        "false",
-        "bool",
-    ),
-    (
-        "Optional Files",
-        "full_retention",
-        "Keep a full copy of every xite you visit (downloads everything, not just what you view)",
-        "false",
-        "bool",
-    ),
-    // --- Storage. `data_dir` is special: the value is the live data root and
-    // the setting persists to `epixnet.conf` (see `AppState::set_data_dir`),
-    // not config.json - config.json lives inside the directory it would name.
-    (
-        "Storage",
-        "data_dir",
-        "Data directory (existing data is copied there; restart EpixNet to apply)",
-        "",
-        "text",
-    ),
-    (
-        "Storage",
-        "volunteer_quota_bytes",
-        "Donate disk to hold encrypted shards you cannot read (0 = off)",
-        DEFAULT_VOLUNTEER_QUOTA,
-        "text",
-    ),
-    // --- Performance
-    (
-        "Performance",
-        "log_level",
-        "Level of logging to file",
-        "INFO",
-        "select:Everything=DEBUG|Only important messages=INFO|Only errors=ERROR",
-    ),
-    // --- Epix Chain Config
-    ("Epix Chain Config", "chain_rpc_url", "Chain RPC URL", "https://api.epix.zone", "text"),
-    ("Epix Chain Config", "chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
-    ("Epix Chain Config", "chain_block_explorer_url", "Block Explorer URL", "https://scan.epix.zone", "text"),
-    ("Epix Chain Config", "xid_clear_cache", "Clear xID Cache", "", "button:xidClearCache"),
-];
-
-/// True for schema entries that aren't stored config keys (action buttons), so
-/// `configList` / save loops can skip them.
-pub fn is_config_action(kind: &str) -> bool {
-    kind.starts_with("button:")
-}
-
-/// Config keys the node only reads while booting - changing one takes effect
-/// on the next start. The Config page offers a restart when one of these has
-/// changed since boot (`data_dir` is tracked separately off epixnet.conf).
-pub const CONFIG_RESTART_KEYS: &[&str] = &[
-    "offline",
-    "fileserver_ip_type",
-    "fileserver_port",
-    "tor",
-    "i2p",
-    "i2p_sam_port",
-    "mesh",
-    "mesh_peers",
-    "mesh_listen",
-    "trackers",
-];
+/// The Config page schema lives in its own module (a declarative table,
+/// excluded from copy-paste detection there); re-exported so every existing
+/// `state::CONFIG_SCHEMA` / `CONFIG_RESTART_KEYS` / `is_config_action` path
+/// keeps resolving.
+pub use crate::config_schema::{is_config_action, CONFIG_RESTART_KEYS, CONFIG_SCHEMA};
 
 /// A config value normalized for change comparison: strings trimmed, bools and
 /// numbers in their canonical text form (config.json written by the Python
@@ -1042,6 +873,15 @@ pub struct AppState {
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The per-run token that authorizes state-changing UI requests (config
+    /// saves, plugin toggles, restart). It is rendered into the mutating forms
+    /// and must come back on the POST. A hostile page can navigate the browser
+    /// anywhere, but the same-origin policy stops it READING a page it is not
+    /// allowed to read - so it cannot learn this value and cannot forge the
+    /// request. Not one-time (unlike a wrapper nonce): the settings pages are
+    /// re-submitted repeatedly, and rotating per render would break the back
+    /// button. Regenerated each run, so it does not persist to disk.
+    ui_csrf: std::sync::OnceLock<String>,
     /// Hosts allowed as WebSocket `Origin`s (a wrapper's Host is added when
     /// served), so a cross-origin page can't drive the local WS API.
     allowed_ws_origins: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1514,6 +1354,7 @@ impl AppState {
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            ui_csrf: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
             data_root: None,
@@ -1663,6 +1504,7 @@ impl AppState {
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            ui_csrf: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
             // The served-xite registry lives where Python's SiteManager keeps
@@ -13291,6 +13133,25 @@ impl AppState {
         self.wrapper_nonces.lock().unwrap().remove(nonce)
     }
 
+    /// This run's CSRF token, generated on first use. Rendered into every
+    /// state-changing UI form; [`Self::ui_csrf_valid`] checks it coming back.
+    pub fn ui_csrf_token(&self) -> &str {
+        self.ui_csrf.get_or_init(|| random_hex(32))
+    }
+
+    /// Whether `token` matches this run's CSRF token. Compared in constant
+    /// time: the comparison runs against attacker-supplied input, and an
+    /// early-exit `==` leaks how long a shared prefix was, which is enough to
+    /// recover the token byte by byte given enough attempts.
+    pub fn ui_csrf_valid(&self, token: &str) -> bool {
+        let expected = self.ui_csrf_token().as_bytes();
+        let got = token.as_bytes();
+        if expected.len() != got.len() {
+            return false;
+        }
+        expected.iter().zip(got).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    }
+
     /// Record a wrapper's Host as an allowed WebSocket origin (EpixNet adds
     /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
     pub fn allow_ws_origin(&self, host: &str) {
@@ -17898,6 +17759,56 @@ mod tests {
         let list = s.config_list().await;
         assert_eq!(list["offline"]["pending"], true);
         assert_eq!(list["language"]["pending"], false);
+    }
+
+    /// The offline-capable transports are compiled into every build (mobile
+    /// included), so what keeps them inert is their config default. Both must
+    /// stay off: a node that joins the LAN unasked answers any stranger's
+    /// discovery request with the hashes of every xite it serves.
+    #[test]
+    fn offline_capable_transports_default_to_off() {
+        let default_for = |key: &str| {
+            CONFIG_SCHEMA
+                .iter()
+                .find(|(_, k, ..)| *k == key)
+                .unwrap_or_else(|| panic!("{key} missing from CONFIG_SCHEMA"))
+                .3
+        };
+        assert_eq!(default_for("local_discovery"), "false");
+        assert_eq!(default_for("mesh"), "disable");
+        // Both are read once at boot, so a change must offer a restart.
+        for key in ["local_discovery", "mesh"] {
+            assert!(CONFIG_RESTART_KEYS.contains(&key), "{key} must be a restart key");
+        }
+        // Both must be reachable from the Config page, or "turn it on" means
+        // hand-editing config.json.
+        for key in ["local_discovery", "mesh", "mesh_peers", "mesh_listen"] {
+            assert!(
+                CONFIG_SCHEMA.iter().any(|(_, k, ..)| k == &key),
+                "{key} must be on the Config page"
+            );
+        }
+    }
+
+    /// The Config page opens a new block every time the section name changes,
+    /// so a section whose entries are not contiguous renders its heading twice
+    /// and splits the group in the UI.
+    #[test]
+    fn config_schema_sections_are_contiguous() {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut current = "";
+        for (section, ..) in CONFIG_SCHEMA {
+            if *section == current {
+                continue;
+            }
+            assert!(
+                !seen.contains(section),
+                "section {section:?} appears in two separate runs of CONFIG_SCHEMA - the \
+                 Config page would render its heading twice; keep each section's keys together"
+            );
+            seen.push(section);
+            current = section;
+        }
     }
 
     #[tokio::test]

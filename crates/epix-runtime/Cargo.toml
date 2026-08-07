@@ -38,7 +38,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [features]
 default = ["local-discovery", "inbound-seeding"]
-# LAN peer discovery over UDP broadcast (AnnounceLocal). Off on mobile.
+# LAN peer discovery over UDP broadcast (AnnounceLocal). Compiled into every
+# build, mobile included, so an isolated/air-gapped LAN works out of the box
+# without a custom build; gated at runtime by the `local_discovery` config key,
+# which defaults to off.
 local-discovery = []
 # Inbound file server so peers can pull our files (seeding), plus UPnP port
 # mapping so the fileserver port is reachable through a home router. Off on

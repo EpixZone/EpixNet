@@ -225,6 +225,10 @@ jobs:
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
           cargo install cargo-ndk --locked
 
+      # Default features (tor, i2p-embedded, mesh, local-discovery) plus the two
+      # Android-only opt-ins. mesh/local-discovery ride in from the default and
+      # are config-gated off at runtime; local-discovery additionally needs the
+      # MulticastLock the shell holds, or it can send but never hear replies.
       - name: Build Rust core into jniLibs
         run: |
           cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \

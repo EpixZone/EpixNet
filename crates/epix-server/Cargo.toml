@@ -41,8 +41,12 @@ i2p = ["epix-node/i2p"]
 mesh = ["epix-node/mesh"]
 # Desktop: compile the embedded router in AND auto-enable it on first run.
 i2p-embedded = ["epix-node/i2p-embedded", "epix-node/i2p-autostart"]
-# The always-on server seeds and maps its port and discovers LAN peers; the
-# node no longer pulls these by default, so re-add them here (the mobile FFI
-# leaves them off). `--no-default-features` drops them for a server-side mobile build.
+# The always-on server seeds and maps its port, and carries the LAN-discovery
+# code; the node no longer pulls these by default, so re-add them here.
+# `--no-default-features` drops them for a server-side mobile build.
+#
+# `local-discovery` is now compiled into every build including the mobile FFI,
+# so this is no longer the desktop-only opt-in it once was; what keeps it
+# inert is the `local_discovery` config key, which defaults to off everywhere.
 inbound-seeding = ["epix-node/inbound-seeding"]
 local-discovery = ["epix-node/local-discovery"]

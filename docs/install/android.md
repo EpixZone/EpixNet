@@ -43,6 +43,14 @@ cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
     build -p epix-ffi --release --features bittorrent
 ```
 
+The default features add `mesh` and `local-discovery` — the transports that
+work with no internet at all (a Reticulum mesh, or peer discovery over LAN
+broadcast). Both ship disabled: the `mesh` and `local_discovery` config keys
+default to off, and with them off the node spawns no task and binds no socket
+for either. Turning LAN discovery on also makes the shell hold a
+`WifiManager.MulticastLock`; without it Android filters the broadcast replies
+and the node finds nobody.
+
 Then generate the Kotlin code that talks to it:
 
 ```sh

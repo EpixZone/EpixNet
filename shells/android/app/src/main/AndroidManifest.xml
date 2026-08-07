@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Wallet: Keystone hardware-wallet pairing scans animated QR codes. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- LAN peer discovery (AnnounceLocal): the Wi-Fi stack filters packets not
+         addressed to this device, so receiving the broadcast replies needs a
+         MulticastLock. Taken only while the local_discovery config key is on. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- BLE mesh (Reticulum) - requested at runtime on Android 12+. -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />

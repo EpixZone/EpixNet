@@ -222,7 +222,7 @@ pub fn seal_datamap(chunks: &[ChunkRef], mode: Mode, viewing_key: &Hash) -> (Has
     let plain = serialize_datamap(chunks, mode);
     let key = blake3::derive_key(KDF_CONTEXT, &[viewing_key.as_slice(), b"datamap"].concat());
     let mut nonce = [0u8; 24];
-    getrandom::getrandom(&mut nonce).expect("os csprng");
+    getrandom::fill(&mut nonce).expect("os csprng");
     let ct = aead(&key).encrypt(&XNonce::from(nonce), plain.as_slice()).expect("seal");
     let mut sealed = Vec::with_capacity(24 + ct.len());
     sealed.extend_from_slice(&nonce);

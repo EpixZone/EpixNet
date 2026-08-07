@@ -78,17 +78,21 @@ jobs:
       # a matching runner (release pipeline). Here we validate the FEATURE
       # PROFILES resolve and compile on the host - a dependency leaking into the
       # wrong profile fails at feature resolution, which is what we guard.
+      # `mesh,local-discovery` are in both profiles: the offline-capable
+      # transports ship on every platform, config-gated off. (`bridges` is
+      # omitted here - it links the vendored IPtProxy artifact, which this
+      # runner does not have; the release pipeline builds that profile.)
       - name: iOS profile (BitTorrent excluded)
-        run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded --locked
+        run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery --locked
       - name: Android profile (BitTorrent included)
-        run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,bittorrent --locked
+        run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery,bittorrent --locked
       # The App-Store guarantee, machine-checked: the iOS feature profile must
       # NOT pull the BitTorrent engine crate. Passes today (epix-bt does not
       # exist yet) and becomes load-bearing the moment it does - a stray
       # `bittorrent`/`epix-bt` edge reachable from the iOS profile fails CI.
       - name: Assert no BitTorrent in the iOS profile
         run: |
-          if cargo tree -p epix-ffi --no-default-features --features tor,i2p-embedded --locked -e features 2>/dev/null | grep -qiE '\bepix-bt\b'; then
+          if cargo tree -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery --locked -e features 2>/dev/null | grep -qiE '\bepix-bt\b'; then
             echo "::error::epix-bt reached the iOS feature profile - BitTorrent must be excluded from the iOS build (App Store 5.2.3)"
             exit 1
           fi

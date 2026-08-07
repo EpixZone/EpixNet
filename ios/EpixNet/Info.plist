@@ -39,6 +39,14 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!--
+	  LAN peer discovery (AnnounceLocal, the local_discovery config key). iOS 14+
+	  silently drops local-network traffic until the user accepts this prompt, so
+	  without the key the UDP broadcasts go nowhere. The prompt appears only when
+	  discovery is actually switched on - the feature ships disabled.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>EpixNet uses the local network to find other EpixNet peers nearby, so xites can sync directly between your devices - including with no internet connection. This is off unless you turn on local network discovery in Config.</string>
 	<!-- epix:// links open the app directly (the Android intent-filter). -->
 	<key>CFBundleURLTypes</key>
 	<array>

@@ -2303,6 +2303,13 @@ async fn serve(
         (mode, port)
     };
 
+    // LAN discovery from the node config (Config page). Opt-in: answering a
+    // discovery request discloses which xites we serve to anyone on the
+    // network, so it stays off until the operator asks for it (an isolated LAN,
+    // an air-gapped test). Forced off in offline mode like every other loop.
+    #[cfg(feature = "local-discovery")]
+    let local_discovery = !offline && state.config_bool("local_discovery", false).await;
+
     // Mesh config from the node config (Config page): enable + TCP interfaces.
     #[cfg(feature = "mesh")]
     let (mesh_enabled, mesh_peers, mesh_listen) = {
@@ -2349,6 +2356,8 @@ async fn serve(
         i2p_mode,
         #[cfg(feature = "i2p")]
         i2p_sam_port,
+        #[cfg(feature = "local-discovery")]
+        local_discovery,
         #[cfg(feature = "mesh")]
         mesh_enabled,
         #[cfg(feature = "mesh")]

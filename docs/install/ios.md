@@ -30,9 +30,17 @@ cd EpixNet
 This compiles the node into a static library the app links against:
 
 ```sh
-cargo build -p epix-ffi --release --no-default-features --features tor,i2p-embedded \
+cargo build -p epix-ffi --release --no-default-features \
+    --features tor,i2p-embedded,mesh,local-discovery \
     --target aarch64-apple-ios
 ```
+
+`mesh` and `local-discovery` are the transports that work with no internet at
+all (a Reticulum mesh, or peer discovery over LAN broadcast). Both ship
+disabled — the `mesh` and `local_discovery` config keys default to off, and
+with them off the node spawns no task and binds no socket for either. LAN
+discovery additionally needs `NSLocalNetworkUsageDescription` in `Info.plist`
+(already present); without it iOS drops the broadcasts without an error.
 
 Then generate the Swift code that talks to it:
 
