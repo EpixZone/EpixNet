@@ -1620,7 +1620,7 @@ impl RuntimeEdxFetcher {
         let salt = epix_blob::manifest::edx_salt(content)
             .ok_or("no edx_salt (missing viewing material)")?;
         let now = now_secs();
-        let peers = self.state.connectable_peers(address, 8).await;
+        let peers = self.state.fetch_session_peers(address, 8).await;
 
         // Fetch each ciphertext shard object into the store, verified by its
         // BLAKE3 address (== the shard's bao root).
@@ -1662,7 +1662,7 @@ impl RuntimeEdxFetcher {
                 Ok(report) => report,
                 Err(e) => return Err(e.to_string()),
             };
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
             if !store.is_complete(id).unwrap_or(false) {
                 return Err(format!("shard {id} did not complete"));
             }
@@ -1751,7 +1751,7 @@ impl RuntimeEdxFetcher {
             return Ok(0);
         }
 
-        let peers = self.state.connectable_peers(address, 8).await;
+        let peers = self.state.fetch_session_peers(address, 8).await;
         let mut held = 0usize;
         for c in want {
             // Soft budget gate: stop before pulling once held shard bytes
@@ -1805,7 +1805,7 @@ impl RuntimeEdxFetcher {
         let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
         let mut swarm = Swarm::new(store.clone(), id, csize);
         if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
         }
         if store.is_complete(id).unwrap_or(false) {
             Ok(true)
@@ -1845,15 +1845,37 @@ impl RuntimeEdxFetcher {
     }
 
     /// Credit each peer that delivered groups in `report` for the bytes it
-    /// served us (reciprocity), when a shared choker is installed.
-    fn credit(&self, report: &epix_edx::sched::FetchReport, node_pks: &HashMap<String, Vec<u8>>, now: u64) {
-        let Some(choker) = &self.choker else { return };
-        let mut c = choker.lock().expect("choker");
-        for (label, groups) in &report.by_peer {
-            if let Some(pk) = node_pks.get(label) {
-                c.credit_peer(pk, groups * epix_blob::bitfield::GROUP_BYTES, now);
+    /// served us (reciprocity, when a shared choker is installed), and stamp
+    /// its data history in the xite's registry. The registry stamp is what
+    /// note_edx_dials cannot record - a peer that answers and holds nothing
+    /// scores ConnectOk there, so "never served us a byte" was invisible -
+    /// and it is what ranks actual byte sources into the data-session slots
+    /// ([`AppState::fetch_session_peers`]).
+    async fn credit(
+        &self,
+        address: &str,
+        report: &epix_edx::sched::FetchReport,
+        node_pks: &HashMap<String, Vec<u8>>,
+        now: u64,
+    ) {
+        if let Some(choker) = &self.choker {
+            let mut c = choker.lock().expect("choker");
+            for (label, groups) in &report.by_peer {
+                if let Some(pk) = node_pks.get(label) {
+                    c.credit_peer(pk, groups * epix_blob::bitfield::GROUP_BYTES, now);
+                }
             }
         }
+        // Lanes share their peer's label (the address string), so this
+        // round-trips; a label that is not an address (test doubles) is
+        // simply not a registry peer.
+        let served: Vec<PeerAddr> = report
+            .by_peer
+            .iter()
+            .filter(|(_, groups)| **groups > 0)
+            .filter_map(|(label, _)| PeerAddr::parse(label).ok())
+            .collect();
+        self.state.note_edx_served(address, served).await;
     }
 
     /// Resolve `inner_path`'s object id + size from the root OR the governing
@@ -1890,7 +1912,10 @@ impl RuntimeEdxFetcher {
         ),
         String,
     > {
-        let peers = self.state.connectable_peers(address, 8).await;
+        // Data-session slots: peers with data history for this xite first
+        // (see fetch_session_peers) - the gateway-style non-seeder must not
+        // occupy one of the 8 dials while a byte source waits below the cut.
+        let peers = self.state.fetch_session_peers(address, 8).await;
         if peers.is_empty() {
             return Err("no peers".into());
         }
@@ -2292,7 +2317,7 @@ impl RuntimeEdxFetcher {
             Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
         match swarm.fetch(needed, &handles, Deadline::tight(), now).await {
             Ok(report) => {
-                self.credit(&report, &node_pks, now);
+                self.credit(address, &report, &node_pks, now).await;
                 None
             }
             Err(e) => {
@@ -2466,7 +2491,7 @@ impl RuntimeEdxFetcher {
             else {
                 return;
             };
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
             let _ = store.enforce_quota(store_quota());
             if report.groups_fetched == 0 {
                 if batch.count() >= needed.count() {
@@ -2479,7 +2504,7 @@ impl RuntimeEdxFetcher {
                 else {
                     return;
                 };
-                self.credit(&rest, &node_pks, now);
+                self.credit(address, &rest, &node_pks, now).await;
                 let _ = store.enforce_quota(store_quota());
                 if rest.groups_fetched == 0 {
                     return;
@@ -2582,7 +2607,7 @@ impl RuntimeEdxFetcher {
         // minute from now - so it fetches in play order over the fastest peers,
         // not as background bulk spread across whoever is idle.
         if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::prefetch(), now).await {
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
         }
         self.xfer.note_readahead(id, address, now_secs(), None);
         let _ = store.enforce_quota(store_quota());
@@ -2965,7 +2990,8 @@ impl RuntimeEdxFetcher {
             for (label, _) in report.by_peer.iter().filter(|(_, groups)| **groups > 0) {
                 BatchProgress::note_peer(serving, label);
             }
-            self.credit(&report, &node_pks.lock().expect("node pks"), now);
+            let pks = node_pks.lock().expect("node pks").clone();
+            self.credit(address, &report, &pks, now).await;
         }
         store.is_complete(id).unwrap_or(false)
     }
@@ -3235,7 +3261,8 @@ impl RuntimeEdxFetcher {
                 return Err(e);
             }
         };
-        self.credit(&report, &node_pks.lock().expect("node pks"), now);
+        let pks = node_pks.lock().expect("node pks").clone();
+        self.credit(address, &report, &pks, now).await;
         if !store.is_complete(id).unwrap_or(false) {
             // The scheduler's silent-exhaustion path (peers ran out of
             // strikes): name it in the telemetry, not just the round log.

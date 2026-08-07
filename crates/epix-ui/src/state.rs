@@ -507,6 +507,18 @@ const OPTIONAL_FETCH_WORKERS: usize = 3;
 /// past its quota.
 const OPTIONAL_MATERIALIZE_BACKLOG: usize = 3;
 
+/// How long a bulk optional pass waits between mid-pass re-announces: 10
+/// minutes plus up to 5 minutes of per-xite deterministic jitter, so several
+/// passes started together do not hit the tracker set in lockstep. The
+/// interval IS the rate bound - each announce fans out to the whole tracker
+/// set, over Tor a circuit per tracker.
+fn optional_reannounce_delay(address: &str) -> std::time::Duration {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    address.hash(&mut h);
+    std::time::Duration::from_secs(600 + h.finish() % 300)
+}
+
 /// How many of a body-less push's advertised publisher addresses are tried when
 /// fetching the content.json back. Each try costs one dial deadline, and the
 /// list comes from the pushing peer, so it cannot be walked in full.
@@ -3302,6 +3314,10 @@ impl AppState {
         peer.connection_errors =
             o.get("errors").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
         peer.time_response = o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
+        // Clamped to now for the same reason as `found` below: a future stamp
+        // must not mint a permanently "just served us" peer.
+        peer.time_data =
+            o.get("data").and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now);
         // How long we have known this peer, which is the durability tiebreak
         // in peer selection. Clamped to now: a future stamp (clock skew, an
         // edited file) must not mint an unbeatably "old" peer. Absent ->
@@ -3318,12 +3334,12 @@ impl AppState {
         // behaviour.
         //
         // Cap against the ceilings the in-memory backoff uses (dial 1h,
-        // probe ~10min) so a hand-edited or corrupt file can't bench a peer
-        // forever.
+        // probe ~10min, 2h for repeat-offender onions) so a hand-edited or
+        // corrupt file can't bench a peer forever.
         let cap =
             |v: Option<&Value>, max: i64| v.and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now + max);
         peer.retry_after = cap(o.get("retry_after"), 3600);
-        peer.probe_after = cap(o.get("probe_after"), 600);
+        peer.probe_after = cap(o.get("probe_after"), 7200);
         peer.probe_failures =
             o.get("probe_failures").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
         peer.benched_since = o.get("benched_since").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
@@ -3437,6 +3453,9 @@ impl AppState {
             ("probe_after", (p.probe_after > now).then_some(p.probe_after)),
             ("benched_since", (p.benched_since > 0).then_some(p.benched_since)),
             ("probe_failures", (p.probe_failures > 0).then_some(p.probe_failures as i64)),
+            // Data history survives a restart: the fetch-slot preference is
+            // most useful right after boot, when everything else looks cold.
+            ("data", (p.time_data > 0).then_some(p.time_data)),
         ] {
             if let Some(v) = value {
                 o.insert(key.into(), json!(v));
@@ -5486,6 +5505,20 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// [`Self::connectable_peers`] for DATA-fetch session slots: peers that
+    /// recently served us verified content bytes for this xite rank first
+    /// (`Peers::connectable_for_data`), so a metadata responder cannot squat
+    /// the few dial slots while the actual byte sources sit below the cut.
+    pub async fn fetch_session_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
+        let nets = self.dialable_networks().await;
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.peers.connectable_for_data(limit, nets, now_secs()))
+            .unwrap_or_default()
+    }
+
     /// Reliable content sources drawn from the tracker list: an Epix tracker is
     /// an operator-run full node that also SEEDS, so its fileserver address is a
     /// dependable place to fetch from - unlike the peer registry, which fills
@@ -5531,8 +5564,31 @@ impl AppState {
         let mut out = self.connectable_peers(address, limit).await;
         let mut seen: std::collections::HashSet<String> =
             out.iter().map(|p| p.to_string()).collect();
+        // A tracker seed is rebuilt fresh from the tracker list every pass, so
+        // it never carried the registry's connect-fail backoff: a dead
+        // operator node was redialed at the top of every data session, each
+        // dial an overlay circuit. Its dial outcomes DO land in the registry
+        // (note_edx_dials adds unknown peers), so consult that entry here and
+        // let a benched seed wait its turn exactly like a table peer. This is
+        // the data-dial assembly only; announces never come through here.
+        let benched: std::collections::HashSet<String> = {
+            let now = now_secs();
+            self.xites
+                .read()
+                .await
+                .get(address)
+                .map(|x| {
+                    x.peers
+                        .peers()
+                        .filter(|p| !p.connected && p.retry_after > now)
+                        .map(|p| p.key())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         for p in self.tracker_seed_peers().await {
-            if seen.insert(p.to_string()) {
+            let key = p.to_string();
+            if !benched.contains(&key) && seen.insert(key) {
                 out.push(p);
             }
         }
@@ -5549,6 +5605,19 @@ impl AppState {
         if results.is_empty() {
             return;
         }
+        // Sessions also dial peers assembled OUTSIDE the registry (tracker
+        // seeds, [`Self::fetch_candidate_peers`]). apply_peer_outcomes skips
+        // unknown addresses, so a dead seed's failures used to vanish and it
+        // bypassed backoff forever; registering it first makes every dialed
+        // peer accumulate the same state as a table peer.
+        {
+            let now = now_secs();
+            if let Some(x) = self.xites.write().await.get_mut(address) {
+                for (p, _) in &results {
+                    x.peers.add(p.clone(), now);
+                }
+            }
+        }
         let outcomes = results
             .into_iter()
             .map(|(p, ok)| {
@@ -5561,6 +5630,28 @@ impl AppState {
             })
             .collect();
         self.apply_peer_outcomes(address, outcomes).await;
+    }
+
+    /// Record which peers actually DELIVERED verified data groups in a fetch
+    /// (per the scheduler's report), stamping each one's data history. This
+    /// is the signal reputation cannot carry - note_edx_dials scores a peer
+    /// that answers and holds nothing as ConnectOk, so "never served us a
+    /// byte" was invisible - and it is what [`Self::fetch_session_peers`]
+    /// prefers when filling data-session slots. Peers are added if unknown
+    /// (a tracker seed that served data has earned a registry entry).
+    pub async fn note_edx_served(&self, address: &str, served: Vec<PeerAddr>) {
+        if served.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            for addr in served {
+                x.peers.add(addr.clone(), now);
+                if let Some(p) = x.peers.get_mut(&addr) {
+                    p.note_data_served(now);
+                }
+            }
+        }
     }
 
     /// Benched peers across every served xite whose probe cooldown has
@@ -12359,6 +12450,41 @@ impl AppState {
         self.connectable_peers(address, 20).await.len()
     }
 
+    /// Re-announce periodically while a bulk optional pass runs.
+    /// [`Self::ensure_optional_peers`] deliberately skips announcing once a
+    /// single peer is known, so a multi-hour pass otherwise never learns
+    /// that a new replica appeared: the peer table it started from is the
+    /// peer table it dies with. Every [`optional_reannounce_delay`] (10-15
+    /// min, jittered per xite) this re-announces to the full tracker set;
+    /// the finds land in the xite's peer table, where the next session
+    /// build, in-file retry and the growable sessions' late joins pick them
+    /// up. One task per PASS, not per file: the parallel fetch workers all
+    /// read the same table, so one announce serves every worker. Ends
+    /// itself when the mandate is withdrawn; the caller aborts it when the
+    /// pass finishes. No "Announcing…" phase is shown - the round sampler
+    /// owns the status line while files are moving.
+    fn spawn_optional_reannounce(
+        self: &Arc<Self>,
+        address: &str,
+        directory: Option<&str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        let address = address.to_string();
+        let directory = directory.map(str::to_string);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(optional_reannounce_delay(&address)).await;
+                if !state.optional_pass_should_continue(&address, directory.as_deref()).await {
+                    break;
+                }
+                let bootstrap = state.bootstrap_trackers.read().await.clone();
+                let trackers = state.all_trackers(&bootstrap).await;
+                // announce_to_trackers registers its finds in the peer table.
+                let _ = state.announce_to_trackers(&address, &trackers).await;
+            }
+        })
+    }
+
     /// One round of a bulk pass: try every queued file once, marking the
     /// snapshot and counters as results land. Returns the files to requeue
     /// (failed this round) and whether the round aborted because the user
@@ -12668,6 +12794,9 @@ impl AppState {
         // announce NOW instead of failing the whole pass and telling the user
         // "could not fetch from any peer" before a single tracker was asked.
         self.ensure_optional_peers(address, false).await;
+        // ...and keep announcing while the pass runs, so a replica that
+        // appears mid-pass joins it instead of waiting for the next one.
+        let reannounce = self.spawn_optional_reannounce(address, directory);
 
         // Up to 3 rounds over the still-missing files. Round 1 tries everything;
         // a later round re-announces first (the peers we knew evidently didn't
@@ -12714,6 +12843,7 @@ impl AppState {
             }
             queue = requeue;
         }
+        reannounce.abort();
         self.set_worker_stats(address, 0, 0, 0).await;
         self.finish_optional_pass(address, cancelled, fetched, failed).await;
         self.log(
@@ -14783,6 +14913,91 @@ mod tests {
         // and the worker marked it connected (it never did before).
         assert_eq!(state.connectable_peers(addr, 10).await, vec![good]);
         assert_eq!(state.peer_counts(addr).await.connected, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_tracker_seed_lands_in_backoff_and_stops_being_offered() {
+        // Tracker seeds are assembled fresh from the tracker list each pass,
+        // outside the registry - before F6 their dial failures vanished
+        // (apply_peer_outcomes skips unknown peers) and every data session
+        // redialed the dead seed at full price. Now note_edx_dials registers
+        // them, and fetch_candidate_peers consults that entry.
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let seed = PeerAddr::parse("9.9.9.9:26959").unwrap();
+        state.set_extra_trackers(vec![epix_xite::Tracker::Epix(seed.clone())]).await;
+        // A healthy table peer, so selection never enters its everything-is-
+        // benched fallback (which deliberately returns benched peers).
+        let table = PeerAddr::parse("1.1.1.1:15441").unwrap();
+        state.add_peers(addr, [table.clone()]).await;
+
+        // Unknown to the registry: offered as a fallback candidate.
+        assert!(state.fetch_candidate_peers(addr, 10).await.contains(&seed));
+
+        // Its EDX dial fails: the outcome must stick even though nothing
+        // added the seed to the registry beforehand.
+        state.note_edx_dials(addr, vec![(seed.clone(), false)]).await;
+        {
+            let xites = state.xites.read().await;
+            let p = xites.get(addr).unwrap().peers.get(&seed).unwrap();
+            assert_eq!(p.connection_errors, 1, "the failure was recorded");
+            assert!(p.retry_after > now_secs(), "and it is in dial backoff");
+        }
+        assert!(
+            !state.fetch_candidate_peers(addr, 10).await.contains(&seed),
+            "a benched seed waits its backoff out like a table peer"
+        );
+
+        // A successful dial clears the bench and the seed is offered again.
+        state.note_edx_dials(addr, vec![(seed.clone(), true)]).await;
+        assert!(state.fetch_candidate_peers(addr, 10).await.contains(&seed));
+    }
+
+    #[tokio::test]
+    async fn served_data_history_ranks_byte_sources_into_the_session_slots() {
+        // The gateway case: a metadata responder out-reputations the actual
+        // seeders, so the plain ranking hands it a session slot every fetch.
+        // note_edx_served stamps who really delivered groups, and
+        // fetch_session_peers prefers that history.
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let squatter = PeerAddr::parse("1.1.1.1:15441").unwrap();
+        let seeder = PeerAddr::parse("2.2.2.2:15441").unwrap();
+        state.add_peers(addr, [squatter.clone(), seeder.clone()]).await;
+        {
+            let mut xites = state.xites.write().await;
+            let peers = &mut xites.get_mut(addr).unwrap().peers;
+            peers.get_mut(&squatter).unwrap().reputation = 100;
+            peers.get_mut(&seeder).unwrap().reputation = -2;
+        }
+        state.note_edx_served(addr, vec![seeder.clone()]).await;
+
+        let slots = state.fetch_session_peers(addr, 8).await;
+        assert_eq!(slots[0], seeder, "the peer that served bytes takes the first slot");
+        assert!(slots.contains(&squatter), "a preference, not a filter");
+        // Non-data selection (sync/publish/PEX) keeps the reputation order.
+        assert_eq!(state.connectable_peers(addr, 8).await[0], squatter);
+    }
+
+    #[test]
+    fn the_reannounce_delay_is_jittered_per_xite_and_rate_bounded() {
+        let a = optional_reannounce_delay("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g");
+        assert!((600..900).contains(&a.as_secs()), "{a:?}");
+        assert_eq!(a, optional_reannounce_delay("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g"));
+        // Different xites spread out (for at least one of a few addresses).
+        let others = ["epix1talkanwfts3qcflekhmkvcz66ss4kxz2tr2k6g", "1Opt", "1Flix"];
+        assert!(
+            others.iter().any(|o| optional_reannounce_delay(o) != a),
+            "per-xite jitter never de-synchronized"
+        );
     }
 
     #[tokio::test]

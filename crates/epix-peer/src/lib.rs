@@ -49,12 +49,6 @@ impl DialableNets {
     }
 }
 
-/// Cooldown before the health prober re-checks a benched peer: ~30s doubling
-/// per consecutive failure to a ~10-minute cap, plus deterministic jitter
-/// (a hash of address + attempt, up to a quarter of the base) so peers
-/// benched together do not re-probe in lockstep. Deliberately capped far
-/// below the dial backoff's hour: the prober's whole point is spotting a
-/// recovered peer within minutes.
 /// How many benched peers [`PeerRegistry::connectable_dialable`] will hand
 /// back when NOTHING is due. Small on purpose: this is the "everything is
 /// backed off" path, so every candidate is one we already know is failing,
@@ -62,6 +56,14 @@ impl DialableNets {
 /// bench is wrong, few enough that a xite full of dead onions stops churning
 /// circuits.
 const BENCHED_FANOUT: usize = 2;
+
+/// How long a peer's data history counts toward [`Peers::connectable_for_data`]'s
+/// slot preference. A time bound, not a filter: long enough to span a bulk
+/// pass's between-file gaps and retry rounds, short enough that yesterday's
+/// seeder does not keep outranking a replica that appeared today. Peers with
+/// no (or stale) history still compete on the normal ranking and through the
+/// explore rotation, so a fresh replica is never locked out of the slots.
+const DATA_HISTORY_SECS: i64 = 6 * 3600;
 
 /// The [`BENCHED_FANOUT`] peers closest to leaving their dial backoff.
 /// Ordering by `retry_after` means the ones benched longest ago (shortest
@@ -74,9 +76,25 @@ fn soonest_due<'a>(peers: impl Iterator<Item = &'a Peer>) -> Vec<&'a Peer> {
     due
 }
 
+/// Cooldown before the health prober re-checks a benched peer: ~30s doubling
+/// per consecutive failure to a ~10-minute cap, plus deterministic jitter
+/// (a hash of address + attempt, up to a quarter of the base) so peers
+/// benched together do not re-probe in lockstep. Capped far below the dial
+/// backoff's hour: the prober's whole point is spotting a recovered peer
+/// within minutes.
+///
+/// Onion repeat offenders keep doubling PAST that cap, to a 2-hour ceiling:
+/// every onion probe is a circuit build plus a descriptor fetch, and
+/// re-probing a set of long-dead onions every ~10 minutes is the churn that
+/// gets guards run into HSDir rate limiting. Still bounded, so a peer that
+/// comes back is spotted within 2h at worst - and one answered probe or dial
+/// (note_probe_ok / note_connect_ok) resets the streak the escalation is
+/// driven by, so a recovering peer drops straight back to short cooldowns.
 pub fn probe_cooldown_secs(addr: &PeerAddr, failures: u32) -> i64 {
-    let shift = failures.saturating_sub(1).min(5);
-    let base = (30i64 << shift).min(600);
+    let (cap, max_shift) =
+        if matches!(addr, PeerAddr::Onion { .. }) { (7200, 8) } else { (600, 5) };
+    let shift = failures.saturating_sub(1).min(max_shift);
+    let base = (30i64 << shift).min(cap);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     addr.to_string().hash(&mut h);
     failures.hash(&mut h);
@@ -136,6 +154,14 @@ pub struct Peer {
     pub time_found: i64,
     /// Unix time of the last successful response (0 = never).
     pub time_response: i64,
+    /// Unix time the peer last DELIVERED verified data bytes to us (0 =
+    /// never). Strictly stronger than `time_response`/reputation: a peer can
+    /// handshake, answer bitfields and serve metadata forever without ever
+    /// serving a byte of content (the gateway non-seeder), and reputation
+    /// cannot tell the two apart. Recorded from fetch reports, consumed by
+    /// [`Peers::connectable_for_data`]. Locally persisted, never sent to
+    /// peers.
+    pub time_data: i64,
     /// Consecutive connection failures.
     pub connection_errors: u32,
     /// Unix time before which selection skips the peer (exponential backoff
@@ -144,10 +170,11 @@ pub struct Peer {
     /// it stays wire-safe.
     pub retry_after: i64,
     /// Unix time before which the health prober skips the peer. Its own
-    /// cooldown, separate from `retry_after`: probes cap at ~10min (see
-    /// [`probe_cooldown_secs`]) while the dial backoff grows to an hour, so
-    /// a recovered peer is spotted quickly without the streaming path ever
-    /// redialing it. Locally persisted, like `retry_after`.
+    /// cooldown, separate from `retry_after`: probes cap at ~10min (2h for
+    /// repeat-offender onions, see [`probe_cooldown_secs`]) while the dial
+    /// backoff grows to an hour, so a recovered peer is spotted quickly
+    /// without the streaming path ever redialing it. Locally persisted, like
+    /// `retry_after`.
     pub probe_after: i64,
     /// Unix time the current failure streak began (0 = not benched).
     /// Locally persisted, like `retry_after`.
@@ -172,6 +199,7 @@ impl Peer {
             reputation: 0,
             time_found: now,
             time_response: 0,
+            time_data: 0,
             connection_errors: 0,
             retry_after: 0,
             probe_after: 0,
@@ -263,6 +291,20 @@ impl Peer {
     pub fn note_file_ok(&mut self, now: i64) {
         self.time_response = now;
         self.reputation += 1;
+    }
+
+    /// The peer delivered verified data groups in a fetch: stamp its data
+    /// history. Deliberately NOT a reputation event - the fetch paths already
+    /// score outcomes; this records the one fact reputation loses, that the
+    /// peer actually served content bytes.
+    pub fn note_data_served(&mut self, now: i64) {
+        self.time_data = now;
+    }
+
+    /// Whether the peer served data recently enough to earn a fetch-slot
+    /// preference (see [`Peers::connectable_for_data`]).
+    fn has_recent_data(&self, now: i64) -> bool {
+        self.time_data != 0 && now.saturating_sub(self.time_data) < DATA_HISTORY_SECS
     }
 
     /// A file fetch failed (refused, timed out, or hash mismatch). Reputation
@@ -472,6 +514,29 @@ impl Peers {
     /// path anyway: the background prober re-checks benched peers on their own
     /// cooldown and lifts the backoff the moment one answers.
     pub fn connectable_dialable(&self, limit: usize, nets: DialableNets, now: i64) -> Vec<PeerAddr> {
+        self.select_dialable(limit, nets, now, false)
+    }
+
+    /// [`Self::connectable_dialable`] for DATA-fetch session slots: peers
+    /// that recently delivered verified data bytes ([`Peer::note_data_served`],
+    /// within [`DATA_HISTORY_SECS`]) rank ahead of everything else. Reputation
+    /// alone cannot make that cut - a metadata responder earns ConnectOk/
+    /// FileOk credit forever without serving a content byte, and at 8 session
+    /// slots such a peer squats a dial slot every fetch while an actual byte
+    /// source sits below the cut. A preference, never a filter: peers with no
+    /// history keep their normal ranking and the explore rotation still
+    /// samples them, so a fresh replica gets its first chance to serve.
+    pub fn connectable_for_data(&self, limit: usize, nets: DialableNets, now: i64) -> Vec<PeerAddr> {
+        self.select_dialable(limit, nets, now, true)
+    }
+
+    fn select_dialable(
+        &self,
+        limit: usize,
+        nets: DialableNets,
+        now: i64,
+        prefer_data: bool,
+    ) -> Vec<PeerAddr> {
         let connectable: Vec<&Peer> =
             self.map.values().filter(|p| p.is_connectable()).collect();
         let mut peers: Vec<&Peer> = connectable
@@ -499,9 +564,13 @@ impl Peers {
                 1
             }
         };
+        // Data history outranks reputation when the caller asked for it: the
+        // whole point is overriding a ranking that reputation gets wrong.
+        let data_rank = |p: &Peer| if prefer_data && p.has_recent_data(now) { 0u8 } else { 1 };
         peers.sort_by(|a, b| {
-            b.reputation
-                .cmp(&a.reputation)
+            data_rank(a)
+                .cmp(&data_rank(b))
+                .then(b.reputation.cmp(&a.reputation))
                 .then(net_rank(a).cmp(&net_rank(b)))
                 .then(a.connection_errors.cmp(&b.connection_errors))
                 // Among peers that are otherwise equally good, prefer the one
@@ -1096,5 +1165,56 @@ mod tests {
         let p = peers.get_mut(&ip("3.3.3.3:1")).unwrap();
         p.time_found = now - 8 * DAY;
         assert_eq!(durability_bucket(p, now), 2);
+    }
+
+    #[test]
+    fn onion_probe_cooldown_escalates_past_the_cap_but_stays_bounded() {
+        let onion = ip("expyuzz4wqqyqhjn.onion:15441");
+        let clear = ip("1.1.1.1:15441");
+        // Early failures: both networks stay on the short doubling ladder.
+        assert!(probe_cooldown_secs(&onion, 1) < 60);
+        assert!(probe_cooldown_secs(&clear, 1) < 60);
+        // A repeat-offender onion keeps growing past the old 600s ceiling...
+        assert!(probe_cooldown_secs(&onion, 6) > 600, "escalation starts where the cap was");
+        assert!(probe_cooldown_secs(&onion, 8) > probe_cooldown_secs(&onion, 6) + 600);
+        // ...but is bounded at ~2h (plus a quarter of jitter), so a peer that
+        // comes back is still re-checked within a bounded window.
+        for f in [9, 12, 100] {
+            let cd = probe_cooldown_secs(&onion, f);
+            assert!((7200..7200 + 7200 / 4 + 1).contains(&cd), "failures={f}: {cd}");
+        }
+        // Clearnet is untouched: cheap probes keep the ~10min ceiling.
+        for f in [6, 12, 100] {
+            let cd = probe_cooldown_secs(&clear, f);
+            assert!(cd <= 600 + 600 / 4, "failures={f}: {cd}");
+        }
+    }
+
+    #[test]
+    fn data_history_outranks_reputation_only_for_data_selection_and_decays() {
+        let now = 100_000;
+        let mut peers = Peers::new();
+        // The gateway case: a metadata responder with a big reputation that
+        // never served a content byte, and a seeder whose failed passes left
+        // it slightly negative but which delivered data minutes ago.
+        let squatter = ip("1.1.1.1:15441");
+        let seeder = ip("2.2.2.2:15441");
+        for (a, rep) in [(&squatter, 100), (&seeder, -2)] {
+            peers.add(a.clone(), 0);
+            peers.get_mut(a).unwrap().reputation = rep;
+        }
+        peers.get_mut(&seeder).unwrap().note_data_served(now - 300);
+
+        let data = peers.connectable_for_data(10, DialableNets::all(), now);
+        assert_eq!(data[0], seeder, "the peer with data history takes the first slot");
+        let plain = peers.connectable_dialable(10, DialableNets::all(), now);
+        assert_eq!(plain[0], squatter, "non-data selection keeps the reputation order");
+        assert!(data.contains(&squatter), "a preference, not a filter");
+
+        // Stale history buys nothing: past the window the normal ranking is
+        // back, so an old seeder cannot outrank a replica forever.
+        peers.get_mut(&seeder).unwrap().time_data = now - DATA_HISTORY_SECS - 1;
+        let decayed = peers.connectable_for_data(10, DialableNets::all(), now);
+        assert_eq!(decayed[0], squatter, "expired data history falls back to reputation");
     }
 }
