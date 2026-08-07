@@ -49,8 +49,19 @@ impl Class {
     }
 
     /// Default class for an address scheme (overridable per address).
+    ///
+    /// In Tor-always mode ([`epix_core::route_all_via_overlay`]) a PUBLIC Ip
+    /// peer is reached through an exit circuit, so it needs overlay batches
+    /// and stall windows - clearnet sizing there (1 MiB batches, a 4s stall
+    /// window) manufactured false stalls on what is really a Tor path. The
+    /// dial-timeout and dial-permit paths already make this same check.
+    /// Private/LAN addresses stay clearnet even then: an exit cannot reach
+    /// RFC1918, so those dials bypass the exit path, and a LAN peer is the
+    /// one genuinely fast class.
     pub fn of_addr(addr: &PeerAddr) -> Self {
         match addr {
+            PeerAddr::Ip(_) if addr.is_private() => Class::Clearnet,
+            PeerAddr::Ip(_) if epix_core::route_all_via_overlay() => Class::Tor,
             PeerAddr::Ip(_) => Class::Clearnet,
             PeerAddr::I2p { .. } => Class::I2p,
             PeerAddr::Onion { .. } | PeerAddr::Rns(_) => Class::Tor,
@@ -299,6 +310,41 @@ mod tests {
         let t = Class::Tor.spec();
         assert!(t.latency >= c.latency * 10);
         assert!(c.bandwidth >= t.bandwidth * 5);
+    }
+
+    /// In Tor-always mode a PUBLIC Ip peer rides an exit circuit and must be
+    /// classed overlay so it gets overlay batches and stall windows; a
+    /// private/LAN peer is dialed directly (an exit cannot reach RFC1918)
+    /// and must stay clearnet - it is the one genuinely fast class. One test
+    /// covers both flag states: the flag is process-global, so a separate
+    /// test asserting the default would race the toggle.
+    #[test]
+    fn tor_always_classes_public_ip_as_overlay_but_never_lan() {
+        use epix_core::set_route_all_via_overlay;
+        let public = PeerAddr::Ip(SocketAddr::from(([8, 8, 8, 8], 26552)));
+        let lan = PeerAddr::Ip(SocketAddr::from(([192, 168, 1, 5], 26552)));
+        let ten = PeerAddr::Ip(SocketAddr::from(([10, 0, 0, 1], 26552)));
+        let lo = PeerAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 26552)));
+
+        // Clearnet default: the address type alone decides.
+        assert_eq!(Class::of_addr(&public), Class::Clearnet);
+        assert_eq!(Class::of_addr(&lan), Class::Clearnet);
+
+        set_route_all_via_overlay(true);
+        let classed = (
+            Class::of_addr(&public),
+            Class::of_addr(&lan),
+            Class::of_addr(&ten),
+            Class::of_addr(&lo),
+            Class::of_addr(&onion("x")),
+        );
+        // Restore before asserting so a failure cannot leave the global on.
+        set_route_all_via_overlay(false);
+        assert_eq!(classed.0, Class::Tor, "a public Ip peer rides an exit circuit");
+        assert_eq!(classed.1, Class::Clearnet, "RFC1918 bypasses the exit; LAN stays fast");
+        assert_eq!(classed.2, Class::Clearnet, "10/8 is private too");
+        assert_eq!(classed.3, Class::Clearnet, "loopback is never an exit path");
+        assert_eq!(classed.4, Class::Tor, "onions are overlay either way");
     }
 
     /// Dialing nowhere fails and is counted.

@@ -114,14 +114,16 @@ pub fn pipeline_depth(class: Class) -> u32 {
     }
 }
 
-/// The batch size for a fetch over `peers`: the smallest any of them wants,
-/// so a session with even one overlay link uses the fine-grained batching
-/// that link needs. Batches are cut before a peer is picked (the pick needs
-/// the batch's groups), so one size has to serve the whole peer set; taking
-/// the minimum keeps a slow circuit from being handed a megabyte, and costs
-/// a fast peer only some request overhead it has the bandwidth to absorb.
+/// The size batches are CUT at for a fetch over `peers`: the largest any of
+/// them wants. Batches are cut before a peer is picked (the pick needs the
+/// batch's groups), so the cut takes the coarsest class present and
+/// [`Window::schedule`] trims each batch down to the PICKED peer's own
+/// request size after the pick - a slow circuit is still never handed a
+/// megabyte. Cutting at the session minimum instead collapsed every
+/// clearnet peer's batches to the overlay size the moment one overlay link
+/// joined the session. Single-class sessions see one size either way.
 pub fn batch_groups_for(peers: &[PeerHandle]) -> u64 {
-    peers.iter().map(|p| groups_per_request(p.class)).min().unwrap_or(GROUPS_PER_REQUEST)
+    peers.iter().map(|p| groups_per_request(p.class)).max().unwrap_or(GROUPS_PER_REQUEST)
 }
 
 /// The no-new-bytes window for one request, given how many requests are
@@ -519,14 +521,27 @@ impl<'a> Window<'a> {
     fn schedule(
         &mut self,
         swarm: &'a Swarm,
-        batch: std::ops::Range<u64>,
-        groups: Vec<u64>,
+        mut batch: std::ops::Range<u64>,
+        mut groups: Vec<u64>,
         idx: usize,
         peers: &'a [PeerHandle],
         deadline: Deadline,
         now: u64,
         report: &mut FetchReport,
     ) {
+        // Cut-after-pick: batches are cut at the coarsest class in the
+        // session ([`batch_groups_for`]) so a fast peer can take a full-size
+        // one, and trimmed here to what the picked peer's class wants per
+        // request. The tail is never booked (not in `inflight`), so the
+        // refill loop re-collects it for the next pick. `groups` is a
+        // contiguous ascending run (both callers cut it from a byte range),
+        // so the kept prefix maps back to a byte range exactly.
+        let max = groups_per_request(peers[idx].class) as usize;
+        if groups.len() > max {
+            groups.truncate(max);
+            let last = *groups.last().expect("nonempty batch");
+            batch.end = epix_blob::bitfield::bytes_of_group(last, swarm.size).end;
+        }
         self.load[idx] += 1;
         for &g in &groups {
             self.inflight.add(g..g + 1);
@@ -716,8 +731,9 @@ impl Swarm {
         } else {
             rarest_first_order(needed, peers)
         };
-        // One size for the whole call: batches are cut before a peer is
-        // picked, so the slowest class present sets it.
+        // One CUT size for the whole call (batches are cut before a peer is
+        // picked): the coarsest class present, trimmed to the picked peer's
+        // own request size in `Window::schedule`.
         let batch_groups = batch_groups_for(peers);
         let mut cursor = 0usize;
         let this = &*self;
@@ -1465,11 +1481,13 @@ mod tests {
         assert!(stall * PEER_FAIL_LIMIT <= Duration::from_secs(360));
     }
 
-    /// Batches are cut before a peer is picked, so one size serves the whole
-    /// set: the slowest class present wins, and a set with no peers falls back
-    /// to the clearnet size rather than zero.
+    /// Batches are CUT at the coarsest class in the session (then trimmed to
+    /// the picked peer's size in `schedule`): one overlay link must no longer
+    /// shrink a clearnet peer's batches, and single-class sessions keep the
+    /// size they always had. An empty set falls back to the clearnet size
+    /// rather than zero.
     #[tokio::test]
-    async fn batch_size_follows_the_slowest_class_in_the_session() {
+    async fn batches_are_cut_at_the_coarsest_class_present() {
         let bits = |n: u64| {
             let mut b = GroupBits::new();
             b.add(0..n);
@@ -1483,11 +1501,93 @@ mod tests {
         };
         assert_eq!(batch_groups_for(&[peer(Class::Clearnet)]), GROUPS_PER_REQUEST);
         assert_eq!(
-            batch_groups_for(&[peer(Class::Clearnet), peer(Class::Tor)]),
+            batch_groups_for(&[peer(Class::Tor)]),
             GROUPS_PER_REQUEST_OVERLAY,
-            "one overlay link sets the size for the session"
+            "a single-class overlay session keeps its fine cut"
+        );
+        assert_eq!(
+            batch_groups_for(&[peer(Class::Tor), peer(Class::I2p)]),
+            GROUPS_PER_REQUEST_OVERLAY,
+            "all-overlay sessions are unchanged by the coarse cut"
+        );
+        assert_eq!(
+            batch_groups_for(&[peer(Class::Clearnet), peer(Class::Tor)]),
+            GROUPS_PER_REQUEST,
+            "one overlay link must not collapse the clearnet peers' batches"
         );
         assert_eq!(batch_groups_for(&[]), GROUPS_PER_REQUEST);
+    }
+
+    /// Captures on_request bookings so a test can see the per-peer batch
+    /// sizes the window actually issued.
+    #[derive(Default)]
+    struct RequestLog(std::sync::Mutex<Vec<(String, u64)>>);
+    impl FetchObserver for RequestLog {
+        fn on_request(&self, peer: &str, _class: Class, bytes: u64) {
+            self.0.lock().unwrap().push((peer.to_string(), bytes));
+        }
+        fn on_batch(&self, _booked: &str, _peer: Option<&str>, _class: Option<Class>, _bytes: u64,
+                    _elapsed: Option<Duration>, _duplicates: u64) {
+        }
+    }
+
+    /// A mixed session sizes every request to the peer it lands on: the
+    /// clearnet peer gets full clearnet batches, the overlay peer overlay
+    /// ones, and both fill their own pipeline depth. Under the old
+    /// session-wide min() every clearnet request here would have been the
+    /// overlay size.
+    #[tokio::test]
+    async fn a_mixed_session_sizes_batches_per_peer() {
+        use epix_blob::bitfield::GROUP_BYTES;
+        let total_groups = 512u64;
+        let size = total_groups * GROUP_BYTES;
+        let bits = GroupBits::complete(size);
+        let peers = vec![
+            PeerHandle {
+                conn: dummy_conn(),
+                class: Class::Clearnet,
+                bits: bits.clone(),
+                label: "clear".into(),
+            },
+            PeerHandle { conn: dummy_conn(), class: Class::Tor, bits, label: "tor".into() },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let log = Arc::new(RequestLog::default());
+        let swarm =
+            Swarm::new(store, ObjId([1u8; 32]), size).with_observer(log.clone());
+
+        let mut needed = GroupBits::new();
+        needed.add(0..total_groups);
+        let full_order = rarest_first_order(&needed, &peers);
+        let batch_groups = batch_groups_for(&peers);
+        let mut window = Window::new(&peers);
+        let mut cursor = 0usize;
+        let mut report = FetchReport::default();
+        // Fill the window; the batch futures are only booked, never polled.
+        window.refill(
+            &swarm,
+            &full_order,
+            &mut cursor,
+            &needed,
+            &peers,
+            Deadline::background(),
+            2,
+            batch_groups,
+            &mut report,
+        );
+
+        let reqs = log.0.lock().unwrap().clone();
+        for (label, bytes) in &reqs {
+            let want = match label.as_str() {
+                "clear" => GROUPS_PER_REQUEST * GROUP_BYTES,
+                _ => GROUPS_PER_REQUEST_OVERLAY * GROUP_BYTES,
+            };
+            assert_eq!(bytes, &want, "{label} got a wrongly sized batch");
+        }
+        let count = |l: &str| reqs.iter().filter(|(label, _)| label == l).count() as u32;
+        assert_eq!(count("clear"), PIPELINE_DEPTH, "clearnet fills its own depth");
+        assert_eq!(count("tor"), PIPELINE_DEPTH_OVERLAY, "overlay fills its own depth");
     }
 
     #[test]
