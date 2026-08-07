@@ -3823,20 +3823,24 @@ impl AppState {
 
     /// Background sampler for the file currently being fetched: every ~1.5s it
     /// reports the phase ("Waiting for peers…", "Fetching from N peer(s)…",
-    /// "Downloading N%") from the connectable-peer count and the
-    /// optional-bytes delta, and moves the overall bar as pieces land.
+    /// "Downloading N%") and moves the overall bar as pieces land.
     /// `done_bytes` is the total already completed; `file_size` sizes the
-    /// current file's %. Byte-level % only appears for bigfiles (their pieces
-    /// bump the counter as they land); a regular file's counter moves once at
-    /// the end, so its phase says "Fetching from…" - honest about connect +
-    /// transfer both - rather than a "Connecting…" that would sit there
-    /// through the whole transfer. `round`/`rounds` tag the status with the
+    /// current file's %. An EDX transfer reads its truth off the transfer
+    /// row: bytes present in the sparse store (live, where the
+    /// optional-bytes counter moves only at materialize) and the session's
+    /// actual connected-peer count (where the connectable count said
+    /// "Fetching from 20 peer(s)" while one peer served). Anything without a
+    /// row yet - the dial phase, the msgpack fallback, bigfile pieces -
+    /// keeps the optional-bytes delta and the connectable count.
+    /// `round`/`rounds` tag the status with the
     /// retry round ("… (retry 2/3)") so retries are visible in the panel
     /// itself - a separate between-rounds phase write gets overwritten by
     /// this sampler within milliseconds. Runs until `stop`.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_optional_status_sampler(
         self: Arc<Self>,
         address: String,
+        inner_path: String,
         stop: Arc<std::sync::atomic::AtomicBool>,
         done_bytes: u64,
         file_size: u64,
@@ -3848,9 +3852,15 @@ impl AppState {
                 if round > 1 { format!(" (retry {round}/{rounds})") } else { String::new() };
             let base = self.optional_downloaded_now(&address).await;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let got = self.optional_downloaded_now(&address).await.saturating_sub(base);
+                let stats = self.edx_transfer_stats(&address, &inner_path, None).await;
+                let (got, peers) = match edx_live_progress(&stats) {
+                    Some((have, connected)) => (have, connected as usize),
+                    None => (
+                        self.optional_downloaded_now(&address).await.saturating_sub(base),
+                        self.connectable_peers(&address, 20).await.len(),
+                    ),
+                };
                 let got = got.min(file_size); // ignore any concurrent optional traffic overshoot
-                let peers = self.connectable_peers(&address, 20).await.len();
                 let status = optional_fetch_status(got, file_size, peers, &suffix);
                 self.set_optional_status(&address, status, done_bytes + got).await;
                 // Short sleeps so `stop` is honored promptly when the fetch ends.
@@ -12249,6 +12259,7 @@ impl AppState {
         let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sampler = self.clone().spawn_optional_status_sampler(
             address.to_string(),
+            path.to_string(),
             sampler_stop.clone(),
             bytes_done,
             size,
@@ -13640,9 +13651,23 @@ fn optional_file_present(
     }
 }
 
+/// The live (bytes present, connected peers) pair from an EDX transfer-stats
+/// row: `have` is read straight off the sparse store's group bitfield, and
+/// `session.connected` is how many of the dialed peers actually joined the
+/// fetch session. `None` when nothing is tracked for the file yet (not an
+/// EDX object, or no session opened this run) - the caller then falls back
+/// to the optional-bytes delta and the connectable-peer count.
+fn edx_live_progress(stats: &Value) -> Option<(u64, u64)> {
+    let have = stats.get("have")?.as_u64()?;
+    let connected =
+        stats.get("session").and_then(|s| s.get("connected")).and_then(Value::as_u64).unwrap_or(0);
+    Some((have, connected))
+}
+
 /// One status-sampler tick's phase line, from the byte delta, the file's
-/// size, and the connectable-peer count. Byte-level % only exists when bytes
-/// moved (bigfile pieces); otherwise the phase names what the fetch is doing.
+/// size, and the peer count (connected peers for an EDX transfer, else the
+/// connectable count). Byte-level % only exists when bytes moved; otherwise
+/// the phase names what the fetch is doing.
 fn optional_fetch_status(got: u64, file_size: u64, peers: usize, suffix: &str) -> String {
     if got > 0 {
         if file_size > 0 {
@@ -14040,6 +14065,32 @@ mod tests {
         let usable = state.all_trackers(&bootstrap).await;
         assert!(usable.contains(&onion));
         assert!(!usable.contains(&i2p));
+    }
+
+    #[test]
+    fn edx_live_progress_reads_have_and_connected() {
+        // A live EDX transfer row: bytes present + the session's real count.
+        let stats = json!({
+            "have": 123456, "session": { "dialed": 8, "connected": 1, "age": 30 },
+        });
+        assert_eq!(edx_live_progress(&stats), Some((123456, 1)));
+
+        // A row before any session was stamped still reports its bytes.
+        assert_eq!(edx_live_progress(&json!({ "have": 42 })), Some((42, 0)));
+
+        // Nothing tracked (msgpack fallback, dial phase): the sampler falls
+        // back to the optional-bytes delta and the connectable count.
+        assert_eq!(edx_live_progress(&Value::Null), None);
+        assert_eq!(edx_live_progress(&json!({ "have": null, "session": {} })), None);
+    }
+
+    #[test]
+    fn optional_fetch_status_prefers_bytes_over_peer_phase() {
+        assert_eq!(optional_fetch_status(0, 100, 0, ""), "Waiting for peers…");
+        assert_eq!(optional_fetch_status(0, 100, 3, ""), "Fetching from 3 peer(s)…");
+        assert_eq!(optional_fetch_status(50, 100, 1, ""), "Downloading… 50%");
+        // Never claims 100% while the fetch is still running.
+        assert_eq!(optional_fetch_status(100, 100, 1, " (retry 2/3)"), "Downloading… 99% (retry 2/3)");
     }
 
     /// A shared tracker whose stats entry was first created while GATED

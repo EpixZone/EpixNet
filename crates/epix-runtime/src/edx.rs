@@ -2670,10 +2670,11 @@ impl RuntimeEdxFetcher {
             // that began on one link widens as the rest land.
             let (store, session) = (store.clone(), Arc::new(session.peers()));
             let serving = progress.serving.clone();
+            let address = address.to_string();
             fetching.spawn(async move {
                 let complete = this
                     .fetch_one_over_session(
-                        &store, r.id, r.size, &session, deadline, now, &serving,
+                        &address, &store, r.id, r.size, &session, deadline, now, &serving,
                     )
                     .await;
                 (r, complete)
@@ -2842,6 +2843,7 @@ impl RuntimeEdxFetcher {
     #[allow(clippy::too_many_arguments)]
     async fn fetch_one_over_session(
         &self,
+        address: &str,
         store: &Arc<Store>,
         id: ObjId,
         size: u64,
@@ -2879,7 +2881,8 @@ impl RuntimeEdxFetcher {
             return false;
         };
         let Ok(needed) = needed_groups(store, id, size) else { return false };
-        let mut swarm = Swarm::new(store.clone(), id, size);
+        let mut swarm =
+            Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
         if let Ok(report) = swarm.fetch(&needed, &handles, deadline, now).await {
             for (label, _) in report.by_peer.iter().filter(|(_, groups)| **groups > 0) {
                 BatchProgress::note_peer(serving, label);
@@ -3126,13 +3129,23 @@ impl RuntimeEdxFetcher {
         let _claim =
             self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
         let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
-        let mut swarm = Swarm::new(store.clone(), id, size);
+        let mut swarm =
+            Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
         let report = match swarm.fetch(&needed, &handles, deadline, now).await {
             Ok(report) => report,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                let e = e.to_string();
+                // Stamped fresh: `now` predates the fetch, which can span
+                // an hour on a multi-GB file, and last_error reports an age.
+                self.xfer.note_error(id, address, now_secs(), &e);
+                return Err(e);
+            }
         };
         self.credit(&report, &node_pks, now);
         if !store.is_complete(id).unwrap_or(false) {
+            // The scheduler's silent-exhaustion path (peers ran out of
+            // strikes): name it in the telemetry, not just the round log.
+            self.xfer.note_error(id, address, now_secs(), "fetch did not complete");
             return Err("fetch did not complete".into());
         }
 
