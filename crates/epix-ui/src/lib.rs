@@ -1500,59 +1500,94 @@ async fn serve_config_post(
     if !params.get("csrf").is_some_and(|t| ctx.state.ui_csrf_valid(t)) {
         return (StatusCode::FORBIDDEN, "Invalid or missing CSRF token").into_response();
     }
-    // Action buttons (e.g. Clear xID Cache) come back as `action=<name>`.
-    if let Some(action) = params.get("action") {
-        if action == "xidClearCache" {
-            // Drop the on-disk resolve cache, the display-name bindings, and
-            // the chain layer's in-memory caches, so the next visit to any
-            // `.epix` name re-resolves on chain (e.g. after a name is moved
-            // to a new address).
+    // An action button (e.g. Clear xID Cache) runs instead of saving, so
+    // pressing one never also commits whatever edits are on the page.
+    match params.get("action") {
+        Some(action) => run_config_action(&ctx, action).await,
+        None => save_config_values(&ctx, &params).await,
+    }
+}
+
+/// One settings-page action button. Unknown names redirect back rather than
+/// erroring: the button set is rendered from the schema, so an unknown one
+/// means a stale page, not an attack (the CSRF token was already checked).
+async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
+    match action {
+        // Drop the on-disk resolve cache, the display-name bindings, and the
+        // chain layer's in-memory caches, so the next visit to any `.epix`
+        // name re-resolves on chain (e.g. after a name is moved to a new
+        // address).
+        "xidClearCache" => {
             ctx.state.xid_clear_cache().await;
-            return Redirect::to("/Config?cleared=1").into_response();
+            Redirect::to("/Config?cleared=1").into_response()
         }
-        if action == "restart" {
-            // The restart bar's button: stop the node and relaunch once the
-            // process is gone. The page returned keeps polling and comes back
-            // to /Config when the node answers again.
+        // The restart bar's button: stop the node and relaunch once the
+        // process is gone. The page returned keeps polling and comes back to
+        // /Config when the node answers again.
+        "restart" => {
             ctx.state.push_notification("info", "Restarting...", 5000);
             ctx.state.shutdown(true).await;
             let theme = ctx.state.theme_class().await;
-            return ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme))
-                .into_response();
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme))
+                .into_response()
         }
-        return Redirect::to("/Config").into_response();
+        _ => Redirect::to("/Config").into_response(),
     }
-    // data_dir is special: it persists to epixnet.conf and copies the data
-    // to the new location, so its outcome is reported back on the page.
-    let mut flash: Option<(bool, String)> = None;
-    if let Some(dir) = params.get("data_dir") {
-        if dir.trim() != ctx.state.data_dir_value() {
-            flash = Some(match ctx.state.set_data_dir(dir).await {
-                Ok(msg) => (true, msg),
-                Err(e) => (false, e),
-            });
-        }
-    }
-    for (_section, key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
-        // Disabled ("coming soon") controls and action buttons aren't saved.
-        if *key == "data_dir" || kind.starts_with("soon:") || crate::state::is_config_action(kind) {
-            continue;
-        }
-        if *kind == "bool" {
-            // An unchecked checkbox isn't submitted, so absence means false.
-            let on = params.get(*key).map(|v| v == "on" || v == "true").unwrap_or(false);
-            ctx.state.config_set(key, Value::from(if on { "true" } else { "false" })).await;
-        } else if let Some(val) = params.get(*key) {
-            ctx.state.config_set(key, Value::from(val.as_str())).await;
-        }
-    }
-    let to = match &flash {
-        Some((ok, msg)) => {
-            format!("/Config?{}={}", if *ok { "done" } else { "error" }, url_encode(msg))
-        }
+}
+
+/// Persist the submitted settings and redirect back, carrying any `data_dir`
+/// outcome as the page's flash message.
+async fn save_config_values(
+    ctx: &Ctx,
+    params: &std::collections::HashMap<String, String>,
+) -> Response {
+    let flash = apply_data_dir(ctx, params).await;
+    apply_schema_keys(ctx, params).await;
+    let to = match flash {
+        Some((true, msg)) => format!("/Config?done={}", url_encode(&msg)),
+        Some((false, msg)) => format!("/Config?error={}", url_encode(&msg)),
         None => "/Config".to_string(),
     };
     Redirect::to(&to).into_response()
+}
+
+/// `data_dir` is special: it persists to epixnet.conf and copies the data to
+/// the new location, so its outcome is reported back on the page. `None` when
+/// it was not submitted or did not change.
+async fn apply_data_dir(
+    ctx: &Ctx,
+    params: &std::collections::HashMap<String, String>,
+) -> Option<(bool, String)> {
+    let dir = params.get("data_dir")?;
+    if dir.trim() == ctx.state.data_dir_value() {
+        return None;
+    }
+    Some(match ctx.state.set_data_dir(dir).await {
+        Ok(msg) => (true, msg),
+        Err(e) => (false, e),
+    })
+}
+
+/// Write every stored key the schema declares. Driven by the schema rather
+/// than by the form, so a key the browser omitted still gets its value - an
+/// unchecked checkbox is not submitted at all, and absence has to mean false.
+async fn apply_schema_keys(ctx: &Ctx, params: &std::collections::HashMap<String, String>) {
+    for (_section, key, _label, _default, kind) in crate::state::CONFIG_SCHEMA {
+        // data_dir is handled above; disabled ("coming soon") controls and
+        // action buttons are not stored values.
+        if *key == "data_dir" || kind.starts_with("soon:") || crate::state::is_config_action(kind) {
+            continue;
+        }
+        let value = if *kind == "bool" {
+            let on = params.get(*key).is_some_and(|v| v == "on" || v == "true");
+            Some(Value::from(if on { "true" } else { "false" }))
+        } else {
+            params.get(*key).map(|v| Value::from(v.as_str()))
+        };
+        if let Some(value) = value {
+            ctx.state.config_set(key, value).await;
+        }
+    }
 }
 
 /// `GET /Config` - render the node settings page. Read-only: every mutation
