@@ -123,6 +123,10 @@ struct Shared {
     cancelled: Mutex<std::collections::HashSet<u64>>,
     /// Set when either connection task has stopped.
     closed: std::sync::atomic::AtomicBool,
+    /// Bytes of fetch batches in flight on this link, summed across every
+    /// `Conn` clone - i.e. across every swarm sharing the connection. See
+    /// [`Conn::charge_fetch`].
+    queued_fetch: AtomicU64,
 }
 
 /// Inbound request delivered to the server side, with the stream id to
@@ -158,6 +162,7 @@ impl Conn {
             waiters: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(std::collections::HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
+            queued_fetch: AtomicU64::new(0),
         });
 
         // Teardown signal: the writer owns `gone_tx` and the reader awaits
@@ -322,6 +327,42 @@ impl Conn {
     /// tasks call this between Data frames and stop encoding on true.
     pub fn take_cancelled(&self, stream: u64) -> bool {
         self.shared.cancelled.lock().expect("cancelled").remove(&stream)
+    }
+
+    /// Bytes of fetch batches currently in flight on this link, across
+    /// every clone of the handle - which is every swarm sharing the
+    /// connection (the link pool hands out clones of one `Conn` per lane).
+    /// The scheduler scales its stall windows and batch caps by this, so a
+    /// batch queued behind ANOTHER swarm's traffic on a shared circuit
+    /// reads as queue depth, not as a stall. A plain atomic: reading it
+    /// takes no lock, so the scheduler cannot deadlock against the
+    /// connection's own locks.
+    pub fn queued_fetch_bytes(&self) -> u64 {
+        self.shared.queued_fetch.load(Ordering::Relaxed)
+    }
+
+    /// Charge `bytes` of fetch work to this link's queue counter for as
+    /// long as the returned guard lives. The refund is the guard's `Drop`,
+    /// so a batch future that is cancelled mid-race (an abandoned racer, a
+    /// fetch that completed elsewhere) refunds the link exactly like a
+    /// completed one - a leak here would permanently inflate every sharing
+    /// swarm's stall windows.
+    pub fn charge_fetch(&self, bytes: u64) -> FetchCharge {
+        self.shared.queued_fetch.fetch_add(bytes, Ordering::Relaxed);
+        FetchCharge { shared: self.shared.clone(), bytes }
+    }
+}
+
+/// One fetch batch's bytes charged against a link's queued-fetch counter
+/// (see [`Conn::charge_fetch`]). Refunds on drop.
+pub struct FetchCharge {
+    shared: Arc<Shared>,
+    bytes: u64,
+}
+
+impl Drop for FetchCharge {
+    fn drop(&mut self) {
+        self.shared.queued_fetch.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
@@ -929,6 +970,28 @@ mod tests {
             hi_pos <= 1,
             "priority frame should preempt queued bulk (pos {hi_pos}), order = {order:?}"
         );
+    }
+
+    /// The queued-fetch counter is one number per LINK: every clone reads
+    /// the same value, and dropping a charge refunds it whatever ended the
+    /// batch. Swarms sharing a circuit size their stall windows off this,
+    /// so a leaked or per-clone counter would poison every later fetch on
+    /// the link.
+    #[tokio::test]
+    async fn fetch_charges_are_shared_across_clones_and_refund_on_drop() {
+        let (a, _b) = tokio::io::duplex(64);
+        let (conn, _in) = Conn::start(a, true);
+        let clone = conn.clone();
+
+        let c1 = conn.charge_fetch(1000);
+        assert_eq!(clone.queued_fetch_bytes(), 1000, "a clone sees the link's charge");
+        let c2 = clone.charge_fetch(500);
+        assert_eq!(conn.queued_fetch_bytes(), 1500, "charges from clones accumulate");
+
+        drop(c1);
+        assert_eq!(conn.queued_fetch_bytes(), 500, "dropping a charge refunds its bytes");
+        drop(c2);
+        assert_eq!(conn.queued_fetch_bytes(), 0);
     }
 
     #[tokio::test]

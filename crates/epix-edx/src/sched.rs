@@ -50,7 +50,7 @@ pub const MAX_DUPLICATES: usize = 2;
 pub const PRIMARY_BUDGET_DIVISOR: u32 = 2;
 /// Groups per striped request (16 KiB * 64 = 1 MiB chunks of work).
 pub const GROUPS_PER_REQUEST: u64 = 64;
-/// Groups per request on an overlay link (16 KiB * 16 = 256 KiB).
+/// Groups per request on an overlay link (16 KiB * 32 = 512 KiB).
 ///
 /// A Tor/I2P circuit carries a few hundred KB/s, so a 1 MiB batch occupies it
 /// for seconds - measured here, 4 s at 250 KB/s and 32 s on a bad circuit.
@@ -58,31 +58,39 @@ pub const GROUPS_PER_REQUEST: u64 = 64;
 /// away a megabyte of circuit time (batch failures ran ~20% on a live overlay
 /// swarm), the stall detector cannot react inside a batch, and the served
 /// contiguous prefix only advances a megabyte at a time, which is what a
-/// player feels as a stall. Quartering the batch quarters all three. The
-/// bytes in flight are unchanged - [`pipeline_depth`] compensates - so this
-/// trades no throughput for the finer granularity.
-pub const GROUPS_PER_REQUEST_OVERLAY: u64 = 16;
+/// player feels as a stall. Halving the batch halves all three, and together
+/// with [`PIPELINE_DEPTH_OVERLAY`] sets the bytes a circuit keeps in flight -
+/// the per-link throughput ceiling (window / RTT). 512 KiB is comfortably
+/// inside the server's per-request caps (64 ranges / 64 MiB), so old seeders
+/// serve it unchanged.
+pub const GROUPS_PER_REQUEST_OVERLAY: u64 = 32;
 /// A clearnet transfer with no new bytes for this long is stalled.
 pub const STALL_CLEARNET: Duration = Duration::from_secs(4);
 /// Overlay stall window: an onion/I2P circuit legitimately pauses for
 /// seconds where the same clearnet silence means trouble.
 pub const STALL_OVERLAY: Duration = Duration::from_secs(12);
 /// Absolute per-batch cap, progress or not: the backstop against a peer
-/// that trickles a byte a second forever.
+/// that trickles a byte a second forever. This is the budget for ONE
+/// request's worth of link queue; `race_batch` scales it by the link's
+/// queue depth ([`link_queue_depth`]), because a batch behind N requests'
+/// worth of bytes on the circuit legitimately needs N shares of it just
+/// to drain - a fixed cap here let a deeper pipeline manufacture batch
+/// failures on a slow-but-healthy circuit.
 pub const MAX_BATCH_WAIT: Duration = Duration::from_secs(90);
 /// Batches kept in flight per healthy peer by the sliding window.
 pub const PIPELINE_DEPTH: u32 = 2;
 /// Sliding-window depth on an overlay link.
 ///
-/// Pipelining exists to cover the round trip between requests, so the useful
-/// depth is set by the bandwidth-delay product, not by a bytes-in-flight
-/// target: a Tor circuit at ~250 KB/s with a ~500 ms round trip holds about
-/// 125 KB in flight, so one 256 KiB request already saturates it and a couple
-/// more only cover the gap while the next is assigned. Queueing deeper than
-/// that does not add throughput - the circuit's rate is fixed - it just makes
-/// every request wait behind its siblings, which is how a *healthy* link
-/// starts tripping the stall detector (see [`stall_window`]).
-pub const PIPELINE_DEPTH_OVERLAY: u32 = 3;
+/// A link's throughput is capped at bytes-in-flight over round trip. The old
+/// 3 x 256 KiB = 768 KiB window was itself the per-circuit ceiling on live
+/// onion links: at the 1-2 s RTTs measured there it capped every transfer at
+/// ~300-400 KB/s regardless of what the circuit could carry. 6 x 512 KiB =
+/// 3 MiB in flight lifts that ceiling to ~1.5-3 MB/s. The cost of queueing
+/// deeper - a healthy request waiting behind its siblings looks silent - is
+/// paid for by scaling the stall window and the absolute batch cap with the
+/// bytes actually queued on the link ([`link_queue_depth`]), not just this
+/// swarm's own load.
+pub const PIPELINE_DEPTH_OVERLAY: u32 = 6;
 /// Consecutive failed batches before a peer is exhausted (dropped from
 /// scheduling for the rest of the fetch); a delivered batch resets it.
 pub const PEER_FAIL_LIMIT: u32 = 3;
@@ -96,8 +104,9 @@ pub fn groups_per_request(class: Class) -> u64 {
     }
 }
 
-/// How many batches to `class` stay in flight at once, sized so the bytes in
-/// flight match across classes (see [`PIPELINE_DEPTH_OVERLAY`]).
+/// How many batches to `class` stay in flight at once. Overlay links run
+/// more, smaller batches: the window has to cover a much larger
+/// bandwidth-delay product (see [`PIPELINE_DEPTH_OVERLAY`]).
 pub fn pipeline_depth(class: Class) -> u32 {
     match class {
         Class::Clearnet => PIPELINE_DEPTH,
@@ -131,8 +140,24 @@ pub fn batch_groups_for(peers: &[PeerHandle]) -> u64 {
 /// Scaling the window by the queue depth keeps the detector meaningful (a
 /// link that has genuinely gone silent still trips it, just proportionally
 /// later) while a request merely waiting its turn does not.
+///
+/// `inflight` is the LINK's queue depth, not this swarm's: several swarms
+/// can share one circuit (the link pool hands out clones of one conn per
+/// lane), and a batch waiting behind another swarm's traffic is exactly as
+/// not-stalled as one waiting behind its own siblings. The scheduler takes
+/// the larger of its own load and [`link_queue_depth`].
 pub fn stall_window(class: Class, inflight: u32) -> Duration {
     stall_timeout(class) * inflight.max(1)
+}
+
+/// The link's queue depth in requests: `queued_bytes` outstanding on the
+/// connection across every swarm sharing it (see
+/// [`Conn::queued_fetch_bytes`]), in units of the class's request size,
+/// rounded up. Feeds [`stall_window`] and the batch cap in the same unit
+/// the swarm's own load is counted in.
+pub fn link_queue_depth(class: Class, queued_bytes: u64) -> u32 {
+    let request_bytes = groups_per_request(class) * epix_blob::bitfield::GROUP_BYTES;
+    queued_bytes.div_ceil(request_bytes).min(u32::MAX as u64) as u32
 }
 
 /// The no-new-bytes window after which a transfer to `class` counts as
@@ -507,14 +532,24 @@ impl<'a> Window<'a> {
             self.inflight.add(g..g + 1);
         }
         report.requests_issued += 1;
+        let bytes = swarm.bytes_of(&groups);
         if let Some(obs) = &swarm.observer {
-            obs.on_request(&peers[idx].label, peers[idx].class, swarm.bytes_of(&groups));
+            obs.on_request(&peers[idx].label, peers[idx].class, bytes);
         }
-        // `load[idx]` already counts this batch, so it is exactly how many
-        // requests this link is now serving - what the stall window scales on.
-        let queued = self.load[idx];
-        self.futs
-            .push(Box::pin(swarm.race_batch(batch, groups, idx, peers, deadline, now, queued)));
+        // Charge this batch's bytes to the LINK before reading its depth,
+        // so the counter includes us. The charge lives inside the batch
+        // future and refunds on its drop (completed, failed or cancelled).
+        let charge = peers[idx].conn.charge_fetch(bytes);
+        // The stall window and cap scale on the link's whole queue: our own
+        // load (`load[idx]` already counts this batch) or, when other swarms
+        // share the circuit, the bytes they have queued on it - whichever
+        // says the queue is deeper. Cross-swarm queueing on a shared circuit
+        // is depth, not silence.
+        let queued = self.load[idx]
+            .max(link_queue_depth(peers[idx].class, peers[idx].conn.queued_fetch_bytes()));
+        self.futs.push(Box::pin(
+            swarm.race_batch(batch, groups, idx, peers, deadline, now, queued, charge),
+        ));
     }
 
     /// Assign one batch to a peer that holds all of it, else split it by
@@ -860,8 +895,16 @@ impl Swarm {
         deadline: Deadline,
         now: u64,
         queued: u32,
+        // Held for this future's whole life: its Drop refunds the link's
+        // queued-bytes counter on completion and cancellation alike.
+        _charge: crate::conn::FetchCharge,
     ) -> BatchOutcome {
-        let cap = deadline.max_wait.min(MAX_BATCH_WAIT);
+        // The cap is a per-request budget scaled by the link's queue depth:
+        // a batch behind `queued` requests' worth of bytes on the circuit
+        // needs that many shares of it just to drain. A fixed cap turned a
+        // deep pipeline on a slow-but-healthy circuit into a strike factory
+        // (every batch on a shared 4 MiB queue blew 90s below ~46 KB/s).
+        let cap = deadline.max_wait.min(MAX_BATCH_WAIT) * queued.max(1);
         // The stall window is capped to a share of the batch budget: a
         // stall detected only near the cap would leave the duplicated race
         // below no time to answer.
@@ -1325,20 +1368,28 @@ mod tests {
     }
 
     /// An overlay link gets smaller requests so a failure or a stall costs a
-    /// fraction of the circuit time, and a shallow queue so a request is not
-    /// left waiting behind its own siblings. Queueing deeper does not raise a
-    /// circuit's fixed rate; it only inflates per-request latency.
+    /// fraction of the circuit time, and a deep window so the circuit's
+    /// bandwidth-delay product stays covered: throughput is bounded by
+    /// bytes-in-flight over RTT, and the old 768 KiB window was itself the
+    /// ~300-400 KB/s per-circuit ceiling observed live.
     #[test]
-    fn overlay_links_get_small_requests_and_a_shallow_queue() {
+    fn overlay_links_get_small_requests_and_a_deep_window() {
+        use epix_blob::bitfield::GROUP_BYTES;
         for overlay in [Class::Tor, Class::I2p] {
             assert_eq!(groups_per_request(overlay), GROUPS_PER_REQUEST_OVERLAY);
             assert!(
                 groups_per_request(overlay) < GROUPS_PER_REQUEST,
                 "{overlay:?} must ask for less per request than clearnet"
             );
-            assert!(
-                pipeline_depth(overlay) <= 3,
-                "{overlay:?} must not queue deeper than the round trip needs"
+            // Wire compat: one request stays inside the server's caps
+            // (64 ranges / 64 MiB), so old seeders serve it unchanged.
+            assert!(groups_per_request(overlay) * GROUP_BYTES <= 64 * 1024 * 1024);
+            let window =
+                pipeline_depth(overlay) as u64 * groups_per_request(overlay) * GROUP_BYTES;
+            assert_eq!(
+                window,
+                3 * 1024 * 1024,
+                "{overlay:?} window: at a 2s circuit RTT this is a ~1.5 MB/s ceiling"
             );
         }
         assert_eq!(groups_per_request(Class::Clearnet), GROUPS_PER_REQUEST);
@@ -1359,6 +1410,59 @@ mod tests {
             stall_window(Class::Tor, PIPELINE_DEPTH_OVERLAY) >= base * PIPELINE_DEPTH_OVERLAY,
             "a full queue must never be judged against a single request's window"
         );
+    }
+
+    /// The link's queue is counted in the class's own request units, rounded
+    /// up, so it composes directly with the swarm's per-request load.
+    #[test]
+    fn link_queue_depth_counts_in_request_units() {
+        use epix_blob::bitfield::GROUP_BYTES;
+        let request = GROUPS_PER_REQUEST_OVERLAY * GROUP_BYTES;
+        assert_eq!(link_queue_depth(Class::Tor, 0), 0);
+        assert_eq!(link_queue_depth(Class::Tor, 1), 1, "a partial request still counts");
+        assert_eq!(link_queue_depth(Class::Tor, request), 1);
+        assert_eq!(link_queue_depth(Class::Tor, request + 1), 2);
+        assert_eq!(link_queue_depth(Class::Tor, 6 * request), 6);
+        assert_eq!(
+            link_queue_depth(Class::Clearnet, GROUPS_PER_REQUEST * GROUP_BYTES),
+            1,
+            "clearnet counts in its larger request unit"
+        );
+    }
+
+    /// Eight 512 KiB requests queued on one circuit (two swarms sharing a
+    /// depth-6 link, or one link run past its own depth) used to face a
+    /// fixed 90s cap: any circuit under ~46 KB/s failed every batch and
+    /// struck out its only peer. The ceilings now scale with the link's
+    /// queue, while a truly dead peer still fails within a bounded few
+    /// windows.
+    #[test]
+    fn a_deep_link_queue_scales_the_ceilings_instead_of_failing_slow_circuits() {
+        use epix_blob::bitfield::GROUP_BYTES;
+        let request = GROUPS_PER_REQUEST_OVERLAY * GROUP_BYTES; // 512 KiB
+        let queued_bytes = 8 * request; // 4 MiB on the wire
+        let q = link_queue_depth(Class::Tor, queued_bytes);
+        assert_eq!(q, 8);
+
+        // What race_batch derives for a background batch at this depth.
+        let cap = Deadline::background().max_wait.min(MAX_BATCH_WAIT) * q;
+        let stall = stall_window(Class::Tor, q).min(cap / PRIMARY_BUDGET_DIVISOR);
+
+        // A 46 KB/s circuit fair-sharing the queue completes a request only
+        // once the whole 4 MiB drains (~91s). It must beat the cap with
+        // room to spare - and so must a circuit three times slower.
+        let drain = Duration::from_secs(queued_bytes / (46 * 1000));
+        assert!(cap > drain, "46 KB/s must survive the cap: cap={cap:?} drain={drain:?}");
+        assert!(cap > drain * 3, "a slower-still circuit must not insta-fail");
+        // The scaled stall window is no longer truncated to the old fixed
+        // cap share (45s): waiting a full turn of the queue for a first
+        // byte is not a stall.
+        assert_eq!(stall, stall_timeout(Class::Tor) * q);
+
+        // A dead peer is still bounded: one silent stall window fails the
+        // batch, PEER_FAIL_LIMIT of them exhausts the peer.
+        assert!(stall <= Duration::from_secs(120));
+        assert!(stall * PEER_FAIL_LIMIT <= Duration::from_secs(360));
     }
 
     /// Batches are cut before a peer is picked, so one size serves the whole
@@ -1596,7 +1700,9 @@ mod tests {
 
         let swarm = Swarm::new(store.clone(), id, size);
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, Deadline::background(), 2, 1).await;
+        let charge = peers[0].conn.charge_fetch(size);
+        let outcome =
+            swarm.race_batch(0..size, groups, 0, &peers, Deadline::background(), 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 0, "a moving transfer is never raced");
         assert_eq!(outcome.winner_label.as_deref(), Some("trickle"));
     }
@@ -1634,7 +1740,8 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1).await;
+        let charge = peers[0].conn.charge_fetch(size);
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 1, "the stalled primary is duplicated onto the other peer");
         assert_eq!(
             outcome.winner_label.as_deref(),
@@ -1684,7 +1791,8 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1).await;
+        let charge = peers[0].conn.charge_fetch(size);
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 0, "a sibling lane is not a duplication target");
         assert_eq!(
             outcome.winner_label, None,
@@ -1723,7 +1831,8 @@ mod tests {
         let swarm = Swarm::new(store.clone(), id, size);
         let deadline = Deadline { ms: 0, max_wait: Duration::ZERO };
         let groups = swarm.groups_of(&(0..size));
-        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1).await;
+        let charge = peers[0].conn.charge_fetch(size);
+        let outcome = swarm.race_batch(0..size, groups, 0, &peers, deadline, 2, 1, charge).await;
         assert_eq!(outcome.duplicates, 0, "no budget left means no duplicate is issued");
         assert!(outcome.winner_label.is_none(), "nobody can win a zero-length race");
     }
@@ -1855,5 +1964,45 @@ mod tests {
             starts[2] < ends[1],
             "the third batch must be issued while the second is still being served"
         );
+    }
+
+    /// Every scheduled batch charges its bytes to its link and the charge
+    /// is refunded when the batch future ends - won, failed, or cancelled -
+    /// so one fetch's leftovers cannot inflate the stall windows of the
+    /// next swarm to share the connection.
+    #[tokio::test]
+    async fn the_link_queue_counter_is_refunded_when_the_fetch_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![7u8; 300_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+
+        let peers = vec![PeerHandle {
+            conn: serving_conn(&data),
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size),
+            label: "srv".into(),
+        }];
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        swarm.fetch(&needed, &peers, Deadline::background(), 2).await.unwrap();
+        assert!(store.is_complete(id).unwrap());
+        assert_eq!(peers[0].conn.queued_fetch_bytes(), 0, "a completed fetch refunds its charges");
+
+        // A fetch whose batches all FAIL (dead link) refunds too.
+        let data2 = vec![9u8; 40_000];
+        let id2 = ObjId::of(&data2);
+        let size2 = data2.len() as u64;
+        let peers = vec![PeerHandle {
+            conn: dead_conn(),
+            class: Class::Clearnet,
+            bits: GroupBits::complete(size2),
+            label: "dead".into(),
+        }];
+        let mut swarm = Swarm::new(store.clone(), id2, size2);
+        let needed = needed_groups(&store, id2, size2).unwrap();
+        let _ = swarm.fetch(&needed, &peers, Deadline::background(), 2).await;
+        assert_eq!(peers[0].conn.queued_fetch_bytes(), 0, "a failed fetch refunds its charges");
     }
 }
