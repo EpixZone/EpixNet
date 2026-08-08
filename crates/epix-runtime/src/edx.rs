@@ -3085,14 +3085,55 @@ impl RuntimeEdxFetcher {
     ) -> Vec<Res> {
         let mut pending: Vec<Res> = Vec::new();
         for r in plain {
-            if store.is_complete(r.id).unwrap_or(false)
-                && self.materialize_into_batch(address, &r, store, progress, batch).await
-            {
+            // A zero-length file has no chunk groups, so there is nothing for
+            // any peer to send. Nothing ever writes a store record for it,
+            // `Store::is_complete` answers false on the MISSING record (not on
+            // the bits - `GroupBits::is_complete` already says true for size
+            // 0), and the fetch below leaves it pending on every pass. One
+            // empty file signed into a xite therefore failed the whole clone
+            // for every node, forever: the core set never completed, so
+            // content.json was never committed and the xite stayed pinned to
+            // its previous version. Seen in the wild as a stray SQLite `-wal`
+            // sidecar swept into a sign. An empty file is complete by
+            // definition - write it here instead of asking the swarm.
+            let landed = if r.size == 0 {
+                self.materialize_empty(address, &r, progress, batch).await
+            } else {
+                store.is_complete(r.id).unwrap_or(false)
+                    && self.materialize_into_batch(address, &r, store, progress, batch).await
+            };
+            if landed {
                 continue;
             }
             pending.push(r);
         }
         pending
+    }
+
+    /// Write a zero-length file straight into the xite tree and count it
+    /// landed. No store record is involved: an empty object has no groups to
+    /// index, and `files_needed` is satisfied by the file being on disk with
+    /// the empty hash. Returns false if the write failed, so the caller leaves
+    /// it pending and it is reported missed rather than silently dropped.
+    async fn materialize_empty(
+        &self,
+        address: &str,
+        r: &Res,
+        progress: &BatchProgress,
+        batch: &mut EdxBatch,
+    ) -> bool {
+        if let Err(e) = self.state.edx_materialize_file(address, &r.path, &[]).await {
+            self.state
+                .log(
+                    "DEBUG",
+                    format!("EDX empty-file materialize {address}/{} failed: {e}", r.path),
+                )
+                .await;
+            return false;
+        }
+        progress.file(&r.path, 0);
+        batch.done.push(r.path.clone());
+        true
     }
 
     /// Encrypted-shard files: no other fetch path exists (they are not in
@@ -7541,5 +7582,83 @@ mod tests {
         store.ensure_sparse(id, Ns::Plain, 4096, 1).unwrap();
         drop(fetcher.claim_object(&store, id, Ns::Plain, 4096, 1).unwrap());
         assert!(store.contains(id).unwrap(), "a pre-existing record is left alone");
+    }
+
+    /// Build a state whose only xite declares `files`, staged (nothing on
+    /// disk) - the shape a clone is in while it downloads.
+    async fn staged_only_node(
+        files: serde_json::Value,
+    ) -> (Arc<AppState>, String, serde_json::Value, tempfile::TempDir) {
+        let address = "epix1zerobytefiletestaddressaaaaaaaaaaaaaaa".to_string();
+        let content = serde_json::json!({ "address": address, "files": files });
+        let state = AppState::new("node-a");
+        let dir = tempfile::tempdir().unwrap();
+        state
+            .add_xite(
+                &address,
+                XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content.clone()) },
+            )
+            .await;
+        let store_dir = tempfile::tempdir().unwrap();
+        state.set_edx_store(Arc::new(test_store(store_dir.path(), dir.path()))).await;
+        state
+            .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
+                state.clone(),
+                epix_crypt::new_seed(),
+                None,
+            )))
+            .await;
+        (state, address, content, dir)
+    }
+
+    /// A zero-length file needs no bytes from anyone, so it must land with NO
+    /// peers and no transport at all.
+    ///
+    /// Regression: an empty file has no chunk groups, so no peer could ever
+    /// serve it and the store never held a record for it. It stayed in every
+    /// fetch pass forever, the clone's core set never completed, and
+    /// content.json was never committed - one stray empty file (a SQLite
+    /// `-wal` sidecar swept into a sign) pinned a whole xite to its previous
+    /// version on every node in the network.
+    #[tokio::test]
+    async fn a_zero_length_file_lands_without_any_peer() {
+        let empty = ObjId::of(&[]).to_string();
+        let (state, address, content, dir) = staged_only_node(serde_json::json!({
+            "empty.txt": { "b3": empty, "size": 0, "sha512": "x" },
+        }))
+        .await;
+
+        // No transport, no peers: if this needed the network it cannot pass.
+        let batch = state
+            .edx_fetch_files(&address, vec![EdxWant::path("empty.txt")], vec![], Some(content), None)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.done, vec!["empty.txt".to_string()], "the empty file landed");
+        assert!(batch.missed.is_empty(), "nothing was handed to the fallback worker");
+        assert_eq!(batch.bytes, 0, "an empty file moves no bytes");
+        let written = dir.path().join("empty.txt");
+        assert!(written.is_file(), "the empty file was written into the xite tree");
+        assert_eq!(std::fs::metadata(&written).unwrap().len(), 0, "and it is empty");
+    }
+
+    /// The empty-file shortcut is scoped to size 0: a file with real bytes and
+    /// no record still goes to the network (and is missed when nobody answers),
+    /// so this cannot become a way to fake a file into a xite.
+    #[tokio::test]
+    async fn a_non_empty_file_is_never_shortcut_to_disk() {
+        let (state, address, content, dir) = staged_only_node(serde_json::json!({
+            "real.bin": { "b3": ObjId([3u8; 32]).to_string(), "size": 64, "sha512": "x" },
+        }))
+        .await;
+
+        let batch = state
+            .edx_fetch_files(&address, vec![EdxWant::path("real.bin")], vec![], Some(content), None)
+            .await
+            .unwrap();
+
+        assert!(batch.done.is_empty(), "a file with bytes is never landed locally");
+        assert_eq!(batch.missed, vec!["real.bin".to_string()], "it goes to the fallback worker");
+        assert!(!dir.path().join("real.bin").exists(), "and nothing was written to the xite tree");
     }
 }

@@ -575,6 +575,19 @@ pub async fn run(opts: NodeOptions) -> Result<(), String> {
     server.serve(running.ui_addr).await.map_err(|e| format!("server: {e}"))
 }
 
+/// The inner paths of up to [`NAME_SAMPLE`] entries, with a `(+N more)` tail
+/// when the list was cut. For error text that has to stay one readable line
+/// while still naming the file an operator needs to look at.
+fn name_sample(files: &[epix_xite::FileEntry]) -> String {
+    const NAME_SAMPLE: usize = 10;
+    let shown =
+        files.iter().take(NAME_SAMPLE).map(|f| f.inner_path.as_str()).collect::<Vec<_>>().join(", ");
+    match files.len().checked_sub(NAME_SAMPLE) {
+        Some(rest) if rest > 0 => format!("{shown} (+{rest} more)"),
+        _ => shown,
+    }
+}
+
 /// Clone a xite into `data_dir` from the network (skipping the fetch if it is
 /// already complete on disk): discover peers, fetch + verify content.json, and
 /// sync every file. Pushes wrapper loading-screen events (`peers_added`,
@@ -1060,10 +1073,18 @@ async fn clone_xite_with_progress(
     // re-enters with the downloaded files still on disk, so a later attempt
     // only fetches what is still missing.
     if let Some(bytes) = &staged_bytes {
-        let missing = xite.files_needed().len();
-        if missing > 0 {
+        let missing = xite.files_needed();
+        if !missing.is_empty() {
+            // Name the files, not just how many. A bare count cannot tell an
+            // unreachable seeder from a file no peer can EVER serve, and the
+            // only way left to find out was to diff content.json against the
+            // directory by hand on some other node. Bounded so a xite whose
+            // whole file set is missing does not put hundreds of paths in one
+            // error line.
             return Err(format!(
-                "clone incomplete: {missing} core file(s) unavailable from current peers"
+                "clone incomplete: {} core file(s) unavailable from current peers: {}",
+                missing.len(),
+                name_sample(&missing)
             ));
         }
         xite.commit_content(bytes).map_err(|e| format!("commit content.json: {e}"))?;
@@ -2535,6 +2556,38 @@ pub fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entries(names: &[&str]) -> Vec<epix_xite::FileEntry> {
+        names
+            .iter()
+            .map(|n| epix_xite::FileEntry {
+                inner_path: (*n).to_string(),
+                size: 0,
+                sha512: String::new(),
+            })
+            .collect()
+    }
+
+    /// A failed clone has to name the file that blocked it: a bare count left
+    /// no way to tell an unreachable seeder from a file no peer can ever
+    /// serve, which is what made a single empty file so hard to track down.
+    #[test]
+    fn a_missing_file_error_names_the_files() {
+        assert_eq!(name_sample(&entries(&["index.html"])), "index.html");
+        assert_eq!(name_sample(&entries(&["a.js", "b.css"])), "a.js, b.css");
+    }
+
+    /// Bounded, so a xite missing its whole file set does not put hundreds of
+    /// paths in one error line.
+    #[test]
+    fn a_long_missing_list_is_truncated_with_a_count() {
+        let many: Vec<String> = (0..13).map(|i| format!("f{i}.bin")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let out = name_sample(&entries(&refs));
+        assert!(out.starts_with("f0.bin, f1.bin, "), "keeps the first entries: {out}");
+        assert!(out.ends_with("f9.bin (+3 more)"), "cuts at 10 and counts the rest: {out}");
+        assert!(!out.contains("f10.bin"), "the truncated entries are not listed");
+    }
 
     #[test]
     fn ui_bind_prefers_default_and_falls_back_to_legacy() {
