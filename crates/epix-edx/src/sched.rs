@@ -131,6 +131,13 @@ pub const LINK_REQUEST_LIMIT: u32 = crate::server::MAX_CONCURRENT_SERVES as u32 
 /// time (another swarm's batch completing) clears it.
 pub const LINK_SATURATION_RETRY: Duration = Duration::from_millis(250);
 
+/// Consecutive saturation-only waits with nothing booked. The shared
+/// link's queue normally turns over within seconds, but a fetch
+/// whose peers cannot supply its remaining groups must not idle
+/// behind its siblings' congestion forever: past the patience it
+/// stops counting congestion as a reason to stay.
+const LINK_SATURATION_PATIENCE: u32 = 240; // x LINK_SATURATION_RETRY = 60s
+
 /// How much work one request to `class` carries. Overlay links get smaller
 /// batches (see [`GROUPS_PER_REQUEST_OVERLAY`]).
 pub fn groups_per_request(class: Class) -> u64 {
@@ -885,6 +892,57 @@ impl<'a> Window<'a> {
             self.inflight.remove(g..g + 1);
         }
     }
+
+    /// A BUSY answer is refusal, not failure: no strike, but a cooldown
+    /// so the refused peer is not re-picked at RTT rate (which would
+    /// hammer the seeder that just told us it is full). A typed refusal
+    /// carries the seeder's own comeback hint (its next unchoke
+    /// rotation / queue drain), honored within [BUSY_RETRY_MIN,
+    /// BUSY_RETRY_MAX]. A peer that does nothing but refuse is still
+    /// dropped after BUSY_LIMIT answers.
+    fn note_busy(&mut self, p: usize, retry_after: Option<Duration>) {
+        self.busy[p] = self.busy[p].saturating_add(1);
+        if self.busy[p] >= BUSY_LIMIT {
+            self.fails[p] = PEER_FAIL_LIMIT;
+        } else {
+            let wait = retry_after
+                .map(|d| d.clamp(BUSY_RETRY_MIN, BUSY_RETRY_MAX))
+                .unwrap_or(BUSY_COOLDOWN);
+            self.cooldown[p] = Some(tokio::time::Instant::now() + wait);
+        }
+    }
+
+    /// Count a failed batch against its peer; a peer that delivered is
+    /// healthy again, so one bad batch cannot bury it forever.
+    ///
+    /// The LAST remaining peer of a fetch is never exhausted without
+    /// one probe retry after a breather: a sole seeder's onion
+    /// circuit legitimately goes dark for a few stall windows and
+    /// recovers, and exhausting it mid-file used to abort the whole
+    /// fetch. One bounded second chance per peer - a peer that
+    /// fails its probe too is out for good.
+    fn note_failed(&mut self, p: usize, peers: &[Arc<PeerHandle>]) {
+        if let Some(f) = self.fails.get_mut(p) {
+            *f = f.saturating_add(1);
+        }
+        if self.fails[p] >= PEER_FAIL_LIMIT
+            && !self.probed[p]
+            && self.fails.iter().enumerate().all(|(j, f)| j == p || *f >= PEER_FAIL_LIMIT)
+        {
+            self.probed[p] = true;
+            self.fails[p] = PEER_FAIL_LIMIT - 1;
+            self.cooldown[p] = Some(tokio::time::Instant::now() + stall_timeout(peers[p].class));
+        }
+    }
+
+    /// A delivery clears the peer's strikes, busy count and cooldown.
+    fn note_delivered(&mut self, w: usize) {
+        if let Some(f) = self.fails.get_mut(w) {
+            *f = 0;
+        }
+        self.busy[w] = 0;
+        self.cooldown[w] = None;
+    }
 }
 
 impl Swarm {
@@ -1005,12 +1063,6 @@ impl Swarm {
         let mut cursor = 0usize;
         let this = &*self;
         let mut window = Window::new(&entry_peers);
-        // Consecutive saturation-only waits with nothing booked. The shared
-        // link's queue normally turns over within seconds, but a fetch
-        // whose peers cannot supply its remaining groups must not idle
-        // behind its siblings' congestion forever: past the patience it
-        // stops counting congestion as a reason to stay.
-        const LINK_SATURATION_PATIENCE: u32 = 240; // x LINK_SATURATION_RETRY = 60s
         let mut sat_waits = 0u32;
         loop {
             let peers = roster.snapshot();
@@ -1030,51 +1082,20 @@ impl Swarm {
                 sat_waits = 0;
             }
             if window.futs.is_empty() {
-                // Nothing in flight and nothing schedulable. When the only
-                // reason is a cooldown (a BUSY seeder sitting out, or the
-                // last-peer probe breather) a patient fetch waits it out and
-                // reschedules: aborting here would abandon the fetch on a
-                // seeder that is alive and merely refusing right now. The
-                // wait is bounded (each peer gets at most BUSY_LIMIT
-                // cooldowns and one probe). A session still dialing may
-                // likewise yet produce a joiner, and the join channel
-                // closes when its dials settle, so that wait is bounded
-                // too. A streaming fetch cannot afford either: it returns
-                // what landed and lets the HTTP layer's own retry cadence
-                // come back.
-                if deadline.is_streaming() {
-                    break;
-                }
-                // A shared link at its request limit is congestion, not a
-                // dead or refusing peer: no cooldown or probe is pending,
-                // but another swarm's batches are draining it, so tick and
-                // re-check rather than abort - up to the bounded patience.
-                // Whichever wake is earlier.
-                let mut saturated = None;
-                if sat_waits < LINK_SATURATION_PATIENCE && window.awaiting_link_room(&peers) {
-                    sat_waits += 1;
-                    saturated = Some(tokio::time::Instant::now() + LINK_SATURATION_RETRY);
-                }
-                let until = match (window.next_retry(), saturated) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
+                let idle = IdleCtx {
+                    joiners: &mut joiners,
+                    joining: &mut joining,
+                    window: &mut window,
+                    roster: &roster,
+                    full_order: &mut full_order,
+                    remaining: &remaining,
+                    batch_groups: &mut batch_groups,
+                    sat_waits: &mut sat_waits,
                 };
-                if until.is_none() && !joining {
-                    break;
+                match idle_step(idle, deadline, &peers).await {
+                    IdleStep::Abort => break,
+                    IdleStep::Rescheduled => continue,
                 }
-                match join_or_retry(&mut joiners, joining, until).await {
-                    Some(Some(handle)) => admit_joiner(
-                        handle,
-                        &roster,
-                        &mut window,
-                        &mut full_order,
-                        &remaining,
-                        &mut batch_groups,
-                    ),
-                    Some(None) => joining = false,
-                    None => {} // a cooldown expired: reschedule
-                }
-                continue;
             }
             let wake = tokio::select! {
                 outcome = next_ready(&mut window.futs) => {
@@ -1148,53 +1169,14 @@ impl Swarm {
                     .observe(label, el, outcome.landed.len() as u64);
             }
         }
-        // A BUSY answer is refusal, not failure: no strike, but a cooldown
-        // so the refused peer is not re-picked at RTT rate (which would
-        // hammer the seeder that just told us it is full). A typed refusal
-        // carries the seeder's own comeback hint (its next unchoke
-        // rotation / queue drain), honored within [BUSY_RETRY_MIN,
-        // BUSY_RETRY_MAX]. A peer that does nothing but refuse is still
-        // dropped after BUSY_LIMIT answers.
         if let Some(p) = outcome.busy_peer {
-            window.busy[p] = window.busy[p].saturating_add(1);
-            if window.busy[p] >= BUSY_LIMIT {
-                window.fails[p] = PEER_FAIL_LIMIT;
-            } else {
-                let wait = outcome
-                    .retry_after
-                    .map(|d| d.clamp(BUSY_RETRY_MIN, BUSY_RETRY_MAX))
-                    .unwrap_or(BUSY_COOLDOWN);
-                window.cooldown[p] = Some(tokio::time::Instant::now() + wait);
-            }
+            window.note_busy(p, outcome.retry_after);
         }
-        // Count a failed batch against its peer; a peer that delivered is
-        // healthy again, so one bad batch cannot bury it forever.
         if let Some(p) = outcome.failed_peer {
-            if let Some(f) = window.fails.get_mut(p) {
-                *f = f.saturating_add(1);
-            }
-            // The LAST remaining peer of a fetch is never exhausted without
-            // one probe retry after a breather: a sole seeder's onion
-            // circuit legitimately goes dark for a few stall windows and
-            // recovers, and exhausting it mid-file used to abort the whole
-            // fetch. One bounded second chance per peer - a peer that
-            // fails its probe too is out for good.
-            if window.fails[p] >= PEER_FAIL_LIMIT
-                && !window.probed[p]
-                && window.fails.iter().enumerate().all(|(j, f)| j == p || *f >= PEER_FAIL_LIMIT)
-            {
-                window.probed[p] = true;
-                window.fails[p] = PEER_FAIL_LIMIT - 1;
-                window.cooldown[p] =
-                    Some(tokio::time::Instant::now() + stall_timeout(peers[p].class));
-            }
+            window.note_failed(p, peers);
         }
         if let Some(w) = outcome.winner {
-            if let Some(f) = window.fails.get_mut(w) {
-                *f = 0;
-            }
-            window.busy[w] = 0;
-            window.cooldown[w] = None;
+            window.note_delivered(w);
         }
         for g in &outcome.landed {
             remaining.remove(*g..*g + 1);
@@ -1609,6 +1591,74 @@ fn frozen_env(value: Option<&str>) -> bool {
 /// cooldown expiry (`None`) or join-channel activity (`Some(joiner)`, or
 /// `Some(None)` = closed). At least one arm can always fire - the caller
 /// breaks out before waiting when neither could.
+/// What the fetch loop does after an idle wait: give up, or go around.
+enum IdleStep {
+    Abort,
+    Rescheduled,
+}
+
+/// The mutable fetch-loop state an idle wait may touch, bundled so the
+/// wait logic reads as one unit instead of a nest inside the loop.
+struct IdleCtx<'w, 'p> {
+    joiners: &'w mut Joiners,
+    joining: &'w mut bool,
+    window: &'w mut Window<'p>,
+    roster: &'w Roster,
+    full_order: &'w mut Vec<u64>,
+    remaining: &'w GroupBits,
+    batch_groups: &'w mut u64,
+    sat_waits: &'w mut u32,
+}
+
+/// Nothing in flight and nothing schedulable. When the only reason is a
+/// cooldown (a BUSY seeder sitting out, or the last-peer probe breather)
+/// a patient fetch waits it out and reschedules: aborting here would
+/// abandon the fetch on a seeder that is alive and merely refusing right
+/// now. The wait is bounded (each peer gets at most BUSY_LIMIT cooldowns
+/// and one probe). A session still dialing may likewise yet produce a
+/// joiner, and the join channel closes when its dials settle, so that
+/// wait is bounded too. A streaming fetch cannot afford either: it
+/// returns what landed and lets the HTTP layer's own retry cadence come
+/// back.
+async fn idle_step(
+    ctx: IdleCtx<'_, '_>,
+    deadline: Deadline,
+    peers: &[Arc<PeerHandle>],
+) -> IdleStep {
+    if deadline.is_streaming() {
+        return IdleStep::Abort;
+    }
+    // A shared link at its request limit is congestion, not a dead or
+    // refusing peer: no cooldown or probe is pending, but another swarm's
+    // batches are draining it, so tick and re-check rather than abort -
+    // up to the bounded patience. Whichever wake is earlier.
+    let mut saturated = None;
+    if *ctx.sat_waits < LINK_SATURATION_PATIENCE && ctx.window.awaiting_link_room(peers) {
+        *ctx.sat_waits += 1;
+        saturated = Some(tokio::time::Instant::now() + LINK_SATURATION_RETRY);
+    }
+    let until = match (ctx.window.next_retry(), saturated) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if until.is_none() && !*ctx.joining {
+        return IdleStep::Abort;
+    }
+    match join_or_retry(ctx.joiners, *ctx.joining, until).await {
+        Some(Some(handle)) => admit_joiner(
+            handle,
+            ctx.roster,
+            ctx.window,
+            ctx.full_order,
+            ctx.remaining,
+            ctx.batch_groups,
+        ),
+        Some(None) => *ctx.joining = false,
+        None => {} // a cooldown expired: reschedule
+    }
+    IdleStep::Rescheduled
+}
+
 async fn join_or_retry(
     joiners: &mut Joiners,
     joining: bool,

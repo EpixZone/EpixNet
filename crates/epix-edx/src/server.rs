@@ -351,6 +351,62 @@ pub async fn client_hello(
     }
 }
 
+/// The bounded Hello gate: the FIRST request must be a valid Hello, and a
+/// peer that completes the handshake and then never speaks would otherwise
+/// hold its inbound slot forever. EDX is the only inbound path now, so
+/// without the timeout a few hundred stalled sockets exhaust MAX_INBOUND
+/// and the node goes deaf to new peers. Returns the verified identity, or
+/// None when the connection must drop.
+async fn hello_gate(
+    conn: &Conn,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    ctx: &Arc<ServeCtx>,
+    handshake_hash: Option<&[u8; 32]>,
+) -> Option<PeerIdentity> {
+    let first = tokio::time::timeout(HELLO_TIMEOUT, incoming.recv()).await.ok()??;
+    // Destructured whole: matching on `first.req` alone is a partial move, so
+    // the un-moved `_budget` would live as long as the caller does and never
+    // refund the Hello's share of the connection's inbound byte budget.
+    let Incoming { stream: hello_stream, req: hello_req, _budget: hello_budget } = first;
+    let Req::Hello(hello) = hello_req else {
+        let _ = conn
+            .respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: "hello first".into() })
+            .await;
+        return None;
+    };
+    let checked = check_identity(
+        &hello.net,
+        &hello.node_pk,
+        &hello.binding_sig,
+        hello.caps,
+        hello.version,
+        handshake_hash,
+        noise::Role::Initiator,
+    );
+    let id = match checked {
+        Ok(id) => id,
+        Err(e) => {
+            let _ =
+                conn.respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: e }).await;
+            return None;
+        }
+    };
+    let ack = HelloAck {
+        net: NET_ID.into(),
+        node_pk: epix_crypt::private_to_compressed_pubkey(&ctx.privatekey).ok()?,
+        binding_sig: binding_sig(&ctx.privatekey, handshake_hash, noise::Role::Responder).ok()?,
+        caps: ctx.caps,
+        observed: None,
+        version: ctx.version.clone(),
+    };
+    if conn.respond(hello_stream, Resp::HelloAck(ack)).await.is_err() {
+        return None;
+    }
+    // Answered: give the units back to the connection's inbound budget.
+    drop(hello_budget);
+    Some(id)
+}
+
 /// Run the serve loop for one connection until it closes. The FIRST
 /// request must be a valid Hello; anything else (or a failed identity
 /// check) drops the connection. Returns the peer identity once the
@@ -361,68 +417,7 @@ pub async fn serve(
     ctx: Arc<ServeCtx>,
     handshake_hash: Option<[u8; 32]>,
 ) -> Option<PeerIdentity> {
-    // Hello gate, bounded: a peer that completes the handshake and then
-    // never speaks would otherwise hold its inbound slot forever. EDX is
-    // the only inbound path now, so without this a few hundred stalled
-    // sockets exhaust MAX_INBOUND and the node goes deaf to new peers.
-    let first = tokio::time::timeout(HELLO_TIMEOUT, incoming.recv()).await.ok()??;
-    // Destructured whole: matching on `first.req` alone is a partial move, so
-    // the un-moved `_budget` would live as long as `serve` does and never
-    // refund the Hello's share of the connection's inbound byte budget.
-    let Incoming { stream: hello_stream, req: hello_req, _budget: hello_budget } = first;
-    let identity = match hello_req {
-        Req::Hello(hello) => {
-            match check_identity(
-                &hello.net,
-                &hello.node_pk,
-                &hello.binding_sig,
-                hello.caps,
-                hello.version,
-                handshake_hash.as_ref(),
-                noise::Role::Initiator,
-            ) {
-                Ok(id) => {
-                    let ack = HelloAck {
-                        net: NET_ID.into(),
-                        node_pk: match epix_crypt::private_to_compressed_pubkey(&ctx.privatekey) {
-                            Ok(pk) => pk,
-                            Err(_) => return None,
-                        },
-                        binding_sig: binding_sig(
-                            &ctx.privatekey,
-                            handshake_hash.as_ref(),
-                            noise::Role::Responder,
-                        )
-                        .ok()?,
-                        caps: ctx.caps,
-                        observed: None,
-                        version: ctx.version.clone(),
-                    };
-                    if conn.respond(hello_stream, Resp::HelloAck(ack)).await.is_err() {
-                        return None;
-                    }
-                    id
-                }
-                Err(e) => {
-                    let _ = conn
-                        .respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: e })
-                        .await;
-                    return None;
-                }
-            }
-        }
-        _ => {
-            let _ = conn
-                .respond(
-                    hello_stream,
-                    Resp::Err { code: err::BAD_REQUEST, msg: "hello first".into() },
-                )
-                .await;
-            return None;
-        }
-    };
-    // Answered: give the units back to the connection's inbound budget.
-    drop(hello_budget);
+    let identity = hello_gate(&conn, &mut incoming, &ctx, handshake_hash.as_ref()).await?;
 
     // Register the connection with the governor (reachability from the
     // link type: overlay links have no handshake hash). Unchoke slots are

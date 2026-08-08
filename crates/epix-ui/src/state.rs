@@ -3922,24 +3922,7 @@ impl AppState {
                 let files: Vec<(String, u64)> =
                     active.lock().unwrap().values().cloned().collect();
                 let size_sum: u64 = files.iter().map(|(_, s)| *s).sum();
-                let (mut got, mut peers, mut rows) = (0u64, 0usize, false);
-                for (path, size) in &files {
-                    let stats = self.edx_transfer_stats(&address, path, None).await;
-                    if let Some((have, connected)) = edx_live_progress(&stats) {
-                        // min() per file: ignore any concurrent traffic overshoot.
-                        got += have.min(*size);
-                        peers = peers.max(connected as usize);
-                        rows = true;
-                    }
-                }
-                if !rows {
-                    got = self
-                        .optional_downloaded_now(&address)
-                        .await
-                        .saturating_sub(base)
-                        .min(size_sum);
-                    peers = self.connectable_peers(&address, 20).await.len();
-                }
+                let (got, peers) = self.optional_pool_sample(&address, &files, base).await;
                 if !files.is_empty() {
                     let status = optional_pool_status(files.len(), got, size_sum, peers, &suffix);
                     self.set_optional_status(&address, status, done_bytes.load(Ordering::Relaxed) + got)
@@ -3954,6 +3937,36 @@ impl AppState {
                 }
             }
         })
+    }
+
+    /// One sampler tick's live totals for the given active files: bytes
+    /// landed and the widest connected-peer count, from each file's live
+    /// transfer row. When NO active file has a row yet (dial phase,
+    /// msgpack fallback, bigfile pieces) the fallback applies: the
+    /// optional-bytes delta since `base`, capped to the queued sizes, and
+    /// the connectable count.
+    async fn optional_pool_sample(
+        &self,
+        address: &str,
+        files: &[(String, u64)],
+        base: u64,
+    ) -> (u64, usize) {
+        let (mut got, mut peers, mut rows) = (0u64, 0usize, false);
+        for (path, size) in files {
+            let stats = self.edx_transfer_stats(address, path, None).await;
+            if let Some((have, connected)) = edx_live_progress(&stats) {
+                // min() per file: ignore any concurrent traffic overshoot.
+                got += have.min(*size);
+                peers = peers.max(connected as usize);
+                rows = true;
+            }
+        }
+        if !rows {
+            let size_sum: u64 = files.iter().map(|(_, s)| *s).sum();
+            got = self.optional_downloaded_now(address).await.saturating_sub(base).min(size_sum);
+            peers = self.connectable_peers(address, 20).await.len();
+        }
+        (got, peers)
     }
 
     /// The addresses of all served xites.
@@ -6573,69 +6586,73 @@ impl AppState {
         // streaming path fetches and materializes it (and does the optional-file
         // bookkeeping in edx_materialize_file). A file with no `b3`, or with no
         // fetcher installed, cannot be fetched (msgpack retired).
-        match entry.get("b3") {
-            Some(_) => {
-                // Retry a failed pass instead of surfacing the first stumble as
-                // "not found". Over Tor a multi-MB asset routinely loses its
-                // peer mid-transfer, and one incomplete swarm pass 404'd the
-                // request - the browser drew a broken image while the caller
-                // still had most of its deadline left. Partial groups persist
-                // in the store, so each attempt RESUMES rather than restarting,
-                // and the caller's timeout bounds the whole loop.
-                //
-                // An attempt that MOVED bytes does not burn the retry budget:
-                // a multi-GB file over tor loses its peer mid-transfer many
-                // times, and requeueing it to a later round (60-600s backoff)
-                // on the third such loss threw away a live resume for a cold
-                // restart. Only consecutive no-progress attempts count toward
-                // giving up, with a hard total so genuinely dead content
-                // still fails out to the round mechanism.
-                const ATTEMPTS: usize = 3;
-                const MAX_ATTEMPTS: usize = 10;
-                let mut last = String::new();
-                let mut no_progress = 0usize;
-                let mut have =
-                    edx_live_progress(&self.edx_transfer_stats(address, inner_path, None).await)
-                        .map(|(h, _)| h)
-                        .unwrap_or(0);
-                for attempt in 1..=MAX_ATTEMPTS {
-                    let result = match &on_fetched {
-                        Some(hook) => {
-                            self.edx_fetch_file_pooled(address, inner_path, hook.clone()).await
-                        }
-                        None => self.edx_fetch_file(address, inner_path, background).await,
-                    };
-                    match result {
-                        Some(Ok(true)) => return Ok(true),
-                        Some(Ok(false)) => {
-                            last = format!("EDX could not complete {inner_path}")
-                        }
-                        Some(Err(e)) => last = e,
-                        // No fetcher is a permanent condition - retrying it
-                        // would just burn the caller's deadline.
-                        None => return Err("no EDX fetcher installed".into()),
-                    }
-                    let now_have =
-                        edx_live_progress(&self.edx_transfer_stats(address, inner_path, None).await)
-                            .map(|(h, _)| h)
-                            .unwrap_or(0);
-                    if now_have > have {
-                        no_progress = 0;
-                    } else {
-                        no_progress += 1;
-                    }
-                    have = have.max(now_have);
-                    if no_progress >= ATTEMPTS || attempt >= MAX_ATTEMPTS {
-                        break;
-                    }
-                    // Let the just-scored dial outcomes settle so the next
-                    // pass draws a different (better) peer set.
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(last)
-            }
-            None => Err(format!("{inner_path} has no b3 and cannot be fetched")),
+        if entry.get("b3").is_none() {
+            return Err(format!("{inner_path} has no b3 and cannot be fetched"));
         }
+        self.edx_fetch_with_resume(address, inner_path, background, on_fetched).await
+    }
+
+    /// Fetch one EDX file, retrying a failed pass instead of surfacing the
+    /// first stumble as "not found". Over Tor a multi-MB asset routinely
+    /// loses its peer mid-transfer, and one incomplete swarm pass 404'd the
+    /// request - the browser drew a broken image while the caller still had
+    /// most of its deadline left. Partial groups persist in the store, so
+    /// each attempt RESUMES rather than restarting, and the caller's
+    /// timeout bounds the whole loop.
+    ///
+    /// An attempt that MOVED bytes does not burn the retry budget: a
+    /// multi-GB file over tor loses its peer mid-transfer many times, and
+    /// requeueing it to a later round (60-600s backoff) on the third such
+    /// loss threw away a live resume for a cold restart. Only consecutive
+    /// no-progress attempts count toward giving up, with a hard total so
+    /// genuinely dead content still fails out to the round mechanism.
+    async fn edx_fetch_with_resume(
+        &self,
+        address: &str,
+        inner_path: &str,
+        background: bool,
+        on_fetched: Option<EdxFetchedHook>,
+    ) -> Result<bool, String> {
+        const ATTEMPTS: usize = 3;
+        const MAX_ATTEMPTS: usize = 10;
+        let mut last = String::new();
+        let mut no_progress = 0usize;
+        let mut have = self.edx_have_bytes(address, inner_path).await;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = match &on_fetched {
+                Some(hook) => self.edx_fetch_file_pooled(address, inner_path, hook.clone()).await,
+                None => self.edx_fetch_file(address, inner_path, background).await,
+            };
+            match result {
+                Some(Ok(true)) => return Ok(true),
+                Some(Ok(false)) => last = format!("EDX could not complete {inner_path}"),
+                Some(Err(e)) => last = e,
+                // No fetcher is a permanent condition - retrying it
+                // would just burn the caller's deadline.
+                None => return Err("no EDX fetcher installed".into()),
+            }
+            let now_have = self.edx_have_bytes(address, inner_path).await;
+            if now_have > have {
+                no_progress = 0;
+            } else {
+                no_progress += 1;
+            }
+            have = have.max(now_have);
+            if no_progress >= ATTEMPTS || attempt >= MAX_ATTEMPTS {
+                break;
+            }
+            // Let the just-scored dial outcomes settle so the next
+            // pass draws a different (better) peer set.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Err(last)
+    }
+
+    /// Bytes already landed in the store for one file's live transfer row.
+    async fn edx_have_bytes(&self, address: &str, inner_path: &str) -> u64 {
+        edx_live_progress(&self.edx_transfer_stats(address, inner_path, None).await)
+            .map(|(h, _)| h)
+            .unwrap_or(0)
     }
 
     /// List optional files with their state and the per-file counters the
