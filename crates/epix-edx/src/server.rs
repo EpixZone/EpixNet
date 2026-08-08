@@ -42,6 +42,27 @@ pub const MAX_CONCURRENT_SERVES: usize = 8;
 /// every other blocking caller. Serving is bound by peer link speed, not
 /// by encode parallelism, so a small number is plenty.
 pub const MAX_ENCODE_THREADS: usize = 32;
+/// Global bound on serves ADMITTED to the encode stage: the running
+/// [`MAX_ENCODE_THREADS`] plus a bounded queue behind them. Per
+/// connection [`MAX_CONCURRENT_SERVES`] caps concurrency, but connections
+/// are many, and every one of them parking its serves on the encode
+/// semaphore was an unbounded process-wide queue. Past this bound the
+/// request waits out one short drain window ([`ENCODE_QUEUE_WAIT`]) and
+/// is then refused with a typed retry-after instead of waiting silently
+/// for an unbounded time.
+pub const MAX_ENCODE_QUEUE: usize = MAX_ENCODE_THREADS * 3;
+/// How long a serve may wait for queue admission before it is refused.
+/// Refusing instantly regressed legacy clients: they parked here without
+/// bound before, they count a BUSY as a strike toward exhausting a seeder
+/// (three in a row and our sole-seeder role is struck out), and a load
+/// spike that fills the queue usually drains within seconds.
+const ENCODE_QUEUE_WAIT: Duration = Duration::from_secs(15);
+/// Retry hint when the global serve queue is full: long enough for a
+/// slice of the queue to drain, short enough to refill a freed queue.
+const ENCODE_QUEUE_RETRY_SECS: u64 = 5;
+/// Retry hint when one connection's serve slots are all taken: those
+/// serves are actively streaming, so a slot frees soon.
+const SERVE_SLOTS_RETRY_SECS: u64 = 2;
 /// How long a connection may sit after the link comes up before sending
 /// its `Hello`. Bounds the slot an authenticated-but-silent peer holds.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -58,6 +79,22 @@ pub const FIRST_PAINT_OBJECT_BYTES: u64 = 4 << 20;
 /// The [`MAX_ENCODE_THREADS`] permits, shared by every connection.
 static ENCODE_SLOTS: std::sync::LazyLock<Semaphore> =
     std::sync::LazyLock::new(|| Semaphore::new(MAX_ENCODE_THREADS));
+
+/// The [`MAX_ENCODE_QUEUE`] admission permits (running + queued serves).
+static ENCODE_QUEUE: std::sync::LazyLock<Semaphore> =
+    std::sync::LazyLock::new(|| Semaphore::new(MAX_ENCODE_QUEUE));
+
+/// Admission to the encode stage. A full queue is waited out for
+/// [`ENCODE_QUEUE_WAIT`] (waiters are bounded by the per-connection serve
+/// slots, so this cannot rebuild the unbounded parking lot the queue bound
+/// removed); None means refuse with the retry hint.
+async fn encode_queue_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    match tokio::time::timeout(ENCODE_QUEUE_WAIT, ENCODE_QUEUE.acquire()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // Timed out; the never-closed semaphore cannot error otherwise.
+        _ => None,
+    }
+}
 
 /// Signed-content access the server delegates to (the real node backs
 /// this with its xite registry; tests use a fixture). Async because the
@@ -181,7 +218,7 @@ impl ServeCtx {
             control: None,
             privatekey,
             version: String::new(),
-            caps: caps::MESH,
+            caps: caps::MESH | caps::RETRY_AFTER,
             now: now_unix,
             choker: None,
             foreground: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -192,6 +229,15 @@ impl ServeCtx {
     /// Attach the shared upload governor.
     pub fn with_choker(mut self, choker: Arc<Mutex<Choker>>) -> Self {
         self.choker = Some(choker);
+        self
+    }
+
+    /// Share the node's foreground-activity flag (the LEDBAT yield's
+    /// input). Contexts are built per connection, so without a shared
+    /// flag each one holds a private always-false bool and the yield
+    /// never engages.
+    pub fn with_foreground(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.foreground = flag;
         self
     }
 
@@ -305,6 +351,62 @@ pub async fn client_hello(
     }
 }
 
+/// The bounded Hello gate: the FIRST request must be a valid Hello, and a
+/// peer that completes the handshake and then never speaks would otherwise
+/// hold its inbound slot forever. EDX is the only inbound path now, so
+/// without the timeout a few hundred stalled sockets exhaust MAX_INBOUND
+/// and the node goes deaf to new peers. Returns the verified identity, or
+/// None when the connection must drop.
+async fn hello_gate(
+    conn: &Conn,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    ctx: &Arc<ServeCtx>,
+    handshake_hash: Option<&[u8; 32]>,
+) -> Option<PeerIdentity> {
+    let first = tokio::time::timeout(HELLO_TIMEOUT, incoming.recv()).await.ok()??;
+    // Destructured whole: matching on `first.req` alone is a partial move, so
+    // the un-moved `_budget` would live as long as the caller does and never
+    // refund the Hello's share of the connection's inbound byte budget.
+    let Incoming { stream: hello_stream, req: hello_req, _budget: hello_budget } = first;
+    let Req::Hello(hello) = hello_req else {
+        let _ = conn
+            .respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: "hello first".into() })
+            .await;
+        return None;
+    };
+    let checked = check_identity(
+        &hello.net,
+        &hello.node_pk,
+        &hello.binding_sig,
+        hello.caps,
+        hello.version,
+        handshake_hash,
+        noise::Role::Initiator,
+    );
+    let id = match checked {
+        Ok(id) => id,
+        Err(e) => {
+            let _ =
+                conn.respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: e }).await;
+            return None;
+        }
+    };
+    let ack = HelloAck {
+        net: NET_ID.into(),
+        node_pk: epix_crypt::private_to_compressed_pubkey(&ctx.privatekey).ok()?,
+        binding_sig: binding_sig(&ctx.privatekey, handshake_hash, noise::Role::Responder).ok()?,
+        caps: ctx.caps,
+        observed: None,
+        version: ctx.version.clone(),
+    };
+    if conn.respond(hello_stream, Resp::HelloAck(ack)).await.is_err() {
+        return None;
+    }
+    // Answered: give the units back to the connection's inbound budget.
+    drop(hello_budget);
+    Some(id)
+}
+
 /// Run the serve loop for one connection until it closes. The FIRST
 /// request must be a valid Hello; anything else (or a failed identity
 /// check) drops the connection. Returns the peer identity once the
@@ -315,75 +417,32 @@ pub async fn serve(
     ctx: Arc<ServeCtx>,
     handshake_hash: Option<[u8; 32]>,
 ) -> Option<PeerIdentity> {
-    // Hello gate, bounded: a peer that completes the handshake and then
-    // never speaks would otherwise hold its inbound slot forever. EDX is
-    // the only inbound path now, so without this a few hundred stalled
-    // sockets exhaust MAX_INBOUND and the node goes deaf to new peers.
-    let first = tokio::time::timeout(HELLO_TIMEOUT, incoming.recv()).await.ok()??;
-    // Destructured whole: matching on `first.req` alone is a partial move, so
-    // the un-moved `_budget` would live as long as `serve` does and never
-    // refund the Hello's share of the connection's inbound byte budget.
-    let Incoming { stream: hello_stream, req: hello_req, _budget: hello_budget } = first;
-    let identity = match hello_req {
-        Req::Hello(hello) => {
-            match check_identity(
-                &hello.net,
-                &hello.node_pk,
-                &hello.binding_sig,
-                hello.caps,
-                hello.version,
-                handshake_hash.as_ref(),
-                noise::Role::Initiator,
-            ) {
-                Ok(id) => {
-                    let ack = HelloAck {
-                        net: NET_ID.into(),
-                        node_pk: match epix_crypt::private_to_compressed_pubkey(&ctx.privatekey) {
-                            Ok(pk) => pk,
-                            Err(_) => return None,
-                        },
-                        binding_sig: binding_sig(
-                            &ctx.privatekey,
-                            handshake_hash.as_ref(),
-                            noise::Role::Responder,
-                        )
-                        .ok()?,
-                        caps: ctx.caps,
-                        observed: None,
-                        version: ctx.version.clone(),
-                    };
-                    if conn.respond(hello_stream, Resp::HelloAck(ack)).await.is_err() {
-                        return None;
-                    }
-                    id
-                }
-                Err(e) => {
-                    let _ = conn
-                        .respond(hello_stream, Resp::Err { code: err::BAD_REQUEST, msg: e })
-                        .await;
-                    return None;
-                }
+    let identity = hello_gate(&conn, &mut incoming, &ctx, handshake_hash.as_ref()).await?;
+
+    // Register the connection with the governor (reachability from the
+    // link type: overlay links have no handshake hash). Unchoke slots are
+    // ranked over CONNECTED peers, so this is what admits the peer to the
+    // competition; the matching note_disconnected runs from a drop guard,
+    // so it also fires if this future is cancelled mid-serve (an accept
+    // loop aborting per-conn tasks) - an unpaired note_connected would
+    // leave a phantom conns>0 account squatting the connected set and
+    // immune to table eviction forever.
+    let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
+    struct Connected {
+        ctx: Arc<ServeCtx>,
+        node_pk: Vec<u8>,
+    }
+    impl Drop for Connected {
+        fn drop(&mut self) {
+            if let Some(choker) = &self.ctx.choker {
+                choker.lock().expect("choker").note_disconnected(&self.node_pk, (self.ctx.now)());
             }
         }
-        _ => {
-            let _ = conn
-                .respond(
-                    hello_stream,
-                    Resp::Err { code: err::BAD_REQUEST, msg: "hello first".into() },
-                )
-                .await;
-            return None;
-        }
-    };
-    // Answered: give the units back to the connection's inbound budget.
-    drop(hello_budget);
-
-    // Register the peer with the governor (reachability from the link
-    // type: overlay links have no handshake hash).
-    let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
-    if let Some(choker) = &ctx.choker {
-        choker.lock().expect("choker").note_peer(&identity.node_pk, reach, (ctx.now)());
     }
+    let _connected = ctx.choker.as_ref().map(|choker| {
+        choker.lock().expect("choker").note_connected(&identity.node_pk, reach, (ctx.now)());
+        Connected { ctx: ctx.clone(), node_pk: identity.node_pk.clone() }
+    });
     let identity = Arc::new(identity);
 
     // Idle reaper: drop a connection that goes quiet, releasing its
@@ -408,7 +467,7 @@ pub async fn serve(
                 let _ = conn
                     .respond(
                         inc.stream,
-                        Resp::Err { code: err::BUSY, msg: "serve slots busy".into() },
+                        busy_resp(&identity, SERVE_SLOTS_RETRY_SECS, "serve slots busy"),
                     )
                     .await;
                 continue;
@@ -422,6 +481,9 @@ pub async fn serve(
             drop(permit);
         });
     }
+    // The connection is gone: `_connected`'s drop tells the governor, so
+    // the peer stops competing for unchoke slots (the account and its
+    // credit stay for when the peer returns).
     Some((*identity).clone())
 }
 
@@ -494,6 +556,21 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
 /// The reply for a control request on a node that doesn't serve control.
 fn unsupported() -> Resp {
     Resp::Err { code: err::UNSUPPORTED, msg: "control plane not served".into() }
+}
+
+/// The refusal reply: a typed `Busy` carrying the comeback hint for a
+/// peer that advertised [`caps::RETRY_AFTER`] in its Hello, the legacy
+/// `Err { BUSY }` for everyone older (postcard variants are positional,
+/// so an unknown appended variant would break an old peer's parse — the
+/// caps bit is what makes the append safe to actually send).
+fn busy_resp(identity: &PeerIdentity, retry_after_secs: u64, msg: &str) -> Resp {
+    if identity.caps & caps::RETRY_AFTER != 0 {
+        Resp::Busy {
+            retry_after_ms: retry_after_secs.saturating_mul(1000).min(u32::MAX as u64) as u32,
+        }
+    } else {
+        Resp::Err { code: err::BUSY, msg: msg.into() }
+    }
 }
 
 /// Byte budget for one batched reply frame, leaving room for the frame
@@ -819,24 +896,22 @@ async fn serve_range(
     let bulk = !first_paint && deadline_ms == 0;
 
     // Bulk governance: consult the choker. First-paint objects (index +
-    // small bundles) are exempt up to the free budget; a choked peer is
-    // told BUSY so it retries elsewhere (the swarm self-heals), and a
-    // throttled one likewise. Control-plane and first-paint bypass this.
+    // small bundles) are exempt up to the free budget; a choked or
+    // throttled peer is refused with the comeback hint (typed when its
+    // Hello advertised the cap) so it retries HERE at the right moment
+    // instead of striking us out. Control-plane bypasses this.
     if let Some(choker) = &ctx.choker {
         let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
-        let decision = choker.lock().expect("choker").decide(
-            &identity.node_pk,
-            charged,
-            first_paint,
-            foreground,
-            (ctx.now)(),
-        );
+        let now = (ctx.now)();
+        let (decision, retry_secs) = {
+            let mut c = choker.lock().expect("choker");
+            let d = c.decide(&identity.node_pk, charged, first_paint, foreground, now);
+            (d, c.retry_after_secs(d, now))
+        };
         match decision {
             ServeDecision::Serve | ServeDecision::FirstPaint => {}
             ServeDecision::Choked | ServeDecision::Throttled => {
-                let _ = conn
-                    .respond(stream, Resp::Err { code: err::BUSY, msg: "choked".into() })
-                    .await;
+                let _ = conn.respond(stream, busy_resp(&identity, retry_secs, "choked")).await;
                 return;
             }
         }
@@ -845,6 +920,16 @@ async fn serve_range(
     let byte_ranges: Vec<std::ops::Range<u64>> =
         ranges.iter().map(|(s, e)| *s..*e).collect();
 
+    // Bounded global admission to the encode stage: at most
+    // MAX_ENCODE_QUEUE serves running-or-queued process-wide; past that
+    // the request rides out one drain window and is then refused with a
+    // retry hint rather than parked on the encode semaphore without bound.
+    let Some(_queue_slot) = encode_queue_slot().await else {
+        let _ = conn
+            .respond(stream, busy_resp(&identity, ENCODE_QUEUE_RETRY_SECS, "serve queue full"))
+            .await;
+        return;
+    };
     // Take a process-wide encode slot before spending a blocking thread, so
     // encodes can never dominate the pool the whole node shares (see
     // ENCODE_SLOTS). Held for the encode's lifetime.
@@ -884,7 +969,12 @@ async fn serve_range(
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
             // The peer stopped draining its lane and `blocking_send`'s stall
             // deadline fired. The queue is still full, so an error frame
-            // would only pile onto it.
+            // would only pile onto it (holding this encode slot for up to
+            // the write deadline). Tear the link down instead: aborting
+            // silently left the peer waiting out its own stream timeout
+            // (up to 120s) against a response that was never coming, while
+            // a dropped link fails its read at once.
+            conn.shutdown();
         }
         Ok(Err(e)) => {
             let code =
@@ -930,14 +1020,24 @@ async fn serve_many(
     };
     let asked = servable.len();
 
-    let bulk = admit_many(&ctx, &identity, &mut servable, now);
+    let (bulk, refused_retry) = admit_many(&ctx, &identity, &mut servable, now);
     if servable.is_empty() && asked > 0 {
-        // Not one item fits right now. Say BUSY rather than send an empty
-        // batch, which would read as "we hold none of these".
-        let _ = conn.respond(stream, Resp::Err { code: err::BUSY, msg: "choked".into() }).await;
+        // Not one item fits right now. Say BUSY (with the comeback hint)
+        // rather than send an empty batch, which would read as "we hold
+        // none of these".
+        let _ = conn
+            .respond(stream, busy_resp(&identity, refused_retry.unwrap_or(1), "choked"))
+            .await;
         return;
     }
 
+    // Same bounded global admission as the range path.
+    let Some(_queue_slot) = encode_queue_slot().await else {
+        let _ = conn
+            .respond(stream, busy_resp(&identity, ENCODE_QUEUE_RETRY_SECS, "serve queue full"))
+            .await;
+        return;
+    };
     // Take the same process-wide encode slot the range path takes. This
     // blocking thread also parks on the peer's drain rate (blocking_send's
     // stall deadline), so without the permit GetMany starves the shared
@@ -1015,33 +1115,40 @@ async fn many_servable(
 /// reports missing ids, and get_many_pass re-asks per peer).
 ///
 /// Truncates `servable` to the admitted prefix (untouched without a
-/// choker) and returns true when any admitted item drew past the free
-/// budget, which routes the reply onto the bulk lane. Synchronous, so the
-/// choker guard is never held across an await.
+/// choker) and returns (bulk, refused_retry): `bulk` is true when any
+/// admitted item drew past the free budget, which routes the reply onto
+/// the bulk lane; `refused_retry` is the comeback hint (secs) of the
+/// decision that cut the batch, `None` when nothing was refused.
+/// Synchronous, so the choker guard is never held across an await.
 fn admit_many(
     ctx: &ServeCtx,
     identity: &PeerIdentity,
     servable: &mut Vec<(ObjId, u64)>,
     now: u64,
-) -> bool {
+) -> (bool, Option<u64>) {
     let mut bulk = false;
+    let mut refused_retry = None;
     if let Some(choker) = &ctx.choker {
         let foreground = ctx.foreground.load(std::sync::atomic::Ordering::Relaxed);
         let mut c = choker.lock().expect("choker");
         let mut admitted = 0usize;
         for (_, size) in servable.iter() {
-            match c.decide(&identity.node_pk, *size, true, foreground, now) {
+            let decision = c.decide(&identity.node_pk, *size, true, foreground, now);
+            match decision {
                 ServeDecision::FirstPaint => {}
                 // Past the free budget this is ordinary bulk upload: it must
                 // not preempt governed ranges on the priority lane.
                 ServeDecision::Serve => bulk = true,
-                ServeDecision::Choked | ServeDecision::Throttled => break,
+                ServeDecision::Choked | ServeDecision::Throttled => {
+                    refused_retry = Some(c.retry_after_secs(decision, now));
+                    break;
+                }
             }
             admitted += 1;
         }
         servable.truncate(admitted);
     }
-    bulk
+    (bulk, refused_retry)
 }
 
 /// The `GetMany` read+frame stage, run on a blocking thread: read each
@@ -1086,7 +1193,8 @@ fn read_and_frame_many(
                 stream,
                 body: FrameBody::Resp { last: false, resp: Resp::Many { items: out } },
             };
-            if send_on_lane(conn, frame, bulk).is_err() {
+            if let Err(e) = send_on_lane(conn, frame, bulk) {
+                stalled_teardown(conn, &e);
                 return;
             }
             credit(served);
@@ -1097,8 +1205,21 @@ fn read_and_frame_many(
     let served = sizes(&batch);
     let frame =
         Frame { stream, body: FrameBody::Resp { last: true, resp: Resp::Many { items: batch } } };
-    if send_on_lane(conn, frame, bulk).is_ok() {
-        credit(served);
+    match send_on_lane(conn, frame, bulk) {
+        Ok(()) => credit(served),
+        Err(e) => stalled_teardown(conn, &e),
+    }
+}
+
+/// Send-stall handling shared by the blocking serve paths: a TimedOut from
+/// `blocking_send` means the peer stopped draining its lane, and an error
+/// frame cannot follow it there (the lane is full; queueing one holds an
+/// encode slot up to the write deadline). Tear the link down so the peer's
+/// read fails now instead of after its own stream timeout. Any other error
+/// means the lane is already gone and there is nothing to do.
+fn stalled_teardown(conn: &Conn, e: &std::io::Error) {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        conn.shutdown();
     }
 }
 
@@ -1175,7 +1296,7 @@ impl std::io::Write for FrameSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES, UNCHOKE_SLOTS};
+    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES};
     use crate::frame;
     use epix_blob::Ns;
 
@@ -1303,12 +1424,9 @@ mod tests {
         let choker = Arc::new(Mutex::new(Choker::new(1 << 40)));
         {
             let mut c = choker.lock().unwrap();
-            // Competitors hold every unchoke slot...
-            for i in 20..(20 + UNCHOKE_SLOTS as u8 + 4) {
-                c.note_peer(&[i; 33], Reach::Clearnet, 0);
-                c.credit_peer(&[i; 33], 1_000_000, 0);
-            }
-            // ...and our peer has already spent its whole free budget.
+            // The peer has already spent its whole free budget, and holds
+            // no unchoke slot (it was never connected in the choker), so
+            // past the budget it is choked.
             c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
             assert_eq!(
                 c.decide(&peer.node_pk, FIRST_PAINT_FREE_BYTES, true, false, 0),
@@ -1327,31 +1445,83 @@ mod tests {
         }
     }
 
+    /// The typed Busy refusal is gated on the PEER's caps bit: an old peer
+    /// keeps receiving the legacy `Err { BUSY }` it can decode (postcard
+    /// variants are positional, so an unknown appended variant would break
+    /// its parse), while a peer that advertised `caps::RETRY_AFTER` gets
+    /// the machine-readable comeback hint.
+    #[tokio::test]
+    async fn busy_is_typed_only_for_peers_that_advertise_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        // A bulk-sized object; the requesting peer holds no unchoke slot
+        // (never connected in the choker), so bulk is Choked.
+        let data = vec![5u8; FIRST_PAINT_OBJECT_BYTES as usize + 1];
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+        let choker = Arc::new(Mutex::new(Choker::new(1 << 40)));
+        let ctx =
+            Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
+
+        // Legacy peer (caps 0): plain BUSY.
+        let (conn, _incoming, mut far) = wired();
+        tokio::spawn(serve_range(conn, ctx.clone(), peer(), 2, id, vec![(0, 1024)], 0));
+        match next_frame(&mut far).await.body {
+            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
+                assert_eq!(code, err::BUSY, "an old peer gets the BUSY it can decode")
+            }
+            other => panic!("expected legacy BUSY, got {other:?}"),
+        }
+
+        // A peer that advertised the cap: typed Busy pointing at the next
+        // unchoke rotation (ctx clock is 0, so exactly one rotation out).
+        let newer = Arc::new(PeerIdentity {
+            node_pk: vec![8u8; 33],
+            address: "test-new".into(),
+            caps: caps::RETRY_AFTER,
+            version: String::new(),
+        });
+        let (conn, _incoming2, mut far2) = wired();
+        tokio::spawn(serve_range(conn, ctx, newer, 4, id, vec![(0, 1024)], 0));
+        match next_frame(&mut far2).await.body {
+            FrameBody::Resp { resp: Resp::Busy { retry_after_ms }, .. } => {
+                assert_eq!(
+                    retry_after_ms as u64,
+                    crate::choke::OPTIMISTIC_ROTATE_SECS * 1000,
+                    "the hint points at the next rotation"
+                );
+            }
+            other => panic!("expected typed Busy, got {other:?}"),
+        }
+    }
+
     /// The choker is charged what goes on the wire (whole chunk groups plus
     /// proof), not the byte count the peer asked for. Charging the request
     /// let 64 one-byte ranges draw ~1 MiB while accounting for 64 bytes,
-    /// which is the global cap and the foreground yield gone.
+    /// which is the per-second bucket gone. The bucket refuses only
+    /// first-paint now (bulk is paced at the writer instead), so the probe
+    /// object is first-paint sized.
     #[tokio::test]
     async fn scattered_one_byte_ranges_are_charged_by_chunk_group() {
         const GROUP: u64 = epix_blob::bitfield::GROUP_BYTES;
 
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(&dir);
+        // A first-paint-sized object spanning MAX_RANGES_PER_REQ groups.
+        let data = vec![7u8; (MAX_RANGES_PER_REQ as u64 * GROUP) as usize];
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+
         let peer = peer();
         let choker = Arc::new(Mutex::new(Choker::new(100_000)));
-        {
-            let mut c = choker.lock().unwrap();
-            // Sole peer, top contributor: never choked, only ever capped.
-            c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
-            c.credit_peer(&peer.node_pk, 1 << 30, 0);
-            c.decide(&peer.node_pk, FIRST_PAINT_FREE_BYTES, true, false, 0);
-        }
         let ctx = Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
 
+        // 64 scattered one-byte ranges: charged as 64 whole groups (1 MiB),
+        // over the 100 KB/s bucket, so the first-paint serve is refused.
         let ranges: Vec<(u64, u64)> =
             (0..MAX_RANGES_PER_REQ as u64).map(|i| (i * GROUP, i * GROUP + 1)).collect();
         let (conn, _incoming, mut far) = wired();
-        tokio::spawn(serve_range(conn, ctx.clone(), peer.clone(), 8, ObjId([3; 32]), ranges, 0));
+        tokio::spawn(serve_range(conn, ctx.clone(), peer.clone(), 8, id, ranges, 0));
         match next_frame(&mut far).await.body {
             FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
                 assert_eq!(code, err::BUSY, "64 one-byte ranges cost 64 whole chunk groups")
@@ -1359,16 +1529,13 @@ mod tests {
             other => panic!("expected BUSY, got {other:?}"),
         }
 
-        // Control: one range of the same shape is a single group, which fits
-        // under the cap, so it passes the choker and fails on the store
-        // instead (the object was never inserted).
+        // Control: ONE range of the same shape is a single group, which
+        // fits under the bucket, so it serves off the free budget.
         let (conn, _incoming2, mut far2) = wired();
-        tokio::spawn(serve_range(conn, ctx, peer, 10, ObjId([3; 32]), vec![(0, 1)], 0));
+        tokio::spawn(serve_range(conn, ctx, peer, 10, id, vec![(0, 1)], 0));
         match next_frame(&mut far2).await.body {
-            FrameBody::Resp { resp: Resp::Err { code, .. }, .. } => {
-                assert_eq!(code, err::NOT_FOUND, "one group is under the cap, so it is served")
-            }
-            other => panic!("expected NOT_FOUND, got {other:?}"),
+            FrameBody::Data { .. } => {}
+            other => panic!("expected Data, got {other:?}"),
         }
     }
 
@@ -1390,18 +1557,11 @@ mod tests {
         store.insert_bytes(small_id, Ns::Plain, &small, 1).unwrap();
 
         let peer = peer();
+        // The peer holds no bulk unchoke slot (never connected in the
+        // choker), so its bulk requests are choked while its first-paint
+        // requests ride the free budget.
         let choker = Arc::new(Mutex::new(Choker::new(1_000_000_000)));
-        {
-            let mut c = choker.lock().unwrap();
-            // More competing contributors than unchoke slots, so the fresh
-            // peer holds no bulk slot (and is not the optimistic pick at
-            // t=0, which goes to a contributor).
-            for i in 100..(100 + UNCHOKE_SLOTS as u8 + 4) {
-                c.note_peer(&[i; 33], Reach::Clearnet, 0);
-                c.credit_peer(&[i; 33], 1_000_000, 0);
-            }
-            c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
-        }
+        choker.lock().unwrap().note_peer(&peer.node_pk, Reach::Clearnet, 0);
         let ctx =
             Arc::new(ctx_for(store, Fixture { signed: None, block: false }).with_choker(choker));
 
@@ -1485,9 +1645,9 @@ mod tests {
         let choker = Arc::new(Mutex::new(Choker::new(100_000)));
         {
             let mut c = choker.lock().unwrap();
-            // Sole peer, so it holds an unchoke slot: this is about the byte
-            // cap, not reciprocity. Free-budget bytes count against the cap
-            // like everything else, so the cap alone cuts the batch.
+            // This is about the byte cap, not reciprocity: the items ride
+            // the free budget, whose bytes count against the cap, so the
+            // cap alone cuts the batch.
             c.note_peer(&peer.node_pk, Reach::Clearnet, 0);
         }
         let ctx =

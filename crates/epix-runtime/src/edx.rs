@@ -526,9 +526,14 @@ pub fn env_on(var: &str) -> bool {
 
 /// The shared upload governor. On by default (reciprocity: seed -> faster
 /// service); `EPIX_EDX_RECIPROCITY=0` disables it and serves everything
-/// ungoverned. One instance is shared between serving and fetching.
+/// ungoverned. One instance is shared between serving and fetching. The
+/// bulk-lane pacer is armed with the same cap: the choker decides WHO is
+/// served, the pacer smooths admitted bulk onto the wire at this rate
+/// (whole-request refusal at the per-second bucket is first-paint only
+/// now). Ungoverned nodes leave the pacer off too.
 pub fn make_choker() -> Option<SharedChoker> {
     if env_on("EPIX_EDX_RECIPROCITY") {
+        epix_edx::pace::bulk().set_rate(EDX_UPLOAD_CAP_BPS);
         Some(Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS))))
     } else {
         None
@@ -874,6 +879,7 @@ fn serve_ctx(
         .with_control(control)
         .with_shards(shards)
         .with_on_served(upload_recorder(state.clone()))
+        .with_foreground(edx_foreground_flag())
 }
 
 /// The serve-side upload recorder: resolve the object just served back to
@@ -1254,7 +1260,20 @@ struct RuntimeEdxFetcher {
     /// Arc-shared for the same reason as the rest: a serve, its read-ahead and
     /// the scheduler all report into one picture of the same file.
     xfer: Arc<crate::xfer::Xfer>,
+    /// Bounds concurrent materialize copies for POOLED bulk fetches (see
+    /// [`MATERIALIZE_CONCURRENCY`]). Arc-shared so every clone of the
+    /// fetcher queues on the same gate.
+    materialize_gate: Arc<tokio::sync::Semaphore>,
 }
+
+/// Concurrent materialize copies a bulk worker pool may run at once. The
+/// copy is GB-scale when the xite tree sits on another filesystem (an SMB
+/// mount is the motivating case), runs on the blocking pool, and competes
+/// with encode slots and store IO there - while the network fetch it used
+/// to serialize behind gains nothing from it. Two, not more: on a network
+/// mount concurrent copies mostly serialize against each other anyway.
+/// Interactive fetches (a page waiting on the file) bypass the gate.
+const MATERIALIZE_CONCURRENCY: usize = 2;
 
 /// Per-file streaming state guarding read-ahead against firing an unbounded
 /// task per browser Range request.
@@ -1325,7 +1344,37 @@ impl Drop for ForegroundFetch {
         if let Ok(mut s) = self.streaming.lock() {
             s.foreground_fetches = s.foreground_fetches.saturating_sub(1);
         }
+        // 1 -> 0: the user's playback is no longer blocked on the network.
+        if FOREGROUND_FETCHES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            set_edx_foreground(false);
+        }
     }
+}
+
+/// Foreground (player-blocking) range fetches across the WHOLE process,
+/// driving the LEDBAT yield on its 0<->1 transitions. Process-wide (not
+/// per fetcher) for the same reason the pacer is: connections and
+/// fetcher clones are many, the user's uplink is one.
+static FOREGROUND_FETCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The node-wide "the user's own playback is blocked on the network"
+/// flag. Shared into every serve context ([`serve_ctx`]) so the choker's
+/// first-paint bucket yields, and mirrored into the bulk pacer so paced
+/// serving slows to the yield fraction. Without this both yields were
+/// dead switches: each per-connection context held a private
+/// always-false bool.
+fn edx_foreground_flag() -> Arc<std::sync::atomic::AtomicBool> {
+    static FLAG: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    FLAG.get_or_init(Default::default).clone()
+}
+
+/// Flip both foreground consumers together (the serve contexts' shared
+/// flag and the bulk pacer).
+fn set_edx_foreground(on: bool) {
+    edx_foreground_flag().store(on, std::sync::atomic::Ordering::Relaxed);
+    epix_edx::pace::bulk().set_foreground(on);
 }
 
 /// A serve's dialed peer session, kept for PEER_CACHE_TTL so consecutive
@@ -1420,6 +1469,7 @@ impl RuntimeEdxFetcher {
             peer_cache: Arc::default(),
             claims: Arc::default(),
             xfer: Arc::default(),
+            materialize_gate: Arc::new(tokio::sync::Semaphore::new(MATERIALIZE_CONCURRENCY)),
         }
     }
 
@@ -1606,7 +1656,7 @@ impl RuntimeEdxFetcher {
         let salt = epix_blob::manifest::edx_salt(content)
             .ok_or("no edx_salt (missing viewing material)")?;
         let now = now_secs();
-        let peers = self.state.connectable_peers(address, 8).await;
+        let peers = self.state.fetch_session_peers(address, 8).await;
 
         // Fetch each ciphertext shard object into the store, verified by its
         // BLAKE3 address (== the shard's bao root).
@@ -1648,7 +1698,7 @@ impl RuntimeEdxFetcher {
                 Ok(report) => report,
                 Err(e) => return Err(e.to_string()),
             };
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
             if !store.is_complete(id).unwrap_or(false) {
                 return Err(format!("shard {id} did not complete"));
             }
@@ -1737,7 +1787,7 @@ impl RuntimeEdxFetcher {
             return Ok(0);
         }
 
-        let peers = self.state.connectable_peers(address, 8).await;
+        let peers = self.state.fetch_session_peers(address, 8).await;
         let mut held = 0usize;
         for c in want {
             // Soft budget gate: stop before pulling once held shard bytes
@@ -1791,7 +1841,7 @@ impl RuntimeEdxFetcher {
         let needed = needed_groups(store, id, csize).map_err(|e| e.to_string())?;
         let mut swarm = Swarm::new(store.clone(), id, csize);
         if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::background(), now).await {
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
         }
         if store.is_complete(id).unwrap_or(false) {
             Ok(true)
@@ -1831,15 +1881,37 @@ impl RuntimeEdxFetcher {
     }
 
     /// Credit each peer that delivered groups in `report` for the bytes it
-    /// served us (reciprocity), when a shared choker is installed.
-    fn credit(&self, report: &epix_edx::sched::FetchReport, node_pks: &HashMap<String, Vec<u8>>, now: u64) {
-        let Some(choker) = &self.choker else { return };
-        let mut c = choker.lock().expect("choker");
-        for (label, groups) in &report.by_peer {
-            if let Some(pk) = node_pks.get(label) {
-                c.credit_peer(pk, groups * epix_blob::bitfield::GROUP_BYTES, now);
+    /// served us (reciprocity, when a shared choker is installed), and stamp
+    /// its data history in the xite's registry. The registry stamp is what
+    /// note_edx_dials cannot record - a peer that answers and holds nothing
+    /// scores ConnectOk there, so "never served us a byte" was invisible -
+    /// and it is what ranks actual byte sources into the data-session slots
+    /// ([`AppState::fetch_session_peers`]).
+    async fn credit(
+        &self,
+        address: &str,
+        report: &epix_edx::sched::FetchReport,
+        node_pks: &HashMap<String, Vec<u8>>,
+        now: u64,
+    ) {
+        if let Some(choker) = &self.choker {
+            let mut c = choker.lock().expect("choker");
+            for (label, groups) in &report.by_peer {
+                if let Some(pk) = node_pks.get(label) {
+                    c.credit_peer(pk, groups * epix_blob::bitfield::GROUP_BYTES, now);
+                }
             }
         }
+        // Lanes share their peer's label (the address string), so this
+        // round-trips; a label that is not an address (test doubles) is
+        // simply not a registry peer.
+        let served: Vec<PeerAddr> = report
+            .by_peer
+            .iter()
+            .filter(|(_, groups)| **groups > 0)
+            .filter_map(|(label, _)| PeerAddr::parse(label).ok())
+            .collect();
+        self.state.note_edx_served(address, served).await;
     }
 
     /// Resolve `inner_path`'s object id + size from the root OR the governing
@@ -1859,12 +1931,27 @@ impl RuntimeEdxFetcher {
     /// still feeds the xite's peer registry via note_edx_dials — a dead (or
     /// zombie: handshakes, never answers the bitfield) peer sinks (backoff)
     /// instead of being redialed at the top of the list on every window.
+    ///
+    /// The third return is the dial channel, STILL OPEN: peers and lanes
+    /// that resolve after the grace keep landing on it. The bulk path feeds
+    /// them into its running fetch (`spawn_late_link_feed`); a caller with
+    /// no use for them drops the receiver, which is the old behavior.
     async fn build_peers(
         &self,
         address: &str,
         id: ObjId,
-    ) -> Result<(Vec<PeerHandle>, HashMap<String, Vec<u8>>), String> {
-        let peers = self.state.connectable_peers(address, 8).await;
+    ) -> Result<
+        (
+            Vec<PeerHandle>,
+            HashMap<String, Vec<u8>>,
+            tokio::sync::mpsc::UnboundedReceiver<LaneResult>,
+        ),
+        String,
+    > {
+        // Data-session slots: peers with data history for this xite first
+        // (see fetch_session_peers) - the gateway-style non-seeder must not
+        // occupy one of the 8 dials while a byte source waits below the cut.
+        let peers = self.state.fetch_session_peers(address, 8).await;
         if peers.is_empty() {
             return Err("no peers".into());
         }
@@ -1903,13 +1990,14 @@ impl RuntimeEdxFetcher {
             }
         }
         // A lane that lands after the grace window is not lost: it stays warm
-        // in the link pool, so the next window of this stream picks it up
-        // without paying for the circuit again.
+        // in the link pool, it reaches the object's cached session via
+        // add_cached_lane, and the bulk path joins it into the running fetch
+        // through the returned channel.
         self.xfer.note_session(id, address, now_secs(), total as u64, handles.len() as u64);
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
-        Ok((handles, node_pks))
+        Ok((handles, node_pks, rx))
     }
 
     /// Open this peer's extra transfer lanes and hand each one to the session
@@ -2084,6 +2172,45 @@ impl RuntimeEdxFetcher {
         entry.handles.push(handle);
     }
 
+    /// Feed a session's late dial results into a running bulk fetch: every
+    /// lane and peer that resolves after the first-handle grace becomes a
+    /// swarm joiner (`Swarm::fetch_growable`) instead of a warm link
+    /// nothing reads. Late whole peers - their lane 0 carries a fresh
+    /// bitfield - are also appended to the object's cached session, exactly
+    /// as `collect_extra_lanes` already does for extra lanes, so a retry
+    /// and the read-ahead see them too. Ends when the dial driver settles
+    /// every peer (the channel closes) or the fetch returns (the send
+    /// fails); dropping `join_tx` then tells the fetch no more are coming.
+    fn spawn_late_link_feed(
+        &self,
+        mut late: tokio::sync::mpsc::UnboundedReceiver<LaneResult>,
+        id: ObjId,
+        address: String,
+        node_pks: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        join_tx: tokio::sync::mpsc::UnboundedSender<PeerHandle>,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            while let Some((peer, got, primary)) = late.recv().await {
+                let Some((conn, identity, bits)) = got else { continue };
+                let label = peer.to_string();
+                let handle =
+                    PeerHandle { conn, class: Class::of_addr(&peer), bits, label: label.clone() };
+                node_pks.lock().expect("node pks").insert(label, identity.node_pk.clone());
+                if primary {
+                    // Extra lanes reach the cache via add_cached_lane on
+                    // the dial path already; adding them here too would
+                    // duplicate the handle in the cached session.
+                    this.add_cached_lane(id, clone_handle(&handle), identity.node_pk);
+                }
+                if join_tx.send(handle).is_err() {
+                    break; // fetch over; the dial driver still scores the rest
+                }
+                this.xfer.note_session_join(id, &address, now_secs());
+            }
+        });
+    }
+
     /// Revalidate cached session handles for `id`: refresh each link's
     /// bitfield (the peer may hold more groups than when it was dialed) and
     /// drop handles whose connection died or stopped answering - the
@@ -2185,7 +2312,10 @@ impl RuntimeEdxFetcher {
                 return Ok((live, node_pks));
             }
         }
-        let (handles, node_pks) = self.build_peers(address, id).await?;
+        // The dial channel is dropped: a streaming window is over in
+        // seconds, and late lanes reach the NEXT window through the cached
+        // session (add_cached_lane) as they always have.
+        let (handles, node_pks, _late) = self.build_peers(address, id).await?;
         self.cache_peers(id, &handles, &node_pks);
         Ok((handles, node_pks))
     }
@@ -2223,7 +2353,7 @@ impl RuntimeEdxFetcher {
             Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
         match swarm.fetch(needed, &handles, Deadline::tight(), now).await {
             Ok(report) => {
-                self.credit(&report, &node_pks, now);
+                self.credit(address, &report, &node_pks, now).await;
                 None
             }
             Err(e) => {
@@ -2286,10 +2416,15 @@ impl RuntimeEdxFetcher {
     /// `EPIX_EDX_COMPLETE_MEDIA=0` opts a bandwidth/disk-conscious node out,
     /// reverting to fetch-what-you-view.
     /// Mark a foreground (player-blocking) range fetch as on the network for
-    /// the guard's lifetime; `run_completion` yields while any is live.
+    /// the guard's lifetime; `run_completion` yields while any is live, and
+    /// the process-wide count drives the seeder side's LEDBAT yield (see
+    /// [`set_edx_foreground`]).
     fn note_foreground_fetch(&self) -> ForegroundFetch {
         if let Ok(mut s) = self.streaming.lock() {
             s.foreground_fetches += 1;
+        }
+        if FOREGROUND_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            set_edx_foreground(true);
         }
         ForegroundFetch { streaming: self.streaming.clone() }
     }
@@ -2397,7 +2532,7 @@ impl RuntimeEdxFetcher {
             else {
                 return;
             };
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
             let _ = store.enforce_quota(store_quota());
             if report.groups_fetched == 0 {
                 if batch.count() >= needed.count() {
@@ -2410,7 +2545,7 @@ impl RuntimeEdxFetcher {
                 else {
                     return;
                 };
-                self.credit(&rest, &node_pks, now);
+                self.credit(address, &rest, &node_pks, now).await;
                 let _ = store.enforce_quota(store_quota());
                 if rest.groups_fetched == 0 {
                     return;
@@ -2513,7 +2648,7 @@ impl RuntimeEdxFetcher {
         // minute from now - so it fetches in play order over the fastest peers,
         // not as background bulk spread across whoever is idle.
         if let Ok(report) = swarm.fetch(&needed, &handles, Deadline::prefetch(), now).await {
-            self.credit(&report, &node_pks, now);
+            self.credit(address, &report, &node_pks, now).await;
         }
         self.xfer.note_readahead(id, address, now_secs(), None);
         let _ = store.enforce_quota(store_quota());
@@ -2665,15 +2800,17 @@ impl RuntimeEdxFetcher {
         let mut spawn_next = |fetching: &mut tokio::task::JoinSet<(Res, bool)>| {
             let Some(r) = queue.next() else { return false };
             let this = self.clone();
-            // Re-read the session per file: peers that finished dialing since
-            // the tier started stripe the objects still queued, so a swarm
-            // that began on one link widens as the rest land.
-            let (store, session) = (store.clone(), Arc::new(session.peers()));
+            // The session is handed down live, not snapshotted: each file
+            // starts on the links dialed so far and keeps joining the ones
+            // that land while it runs (fetch_one_over_session), so a swarm
+            // that began on one link widens as the rest arrive.
+            let (store, session) = (store.clone(), session.clone());
             let serving = progress.serving.clone();
+            let address = address.to_string();
             fetching.spawn(async move {
                 let complete = this
                     .fetch_one_over_session(
-                        &store, r.id, r.size, &session, deadline, now, &serving,
+                        &address, &store, r.id, r.size, &session, deadline, now, &serving,
                     )
                     .await;
                 (r, complete)
@@ -2839,13 +2976,18 @@ impl RuntimeEdxFetcher {
     /// Every peer the swarm actually drew groups from joins the batch's serving
     /// set, so a big file striped across the session reports the same "from N
     /// peers" the GetMany rounds do.
+    ///
+    /// Links that finish dialing while THIS file runs join its swarm with a
+    /// fresh bitfield (`spawn_session_link_feed`) rather than waiting for
+    /// the next file - a clone's large files span the whole dial phase.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_one_over_session(
         &self,
+        address: &str,
         store: &Arc<Store>,
         id: ObjId,
         size: u64,
-        session: &[SessionPeer],
+        session: &Session,
         deadline: Deadline,
         now: u64,
         serving: &Arc<Mutex<HashSet<String>>>,
@@ -2853,9 +2995,10 @@ impl RuntimeEdxFetcher {
         if store.is_complete(id).unwrap_or(false) {
             return true;
         }
+        let snapshot = session.peers();
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
-        for p in session {
+        for p in &snapshot {
             p.reg.note_cmd_sent("GetBitfield", None);
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&p.conn, id))
@@ -2879,12 +3022,17 @@ impl RuntimeEdxFetcher {
             return false;
         };
         let Ok(needed) = needed_groups(store, id, size) else { return false };
-        let mut swarm = Swarm::new(store.clone(), id, size);
-        if let Ok(report) = swarm.fetch(&needed, &handles, deadline, now).await {
+        let mut swarm =
+            Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
+        let node_pks = Arc::new(Mutex::new(node_pks));
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        spawn_session_link_feed(session.clone(), snapshot.len(), id, node_pks.clone(), join_tx);
+        if let Ok(report) = swarm.fetch_growable(&needed, handles, joiners, deadline, now).await {
             for (label, _) in report.by_peer.iter().filter(|(_, groups)| **groups > 0) {
                 BatchProgress::note_peer(serving, label);
             }
-            self.credit(&report, &node_pks, now);
+            let pks = node_pks.lock().expect("node pks").clone();
+            self.credit(address, &report, &pks, now).await;
         }
         store.is_complete(id).unwrap_or(false)
     }
@@ -3097,6 +3245,7 @@ impl RuntimeEdxFetcher {
         address: &str,
         inner_path: &str,
         deadline: Deadline,
+        on_fetched: Option<epix_ui::state::EdxFetchedHook>,
     ) -> Result<bool, String> {
         let store = self.state.edx_store().await.ok_or("no EDX store")?;
         // Encrypted-shard file: fetch the ciphertext shards and decrypt.
@@ -3114,11 +3263,20 @@ impl RuntimeEdxFetcher {
 
         // Already complete in the store: just materialize it.
         if store.is_complete(id).unwrap_or(false) {
-            self.materialize(address, inner_path, id, size, &store).await?;
+            self.materialize_gated(address, inner_path, id, size, &store, on_fetched.as_ref())
+                .await?;
             return Ok(true);
         }
 
-        let (handles, node_pks) = self.build_peers(address, id).await?;
+        let (handles, node_pks, late) = self.build_peers(address, id).await?;
+        // Register the session in the peer cache BEFORE fetching. This is
+        // what lets add_cached_lane land the extra overlay lanes still
+        // dialing - over Tor they nearly always finish after the
+        // first-handle grace, and with no cache entry they were silently
+        // dropped, which is how a multi-GB file rode ONE circuit for its
+        // whole life. It also hands a retry of this file a warm session
+        // instead of a redial.
+        self.cache_peers(id, &handles, &node_pks);
         // Reserve the sparse record only now that a peer can serve it, and drop
         // it again if nothing lands (see `ObjClaim`): a manifest entry a
         // visitor touches once must not leave an index row and a sparse/.obao
@@ -3126,21 +3284,87 @@ impl RuntimeEdxFetcher {
         let _claim =
             self.claim_object(&store, id, Ns::Plain, size, now).map_err(|e| e.to_string())?;
         let needed = needed_groups(&store, id, size).map_err(|e| e.to_string())?;
-        let mut swarm = Swarm::new(store.clone(), id, size);
-        let report = match swarm.fetch(&needed, &handles, deadline, now).await {
+        let mut swarm =
+            Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
+        // Links that finish dialing after the grace join the RUNNING fetch:
+        // the extra lanes and the slow circuits used to warm a pool nothing
+        // read while the fetch stayed frozen on whatever made the 2s cut.
+        let node_pks = Arc::new(Mutex::new(node_pks));
+        let (join_tx, joiners) = tokio::sync::mpsc::unbounded_channel();
+        self.spawn_late_link_feed(late, id, address.to_string(), node_pks.clone(), join_tx);
+        let report = match swarm.fetch_growable(&needed, handles, joiners, deadline, now).await {
             Ok(report) => report,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => {
+                let e = e.to_string();
+                // Stamped fresh: `now` predates the fetch, which can span
+                // an hour on a multi-GB file, and last_error reports an age.
+                self.xfer.note_error(id, address, now_secs(), &e);
+                return Err(e);
+            }
         };
-        self.credit(&report, &node_pks, now);
+        // Hold the (possibly just-completed) object against quota eviction
+        // NOW, not in materialize_gated: `credit` awaits first (choker +
+        // xites locks), and a sibling pooled file completing in that gap
+        // runs `enforce_quota` - at quota its LRU pass could take exactly
+        // the bytes this fetch just spent an hour landing. Holds are
+        // counted, so the one materialize_gated takes simply overlaps.
+        let _hold = store.hold_eviction(id);
+        let pks = node_pks.lock().expect("node pks").clone();
+        self.credit(address, &report, &pks, now).await;
         if !store.is_complete(id).unwrap_or(false) {
+            // The scheduler's silent-exhaustion path (peers ran out of
+            // strikes): name it in the telemetry, not just the round log.
+            self.xfer.note_error(id, address, now_secs(), "fetch did not complete");
             return Err("fetch did not complete".into());
         }
 
-        self.materialize(address, inner_path, id, size, &store).await?;
+        self.materialize_gated(address, inner_path, id, size, &store, on_fetched.as_ref()).await?;
         // Cached content grows the store; keep it under quota (own content is
         // pinned, so only cached-from-others objects are evicted).
         let _ = store.enforce_quota(store_quota());
         Ok(true)
+    }
+
+    /// [`Self::materialize`] with the pool handoff around it: hold the
+    /// completed object against quota eviction, tell the worker pool the
+    /// network phase is over (`on_fetched`), and only then run the copy -
+    /// pooled callers queue it on the bounded materialize gate.
+    ///
+    /// The hold closes a real window: a complete-but-not-yet-materialized
+    /// object is refcount-0 (`ObjClaim` guards record removal by sibling
+    /// claims, not quota eviction), and every OTHER completing file runs
+    /// `enforce_quota` - at quota, the LRU pass would take exactly the bytes
+    /// this file just spent an hour fetching, and a gate queue makes that
+    /// window minutes wide. In-memory on purpose: after a crash the holds
+    /// are gone, the object is ordinary cache again, and the file re-checks
+    /// as missing and refetches (completing instantly if it survived).
+    async fn materialize_gated(
+        &self,
+        address: &str,
+        inner_path: &str,
+        id: ObjId,
+        size: u64,
+        store: &Arc<Store>,
+        on_fetched: Option<&epix_ui::state::EdxFetchedHook>,
+    ) -> Result<(), String> {
+        let _hold = store.hold_eviction(id);
+        let _permit = match on_fetched {
+            Some(fetched) => {
+                // Hold taken first: the freed slot's next file can complete
+                // and run enforce_quota before our copy starts.
+                fetched();
+                Some(
+                    self.materialize_gate
+                        .acquire()
+                        .await
+                        .expect("materialize gate is never closed"),
+                )
+            }
+            // Interactive/streaming callers: something is waiting on the
+            // file, so never queue it behind bulk copies.
+            None => None,
+        };
+        self.materialize(address, inner_path, id, size, store).await
     }
 
     /// Turn a completed object into the xite's file on disk.
@@ -3367,6 +3591,43 @@ impl Session {
             }
         }
     }
+}
+
+/// Turn session links that finish dialing while one file's swarm runs into
+/// joiners for it: fetch the newcomer's bitfield for this object and hand
+/// the handle to the fetch. The first `staffed` links are the fetch's entry
+/// set. Ends when the session stops growing (dialing settled) or the fetch
+/// returns (the send fails); dropping `join_tx` then tells the fetch no
+/// more are coming.
+fn spawn_session_link_feed(
+    session: Session,
+    mut staffed: usize,
+    id: ObjId,
+    node_pks: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    join_tx: tokio::sync::mpsc::UnboundedSender<PeerHandle>,
+) {
+    tokio::spawn(async move {
+        while session.grows_past(staffed).await {
+            for p in session.peers().into_iter().skip(staffed) {
+                staffed += 1;
+                p.reg.note_cmd_sent("GetBitfield", None);
+                let Ok(Ok((_sz, bits))) = tokio::time::timeout(
+                    EDX_FETCH_TIMEOUT,
+                    epix_edx::fetch::fetch_bitfield(&p.conn, id),
+                )
+                .await
+                else {
+                    continue;
+                };
+                node_pks.lock().expect("node pks").insert(p.label.clone(), p.node_pk.clone());
+                let handle =
+                    PeerHandle { conn: p.conn, class: p.class, bits, label: p.label };
+                if join_tx.send(handle).is_err() {
+                    return; // the fetch is over
+                }
+            }
+        }
+    });
 }
 
 /// The distinct object ids of a batch's wants, in caller order, plus the want
@@ -3597,7 +3858,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // queued behind whatever the scheduler was already doing, which is the
         // other half of "the page you are viewing should jump the queue"
         // (the first half is the type ladder in `fetch_tiers`).
-        self.fetch_file_at(address, inner_path, Deadline::tight()).await
+        self.fetch_file_at(address, inner_path, Deadline::tight(), None).await
     }
 
     async fn fetch_file_background(&self, address: &str, inner_path: &str) -> Result<bool, String> {
@@ -3606,7 +3867,19 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // retention completion pass and the optional retry loop use - work
         // that runs behind an already-painted page must never compete at
         // first-paint urgency, nor pay first-paint impatience.
-        self.fetch_file_at(address, inner_path, Deadline::background()).await
+        self.fetch_file_at(address, inner_path, Deadline::background(), None).await
+    }
+
+    async fn fetch_file_pooled(
+        &self,
+        address: &str,
+        inner_path: &str,
+        fetched: epix_ui::state::EdxFetchedHook,
+    ) -> Result<bool, String> {
+        // Background patience, plus the slot handoff: `fetched` fires once
+        // the object is complete in the store, and the materialize copy
+        // then queues on the bounded gate instead of the caller's pool.
+        self.fetch_file_at(address, inner_path, Deadline::background(), Some(fetched)).await
     }
 
     async fn fetch_signed(
@@ -4276,6 +4549,29 @@ mod tests {
     use epix_transport::{TcpTransport, Transport};
     use epix_ui::state::XiteEntry;
     use epix_xite::{Xite, XiteStorage};
+
+    /// The foreground guards drive the process-wide LEDBAT flag: any live
+    /// guard holds it up, and the last drop clears it. Asserted relatively
+    /// where it must be (other tests in this binary can hold their own
+    /// guards concurrently).
+    #[tokio::test]
+    async fn foreground_fetch_guards_flip_the_shared_yield_flag() {
+        use std::sync::atomic::Ordering;
+        let state = epix_ui::state::AppState::new("test");
+        let fetcher = RuntimeEdxFetcher::new(state, String::new(), None);
+        let flag = edx_foreground_flag();
+        let a = fetcher.note_foreground_fetch();
+        let b = fetcher.note_foreground_fetch();
+        assert!(flag.load(Ordering::Relaxed), "a live guard holds the flag up");
+        drop(a);
+        assert!(flag.load(Ordering::Relaxed), "one guard still in flight");
+        drop(b);
+        // Our own drops must never leave the flag stuck; only meaningful
+        // when no other test currently holds a guard.
+        if FOREGROUND_FETCHES.load(Ordering::Relaxed) == 0 {
+            assert!(!flag.load(Ordering::Relaxed), "the last drop clears the flag");
+        }
+    }
 
     /// env_on is on unless explicitly disabled: true when unset, false only for
     /// a 0/false value. EDX itself has no on/off knob anymore (it is the

@@ -22,6 +22,7 @@ pub mod frame;
 pub mod link;
 pub mod msg;
 pub mod noise;
+pub mod pace;
 pub mod sched;
 pub mod server;
 pub mod sim;

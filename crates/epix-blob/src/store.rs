@@ -266,6 +266,16 @@ pub struct Store {
     /// the fresh record's present bits with groups whose bytes went to
     /// the unlinked inode.
     sparse_writers: Mutex<HashMap<ObjId, usize>>,
+    /// Objects held out of QUOTA eviction's reach while a caller finishes
+    /// post-completion work (a bulk fetch queueing its materialize). A
+    /// complete-but-not-yet-materialized object is refcount-0 — exactly what
+    /// `evict_lru` reclaims first at quota — so without a hold, one file's
+    /// completing `enforce_quota` could evict the bytes another just spent
+    /// an hour fetching. In-memory deliberately: a crash drops every hold,
+    /// the object is ordinary cache again, and the file re-checks as
+    /// missing and refetches. Only eviction consults this; an explicit
+    /// `remove` (the user deleting content) still proceeds.
+    evict_holds: Mutex<HashMap<ObjId, usize>>,
 }
 
 /// Registration of one in-flight sparse decode (see `Store::sparse_writers`).
@@ -288,6 +298,26 @@ impl Drop for SparseWriteGuard<'_> {
             *n -= 1;
             if *n == 0 {
                 writers.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// One live hold keeping an object out of eviction while it lives (see
+/// `Store::evict_holds`). Counted, so overlapping fetches of the same object
+/// each hold independently. Releases on drop, error paths included.
+pub struct EvictionHold<'a> {
+    store: &'a Store,
+    id: ObjId,
+}
+
+impl Drop for EvictionHold<'_> {
+    fn drop(&mut self) {
+        let mut holds = self.store.evict_holds.lock().expect("evict_holds");
+        if let Some(n) = holds.get_mut(&self.id) {
+            *n -= 1;
+            if *n == 0 {
+                holds.remove(&self.id);
             }
         }
     }
@@ -431,6 +461,7 @@ impl Store {
             cfg,
             open_slab: Mutex::new(open_slab),
             sparse_writers: Mutex::new(HashMap::new()),
+            evict_holds: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1367,6 +1398,13 @@ impl Store {
         if writers.contains_key(&id) {
             return Ok(None);
         }
+        // Also held across the delete: a hold taken while this txn commits
+        // waits here, so it either precedes the check or sees the record
+        // already gone (and the holder's materialize fails into a refetch).
+        let holds = self.evict_holds.lock().expect("evict_holds");
+        if holds.contains_key(&id) {
+            return Ok(None);
+        }
         let txn = self.db.begin_write().map_err(db_err)?;
         let deleted: Option<ObjRecord>;
         {
@@ -1442,6 +1480,15 @@ impl Store {
             }
         }
         Ok(total)
+    }
+
+    /// Hold `id` out of eviction's reach until the returned guard drops
+    /// (see `evict_holds`). Unlike [`Store::pin`] this is not persisted:
+    /// it protects a completed download only for as long as the process is
+    /// still on its way to materializing it.
+    pub fn hold_eviction(&self, id: ObjId) -> EvictionHold<'_> {
+        *self.evict_holds.lock().expect("evict_holds").entry(id).or_insert(0) += 1;
+        EvictionHold { store: self, id }
     }
 
     /// Pin an object so eviction never reclaims it (the node's own content).
@@ -2022,6 +2069,39 @@ mod tests {
         store.ref_delta(id, -1).unwrap();
         assert!(store.delete_if_unreferenced(id).unwrap().is_some());
         assert!(!store.contains(id).unwrap());
+    }
+
+    /// A completed download waiting on its materialize copy is refcount-0 -
+    /// LRU's first pick at quota - so the fetch holds it. The hold must beat
+    /// both quota passes, count overlapping holders, and release on drop so
+    /// the object goes back to being ordinary evictable cache.
+    #[test]
+    fn an_eviction_hold_keeps_a_complete_object_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+
+        let data = test_data(50_000);
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+        let newer = test_data(51_000);
+        let newer_id = ObjId::of(&newer);
+        store.insert_bytes(newer_id, Ns::Plain, &newer, 2).unwrap();
+
+        let hold = store.hold_eviction(id);
+        let again = store.hold_eviction(id);
+        // Quota 0: everything unheld must go; the held object survives even
+        // though it is the LRU candidate.
+        store.enforce_quota(0).unwrap();
+        assert!(store.contains(id).unwrap(), "a held object outlives the quota pass");
+        assert!(!store.contains(newer_id).unwrap(), "unheld cache is still evicted");
+
+        drop(hold);
+        store.enforce_quota(0).unwrap();
+        assert!(store.contains(id).unwrap(), "still held by the second holder");
+
+        drop(again);
+        store.enforce_quota(0).unwrap();
+        assert!(!store.contains(id).unwrap(), "released, it is ordinary cache again");
     }
 
     #[test]

@@ -139,6 +139,23 @@ pub trait EdxFetcher: Send + Sync {
         self.fetch_file(address, inner_path).await
     }
 
+    /// [`Self::fetch_file_background`] for one file of a bulk WORKER POOL:
+    /// same patient fetch, plus `fetched` fires the moment the network phase
+    /// ends (object complete in the store), letting the pool reassign the
+    /// slot while this call finishes the materialize copy off-pool. The
+    /// default delegates and signals only on return, which is correct (if
+    /// slotless) for mocks and simple implementations.
+    async fn fetch_file_pooled(
+        &self,
+        address: &str,
+        inner_path: &str,
+        fetched: EdxFetchedHook,
+    ) -> Result<bool, String> {
+        let done = self.fetch_file_background(address, inner_path).await;
+        fetched();
+        done
+    }
+
     /// Fetch a signed inner_path (content.json - the manifest, or a child
     /// content.json) of `address` from a single `peer` over an EDX link, via
     /// `GetSigned`. This is the EDX manifest channel that replaces the msgpack
@@ -344,6 +361,15 @@ pub type EdxBatchProgress = Arc<dyn Fn(&str, u64, usize) + Send + Sync>;
 /// dozen-plus per-user manifests.
 pub type EdxSignedProgress = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
 
+/// Signal from [`EdxFetcher::fetch_file_pooled`] that the file's NETWORK
+/// phase is over: the object is complete in the store and only the
+/// materialize copy into the xite tree remains. The bulk worker pool hands
+/// the freed slot to its next file on this, instead of idling a fetch slot
+/// through a GB-scale copy (the data dir can sit on a network mount). May
+/// fire more than once (an in-place retry that finds the object already
+/// complete re-signals); receivers treat it as idempotent.
+pub type EdxFetchedHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Read a file's `(b3 ObjId, size)` from a content.json `files` map, so a
 /// staged (uncommitted) update's files resolve against the NEW manifest rather
 /// than the committed one. `None` if the file is absent or has no `b3`.
@@ -458,6 +484,40 @@ const FEED_PIN_GRACE_MS: u64 = 2 * crate::feed::SEGMENT_INTERVAL_MS;
 /// how long a toggled-off / paused / deleted xite keeps pulling bytes, while
 /// still dialing the seed peers once per batch rather than once per file.
 const EDX_BULK_OPTIONAL_CHUNK: usize = 32;
+
+/// How many optional files a bulk round keeps in the NETWORK phase at once.
+/// Each file rides its own peer session (own circuits/lanes), so the old
+/// strictly serial loop capped a whole multi-file pass at one circuit's
+/// ~300-400 KB/s; parallel files multiply the circuits drawn against the
+/// seeder set and hide per-file dial/bitfield boundaries. Safe against the
+/// shared-circuit false-stall trap because files sharing a seeder share its
+/// pooled `Conn`, whose link-level queued-bytes counter scales every
+/// sharing swarm's stall windows and batch caps (`Conn::queued_fetch_bytes`
+/// / `link_queue_depth`) - a batch queued behind a sibling file reads as
+/// queue depth, not as a stall. Three, not more: dials run through a
+/// process-wide 8-permit semaphore, and a lone complete seeder's onion
+/// stack has to build ~3 lanes per file.
+const OPTIONAL_FETCH_WORKERS: usize = 3;
+
+/// How many completed-but-not-yet-materialized files a bulk round tolerates
+/// before it stops assigning new fetches. The materialize copy runs off the
+/// pool behind a small gate; on a slow data dir (SMB) fetches can outrun
+/// copies, and every completed-unmaterialized object sits in the store held
+/// against eviction - unbounded, that could push the store arbitrarily far
+/// past its quota.
+const OPTIONAL_MATERIALIZE_BACKLOG: usize = 3;
+
+/// How long a bulk optional pass waits between mid-pass re-announces: 10
+/// minutes plus up to 5 minutes of per-xite deterministic jitter, so several
+/// passes started together do not hit the tracker set in lockstep. The
+/// interval IS the rate bound - each announce fans out to the whole tracker
+/// set, over Tor a circuit per tracker.
+fn optional_reannounce_delay(address: &str) -> std::time::Duration {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    address.hash(&mut h);
+    std::time::Duration::from_secs(600 + h.finish() % 300)
+}
 
 /// How many of a body-less push's advertised publisher addresses are tried when
 /// fetching the content.json back. Each try costs one dial deadline, and the
@@ -3254,6 +3314,10 @@ impl AppState {
         peer.connection_errors =
             o.get("errors").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
         peer.time_response = o.get("seen").and_then(|v| v.as_i64()).unwrap_or(0);
+        // Clamped to now for the same reason as `found` below: a future stamp
+        // must not mint a permanently "just served us" peer.
+        peer.time_data =
+            o.get("data").and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now);
         // How long we have known this peer, which is the durability tiebreak
         // in peer selection. Clamped to now: a future stamp (clock skew, an
         // edited file) must not mint an unbeatably "old" peer. Absent ->
@@ -3270,12 +3334,12 @@ impl AppState {
         // behaviour.
         //
         // Cap against the ceilings the in-memory backoff uses (dial 1h,
-        // probe ~10min) so a hand-edited or corrupt file can't bench a peer
-        // forever.
+        // probe ~10min, 2h for repeat-offender onions) so a hand-edited or
+        // corrupt file can't bench a peer forever.
         let cap =
             |v: Option<&Value>, max: i64| v.and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, now + max);
         peer.retry_after = cap(o.get("retry_after"), 3600);
-        peer.probe_after = cap(o.get("probe_after"), 600);
+        peer.probe_after = cap(o.get("probe_after"), 7200);
         peer.probe_failures =
             o.get("probe_failures").and_then(|v| v.as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
         peer.benched_since = o.get("benched_since").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
@@ -3389,6 +3453,9 @@ impl AppState {
             ("probe_after", (p.probe_after > now).then_some(p.probe_after)),
             ("benched_since", (p.benched_since > 0).then_some(p.benched_since)),
             ("probe_failures", (p.probe_failures > 0).then_some(p.probe_failures as i64)),
+            // Data history survives a restart: the fetch-slot preference is
+            // most useful right after boot, when everything else looks cold.
+            ("data", (p.time_data > 0).then_some(p.time_data)),
         ] {
             if let Some(v) = value {
                 o.insert(key.into(), json!(v));
@@ -3821,25 +3888,29 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    /// Background sampler for the file currently being fetched: every ~1.5s it
-    /// reports the phase ("Waiting for peers…", "Fetching from N peer(s)…",
-    /// "Downloading N%") from the connectable-peer count and the
-    /// optional-bytes delta, and moves the overall bar as pieces land.
-    /// `done_bytes` is the total already completed; `file_size` sizes the
-    /// current file's %. Byte-level % only appears for bigfiles (their pieces
-    /// bump the counter as they land); a regular file's counter moves once at
-    /// the end, so its phase says "Fetching from…" - honest about connect +
-    /// transfer both - rather than a "Connecting…" that would sit there
-    /// through the whole transfer. `round`/`rounds` tag the status with the
+    /// Background sampler for a round's worker pool: every ~1.5s it reports
+    /// the phase ("Waiting for peers…", "Fetching from N peer(s)…",
+    /// "Downloading N%") and moves the overall bar as pieces land, summed
+    /// over every file in `active` (the pool runs several at once, and one
+    /// sampler owns the status line - per-file samplers would overwrite each
+    /// other). An EDX transfer reads its truth off its transfer row: bytes
+    /// present in the sparse store (live, where the optional-bytes counter
+    /// moves only at materialize) and the session's actual connected-peer
+    /// count; the peer readout is the busiest file's count, since parallel
+    /// files usually share the same seeders. When NO active file has a row
+    /// yet (dial phase, msgpack fallback, bigfile pieces) the old fallback
+    /// applies: the optional-bytes delta and the connectable count.
+    /// `done_bytes` is the running completed-bytes total, advanced by the
+    /// round loop as files land. `round`/`rounds` tag the status with the
     /// retry round ("… (retry 2/3)") so retries are visible in the panel
     /// itself - a separate between-rounds phase write gets overwritten by
     /// this sampler within milliseconds. Runs until `stop`.
     fn spawn_optional_status_sampler(
         self: Arc<Self>,
         address: String,
-        stop: Arc<std::sync::atomic::AtomicBool>,
-        done_bytes: u64,
-        file_size: u64,
+        active: Arc<std::sync::Mutex<HashMap<usize, (String, u64)>>>,
+        stop: Arc<AtomicBool>,
+        done_bytes: Arc<AtomicU64>,
         round: usize,
         rounds: usize,
     ) -> tokio::task::JoinHandle<()> {
@@ -3847,21 +3918,55 @@ impl AppState {
             let suffix =
                 if round > 1 { format!(" (retry {round}/{rounds})") } else { String::new() };
             let base = self.optional_downloaded_now(&address).await;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let got = self.optional_downloaded_now(&address).await.saturating_sub(base);
-                let got = got.min(file_size); // ignore any concurrent optional traffic overshoot
-                let peers = self.connectable_peers(&address, 20).await.len();
-                let status = optional_fetch_status(got, file_size, peers, &suffix);
-                self.set_optional_status(&address, status, done_bytes + got).await;
-                // Short sleeps so `stop` is honored promptly when the fetch ends.
+            while !stop.load(Ordering::Relaxed) {
+                let files: Vec<(String, u64)> =
+                    active.lock().unwrap().values().cloned().collect();
+                let size_sum: u64 = files.iter().map(|(_, s)| *s).sum();
+                let (got, peers) = self.optional_pool_sample(&address, &files, base).await;
+                if !files.is_empty() {
+                    let status = optional_pool_status(files.len(), got, size_sum, peers, &suffix);
+                    self.set_optional_status(&address, status, done_bytes.load(Ordering::Relaxed) + got)
+                        .await;
+                }
+                // Short sleeps so `stop` is honored promptly when the round ends.
                 for _ in 0..3 {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if stop.load(Ordering::Relaxed) {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }
         })
+    }
+
+    /// One sampler tick's live totals for the given active files: bytes
+    /// landed and the widest connected-peer count, from each file's live
+    /// transfer row. When NO active file has a row yet (dial phase,
+    /// msgpack fallback, bigfile pieces) the fallback applies: the
+    /// optional-bytes delta since `base`, capped to the queued sizes, and
+    /// the connectable count.
+    async fn optional_pool_sample(
+        &self,
+        address: &str,
+        files: &[(String, u64)],
+        base: u64,
+    ) -> (u64, usize) {
+        let (mut got, mut peers, mut rows) = (0u64, 0usize, false);
+        for (path, size) in files {
+            let stats = self.edx_transfer_stats(address, path, None).await;
+            if let Some((have, connected)) = edx_live_progress(&stats) {
+                // min() per file: ignore any concurrent traffic overshoot.
+                got += have.min(*size);
+                peers = peers.max(connected as usize);
+                rows = true;
+            }
+        }
+        if !rows {
+            let size_sum: u64 = files.iter().map(|(_, s)| *s).sum();
+            got = self.optional_downloaded_now(address).await.saturating_sub(base).min(size_sum);
+            peers = self.connectable_peers(address, 20).await.len();
+        }
+        (got, peers)
     }
 
     /// The addresses of all served xites.
@@ -5413,6 +5518,20 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// [`Self::connectable_peers`] for DATA-fetch session slots: peers that
+    /// recently served us verified content bytes for this xite rank first
+    /// (`Peers::connectable_for_data`), so a metadata responder cannot squat
+    /// the few dial slots while the actual byte sources sit below the cut.
+    pub async fn fetch_session_peers(&self, address: &str, limit: usize) -> Vec<PeerAddr> {
+        let nets = self.dialable_networks().await;
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .map(|x| x.peers.connectable_for_data(limit, nets, now_secs()))
+            .unwrap_or_default()
+    }
+
     /// Reliable content sources drawn from the tracker list: an Epix tracker is
     /// an operator-run full node that also SEEDS, so its fileserver address is a
     /// dependable place to fetch from - unlike the peer registry, which fills
@@ -5458,8 +5577,31 @@ impl AppState {
         let mut out = self.connectable_peers(address, limit).await;
         let mut seen: std::collections::HashSet<String> =
             out.iter().map(|p| p.to_string()).collect();
+        // A tracker seed is rebuilt fresh from the tracker list every pass, so
+        // it never carried the registry's connect-fail backoff: a dead
+        // operator node was redialed at the top of every data session, each
+        // dial an overlay circuit. Its dial outcomes DO land in the registry
+        // (note_edx_dials adds unknown peers), so consult that entry here and
+        // let a benched seed wait its turn exactly like a table peer. This is
+        // the data-dial assembly only; announces never come through here.
+        let benched: std::collections::HashSet<String> = {
+            let now = now_secs();
+            self.xites
+                .read()
+                .await
+                .get(address)
+                .map(|x| {
+                    x.peers
+                        .peers()
+                        .filter(|p| !p.connected && p.retry_after > now)
+                        .map(|p| p.key())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         for p in self.tracker_seed_peers().await {
-            if seen.insert(p.to_string()) {
+            let key = p.to_string();
+            if !benched.contains(&key) && seen.insert(key) {
                 out.push(p);
             }
         }
@@ -5476,6 +5618,19 @@ impl AppState {
         if results.is_empty() {
             return;
         }
+        // Sessions also dial peers assembled OUTSIDE the registry (tracker
+        // seeds, [`Self::fetch_candidate_peers`]). apply_peer_outcomes skips
+        // unknown addresses, so a dead seed's failures used to vanish and it
+        // bypassed backoff forever; registering it first makes every dialed
+        // peer accumulate the same state as a table peer.
+        {
+            let now = now_secs();
+            if let Some(x) = self.xites.write().await.get_mut(address) {
+                for (p, _) in &results {
+                    x.peers.add(p.clone(), now);
+                }
+            }
+        }
         let outcomes = results
             .into_iter()
             .map(|(p, ok)| {
@@ -5488,6 +5643,28 @@ impl AppState {
             })
             .collect();
         self.apply_peer_outcomes(address, outcomes).await;
+    }
+
+    /// Record which peers actually DELIVERED verified data groups in a fetch
+    /// (per the scheduler's report), stamping each one's data history. This
+    /// is the signal reputation cannot carry - note_edx_dials scores a peer
+    /// that answers and holds nothing as ConnectOk, so "never served us a
+    /// byte" was invisible - and it is what [`Self::fetch_session_peers`]
+    /// prefers when filling data-session slots. Peers are added if unknown
+    /// (a tracker seed that served data has earned a registry entry).
+    pub async fn note_edx_served(&self, address: &str, served: Vec<PeerAddr>) {
+        if served.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        if let Some(x) = self.xites.write().await.get_mut(address) {
+            for addr in served {
+                x.peers.add(addr.clone(), now);
+                if let Some(p) = x.peers.get_mut(&addr) {
+                    p.note_data_served(now);
+                }
+            }
+        }
     }
 
     /// Benched peers across every served xite whose probe cooldown has
@@ -6324,7 +6501,7 @@ impl AppState {
     /// so the fetch runs at the tight deadline. Background work uses
     /// [`Self::file_need_background`].
     pub async fn file_need(&self, address: &str, inner_path: &str) -> Result<bool, String> {
-        self.file_need_at(address, inner_path, false).await
+        self.file_need_at(address, inner_path, false, None).await
     }
 
     /// [`Self::file_need`] for work nothing is waiting on: the retention
@@ -6338,7 +6515,20 @@ impl AppState {
         address: &str,
         inner_path: &str,
     ) -> Result<bool, String> {
-        self.file_need_at(address, inner_path, true).await
+        self.file_need_at(address, inner_path, true, None).await
+    }
+
+    /// [`Self::file_need_background`] for one file of the bulk worker pool:
+    /// `on_fetched` fires when the network phase ends so the pool can hand
+    /// the slot to the next file while this one's materialize copy drains
+    /// off-pool (see [`EdxFetchedHook`]).
+    async fn file_need_pooled(
+        &self,
+        address: &str,
+        inner_path: &str,
+        on_fetched: EdxFetchedHook,
+    ) -> Result<bool, String> {
+        self.file_need_at(address, inner_path, true, Some(on_fetched)).await
     }
 
     async fn file_need_at(
@@ -6346,6 +6536,7 @@ impl AppState {
         address: &str,
         inner_path: &str,
         background: bool,
+        on_fetched: Option<EdxFetchedHook>,
     ) -> Result<bool, String> {
         let (entry, _, _optional) = self
             .declared_entry(address, inner_path)
@@ -6395,38 +6586,73 @@ impl AppState {
         // streaming path fetches and materializes it (and does the optional-file
         // bookkeeping in edx_materialize_file). A file with no `b3`, or with no
         // fetcher installed, cannot be fetched (msgpack retired).
-        match entry.get("b3") {
-            Some(_) => {
-                // Retry a failed pass instead of surfacing the first stumble as
-                // "not found". Over Tor a multi-MB asset routinely loses its
-                // peer mid-transfer, and one incomplete swarm pass 404'd the
-                // request - the browser drew a broken image while the caller
-                // still had most of its deadline left. Partial groups persist
-                // in the store, so each attempt RESUMES rather than restarting,
-                // and the caller's timeout bounds the whole loop.
-                const ATTEMPTS: usize = 3;
-                let mut last = String::new();
-                for attempt in 0..ATTEMPTS {
-                    match self.edx_fetch_file(address, inner_path, background).await {
-                        Some(Ok(true)) => return Ok(true),
-                        Some(Ok(false)) => {
-                            last = format!("EDX could not complete {inner_path}")
-                        }
-                        Some(Err(e)) => last = e,
-                        // No fetcher is a permanent condition - retrying it
-                        // would just burn the caller's deadline.
-                        None => return Err("no EDX fetcher installed".into()),
-                    }
-                    if attempt + 1 < ATTEMPTS {
-                        // Let the just-scored dial outcomes settle so the next
-                        // pass draws a different (better) peer set.
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                }
-                Err(last)
-            }
-            None => Err(format!("{inner_path} has no b3 and cannot be fetched")),
+        if entry.get("b3").is_none() {
+            return Err(format!("{inner_path} has no b3 and cannot be fetched"));
         }
+        self.edx_fetch_with_resume(address, inner_path, background, on_fetched).await
+    }
+
+    /// Fetch one EDX file, retrying a failed pass instead of surfacing the
+    /// first stumble as "not found". Over Tor a multi-MB asset routinely
+    /// loses its peer mid-transfer, and one incomplete swarm pass 404'd the
+    /// request - the browser drew a broken image while the caller still had
+    /// most of its deadline left. Partial groups persist in the store, so
+    /// each attempt RESUMES rather than restarting, and the caller's
+    /// timeout bounds the whole loop.
+    ///
+    /// An attempt that MOVED bytes does not burn the retry budget: a
+    /// multi-GB file over tor loses its peer mid-transfer many times, and
+    /// requeueing it to a later round (60-600s backoff) on the third such
+    /// loss threw away a live resume for a cold restart. Only consecutive
+    /// no-progress attempts count toward giving up, with a hard total so
+    /// genuinely dead content still fails out to the round mechanism.
+    async fn edx_fetch_with_resume(
+        &self,
+        address: &str,
+        inner_path: &str,
+        background: bool,
+        on_fetched: Option<EdxFetchedHook>,
+    ) -> Result<bool, String> {
+        const ATTEMPTS: usize = 3;
+        const MAX_ATTEMPTS: usize = 10;
+        let mut last = String::new();
+        let mut no_progress = 0usize;
+        let mut have = self.edx_have_bytes(address, inner_path).await;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = match &on_fetched {
+                Some(hook) => self.edx_fetch_file_pooled(address, inner_path, hook.clone()).await,
+                None => self.edx_fetch_file(address, inner_path, background).await,
+            };
+            match result {
+                Some(Ok(true)) => return Ok(true),
+                Some(Ok(false)) => last = format!("EDX could not complete {inner_path}"),
+                Some(Err(e)) => last = e,
+                // No fetcher is a permanent condition - retrying it
+                // would just burn the caller's deadline.
+                None => return Err("no EDX fetcher installed".into()),
+            }
+            let now_have = self.edx_have_bytes(address, inner_path).await;
+            if now_have > have {
+                no_progress = 0;
+            } else {
+                no_progress += 1;
+            }
+            have = have.max(now_have);
+            if no_progress >= ATTEMPTS || attempt >= MAX_ATTEMPTS {
+                break;
+            }
+            // Let the just-scored dial outcomes settle so the next
+            // pass draws a different (better) peer set.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        Err(last)
+    }
+
+    /// Bytes already landed in the store for one file's live transfer row.
+    async fn edx_have_bytes(&self, address: &str, inner_path: &str) -> u64 {
+        edx_live_progress(&self.edx_transfer_stats(address, inner_path, None).await)
+            .map(|(h, _)| h)
+            .unwrap_or(0)
     }
 
     /// List optional files with their state and the per-file counters the
@@ -8922,6 +9148,19 @@ impl AppState {
         } else {
             fetcher.fetch_file(address, inner_path).await
         })
+    }
+
+    /// [`Self::edx_fetch_file`] for one file of the bulk worker pool: the
+    /// background fetch plus the fetcher's network-phase-done signal (see
+    /// [`EdxFetchedHook`]).
+    pub async fn edx_fetch_file_pooled(
+        &self,
+        address: &str,
+        inner_path: &str,
+        fetched: EdxFetchedHook,
+    ) -> Option<Result<bool, String>> {
+        let fetcher = self.edx_fetcher.read().await.clone()?;
+        Some(fetcher.fetch_file_pooled(address, inner_path, fetched).await)
     }
 
     /// Fetch a signed inner_path (content.json) of `address` from `peer` over
@@ -12228,37 +12467,39 @@ impl AppState {
         self.connectable_peers(address, 20).await.len()
     }
 
-    /// Fetch ONE optional file within a bulk pass: mark it Active in the
-    /// snapshot, run [`Self::file_need`] with a concurrent status sampler
-    /// (file_need blocks on peer discovery/connects/pieces; the sampler
-    /// reports what it is doing and moves the bar off the byte delta), and
-    /// stop the sampler the moment the fetch returns.
-    #[allow(clippy::too_many_arguments)]
-    async fn fetch_optional_with_status(
+    /// Re-announce periodically while a bulk optional pass runs.
+    /// [`Self::ensure_optional_peers`] deliberately skips announcing once a
+    /// single peer is known, so a multi-hour pass otherwise never learns
+    /// that a new replica appeared: the peer table it started from is the
+    /// peer table it dies with. Every [`optional_reannounce_delay`] (10-15
+    /// min, jittered per xite) this re-announces to the full tracker set;
+    /// the finds land in the xite's peer table, where the next session
+    /// build, in-file retry and the growable sessions' late joins pick them
+    /// up. One task per PASS, not per file: the parallel fetch workers all
+    /// read the same table, so one announce serves every worker. Ends
+    /// itself when the mandate is withdrawn; the caller aborts it when the
+    /// pass finishes. No "Announcing…" phase is shown - the round sampler
+    /// owns the status line while files are moving.
+    fn spawn_optional_reannounce(
         self: &Arc<Self>,
         address: &str,
-        idx: usize,
-        path: &str,
-        size: u64,
-        bytes_done: u64,
-        round: usize,
-        rounds: usize,
-    ) -> Result<bool, String> {
-        self.mark_optional_file(address, idx, OptFileState::Active, path).await;
-        self.push_site_info(address).await;
-        let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sampler = self.clone().spawn_optional_status_sampler(
-            address.to_string(),
-            sampler_stop.clone(),
-            bytes_done,
-            size,
-            round,
-            rounds,
-        );
-        let result = self.file_need_background(address, path).await;
-        sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = sampler.await;
-        result
+        directory: Option<&str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        let address = address.to_string();
+        let directory = directory.map(str::to_string);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(optional_reannounce_delay(&address)).await;
+                if !state.optional_pass_should_continue(&address, directory.as_deref()).await {
+                    break;
+                }
+                let bootstrap = state.bootstrap_trackers.read().await.clone();
+                let trackers = state.all_trackers(&bootstrap).await;
+                // announce_to_trackers registers its finds in the peer table.
+                let _ = state.announce_to_trackers(&address, &trackers).await;
+            }
+        })
     }
 
     /// One round of a bulk pass: try every queued file once, marking the
@@ -12266,6 +12507,22 @@ impl AppState {
     /// (failed this round) and whether the round aborted because the user
     /// withdrew the mandate mid-round (toggle off, pause, delete) - a
     /// multi-GB queue nobody wants anymore must stop between files.
+    ///
+    /// Files run through a small worker pool - [`OPTIONAL_FETCH_WORKERS`]
+    /// in the network phase at once - instead of strictly one at a time:
+    /// each file rides its own peer session, so the serial loop capped a
+    /// whole pass at one circuit's ~300-400 KB/s. A slot passes to the next
+    /// file the moment the fetcher signals a file's network phase is over
+    /// (see [`EdxFetchedHook`]); the materialize copy drains off-pool,
+    /// bounded by [`OPTIONAL_MATERIALIZE_BACKLOG`] here and the fetcher's
+    /// copy gate there, and a file counts Done/Failed only when the whole
+    /// job resolves - a failed materialize requeues exactly like a failed
+    /// fetch. The mandate is re-checked before every assignment and polled
+    /// while the loop waits (with the pool full, or the queue drained into
+    /// it, no assignment runs for the rest of the round - the tail files
+    /// would otherwise fetch to completion after the user toggled off);
+    /// withdrawal drops the in-flight fetches (partial groups persist in
+    /// the store, so a resumed pass loses nothing) and aborts the round.
     #[allow(clippy::too_many_arguments)]
     async fn run_optional_round<'a>(
         self: &Arc<Self>,
@@ -12277,40 +12534,170 @@ impl AppState {
         fetched: &mut usize,
         bytes_done: &mut u64,
     ) -> (Vec<(usize, &'a String, u64)>, bool) {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
         let mut requeue: Vec<(usize, &'a String, u64)> = Vec::new();
-        for (pos, (idx, path, size)) in queue.iter().enumerate() {
-            if !self.optional_pass_should_continue(address, directory).await {
-                return (requeue, true);
-            }
-            let result = self
-                .fetch_optional_with_status(address, *idx, path, *size, *bytes_done, round, rounds)
-                .await;
-            match result {
-                Ok(_) => {
-                    *fetched += 1;
-                    *bytes_done += *size;
-                    self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
-                    self.bump_optional_progress(address, *fetched, requeue.len(), *bytes_done)
-                        .await;
-                    // Per-file event: open pages re-query, the sidebar's
-                    // downloaded-bytes counter moves while the pass runs.
-                    self.push_site_info_file_done(address, path, None).await;
+        // Per-idx lookup for completions, which arrive out of queue order.
+        let by_idx: HashMap<usize, (&'a String, u64)> =
+            queue.iter().map(|(i, p, s)| (*i, (*p, *s))).collect();
+
+        // One sampler owns the round's status line (per-file samplers would
+        // overwrite each other); the loop maintains its view of the active
+        // files and the completed-bytes base.
+        let active: Arc<std::sync::Mutex<HashMap<usize, (String, u64)>>> = Arc::default();
+        let done_bytes = Arc::new(AtomicU64::new(*bytes_done));
+        let sampler_stop = Arc::new(AtomicBool::new(false));
+        let sampler = self.clone().spawn_optional_status_sampler(
+            address.to_string(),
+            active.clone(),
+            sampler_stop.clone(),
+            done_bytes.clone(),
+            round,
+            rounds,
+        );
+
+        let mut pending = queue.iter().peekable();
+        let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let mut in_flight = FuturesUnordered::new();
+        // Files currently in the network phase: the REAL pool occupancy,
+        // reported as `workers`. A file leaves on its fetched signal or, if
+        // it never fires one (error, shard path), on completion.
+        let mut fetching: std::collections::HashSet<usize> = Default::default();
+        // Assignment order, newest last, for the sidebar's highlight.
+        let mut assigned: Vec<(usize, String)> = Vec::new();
+        let mut resolved = 0usize;
+        let mut aborted = false;
+        // The assignment loop checks the mandate, but with the pool full or
+        // the queue drained nothing assigns, so nothing checks: the last
+        // files in flight (multi-GB each) would run out long after a toggle
+        // off. Poll it while waiting too.
+        let mut mandate_poll = tokio::time::interval(std::time::Duration::from_secs(5));
+        mandate_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        'round: loop {
+            while pending.peek().is_some()
+                && fetching.len() < OPTIONAL_FETCH_WORKERS
+                && in_flight.len() < OPTIONAL_FETCH_WORKERS + OPTIONAL_MATERIALIZE_BACKLOG
+            {
+                if !self.optional_pass_should_continue(address, directory).await {
+                    aborted = true;
+                    break 'round;
                 }
-                Err(e) => {
-                    requeue.push((*idx, *path, *size));
-                    self.mark_optional_file(address, *idx, OptFileState::Failed, "").await;
-                    self.bump_optional_progress(address, *fetched, requeue.len(), *bytes_done)
+                let Some(&(idx, path, size)) = pending.next() else { break };
+                self.mark_optional_file(address, idx, OptFileState::Active, path).await;
+                self.push_site_info(address).await;
+                active.lock().unwrap().insert(idx, (path.clone(), size));
+                assigned.push((idx, path.clone()));
+                fetching.insert(idx);
+                let state = self.clone();
+                let tx = phase_tx.clone();
+                let hook: EdxFetchedHook = Arc::new(move || {
+                    let _ = tx.send(idx);
+                });
+                in_flight.push(async move {
+                    (idx, state.file_need_pooled(address, path, hook).await)
+                });
+                self.set_worker_stats(
+                    address,
+                    queue.len() - resolved + requeue.len(),
+                    fetching.len(),
+                    0,
+                )
+                .await;
+            }
+            if in_flight.is_empty() {
+                break;
+            }
+            tokio::select! {
+                _ = mandate_poll.tick() => {
+                    if !self.optional_pass_should_continue(address, directory).await {
+                        aborted = true;
+                        break 'round;
+                    }
+                }
+                Some(idx) = phase_rx.recv() => {
+                    // Network phase over: the slot frees for the next file
+                    // while the materialize tail keeps running in
+                    // `in_flight`. Idempotent - a retry can re-signal, and
+                    // the completion below also clears it.
+                    if fetching.remove(&idx) {
+                        self.set_worker_stats(
+                            address,
+                            queue.len() - resolved + requeue.len(),
+                            fetching.len(),
+                            0,
+                        )
                         .await;
-                    self.log(
-                        "DEBUG",
-                        format!("Optional file {path} failed (round {round}/{rounds}): {e}"),
+                    }
+                }
+                Some((idx, result)) = in_flight.next() => {
+                    fetching.remove(&idx);
+                    active.lock().unwrap().remove(&idx);
+                    resolved += 1;
+                    let (path, size) = by_idx[&idx];
+                    // Keep the highlight on a file that is still running.
+                    let current: String = {
+                        let act = active.lock().unwrap();
+                        assigned
+                            .iter()
+                            .rev()
+                            .find(|(i, _)| act.contains_key(i))
+                            .map(|(_, p)| p.clone())
+                            .unwrap_or_default()
+                    };
+                    match result {
+                        Ok(_) => {
+                            *fetched += 1;
+                            *bytes_done += size;
+                            done_bytes.store(*bytes_done, Ordering::Relaxed);
+                            self.mark_optional_file(address, idx, OptFileState::Done, &current)
+                                .await;
+                            self.bump_optional_progress(
+                                address,
+                                *fetched,
+                                requeue.len(),
+                                *bytes_done,
+                            )
+                            .await;
+                            // Per-file event: open pages re-query, the sidebar's
+                            // downloaded-bytes counter moves while the pass runs.
+                            self.push_site_info_file_done(address, path, None).await;
+                        }
+                        Err(e) => {
+                            requeue.push((idx, path, size));
+                            self.mark_optional_file(address, idx, OptFileState::Failed, &current)
+                                .await;
+                            self.bump_optional_progress(
+                                address,
+                                *fetched,
+                                requeue.len(),
+                                *bytes_done,
+                            )
+                            .await;
+                            self.log(
+                                "DEBUG",
+                                format!("Optional file {path} failed (round {round}/{rounds}): {e}"),
+                            )
+                            .await;
+                        }
+                    }
+                    self.set_worker_stats(
+                        address,
+                        queue.len() - resolved + requeue.len(),
+                        fetching.len(),
+                        0,
                     )
                     .await;
                 }
             }
-            self.set_worker_stats(address, queue.len() - pos - 1 + requeue.len(), 1, 0).await;
         }
-        (requeue, false)
+        // On abort this cancels the in-flight fetches (a copy already inside
+        // the store's blocking materialize finishes on its own; the eviction
+        // hold releases with the future either way).
+        drop(in_flight);
+        sampler_stop.store(true, Ordering::Relaxed);
+        let _ = sampler.await;
+        (requeue, aborted)
     }
 
     /// Between in-pass rounds: some files failed, so force-announce for FRESH
@@ -12439,6 +12826,9 @@ impl AppState {
         // announce NOW instead of failing the whole pass and telling the user
         // "could not fetch from any peer" before a single tracker was asked.
         self.ensure_optional_peers(address, false).await;
+        // ...and keep announcing while the pass runs, so a replica that
+        // appears mid-pass joins it instead of waiting for the next one.
+        let reannounce = self.spawn_optional_reannounce(address, directory);
 
         // Up to 3 rounds over the still-missing files. Round 1 tries everything;
         // a later round re-announces first (the peers we knew evidently didn't
@@ -12485,6 +12875,7 @@ impl AppState {
             }
             queue = requeue;
         }
+        reannounce.abort();
         self.set_worker_stats(address, 0, 0, 0).await;
         self.finish_optional_pass(address, cancelled, fetched, failed).await;
         self.log(
@@ -13640,9 +14031,23 @@ fn optional_file_present(
     }
 }
 
+/// The live (bytes present, connected peers) pair from an EDX transfer-stats
+/// row: `have` is read straight off the sparse store's group bitfield, and
+/// `session.connected` is how many of the dialed peers actually joined the
+/// fetch session. `None` when nothing is tracked for the file yet (not an
+/// EDX object, or no session opened this run) - the caller then falls back
+/// to the optional-bytes delta and the connectable-peer count.
+fn edx_live_progress(stats: &Value) -> Option<(u64, u64)> {
+    let have = stats.get("have")?.as_u64()?;
+    let connected =
+        stats.get("session").and_then(|s| s.get("connected")).and_then(Value::as_u64).unwrap_or(0);
+    Some((have, connected))
+}
+
 /// One status-sampler tick's phase line, from the byte delta, the file's
-/// size, and the connectable-peer count. Byte-level % only exists when bytes
-/// moved (bigfile pieces); otherwise the phase names what the fetch is doing.
+/// size, and the peer count (connected peers for an EDX transfer, else the
+/// connectable count). Byte-level % only exists when bytes moved; otherwise
+/// the phase names what the fetch is doing.
 fn optional_fetch_status(got: u64, file_size: u64, peers: usize, suffix: &str) -> String {
     if got > 0 {
         if file_size > 0 {
@@ -13655,6 +14060,27 @@ fn optional_fetch_status(got: u64, file_size: u64, peers: usize, suffix: &str) -
         format!("Waiting for peers…{suffix}")
     } else {
         format!("Fetching from {peers} peer(s)…{suffix}")
+    }
+}
+
+/// [`optional_fetch_status`] for the worker pool: one file in flight keeps
+/// the classic wording exactly; several report the count, with `got`/`size`
+/// summed over the active files (the % is the pool's combined progress).
+fn optional_pool_status(files: usize, got: u64, size: u64, peers: usize, suffix: &str) -> String {
+    if files <= 1 {
+        return optional_fetch_status(got, size, peers, suffix);
+    }
+    if got > 0 {
+        if size > 0 {
+            let pct = (got as f64 / size as f64 * 100.0).min(99.0);
+            format!("Downloading {files} files… {pct:.0}%{suffix}")
+        } else {
+            format!("Downloading {files} files…{suffix}")
+        }
+    } else if peers == 0 {
+        format!("Waiting for peers…{suffix}")
+    } else {
+        format!("Fetching {files} files from {peers} peer(s)…{suffix}")
     }
 }
 
@@ -14040,6 +14466,48 @@ mod tests {
         let usable = state.all_trackers(&bootstrap).await;
         assert!(usable.contains(&onion));
         assert!(!usable.contains(&i2p));
+    }
+
+    #[test]
+    fn edx_live_progress_reads_have_and_connected() {
+        // A live EDX transfer row: bytes present + the session's real count.
+        let stats = json!({
+            "have": 123456, "session": { "dialed": 8, "connected": 1, "age": 30 },
+        });
+        assert_eq!(edx_live_progress(&stats), Some((123456, 1)));
+
+        // A row before any session was stamped still reports its bytes.
+        assert_eq!(edx_live_progress(&json!({ "have": 42 })), Some((42, 0)));
+
+        // Nothing tracked (msgpack fallback, dial phase): the sampler falls
+        // back to the optional-bytes delta and the connectable count.
+        assert_eq!(edx_live_progress(&Value::Null), None);
+        assert_eq!(edx_live_progress(&json!({ "have": null, "session": {} })), None);
+    }
+
+    #[test]
+    fn optional_fetch_status_prefers_bytes_over_peer_phase() {
+        assert_eq!(optional_fetch_status(0, 100, 0, ""), "Waiting for peers…");
+        assert_eq!(optional_fetch_status(0, 100, 3, ""), "Fetching from 3 peer(s)…");
+        assert_eq!(optional_fetch_status(50, 100, 1, ""), "Downloading… 50%");
+        // Never claims 100% while the fetch is still running.
+        assert_eq!(optional_fetch_status(100, 100, 1, " (retry 2/3)"), "Downloading… 99% (retry 2/3)");
+    }
+
+    #[test]
+    fn optional_pool_status_reports_the_pool_but_keeps_single_file_wording() {
+        // One file: exactly the classic line, so nothing the UI (or a user)
+        // knows changes until the pool actually holds several files.
+        assert_eq!(optional_pool_status(1, 50, 100, 1, ""), "Downloading… 50%");
+        assert_eq!(optional_pool_status(0, 0, 0, 0, ""), "Waiting for peers…");
+        // Several: the count, with the combined progress.
+        assert_eq!(optional_pool_status(3, 0, 300, 0, ""), "Waiting for peers…");
+        assert_eq!(optional_pool_status(3, 0, 300, 2, ""), "Fetching 3 files from 2 peer(s)…");
+        assert_eq!(optional_pool_status(3, 150, 300, 2, ""), "Downloading 3 files… 50%");
+        assert_eq!(
+            optional_pool_status(2, 300, 300, 1, " (retry 2/3)"),
+            "Downloading 2 files… 99% (retry 2/3)"
+        );
     }
 
     /// A shared tracker whose stats entry was first created while GATED
@@ -14477,6 +14945,91 @@ mod tests {
         // and the worker marked it connected (it never did before).
         assert_eq!(state.connectable_peers(addr, 10).await, vec![good]);
         assert_eq!(state.peer_counts(addr).await.connected, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_tracker_seed_lands_in_backoff_and_stops_being_offered() {
+        // Tracker seeds are assembled fresh from the tracker list each pass,
+        // outside the registry - before F6 their dial failures vanished
+        // (apply_peer_outcomes skips unknown peers) and every data session
+        // redialed the dead seed at full price. Now note_edx_dials registers
+        // them, and fetch_candidate_peers consults that entry.
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let seed = PeerAddr::parse("9.9.9.9:26959").unwrap();
+        state.set_extra_trackers(vec![epix_xite::Tracker::Epix(seed.clone())]).await;
+        // A healthy table peer, so selection never enters its everything-is-
+        // benched fallback (which deliberately returns benched peers).
+        let table = PeerAddr::parse("1.1.1.1:15441").unwrap();
+        state.add_peers(addr, [table.clone()]).await;
+
+        // Unknown to the registry: offered as a fallback candidate.
+        assert!(state.fetch_candidate_peers(addr, 10).await.contains(&seed));
+
+        // Its EDX dial fails: the outcome must stick even though nothing
+        // added the seed to the registry beforehand.
+        state.note_edx_dials(addr, vec![(seed.clone(), false)]).await;
+        {
+            let xites = state.xites.read().await;
+            let p = xites.get(addr).unwrap().peers.get(&seed).unwrap();
+            assert_eq!(p.connection_errors, 1, "the failure was recorded");
+            assert!(p.retry_after > now_secs(), "and it is in dial backoff");
+        }
+        assert!(
+            !state.fetch_candidate_peers(addr, 10).await.contains(&seed),
+            "a benched seed waits its backoff out like a table peer"
+        );
+
+        // A successful dial clears the bench and the seed is offered again.
+        state.note_edx_dials(addr, vec![(seed.clone(), true)]).await;
+        assert!(state.fetch_candidate_peers(addr, 10).await.contains(&seed));
+    }
+
+    #[tokio::test]
+    async fn served_data_history_ranks_byte_sources_into_the_session_slots() {
+        // The gateway case: a metadata responder out-reputations the actual
+        // seeders, so the plain ranking hands it a session slot every fetch.
+        // note_edx_served stamps who really delivered groups, and
+        // fetch_session_peers prefers that history.
+        let dir = tempdir().unwrap();
+        let addr = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let squatter = PeerAddr::parse("1.1.1.1:15441").unwrap();
+        let seeder = PeerAddr::parse("2.2.2.2:15441").unwrap();
+        state.add_peers(addr, [squatter.clone(), seeder.clone()]).await;
+        {
+            let mut xites = state.xites.write().await;
+            let peers = &mut xites.get_mut(addr).unwrap().peers;
+            peers.get_mut(&squatter).unwrap().reputation = 100;
+            peers.get_mut(&seeder).unwrap().reputation = -2;
+        }
+        state.note_edx_served(addr, vec![seeder.clone()]).await;
+
+        let slots = state.fetch_session_peers(addr, 8).await;
+        assert_eq!(slots[0], seeder, "the peer that served bytes takes the first slot");
+        assert!(slots.contains(&squatter), "a preference, not a filter");
+        // Non-data selection (sync/publish/PEX) keeps the reputation order.
+        assert_eq!(state.connectable_peers(addr, 8).await[0], squatter);
+    }
+
+    #[test]
+    fn the_reannounce_delay_is_jittered_per_xite_and_rate_bounded() {
+        let a = optional_reannounce_delay("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g");
+        assert!((600..900).contains(&a.as_secs()), "{a:?}");
+        assert_eq!(a, optional_reannounce_delay("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g"));
+        // Different xites spread out (for at least one of a few addresses).
+        let others = ["epix1talkanwfts3qcflekhmkvcz66ss4kxz2tr2k6g", "1Opt", "1Flix"];
+        assert!(
+            others.iter().any(|o| optional_reannounce_delay(o) != a),
+            "per-xite jitter never de-synchronized"
+        );
     }
 
     #[tokio::test]
@@ -19023,5 +19576,325 @@ mod tests {
             )
             .await;
         assert_eq!(batches.lock().unwrap().len(), 1, "stopped after the batch in flight");
+    }
+
+    /// Per-file gate pair the [`PoolFetcher`] consumes: release the first to
+    /// end the file's NETWORK phase (the mock then fires the slot-handoff
+    /// hook), send on the second to resolve its MATERIALIZE phase with the
+    /// scripted result.
+    type PoolGates = Arc<
+        std::sync::Mutex<
+            HashMap<
+                String,
+                (
+                    tokio::sync::oneshot::Receiver<()>,
+                    tokio::sync::oneshot::Receiver<Result<bool, String>>,
+                ),
+            >,
+        >,
+    >;
+
+    /// Mock for the worker-pool round tests: each `fetch_file_pooled` call
+    /// announces itself on `events`, parks in its network phase until the
+    /// test releases it, fires the hook, parks in its materialize phase,
+    /// and returns the scripted result. Everything rendezvouses on
+    /// channels, so the tests assert exact orderings with no wall-clock
+    /// waits (paired with a paused-time runtime for the retry sleeps).
+    struct PoolFetcher {
+        events: tokio::sync::mpsc::UnboundedSender<(String, &'static str)>,
+        gates: PoolGates,
+    }
+
+    #[async_trait::async_trait]
+    impl EdxFetcher for PoolFetcher {
+        async fn fetch_file_pooled(
+            &self,
+            _: &str,
+            inner_path: &str,
+            fetched: EdxFetchedHook,
+        ) -> Result<bool, String> {
+            let Some((net, mat)) = self.gates.lock().unwrap().remove(inner_path) else {
+                // file_need_at's in-place retry of a scripted failure: fail
+                // again, silently, so the retry budget drains (paused-time
+                // sleeps) and the round sees the Err.
+                return Err("still failing".into());
+            };
+            let _ = self.events.send((inner_path.to_string(), "start"));
+            let _ = net.await;
+            fetched();
+            let _ = self.events.send((inner_path.to_string(), "fetched"));
+            let result = mat.await.expect("materialize gate dropped");
+            let _ = self.events.send((inner_path.to_string(), "done"));
+            result
+        }
+        async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+            unreachable!()
+        }
+        async fn fetch_signed(
+            &self,
+            _: PeerAddr,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Vec<u8>>, String> {
+            unreachable!()
+        }
+        async fn fetch_signed_many(
+            &self,
+            _: &str,
+            _: Vec<String>,
+            _: Vec<PeerAddr>,
+            _: Option<EdxSignedProgress>,
+        ) -> HashMap<String, Vec<u8>> {
+            unreachable!()
+        }
+        async fn fetch_range(
+            &self,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: u64,
+        ) -> Result<Option<Vec<u8>>, String> {
+            unreachable!()
+        }
+        async fn push_update(
+            &self,
+            _: PeerAddr,
+            _: &str,
+            _: &str,
+            _: Arc<Vec<u8>>,
+            _: f64,
+            _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+            _: Arc<Vec<String>>,
+            _: Arc<AtomicBool>,
+        ) -> Result<(), EdxPushError> {
+            unreachable!()
+        }
+        async fn fetch_files(
+            &self,
+            _: &str,
+            _: Vec<EdxWant>,
+            _: Vec<PeerAddr>,
+            _: Option<Value>,
+            _: Option<EdxBatchProgress>,
+        ) -> EdxBatch {
+            unreachable!()
+        }
+        async fn list_signed(
+            &self,
+            _: PeerAddr,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+            unreachable!()
+        }
+        async fn pex(
+            &self,
+            _: PeerAddr,
+            _: &str,
+            _: u32,
+            _: Vec<PeerAddr>,
+        ) -> Result<Vec<PeerAddr>, String> {
+            unreachable!()
+        }
+        async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+            unreachable!()
+        }
+        async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+            unreachable!()
+        }
+        async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+            unreachable!()
+        }
+        async fn updates_since(
+            &self,
+            _: PeerAddr,
+            _: u64,
+        ) -> Result<(Vec<(String, i64)>, u64), String> {
+            unreachable!()
+        }
+    }
+
+    /// A xite whose content.json declares `f0.bin`…`f{n-1}.bin` as optional
+    /// EDX files (a `b3` entry is what routes file_need through the
+    /// fetcher), the mandate toggles on, plus the per-file gate senders the
+    /// driver releases.
+    #[allow(clippy::type_complexity)]
+    async fn pool_round_fixture(
+        state: &Arc<AppState>,
+        dir: &std::path::Path,
+        n: usize,
+    ) -> (
+        Vec<(String, u64)>,
+        HashMap<String, tokio::sync::oneshot::Sender<()>>,
+        HashMap<String, tokio::sync::oneshot::Sender<Result<bool, String>>>,
+        tokio::sync::mpsc::UnboundedReceiver<(String, &'static str)>,
+        PoolGates,
+    ) {
+        let files: Vec<String> = (0..n).map(|i| format!("f{i}.bin")).collect();
+        let mut declared = serde_json::Map::new();
+        for f in &files {
+            declared.insert(f.clone(), json!({ "size": 10, "sha512": "aa", "b3": "bb" }));
+        }
+        state
+            .add_xite("epix1pool", XiteEntry {
+                storage: XiteStorage::new(dir),
+                content: Some(json!({
+                    "address": "epix1pool", "modified": 1.0, "files": {},
+                    "files_optional": Value::Object(declared),
+                })),
+            })
+            .await;
+        state.set_download_optional("epix1pool", true, false).await;
+        state.set_autodownloadoptional("epix1pool", true).await;
+
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gates: PoolGates = Arc::default();
+        let mut net = HashMap::new();
+        let mut mat = HashMap::new();
+        for f in &files {
+            let (net_tx, net_rx) = tokio::sync::oneshot::channel();
+            let (mat_tx, mat_rx) = tokio::sync::oneshot::channel();
+            net.insert(f.clone(), net_tx);
+            mat.insert(f.clone(), mat_tx);
+            gates.lock().unwrap().insert(f.clone(), (net_rx, mat_rx));
+        }
+        state
+            .set_edx_fetcher(Arc::new(PoolFetcher { events: ev_tx, gates: gates.clone() }))
+            .await;
+        (files.into_iter().map(|f| (f, 10u64)).collect(), net, mat, ev_rx, gates)
+    }
+
+    /// The round loop is a worker pool: [`OPTIONAL_FETCH_WORKERS`] files
+    /// fetch concurrently, a slot passes to the NEXT file the moment a
+    /// file's network phase ends (not when its materialize copy resolves),
+    /// a failed file requeues for the next round, and completions count
+    /// only once the whole job (copy included) is in. Orderings are
+    /// asserted on the fetcher's own event stream; the paused-time runtime
+    /// fast-forwards the retry and sampler sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn the_optional_round_pools_fetches_and_frees_slots_at_network_phase_end() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (todo, mut net, mut mat, mut ev, _gates) =
+            pool_round_fixture(&state, dir.path(), 5).await;
+        let queue: Vec<(usize, &String, u64)> =
+            todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        let (mut fetched, mut bytes_done) = (0usize, 0u64);
+
+        let round =
+            state.run_optional_round("epix1pool", None, &queue, 1, 3, &mut fetched, &mut bytes_done);
+        let driver = async {
+            // The pool fills to exactly OPTIONAL_FETCH_WORKERS network slots.
+            for want in ["f0.bin", "f1.bin", "f2.bin"] {
+                let (path, what) = ev.recv().await.unwrap();
+                assert_eq!((path.as_str(), what), (want, "start"));
+            }
+            // f0's network phase ends: its slot goes to f3 while f0 is
+            // still materializing - the handoff this work is for.
+            net.remove("f0.bin").unwrap().send(()).unwrap();
+            assert_eq!(ev.recv().await.unwrap(), ("f0.bin".to_string(), "fetched"));
+            assert_eq!(ev.recv().await.unwrap(), ("f3.bin".to_string(), "start"));
+            // Same handoff again: f1 -> f4.
+            net.remove("f1.bin").unwrap().send(()).unwrap();
+            assert_eq!(ev.recv().await.unwrap(), ("f1.bin".to_string(), "fetched"));
+            assert_eq!(ev.recv().await.unwrap(), ("f4.bin".to_string(), "start"));
+            // Remaining network phases end; the queue is empty, no more starts.
+            for f in ["f2.bin", "f3.bin", "f4.bin"] {
+                net.remove(f).unwrap().send(()).unwrap();
+                assert_eq!(ev.recv().await.unwrap(), (f.to_string(), "fetched"));
+            }
+            // Materializes resolve: f1's copy fails (it must requeue), the
+            // rest land. f1 then burns its in-place retries silently.
+            mat.remove("f1.bin").unwrap().send(Err("copy failed".into())).unwrap();
+            assert_eq!(ev.recv().await.unwrap(), ("f1.bin".to_string(), "done"));
+            for f in ["f0.bin", "f2.bin", "f3.bin", "f4.bin"] {
+                mat.remove(f).unwrap().send(Ok(true)).unwrap();
+                assert_eq!(ev.recv().await.unwrap(), (f.to_string(), "done"));
+            }
+        };
+        let ((requeue, aborted), ()) = tokio::join!(round, driver);
+        assert!(!aborted);
+        assert_eq!(requeue, vec![(1, &todo[1].0, 10)], "the failed file requeues, alone");
+        assert_eq!(fetched, 4);
+        assert_eq!(bytes_done, 40);
+    }
+
+    /// The mandate is re-checked before every ASSIGNMENT: withdrawing it
+    /// while the pool is full aborts the round the moment a slot would go
+    /// to the next file - in-flight fetches are dropped, later files never
+    /// start, and nothing is requeued (the pass is over).
+    #[tokio::test(start_paused = true)]
+    async fn the_optional_round_stops_assigning_when_the_mandate_drops() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (todo, mut net, _mat, mut ev, gates) =
+            pool_round_fixture(&state, dir.path(), 5).await;
+        let queue: Vec<(usize, &String, u64)> =
+            todo.iter().enumerate().map(|(i, (p, s))| (i, p, *s)).collect();
+        let (mut fetched, mut bytes_done) = (0usize, 0u64);
+
+        let round =
+            state.run_optional_round("epix1pool", None, &queue, 1, 3, &mut fetched, &mut bytes_done);
+        let driver = async {
+            for want in ["f0.bin", "f1.bin", "f2.bin"] {
+                let (path, what) = ev.recv().await.unwrap();
+                assert_eq!((path.as_str(), what), (want, "start"));
+            }
+            // Toggle off while all three are mid-fetch...
+            if let Some(x) = state.xites.write().await.get_mut("epix1pool") {
+                x.settings.serving = false;
+            }
+            // ...then end f0's network phase: re-assigning its freed slot is
+            // exactly where the mandate check lives.
+            net.remove("f0.bin").unwrap().send(()).unwrap();
+            assert_eq!(ev.recv().await.unwrap(), ("f0.bin".to_string(), "fetched"));
+        };
+        let ((requeue, aborted), ()) = tokio::join!(round, driver);
+        assert!(aborted, "the round reports the withdrawal");
+        assert!(requeue.is_empty(), "an aborted pass requeues nothing");
+        assert!(
+            gates.lock().unwrap().contains_key("f3.bin"),
+            "no file was assigned after the mandate dropped"
+        );
+        // The in-flight fetches were dropped with the round, not run out.
+        assert!(net.remove("f1.bin").unwrap().send(()).is_err(), "f1's fetch was cancelled");
+    }
+
+    /// Withdrawal must also land when NO assignment is left to check it:
+    /// the whole queue is in flight (pending drained), the user toggles
+    /// off, and no phase or completion event ever fires. The waiting
+    /// select's mandate poll has to catch it, or the tail files run to
+    /// completion - hours of unwanted transfer after the off switch.
+    #[tokio::test(start_paused = true)]
+    async fn the_optional_round_aborts_mid_wait_when_the_mandate_drops() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (_todo, mut net, _mat, mut ev, _gates) =
+            pool_round_fixture(&state, dir.path(), 3).await;
+        let files: Vec<String> = (0..3).map(|i| format!("f{i}.bin")).collect();
+        let queue: Vec<(usize, &String, u64)> =
+            files.iter().enumerate().map(|(i, p)| (i, p, 10u64)).collect();
+        let (mut fetched, mut bytes_done) = (0usize, 0u64);
+
+        let round =
+            state.run_optional_round("epix1pool", None, &queue, 1, 3, &mut fetched, &mut bytes_done);
+        let driver = async {
+            // All three files assign; the pending queue is now empty, so
+            // the assignment-time mandate check never runs again.
+            for want in ["f0.bin", "f1.bin", "f2.bin"] {
+                let (path, what) = ev.recv().await.unwrap();
+                assert_eq!((path.as_str(), what), (want, "start"));
+            }
+            if let Some(x) = state.xites.write().await.get_mut("epix1pool") {
+                x.settings.serving = false;
+            }
+            // No further events: the paused clock fast-forwards the poll.
+        };
+        let ((requeue, aborted), ()) = tokio::join!(round, driver);
+        assert!(aborted, "the waiting round noticed the withdrawal");
+        assert!(requeue.is_empty(), "an aborted pass requeues nothing");
+        for f in ["f0.bin", "f1.bin", "f2.bin"] {
+            assert!(net.remove(f).unwrap().send(()).is_err(), "{f}'s fetch was cancelled");
+        }
     }
 }

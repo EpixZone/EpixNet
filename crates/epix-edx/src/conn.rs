@@ -27,6 +27,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::frame::{self};
 use crate::msg::{Frame, FrameBody, Req, Resp};
+use crate::pace;
 
 /// Deadline on one frame write. A peer that stops reading (zero window, no
 /// FIN) parks the writer inside `write_all` forever, and the whole
@@ -123,6 +124,17 @@ struct Shared {
     cancelled: Mutex<std::collections::HashSet<u64>>,
     /// Set when either connection task has stopped.
     closed: std::sync::atomic::AtomicBool,
+    /// Bytes of fetch batches in flight on this link, summed across every
+    /// `Conn` clone - i.e. across every swarm sharing the connection. See
+    /// [`Conn::charge_fetch`].
+    queued_fetch: AtomicU64,
+    /// The same in-flight batches counted as REQUESTS: the unit the
+    /// server's per-connection serve gate works in. See
+    /// [`Conn::queued_fetch_requests`].
+    queued_fetch_reqs: AtomicU64,
+    /// Fired by [`Conn::shutdown`]: the writer breaks out (even mid-write),
+    /// which cascades into the reader via `gone` and drops the socket.
+    shutdown: tokio::sync::Notify,
 }
 
 /// Inbound request delivered to the server side, with the stream id to
@@ -158,6 +170,9 @@ impl Conn {
             waiters: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(std::collections::HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
+            queued_fetch: AtomicU64::new(0),
+            queued_fetch_reqs: AtomicU64::new(0),
+            shutdown: tokio::sync::Notify::new(),
         });
 
         // Teardown signal: the writer owns `gone_tx` and the reader awaits
@@ -183,6 +198,21 @@ impl Conn {
 
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Relaxed)
+    }
+
+    /// Tear the connection down NOW, from any context (sync, callable off
+    /// blocking serve threads). For a peer that stopped draining its lane:
+    /// an error frame cannot be sent to it — the wedged lane is exactly
+    /// where it would have to go, holding an encode slot for up to the
+    /// write deadline — so the link is dropped instead. The peer's next
+    /// read fails immediately, which beats waiting out its own stream
+    /// timeout against a silently abandoned response.
+    pub fn shutdown(&self) {
+        // Order matters: mark closed BEFORE waking the writer, so a racing
+        // sender observes the close. `notify_one` stores a permit, so a
+        // writer between selects still sees it on its next poll.
+        self.shared.closed.store(true, Ordering::Relaxed);
+        self.shared.shutdown.notify_one();
     }
 
     /// How many handles share this link. The reader and writer tasks hold
@@ -323,6 +353,53 @@ impl Conn {
     pub fn take_cancelled(&self, stream: u64) -> bool {
         self.shared.cancelled.lock().expect("cancelled").remove(&stream)
     }
+
+    /// Bytes of fetch batches currently in flight on this link, across
+    /// every clone of the handle - which is every swarm sharing the
+    /// connection (the link pool hands out clones of one `Conn` per lane).
+    /// The scheduler scales its stall windows and batch caps by this, so a
+    /// batch queued behind ANOTHER swarm's traffic on a shared circuit
+    /// reads as queue depth, not as a stall. A plain atomic: reading it
+    /// takes no lock, so the scheduler cannot deadlock against the
+    /// connection's own locks.
+    pub fn queued_fetch_bytes(&self) -> u64 {
+        self.shared.queued_fetch.load(Ordering::Relaxed)
+    }
+
+    /// The same in-flight charges counted as requests. The server admits at
+    /// most `MAX_CONCURRENT_SERVES` serves per connection, strictly in
+    /// arrival order, so this is what the scheduler compares against that
+    /// gate to stop stacking requests a link cannot serve concurrently
+    /// anyway (they only lengthen the FIFO a latecomer queues behind).
+    pub fn queued_fetch_requests(&self) -> u32 {
+        self.shared.queued_fetch_reqs.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
+    }
+
+    /// Charge `bytes` of fetch work (one request) to this link's queue
+    /// counters for as long as the returned guard lives. The refund is the
+    /// guard's `Drop`, so a batch future that is cancelled mid-race (an
+    /// abandoned racer, a fetch that completed elsewhere) refunds the link
+    /// exactly like a completed one - a leak here would permanently
+    /// inflate every sharing swarm's stall windows.
+    pub fn charge_fetch(&self, bytes: u64) -> FetchCharge {
+        self.shared.queued_fetch.fetch_add(bytes, Ordering::Relaxed);
+        self.shared.queued_fetch_reqs.fetch_add(1, Ordering::Relaxed);
+        FetchCharge { shared: self.shared.clone(), bytes }
+    }
+}
+
+/// One fetch batch's bytes charged against a link's queued-fetch counter
+/// (see [`Conn::charge_fetch`]). Refunds on drop.
+pub struct FetchCharge {
+    shared: Arc<Shared>,
+    bytes: u64,
+}
+
+impl Drop for FetchCharge {
+    fn drop(&mut self) {
+        self.shared.queued_fetch.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.shared.queued_fetch_reqs.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn closed_err() -> std::io::Error {
@@ -381,17 +458,42 @@ fn spawn_writer<W>(
             // Priority drain: a ready priority frame always goes before any
             // bulk frame (biased polls `hi` first), so first-paint/control
             // traffic preempts a large background range on the same conn.
-            // `else` fires only when BOTH lanes are closed and drained.
-            let frame = tokio::select! {
-                biased;
-                Some(f) = hi.recv() => f,
-                Some(f) = lo.recv() => f,
-                else => break,
+            // Bulk frames additionally wait for the process-wide pacer
+            // (`paced_bulk_recv`): rate governance lives HERE, on the async
+            // writer, never as sleeps on the blocking encode threads — and
+            // a pacing wait keeps the priority lane live because `hi` wins
+            // the biased select the moment it has a frame.
+            // The inner `else` fires only when BOTH lanes are closed and
+            // drained (the last handle dropped); the outer select adds the
+            // `Conn::shutdown` teardown. Nested because an eternal
+            // shutdown branch inside the lane select would keep it pending
+            // and the closed-lanes `else` could never fire.
+            let next = {
+                let lanes = async {
+                    tokio::select! {
+                        biased;
+                        Some(f) = hi.recv() => Some(charge_priority(f)),
+                        Some(f) = paced_bulk_recv(&mut lo) => Some(f),
+                        else => None,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = shared.shutdown.notified() => None,
+                    f = lanes => f,
+                }
             };
-            if !matches!(
-                tokio::time::timeout(WRITE_STALL_TIMEOUT, frame::write_frame(&mut w, &frame)).await,
-                Ok(Ok(()))
-            ) {
+            let Some(frame) = next else { break };
+            // The write races the shutdown signal too: a teardown must not
+            // wait out a wedged socket's whole write deadline.
+            let sent = tokio::select! {
+                biased;
+                _ = shared.shutdown.notified() => false,
+                res = tokio::time::timeout(WRITE_STALL_TIMEOUT, frame::write_frame(&mut w, &frame)) => {
+                    matches!(res, Ok(Ok(())))
+                }
+            };
+            if !sent {
                 break;
             }
         }
@@ -400,6 +502,41 @@ fn spawn_writer<W>(
         shared.waiters.lock().expect("waiters").clear();
         drop(gone);
     });
+}
+
+/// Dequeue the next BULK frame once the process-wide pacer grants wire
+/// budget. Cancel-safe for the writer's `select!`: `ready` consumes
+/// nothing and `recv` is cancel-safe; the charge happens synchronously
+/// after a frame is actually taken.
+async fn paced_bulk_recv(lo: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
+    pace::bulk().ready().await;
+    let frame = lo.recv().await?;
+    pace::bulk().charge(wire_cost(&frame));
+    Some(frame)
+}
+
+/// A priority-lane frame is never paced - but its payload still counts
+/// against the paced rate as debt, so bulk yields to first-paint. Without
+/// the charge the two lanes were governed independently (the bucket
+/// admitted first-paint up to the cap while the pacer ran bulk at the
+/// cap), so a busy seeder could upload at TWICE the configured rate.
+/// Client requests and control frames have zero [`wire_cost`], so only
+/// served payload bytes debt the lane.
+fn charge_priority(frame: Frame) -> Frame {
+    pace::bulk().charge(wire_cost(&frame));
+    frame
+}
+
+/// What a frame costs against the paced rate: its payload bytes (headers
+/// and framing are noise at these sizes).
+fn wire_cost(frame: &Frame) -> u64 {
+    match &frame.body {
+        FrameBody::Data { bytes, .. } => bytes.len() as u64,
+        FrameBody::Resp { resp: Resp::Many { items }, .. } => {
+            items.iter().map(|(_, b)| b.len() as u64).fold(0, u64::saturating_add)
+        }
+        _ => 0,
+    }
 }
 
 fn spawn_reader<R>(
@@ -810,6 +947,41 @@ mod tests {
         assert!(conn.is_closed(), "the write deadline must tear a wedged link down");
     }
 
+    /// `shutdown` must tear the link down from OUR side without an error
+    /// frame: the serve side calls it when a peer stops draining its lane
+    /// (send stall), so the peer's read fails in seconds instead of the
+    /// peer waiting out its own stream timeout against a silent abort.
+    #[tokio::test]
+    async fn shutdown_tears_the_link_down_and_fails_the_peer_fast() {
+        let (a, b) = tokio::io::duplex(1024);
+        let (server, _server_in) = Conn::start(a, false);
+        let (client, _client_in) = Conn::start(b, true);
+        client.ping().await.expect("link is up");
+
+        // A client request in flight when the server tears down: nothing
+        // answers it, so only the teardown can resolve it.
+        let waiter = {
+            let c = client.clone();
+            tokio::spawn(async move { c.request(Req::GetTrackers).await })
+        };
+        tokio::task::yield_now().await;
+        server.shutdown();
+        let res = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the pending request must resolve fast, not hang")
+            .unwrap();
+        assert!(res.is_err(), "the pending request fails instead of hanging");
+        assert!(server.is_closed(), "the torn-down side is closed at once");
+        // The peer observes the close too (its reader sees the socket go).
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.is_closed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(observed.is_ok(), "the peer's connection observes the teardown");
+    }
+
     /// `holders` counts live handles and nothing else. A pool leans on it to
     /// keep a cached link that a transfer is still running over, so counting
     /// the reader/writer tasks (which never hold a `Conn`) would make every
@@ -929,6 +1101,32 @@ mod tests {
             hi_pos <= 1,
             "priority frame should preempt queued bulk (pos {hi_pos}), order = {order:?}"
         );
+    }
+
+    /// The queued-fetch counter is one number per LINK: every clone reads
+    /// the same value, and dropping a charge refunds it whatever ended the
+    /// batch. Swarms sharing a circuit size their stall windows off this,
+    /// so a leaked or per-clone counter would poison every later fetch on
+    /// the link.
+    #[tokio::test]
+    async fn fetch_charges_are_shared_across_clones_and_refund_on_drop() {
+        let (a, _b) = tokio::io::duplex(64);
+        let (conn, _in) = Conn::start(a, true);
+        let clone = conn.clone();
+
+        let c1 = conn.charge_fetch(1000);
+        assert_eq!(clone.queued_fetch_bytes(), 1000, "a clone sees the link's charge");
+        assert_eq!(clone.queued_fetch_requests(), 1, "one charge is one request");
+        let c2 = clone.charge_fetch(500);
+        assert_eq!(conn.queued_fetch_bytes(), 1500, "charges from clones accumulate");
+        assert_eq!(conn.queued_fetch_requests(), 2);
+
+        drop(c1);
+        assert_eq!(conn.queued_fetch_bytes(), 500, "dropping a charge refunds its bytes");
+        assert_eq!(conn.queued_fetch_requests(), 1, "and its request slot");
+        drop(c2);
+        assert_eq!(conn.queued_fetch_bytes(), 0);
+        assert_eq!(conn.queued_fetch_requests(), 0);
     }
 
     #[tokio::test]
