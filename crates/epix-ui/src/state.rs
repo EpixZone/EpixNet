@@ -10808,6 +10808,13 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         self.log("INFO", format!("Signed {content_inner_path} on {address}")).await;
         self.ingest_file_from(address, content_inner_path, origin).await;
+        // Re-register into the EDX store, like sign_xite_with does for the
+        // root: a child sign can declare new b3 objects (a first sign after
+        // the b3 migration, or freshly written data files), and without this
+        // the publish ships a manifest whose objects no peer can fetch ("no
+        // EDX peer holds this object") until the root is re-signed or the
+        // node restarts. Cheap on repeat: present objects short-circuit.
+        self.edx_register_xite(address).await;
         Ok(())
     }
 
