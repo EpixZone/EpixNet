@@ -1048,13 +1048,7 @@ impl Swarm {
         // join does not rebuild it either - a joiner serves the existing
         // order through pick_peer, and only the groups no earlier peer
         // held (excluded as unschedulable) are appended (`admit_joiner`).
-        // A player needs contiguity (see `sequential_order`); a bulk
-        // transfer needs swarm health (see `rarest_first_order`).
-        let mut full_order = if deadline.is_streaming() {
-            sequential_order(needed, &entry_peers)
-        } else {
-            rarest_first_order(needed, &entry_peers)
-        };
+        let mut full_order = initial_order(deadline, needed, &entry_peers);
         // One CUT size at a time (batches are cut before a peer is
         // picked): the coarsest class present, trimmed to the picked
         // peer's own request size in `Window::schedule`. Re-derived when a
@@ -1078,9 +1072,6 @@ impl Swarm {
                 batch_groups,
                 &mut report,
             );
-            if !window.futs.is_empty() {
-                sat_waits = 0;
-            }
             if window.futs.is_empty() {
                 let idle = IdleCtx {
                     joiners: &mut joiners,
@@ -1097,6 +1088,8 @@ impl Swarm {
                     IdleStep::Rescheduled => continue,
                 }
             }
+            // Something is in flight: this pass was not saturation-blocked.
+            sat_waits = 0;
             let wake = tokio::select! {
                 outcome = next_ready(&mut window.futs) => {
                     Wake::Batch(outcome.expect("the window was not empty"))
@@ -1591,6 +1584,21 @@ fn frozen_env(value: Option<&str>) -> bool {
 /// cooldown expiry (`None`) or join-channel activity (`Some(joiner)`, or
 /// `Some(None)` = closed). At least one arm can always fire - the caller
 /// breaks out before waiting when neither could.
+/// The scheduling order for a fetch's entry set: a player needs
+/// contiguity (see `sequential_order`); a bulk transfer needs swarm
+/// health (see `rarest_first_order`).
+fn initial_order(
+    deadline: Deadline,
+    needed: &GroupBits,
+    peers: &[Arc<PeerHandle>],
+) -> Vec<u64> {
+    if deadline.is_streaming() {
+        sequential_order(needed, peers)
+    } else {
+        rarest_first_order(needed, peers)
+    }
+}
+
 /// What the fetch loop does after an idle wait: give up, or go around.
 enum IdleStep {
     Abort,
