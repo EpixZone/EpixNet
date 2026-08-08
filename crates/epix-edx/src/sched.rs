@@ -115,6 +115,21 @@ pub const BUSY_RETRY_MAX: Duration = Duration::from_secs(120);
 /// grant us a slot, and retries on that timescale belong to the caller's
 /// round mechanism, not a parked fetch.
 pub const BUSY_LIMIT: u32 = 8;
+/// The most requests kept outstanding on one LINK, across every swarm
+/// sharing it. The server runs at most `MAX_CONCURRENT_SERVES` serves per
+/// connection and admits them strictly in arrival order, so requests past
+/// that add no throughput - they only lengthen the connection's FIFO,
+/// which any latecomer (a streaming seek riding the same pooled conn)
+/// queues behind; three pooled bulk fetches at full depth put a seek half
+/// a minute out. Two spares above the server's gate keep a freed serve
+/// slot fed across the completion round trip. Patient batches respect the
+/// limit; streaming ones are exempt (their own depth bounds them, and
+/// they must be able to enter a busy link's queue at all).
+pub const LINK_REQUEST_LIMIT: u32 = crate::server::MAX_CONCURRENT_SERVES as u32 + 2;
+/// The retry tick while every otherwise-schedulable peer's link is at
+/// [`LINK_REQUEST_LIMIT`]: congestion, not peer health, so nothing but
+/// time (another swarm's batch completing) clears it.
+pub const LINK_SATURATION_RETRY: Duration = Duration::from_millis(250);
 
 /// How much work one request to `class` carries. Overlay links get smaller
 /// batches (see [`GROUPS_PER_REQUEST_OVERLAY`]).
@@ -181,6 +196,27 @@ pub fn stall_window(class: Class, inflight: u32) -> Duration {
 pub fn link_queue_depth(class: Class, queued_bytes: u64) -> u32 {
     let request_bytes = groups_per_request(class) * epix_blob::bitfield::GROUP_BYTES;
     queued_bytes.div_ceil(request_bytes).min(u32::MAX as u64) as u32
+}
+
+/// The queue depth one batch's stall window and absolute cap scale by.
+/// Patient batches take the link-wide depth when other swarms share the
+/// circuit (cross-swarm queueing is depth, not silence); a streaming
+/// batch scales by its own load alone - its rescue and abort windows are
+/// what bound player latency, and scaling them by a shared link's bulk
+/// backlog multiplied a seek's failover time by the whole queue. A
+/// streaming batch stuck behind bulk may thus false-stall and duplicate;
+/// for a player that is the right error to make.
+fn window_queue_depth(deadline: Deadline, own_load: u32, class: Class, link_bytes: u64) -> u32 {
+    if deadline.is_streaming() {
+        own_load
+    } else {
+        own_load.max(link_queue_depth(class, link_bytes))
+    }
+}
+
+/// Whether a link already carries [`LINK_REQUEST_LIMIT`] requests.
+fn link_full(peer: &PeerHandle) -> bool {
+    peer.conn.queued_fetch_requests() >= LINK_REQUEST_LIMIT
 }
 
 /// The no-new-bytes window after which a transfer to `class` counts as
@@ -651,6 +687,19 @@ impl<'a> Window<'a> {
             .sum()
     }
 
+    /// Whether some peer is blocked ONLY by its link sitting at
+    /// [`LINK_REQUEST_LIMIT`]: not failed, not cooling, pipeline room
+    /// free, just a shared connection already carrying a serve gate's
+    /// worth of requests. The fetch loop waits a [`LINK_SATURATION_RETRY`]
+    /// tick on this instead of aborting - the queue drains on its own
+    /// (every charge lives in some swarm's cap-bounded batch future).
+    fn awaiting_link_room(&self, peers: &[Arc<PeerHandle>]) -> bool {
+        let now = tokio::time::Instant::now();
+        (0..self.load.len()).any(|i| {
+            self.schedulable(i, now) && self.load[i] < self.depth[i] && link_full(&peers[i])
+        })
+    }
+
     /// The earliest instant a cooling-down, non-exhausted peer becomes
     /// schedulable again; None when nothing is merely cooling (every
     /// cooldown expired, or every cooling peer is exhausted anyway). The
@@ -708,13 +757,16 @@ impl<'a> Window<'a> {
         // so the counter includes us. The charge lives inside the batch
         // future and refunds on its drop (completed, failed or cancelled).
         let charge = peers[idx].conn.charge_fetch(bytes);
-        // The stall window and cap scale on the link's whole queue: our own
-        // load (`load[idx]` already counts this batch) or, when other swarms
-        // share the circuit, the bytes they have queued on it - whichever
-        // says the queue is deeper. Cross-swarm queueing on a shared circuit
-        // is depth, not silence.
-        let queued = self.load[idx]
-            .max(link_queue_depth(peers[idx].class, peers[idx].conn.queued_fetch_bytes()));
+        // The stall window and cap scale on the queue this batch actually
+        // waits in: own load (`load[idx]` already counts this batch), or
+        // for patient fetches the link's whole queue (see
+        // [`window_queue_depth`]).
+        let queued = window_queue_depth(
+            deadline,
+            self.load[idx],
+            peers[idx].class,
+            peers[idx].conn.queued_fetch_bytes(),
+        );
         self.futs.push(Box::pin(
             swarm.race_batch(batch, groups, idx, roster, deadline, now, queued, charge),
         ));
@@ -953,6 +1005,13 @@ impl Swarm {
         let mut cursor = 0usize;
         let this = &*self;
         let mut window = Window::new(&entry_peers);
+        // Consecutive saturation-only waits with nothing booked. The shared
+        // link's queue normally turns over within seconds, but a fetch
+        // whose peers cannot supply its remaining groups must not idle
+        // behind its siblings' congestion forever: past the patience it
+        // stops counting congestion as a reason to stay.
+        const LINK_SATURATION_PATIENCE: u32 = 240; // x LINK_SATURATION_RETRY = 60s
+        let mut sat_waits = 0u32;
         loop {
             let peers = roster.snapshot();
             window.refill(
@@ -967,6 +1026,9 @@ impl Swarm {
                 batch_groups,
                 &mut report,
             );
+            if !window.futs.is_empty() {
+                sat_waits = 0;
+            }
             if window.futs.is_empty() {
                 // Nothing in flight and nothing schedulable. When the only
                 // reason is a cooldown (a BUSY seeder sitting out, or the
@@ -983,7 +1045,20 @@ impl Swarm {
                 if deadline.is_streaming() {
                     break;
                 }
-                let until = window.next_retry();
+                // A shared link at its request limit is congestion, not a
+                // dead or refusing peer: no cooldown or probe is pending,
+                // but another swarm's batches are draining it, so tick and
+                // re-check rather than abort - up to the bounded patience.
+                // Whichever wake is earlier.
+                let mut saturated = None;
+                if sat_waits < LINK_SATURATION_PATIENCE && window.awaiting_link_room(&peers) {
+                    sat_waits += 1;
+                    saturated = Some(tokio::time::Instant::now() + LINK_SATURATION_RETRY);
+                }
+                let until = match (window.next_retry(), saturated) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
                 if until.is_none() && !joining {
                     break;
                 }
@@ -1173,6 +1248,10 @@ impl Swarm {
             fails[*i] < PEER_FAIL_LIMIT
                 && cooldown[*i].is_none_or(|t| t <= now)
                 && load[*i] < pipeline_depth(p.class)
+                // A patient batch never stacks past the link's serve gate
+                // (see [`LINK_REQUEST_LIMIT`]); the fetch loop waits out a
+                // fully saturated moment instead of aborting.
+                && (deadline.is_streaming() || !link_full(p))
                 && groups.iter().all(|g| p.bits.contains(*g))
         });
         if deadline.is_streaming() {
@@ -1890,6 +1969,77 @@ mod tests {
         assert!(stall * PEER_FAIL_LIMIT <= Duration::from_secs(360));
     }
 
+    /// Streaming windows scale by the batch's own load only; a patient
+    /// batch takes the link-wide queue when that is deeper. A shared
+    /// link's bulk backlog must never multiply a player's failover time
+    /// (a seek's rescue moved from ~30s to minutes when it did).
+    #[test]
+    fn streaming_windows_ignore_the_links_bulk_backlog() {
+        use epix_blob::bitfield::GROUP_BYTES;
+        let request = GROUPS_PER_REQUEST_OVERLAY * GROUP_BYTES;
+        // Three pooled bulk fetches at full depth on the shared conn.
+        let backlog = 18 * request;
+        assert_eq!(window_queue_depth(Deadline::background(), 2, Class::Tor, backlog), 18);
+        assert_eq!(window_queue_depth(Deadline::tight(), 2, Class::Tor, backlog), 2);
+        assert_eq!(window_queue_depth(Deadline::prefetch(), 2, Class::Tor, backlog), 2);
+        // A quiet link still scales by the swarm's own load.
+        assert_eq!(window_queue_depth(Deadline::background(), 4, Class::Tor, 0), 4);
+    }
+
+    // Real time: the fetch decodes on real blocking threads.
+    /// A patient fetch must not stack requests past the link's serve gate:
+    /// with [`LINK_REQUEST_LIMIT`] charges already outstanding on the
+    /// shared conn (another swarm's traffic), it issues NOTHING - and
+    /// instead of aborting "nothing schedulable", it waits the saturation
+    /// tick out and fetches once the link drains.
+    #[tokio::test]
+    async fn a_saturated_link_defers_a_patient_fetch_until_it_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let data = vec![9u8; 40_000];
+        let id = ObjId::of(&data);
+        let size = data.len() as u64;
+        store.ensure_sparse(id, epix_blob::Ns::Plain, size, 1).unwrap();
+
+        let requests = Arc::new(AtomicU64::new(0));
+        let conn = counting_serving_conn(&data, requests.clone());
+        let charges: Vec<_> =
+            (0..LINK_REQUEST_LIMIT).map(|_| conn.charge_fetch(512 * 1024)).collect();
+        let peers = vec![PeerHandle {
+            conn,
+            class: Class::Tor,
+            bits: GroupBits::complete(size),
+            label: "shared".into(),
+        }];
+
+        let mut swarm = Swarm::new(store.clone(), id, size);
+        let needed = needed_groups(&store, id, size).unwrap();
+        let fetch = async {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                swarm.fetch(&needed, &peers, Deadline::background(), 2),
+            )
+            .await
+            .expect("the drained link must let the fetch finish")
+            .unwrap()
+        };
+        let driver = async {
+            // Several saturation ticks pass; the scheduler must sit tight.
+            // Deterministic: nothing can issue requests while the charges
+            // are held, however slow this runner is.
+            tokio::time::sleep(LINK_SATURATION_RETRY * 3).await;
+            assert_eq!(
+                requests.load(Ordering::Relaxed),
+                0,
+                "no request may be issued past a full link"
+            );
+            drop(charges);
+        };
+        let (report, ()) = tokio::join!(fetch, driver);
+        assert!(report.requests_issued > 0, "the fetch ran once the link drained");
+        assert!(store.is_complete(id).unwrap(), "and completed the object");
+    }
+
     /// Batches are CUT at the coarsest class in the session (then trimmed to
     /// the picked peer's size in `schedule`): one overlay link must no longer
     /// shrink a clearnet peer's batches, and single-class sessions keep the
@@ -2133,6 +2283,41 @@ mod tests {
                 if !matches!(inc.req, Req::GetRange { .. }) {
                     continue;
                 }
+                let mut off = 0usize;
+                while off < slice.len() {
+                    let end = (off + 60_000).min(slice.len());
+                    let last = end == slice.len();
+                    let body = FrameBody::Data { last, bytes: slice[off..end].to_vec() };
+                    if server.send(Frame { stream: inc.stream, body }).await.is_err() {
+                        return;
+                    }
+                    off = end;
+                }
+            }
+        });
+        client
+    }
+
+    /// [`serving_conn`] that also counts the GetRanges it receives, so a
+    /// test can assert the scheduler issued nothing.
+    fn counting_serving_conn(data: &[u8], requests: Arc<AtomicU64>) -> Conn {
+        use crate::msg::{Frame, FrameBody, Req};
+        use epix_blob::verified::{encode_slice, OutboardBytes};
+
+        let ob = OutboardBytes::from_slice(data);
+        let ranges = vec![0..data.len() as u64];
+        let mut slice = Vec::new();
+        encode_slice(data, &ob, &ranges, &mut slice).unwrap();
+
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+        tokio::spawn(async move {
+            while let Some(inc) = server_in.recv().await {
+                if !matches!(inc.req, Req::GetRange { .. }) {
+                    continue;
+                }
+                requests.fetch_add(1, Ordering::Relaxed);
                 let mut off = 0usize;
                 while off < slice.len() {
                     let end = (off + 60_000).min(slice.len());

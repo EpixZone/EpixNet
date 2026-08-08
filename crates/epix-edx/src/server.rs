@@ -47,9 +47,16 @@ pub const MAX_ENCODE_THREADS: usize = 32;
 /// connection [`MAX_CONCURRENT_SERVES`] caps concurrency, but connections
 /// are many, and every one of them parking its serves on the encode
 /// semaphore was an unbounded process-wide queue. Past this bound the
-/// request is refused with a typed retry-after instead of waiting
-/// silently for an unbounded time.
+/// request waits out one short drain window ([`ENCODE_QUEUE_WAIT`]) and
+/// is then refused with a typed retry-after instead of waiting silently
+/// for an unbounded time.
 pub const MAX_ENCODE_QUEUE: usize = MAX_ENCODE_THREADS * 3;
+/// How long a serve may wait for queue admission before it is refused.
+/// Refusing instantly regressed legacy clients: they parked here without
+/// bound before, they count a BUSY as a strike toward exhausting a seeder
+/// (three in a row and our sole-seeder role is struck out), and a load
+/// spike that fills the queue usually drains within seconds.
+const ENCODE_QUEUE_WAIT: Duration = Duration::from_secs(15);
 /// Retry hint when the global serve queue is full: long enough for a
 /// slice of the queue to drain, short enough to refill a freed queue.
 const ENCODE_QUEUE_RETRY_SECS: u64 = 5;
@@ -76,6 +83,18 @@ static ENCODE_SLOTS: std::sync::LazyLock<Semaphore> =
 /// The [`MAX_ENCODE_QUEUE`] admission permits (running + queued serves).
 static ENCODE_QUEUE: std::sync::LazyLock<Semaphore> =
     std::sync::LazyLock::new(|| Semaphore::new(MAX_ENCODE_QUEUE));
+
+/// Admission to the encode stage. A full queue is waited out for
+/// [`ENCODE_QUEUE_WAIT`] (waiters are bounded by the per-connection serve
+/// slots, so this cannot rebuild the unbounded parking lot the queue bound
+/// removed); None means refuse with the retry hint.
+async fn encode_queue_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    match tokio::time::timeout(ENCODE_QUEUE_WAIT, ENCODE_QUEUE.acquire()).await {
+        Ok(Ok(permit)) => Some(permit),
+        // Timed out; the never-closed semaphore cannot error otherwise.
+        _ => None,
+    }
+}
 
 /// Signed-content access the server delegates to (the real node backs
 /// this with its xite registry; tests use a fixture). Async because the
@@ -210,6 +229,15 @@ impl ServeCtx {
     /// Attach the shared upload governor.
     pub fn with_choker(mut self, choker: Arc<Mutex<Choker>>) -> Self {
         self.choker = Some(choker);
+        self
+    }
+
+    /// Share the node's foreground-activity flag (the LEDBAT yield's
+    /// input). Contexts are built per connection, so without a shared
+    /// flag each one holds a private always-false bool and the yield
+    /// never engages.
+    pub fn with_foreground(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.foreground = flag;
         self
     }
 
@@ -399,12 +427,27 @@ pub async fn serve(
     // Register the connection with the governor (reachability from the
     // link type: overlay links have no handshake hash). Unchoke slots are
     // ranked over CONNECTED peers, so this is what admits the peer to the
-    // competition; the matching note_disconnected is below, after the
-    // serve loop, on every exit path past this point.
+    // competition; the matching note_disconnected runs from a drop guard,
+    // so it also fires if this future is cancelled mid-serve (an accept
+    // loop aborting per-conn tasks) - an unpaired note_connected would
+    // leave a phantom conns>0 account squatting the connected set and
+    // immune to table eviction forever.
     let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
-    if let Some(choker) = &ctx.choker {
-        choker.lock().expect("choker").note_connected(&identity.node_pk, reach, (ctx.now)());
+    struct Connected {
+        ctx: Arc<ServeCtx>,
+        node_pk: Vec<u8>,
     }
+    impl Drop for Connected {
+        fn drop(&mut self) {
+            if let Some(choker) = &self.ctx.choker {
+                choker.lock().expect("choker").note_disconnected(&self.node_pk, (self.ctx.now)());
+            }
+        }
+    }
+    let _connected = ctx.choker.as_ref().map(|choker| {
+        choker.lock().expect("choker").note_connected(&identity.node_pk, reach, (ctx.now)());
+        Connected { ctx: ctx.clone(), node_pk: identity.node_pk.clone() }
+    });
     let identity = Arc::new(identity);
 
     // Idle reaper: drop a connection that goes quiet, releasing its
@@ -443,11 +486,9 @@ pub async fn serve(
             drop(permit);
         });
     }
-    // The connection is gone: it stops competing for unchoke slots (the
-    // account and its credit stay for when the peer returns).
-    if let Some(choker) = &ctx.choker {
-        choker.lock().expect("choker").note_disconnected(&identity.node_pk, (ctx.now)());
-    }
+    // The connection is gone: `_connected`'s drop tells the governor, so
+    // the peer stops competing for unchoke slots (the account and its
+    // credit stay for when the peer returns).
     Some((*identity).clone())
 }
 
@@ -886,9 +927,9 @@ async fn serve_range(
 
     // Bounded global admission to the encode stage: at most
     // MAX_ENCODE_QUEUE serves running-or-queued process-wide; past that
-    // the request is refused with a retry hint rather than parked on the
-    // encode semaphore without bound.
-    let Ok(_queue_slot) = ENCODE_QUEUE.try_acquire() else {
+    // the request rides out one drain window and is then refused with a
+    // retry hint rather than parked on the encode semaphore without bound.
+    let Some(_queue_slot) = encode_queue_slot().await else {
         let _ = conn
             .respond(stream, busy_resp(&identity, ENCODE_QUEUE_RETRY_SECS, "serve queue full"))
             .await;
@@ -996,7 +1037,7 @@ async fn serve_many(
     }
 
     // Same bounded global admission as the range path.
-    let Ok(_queue_slot) = ENCODE_QUEUE.try_acquire() else {
+    let Some(_queue_slot) = encode_queue_slot().await else {
         let _ = conn
             .respond(stream, busy_resp(&identity, ENCODE_QUEUE_RETRY_SECS, "serve queue full"))
             .await;
@@ -1260,7 +1301,7 @@ impl std::io::Write for FrameSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES, UNCHOKE_SLOTS};
+    use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES};
     use crate::frame;
     use epix_blob::Ns;
 

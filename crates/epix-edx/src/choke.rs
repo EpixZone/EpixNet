@@ -246,8 +246,11 @@ impl Choker {
     /// pacer ([`crate::pace`], same cap and yield) instead of being
     /// refused whole — a per-second bucket over multi-hundred-KiB batches
     /// turned every saturated second into a BUSY storm, and each BUSY
-    /// costs the leecher a cooldown. `foreground` signals the user's own
-    /// traffic is active (LEDBAT yield).
+    /// costs the leecher a cooldown. First-paint payload charges the
+    /// pacer's debt at the writer too (never waiting there), so the two
+    /// lanes share the one cap rather than spending a cap each.
+    /// `foreground` signals the user's own traffic is active (LEDBAT
+    /// yield).
     pub fn decide(
         &mut self,
         node_pk: &[u8],

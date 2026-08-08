@@ -200,13 +200,28 @@ impl PeerAddr {
         }
     }
 
-    /// True for loopback/private IPs (EpixNet skips these in PEX with
-    /// `allow_private=False`).
+    /// True for IPs that are not globally routable: loopback, RFC1918,
+    /// link-local (v4 and v6), CGNAT 100.64/10 (carrier NAT, Tailscale)
+    /// and v6 ULA. EpixNet skips these in PEX with `allow_private=False`,
+    /// and under Tor-always they class as direct paths (an exit cannot
+    /// reach any of them, so such a dial never rides the exit).
     pub fn is_private(&self) -> bool {
         match self {
             PeerAddr::Ip(addr) => match addr.ip() {
-                IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-                IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+                IpAddr::V4(ip) => {
+                    ip.is_private()
+                        || ip.is_loopback()
+                        || ip.is_link_local()
+                        // 100.64.0.0/10 (RFC 6598 shared address space).
+                        || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 0x40)
+                }
+                IpAddr::V6(ip) => {
+                    ip.is_loopback()
+                        // fc00::/7 (unique local).
+                        || (ip.segments()[0] & 0xfe00) == 0xfc00
+                        // fe80::/10 (link-local).
+                        || (ip.segments()[0] & 0xffc0) == 0xfe80
+                }
             },
             _ => false,
         }
@@ -445,5 +460,14 @@ mod tests {
         assert!(PeerAddr::parse("127.0.0.1:1").unwrap().is_private());
         assert!(PeerAddr::parse("192.168.1.5:1").unwrap().is_private());
         assert!(!PeerAddr::parse("8.8.8.8:1").unwrap().is_private());
+        // CGNAT shared space (Tailscale-style addresses): 100.64/10 only.
+        assert!(PeerAddr::parse("100.64.0.1:1").unwrap().is_private());
+        assert!(PeerAddr::parse("100.127.255.254:1").unwrap().is_private());
+        assert!(!PeerAddr::parse("100.63.0.1:1").unwrap().is_private());
+        assert!(!PeerAddr::parse("100.128.0.1:1").unwrap().is_private());
+        // v6 link-local and ULA; global v6 stays public.
+        assert!(PeerAddr::parse("[fe80::1]:1").unwrap().is_private());
+        assert!(PeerAddr::parse("[fd00::1]:1").unwrap().is_private());
+        assert!(!PeerAddr::parse("[2001:db8::1]:1").unwrap().is_private());
     }
 }

@@ -128,6 +128,10 @@ struct Shared {
     /// `Conn` clone - i.e. across every swarm sharing the connection. See
     /// [`Conn::charge_fetch`].
     queued_fetch: AtomicU64,
+    /// The same in-flight batches counted as REQUESTS: the unit the
+    /// server's per-connection serve gate works in. See
+    /// [`Conn::queued_fetch_requests`].
+    queued_fetch_reqs: AtomicU64,
     /// Fired by [`Conn::shutdown`]: the writer breaks out (even mid-write),
     /// which cascades into the reader via `gone` and drops the socket.
     shutdown: tokio::sync::Notify,
@@ -167,6 +171,7 @@ impl Conn {
             cancelled: Mutex::new(std::collections::HashSet::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             queued_fetch: AtomicU64::new(0),
+            queued_fetch_reqs: AtomicU64::new(0),
             shutdown: tokio::sync::Notify::new(),
         });
 
@@ -361,14 +366,24 @@ impl Conn {
         self.shared.queued_fetch.load(Ordering::Relaxed)
     }
 
-    /// Charge `bytes` of fetch work to this link's queue counter for as
-    /// long as the returned guard lives. The refund is the guard's `Drop`,
-    /// so a batch future that is cancelled mid-race (an abandoned racer, a
-    /// fetch that completed elsewhere) refunds the link exactly like a
-    /// completed one - a leak here would permanently inflate every sharing
-    /// swarm's stall windows.
+    /// The same in-flight charges counted as requests. The server admits at
+    /// most `MAX_CONCURRENT_SERVES` serves per connection, strictly in
+    /// arrival order, so this is what the scheduler compares against that
+    /// gate to stop stacking requests a link cannot serve concurrently
+    /// anyway (they only lengthen the FIFO a latecomer queues behind).
+    pub fn queued_fetch_requests(&self) -> u32 {
+        self.shared.queued_fetch_reqs.load(Ordering::Relaxed).min(u32::MAX as u64) as u32
+    }
+
+    /// Charge `bytes` of fetch work (one request) to this link's queue
+    /// counters for as long as the returned guard lives. The refund is the
+    /// guard's `Drop`, so a batch future that is cancelled mid-race (an
+    /// abandoned racer, a fetch that completed elsewhere) refunds the link
+    /// exactly like a completed one - a leak here would permanently
+    /// inflate every sharing swarm's stall windows.
     pub fn charge_fetch(&self, bytes: u64) -> FetchCharge {
         self.shared.queued_fetch.fetch_add(bytes, Ordering::Relaxed);
+        self.shared.queued_fetch_reqs.fetch_add(1, Ordering::Relaxed);
         FetchCharge { shared: self.shared.clone(), bytes }
     }
 }
@@ -383,6 +398,7 @@ pub struct FetchCharge {
 impl Drop for FetchCharge {
     fn drop(&mut self) {
         self.shared.queued_fetch.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.shared.queued_fetch_reqs.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -456,7 +472,7 @@ fn spawn_writer<W>(
                 let lanes = async {
                     tokio::select! {
                         biased;
-                        Some(f) = hi.recv() => Some(f),
+                        Some(f) = hi.recv() => Some(charge_priority(f)),
                         Some(f) = paced_bulk_recv(&mut lo) => Some(f),
                         else => None,
                     }
@@ -497,6 +513,18 @@ async fn paced_bulk_recv(lo: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
     let frame = lo.recv().await?;
     pace::bulk().charge(wire_cost(&frame));
     Some(frame)
+}
+
+/// A priority-lane frame is never paced - but its payload still counts
+/// against the paced rate as debt, so bulk yields to first-paint. Without
+/// the charge the two lanes were governed independently (the bucket
+/// admitted first-paint up to the cap while the pacer ran bulk at the
+/// cap), so a busy seeder could upload at TWICE the configured rate.
+/// Client requests and control frames have zero [`wire_cost`], so only
+/// served payload bytes debt the lane.
+fn charge_priority(frame: Frame) -> Frame {
+    pace::bulk().charge(wire_cost(&frame));
+    frame
 }
 
 /// What a frame costs against the paced rate: its payload bytes (headers
@@ -1088,13 +1116,17 @@ mod tests {
 
         let c1 = conn.charge_fetch(1000);
         assert_eq!(clone.queued_fetch_bytes(), 1000, "a clone sees the link's charge");
+        assert_eq!(clone.queued_fetch_requests(), 1, "one charge is one request");
         let c2 = clone.charge_fetch(500);
         assert_eq!(conn.queued_fetch_bytes(), 1500, "charges from clones accumulate");
+        assert_eq!(conn.queued_fetch_requests(), 2);
 
         drop(c1);
         assert_eq!(conn.queued_fetch_bytes(), 500, "dropping a charge refunds its bytes");
+        assert_eq!(conn.queued_fetch_requests(), 1, "and its request slot");
         drop(c2);
         assert_eq!(conn.queued_fetch_bytes(), 0);
+        assert_eq!(conn.queued_fetch_requests(), 0);
     }
 
     #[tokio::test]

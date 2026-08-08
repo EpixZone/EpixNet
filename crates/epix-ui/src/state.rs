@@ -12500,9 +12500,12 @@ impl AppState {
     /// bounded by [`OPTIONAL_MATERIALIZE_BACKLOG`] here and the fetcher's
     /// copy gate there, and a file counts Done/Failed only when the whole
     /// job resolves - a failed materialize requeues exactly like a failed
-    /// fetch. The mandate is re-checked before every assignment; withdrawal
-    /// drops the in-flight fetches (partial groups persist in the store, so
-    /// a resumed pass loses nothing) and aborts the round.
+    /// fetch. The mandate is re-checked before every assignment and polled
+    /// while the loop waits (with the pool full, or the queue drained into
+    /// it, no assignment runs for the rest of the round - the tail files
+    /// would otherwise fetch to completion after the user toggled off);
+    /// withdrawal drops the in-flight fetches (partial groups persist in
+    /// the store, so a resumed pass loses nothing) and aborts the round.
     #[allow(clippy::too_many_arguments)]
     async fn run_optional_round<'a>(
         self: &Arc<Self>,
@@ -12547,6 +12550,12 @@ impl AppState {
         let mut assigned: Vec<(usize, String)> = Vec::new();
         let mut resolved = 0usize;
         let mut aborted = false;
+        // The assignment loop checks the mandate, but with the pool full or
+        // the queue drained nothing assigns, so nothing checks: the last
+        // files in flight (multi-GB each) would run out long after a toggle
+        // off. Poll it while waiting too.
+        let mut mandate_poll = tokio::time::interval(std::time::Duration::from_secs(5));
+        mandate_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         'round: loop {
             while pending.peek().is_some()
@@ -12583,6 +12592,12 @@ impl AppState {
                 break;
             }
             tokio::select! {
+                _ = mandate_poll.tick() => {
+                    if !self.optional_pass_should_continue(address, directory).await {
+                        aborted = true;
+                        break 'round;
+                    }
+                }
                 Some(idx) = phase_rx.recv() => {
                     // Network phase over: the slot frees for the next file
                     // while the materialize tail keeps running in
@@ -19826,5 +19841,43 @@ mod tests {
         );
         // The in-flight fetches were dropped with the round, not run out.
         assert!(net.remove("f1.bin").unwrap().send(()).is_err(), "f1's fetch was cancelled");
+    }
+
+    /// Withdrawal must also land when NO assignment is left to check it:
+    /// the whole queue is in flight (pending drained), the user toggles
+    /// off, and no phase or completion event ever fires. The waiting
+    /// select's mandate poll has to catch it, or the tail files run to
+    /// completion - hours of unwanted transfer after the off switch.
+    #[tokio::test(start_paused = true)]
+    async fn the_optional_round_aborts_mid_wait_when_the_mandate_drops() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (_todo, mut net, _mat, mut ev, _gates) =
+            pool_round_fixture(&state, dir.path(), 3).await;
+        let files: Vec<String> = (0..3).map(|i| format!("f{i}.bin")).collect();
+        let queue: Vec<(usize, &String, u64)> =
+            files.iter().enumerate().map(|(i, p)| (i, p, 10u64)).collect();
+        let (mut fetched, mut bytes_done) = (0usize, 0u64);
+
+        let round =
+            state.run_optional_round("epix1pool", None, &queue, 1, 3, &mut fetched, &mut bytes_done);
+        let driver = async {
+            // All three files assign; the pending queue is now empty, so
+            // the assignment-time mandate check never runs again.
+            for want in ["f0.bin", "f1.bin", "f2.bin"] {
+                let (path, what) = ev.recv().await.unwrap();
+                assert_eq!((path.as_str(), what), (want, "start"));
+            }
+            if let Some(x) = state.xites.write().await.get_mut("epix1pool") {
+                x.settings.serving = false;
+            }
+            // No further events: the paused clock fast-forwards the poll.
+        };
+        let ((requeue, aborted), ()) = tokio::join!(round, driver);
+        assert!(aborted, "the waiting round noticed the withdrawal");
+        assert!(requeue.is_empty(), "an aborted pass requeues nothing");
+        for f in ["f0.bin", "f1.bin", "f2.bin"] {
+            assert!(net.remove(f).unwrap().send(()).is_err(), "{f}'s fetch was cancelled");
+        }
     }
 }

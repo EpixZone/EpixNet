@@ -55,13 +55,21 @@ impl Class {
     /// and stall windows - clearnet sizing there (1 MiB batches, a 4s stall
     /// window) manufactured false stalls on what is really a Tor path. The
     /// dial-timeout and dial-permit paths already make this same check.
-    /// Private/LAN addresses stay clearnet even then: an exit cannot reach
-    /// RFC1918, so those dials bypass the exit path, and a LAN peer is the
-    /// one genuinely fast class.
+    /// Private/LAN addresses (RFC1918, link-local, CGNAT - see
+    /// [`PeerAddr::is_private`]) stay clearnet even then: an exit cannot
+    /// reach any of them, so those dials bypass the exit path, and a LAN
+    /// peer is the one genuinely fast class.
     pub fn of_addr(addr: &PeerAddr) -> Self {
+        Self::of_addr_routed(addr, epix_core::route_all_via_overlay())
+    }
+
+    /// [`Self::of_addr`] with the Tor-always flag passed in: pure, so tests
+    /// cover both states without toggling the process-global (which races
+    /// any concurrently running test that classifies an Ip address).
+    fn of_addr_routed(addr: &PeerAddr, route_all_via_overlay: bool) -> Self {
         match addr {
             PeerAddr::Ip(_) if addr.is_private() => Class::Clearnet,
-            PeerAddr::Ip(_) if epix_core::route_all_via_overlay() => Class::Tor,
+            PeerAddr::Ip(_) if route_all_via_overlay => Class::Tor,
             PeerAddr::Ip(_) => Class::Clearnet,
             PeerAddr::I2p { .. } => Class::I2p,
             PeerAddr::Onion { .. } | PeerAddr::Rns(_) => Class::Tor,
@@ -314,37 +322,49 @@ mod tests {
 
     /// In Tor-always mode a PUBLIC Ip peer rides an exit circuit and must be
     /// classed overlay so it gets overlay batches and stall windows; a
-    /// private/LAN peer is dialed directly (an exit cannot reach RFC1918)
-    /// and must stay clearnet - it is the one genuinely fast class. One test
-    /// covers both flag states: the flag is process-global, so a separate
-    /// test asserting the default would race the toggle.
+    /// private/LAN peer is dialed directly (an exit cannot reach RFC1918,
+    /// link-local or CGNAT space) and must stay clearnet - it is the one
+    /// genuinely fast class. Tested through the pure `of_addr_routed` so
+    /// the process-global flag is never toggled (toggling raced any
+    /// concurrent test that classifies an Ip address).
     #[test]
     fn tor_always_classes_public_ip_as_overlay_but_never_lan() {
-        use epix_core::set_route_all_via_overlay;
         let public = PeerAddr::Ip(SocketAddr::from(([8, 8, 8, 8], 26552)));
         let lan = PeerAddr::Ip(SocketAddr::from(([192, 168, 1, 5], 26552)));
         let ten = PeerAddr::Ip(SocketAddr::from(([10, 0, 0, 1], 26552)));
         let lo = PeerAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 26552)));
+        let cgnat = PeerAddr::Ip(SocketAddr::from(([100, 100, 1, 2], 26552)));
 
         // Clearnet default: the address type alone decides.
-        assert_eq!(Class::of_addr(&public), Class::Clearnet);
-        assert_eq!(Class::of_addr(&lan), Class::Clearnet);
+        assert_eq!(Class::of_addr_routed(&public, false), Class::Clearnet);
+        assert_eq!(Class::of_addr_routed(&lan, false), Class::Clearnet);
 
-        set_route_all_via_overlay(true);
-        let classed = (
-            Class::of_addr(&public),
-            Class::of_addr(&lan),
-            Class::of_addr(&ten),
-            Class::of_addr(&lo),
-            Class::of_addr(&onion("x")),
+        assert_eq!(
+            Class::of_addr_routed(&public, true),
+            Class::Tor,
+            "a public Ip peer rides an exit circuit"
         );
-        // Restore before asserting so a failure cannot leave the global on.
-        set_route_all_via_overlay(false);
-        assert_eq!(classed.0, Class::Tor, "a public Ip peer rides an exit circuit");
-        assert_eq!(classed.1, Class::Clearnet, "RFC1918 bypasses the exit; LAN stays fast");
-        assert_eq!(classed.2, Class::Clearnet, "10/8 is private too");
-        assert_eq!(classed.3, Class::Clearnet, "loopback is never an exit path");
-        assert_eq!(classed.4, Class::Tor, "onions are overlay either way");
+        assert_eq!(
+            Class::of_addr_routed(&lan, true),
+            Class::Clearnet,
+            "RFC1918 bypasses the exit; LAN stays fast"
+        );
+        assert_eq!(Class::of_addr_routed(&ten, true), Class::Clearnet, "10/8 is private too");
+        assert_eq!(
+            Class::of_addr_routed(&lo, true),
+            Class::Clearnet,
+            "loopback is never an exit path"
+        );
+        assert_eq!(
+            Class::of_addr_routed(&cgnat, true),
+            Class::Clearnet,
+            "CGNAT/Tailscale space is a direct path, not an exit one"
+        );
+        assert_eq!(
+            Class::of_addr_routed(&onion("x"), true),
+            Class::Tor,
+            "onions are overlay either way"
+        );
     }
 
     /// Dialing nowhere fails and is counted.

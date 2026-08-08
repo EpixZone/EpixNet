@@ -879,6 +879,7 @@ fn serve_ctx(
         .with_control(control)
         .with_shards(shards)
         .with_on_served(upload_recorder(state.clone()))
+        .with_foreground(edx_foreground_flag())
 }
 
 /// The serve-side upload recorder: resolve the object just served back to
@@ -1343,7 +1344,37 @@ impl Drop for ForegroundFetch {
         if let Ok(mut s) = self.streaming.lock() {
             s.foreground_fetches = s.foreground_fetches.saturating_sub(1);
         }
+        // 1 -> 0: the user's playback is no longer blocked on the network.
+        if FOREGROUND_FETCHES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            set_edx_foreground(false);
+        }
     }
+}
+
+/// Foreground (player-blocking) range fetches across the WHOLE process,
+/// driving the LEDBAT yield on its 0<->1 transitions. Process-wide (not
+/// per fetcher) for the same reason the pacer is: connections and
+/// fetcher clones are many, the user's uplink is one.
+static FOREGROUND_FETCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The node-wide "the user's own playback is blocked on the network"
+/// flag. Shared into every serve context ([`serve_ctx`]) so the choker's
+/// first-paint bucket yields, and mirrored into the bulk pacer so paced
+/// serving slows to the yield fraction. Without this both yields were
+/// dead switches: each per-connection context held a private
+/// always-false bool.
+fn edx_foreground_flag() -> Arc<std::sync::atomic::AtomicBool> {
+    static FLAG: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    FLAG.get_or_init(Default::default).clone()
+}
+
+/// Flip both foreground consumers together (the serve contexts' shared
+/// flag and the bulk pacer).
+fn set_edx_foreground(on: bool) {
+    edx_foreground_flag().store(on, std::sync::atomic::Ordering::Relaxed);
+    epix_edx::pace::bulk().set_foreground(on);
 }
 
 /// A serve's dialed peer session, kept for PEER_CACHE_TTL so consecutive
@@ -2385,10 +2416,15 @@ impl RuntimeEdxFetcher {
     /// `EPIX_EDX_COMPLETE_MEDIA=0` opts a bandwidth/disk-conscious node out,
     /// reverting to fetch-what-you-view.
     /// Mark a foreground (player-blocking) range fetch as on the network for
-    /// the guard's lifetime; `run_completion` yields while any is live.
+    /// the guard's lifetime; `run_completion` yields while any is live, and
+    /// the process-wide count drives the seeder side's LEDBAT yield (see
+    /// [`set_edx_foreground`]).
     fn note_foreground_fetch(&self) -> ForegroundFetch {
         if let Ok(mut s) = self.streaming.lock() {
             s.foreground_fetches += 1;
+        }
+        if FOREGROUND_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            set_edx_foreground(true);
         }
         ForegroundFetch { streaming: self.streaming.clone() }
     }
@@ -3266,6 +3302,13 @@ impl RuntimeEdxFetcher {
                 return Err(e);
             }
         };
+        // Hold the (possibly just-completed) object against quota eviction
+        // NOW, not in materialize_gated: `credit` awaits first (choker +
+        // xites locks), and a sibling pooled file completing in that gap
+        // runs `enforce_quota` - at quota its LRU pass could take exactly
+        // the bytes this fetch just spent an hour landing. Holds are
+        // counted, so the one materialize_gated takes simply overlaps.
+        let _hold = store.hold_eviction(id);
         let pks = node_pks.lock().expect("node pks").clone();
         self.credit(address, &report, &pks, now).await;
         if !store.is_complete(id).unwrap_or(false) {
@@ -4506,6 +4549,29 @@ mod tests {
     use epix_transport::{TcpTransport, Transport};
     use epix_ui::state::XiteEntry;
     use epix_xite::{Xite, XiteStorage};
+
+    /// The foreground guards drive the process-wide LEDBAT flag: any live
+    /// guard holds it up, and the last drop clears it. Asserted relatively
+    /// where it must be (other tests in this binary can hold their own
+    /// guards concurrently).
+    #[tokio::test]
+    async fn foreground_fetch_guards_flip_the_shared_yield_flag() {
+        use std::sync::atomic::Ordering;
+        let state = epix_ui::state::AppState::new("test");
+        let fetcher = RuntimeEdxFetcher::new(state, String::new(), None);
+        let flag = edx_foreground_flag();
+        let a = fetcher.note_foreground_fetch();
+        let b = fetcher.note_foreground_fetch();
+        assert!(flag.load(Ordering::Relaxed), "a live guard holds the flag up");
+        drop(a);
+        assert!(flag.load(Ordering::Relaxed), "one guard still in flight");
+        drop(b);
+        // Our own drops must never leave the flag stuck; only meaningful
+        // when no other test currently holds a guard.
+        if FOREGROUND_FETCHES.load(Ordering::Relaxed) == 0 {
+            assert!(!flag.load(Ordering::Relaxed), "the last drop clears the flag");
+        }
+    }
 
     /// env_on is on unless explicitly disabled: true when unset, false only for
     /// a 0/false value. EDX itself has no on/off knob anymore (it is the

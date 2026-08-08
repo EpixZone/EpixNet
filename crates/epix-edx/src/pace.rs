@@ -14,8 +14,10 @@
 //! 32 encode threads sleeping for rate would starve it). The writer task
 //! is async and already the last hop before the socket, so the wait
 //! costs a timer, not a thread. The PRIORITY lane (control frames,
-//! first-paint data) is never paced — those bytes stay governed by the
-//! choker's per-second bucket.
+//! first-paint data) is never paced — admission stays governed by the
+//! choker's per-second bucket — but its served payload still charges the
+//! debt here, so bulk yields to first-paint and the two lanes together
+//! hold the one configured cap instead of a cap each.
 //!
 //! Debt model rather than a token bank: a frame is sent whenever no debt
 //! is outstanding and its bytes become debt paid down at the configured

@@ -75,6 +75,12 @@ fn busy_err(retry_after_ms: u32) -> std::io::Error {
     )
 }
 
+// Advertising `caps::RETRY_AFTER` in our Hello means the server may answer
+// ANY request with `Resp::Busy` (its serve-slots gate refuses before it
+// even looks at the request type), so every decoder below must map Busy to
+// the refusal error, not the catch-all protocol error - a refusal scores a
+// peer "come back later", a protocol error strikes it.
+
 /// Fires a best-effort `Conn::cancel_now` for its stream when dropped while
 /// still armed, so an abandoned in-flight fetch stops the peer's encode
 /// (see `fetch_many`; the range path uses [`RangeGuard`], which also
@@ -401,6 +407,7 @@ pub async fn push_update(
     {
         Resp::Ok => Ok(()),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected Ok, got {other:?}"))),
     }
 }
@@ -431,6 +438,9 @@ pub async fn fetch_signed(conn: &Conn, xite: &str, inner_path: &str) -> std::io:
             }
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
                 return Err(remote_err(code, &msg))
+            }
+            Some(FrameBody::Resp { resp: Resp::Busy { retry_after_ms }, .. }) => {
+                return Err(busy_err(retry_after_ms))
             }
             Some(other) => return Err(proto_err(format!("expected Signed, got {other:?}"))),
             None => {
@@ -469,6 +479,9 @@ pub async fn list_signed(
             }
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
                 return Err(remote_err(code, &msg))
+            }
+            Some(FrameBody::Resp { resp: Resp::Busy { retry_after_ms }, .. }) => {
+                return Err(busy_err(retry_after_ms))
             }
             Some(other) => return Err(proto_err(format!("expected SignedList, got {other:?}"))),
             None => {
@@ -614,6 +627,7 @@ pub async fn fetch_bitfield(conn: &Conn, obj: ObjId) -> std::io::Result<(u64, Gr
             Ok((size, bits))
         }
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected Bitfield, got {other:?}"))),
     }
 }
@@ -629,6 +643,7 @@ pub async fn fetch_has_shards(conn: &Conn, addrs: &[ObjId]) -> std::io::Result<V
             .map(|i| bits.get(i / 8).map(|b| b & (1 << (i % 8)) != 0).unwrap_or(false))
             .collect()),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected ShardMask, got {other:?}"))),
     }
 }
@@ -659,6 +674,9 @@ pub async fn updates_since(conn: &Conn, after: u64) -> std::io::Result<(Vec<(Str
             Some(FrameBody::Resp { resp: Resp::Err { code, msg }, .. }) => {
                 return Err(remote_err(code, &msg))
             }
+            Some(FrameBody::Resp { resp: Resp::Busy { retry_after_ms }, .. }) => {
+                return Err(busy_err(retry_after_ms))
+            }
             Some(other) => return Err(proto_err(format!("expected Updates, got {other:?}"))),
             None => {
                 return Err(std::io::Error::new(
@@ -680,6 +698,7 @@ pub async fn pex(
     match conn.request(Req::Pex { xite: xite.into(), need, peers: have }).await? {
         Resp::Peers { peers } => Ok(peers),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected Peers, got {other:?}"))),
     }
 }
@@ -689,6 +708,7 @@ pub async fn get_trackers(conn: &Conn) -> std::io::Result<Vec<String>> {
     match conn.request(Req::GetTrackers).await? {
         Resp::Trackers { trackers } => Ok(trackers),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected Trackers, got {other:?}"))),
     }
 }
@@ -698,6 +718,7 @@ pub async fn kad(conn: &Conn, payload: Vec<u8>) -> std::io::Result<Vec<u8>> {
     match conn.request(Req::Kad { payload }).await? {
         Resp::Payload { bytes } => Ok(bytes),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected Payload, got {other:?}"))),
     }
 }
@@ -707,6 +728,7 @@ pub async fn announce(conn: &Conn, payload: Vec<u8>) -> std::io::Result<Vec<u8>>
     match conn.request(Req::Announce { payload }).await? {
         Resp::Payload { bytes } => Ok(bytes),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),
+        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
         other => Err(proto_err(format!("expected Payload, got {other:?}"))),
     }
 }
@@ -1057,6 +1079,44 @@ mod tests {
 
         let err = fetch_signed(&client, "1Abc", "content.json").await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        drop(server);
+    }
+
+    /// The server's serve-slots gate answers `Resp::Busy` before it looks at
+    /// the request type, so EVERY decoder must read Busy as the refusal it
+    /// is. A protocol error here would strike the peer for being busy.
+    #[tokio::test]
+    async fn a_busy_reply_to_any_request_reads_as_a_refusal() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            while let Some(inc) = server_in.recv().await {
+                let frame = Frame {
+                    stream: inc.stream,
+                    body: FrameBody::Resp {
+                        last: true,
+                        resp: Resp::Busy { retry_after_ms: 2000 },
+                    },
+                };
+                if srv.send(frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let err = fetch_bitfield(&client, ObjId::of(b"busy")).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::QuotaExceeded, "{err}");
+        let hint = err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RetryAfter>())
+            .expect("the typed hint survives the decode");
+        assert_eq!(hint.0, std::time::Duration::from_millis(2000));
+
+        let err = get_trackers(&client).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::QuotaExceeded, "{err}");
         drop(server);
     }
 }
