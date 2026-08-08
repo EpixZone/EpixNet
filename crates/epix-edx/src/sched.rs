@@ -1058,6 +1058,7 @@ impl Swarm {
         let this = &*self;
         let mut window = Window::new(&entry_peers);
         let mut sat_waits = 0u32;
+        let mut join_waits = 0u32;
         loop {
             let peers = roster.snapshot();
             window.refill(
@@ -1082,14 +1083,17 @@ impl Swarm {
                     remaining: &remaining,
                     batch_groups: &mut batch_groups,
                     sat_waits: &mut sat_waits,
+                    join_waits: &mut join_waits,
                 };
                 match idle_step(idle, deadline, &peers).await {
                     IdleStep::Abort => break,
                     IdleStep::Rescheduled => continue,
                 }
             }
-            // Something is in flight: this pass was not saturation-blocked.
+            // Something is in flight: this pass was neither saturation- nor
+            // joiner-blocked.
             sat_waits = 0;
+            join_waits = 0;
             let wake = tokio::select! {
                 outcome = next_ready(&mut window.futs) => {
                     Wake::Batch(outcome.expect("the window was not empty"))
@@ -1616,7 +1620,18 @@ struct IdleCtx<'w, 'p> {
     remaining: &'w GroupBits,
     batch_groups: &'w mut u64,
     sat_waits: &'w mut u32,
+    join_waits: &'w mut u32,
 }
+
+/// How long an idle fetch waits on the joiner channel per tick, and how
+/// many consecutive joiner-only ticks it tolerates before giving up. The
+/// channel's close is supposed to be guaranteed by the dial driver, but a
+/// fetch must never bet its liveness on that: a sender leaked anywhere
+/// (this exact shape froze a node when dial scoring parked on a wedged
+/// lock while owning the sender) turns an unbounded joiner wait into a
+/// permanent hang. Two minutes covers multiple 45s overlay dial waves.
+const JOIN_WAIT_TICK: Duration = Duration::from_secs(2);
+const JOIN_WAIT_PATIENCE: u32 = 60; // x JOIN_WAIT_TICK = 120s
 
 /// Nothing in flight and nothing schedulable. When the only reason is a
 /// cooldown (a BUSY seeder sitting out, or the last-peer probe breather)
@@ -1645,24 +1660,37 @@ async fn idle_step(
         *ctx.sat_waits += 1;
         saturated = Some(tokio::time::Instant::now() + LINK_SATURATION_RETRY);
     }
-    let until = match (ctx.window.next_retry(), saturated) {
+    let mut until = match (ctx.window.next_retry(), saturated) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    if until.is_none() && !*ctx.joining {
-        return IdleStep::Abort;
+    if until.is_none() {
+        if !*ctx.joining {
+            return IdleStep::Abort;
+        }
+        // The joiner channel must never be the SOLE wake source: tick and
+        // re-check on a bounded budget instead of awaiting its close
+        // unconditionally (see JOIN_WAIT_PATIENCE).
+        if *ctx.join_waits >= JOIN_WAIT_PATIENCE {
+            return IdleStep::Abort;
+        }
+        *ctx.join_waits += 1;
+        until = Some(tokio::time::Instant::now() + JOIN_WAIT_TICK);
     }
     match join_or_retry(ctx.joiners, *ctx.joining, until).await {
-        Some(Some(handle)) => admit_joiner(
-            handle,
-            ctx.roster,
-            ctx.window,
-            ctx.full_order,
-            ctx.remaining,
-            ctx.batch_groups,
-        ),
+        Some(Some(handle)) => {
+            *ctx.join_waits = 0;
+            admit_joiner(
+                handle,
+                ctx.roster,
+                ctx.window,
+                ctx.full_order,
+                ctx.remaining,
+                ctx.batch_groups,
+            )
+        }
         Some(None) => *ctx.joining = false,
-        None => {} // a cooldown expired: reschedule
+        None => {} // a cooldown or the join tick expired: reschedule
     }
     IdleStep::Rescheduled
 }

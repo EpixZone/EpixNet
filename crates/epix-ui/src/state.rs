@@ -12253,6 +12253,64 @@ impl AppState {
         });
     }
 
+    /// Liveness watchdog for the central `xites` lock. Everything in the
+    /// node - UI pages, admin commands, file serving, dial scoring - goes
+    /// through that lock, and it is write-preferring: a single task holding
+    /// a guard across an await that never resolves freezes the entire
+    /// process while it keeps looking alive (listening socket up, Tor
+    /// chattering). That exact failure ran a node silently dead for hours
+    /// in the field. The watchdog probes the lock on a timeout; a probe
+    /// that cannot get a READ guard in 15s means the node is wedged, and
+    /// after ~2 minutes of that it aborts so a supervisor restarts it -
+    /// a crashed process recovers, a frozen one squats the port forever.
+    /// `EPIX_LOCK_WATCHDOG=log` keeps the loud logging but never aborts.
+    pub fn spawn_lock_watchdog(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let abort_allowed =
+                std::env::var("EPIX_LOCK_WATCHDOG").map(|v| v != "log").unwrap_or(true);
+            let mut wedged = 0u32;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let probe = tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    state.xites.read(),
+                );
+                if probe.await.is_ok() {
+                    wedged = 0;
+                    continue;
+                }
+                wedged += 1;
+                // eprintln first: the structured logger takes its own locks,
+                // and the alarm must not depend on any of them being free.
+                eprintln!(
+                    "[ERROR] xites lock wedged: a read probe timed out after 15s \
+                     ({wedged} consecutive). A task is holding the lock across \
+                     an await that never resolved; the node is effectively frozen."
+                );
+                // Best effort only, and bounded: the logger's own locks may
+                // be downstream of whatever wedged, and a hung log call must
+                // not stop the watchdog from reaching the abort.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    state.log(
+                        "error",
+                        format!("xites lock wedged ({wedged} consecutive 15s probe timeouts)"),
+                    ),
+                )
+                .await;
+                if abort_allowed && wedged >= 4 {
+                    eprintln!(
+                        "[ERROR] xites lock wedged for ~2 minutes; aborting so a \
+                         supervisor can restart the node (set EPIX_LOCK_WATCHDOG=log \
+                         to disable the abort)."
+                    );
+                    std::process::abort();
+                }
+            }
+        });
+    }
+
     /// One tick of the optional retry loop: run every watched scope through
     /// its candidate check, then prune schedule entries whose scope left the
     /// watched sets (toggled off, paused, or deleted).
@@ -12367,9 +12425,13 @@ impl AppState {
                 return;
             }
             state.mark_optional_dirty(&addr);
-            if state.xites.read().await.contains_key(&addr)
-                && !state.optional_scope_missing(&addr, &dirs).await
-            {
+            // Two statements on purpose: the right operand re-acquires the
+            // xites lock, and only the temporary-guard form of the left
+            // operand keeps that sound. Binding the guard (or letting a
+            // refactor merge these) makes this a self-deadlock on a
+            // write-preferring lock.
+            let known = state.xites.read().await.contains_key(&addr);
+            if known && !state.optional_scope_missing(&addr, &dirs).await {
                 state.push_notification(
                     "done",
                     &format!("Downloaded {fetched_total} optional file(s)."),
@@ -13387,12 +13449,35 @@ impl AppState {
 
     /// Build the `siteInfo` response for a xite - EpixNet's `formatSiteInfo`.
     /// Returns `Null` if the xite isn't served here.
+    ///
+    /// The `xites` guard here must NEVER be held across an await. This is
+    /// the node's central lock and it is write-preferring: one reader
+    /// parked on a slow await queues a writer, and that writer then blocks
+    /// every reader in the process - UI, file serving, the works. This
+    /// exact shape (guard held across the `user` lock calls below) froze a
+    /// node for hours in the field. Copy what the response needs, drop the
+    /// guard, then do the user work.
     pub async fn site_info(&self, address: &str) -> Value {
-        let xites = self.xites.read().await;
-        let Some(entry) = xites.get(address) else {
-            return Value::Null;
+        let (settings, display, content, known_peers, started_task_num, tasks_active, workers, optional_progress) = {
+            let xites = self.xites.read().await;
+            let Some(entry) = xites.get(address) else {
+                return Value::Null;
+            };
+            (
+                entry.settings.clone(),
+                entry.display.clone(),
+                // No verified content.json yet (registered mid-clone): an
+                // EMPTY object, not null - EpixNet's formatSiteInfo sends {}
+                // too, and dashboard site rows read `content.title` without a
+                // null check, so null kills the whole site list render.
+                entry.content.as_ref().map(summarize_content).unwrap_or_else(|| json!({})),
+                entry.peers.len() as i64,
+                entry.started_task_num,
+                entry.tasks_active,
+                entry.workers,
+                entry.optional_progress.as_ref().map(|p| p.to_json()).unwrap_or(Value::Null),
+            )
         };
-        let settings = &entry.settings;
 
         let auth_address = self
             .user
@@ -13412,14 +13497,8 @@ impl AppState {
         let short = if address.len() > 6 { &address[..6] } else { address };
         let size_limit = settings.size_limit(DEFAULT_SIZE_LIMIT_MB);
         let next_size_limit = next_size_limit(settings.size);
-        // No verified content.json yet (registered mid-clone): an EMPTY object,
-        // not null - EpixNet's formatSiteInfo sends {} too, and dashboard site
-        // rows read `content.title` without a null check, so null kills the
-        // whole site list render.
-        let content = entry.content.as_ref().map(summarize_content).unwrap_or_else(|| json!({}));
 
         // peers = max(settings, known) + self (we serve it), matching formatSiteInfo.
-        let known_peers = entry.peers.len() as i64;
         let mut peers = settings.peers.max(known_peers);
         if settings.serving {
             peers += 1;
@@ -13445,23 +13524,19 @@ impl AppState {
             "feed_follow_num": feed_follow_num,
             "xid_directory": xid_directory,
             "address": address,
-            "display": entry.display,
+            "display": display,
             "address_short": short,
             "address_hash": address_hash,
-            "settings": serde_json::to_value(settings).unwrap_or(Value::Null),
             "content_updated": settings.modified,
             "bad_files": settings.cache.bad_files.len(),
+            "settings": serde_json::to_value(settings).unwrap_or(Value::Null),
             "size_limit": size_limit,
             "next_size_limit": next_size_limit,
             "peers": peers.max(1),
-            "started_task_num": entry.started_task_num,
-            "tasks": entry.tasks_active,
-            "workers": entry.workers,
-            "optional_progress": entry
-                .optional_progress
-                .as_ref()
-                .map(|p| p.to_json())
-                .unwrap_or(Value::Null),
+            "started_task_num": started_task_num,
+            "tasks": tasks_active,
+            "workers": workers,
+            "optional_progress": optional_progress,
             "content": content,
         })
     }
