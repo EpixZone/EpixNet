@@ -2205,6 +2205,10 @@ async fn serve(
     // tracker set.
     state.spawn_optional_retry_loop();
 
+    // Liveness watchdog: probe the central xites lock and abort a wedged
+    // process rather than let it squat the port looking alive.
+    state.spawn_lock_watchdog();
+
     // On-demand resolve + clone: typing any `talk.epix` in the browser clones
     // and serves it live.
     let on_demand = Arc::new(OnDemand {

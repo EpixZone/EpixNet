@@ -1545,13 +1545,18 @@ impl RuntimeEdxFetcher {
         // dialed through an exit circuit, so it costs a circuit too and must
         // be counted. Gating on the address alone left every clearnet dial
         // uncapped in exactly the mode where all of them ride Tor.
-        let _circuit_slot = match peer.is_overlay() || epix_core::route_all_via_overlay() {
-            true => Some(overlay_dial_permit().await),
-            false => None,
-        };
         // Bound the whole handshake: a peer that TCP-accepts then stalls the
-        // Noise / client_hello exchange must not hang the fetch forever.
+        // Noise / client_hello exchange must not hang the fetch forever. The
+        // permit acquire lives INSIDE the timeout: callers hold the
+        // per-(peer,lane) dial gate across this function, and the gate's
+        // safety argument is that nothing here waits unboundedly. An
+        // uncapped semaphore wait outside the timeout broke that invariant
+        // and let one exhausted dial budget park every dial to the peer.
         tokio::time::timeout(peer.connect_timeout(), async {
+            let _circuit_slot = match peer.is_overlay() || epix_core::route_all_via_overlay() {
+                true => Some(overlay_dial_permit().await),
+                false => None,
+            };
             let stream = transport.dial_lane(peer, lane).await.map_err(|e| e.to_string())?;
             let (reg, stream) =
                 ConnHandle::new(Direction::Out, peer.clone()).attach(stream);
@@ -2045,6 +2050,13 @@ impl RuntimeEdxFetcher {
                 let Ok((peer, dialed)) = res else { continue };
                 outcomes.push((peer, dialed));
             }
+            // Release the joiner channel BEFORE the scoring await. Scoring
+            // takes the xites write lock; holding `tx` across it means a
+            // wedged lock keeps every downstream joiner channel open, which
+            // parks every in-flight fetch on a join that can never arrive -
+            // the freeze becomes self-sealing. Dials are settled here, so
+            // the channel has nothing left to say.
+            drop(tx);
             this.state.note_edx_dials(&address, outcomes).await;
         });
     }
