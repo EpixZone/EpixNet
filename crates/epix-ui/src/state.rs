@@ -4141,9 +4141,14 @@ impl AppState {
             return Err("Site still in sync".into());
         }
         let root = root_inner_path.trim_matches('/');
+        // Old clones recorded `clone_root: "."` for a whole-site clone. Treat it
+        // as the root, or the `<root>/` prefix below matches no source file and
+        // an "Upgrade code" rewrites content.json while copying nothing.
+        let root = if root == "." { "" } else { root };
         let prefix = if root.is_empty() { String::new() } else { format!("{root}/") };
 
         // The new owner's key: a fresh derivation, or the target's saved key.
+        let is_upgrade = target_address.is_some();
         let (address, privatekey) = match target_address {
             Some(target) => {
                 let key = self
@@ -4184,6 +4189,24 @@ impl AppState {
             format!("My {title}")
         };
         map.insert("title".into(), json!(new_title));
+        // An upgrade refreshes the code but keeps the site's own identity: the
+        // owner's title/description and any domain / xid_name claim (all were
+        // just reset to the template's above, and a lost domain claim would
+        // un-name the site until the owner re-claimed it).
+        if is_upgrade {
+            if let Some(existing) = self.content(&address).await.and_then(|c| c.as_object().cloned()) {
+                for key in ["title", "description", "domain", "xid_name"] {
+                    match existing.get(key) {
+                        Some(v) => {
+                            map.insert(key.into(), v.clone());
+                        }
+                        None => {
+                            map.remove(key);
+                        }
+                    }
+                }
+            }
+        }
         map.insert("cloned_from".into(), json!(source));
         if !root.is_empty() {
             map.insert("clone_root".into(), json!(root));
