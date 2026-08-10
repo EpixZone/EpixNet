@@ -281,6 +281,70 @@ async fn site_clone_from_template_root_uses_root_content() {
     assert!(epix_content::verify_signer(&content, &new_address), "signature verifies");
 }
 
+/// "Upgrade code" (siteClone with a `target_address`) re-copies the source
+/// files onto the existing clone. Old clones recorded `clone_root: "."`, which
+/// must read as the whole site - it used to build a `./` prefix that matched
+/// no file, so the upgrade rewrote content.json while silently copying
+/// nothing. The clone's own identity (title, domain claim) survives; only the
+/// code files come from the source.
+#[tokio::test]
+async fn site_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
+    let (state, root, address, _key) = state_with_site().await;
+    let registry = CommandRegistry::with_defaults();
+    let session = WsSession::new(state.clone(), Some(address.clone()));
+
+    // The existing clone: its own key, an outdated page, live user data, and
+    // its own title + domain claim.
+    let clone_key = epix_crypt::new_seed();
+    let clone_addr = epix_crypt::privatekey_to_address(&clone_key).unwrap();
+    let clone_dir = root.path().join("data").join(&clone_addr);
+    let clone_storage = XiteStorage::new(&clone_dir);
+    clone_storage.write("index.html", b"<h1>old fork</h1>").unwrap();
+    clone_storage.write("data/users/carol/data.json", b"{}").unwrap();
+    let clone_content = json!({
+        "address": clone_addr,
+        "title": "Magyar Blog",
+        "domain": "magyar.epix",
+        "cloned_from": address,
+        "clone_root": ".",
+        "files": {},
+    });
+    state
+        .add_xite(&clone_addr, XiteEntry { storage: clone_storage, content: Some(clone_content) })
+        .await;
+    state.set_site_privatekey(&clone_addr, &clone_key).await.unwrap();
+    state.sign_xite(&clone_addr, &clone_key).await.unwrap();
+
+    let res = registry
+        .dispatch(
+            &session,
+            "siteClone",
+            &json!({ "address": address, "root_inner_path": ".", "target_address": clone_addr }),
+            WRAPPER_ID,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res["address"], clone_addr, "upgrade stays on the target address");
+
+    // The source's code files replaced the fork's.
+    let index = std::fs::read_to_string(clone_dir.join("index.html")).unwrap();
+    assert_eq!(index, "<h1>template</h1>", "'.' clone_root copies the whole site");
+    // -default landed de-suffixed; the clone's live user data survived; the
+    // source's live user data still is not copied over.
+    assert!(clone_dir.join("data/users/content.json").exists(), "-default landed de-suffixed");
+    assert!(clone_dir.join("data/users/carol/data.json").exists(), "upgrade keeps live user data");
+    assert!(!clone_dir.join("data/users/alice").exists(), "source live data not copied");
+
+    // The clone keeps its own identity, signed with its own key.
+    let content: Value =
+        serde_json::from_slice(&std::fs::read(clone_dir.join("content.json")).unwrap()).unwrap();
+    assert_eq!(content["address"], clone_addr);
+    assert_eq!(content["title"], "Magyar Blog", "upgrade keeps the site's own title");
+    assert_eq!(content["domain"], "magyar.epix", "upgrade keeps the domain claim");
+    assert_eq!(content["cloned_from"], address);
+    assert!(epix_content::verify_signer(&content, &clone_addr), "signed by the clone's key");
+}
+
 /// `permissionAdd("Merger:<type>")` must leave the merger's db populated
 /// before it responds (the app's grant callback queries right away - python
 /// MergerSite rebuilds in actionPermissionAdd) and push the updated siteInfo.
