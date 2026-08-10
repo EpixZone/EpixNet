@@ -67,15 +67,49 @@ impl XiteStorage {
             f.write_all(bytes).map_err(Error::Io)?;
             f.sync_all().map_err(Error::Io)?;
         }
-        if let Err(e) = std::fs::rename(&tmp, &p) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(Error::Io(e));
+        // Network filesystems fail the replace transiently: SMB returns
+        // EBUSY while any client holds a lease on the destination, and the
+        // lease from a concurrent reader clears in well under a second. A
+        // short retry ladder rescues that case.
+        let mut rename_err = None;
+        for wait_ms in [0u64, 100, 400, 1500] {
+            if wait_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
+            match std::fs::rename(&tmp, &p) {
+                Ok(()) => {
+                    // Best-effort durability of the rename itself.
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
+                    return Ok(());
+                }
+                Err(e) => rename_err = Some(e),
+            }
         }
-        // Best-effort durability of the rename itself.
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
+        // The rename is refused outright (an SMB share under sustained
+        // read pressure can refuse it indefinitely - a node once served a
+        // four-day-old content.json because every commit attempt died
+        // here). Fall back to an in-place replace. Not atomic, but
+        // content.json is signature-verified on load, so a torn write is
+        // detected and re-fetched rather than trusted; the temp file is
+        // kept when even the fallback fails.
+        let fallback = (|| {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)?;
+            f.write_all(bytes)?;
+            f.sync_all()
+        })();
+        match fallback {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(_) => Err(Error::Io(rename_err.expect("rename ran at least once"))),
         }
-        Ok(())
     }
 
     /// Delete a stored file, pruning any directories the removal left empty.
