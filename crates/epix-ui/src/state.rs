@@ -6846,39 +6846,19 @@ impl AppState {
                     f.size,
                     f.bigfile,
                 );
-                if only_downloaded && !is_downloaded {
+                if optional_row_excluded(
+                    &f,
+                    is_downloaded,
+                    only_downloaded,
+                    only_bigfile,
+                    filter_inner_path,
+                ) {
                     return None;
-                }
-                if only_bigfile && !f.bigfile {
-                    return None;
-                }
-                if let Some(pattern) = filter_inner_path {
-                    if !sql_like(pattern, &f.inner_path) {
-                        return None;
-                    }
                 }
                 let stat = stats.get(&f.inner_path);
                 // Seeders: peers whose hashfield advertises the file, plus us.
                 let peer = peer_fields.iter().filter(|hf| hf.has_hash(&f.sha512)).count()
                     + is_downloaded as usize;
-                // Files downloaded before the counter existed fall back to
-                // the file's mtime, so "Finished" isn't n/a for them.
-                let time_downloaded = stat
-                    .map(|s| s.time_downloaded)
-                    .filter(|t| *t > 0)
-                    .or_else(|| {
-                        if !is_downloaded {
-                            return None;
-                        }
-                        xite.storage
-                            .path(&f.inner_path)
-                            .ok()
-                            .and_then(|p| std::fs::metadata(p).ok())
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                    })
-                    .unwrap_or(0);
                 let mut row = json!({
                     "inner_path": f.inner_path,
                     "size": f.size,
@@ -6887,30 +6867,21 @@ impl AppState {
                     "is_pinned": pinned.contains(&f.inner_path),
                     "uploaded": stat.map(|s| s.uploaded).unwrap_or(0),
                     "peer": peer,
-                    "time_downloaded": time_downloaded,
+                    "time_downloaded": optional_time_downloaded(
+                        &xite.storage,
+                        stat.map(|s| s.time_downloaded),
+                        is_downloaded,
+                        &f.inner_path,
+                    ),
                 });
-                if f.bigfile {
-                    // The Bigfiles Status column: piece layout from the
-                    // declaration (same source add_bigfile_fields reads), the
-                    // in-flight flag from the running download pass. A
-                    // complete file holds every piece; a partial one gets its
-                    // live count filled in below, after sort+trim.
-                    let piece_size = f.piece_size.max(1);
-                    let pieces = (f.size + piece_size - 1) / piece_size;
-                    if let Value::Object(o) = &mut row {
-                        o.insert("pieces".into(), json!(pieces));
-                        o.insert(
-                            "pieces_downloaded".into(),
-                            json!(if is_downloaded { pieces } else { 0 }),
-                        );
-                        o.insert(
-                            "is_downloading".into(),
-                            json!(downloading.contains(&f.inner_path)),
-                        );
-                    }
-                    if !is_downloaded {
-                        bigfile_piece_sizes.insert(f.inner_path.clone(), piece_size);
-                    }
+                // A partial bigfile reports the piece size it wants live
+                // progress for, filled in after the sort+trim below so a
+                // Files-tab render never walks transfer rows for files it
+                // won't show.
+                if let Some(piece_size) =
+                    add_bigfile_row_fields(&mut row, &f, is_downloaded, &downloading)
+                {
+                    bigfile_piece_sizes.insert(f.inner_path.clone(), piece_size);
                 }
                 Some(row)
             })
@@ -6919,18 +6890,28 @@ impl AppState {
         if limit > 0 {
             out.truncate(limit);
         }
-        // Live piece progress for the partial bigfiles that made the page:
-        // bytes landed in the store, floored to whole pieces.
-        for row in out.iter_mut() {
+        self.fill_bigfile_piece_progress(address, &mut out, &bigfile_piece_sizes).await;
+        Ok(out)
+    }
+
+    /// Live piece progress for the partial bigfiles that made the page: bytes
+    /// landed in the store, floored to whole pieces. Only the rows
+    /// [`Self::optional_file_list_filtered`] kept are walked.
+    async fn fill_bigfile_piece_progress(
+        &self,
+        address: &str,
+        rows: &mut [Value],
+        piece_sizes: &HashMap<String, i64>,
+    ) {
+        for row in rows.iter_mut() {
             let Some(path) = row["inner_path"].as_str() else { continue };
-            let Some(&piece_size) = bigfile_piece_sizes.get(path) else { continue };
+            let Some(&piece_size) = piece_sizes.get(path) else { continue };
             let have = self.edx_have_bytes(address, path).await as i64;
             if have > 0 {
                 let pieces = row["pieces"].as_i64().unwrap_or(0);
                 row["pieces_downloaded"] = json!((have / piece_size).min(pieces));
             }
         }
-        Ok(out)
     }
 
     /// Info for one optional file, or null. `optionalFileInfo`. For a big file
@@ -12490,54 +12471,63 @@ impl AppState {
     /// Walks the xite's content.jsons, so call it when the answer can change,
     /// not to read it. Readers take the cached [`Self::optional_owed`].
     pub async fn refresh_optional_owed(&self, address: &str) -> usize {
-        let scope = {
-            let xites = self.xites.read().await;
-            let Some(x) = xites.get(address) else { return 0 };
-            if !x.settings.serving {
-                // Paused: no pass will run, so nothing is pending.
-                None
-            } else if x.settings.autodownloadoptional && x.settings.download_optional {
-                Some(None)
-            } else if !x.settings.optional_help.is_empty() {
-                Some(Some(x.settings.optional_help.keys().cloned().collect::<Vec<_>>()))
-            } else if x.settings.own || x.settings.download_optional {
-                // Own xites are authored here; `download_optional` alone is the
-                // on-demand permission, not a promise to fetch everything.
-                None
-            } else {
-                // No promise of its own - the reader's global setting may still
-                // cover it. `retention_completion_plan` returns an empty plan
-                // when the setting is off, so this stays correct either way.
-                Some(Some(Vec::new()))
-            }
-        };
-        let owed = match scope {
+        let owed = match self.optional_owed_scope(address).await {
+            // No promise: nothing is pending however much the xite declares.
             None => 0,
-            // The reader's global full-retention promise, which covers required
-            // files as well as optional ones. Gated exactly like the pass that
-            // would do the fetching: only while the setting is on (the plan
-            // itself also describes the AUTHOR's `retention:complete` policy,
-            // which is completed once at clone time and has no recurring pass
-            // to count down), and never when the author vetoed bulk copies or
-            // the size budget is waiting on a consent the user hasn't given.
-            Some(Some(dirs)) if dirs.is_empty() => {
-                if !self.config_bool("full_retention", false).await
-                    || self.retention_author_veto_holds(address, true).await
-                {
-                    0
-                } else {
-                    let plan = self.retention_completion_plan_as(address, true).await;
-                    if plan.needs_consent && !self.retention_fetch_allowed(address).await {
-                        0
-                    } else {
-                        plan.paths.len()
-                    }
-                }
-            }
+            // An empty directory list means "no promise of its own" - only the
+            // reader's global full-retention setting can still cover it.
+            Some(Some(dirs)) if dirs.is_empty() => self.retention_owed(address).await,
             Some(dirs) => self.optional_scope_owed(address, &dirs).await,
         };
         self.set_optional_owed(address, owed).await;
         owed
+    }
+
+    /// Which files this node promised to fetch for a xite, as a retry scope:
+    /// `None` for no promise at all, `Some(None)` for the whole xite,
+    /// `Some(Some(dirs))` for per-directory commitments, and `Some(Some([]))`
+    /// for "no promise of its own, the global setting may still cover it".
+    async fn optional_owed_scope(&self, address: &str) -> Option<Option<Vec<String>>> {
+        let xites = self.xites.read().await;
+        let x = xites.get(address)?;
+        if !x.settings.serving {
+            // Paused: no pass will run, so nothing is pending.
+            return None;
+        }
+        if x.settings.autodownloadoptional && x.settings.download_optional {
+            return Some(None);
+        }
+        if !x.settings.optional_help.is_empty() {
+            return Some(Some(x.settings.optional_help.keys().cloned().collect()));
+        }
+        if x.settings.own || x.settings.download_optional {
+            // Own xites are authored here; `download_optional` alone is the
+            // on-demand permission, not a promise to fetch everything.
+            return None;
+        }
+        // `retention_completion_plan` returns an empty plan when the global
+        // setting is off, so this stays correct either way.
+        Some(Some(Vec::new()))
+    }
+
+    /// How many files the reader's global full-retention promise still owes a
+    /// xite - required files as well as optional ones. Gated exactly like the
+    /// pass that would do the fetching: only while the setting is on (the plan
+    /// itself also describes the AUTHOR's `retention:complete` policy, which is
+    /// completed once at clone time and has no recurring pass to count down),
+    /// and never when the author vetoed bulk copies or the size budget is
+    /// waiting on a consent the user hasn't given.
+    async fn retention_owed(&self, address: &str) -> usize {
+        if !self.config_bool("full_retention", false).await
+            || self.retention_author_veto_holds(address, true).await
+        {
+            return 0;
+        }
+        let plan = self.retention_completion_plan_as(address, true).await;
+        if plan.needs_consent && !self.retention_fetch_allowed(address).await {
+            return 0;
+        }
+        plan.paths.len()
     }
 
     /// Record how far the update check has walked its candidate peers, and tell
@@ -14484,6 +14474,81 @@ struct DeclaredOptional {
     /// The declared `piece_size` (1 MB when the declaration omits it, like
     /// `add_bigfile_fields`). Only meaningful when `bigfile`.
     piece_size: i64,
+}
+
+/// Whether `optionalFileList`'s filters drop this file: the `downloaded` and
+/// `bigfile` filter words, and the search box's `filter_inner_path` LIKE
+/// pattern.
+fn optional_row_excluded(
+    f: &DeclaredOptional,
+    is_downloaded: bool,
+    only_downloaded: bool,
+    only_bigfile: bool,
+    filter_inner_path: Option<&str>,
+) -> bool {
+    if only_downloaded && !is_downloaded {
+        return true;
+    }
+    if only_bigfile && !f.bigfile {
+        return true;
+    }
+    match filter_inner_path {
+        Some(pattern) => !sql_like(pattern, &f.inner_path),
+        None => false,
+    }
+}
+
+/// When an optional file finished downloading. Files downloaded before the
+/// counter existed fall back to the file's mtime, so "Finished" isn't n/a for
+/// them; 0 means unknown (or not downloaded).
+fn optional_time_downloaded(
+    storage: &XiteStorage,
+    recorded: Option<i64>,
+    is_downloaded: bool,
+    inner_path: &str,
+) -> i64 {
+    if let Some(t) = recorded.filter(|t| *t > 0) {
+        return t;
+    }
+    if !is_downloaded {
+        return 0;
+    }
+    storage
+        .path(inner_path)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The Bigfiles Status column's fields: piece layout from the declaration
+/// (the same source `add_bigfile_fields` reads) and the in-flight flag from
+/// the running download pass. A complete file holds every piece; a partial one
+/// returns its piece size so the caller can fill live progress in later. Does
+/// nothing for a file that is not a bigfile.
+fn add_bigfile_row_fields(
+    row: &mut Value,
+    f: &DeclaredOptional,
+    is_downloaded: bool,
+    downloading: &std::collections::HashSet<String>,
+) -> Option<i64> {
+    if !f.bigfile {
+        return None;
+    }
+    let piece_size = f.piece_size.max(1);
+    let pieces = (f.size + piece_size - 1) / piece_size;
+    if let Value::Object(o) = row {
+        o.insert("pieces".into(), json!(pieces));
+        o.insert("pieces_downloaded".into(), json!(if is_downloaded { pieces } else { 0 }));
+        o.insert("is_downloading".into(), json!(downloading.contains(&f.inner_path)));
+    }
+    if is_downloaded {
+        None
+    } else {
+        Some(piece_size)
+    }
 }
 
 /// EVERY declared optional file of a site: the root content.json's
