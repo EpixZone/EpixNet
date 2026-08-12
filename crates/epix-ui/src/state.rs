@@ -10327,6 +10327,75 @@ impl AppState {
         epix_content::declared_merge_files(&content).iter().any(|p| p == rel)
     }
 
+    /// The fetch half of [`Self::fetch_and_merge_records`]: dial `peers` in
+    /// order, union each served copy into `merged`, and stop once `union_from`
+    /// copies landed or candidates ran out. Per-peer outcomes are returned so
+    /// the caller can feed the registry: a peer that can't be dialed backs off
+    /// (stops wasting a slot every pass), one that serves the file is rewarded
+    /// and rises in selection. Without this the merge fetch was outcome-blind,
+    /// so dead peers kept their slots and a good seed never gained the
+    /// reputation to be picked. `EPIX_MERGE_TRACE=1` logs every answer.
+    async fn union_merge_copies(
+        &self,
+        canonical: &str,
+        inner_path: &str,
+        signers: &[String],
+        peers: &[PeerAddr],
+        union_from: usize,
+        mut merged: Value,
+    ) -> (Value, usize, Vec<(PeerAddr, epix_worker::PeerOutcome)>) {
+        let union_from = union_from.max(1);
+        let trace = std::env::var("EPIX_MERGE_TRACE").map_or(false, |v| !v.is_empty() && v != "0");
+        let mut served = 0usize;
+        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
+        for p in peers {
+            if served >= union_from {
+                break;
+            }
+            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
+            // link; we verify them against the merge rules. A peer that serves
+            // unparsable bytes counts as answering (FileOk for the registry)
+            // but not as a served copy.
+            let answer;
+            match self.edx_fetch_signed(p.clone(), canonical, inner_path).await {
+                Some(Ok(Some(bytes))) => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
+                    match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(incoming) => {
+                            answer = format!(
+                                "served {} record(s)",
+                                epix_content::records_of(&incoming).len()
+                            );
+                            merged = epix_content::merge_orset(
+                                &merged,
+                                &incoming,
+                                signers,
+                                epix_core::now_ms(),
+                            );
+                            served += 1;
+                        }
+                        Err(_) => answer = "served unparsable bytes".to_string(),
+                    }
+                }
+                // Dialed fine but couldn't serve this file: dock reputation only
+                // (it may still serve others), don't back it off.
+                Some(Ok(None)) => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail));
+                    answer = "refused".to_string();
+                }
+                // Dial/link failed, or no fetcher: back it off.
+                Some(Err(_)) | None => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail));
+                    answer = "dial failed".to_string();
+                }
+            }
+            if trace {
+                self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: {answer}")).await;
+            }
+        }
+        (merged, served, outcomes)
+    }
+
     /// Fetch a declared merge file from `sender` (falling back to known
     /// connectable peers) and merge it into the local copy: verify every record
     /// against `signers`, union with what is on disk (grow-only), write, and
@@ -10334,6 +10403,22 @@ impl AppState {
     /// to run on any content.json bump - no diffing needed. Merge files are not
     /// in `files`, so the normal file-sync loop never fetches them; this is how
     /// posts propagate.
+    ///
+    /// `union_from` is the number of SUCCESSFUL copies to union before
+    /// stopping. One copy is not convergence: a peer that serves the file
+    /// promptly but is itself missing the newest records satisfies the fetch
+    /// while teaching us nothing, and with a stable candidate order the same
+    /// stale peer wins the race every pass - a node stayed days behind on a
+    /// forum thread its own LAN neighbour had (the origin had gone offline
+    /// right after posting, so only the pull path could ever heal it). The
+    /// live bump path passes 1 (its sender just pushed the triggering change,
+    /// so that one copy is authoritative for it); the anti-entropy sweep
+    /// passes more and shuffles its candidates, which makes convergence a
+    /// guarantee instead of a race outcome.
+    ///
+    /// Returns how many peers were tried and how many served a copy, so sweep
+    /// callers can aggregate and surface total failures - every exit here is
+    /// otherwise silent, and "Updated!" with stale data is undebuggable.
     pub async fn fetch_and_merge_records(
         &self,
         address: &str,
@@ -10341,16 +10426,17 @@ impl AppState {
         signers: &[String],
         sender: Option<&PeerAddr>,
         sender_peers: &[PeerAddr],
-    ) {
+        union_from: usize,
+    ) -> MergeFetchOutcome {
         if self.transport.read().await.is_none() {
-            return; // offline
+            return MergeFetchOutcome::default(); // offline
         }
         // Peers key files by the signed (canonical) address even when we serve
         // under a `.epix` alias; storage is keyed by the served address.
         let (storage, canonical) = {
             let x = self.xites.read().await;
             let Some(e) = x.get(address) else {
-                return;
+                return MergeFetchOutcome::default();
             };
             (e.storage.clone(), canonical_address(e.content.as_ref(), address))
         };
@@ -10366,55 +10452,29 @@ impl AppState {
                 peers.push(sp.clone());
             }
         }
-        // Try each candidate until one serves the file, recording the outcome
-        // per peer so the registry self-heals: a peer that can't be dialed backs
-        // off (stops wasting a slot every pass), one that serves the file is
-        // rewarded and rises in selection. Without this the merge fetch was
-        // outcome-blind, so dead peers kept their slots and a good seed never
-        // gained the reputation to be picked.
-        let mut fetched: Option<Vec<u8>> = None;
-        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
-        for p in &peers {
-            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
-            // link; the caller verifies them against the merge rules.
-            match self.edx_fetch_signed(p.clone(), &canonical, inner_path).await {
-                Some(Ok(Some(bytes))) => {
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
-                    fetched = Some(bytes);
-                    break;
-                }
-                // Dialed fine but couldn't serve this file: dock reputation only
-                // (it may still serve others), don't back it off.
-                Some(Ok(None)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
-                // Dial/link failed, or no fetcher: back it off.
-                Some(Err(_)) | None => {
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail))
-                }
-            }
-        }
-        if !outcomes.is_empty() {
-            self.apply_peer_outcomes(address, outcomes).await;
-        }
-        let Some(bytes) = fetched else {
-            return;
-        };
-        let Ok(incoming) = serde_json::from_slice::<Value>(&bytes) else {
-            return;
-        };
         let existing = storage
             .read(inner_path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .unwrap_or_else(|| epix_content::make_container(vec![]));
         let before = epix_content::records_of(&existing).len();
-        let merged = epix_content::merge_orset(&existing, &incoming, signers, epix_core::now_ms());
+        let (merged, served, outcomes) =
+            self.union_merge_copies(&canonical, inner_path, signers, &peers, union_from, existing).await;
+        let tried = outcomes.len();
+        if !outcomes.is_empty() {
+            self.apply_peer_outcomes(address, outcomes).await;
+        }
+        let outcome = MergeFetchOutcome { tried, served };
+        if served == 0 {
+            return outcome;
+        }
         // A sweep that found nothing new ends here: no write, no re-ingest,
         // and crucially no file_done event. The anti-entropy pass re-fetches
         // every merge file, and firing an event per no-op merge kept pages'
         // "downloading" indicators up long after the real download ended.
         let after = epix_content::records_of(&merged).len();
         if after == before {
-            return;
+            return outcome;
         }
         if let Ok(out) = serde_json::to_vec(&merged) {
             if storage.write(inner_path, &out).is_ok() {
@@ -10426,6 +10486,7 @@ impl AppState {
                 self.recompute_feeds(address).await;
             }
         }
+        outcome
     }
 
     /// Anti-entropy for merge files: for every served xite, re-fetch + merge
@@ -10450,29 +10511,55 @@ impl AppState {
         if !self.is_serving(address).await {
             return;
         }
-        // Reliable tracker-seeds first, then the registry peers: merge records
-        // (posts/comments/upvotes) bypass whole-file hash sync and are only ever
-        // pulled from a peer that actually holds them. The registry fills with
-        // dead gossip peers all at reputation 0, so without the seeds up front a
-        // new record can go unfetched for many passes (it did - every registry
-        // peer selected failed to serve it while a known seed had it).
-        let peers = self.fetch_candidate_peers(address, 8).await;
+        // The pool is SHUFFLED every pass, and each file unions copies from
+        // more than one serving peer (see `fetch_and_merge_records`). Both are
+        // load-bearing: candidate ranking is stable (registry reputation, then
+        // seeds), so with a first-answer-wins fetch the same responsive-but-
+        // stale peer won the race every pass and the one peer actually holding
+        // a new record was never asked - a node sat minutes from its LAN
+        // neighbour's copy of a forum reply and could not converge, every
+        // 5-minute sweep and manual Update a silent no-op. Shuffling makes
+        // every candidate reachable eventually; the union makes each pass try
+        // more than one answer.
+        let mut peers = self.fetch_candidate_peers(address, MERGE_SWEEP_POOL).await;
         if peers.is_empty() {
+            self.log("DEBUG", format!("Merge resync {address}: no connectable peers")).await;
             return;
         }
+        shuffle_peers(&mut peers);
         let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone()) else {
             return;
         };
         let Ok(view) = self.xite_view(address).await else {
             return;
         };
+        let mut files = 0usize;
+        let mut unserved = 0usize;
         for content_path in walk_content_json(storage.root()) {
-            self.resync_merge_dir(address, &content_path, &storage, &view, &peers).await;
+            let (f, u) = self.resync_merge_dir(address, &content_path, &storage, &view, &peers).await;
+            files += f;
+            unserved += u;
+        }
+        // Every declared merge file failed on every tried peer: the site's
+        // records CANNOT converge this pass. Say so once per sweep - each
+        // fetch exit is individually silent, and the resulting "Updated!"
+        // with stale posts is undebuggable without this line.
+        if files > 0 && unserved == files {
+            self.log(
+                "INFO",
+                format!(
+                    "Merge resync {address}: no peer served any of {files} merge file(s) ({} tried)",
+                    peers.len()
+                ),
+            )
+            .await;
         }
     }
 
     /// Anti-entropy for the merge files declared by ONE content.json unit:
     /// re-fetch + merge each from `peers`. Broken out of [`resync_merge_files`].
+    /// Returns (merge files seen, merge files no peer served) for the sweep's
+    /// aggregate failure log.
     async fn resync_merge_dir(
         &self,
         address: &str,
@@ -10480,24 +10567,33 @@ impl AppState {
         storage: &XiteStorage,
         view: &Xite,
         peers: &[PeerAddr],
-    ) {
+    ) -> (usize, usize) {
         let Ok(bytes) = storage.read(content_path) else {
-            return;
+            return (0, 0);
         };
         let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
-            return;
+            return (0, 0);
         };
         let merge_paths = epix_content::declared_merge_files(&content);
         if merge_paths.is_empty() {
-            return;
+            return (0, 0);
         }
         let dir = content_path.strip_suffix("content.json").unwrap_or("").trim_end_matches('/');
         let xid_map = Self::resolve_xid_map(storage, content_path).await;
         let signers = view.valid_signers_for(content_path, &xid_map);
+        let mut files = 0usize;
+        let mut unserved = 0usize;
         for rel in merge_paths {
             let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
-            self.fetch_and_merge_records(address, &mpath, &signers, None, peers).await;
+            let outcome = self
+                .fetch_and_merge_records(address, &mpath, &signers, None, peers, MERGE_SWEEP_UNION)
+                .await;
+            files += 1;
+            if outcome.served == 0 {
+                unserved += 1;
+            }
         }
+        (files, unserved)
     }
 
     // ---- Feed engine (derived, read-only cache over the OR-set records) -----
@@ -11553,14 +11649,31 @@ impl AppState {
                             } else {
                                 format!("{dir}/{rel}")
                             };
-                            self.fetch_and_merge_records(
-                                &key,
-                                &mpath,
-                                &signers,
-                                sender.as_ref(),
-                                &sender_peers,
-                            )
-                            .await;
+                            let outcome = self
+                                .fetch_and_merge_records(
+                                    &key,
+                                    &mpath,
+                                    &signers,
+                                    sender.as_ref(),
+                                    &sender_peers,
+                                    1,
+                                )
+                                .await;
+                            // The bump told us new records exist and nobody
+                            // served them: the posts behind this content bump
+                            // stay invisible until an anti-entropy sweep
+                            // succeeds. Rare (per bump, not per sweep), so it
+                            // can say so out loud.
+                            if outcome.served == 0 && outcome.tried > 0 {
+                                self.log(
+                                    "INFO",
+                                    format!(
+                                        "Merge fetch {mpath}: none of {} peer(s) served it",
+                                        outcome.tried
+                                    ),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -14285,6 +14398,50 @@ fn declared_object_ids(storage: &XiteStorage, content: Option<&Value>) -> Vec<ep
     out
 }
 
+/// What one [`AppState::fetch_and_merge_records`] pass achieved, for the
+/// caller's aggregate logging: how many peers it tried and how many actually
+/// served a copy of the file (0 served = the pass could not have converged).
+#[derive(Default, Clone, Copy)]
+pub struct MergeFetchOutcome {
+    pub tried: usize,
+    pub served: usize,
+}
+
+/// Candidate-pool size for a merge sweep. Larger than the clone path's dial
+/// cap on purpose: convergence needs the pool to eventually include EVERY
+/// peer that might hold a record, not just the reputation top ranks.
+const MERGE_SWEEP_POOL: usize = 16;
+
+/// Successful copies a sweep unions per merge file. 1 is the live-bump value
+/// (the sender's copy is authoritative for the change it just pushed); the
+/// sweep unions a second copy so one stale-but-responsive peer cannot satisfy
+/// the whole pass. Kept small because every copy is a full file fetch, often
+/// over Tor, for every merge file of every site each sweep.
+const MERGE_SWEEP_UNION: usize = 2;
+
+/// Fisher-Yates with a cheap xorshift seed. Merge sweeps shuffle their
+/// candidate pool so the fetch race has a different grid every pass: with the
+/// registry's stable reputation order, the same responsive peer won every
+/// pass, and a record held only by a lower-ranked peer was unreachable
+/// forever. A fresh permutation per pass makes every candidate the first
+/// responder eventually, which is what turns the sweep into an actual
+/// anti-entropy guarantee.
+fn shuffle_peers(peers: &mut [PeerAddr]) {
+    static SALT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut seed = (epix_core::now_ms() as u64)
+        ^ SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_mul(0x9e3779b97f4a7c15);
+    if seed == 0 {
+        seed = 0x2545f4914f6cdd1d;
+    }
+    for i in (1..peers.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let j = (seed % (i as u64 + 1)) as usize;
+        peers.swap(i, j);
+    }
+}
+
 /// Every `content.json` under `root`, as site-relative inner_paths.
 fn walk_content_json(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
@@ -14828,6 +14985,31 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn shuffle_peers_permutes_without_losing_anyone() {
+        let original: Vec<PeerAddr> = (0..50u16)
+            .map(|i| PeerAddr::Ip(format!("10.0.0.{}:{}", i % 250 + 1, 1000 + i).parse().unwrap()))
+            .collect();
+        let mut peers = original.clone();
+        shuffle_peers(&mut peers);
+        // Same multiset: nobody dropped, nobody duplicated.
+        let mut a: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
+        let mut b: Vec<String> = original.iter().map(|p| p.to_string()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "shuffle keeps the same peer set");
+        // And it actually varies across passes: convergence relies on every
+        // candidate eventually reaching the front of the pool. Three attempts
+        // make an accidental identity permutation astronomically unlikely.
+        let identity: Vec<String> = original.iter().map(|p| p.to_string()).collect();
+        let changed = (0..3).any(|_| {
+            let mut again = original.clone();
+            shuffle_peers(&mut again);
+            again.iter().map(|p| p.to_string()).collect::<Vec<_>>() != identity
+        });
+        assert!(changed, "shuffle produces fresh permutations across passes");
+    }
 
     #[test]
     fn summarize_content_falls_back_to_favicon_file() {
