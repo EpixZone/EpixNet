@@ -8035,6 +8035,13 @@ impl AppState {
                 logs.pop_front();
             }
         }
+        // The dashboard's health chip turns red on the first error, so hand it
+        // the new list right away (`serverChanged`) instead of leaving it on
+        // whatever `serverErrors` returned when the page loaded.
+        if matches!(level, "ERROR" | "CRITICAL") {
+            let errors = self.server_errors().await;
+            self.push_event("setServerErrors", json!(errors), Some("serverChanged"), None);
+        }
         // Stream to any open sidebar console(s) whose filter matches this line.
         let streams = self.log_streams.read().await;
         if !streams.is_empty() {
@@ -9255,8 +9262,25 @@ impl AppState {
     }
 
     /// Store the latest I2P status snapshot (JSON) for the Stats page.
+    ///
+    /// The runtime polls I2P every few seconds, so this pushes `serverChanged`
+    /// only when a field the dashboard's reachability readout is built from
+    /// moves (mode, phase, inbound b32) - the counters in the rest of the
+    /// snapshot change constantly and would push on every poll.
     pub async fn set_i2p_status(&self, status: Value) {
-        *self.i2p_status.write().await = status;
+        let reachability = |v: &Value| {
+            let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+            (field("mode"), field("phase"), field("b32"))
+        };
+        let changed = {
+            let mut cur = self.i2p_status.write().await;
+            let was = reachability(&cur);
+            *cur = status;
+            was != reachability(&cur)
+        };
+        if changed {
+            self.push_server_info().await;
+        }
     }
 
     /// The latest I2P status snapshot (`{}` when I2P is off).
@@ -20205,6 +20229,45 @@ mod tests {
         let payload: Value = serde_json::from_str(&ev.payload).unwrap();
         assert_eq!(payload["cmd"], "setServerInfo");
         assert!(payload["params"]["version"].is_string());
+    }
+
+    #[tokio::test]
+    async fn error_log_pushes_server_errors() {
+        let s = AppState::new("test");
+        let mut events = s.subscribe_events();
+
+        s.log("INFO", "routine activity").await;
+        assert!(events.try_recv().is_err(), "INFO is not worth a push");
+
+        s.log("ERROR", "sync failed").await;
+        let ev = events.try_recv().unwrap();
+        assert_eq!(ev.channel.as_deref(), Some("serverChanged"));
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "setServerErrors");
+        let errors = payload["params"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "only the error line, not the INFO one");
+        assert_eq!(errors[0][2], "sync failed");
+    }
+
+    #[tokio::test]
+    async fn i2p_status_pushes_only_on_reachability_change() {
+        let s = AppState::new("test");
+        let mut events = s.subscribe_events();
+
+        s.set_i2p_status(json!({ "mode": "both", "phase": "Starting…", "b32": "" })).await;
+        let ev = events.try_recv().unwrap();
+        assert_eq!(ev.channel.as_deref(), Some("serverChanged"));
+
+        // Same phase, moved counters: the poll loop's normal case.
+        s.set_i2p_status(json!({ "mode": "both", "phase": "Starting…", "b32": "", "tunnels_built": 3 }))
+            .await;
+        assert!(events.try_recv().is_err(), "counters alone do not push");
+
+        s.set_i2p_status(json!({ "mode": "both", "phase": "ready", "b32": "xyz.b32.i2p" })).await;
+        let ev = events.try_recv().unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "setServerInfo");
+        assert_eq!(payload["params"]["network_status"]["i2p"]["reachable"], json!(true));
     }
 
     #[tokio::test]
