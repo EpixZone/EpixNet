@@ -10399,6 +10399,7 @@ impl AppState {
         let mut merged = existing;
         let mut served = 0usize;
         let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
+        let trace = std::env::var("EPIX_MERGE_TRACE").map_or(false, |v| !v.is_empty() && v != "0");
         for p in &peers {
             if served >= union_from {
                 break;
@@ -10409,6 +10410,10 @@ impl AppState {
                 Some(Ok(Some(bytes))) => {
                     outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
                     if let Ok(incoming) = serde_json::from_slice::<Value>(&bytes) {
+                        let n = epix_content::records_of(&incoming).len();
+                        if trace {
+                            self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: served {n} record(s)")).await;
+                        }
                         merged = epix_content::merge_orset(
                             &merged,
                             &incoming,
@@ -10420,9 +10425,17 @@ impl AppState {
                 }
                 // Dialed fine but couldn't serve this file: dock reputation only
                 // (it may still serve others), don't back it off.
-                Some(Ok(None)) => outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail)),
+                Some(Ok(None)) => {
+                    if trace {
+                        self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: refused")).await;
+                    }
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail))
+                }
                 // Dial/link failed, or no fetcher: back it off.
                 Some(Err(_)) | None => {
+                    if trace {
+                        self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: dial failed")).await;
+                    }
                     outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail))
                 }
             }
