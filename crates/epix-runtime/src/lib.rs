@@ -18,7 +18,7 @@
 
 use epix_core::PeerAddr;
 use epix_ui::conn_pool::LinkOpener;
-use epix_ui::AppState;
+use epix_ui::{AppState, UpdateOutcome, UPDATE_PHASE_CHECKING};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1074,13 +1074,15 @@ async fn resync_loop(
             _ = shutdown.notified() => break,
             _ = tick.tick() => {
                 for address in state.xite_addresses().await {
-                    // Show the check on the dashboard like EpixNet: the
-                    // "Updating..." pill while checking, then an `updated`
-                    // outcome event - "Updated!" (self-clearing) on success,
-                    // the error pill on failure. The pill only clears on a
-                    // matching outcome event, never on a plain refresh.
-                    state.push_site_info_event(&address, "updating").await;
+                    // Show the pass on the dashboard: the quiet "Checking..."
+                    // pill while we ask peers whether anything is newer, which
+                    // becomes "Updating..." only if one of them says yes (see
+                    // `resync_apply_newer`), then an `updated` outcome event.
+                    // The phase is registered BEFORE the event so the pushed
+                    // siteInfo carries it. The pill only clears on a matching
+                    // outcome event, never on a plain refresh.
                     state.begin_site_update(&address);
+                    state.push_site_info_event(&address, UPDATE_PHASE_CHECKING).await;
                     // The pass runs on its own task so a panic in one xite's
                     // sync can't kill this loop (which would strand the pill
                     // and end all future resyncs) - it surfaces as a JoinError
@@ -1089,25 +1091,33 @@ async fn resync_loop(
                         let state = state.clone();
                         let address = address.clone();
                         async move {
-                            let ok = state.resync_xite(&address).await.is_ok();
+                            let applied = state.resync_xite(&address).await;
                             // New and updated user content (posts, comments)
-                            // rides the same cycle.
-                            state.sync_user_content(&address).await;
-                            ok
+                            // rides the same cycle, and counts as an update in
+                            // its own right: a pass that pulled a new post did
+                            // bring something, even when the root content.json
+                            // was already current.
+                            let user_bytes = state.sync_user_content(&address).await;
+                            match applied {
+                                Ok(true) => UpdateOutcome::Applied,
+                                Ok(false) if user_bytes > 0 => UpdateOutcome::Applied,
+                                Ok(false) => UpdateOutcome::NoChange,
+                                Err(_) => UpdateOutcome::Failed,
+                            }
                         }
                     })
                     .await;
                     state.end_site_update(&address);
-                    let ok = match joined {
-                        Ok(ok) => ok,
+                    let outcome = match joined {
+                        Ok(outcome) => outcome,
                         Err(e) => {
                             state
                                 .log("ERROR", format!("Resync pass for {address} died: {e}"))
                                 .await;
-                            false
+                            UpdateOutcome::Failed
                         }
                     };
-                    state.push_update_result(&address, ok).await;
+                    state.push_update_result(&address, outcome).await;
                 }
                 // Verified updates whose files couldn't all be fetched are
                 // held uncommitted (the previous version keeps serving);
@@ -1213,9 +1223,24 @@ async fn propagation_loop(
                     // sync, so a "content already current" resync never fetches
                     // them). Each fires its own file_done/updated events, so open
                     // pages re-query as the data lands.
-                    let _ = state.resync_xite(&address).await;
-                    state.sync_user_content(&address).await;
+                    //
+                    // Bracketed like the tick above so the row shows what is
+                    // happening: a hint means a peer told us this xite moved,
+                    // so the pill usually goes checking -> updating -> the file
+                    // countdown rather than quietly retiring.
+                    state.begin_site_update(&address);
+                    state.push_site_info_event(&address, UPDATE_PHASE_CHECKING).await;
+                    let applied = state.resync_xite(&address).await;
+                    let user_bytes = state.sync_user_content(&address).await;
                     state.resync_merge_files_for(&address).await;
+                    state.end_site_update(&address);
+                    let outcome = match applied {
+                        Ok(true) => UpdateOutcome::Applied,
+                        Ok(false) if user_bytes > 0 => UpdateOutcome::Applied,
+                        Ok(false) => UpdateOutcome::NoChange,
+                        Err(_) => UpdateOutcome::Failed,
+                    };
+                    state.push_update_result(&address, outcome).await;
                 }
             }
         }

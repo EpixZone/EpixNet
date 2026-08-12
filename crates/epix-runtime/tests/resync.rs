@@ -104,6 +104,24 @@ async fn runtime_resyncs_a_published_update() {
             ..Default::default()
         },
     );
+    // Collect the dashboard's event stream for the whole pass, so we can assert
+    // the row pill's phases below. Drained in a task: the broadcast buffer is
+    // small and the loop ticks every 100ms.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let mut events = state.subscribe_events();
+    tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            while let Ok(ev) = events.recv().await {
+                if let Ok(v) = serde_json::from_str::<Value>(&ev.payload) {
+                    if v["cmd"] == "setSiteInfo" {
+                        seen.lock().unwrap().push(v["params"].clone());
+                    }
+                }
+            }
+        }
+    });
+
     runtime.start();
 
     // The loop should fetch the newer content.json over EDX, verify it, and
@@ -124,5 +142,58 @@ async fn runtime_resyncs_a_published_update() {
 
     assert_eq!(std::fs::read(&post_path).unwrap(), post);
 
+    // Let the loop tick again with nothing left to fetch, so the assertions
+    // below can compare an applying pass against a no-change one.
+    let no_change = {
+        let seen = seen.clone();
+        timeout(Duration::from_secs(15), async move {
+            loop {
+                let found = seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["event"][0] == "updated" && p["update_applied"] == json!(false));
+                if found {
+                    return;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+    };
+    no_change.expect("a later tick closed a pass that found nothing newer");
+
     runtime.shutdown().await;
+
+    // The dashboard row's pill, as this pass drove it. A pass opens on the
+    // quiet "checking" phase (we don't know anything is stale yet), escalates
+    // to "updating" only once a peer actually answered with a newer
+    // content.json, and closes by declaring whether anything landed. Every
+    // step also carries `update_phase`, which is what lets a dashboard that
+    // loads mid-pass render the same pill instead of a blank row.
+    let seen = seen.lock().unwrap();
+    let step = |event: &str| -> Option<Value> {
+        seen.iter().find(|p| p["event"][0] == event).cloned()
+    };
+
+    let checking = step("checking").expect("pass announced the checking phase");
+    assert_eq!(checking["update_phase"], "checking");
+
+    let updating = step("updating").expect("a newer content.json escalated the pass to updating");
+    assert_eq!(updating["update_phase"], "updating");
+
+    // The closing event for the pass that actually applied the update.
+    let applied = seen
+        .iter()
+        .find(|p| p["event"][0] == "updated" && p["update_applied"] == json!(true))
+        .expect("the pass that landed the update reported it as applied");
+    assert_eq!(applied["update_phase"], Value::Null, "phase clears before the outcome");
+    assert_ne!(applied["content_updated"], json!(false), "not an error");
+
+    // Later ticks re-check and find nothing: they must close as no-change, or
+    // the row would flash a green "Updated!" every cycle forever.
+    assert!(
+        seen.iter().any(|p| p["event"][0] == "updated" && p["update_applied"] == json!(false)),
+        "a pass with nothing newer closes without claiming an update"
+    );
 }

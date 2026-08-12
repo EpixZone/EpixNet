@@ -1936,8 +1936,11 @@ impl WsCommand for SiteUpdate {
         // popup notification.
         let state = s.state.clone();
         tokio::spawn(async move {
-            state.push_site_info_event(&address, "updating").await;
+            // Phase first, then the event carrying it: the row opens on the
+            // quiet "Checking..." pill and only escalates to "Updating..." if a
+            // peer actually has something newer.
             state.begin_site_update(&address);
+            state.push_site_info_event(&address, crate::state::UPDATE_PHASE_CHECKING).await;
             // Own task so a panic mid-sync still reaches the outcome push
             // below - without it the row's "Updating..." pill never clears.
             let joined = tokio::spawn({
@@ -1950,19 +1953,21 @@ impl WsCommand for SiteUpdate {
                     // the "I clicked Update and it says it worked but the xite
                     // is still stale" complaint. resync_xite now errors when
                     // nobody answered, which surfaces here as a failed update.
-                    let ok = match state.resync_xite(&address).await {
-                        Ok(_) => true,
+                    let applied = match state.resync_xite(&address).await {
+                        Ok(applied) => Some(applied),
                         Err(e) => {
                             state
                                 .log("INFO", format!("Update of {address} failed: {e}"))
                                 .await;
-                            false
+                            None
                         }
                     };
                     // Root files alone miss a user_contents site's actual data
                     // (topics and posts live in per-user files) - sync those
-                    // too, like the periodic resync cycle does.
-                    state.sync_user_content(&address).await;
+                    // too, like the periodic resync cycle does. Bytes pulled
+                    // here count as an update: the user clicked Update and new
+                    // posts arrived, even if the root content.json was current.
+                    let user_bytes = state.sync_user_content(&address).await;
                     // Posts/comments/upvotes are CRDT merge records that bypass
                     // hash sync. The syncs above only fetch merge files for dirs
                     // whose content.json changed in the pass; when we already
@@ -1972,12 +1977,24 @@ impl WsCommand for SiteUpdate {
                     // invisible until the 5-min sweep. Pull them unconditionally
                     // so a user who clicks Update sees them now.
                     state.resync_merge_files_for(&address).await;
-                    ok
+                    match applied {
+                        Some(true) => crate::state::UpdateOutcome::Applied,
+                        Some(false) if user_bytes > 0 => crate::state::UpdateOutcome::Applied,
+                        Some(false) => crate::state::UpdateOutcome::NoChange,
+                        None => crate::state::UpdateOutcome::Failed,
+                    }
                 }
             })
             .await;
             state.end_site_update(&address);
-            state.push_update_result(&address, joined.unwrap_or(false)).await;
+            // A panicked task lost its outcome; report the failure rather than
+            // leaving the pill up forever.
+            state
+                .push_update_result(
+                    &address,
+                    joined.unwrap_or(crate::state::UpdateOutcome::Failed),
+                )
+                .await;
         });
         Ok(Value::from("Updated"))
     }
@@ -2854,7 +2871,10 @@ impl WsCommand for FileNeed {
     }
 }
 
-/// `optionalFileList(address, orderby, limit, filter)` - this xite's optional files.
+/// `optionalFileList(address, orderby, limit, filter, filter_inner_path)` -
+/// this xite's optional files. `filter` is comma-separated
+/// ("downloaded", "downloaded,bigfile"); `filter_inner_path` is the search
+/// box's LIKE pattern.
 struct OptionalFileList;
 #[async_trait]
 impl WsCommand for OptionalFileList {
@@ -2872,6 +2892,8 @@ impl WsCommand for OptionalFileList {
             None => s.address()?.to_string(),
         };
         let filter = p.get("filter").and_then(|v| v.as_str()).unwrap_or("downloaded");
+        // The search box's LIKE pattern ("%name%"), applied per site.
+        let filter_inner_path = p.get("filter_inner_path").and_then(|v| v.as_str());
         let orderby =
             p.get("orderby").and_then(|v| v.as_str()).unwrap_or("time_downloaded DESC");
         let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -2883,7 +2905,10 @@ impl WsCommand for OptionalFileList {
         if address == "all" {
             let mut rows = Vec::new();
             for addr in s.state.xite_addresses().await {
-                let Ok(mut list) = s.state.optional_file_list(&addr, filter, orderby, 0).await
+                let Ok(mut list) = s
+                    .state
+                    .optional_file_list_filtered(&addr, filter, orderby, 0, filter_inner_path)
+                    .await
                 else {
                     continue;
                 };
@@ -2900,7 +2925,11 @@ impl WsCommand for OptionalFileList {
             }
             return Ok(Value::Array(rows));
         }
-        Ok(Value::Array(s.state.optional_file_list(&address, filter, orderby, limit).await?))
+        Ok(Value::Array(
+            s.state
+                .optional_file_list_filtered(&address, filter, orderby, limit, filter_inner_path)
+                .await?,
+        ))
     }
 }
 
@@ -2982,7 +3011,11 @@ impl WsCommand for FileTransferStats {
     }
 }
 
-/// `optionalFileDelete(inner_path)`.
+/// `optionalFileDelete(inner_path, address?)`. The optional `address` (the
+/// dashboard's Files tab deletes other sites' files) targets that site with
+/// the same permission gate as `optionalFileList`; without it the path
+/// resolves against the session's own site as before (cors-/merged-
+/// prefixes included).
 struct OptionalFileDelete;
 #[async_trait]
 impl WsCommand for OptionalFileDelete {
@@ -2991,12 +3024,23 @@ impl WsCommand for OptionalFileDelete {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileDelete: inner_path required")?;
-        let (address, inner_path) = s.resolve_target(inner_path).await?;
+        let (address, inner_path) = match arg_str(p, "address", 1) {
+            Some(a) => {
+                require_site_permission(s, a).await?;
+                (a.to_string(), inner_path.to_string())
+            }
+            None => s.resolve_target(inner_path).await?,
+        };
         s.state.optional_file_delete(&address, &inner_path).await
     }
 }
 
-/// `optionalFilePin` / `optionalFileUnpin`.
+/// `optionalFilePin` / `optionalFileUnpin` - `inner_path` is a single path or
+/// an ARRAY of paths (the dashboard's bulk selectbar sends
+/// `[inner_paths, address]`), and the optional `address` targets another
+/// site's files with the same permission gate as `optionalFileList`
+/// (own site / admin / merger). No address = the session's own site,
+/// single-string behavior unchanged.
 struct OptionalFilePin {
     pin: bool,
 }
@@ -3006,10 +3050,34 @@ impl WsCommand for OptionalFilePin {
         if self.pin { "optionalFilePin" } else { "optionalFileUnpin" }
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
-        let inner_path = arg_str(p, "inner_path", 0).ok_or("inner_path required")?;
-        s.state.set_pin(&address, inner_path, self.pin).await;
+        let address = match arg_str(p, "address", 1) {
+            Some(a) => {
+                require_site_permission(s, a).await?;
+                a.to_string()
+            }
+            None => s.address()?.to_string(),
+        };
+        let inner_paths = arg_str_list(p, "inner_path", 0).ok_or("inner_path required")?;
+        s.state.set_pins(&address, &inner_paths, self.pin).await;
         Ok(Value::from("ok"))
+    }
+}
+
+/// Read a positional-or-named arg that is either one string or an array of
+/// strings, as a list. `None` when absent or when the array holds no strings.
+fn arg_str_list(p: &Value, key: &str, idx: usize) -> Option<Vec<String>> {
+    let raw = p
+        .get(key)
+        .or_else(|| p.as_array().and_then(|a| a.get(idx)))
+        .unwrap_or(p);
+    match raw {
+        Value::String(one) => Some(vec![one.clone()]),
+        Value::Array(items) => {
+            let list: Vec<String> =
+                items.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            (!list.is_empty()).then_some(list)
+        }
+        _ => None,
     }
 }
 
@@ -3529,8 +3597,12 @@ impl WsCommand for SiteSetAutodownloadoptional {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
+        // Named form reads `value` (this used to read `owned` - a copy-paste
+        // from the siteSetOwned handler - so `{value: true}` silently became
+        // false); the legacy key and the positional form keep working.
         let on = p
-            .get("owned")
+            .get("value")
+            .or_else(|| p.get("owned"))
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
@@ -4099,6 +4171,97 @@ mod tests {
         assert_eq!(feed_item_limit(Some(&json!(10))), 10);
         assert_eq!(feed_item_limit(Some(&json!(1_000_000))), FEED_ITEM_MAX_RECORDS);
         assert_eq!(feed_item_limit(Some(&json!("all"))), FEED_ITEM_MAX_RECORDS);
+    }
+
+    /// The dashboard's Files tab contracts: optionalFilePin/Unpin take
+    /// `[inner_paths_ARRAY, address]` (bulk, cross-site, gated like
+    /// optionalFileList), optionalFileDelete honors a positional address,
+    /// and the old single-string session-bound shapes keep working.
+    #[tokio::test]
+    async fn optional_pin_unpin_delete_accept_arrays_and_cross_site_address() {
+        use tempfile::tempdir;
+        let dash_dir = tempdir().unwrap();
+        let files_dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let storage = XiteStorage::new(files_dir.path());
+        storage.write("a.bin", b"aaaa").unwrap();
+        let target =
+            &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": target, "modified": 1.0, "files": {},
+            "files_optional": {
+                "a.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"aaaa") },
+                "b.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"bbbb") },
+            },
+        });
+        state.add_xite(target, XiteEntry { storage, content: Some(content) }).await;
+        // The dashboard runs on an ADMIN site.
+        state
+            .add_xite(
+                "1dash",
+                XiteEntry {
+                    storage: XiteStorage::new(dash_dir.path()),
+                    content: Some(json!({ "address": "1dash", "files": {} })),
+                },
+            )
+            .await;
+        state.add_permission("1dash", "ADMIN").await;
+        let session = WsSession::new(state.clone(), Some("1dash".into()));
+
+        // Bulk pin on another site: [paths_array, address].
+        OptionalFilePin { pin: true }
+            .handle(&session, &json!([["a.bin", "b.bin"], target]))
+            .await
+            .unwrap();
+        let list = state.optional_file_list(target, "all", "", 0).await.unwrap();
+        assert!(list.iter().all(|f| f["is_pinned"] == true), "both pinned in one call");
+
+        // Bulk unpin mirrors it.
+        OptionalFilePin { pin: false }
+            .handle(&session, &json!([["a.bin", "b.bin"], target]))
+            .await
+            .unwrap();
+        let list = state.optional_file_list(target, "all", "", 0).await.unwrap();
+        assert!(list.iter().all(|f| f["is_pinned"] == false));
+
+        // Old shape: single string, no address = the session's own site.
+        let own = WsSession::new(state.clone(), Some(target.into()));
+        OptionalFilePin { pin: true }.handle(&own, &json!(["a.bin"])).await.unwrap();
+        let list = state.optional_file_list(target, "all", "", 0).await.unwrap();
+        let a = list.iter().find(|f| f["inner_path"] == "a.bin").unwrap();
+        assert_eq!(a["is_pinned"], true);
+
+        // A non-admin bystander site cannot touch another site's pins/files.
+        let outsider = WsSession::new(state.clone(), Some("1random".into()));
+        let err = OptionalFilePin { pin: true }
+            .handle(&outsider, &json!([["a.bin"], target]))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Forbidden");
+        let err = OptionalFileDelete
+            .handle(&outsider, &json!(["a.bin", target]))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Forbidden");
+
+        // The Files search: `address: "all"` honors filter_inner_path and
+        // tags each row with its site.
+        let rows = OptionalFileList
+            .handle(
+                &session,
+                &json!({ "address": "all", "filter": "downloaded", "filter_inner_path": "%A%" }),
+            )
+            .await
+            .unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "only the downloaded a.bin matches");
+        assert_eq!(rows[0]["inner_path"], "a.bin");
+        assert_eq!(rows[0]["address"].as_str(), Some(target.as_str()));
+
+        // optionalFileDelete honors the positional address with the same gate.
+        OptionalFileDelete.handle(&session, &json!(["a.bin", target])).await.unwrap();
+        let list = state.optional_file_list(target, "downloaded", "", 0).await.unwrap();
+        assert!(list.is_empty(), "the downloaded copy is gone");
     }
 
     #[tokio::test]

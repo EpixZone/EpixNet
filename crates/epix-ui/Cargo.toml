@@ -22,6 +22,9 @@ epix-peer = { path = "../epix-peer" }
 # announce handlers. Already an indirect dependency through epix-xite.
 epix-discovery = { path = "../epix-discovery" }
 epix-db = { path = "../epix-db" }
+# Process-wide protocol request totals (`request_totals`) for the chart
+# collector's request_num_sent/request_num_recv series.
+epix-edx = { path = "../epix-edx" }
 epix-protocol = { path = "../epix-protocol" }
 epix-transport = { path = "../epix-transport" }
 epix-propagation = { path = "../epix-propagation" }
