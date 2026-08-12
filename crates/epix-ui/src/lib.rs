@@ -27,7 +27,8 @@ pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
 pub use state::{
-    self_exe, AppState, ContentSyncer, OnDemandResolver, PeerFinder, XiteEntry, DEFAULT_SIZE_LIMIT_MB,
+    self_exe, AppState, ContentSyncer, OnDemandResolver, PeerFinder, UpdateOutcome, XiteEntry,
+    DEFAULT_SIZE_LIMIT_MB, UPDATE_PHASE_CHECKING, UPDATE_PHASE_UPDATING,
 };
 
 use axum::{

@@ -59,6 +59,21 @@ const SEND_POLL: Duration = Duration::from_millis(100);
 /// request. 1 MiB leaves room for a dozen max-size requests in flight.
 const INBOUND_QUEUE_UNITS: u32 = 1024;
 
+/// Process-wide protocol request totals. Every `Req` a local caller sends
+/// goes through [`Conn::request_stream`] and every `Req` a peer sends us is
+/// routed by the reader, so these two counters see all protocol requests -
+/// control ops, GetSigned/GetMany syncs, and each GetRange of a bulk fetch
+/// alike (frame-level Ping/Pong is transport liveness, not a request). The
+/// chart collector samples them as `request_num_sent` / `request_num_recv`;
+/// they reset with the process, which the `|change` recording absorbs.
+static REQ_SENT: AtomicU64 = AtomicU64::new(0);
+static REQ_RECV: AtomicU64 = AtomicU64::new(0);
+
+/// `(sent, received)` protocol requests since this process started.
+pub fn request_totals() -> (u64, u64) {
+    (REQ_SENT.load(Ordering::Relaxed), REQ_RECV.load(Ordering::Relaxed))
+}
+
 /// A streaming response: `Data`/`Resp` frames delivered in order until a
 /// frame with `last = true`. Carries the stream `id` it was allocated so
 /// the caller can [`Conn::cancel`] exactly this stream (duplicate-on-
@@ -260,6 +275,7 @@ impl Conn {
             self.shared.waiters.lock().expect("waiters").remove(&stream);
             return Err(closed_err());
         }
+        REQ_SENT.fetch_add(1, Ordering::Relaxed);
         Ok(StreamRx { id: stream, rx, shared: self.shared.clone() })
     }
 
@@ -586,6 +602,7 @@ async fn route_frame(
 ) -> bool {
     match frame.body {
         FrameBody::Req(req) => {
+            REQ_RECV.fetch_add(1, Ordering::Relaxed);
             return admit_request(frame.stream, req, in_tx, gone, in_budget).await;
         }
         FrameBody::Cancel => {
@@ -779,6 +796,20 @@ mod tests {
         let (client, _server) = linked().await;
         let resp = client.request(Req::GetBitfield { obj: ObjId([1; 32]) }).await.unwrap();
         assert_eq!(resp, Resp::Bitfield { size: 1, runs: vec![1] });
+    }
+
+    /// The chart's request_num_sent/request_num_recv source: every dispatched
+    /// `Req` bumps the process-wide sent total, every routed inbound `Req`
+    /// the received one. Deltas are `>=` because the totals are shared with
+    /// other tests in this process.
+    #[tokio::test]
+    async fn request_totals_count_sent_and_received() {
+        let (sent0, recv0) = request_totals();
+        let (client, _server) = linked().await;
+        client.request(Req::GetBitfield { obj: ObjId([3; 32]) }).await.unwrap();
+        let (sent1, recv1) = request_totals();
+        assert!(sent1 >= sent0 + 1, "the dispatched request was counted");
+        assert!(recv1 >= recv0 + 1, "the served request was counted");
     }
 
     #[tokio::test]

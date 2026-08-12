@@ -435,6 +435,31 @@ pub enum LoadingFile {
     NotInSite,
 }
 
+/// An update pass is asking peers whether a newer content.json exists. Nothing
+/// is known to be out of date yet, so the dashboard renders this as a quiet
+/// "Checking..." that retires on its own.
+pub const UPDATE_PHASE_CHECKING: &str = "checking";
+
+/// A peer answered with a newer content.json and the pass is applying it:
+/// verify, fetch the changed files, commit. This is the phase the dashboard's
+/// "Updating..." pill (and its "N left" file countdown) belongs to.
+pub const UPDATE_PHASE_UPDATING: &str = "updating";
+
+/// How an update pass ended, as the dashboard's row pill renders it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// Something landed: a newer content.json was committed, or the pass
+    /// pulled new user content (posts, comments). The row flashes "Updated!".
+    Applied,
+    /// The check completed and there was nothing newer. The row's pill retires
+    /// without a flash - this is the outcome of most passes, and announcing it
+    /// as an update was the lie.
+    NoChange,
+    /// The check itself could not be made (no transport, no reachable peer) or
+    /// the xite's local content is unverifiable. The row shows the error pill.
+    Failed,
+}
+
 /// Plugins that ship disabled by default, matching the plugins EpixNet keeps
 /// `disabled-` (that we have): they are off until the operator turns them on.
 const DEFAULT_DISABLED_PLUGINS: &[&str] = &["NoNewSites", "UiPassword", "Multiuser"];
@@ -583,6 +608,28 @@ struct ManagedXite {
     /// sidebar so the "help distribute" toggle shows a spinner + per-file
     /// status instead of appearing frozen. `None` when nothing is downloading.
     optional_progress: Option<OptionalProgress>,
+    /// How many optional files this node has PROMISED to fetch for this xite
+    /// and does not have yet - the dashboard row's countdown. The promise is
+    /// the user's own: the whole-site toggle, per-directory `optionalHelp`
+    /// commitments, or the global full-retention setting. A xite the user
+    /// never opted into owes nothing, however many optional files it declares.
+    ///
+    /// Cached because the real answer walks the xite's content.jsons on disk,
+    /// and `site_info` is built on every push. Refreshed by
+    /// [`AppState::refresh_optional_owed`] at the few points where the answer
+    /// can change: the retry loop's own scope check (which was already paying
+    /// for that walk), a committed update, and the toggles themselves.
+    optional_owed: usize,
+    /// How many files the batch currently draining `tasks_active` started with,
+    /// so a row can show how far through it is rather than only how much is
+    /// left. Recorded when a batch primes its counters and cleared when the
+    /// queue empties.
+    tasks_total: usize,
+    /// `(peers probed, peers to probe)` for the update check in progress. The
+    /// check walks its candidate list one peer at a time, each bounded by that
+    /// peer's own dial timeout, which is why it can sit for a minute or more on
+    /// a cold registry - this is the only honest progress there is for it.
+    check_peers: (usize, usize),
 }
 
 /// Per-file state within an [`OptionalProgress`] run. Serialized to the sidebar
@@ -864,12 +911,18 @@ pub struct AppState {
     /// the small signed JSON + bytes, never file data.
     pending_updates: std::sync::Mutex<HashMap<String, PendingUpdate>>,
     /// Xite addresses with an update pass (periodic resync or `siteUpdate`)
-    /// currently running, bracketed by [`Self::begin_site_update`] /
-    /// [`Self::end_site_update`]. A websocket whose event stream lagged
-    /// (dropped events under load) uses this to re-send the closing `updated`
-    /// event for finished sites only - an in-flight site's real outcome event
-    /// is still coming, and a premature one would clear its pill early.
-    site_updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// currently running, mapped to the phase it is in
+    /// ([`UPDATE_PHASE_CHECKING`] -> [`UPDATE_PHASE_UPDATING`]), bracketed by
+    /// [`Self::begin_site_update`] / [`Self::end_site_update`].
+    ///
+    /// Two readers: a websocket whose event stream lagged (dropped events
+    /// under load) re-sends the closing `updated` event for finished sites
+    /// only - an in-flight site's real outcome event is still coming, and a
+    /// premature one would clear its pill early. And `site_info` reports the
+    /// phase as `update_phase`, so a dashboard that loads (or reloads)
+    /// mid-pass renders the row's pill from the xite list instead of waiting
+    /// for an event it already missed.
+    site_updates_in_flight: std::sync::Mutex<HashMap<String, &'static str>>,
     /// Xite addresses with an on-demand clone currently downloading files,
     /// bracketed by [`Self::begin_clone`] / [`Self::end_clone`]. The html
     /// serving gate reads this: while a clone runs, the page document waits
@@ -1466,7 +1519,7 @@ impl AppState {
             pins_path: persist.pins_path,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
-            site_updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            site_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -2598,6 +2651,9 @@ impl AppState {
                 hashfield,
                 peer_hashfields: HashMap::new(),
                 optional_progress: None,
+                optional_owed: 0,
+                tasks_total: 0,
+                check_peers: (0, 0),
             },
         );
         // Record the served-xite list so it is restored on the next start.
@@ -3801,11 +3857,26 @@ impl AppState {
     }
 
     /// Update live worker accounting for a xite.
+    ///
+    /// A caller priming a fresh batch passes its size as `started_delta` (that
+    /// is what "started" means), so this is also where the batch total gets
+    /// recorded - the denominator a row needs to draw progress rather than just
+    /// a shrinking number. Both the update path and the bulk optional pass
+    /// prime this way, so both get it without knowing about it.
     pub async fn set_worker_stats(&self, address: &str, active: usize, workers: usize, started_delta: usize) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.tasks_active = active;
             x.workers = workers;
             x.started_task_num += started_delta;
+            if started_delta > 0 {
+                x.tasks_total = active;
+            } else if active == 0 {
+                x.tasks_total = 0;
+            } else if active > x.tasks_total {
+                // A retry round re-queued more than the batch began with; the
+                // bar must not read past 100%.
+                x.tasks_total = active;
+            }
         }
     }
 
@@ -5367,9 +5438,15 @@ impl AppState {
         // that even when serving under a `.epix` alias.
         let canonical = canonical_address(view.content.as_ref(), address);
 
-        for peer in &peers {
-            let Some((new, bytes)) = self.resync_probe_peer(address, &canonical, peer).await
-            else {
+        // The check is a sequential walk over the candidates, each probe
+        // bounded by that peer's dial timeout - which is the whole reason it
+        // can sit there for a minute. Report position in the list so the row
+        // can show how far through it is instead of an opaque wait.
+        self.set_check_progress(address, 0, peers.len()).await;
+        for (probed, peer) in peers.iter().enumerate() {
+            let result = self.resync_probe_peer(address, &canonical, peer).await;
+            self.set_check_progress(address, probed + 1, peers.len()).await;
+            let Some((new, bytes)) = result else {
                 continue;
             };
             answered = true;
@@ -5481,6 +5558,14 @@ impl AppState {
         bytes: Vec<u8>,
         peers: Vec<PeerAddr>,
     ) -> Result<bool, String> {
+        // The check phase is over: this xite really is out of date. Move the
+        // pass to `updating` so the dashboard's quiet "Checking..." becomes the
+        // "Updating..." pill (and, once the file count is known below, the
+        // "N left" countdown). Both the phase and the event, so open pages
+        // switch now and a page loading later reads the same state.
+        if self.mark_site_update_applying(address) {
+            self.push_site_info_event(address, UPDATE_PHASE_UPDATING).await;
+        }
         let mut xite = Xite::new(
             Address::parse(canonical.to_string()).map_err(|e| e.to_string())?,
             storage.clone(),
@@ -5518,6 +5603,14 @@ impl AppState {
         let committed = self
             .finalize_root_update(&keys, canonical, storage, content, &bytes, &failed)
             .await;
+        if committed {
+            // The new version may declare optional files the user has promised
+            // to fetch. Count them NOW rather than waiting for the retry loop's
+            // next tick, so the row's countdown continues straight out of the
+            // update instead of flashing "Updated!" and picking the count back
+            // up half a minute later.
+            self.refresh_optional_owed(address).await;
+        }
         Ok(committed)
     }
 
@@ -6680,8 +6773,12 @@ impl AppState {
 
     /// List optional files with their state and the per-file counters the
     /// dashboard's Files tab renders (uploaded bytes/ratio, seeder count,
-    /// finished time). `filter` = "downloaded" (default) or anything else for
-    /// all; `orderby` is the tab's SQL-ish sort ("time_downloaded DESC",
+    /// finished time). `filter` is a comma-separated set: "downloaded"
+    /// restricts to files present here, "bigfile" to piecemap-declared big
+    /// files (the dashboard's Bigfiles section sends "downloaded,bigfile");
+    /// anything else lists all. `filter_inner_path` is the search box's
+    /// SQL-LIKE pattern (`%name%`, case-insensitive) against the inner_path.
+    /// `orderby` is the tab's SQL-ish sort ("time_downloaded DESC",
     /// "is_pinned DESC, inner_path", ...); `limit` 0 = all. `optionalFileList`.
     pub async fn optional_file_list(
         &self,
@@ -6690,19 +6787,50 @@ impl AppState {
         orderby: &str,
         limit: usize,
     ) -> Result<Vec<Value>, String> {
+        self.optional_file_list_filtered(address, filter, orderby, limit, None).await
+    }
+
+    /// [`Self::optional_file_list`] with the search box's `filter_inner_path`
+    /// LIKE pattern.
+    pub async fn optional_file_list_filtered(
+        &self,
+        address: &str,
+        filter: &str,
+        orderby: &str,
+        limit: usize,
+        filter_inner_path: Option<&str>,
+    ) -> Result<Vec<Value>, String> {
         let xite = self.xite_view(address).await?;
-        let (pinned, stats, peer_fields) = {
+        let (pinned, stats, peer_fields, downloading) = {
             let xites = self.xites.read().await;
             match xites.get(address) {
                 Some(x) => (
                     x.pinned.clone(),
                     x.settings.cache.optional_stats.clone(),
                     x.peer_hashfields.values().cloned().collect::<Vec<_>>(),
+                    // Files the running bulk-download pass is fetching right
+                    // now - the Bigfiles Status column's "paused" logic keys
+                    // on this.
+                    x.optional_progress
+                        .as_ref()
+                        .map(|p| {
+                            p.files
+                                .iter()
+                                .filter(|f| f.state == OptFileState::Active)
+                                .map(|f| f.path.clone())
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .unwrap_or_default(),
                 ),
                 None => Default::default(),
             }
         };
-        let only_downloaded = filter == "downloaded";
+        let only_downloaded = filter.split(',').any(|f| f.trim() == "downloaded");
+        let only_bigfile = filter.split(',').any(|f| f.trim() == "bigfile");
+        // Bigfiles the caller may need live piece progress for (declared
+        // piece size per path), resolved after the sort+trim below so a
+        // Files-tab render never walks transfer rows for files it won't show.
+        let mut bigfile_piece_sizes: HashMap<String, i64> = HashMap::new();
         // Root + child content.json declarations: a hub's per-user optional
         // files (avatars…) must list too, not just the root's.
         let mut out: Vec<Value> = declared_optional_files(&xite.storage, xite.content.as_ref())
@@ -6720,6 +6848,14 @@ impl AppState {
                 );
                 if only_downloaded && !is_downloaded {
                     return None;
+                }
+                if only_bigfile && !f.bigfile {
+                    return None;
+                }
+                if let Some(pattern) = filter_inner_path {
+                    if !sql_like(pattern, &f.inner_path) {
+                        return None;
+                    }
                 }
                 let stat = stats.get(&f.inner_path);
                 // Seeders: peers whose hashfield advertises the file, plus us.
@@ -6743,7 +6879,7 @@ impl AppState {
                             .map(|d| d.as_secs() as i64)
                     })
                     .unwrap_or(0);
-                Some(json!({
+                let mut row = json!({
                     "inner_path": f.inner_path,
                     "size": f.size,
                     "sha512": f.sha512,
@@ -6752,12 +6888,47 @@ impl AppState {
                     "uploaded": stat.map(|s| s.uploaded).unwrap_or(0),
                     "peer": peer,
                     "time_downloaded": time_downloaded,
-                }))
+                });
+                if f.bigfile {
+                    // The Bigfiles Status column: piece layout from the
+                    // declaration (same source add_bigfile_fields reads), the
+                    // in-flight flag from the running download pass. A
+                    // complete file holds every piece; a partial one gets its
+                    // live count filled in below, after sort+trim.
+                    let piece_size = f.piece_size.max(1);
+                    let pieces = (f.size + piece_size - 1) / piece_size;
+                    if let Value::Object(o) = &mut row {
+                        o.insert("pieces".into(), json!(pieces));
+                        o.insert(
+                            "pieces_downloaded".into(),
+                            json!(if is_downloaded { pieces } else { 0 }),
+                        );
+                        o.insert(
+                            "is_downloading".into(),
+                            json!(downloading.contains(&f.inner_path)),
+                        );
+                    }
+                    if !is_downloaded {
+                        bigfile_piece_sizes.insert(f.inner_path.clone(), piece_size);
+                    }
+                }
+                Some(row)
             })
             .collect();
         sort_file_list(&mut out, orderby);
         if limit > 0 {
             out.truncate(limit);
+        }
+        // Live piece progress for the partial bigfiles that made the page:
+        // bytes landed in the store, floored to whole pieces.
+        for row in out.iter_mut() {
+            let Some(path) = row["inner_path"].as_str() else { continue };
+            let Some(&piece_size) = bigfile_piece_sizes.get(path) else { continue };
+            let have = self.edx_have_bytes(address, path).await as i64;
+            if have > 0 {
+                let pieces = row["pieces"].as_i64().unwrap_or(0);
+                row["pieces_downloaded"] = json!((have / piece_size).min(pieces));
+            }
         }
         Ok(out)
     }
@@ -7087,14 +7258,23 @@ impl AppState {
 
     /// Pin/unpin an optional file. `optionalFilePin` / `optionalFileUnpin`.
     pub async fn set_pin(&self, address: &str, inner_path: &str, pinned: bool) {
+        self.set_pins(address, std::slice::from_ref(&inner_path.to_string()), pinned).await;
+    }
+
+    /// Pin/unpin a batch of optional files in one pass (the dashboard's
+    /// selectbar sends every selected path of a site at once) - one persist
+    /// for the whole batch instead of one write per file.
+    pub async fn set_pins(&self, address: &str, inner_paths: &[String], pinned: bool) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
-            if pinned {
-                x.pinned.insert(inner_path.to_string());
-            } else {
-                x.pinned.remove(inner_path);
+            for inner_path in inner_paths {
+                if pinned {
+                    x.pinned.insert(inner_path.clone());
+                } else {
+                    x.pinned.remove(inner_path);
+                }
             }
         }
-        // Persist so the pin survives a restart (OptionalManager).
+        // Persist so the pins survive a restart (OptionalManager).
         self.persist_pins().await;
     }
 
@@ -8055,15 +8235,20 @@ impl AppState {
     }
 
     /// Push the outcome of an update check as the dashboard expects it
-    /// (EpixNet's contract): an `updated` event ends the "Updating..." pill -
-    /// rendered as a self-clearing "Updated!" flash on success, or (with
-    /// `content_updated: false`) as the "Update failed"/"No peers" error pill.
-    /// A plain eventless push would leave the old pill text on screen.
-    pub async fn push_update_result(&self, address: &str, ok: bool) {
+    /// (EpixNet's contract): an `updated` event ends the in-progress pill.
+    /// `update_applied` says which ending it is - a self-clearing "Updated!"
+    /// flash for a pass that actually brought something, a silent retirement
+    /// of the pill for a pass that found nothing (the common case: every xite
+    /// gets checked on every resync tick, and a green "Updated!" on all of
+    /// them was reporting work that never happened). A failure keeps the
+    /// `content_updated: false` marker the "Update failed"/"No peers" error
+    /// pill reads. A plain eventless push would leave the old pill on screen.
+    pub async fn push_update_result(&self, address: &str, outcome: UpdateOutcome) {
         let mut info = self.site_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!(["updated", true]));
-            if !ok {
+            m.insert("update_applied".to_string(), json!(outcome == UpdateOutcome::Applied));
+            if outcome == UpdateOutcome::Failed {
                 m.insert("content_updated".to_string(), json!(false));
             }
             self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
@@ -8071,15 +8256,42 @@ impl AppState {
     }
 
     /// Mark an update pass (periodic resync or `siteUpdate`) as running for a
-    /// xite. Pair with [`Self::end_site_update`] before pushing the outcome.
+    /// xite, in its opening phase: asking peers whether a newer content.json
+    /// even exists. Pair with [`Self::end_site_update`] before pushing the
+    /// outcome.
     pub fn begin_site_update(&self, address: &str) {
-        self.site_updates_in_flight.lock().unwrap().insert(address.to_string());
+        self.site_updates_in_flight
+            .lock()
+            .unwrap()
+            .insert(address.to_string(), UPDATE_PHASE_CHECKING);
+    }
+
+    /// A peer answered with a NEWER content.json: the pass moves from checking
+    /// to actually updating. Returns whether the phase moved, which is false
+    /// for a caller that never bracketed the pass ([`Self::begin_site_update`])
+    /// - those get no phase and no event, because nothing would ever push the
+    /// outcome that retires the pill.
+    pub fn mark_site_update_applying(&self, address: &str) -> bool {
+        let mut in_flight = self.site_updates_in_flight.lock().unwrap();
+        match in_flight.get_mut(address) {
+            Some(phase) => {
+                *phase = UPDATE_PHASE_UPDATING;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The update pass for a xite finished (its outcome event is about to be
     /// pushed).
     pub fn end_site_update(&self, address: &str) {
         self.site_updates_in_flight.lock().unwrap().remove(address);
+    }
+
+    /// The phase of the update pass running for this xite, if any - what
+    /// `site_info` reports as `update_phase`.
+    pub fn site_update_phase(&self, address: &str) -> Option<&'static str> {
+        self.site_updates_in_flight.lock().unwrap().get(address).copied()
     }
 
     /// Mark an on-demand clone as downloading a xite's files. Pair with
@@ -8144,12 +8356,15 @@ impl AppState {
     /// mid-update are skipped - their real outcome event is coming.
     pub async fn push_missed_update_results(&self, only: u64) {
         for address in self.xite_addresses().await {
-            if self.site_updates_in_flight.lock().unwrap().contains(&address) {
+            if self.site_updates_in_flight.lock().unwrap().contains_key(&address) {
                 continue;
             }
             let mut info = self.site_info(&address).await;
             if let Value::Object(m) = &mut info {
                 m.insert("event".to_string(), json!(["updated", true]));
+                // Recovery, not a result: retire whatever pill the dropped
+                // window stranded without claiming an update landed.
+                m.insert("update_applied".to_string(), json!(false));
                 self.push_event_routed(
                     "setSiteInfo",
                     info,
@@ -8779,6 +8994,7 @@ impl AppState {
         let now = now_secs();
         let optional_limit = self.optional_limit_bytes().await;
         let conns = self.connection_stats().await;
+        let (req_sent, req_recv) = epix_edx::conn::request_totals();
         let xites = self.xites.read().await;
 
         let mut size = 0i64;
@@ -8825,6 +9041,11 @@ impl AppState {
             Metric::now("content", content.len() as f64),
             Metric::change("file_bytes_recv", bytes_recv),
             Metric::change("file_bytes_sent", bytes_sent),
+            // Protocol requests, counted at the EDX request choke points
+            // (every Req sent/received on any link). The dashboard's Stats
+            // page plots these as the Sent/Received requests series.
+            Metric::change("request_num_sent", req_sent as f64),
+            Metric::change("request_num_recv", req_recv as f64),
         ];
         self.chart.record(now, None, &global);
 
@@ -11580,8 +11801,10 @@ impl AppState {
         if committed {
             // The update may declare new optional files; wake the retry loop
             // so a xite that promised to fetch them (autodownloadoptional /
-            // optionalHelp) picks them up on its next tick.
+            // optionalHelp) picks them up on its next tick, and count them now
+            // so the row's countdown includes them from the first push.
             self.mark_optional_dirty(&key);
+            self.refresh_optional_owed(&key).await;
             for k in &keys {
                 self.push_site_info_event(k, "updated").await;
             }
@@ -11793,6 +12016,9 @@ impl AppState {
             tally(child_json.get("files_optional"), dir);
         }
         self.persist_sites().await;
+        // A new directory commitment changes what this node owes, and so the
+        // dashboard row's countdown.
+        self.refresh_optional_owed(address).await;
         // Helping a directory means fetching it, not just advertising it.
         self.spawn_optional_download(address, Some(directory.to_string()));
         Some((num, size))
@@ -11819,6 +12045,10 @@ impl AppState {
         };
         if removed {
             self.persist_sites().await;
+            // Withdrawing the promise drops what this node owes, so the row's
+            // countdown must shrink (usually to nothing) with it.
+            self.refresh_optional_owed(address).await;
+            self.push_site_info(address).await;
         }
         removed
     }
@@ -11838,6 +12068,10 @@ impl AppState {
         };
         if found {
             self.persist_sites().await;
+            // The promise just changed, and with it how many files this node
+            // owes - which is what the dashboard row counts down. Recount here
+            // so the row reacts to the toggle instead of to the retry tick.
+            self.refresh_optional_owed(address).await;
             if on {
                 self.spawn_optional_download(address, None);
             } else {
@@ -12209,6 +12443,8 @@ impl AppState {
             return;
         }
         let plan = self.retention_completion_plan(addr).await;
+        // Same walk the row's countdown needs; cache it rather than repeat it.
+        self.set_optional_owed(addr, plan.paths.len()).await;
         if plan.paths.is_empty() {
             // Full copy on disk: park on the slow re-verify interval (a
             // dirty mark bypasses it the tick after new content lands).
@@ -12222,18 +12458,121 @@ impl AppState {
         self.spawn_retention_completion(addr);
     }
 
-    /// Whether any file within a retry scope is still missing on disk.
-    async fn optional_scope_missing(&self, address: &str, dirs: &Option<Vec<String>>) -> bool {
+    /// How many files within a retry scope are still missing on disk. Directory
+    /// scopes are deduped: `optionalHelp` commitments can nest, and a file
+    /// under two of them is still one download.
+    async fn optional_scope_owed(&self, address: &str, dirs: &Option<Vec<String>>) -> usize {
         match dirs {
-            None => !self.missing_optional_files(address, None).await.is_empty(),
+            None => self.missing_optional_files(address, None).await.len(),
             Some(dirs) => {
+                let mut paths = std::collections::HashSet::new();
                 for d in dirs {
-                    if !self.missing_optional_files(address, Some(d)).await.is_empty() {
-                        return true;
+                    for (path, _) in self.missing_optional_files(address, Some(d)).await {
+                        paths.insert(path);
                     }
                 }
-                false
+                paths.len()
             }
+        }
+    }
+
+    /// Recompute and cache how many optional files this node owes a xite - the
+    /// number the dashboard row counts down - from the user's own preferences.
+    ///
+    /// Three ways to have promised: the whole-site "help distribute" toggle,
+    /// per-directory `optionalHelp` commitments a page registered, or the
+    /// global full-retention setting (which only applies to xites without a
+    /// promise of their own). A xite the user never opted into owes zero, so
+    /// its row shows no countdown no matter how many optional files it
+    /// declares - which is the point: the number is what WILL be downloaded,
+    /// not what exists.
+    ///
+    /// Walks the xite's content.jsons, so call it when the answer can change,
+    /// not to read it. Readers take the cached [`Self::optional_owed`].
+    pub async fn refresh_optional_owed(&self, address: &str) -> usize {
+        let scope = {
+            let xites = self.xites.read().await;
+            let Some(x) = xites.get(address) else { return 0 };
+            if !x.settings.serving {
+                // Paused: no pass will run, so nothing is pending.
+                None
+            } else if x.settings.autodownloadoptional && x.settings.download_optional {
+                Some(None)
+            } else if !x.settings.optional_help.is_empty() {
+                Some(Some(x.settings.optional_help.keys().cloned().collect::<Vec<_>>()))
+            } else if x.settings.own || x.settings.download_optional {
+                // Own xites are authored here; `download_optional` alone is the
+                // on-demand permission, not a promise to fetch everything.
+                None
+            } else {
+                // No promise of its own - the reader's global setting may still
+                // cover it. `retention_completion_plan` returns an empty plan
+                // when the setting is off, so this stays correct either way.
+                Some(Some(Vec::new()))
+            }
+        };
+        let owed = match scope {
+            None => 0,
+            // The reader's global full-retention promise, which covers required
+            // files as well as optional ones. Gated exactly like the pass that
+            // would do the fetching: only while the setting is on (the plan
+            // itself also describes the AUTHOR's `retention:complete` policy,
+            // which is completed once at clone time and has no recurring pass
+            // to count down), and never when the author vetoed bulk copies or
+            // the size budget is waiting on a consent the user hasn't given.
+            Some(Some(dirs)) if dirs.is_empty() => {
+                if !self.config_bool("full_retention", false).await
+                    || self.retention_author_veto_holds(address, true).await
+                {
+                    0
+                } else {
+                    let plan = self.retention_completion_plan_as(address, true).await;
+                    if plan.needs_consent && !self.retention_fetch_allowed(address).await {
+                        0
+                    } else {
+                        plan.paths.len()
+                    }
+                }
+            }
+            Some(dirs) => self.optional_scope_owed(address, &dirs).await,
+        };
+        self.set_optional_owed(address, owed).await;
+        owed
+    }
+
+    /// Record how far the update check has walked its candidate peers, and tell
+    /// open pages. Nothing clears this: `site_info` only reports it while the
+    /// pass is in its checking phase, so a stale pair is never read.
+    async fn set_check_progress(&self, address: &str, probed: usize, total: usize) {
+        {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) => x.check_peers = (probed, total),
+                None => return,
+            }
+        }
+        self.push_site_info(address).await;
+    }
+
+    /// Cache the count [`Self::refresh_optional_owed`] computed, and tell open
+    /// pages when it moved. Without the push the number would only reach a row
+    /// on the back of some unrelated event: a xite waiting out a retry backoff
+    /// (its seeder offline) pushes nothing of its own, so its countdown would
+    /// sit in this cache unseen. The write guard is dropped before the push -
+    /// `site_info` takes the same lock for reading.
+    async fn set_optional_owed(&self, address: &str, owed: usize) {
+        let changed = {
+            let mut xites = self.xites.write().await;
+            match xites.get_mut(address) {
+                Some(x) if x.optional_owed != owed => {
+                    x.optional_owed = owed;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.push_site_info(address).await;
         }
     }
 
@@ -12410,7 +12749,11 @@ impl AppState {
         if self.optional_pass_in_flight(addr) {
             return; // still working - check again next tick
         }
-        if !self.optional_scope_missing(addr, dirs).await {
+        // This walk is what the row's countdown is made of, so cache what it
+        // found - the check was already being paid for.
+        let owed = self.optional_scope_owed(addr, dirs).await;
+        self.set_optional_owed(addr, owed).await;
+        if owed == 0 {
             // Complete: park it on the slow re-verify interval.
             schedule.insert(addr.to_string(), (0, now_secs() as i64 + 600));
             return;
@@ -12444,17 +12787,26 @@ impl AppState {
                     }
                 }
             }
-            if fetched_total == 0 {
-                return;
-            }
-            state.mark_optional_dirty(&addr);
+            // Recount FIRST, whatever the pass managed: while it ran, the
+            // countdown came from the worker counters, and those are now zero.
+            // A pass that fetched nothing (seeder offline) still owes every
+            // file, and the row has to keep saying so until the next attempt -
+            // otherwise the number vanishes between attempts and reappears a
+            // minute later.
+            //
             // Two statements on purpose: the right operand re-acquires the
             // xites lock, and only the temporary-guard form of the left
             // operand keeps that sound. Binding the guard (or letting a
             // refactor merge these) makes this a self-deadlock on a
             // write-preferring lock.
             let known = state.xites.read().await.contains_key(&addr);
-            if known && !state.optional_scope_missing(&addr, &dirs).await {
+            let left = state.optional_scope_owed(&addr, &dirs).await;
+            state.set_optional_owed(&addr, left).await;
+            if fetched_total == 0 {
+                return;
+            }
+            state.mark_optional_dirty(&addr);
+            if known && left == 0 {
                 state.push_notification(
                     "done",
                     &format!("Downloaded {fetched_total} optional file(s)."),
@@ -12968,6 +13320,12 @@ impl AppState {
             queue = requeue;
         }
         reannounce.abort();
+        // Recount BEFORE the worker counters clear. Those counters are what the
+        // dashboard row counts down during the pass; if they hit zero while the
+        // owed count is still stale, the row sees "nothing left" for an instant
+        // and flashes "Updated!" for a pass that fetched nothing.
+        let remaining = self.missing_optional_files(address, directory).await.len();
+        self.set_optional_owed(address, remaining).await;
         self.set_worker_stats(address, 0, 0, 0).await;
         self.finish_optional_pass(address, cancelled, fetched, failed).await;
         self.log(
@@ -13288,12 +13646,20 @@ impl AppState {
         consented: bool,
     ) -> usize {
         let mut attempted = 0usize;
+        // This pass fetches file-by-file without the bulk pass's worker
+        // counters, so drive the row's countdown from the remaining plan
+        // instead. Without it a full-retention xite would sit on one stale
+        // number until the retry loop next rebuilt the whole plan.
+        let mut left = paths.len();
+        self.set_optional_owed(address, left).await;
         for path in paths {
             if !self.retention_pass_should_continue(address, reader, consented).await {
                 break;
             }
             attempted += 1;
             let _ = self.file_need_background(address, &path).await;
+            left = left.saturating_sub(1);
+            self.set_optional_owed(address, left).await;
         }
         attempted
     }
@@ -13481,10 +13847,44 @@ impl AppState {
     /// node for hours in the field. Copy what the response needs, drop the
     /// guard, then do the user work.
     pub async fn site_info(&self, address: &str) -> Value {
-        let (settings, display, content, known_peers, started_task_num, tasks_active, workers, optional_progress) = {
+        // Whether a bulk optional pass is running RIGHT NOW - not whether a
+        // progress panel exists. A pass that ended with failures keeps its
+        // panel up ("Waiting for peers…"), and using the panel as the signal
+        // masked the owed count for exactly the xites that most need to show
+        // one.
+        let optional_pass_running = self.optional_pass_in_flight(address);
+        let update_phase = self.site_update_phase(address);
+        let (settings, display, content, known_peers, started_task_num, tasks_active, workers, optional_progress, optional_left, progress) = {
             let xites = self.xites.read().await;
             let Some(entry) = xites.get(address) else {
                 return Value::Null;
+            };
+            // Optional work still owed that `tasks` does NOT already cover, so
+            // the dashboard can simply add the two. A bulk optional pass drives
+            // the same worker counters as an update does
+            // (`download_optional_files` -> `set_worker_stats`), so while one
+            // runs, `tasks` IS the optional countdown and reporting the owed
+            // count on top would double it.
+            // ...and only while those counters actually hold something. A pass
+            // whose queue has drained is no longer counting anything down, so
+            // the owed count must take over immediately rather than leave a
+            // window where the row believes the work is finished.
+            // How far the CURRENT phase has got, as `(done, total)`, for the
+            // row's progress bar. Files while a batch is draining, otherwise
+            // the check's walk through its candidate peers. Only reported for
+            // the phase it belongs to, which is what keeps a stale pair from
+            // ever being read - neither is cleared when its phase ends.
+            let progress = if entry.tasks_active > 0 && entry.tasks_total > 0 {
+                Some((entry.tasks_total.saturating_sub(entry.tasks_active), entry.tasks_total))
+            } else if update_phase == Some(UPDATE_PHASE_CHECKING) && entry.check_peers.1 > 0 {
+                Some(entry.check_peers)
+            } else {
+                None
+            };
+            let optional_left = if optional_pass_running && entry.tasks_active > 0 {
+                0
+            } else {
+                entry.optional_owed
             };
             (
                 entry.settings.clone(),
@@ -13499,6 +13899,8 @@ impl AppState {
                 entry.tasks_active,
                 entry.workers,
                 entry.optional_progress.as_ref().map(|p| p.to_json()).unwrap_or(Value::Null),
+                optional_left,
+                progress,
             )
         };
 
@@ -13551,6 +13953,18 @@ impl AppState {
             "address_short": short,
             "address_hash": address_hash,
             "content_updated": settings.modified,
+            // The phase of an update pass running right now (null when idle),
+            // so a dashboard that loads mid-pass shows the same pill as one
+            // that watched it start. Events alone can't do that: they only
+            // reach pages that were already open.
+            "update_phase": update_phase,
+            // How far the current phase has got, for the row's progress bar:
+            // `{done, total}`, or null when the phase has nothing countable
+            // (staging a content.json, waiting out a retry backoff). Better an
+            // absent bar than an invented one.
+            "progress": progress
+                .map(|(done, total)| json!({ "done": done, "total": total }))
+                .unwrap_or(Value::Null),
             "bad_files": settings.cache.bad_files.len(),
             "settings": serde_json::to_value(settings).unwrap_or(Value::Null),
             "size_limit": size_limit,
@@ -13558,6 +13972,11 @@ impl AppState {
             "peers": peers.max(1),
             "started_task_num": started_task_num,
             "tasks": tasks_active,
+            // Optional files this node PROMISED to fetch and hasn't got yet -
+            // what the user opted into, not what the xite declares. The
+            // dashboard row adds this to `tasks` for its countdown, so a xite
+            // the user never opted into contributes nothing.
+            "optional_left": optional_left,
             "workers": workers,
             "optional_progress": optional_progress,
             "content": content,
@@ -14062,6 +14481,9 @@ struct DeclaredOptional {
     size: i64,
     sha512: String,
     bigfile: bool,
+    /// The declared `piece_size` (1 MB when the declaration omits it, like
+    /// `add_bigfile_fields`). Only meaningful when `bigfile`.
+    piece_size: i64,
 }
 
 /// EVERY declared optional file of a site: the root content.json's
@@ -14098,6 +14520,10 @@ fn declared_files_under(
                     .unwrap_or_default()
                     .to_string(),
                 bigfile: info.get("piecemap").is_some(),
+                piece_size: info
+                    .get("piece_size")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(1024 * 1024),
             });
         }
     };
@@ -14112,6 +14538,37 @@ fn declared_files_under(
         scan(json.get(key), dir);
     }
     out
+}
+
+/// SQL `LIKE` match, case-insensitive, for `optionalFileList`'s
+/// `filter_inner_path` (the dashboard's search box sends `%name%`): `%`
+/// matches any run of characters, `_` exactly one. The classic
+/// backtrack-to-last-`%` wildcard walk - O(pattern × text), so a page
+/// cannot spin the node with a pathological pattern.
+fn sql_like(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // The most recent `%`'s position, and where in the text its run started.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, sti)) = star {
+            // Dead end: grow the last `%`'s run by one and retry after it.
+            star = Some((sp, sti + 1));
+            pi = sp + 1;
+            ti = sti + 1;
+        } else {
+            return false;
+        }
+    }
+    // Only trailing `%`s may remain unconsumed.
+    p[pi..].iter().all(|c| *c == '%')
 }
 
 /// Whether a declared optional file is PRESENT on disk: a file at the
@@ -14674,6 +15131,19 @@ mod tests {
         assert!(names.contains(&"size"));
         assert!(names.contains(&"connection"));
         assert!(names.contains(&"peer"));
+        // The dashboard's Sent/Received requests series: the request totals
+        // are sampled every collect, so the type ids the Stats page looks up
+        // exist and each collect writes a datapoint.
+        assert!(names.contains(&"request_num_sent"));
+        assert!(names.contains(&"request_num_recv"));
+        let req_rows = state
+            .chart_query(
+                "SELECT value FROM data WHERE type_id = (SELECT type_id FROM type WHERE name='request_num_sent') AND site_id IS NULL",
+                &Value::Null,
+            )
+            .await
+            .unwrap();
+        assert_eq!(req_rows.len(), 1, "one request_num_sent datapoint per collect");
 
         // The site table has our xite.
         let sites = state.chart_query("SELECT * FROM site", &Value::Null).await.unwrap();
@@ -17059,6 +17529,125 @@ mod tests {
         assert_eq!(by_path("absent.bin")["is_downloaded"], false, "absent = missing");
     }
 
+    /// The Bigfiles section's node contract: `filter: "downloaded,bigfile"`
+    /// restricts to downloaded piecemap-declared files, bigfile rows carry
+    /// the `pieces`/`pieces_downloaded`/`is_downloading` fields its Status
+    /// column renders, and `filter_inner_path` is the search box's
+    /// case-insensitive LIKE against the inner_path.
+    #[tokio::test]
+    async fn optional_file_list_bigfile_filter_piece_fields_and_search() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let big = vec![7u8; 2 * 1024 * 1024 + 5]; // 3 pieces at 1 MB
+        storage.write("Movie.mp4", &big).unwrap();
+        storage.write("song.ogg", b"lalala").unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr, "modified": 1.0, "files": {},
+            "files_optional": {
+                "Movie.mp4": {
+                    "size": big.len(), "sha512": XiteStorage::hash_bytes(&big),
+                    "piecemap": "Movie.mp4.piecemap.msgpack", "piece_size": 1024 * 1024,
+                },
+                "song.ogg": { "size": 6, "sha512": XiteStorage::hash_bytes(b"lalala") },
+                "absent.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"zzzz") },
+            },
+        });
+        let state = AppState::new("test");
+        state.add_xite(addr, XiteEntry { storage, content: Some(content) }).await;
+        // A bigfile only counts as downloaded with its completion stamp (its
+        // sparse file sits at full size from the first piece).
+        {
+            let mut xites = state.xites.write().await;
+            let stat = xites
+                .get_mut(addr.as_str())
+                .unwrap()
+                .settings
+                .cache
+                .optional_stats
+                .entry("Movie.mp4".into())
+                .or_default();
+            stat.time_downloaded = 1000;
+        }
+
+        // "downloaded,bigfile" = downloaded AND declared with a piecemap.
+        let bigs =
+            state.optional_file_list(addr, "downloaded,bigfile", "", 0).await.unwrap();
+        assert_eq!(bigs.len(), 1, "the small file and the absent file are filtered out");
+        assert_eq!(bigs[0]["inner_path"], "Movie.mp4");
+        // The Status column's fields: full piece count, complete, idle.
+        assert_eq!(bigs[0]["pieces"], 3);
+        assert_eq!(bigs[0]["pieces_downloaded"], 3);
+        assert_eq!(bigs[0]["is_downloading"], false);
+
+        // Non-bigfile rows carry no piece fields (the UI guards on absence).
+        let all = state.optional_file_list(addr, "downloaded", "", 0).await.unwrap();
+        let song = all.iter().find(|f| f["inner_path"] == "song.ogg").unwrap();
+        assert!(song.get("pieces").is_none());
+        assert!(song.get("is_downloading").is_none());
+
+        // The search box's LIKE pattern: case-insensitive substring.
+        let hits = state
+            .optional_file_list_filtered(addr, "all", "", 0, Some("%movie%"))
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["inner_path"], "Movie.mp4");
+        assert!(state
+            .optional_file_list_filtered(addr, "all", "", 0, Some("%nothere%"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `filter_inner_path` promises SQL LIKE semantics: `%` any run, `_`
+    /// exactly one character, case-insensitive.
+    #[test]
+    fn sql_like_matches_sql_semantics() {
+        assert!(sql_like("%mov%", "data/Movie.mp4"));
+        assert!(sql_like("%MOV%", "data/movie.mp4"));
+        assert!(sql_like("%.mp4", "a/b.mp4"));
+        assert!(!sql_like("%.mp4", "a/b.mp3"));
+        assert!(sql_like("data/%", "data/x"));
+        assert!(sql_like("exact", "EXACT"));
+        assert!(!sql_like("exact", "exactly"));
+        assert!(sql_like("fil_.bin", "file.bin"));
+        assert!(!sql_like("fil_.bin", "fill2.bin"));
+        assert!(sql_like("%a%b%", "xxaxxbxx"));
+        assert!(!sql_like("%a%b%", "xxbxxa"), "order matters across % runs");
+        assert!(sql_like("%", "anything"));
+        assert!(sql_like("", ""));
+        assert!(!sql_like("", "x"));
+    }
+
+    /// The bulk pin/unpin path behind the dashboard's selectbar: one call
+    /// pins a whole batch, one call unpins it.
+    #[tokio::test]
+    async fn set_pins_applies_a_whole_batch() {
+        let dir = tempdir().unwrap();
+        let addr = &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let content = json!({
+            "address": addr,
+            "files_optional": {
+                "a.bin": { "size": 4, "sha512": "aa" },
+                "b.bin": { "size": 4, "sha512": "bb" },
+            },
+        });
+        let state = AppState::new("test");
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
+            .await;
+
+        let paths = vec!["a.bin".to_string(), "b.bin".to_string()];
+        state.set_pins(addr, &paths, true).await;
+        let list = state.optional_file_list(addr, "all", "", 0).await.unwrap();
+        assert!(list.iter().all(|f| f["is_pinned"] == true), "both pinned in one call");
+
+        state.set_pins(addr, &paths, false).await;
+        let list = state.optional_file_list(addr, "all", "", 0).await.unwrap();
+        assert!(list.iter().all(|f| f["is_pinned"] == false));
+    }
+
     /// The bulk optional download behind "Download and help distribute all
     /// files": enumerates the root's and child content.jsons' optional
     /// declarations, skips files already present at their declared size, and
@@ -17193,7 +17782,7 @@ mod tests {
         state.set_autodownloadoptional("1Opt", true).await;
         let flagged = state.optional_retry_flagged().await;
         assert_eq!(flagged, vec![("1Opt".to_string(), None)]);
-        assert!(state.optional_scope_missing("1Opt", &None).await);
+        assert!(state.optional_scope_owed("1Opt", &None).await > 0);
 
         // Paused xites are left alone.
         if let Some(x) = state.xites.write().await.get_mut("1Opt") {
@@ -17207,7 +17796,7 @@ mod tests {
         // File arrives at the declared size -> scope complete (the loop then
         // parks the xite on its slow re-verify interval).
         storage.write("a.bin", b"12345").unwrap();
-        assert!(!state.optional_scope_missing("1Opt", &None).await);
+        assert_eq!(state.optional_scope_owed("1Opt", &None).await, 0);
 
         // An optionalHelp commitment (whole-site mandate off) is watched
         // dir-scoped.
@@ -17220,6 +17809,65 @@ mod tests {
             flagged,
             vec![("1Opt".to_string(), Some(vec!["data/users/alice".to_string()]))]
         );
+    }
+
+    /// The dashboard row's countdown counts what THIS node will actually
+    /// download, which is a question about the user's settings - not about how
+    /// many optional files the xite declares.
+    #[tokio::test]
+    async fn optional_owed_counts_only_what_the_user_opted_into() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let content = json!({
+            "address": "1Owed", "modified": 1.0, "files": {},
+            "files_optional": {
+                "a.bin": { "size": 5, "sha512": "aa" },
+                "b.bin": { "size": 5, "sha512": "bb" },
+                "media/c.bin": { "size": 5, "sha512": "cc" },
+            },
+        });
+        let state = AppState::new("test");
+        state.config_set("download_optional_default", Value::from("false")).await;
+        state.config_set("autodownloadoptional_default", Value::from("false")).await;
+        state.add_xite("1Owed", XiteEntry { storage: storage.clone(), content: Some(content) }).await;
+
+        // Three optional files declared, none on disk - but the user never
+        // asked for any of them, so the row has nothing to count down.
+        assert_eq!(state.refresh_optional_owed("1Owed").await, 0);
+        assert_eq!(state.site_info("1Owed").await["optional_left"], 0);
+
+        // Opting the whole xite in (both toggles - the prefetch mandate plus
+        // the download permission) owes all three.
+        state.set_download_optional("1Owed", true, false).await;
+        state.set_autodownloadoptional("1Owed", true).await;
+        assert_eq!(state.refresh_optional_owed("1Owed").await, 3);
+        assert_eq!(state.site_info("1Owed").await["optional_left"], 3);
+
+        // Files landing count down.
+        storage.write("a.bin", b"12345").unwrap();
+        assert_eq!(state.refresh_optional_owed("1Owed").await, 2);
+
+        // A directory commitment is scoped to that directory, not the xite.
+        state.set_autodownloadoptional("1Owed", false).await;
+        state.set_download_optional("1Owed", false, false).await;
+        if let Some(x) = state.xites.write().await.get_mut("1Owed") {
+            x.settings.optional_help.insert("media".into(), "1".into());
+        }
+        assert_eq!(state.refresh_optional_owed("1Owed").await, 1, "only media/c.bin");
+
+        // Withdrawing the promise empties the countdown even though the file is
+        // still missing - nothing is going to fetch it now.
+        assert!(state.optional_help_remove("1Owed", "media").await);
+        assert_eq!(state.site_info("1Owed").await["optional_left"], 0);
+
+        // A paused xite runs no passes, so it owes nothing either.
+        state.set_download_optional("1Owed", true, false).await;
+        state.set_autodownloadoptional("1Owed", true).await;
+        assert_eq!(state.refresh_optional_owed("1Owed").await, 2);
+        if let Some(x) = state.xites.write().await.get_mut("1Owed") {
+            x.settings.serving = false;
+        }
+        assert_eq!(state.refresh_optional_owed("1Owed").await, 0);
     }
 
     #[tokio::test]
@@ -19202,6 +19850,8 @@ mod tests {
         assert_eq!(payload["cmd"], "setSiteInfo");
         assert_eq!(payload["params"]["address"], "epix1done");
         assert_eq!(payload["params"]["event"][0], "updated");
+        // Recovery retires a stranded pill; it must not claim an update landed.
+        assert_eq!(payload["params"]["update_applied"], json!(false));
         assert!(events.try_recv().is_err(), "no event for the in-flight site");
 
         // Once its pass ends, a later recovery covers it too.
@@ -19214,6 +19864,88 @@ mod tests {
         }
         addrs.sort();
         assert_eq!(addrs, ["epix1busy", "epix1done"]);
+    }
+
+    /// The dashboard's row pill is driven by two things: `update_phase` on
+    /// every siteInfo (so a page that loads mid-pass shows the same pill as one
+    /// that watched it start) and `update_applied` on the closing event (so
+    /// only a pass that brought something flashes "Updated!").
+    #[tokio::test]
+    async fn update_phase_and_outcome_reach_site_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        s.add_xite(
+            "epix1p",
+            XiteEntry { storage: XiteStorage::new(dir.path().join("a")), content: None },
+        )
+        .await;
+
+        // Idle: no phase at all, so no pill.
+        assert_eq!(s.site_info("epix1p").await["update_phase"], Value::Null);
+
+        // A pass opens on the quiet checking phase. No peers probed yet, so no
+        // progress either - the row shows a bar only for something countable.
+        s.begin_site_update("epix1p");
+        assert_eq!(s.site_info("epix1p").await["update_phase"], UPDATE_PHASE_CHECKING);
+        assert_eq!(s.site_info("epix1p").await["progress"], Value::Null);
+
+        // The check walks its candidate peers; its position is the progress.
+        s.set_check_progress("epix1p", 3, 10).await;
+        assert_eq!(
+            s.site_info("epix1p").await["progress"],
+            json!({ "done": 3, "total": 10 })
+        );
+
+        // A peer answered with something newer: the pass escalates, and the
+        // peer-walk progress no longer applies (it belongs to checking).
+        assert!(s.mark_site_update_applying("epix1p"), "bracketed pass escalates");
+        assert_eq!(s.site_info("epix1p").await["update_phase"], UPDATE_PHASE_UPDATING);
+        assert_eq!(s.site_info("epix1p").await["progress"], Value::Null);
+
+        // A file batch primes the worker counters; progress = done/total files.
+        s.set_worker_stats("epix1p", 8, 1, 8).await;
+        assert_eq!(
+            s.site_info("epix1p").await["progress"],
+            json!({ "done": 0, "total": 8 })
+        );
+        s.set_worker_stats("epix1p", 2, 1, 0).await;
+        assert_eq!(
+            s.site_info("epix1p").await["progress"],
+            json!({ "done": 6, "total": 8 })
+        );
+        // Batch drained: total clears with it.
+        s.set_worker_stats("epix1p", 0, 0, 0).await;
+        assert_eq!(s.site_info("epix1p").await["progress"], Value::Null);
+
+        // A caller that never bracketed gets no phase - nothing would push the
+        // outcome that retires its pill, so it must not raise one.
+        assert!(!s.mark_site_update_applying("epix1other"), "unbracketed pass is ignored");
+
+        s.end_site_update("epix1p");
+        assert_eq!(s.site_info("epix1p").await["update_phase"], Value::Null);
+
+        // The three outcomes, as the row renders them.
+        let mut events = s.subscribe_events();
+        let outcome = |ev: &UiEvent| -> Value {
+            serde_json::from_str::<Value>(&ev.payload).unwrap()["params"].clone()
+        };
+
+        s.push_update_result("epix1p", UpdateOutcome::Applied).await;
+        let p = outcome(&events.try_recv().unwrap());
+        assert_eq!(p["event"][0], "updated");
+        assert_eq!(p["update_applied"], json!(true), "Applied flashes Updated!");
+        assert_ne!(p["content_updated"], json!(false));
+
+        s.push_update_result("epix1p", UpdateOutcome::NoChange).await;
+        let p = outcome(&events.try_recv().unwrap());
+        assert_eq!(p["event"][0], "updated");
+        assert_eq!(p["update_applied"], json!(false), "NoChange retires the pill quietly");
+        assert_ne!(p["content_updated"], json!(false), "not an error");
+
+        s.push_update_result("epix1p", UpdateOutcome::Failed).await;
+        let p = outcome(&events.try_recv().unwrap());
+        assert_eq!(p["update_applied"], json!(false));
+        assert_eq!(p["content_updated"], json!(false), "Failed keeps the error marker");
     }
 
     #[tokio::test]
