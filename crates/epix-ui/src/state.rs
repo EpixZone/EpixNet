@@ -10327,6 +10327,75 @@ impl AppState {
         epix_content::declared_merge_files(&content).iter().any(|p| p == rel)
     }
 
+    /// The fetch half of [`Self::fetch_and_merge_records`]: dial `peers` in
+    /// order, union each served copy into `merged`, and stop once `union_from`
+    /// copies landed or candidates ran out. Per-peer outcomes are returned so
+    /// the caller can feed the registry: a peer that can't be dialed backs off
+    /// (stops wasting a slot every pass), one that serves the file is rewarded
+    /// and rises in selection. Without this the merge fetch was outcome-blind,
+    /// so dead peers kept their slots and a good seed never gained the
+    /// reputation to be picked. `EPIX_MERGE_TRACE=1` logs every answer.
+    async fn union_merge_copies(
+        &self,
+        canonical: &str,
+        inner_path: &str,
+        signers: &[String],
+        peers: &[PeerAddr],
+        union_from: usize,
+        mut merged: Value,
+    ) -> (Value, usize, Vec<(PeerAddr, epix_worker::PeerOutcome)>) {
+        let union_from = union_from.max(1);
+        let trace = std::env::var("EPIX_MERGE_TRACE").map_or(false, |v| !v.is_empty() && v != "0");
+        let mut served = 0usize;
+        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
+        for p in peers {
+            if served >= union_from {
+                break;
+            }
+            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
+            // link; we verify them against the merge rules. A peer that serves
+            // unparsable bytes counts as answering (FileOk for the registry)
+            // but not as a served copy.
+            let answer;
+            match self.edx_fetch_signed(p.clone(), canonical, inner_path).await {
+                Some(Ok(Some(bytes))) => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
+                    match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(incoming) => {
+                            answer = format!(
+                                "served {} record(s)",
+                                epix_content::records_of(&incoming).len()
+                            );
+                            merged = epix_content::merge_orset(
+                                &merged,
+                                &incoming,
+                                signers,
+                                epix_core::now_ms(),
+                            );
+                            served += 1;
+                        }
+                        Err(_) => answer = "served unparsable bytes".to_string(),
+                    }
+                }
+                // Dialed fine but couldn't serve this file: dock reputation only
+                // (it may still serve others), don't back it off.
+                Some(Ok(None)) => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail));
+                    answer = "refused".to_string();
+                }
+                // Dial/link failed, or no fetcher: back it off.
+                Some(Err(_)) | None => {
+                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail));
+                    answer = "dial failed".to_string();
+                }
+            }
+            if trace {
+                self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: {answer}")).await;
+            }
+        }
+        (merged, served, outcomes)
+    }
+
     /// Fetch a declared merge file from `sender` (falling back to known
     /// connectable peers) and merge it into the local copy: verify every record
     /// against `signers`, union with what is on disk (grow-only), write, and
@@ -10389,57 +10458,8 @@ impl AppState {
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .unwrap_or_else(|| epix_content::make_container(vec![]));
         let before = epix_content::records_of(&existing).len();
-        // Union copies from up to `union_from` serving peers, recording the
-        // outcome per peer so the registry self-heals: a peer that can't be
-        // dialed backs off (stops wasting a slot every pass), one that serves
-        // the file is rewarded and rises in selection. Without this the merge
-        // fetch was outcome-blind, so dead peers kept their slots and a good
-        // seed never gained the reputation to be picked.
-        let union_from = union_from.max(1);
-        let mut merged = existing;
-        let mut served = 0usize;
-        let mut outcomes: Vec<(PeerAddr, epix_worker::PeerOutcome)> = Vec::new();
-        let trace = std::env::var("EPIX_MERGE_TRACE").map_or(false, |v| !v.is_empty() && v != "0");
-        for p in &peers {
-            if served >= union_from {
-                break;
-            }
-            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
-            // link; the caller verifies them against the merge rules.
-            match self.edx_fetch_signed(p.clone(), &canonical, inner_path).await {
-                Some(Ok(Some(bytes))) => {
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
-                    if let Ok(incoming) = serde_json::from_slice::<Value>(&bytes) {
-                        let n = epix_content::records_of(&incoming).len();
-                        if trace {
-                            self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: served {n} record(s)")).await;
-                        }
-                        merged = epix_content::merge_orset(
-                            &merged,
-                            &incoming,
-                            signers,
-                            epix_core::now_ms(),
-                        );
-                        served += 1;
-                    }
-                }
-                // Dialed fine but couldn't serve this file: dock reputation only
-                // (it may still serve others), don't back it off.
-                Some(Ok(None)) => {
-                    if trace {
-                        self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: refused")).await;
-                    }
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail))
-                }
-                // Dial/link failed, or no fetcher: back it off.
-                Some(Err(_)) | None => {
-                    if trace {
-                        self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: dial failed")).await;
-                    }
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail))
-                }
-            }
-        }
+        let (merged, served, outcomes) =
+            self.union_merge_copies(&canonical, inner_path, signers, &peers, union_from, existing).await;
         let tried = outcomes.len();
         if !outcomes.is_empty() {
             self.apply_peer_outcomes(address, outcomes).await;
