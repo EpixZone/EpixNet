@@ -91,6 +91,53 @@ async fn sites_json_uses_the_epixnet_schema_and_restores_settings() {
 }
 
 #[tokio::test]
+async fn re_adding_a_served_xite_keeps_its_settings() {
+    // The launch xite goes through add_xite again every boot, AFTER
+    // restore_sites already registered it. Rebuilding its settings from
+    // scratch there used to reset "This is my site" (own), favourite, and the
+    // size limit - and the persist at the end of add_xite then wrote the loss
+    // back to sites.json, so the toggle never survived a restart.
+    let root = tempfile::tempdir().unwrap();
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let (content, bytes) = signed_content(&address, &privkey, 1000);
+
+    let xite_dir = root.path().join("data").join(&address);
+    let storage = XiteStorage::new(&xite_dir);
+    storage.write("content.json", &bytes).unwrap();
+
+    // First run: serve the xite and claim it.
+    {
+        let state = AppState::with_data_dir("run-1", root.path());
+        state
+            .add_xite(&address, XiteEntry { storage: storage.clone(), content: Some(content.clone()) })
+            .await;
+        state.set_owned(&address, true).await;
+        state.set_size_limit(&address, 25).await;
+    }
+
+    // Second run, the boot sequence: restore_sites first, then the launch
+    // xite is registered again via add_xite.
+    let state = AppState::with_data_dir("run-2", root.path());
+    assert_eq!(state.restore_sites().await, 1);
+    state.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
+
+    let info = state.site_info(&address).await;
+    assert_eq!(
+        info.get("settings").and_then(|s| s.get("own")),
+        Some(&json!(true)),
+        "own survives the launch-xite re-add"
+    );
+    assert_eq!(info.get("size_limit").and_then(|v| v.as_i64()), Some(25));
+
+    // And the persist at the end of add_xite kept it on disk too.
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("private/sites.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved[&address]["own"], json!(true));
+}
+
+#[tokio::test]
 async fn restores_a_python_written_sites_json_entry() {
     let root = tempfile::tempdir().unwrap();
     let privkey = epix_crypt::new_seed();
