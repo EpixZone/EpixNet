@@ -3398,7 +3398,7 @@ impl WsCommand for UserLogout {
 /// one identity; names are translated to addresses at the HTTP/WS edges.
 fn require_address(addr: &str) -> Result<String, String> {
     if addr.contains('.') {
-        return Err(format!("Site commands take the epix1 address, not a name: {addr}"));
+        return Err(format!("Xite commands take the epix1 address, not a name: {addr}"));
     }
     Ok(addr.to_string())
 }
@@ -3425,7 +3425,7 @@ impl WsCommand for XiteServing {
         if s.state.set_serving(&address, self.serving).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
@@ -3442,7 +3442,7 @@ impl WsCommand for XiteDelete {
         if s.state.remove_xite(&address).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
@@ -3488,7 +3488,7 @@ impl WsCommand for OptionalHelp {
             .state
             .optional_help_add(&address, &directory, &title)
             .await
-            .ok_or("Unknown site")?;
+            .ok_or("Unknown xite")?;
         s.state.push_notification(
             "done",
             &format!("You started to help distribute {title}. Directory: {directory}"),
@@ -3538,7 +3538,7 @@ impl WsCommand for OptionalHelpList {
             None => s.address()?.to_string(),
         };
         require_xite_permission(s, &address).await?;
-        let map = s.state.optional_help_list(&address).await.ok_or("Unknown site")?;
+        let map = s.state.optional_help_list(&address).await.ok_or("Unknown xite")?;
         Ok(Value::Object(map))
     }
 }
@@ -3625,7 +3625,7 @@ impl WsCommand for DbRebuild {
         if s.state.rebuild_xite_db(&address).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
@@ -3645,7 +3645,7 @@ impl WsCommand for XiteFavourite {
         if s.state.set_favorite(&address, self.favorite).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
@@ -3690,7 +3690,7 @@ impl WsCommand for ServerShowdirectory {
                 Some(a) => a.to_string(),
                 None => s.address()?.to_string(),
             };
-            s.state.xite_root(&address).await.ok_or_else(|| format!("Unknown site: {address}"))?
+            s.state.xite_root(&address).await.ok_or_else(|| format!("Unknown xite: {address}"))?
         };
         open_path(&path);
         Ok(Value::from("ok"))

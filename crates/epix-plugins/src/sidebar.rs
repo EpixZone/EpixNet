@@ -315,7 +315,7 @@ fn render_sidebar(
         "<li><label>Files \
           <a href='/list/{addr}' class='link-right link-outline' id='browse-files'>Browse files</a>\
           <small class='label-right'>\
-           <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='link-right' download='site.zip'>Save as .zip</a>\
+           <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='link-right' download='xite.zip'>Save as .zip</a>\
           </small></label>\
          <ul class='graph graph-stacked'>\
           <li style='width: 100%' class='total back-black' title='Total size'></li>\
@@ -389,7 +389,7 @@ fn render_sidebar(
     // Controls - favourite/pause-resume shown by state; the sidebar JS toggles
     // the paired button's `hidden` class on click.
     b.push_str(&format!(
-        "<li><label>Site control \
+        "<li><label>Xite control \
           <a href='#Directory' id='link-directory' class='link-right'>Show directory</a></label>\
          <a href='#Update' class='button' id='button-update'>Update</a>\
          <a href='#Pause' class='button {pause_h}' id='button-pause'>Pause</a>\
@@ -415,13 +415,13 @@ fn render_sidebar(
          <input type='checkbox' class='checkbox' id='checkbox-owned' {checked}/>\
          <div class='checkbox-skin'></div>\
          <div class='settings-owned'>\
-          <li><label for='settings-title'>Site title</label>\
+          <li><label for='settings-title'>Xite title</label>\
            <input type='text' class='text' value=\"{title}\" id='settings-title'/></li>\
-          <li><label for='settings-description'>Site description</label>\
+          <li><label for='settings-description'>Xite description</label>\
            <input type='text' class='text' value=\"{desc}\" id='settings-description'/></li>\
           <li><label for='settings-xid-name'>xID name <small class='label-right'>e.g. mysite.epix</small></label>\
            <input type='text' class='text' value=\"{xid}\" id='settings-xid-name' placeholder='name.epix'/></li>\
-          <li><a href='#Save' class='button' id='button-settings'>Save site settings</a></li>\
+          <li><a href='#Save' class='button' id='button-settings'>Save xite settings</a></li>\
           <li><label>Content publishing</label>\
            <div class='flex'>\
             <input type='text' class='text' value='content.json' id='input-contents'/>\

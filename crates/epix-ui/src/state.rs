@@ -3275,9 +3275,9 @@ impl AppState {
     ) -> Result<String, String> {
         let (key, info) = {
             let xites = self.xites.read().await;
-            let x = self.resolve_xite(&xites, xite).ok_or("Unknown site")?;
+            let x = self.resolve_xite(&xites, xite).ok_or("Unknown xite")?;
             if x.settings.downloaded.is_none() {
-                return Err("Site not yet downloaded".into());
+                return Err("Xite not yet downloaded".into());
             }
             // File must be declared (required or optional) in content.json.
             let info = x
@@ -3298,7 +3298,7 @@ impl AppState {
                     k.as_str() == xite || canonical_address(x.content.as_ref(), k) == xite
                 })
                 .map(|(k, _)| k.clone())
-                .ok_or("Unknown site")?;
+                .ok_or("Unknown xite")?;
             (key, (size, sha512))
         };
         let (expected_size, expected_hash) = info;
@@ -3311,7 +3311,7 @@ impl AppState {
         }
         {
             let xites = self.xites.read().await;
-            let x = xites.get(&key).ok_or("Unknown site")?;
+            let x = xites.get(&key).ok_or("Unknown xite")?;
             x.storage.write(inner_path, body).map_err(|e| e.to_string())?;
         }
         self.hashfield_add(&key, &expected_hash).await;
@@ -4235,7 +4235,7 @@ impl AppState {
     ) -> Result<String, String> {
         let src_storage = {
             let xites = self.xites.read().await;
-            self.resolve_xite(&xites, source).map(|x| x.storage.clone()).ok_or("Unknown site")?
+            self.resolve_xite(&xites, source).map(|x| x.storage.clone()).ok_or("Unknown xite")?
         };
         // Refuse mid-sync sources (EpixNet: "Xite still in sync").
         let bad = self.bad_files(source).await;
@@ -4256,7 +4256,7 @@ impl AppState {
                 let key = self
                     .xite_privatekey(&target)
                     .await
-                    .ok_or("Target site private key not known")?;
+                    .ok_or("Target xite private key not known")?;
                 (target, key)
             }
             None => {
@@ -4285,9 +4285,9 @@ impl AppState {
         // A `template-*` clone root is a blank starter, so it gets a generic
         // title rather than "My <source title>" (EpixNet's `Site.clone`).
         let new_title = if root.starts_with("template-") {
-            "My New Epix Site".to_string()
+            "My New Epix Xite".to_string()
         } else {
-            let title = map.get("title").and_then(|v| v.as_str()).unwrap_or("New Epix Site");
+            let title = map.get("title").and_then(|v| v.as_str()).unwrap_or("New Epix Xite");
             format!("My {title}")
         };
         map.insert("title".into(), json!(new_title));
@@ -4353,7 +4353,7 @@ impl AppState {
             }
         }
         if !dst_storage.exists("index.html") {
-            let _ = dst_storage.write("index.html", b"<h1>My new site</h1>");
+            let _ = dst_storage.write("index.html", b"<h1>My new xite</h1>");
         }
         dst_storage
             .write("content.json", epix_content::dumps_content(&content).as_bytes())
@@ -7111,7 +7111,7 @@ impl AppState {
             .await
             .get(&upload.address)
             .map(|x| x.storage.clone())
-            .ok_or("Unknown site")?;
+            .ok_or("Unknown xite")?;
 
         let hash = epix_xite::hash_bigfile(body, upload.piece_size);
         storage.write(&upload.inner_path, body).map_err(|e| e.to_string())?;
@@ -8004,7 +8004,7 @@ impl AppState {
         }
 
         // Xites.
-        h.push_str("<h2>Sites</h2><table><tr><th>address</th><th>peers (conn/able/total)</th><th>onion</th><th>local</th><th>out</th><th>in</th><th>serving</th></tr>");
+        h.push_str("<h2>Xites</h2><table><tr><th>address</th><th>peers (conn/able/total)</th><th>onion</th><th>local</th><th>out</th><th>in</th><th>serving</th></tr>");
         for address in self.xite_addresses().await {
             // One row per xite (skip the display-name alias key, if any).
             if address.contains('.') {
@@ -9117,7 +9117,7 @@ impl AppState {
     pub async fn merger_list(&self, address: &str, query_xite_info: bool) -> Result<Value, String> {
         let merger_types = self.merger_types(address).await;
         if merger_types.is_empty() {
-            return Err("Not a merger site".into());
+            return Err("Not a merger xite".into());
         }
         // Collect matches under the read lock, then build the response (siteInfo
         // re-locks, so don't hold the lock across it).
@@ -9235,7 +9235,7 @@ impl AppState {
         }
         let key = self.canonical_key(&address).await;
         if !self.has_xite(&key).await {
-            return Err(format!("Merged site not found: {address}"));
+            return Err(format!("Merged xite not found: {address}"));
         }
         if self.xite_merged_type(&key).await.as_deref() != Some(merged_type.as_str()) {
             // A xite mid-clone has no verified content.json yet, so it cannot
@@ -9245,7 +9245,7 @@ impl AppState {
             let still_cloning = self.is_cloning(&key) && self.content(&key).await.is_none();
             if !still_cloning {
                 return Err(format!(
-                    "Merger site ({merged_type}) does not have permission for merged site: {address}"
+                    "Merger xite ({merged_type}) does not have permission for merged xite: {address}"
                 ));
             }
         }
@@ -10033,7 +10033,7 @@ impl AppState {
     /// success (key saved + marked owned), else `{error}`. `siteRecoverPrivatekey`.
     pub async fn recover_privatekey(&self, address: &str) -> Value {
         if self.user.read().await.xite_privatekey(address).is_some() {
-            return json!({ "error": "This site already has a saved private key" });
+            return json!({ "error": "This xite already has a saved private key" });
         }
         let content = self.content(address).await;
         let Some(index) = content.as_ref().and_then(|c| c.get("address_index")).and_then(|v| v.as_u64())
@@ -10052,7 +10052,7 @@ impl AppState {
                 self.set_owned(address, true).await;
                 json!("ok")
             }
-            _ => json!({ "error": "Unable to deliver private key for this site from current user's master_seed" }),
+            _ => json!({ "error": "Unable to deliver private key for this xite from current user's master_seed" }),
         }
     }
 
@@ -10929,7 +10929,7 @@ impl AppState {
         let art = self
             .feed_artifacts(address, feed)
             .await
-            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+            .ok_or_else(|| format!("no feed '{feed}' declared for this xite"))?;
         Ok(crate::feed::item_query(&art, target, limit, before_clock))
     }
 
@@ -10944,7 +10944,7 @@ impl AppState {
         let art = self
             .feed_artifacts(address, feed)
             .await
-            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+            .ok_or_else(|| format!("no feed '{feed}' declared for this xite"))?;
         Ok(crate::feed::gallery_rollup(&art, items))
     }
 
@@ -10961,7 +10961,7 @@ impl AppState {
         let art = self
             .feed_artifacts(address, feed)
             .await
-            .ok_or_else(|| format!("no feed '{feed}' declared for this site"))?;
+            .ok_or_else(|| format!("no feed '{feed}' declared for this xite"))?;
         Ok(crate::feed::segment_search(&art, terms, limit))
     }
 
@@ -11542,10 +11542,10 @@ impl AppState {
                 .collect()
         };
         let Some(key) = keys.first().cloned() else {
-            return Err("Unknown site".into());
+            return Err("Unknown xite".into());
         };
         if !self.is_serving(&key).await {
-            return Err("Unknown site".into());
+            return Err("Unknown xite".into());
         }
         if !inner_path.ends_with("content.json") {
             return Err("Only content.json update allowed".into());
@@ -11556,7 +11556,7 @@ impl AppState {
         // content.json - the on-disk child's own `modified`.
         let (downloaded, current_modified) = {
             let xites = self.xites.read().await;
-            let x = xites.get(&key).ok_or("Unknown site")?;
+            let x = xites.get(&key).ok_or("Unknown xite")?;
             let current = if is_root {
                 x.content
                     .as_ref()
@@ -11574,7 +11574,7 @@ impl AppState {
             (x.settings.downloaded.is_some(), current)
         };
         if !downloaded {
-            return Err("Site not yet downloaded".into());
+            return Err("Xite not yet downloaded".into());
         }
 
         // Same or older version than ours: record the sender as a peer and stop.

@@ -277,7 +277,7 @@ async fn xite_clone_from_template_root_uses_root_content() {
     assert_eq!(content["address"], new_address);
     assert_eq!(content["clone_root"], "template-new");
     // A `template-*` root gets the generic title, not "My <source title>".
-    assert_eq!(content["title"], "My New Epix Site");
+    assert_eq!(content["title"], "My New Epix Xite");
     assert!(epix_content::verify_signer(&content, &new_address), "signature verifies");
 }
 

@@ -157,7 +157,7 @@ impl User {
         let privatekey = epix_crypt::hd_privatekey(&self.master_seed, index)?;
         let address = epix_crypt::privatekey_to_address(&privatekey)?;
         if self.xites.contains_key(&address) {
-            return Err("Random collision: site already exists".into());
+            return Err("Random collision: xite already exists".into());
         }
         self.xite_data(&address)?;
         if let Some(auth) = self.xites.get_mut(&address) {
@@ -262,7 +262,7 @@ impl User {
                 .values()
                 .find(|s| s.auth_address == auth_address)
                 .map(|s| s.auth_privatekey.clone())
-                .ok_or_else(|| format!("Auth address {auth_address} not found in sites or master"))?
+                .ok_or_else(|| format!("Auth address {auth_address} not found in xites or master"))?
         };
         let node = Cert {
             auth_address: auth_address.to_string(),
@@ -628,7 +628,7 @@ mod tests {
 
         let ids = u.identity_addresses();
         assert_eq!(ids, vec![id1.clone(), id2.clone()], "identity order by index");
-        assert!(!ids.contains(&xite_auth), "site auth is not an identity");
+        assert!(!ids.contains(&xite_auth), "xite auth is not an identity");
 
         // privatekey_for finds identity keys, the xite auth key, and master.
         assert_eq!(u.privatekey_for(&id1).as_deref(), Some(pk1.as_str()));

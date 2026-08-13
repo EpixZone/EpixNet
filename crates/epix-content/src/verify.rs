@@ -376,7 +376,7 @@ fn verify_content_rules(
     // Address must match the xite.
     if let Some(addr) = content.get("address").and_then(|v| v.as_str()) {
         if addr != ctx.xite_address() {
-            return err(format!("Wrong site address: {addr} != {}", ctx.xite_address()));
+            return err(format!("Wrong xite address: {addr} != {}", ctx.xite_address()));
         }
     }
     // inner_path must match (normalizing backslashes).
@@ -732,7 +732,7 @@ mod tests {
             &pk,
         );
         let e = verify_content_file("content.json", &mismatch, mbytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Wrong site address"), "{}", e.0);
+        assert!(e.0.contains("Wrong xite address"), "{}", e.0);
     }
 
     #[test]

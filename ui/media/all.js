@@ -683,7 +683,7 @@ if (window.getComputedStyle(document.body).transform) {
       })(this)), 300);
     };
 
-    Loading.STAGES = ["Searching for peers", "Fetching site information", "Downloading files", "Opening the site"];
+    Loading.STAGES = ["Searching for peers", "Fetching xite information", "Downloading files", "Opening the xite"];
 
     // The centered stage ticker: previous action faded above, the current one
     // big in the middle with a live detail line, the next faded below.
@@ -727,10 +727,10 @@ if (window.getComputedStyle(document.body).transform) {
 
     Loading.prototype.showTooLarge = function (site_info) {
       var button, line;
-      this.log("Displaying large site confirmation");
+      this.log("Displaying large xite confirmation");
       if ($(".console .button-setlimit").length === 0) {
-        line = this.printLine("Site size: <b>" + (parseInt(site_info.settings.size / 1024 / 1024)) + "MB</b> is larger than default allowed " + (parseInt(site_info.size_limit)) + "MB", "warning");
-        button = $("<a href='#Set+limit' class='button button-setlimit'>" + ("Open site and set size limit to " + site_info.next_size_limit + "MB") + "</a>");
+        line = this.printLine("Xite size: <b>" + (parseInt(site_info.settings.size / 1024 / 1024)) + "MB</b> is larger than default allowed " + (parseInt(site_info.size_limit)) + "MB", "warning");
+        button = $("<a href='#Set+limit' class='button button-setlimit'>" + ("Open xite and set size limit to " + site_info.next_size_limit + "MB") + "</a>");
         button.on("click", (function (_this) {
           return function () {
             button.addClass("loading");
@@ -1290,7 +1290,7 @@ if (window.getComputedStyle(document.body).transform) {
       if (query.startsWith("#")) {
         back = query;
       } else if (query.startsWith("/")) {
-        // Site-relative path: keep the address segment, replace the rest, so
+        // Xite-relative path: keep the address segment, replace the rest, so
         // a page can put itself in the address bar (refresh + direct links).
         m = window.location.pathname.match(/^\/[^\/]+/);
         back = (m ? m[0] : "") + query;
@@ -1302,7 +1302,7 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.displayOpenerDialog = function () {
       var elem;
-      elem = $("<div class='opener-overlay'><div class='dialog'>You have opened this page by clicking on a link. Please, confirm if you want to load this site.<a href='?' target='_blank' class='button'>Open site</a></div></div>");
+      elem = $("<div class='opener-overlay'><div class='dialog'>You have opened this page by clicking on a link. Please, confirm if you want to load this xite.<a href='?' target='_blank' class='button'>Open xite</a></div></div>");
       elem.find('a').on("click", function () {
         window.open("?", "_blank");
         window.close();
@@ -1418,7 +1418,7 @@ if (window.getComputedStyle(document.body).transform) {
             return false;
           }
           return _this.ws.cmd("permissionDetails", permission, function (permission_details) {
-            return _this.displayConfirm("This site requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", function () {
+            return _this.displayConfirm("This xite requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", function () {
               return _this.ws.cmd("permissionAdd", permission, function (res) {
                 return _this.sendInner({
                   "cmd": "response",
@@ -1655,13 +1655,17 @@ if (window.getComputedStyle(document.body).transform) {
       return $.when(this.event_site_info).done((function (_this) {
         return function () {
           var data;
-          data = localStorage.getItem("site." + _this.site_info.address + "." + _this.site_info.auth_address);
+          data = localStorage.getItem("xite." + _this.site_info.address + "." + _this.site_info.auth_address);
           if (!data) {
-            data = localStorage.getItem("site." + _this.site_info.address);
+            // Legacy keys, newest first: the "site."-prefixed auth_address
+            // key, then the pre-auth_address global one. Both migrate forward
+            // to the "xite." prefix so no stored data is lost on the rename.
+            data = localStorage.getItem("site." + _this.site_info.address + "." + _this.site_info.auth_address) || localStorage.getItem("site." + _this.site_info.address);
             if (data) {
-              localStorage.setItem("site." + _this.site_info.address + "." + _this.site_info.auth_address, data);
+              localStorage.setItem("xite." + _this.site_info.address + "." + _this.site_info.auth_address, data);
+              localStorage.removeItem("site." + _this.site_info.address + "." + _this.site_info.auth_address);
               localStorage.removeItem("site." + _this.site_info.address);
-              _this.log("Migrated LocalStorage from global to auth_address based");
+              _this.log("Migrated LocalStorage to the xite. prefix");
             }
           }
           if (data) {
@@ -1680,7 +1684,7 @@ if (window.getComputedStyle(document.body).transform) {
       return $.when(this.event_site_info).done((function (_this) {
         return function () {
           var back;
-          back = localStorage.setItem("site." + _this.site_info.address + "." + _this.site_info.auth_address, JSON.stringify(message.params));
+          back = localStorage.setItem("xite." + _this.site_info.address + "." + _this.site_info.auth_address, JSON.stringify(message.params));
           return _this.sendInner({
             "cmd": "response",
             "to": message.id,
@@ -1769,7 +1773,7 @@ if (window.getComputedStyle(document.body).transform) {
       // The iframe often finishes AFTER the first siteInfo response has
       // already been handled (with inner_loaded still false, so the screen
       // was not hidden). Without this re-check the overlay only goes away on
-      // the next site event - typically the announce finishing seconds later -
+      // the next xite event - typically the announce finishing seconds later -
       // and until then it invisibly swallows every click on the page.
       if (this.site_info && this.loading.screen_visible && this.site_info.settings &&
           this.site_info.settings.size > 0 &&
@@ -1816,7 +1820,7 @@ if (window.getComputedStyle(document.body).transform) {
       count = count || 0;
       var changed = count !== (this.notif_count || 0);
       this.notif_count = count;
-      // Re-applied every poll (cheap) so the count survives a site setting its
+      // Re-applied every poll (cheap) so the count survives a xite setting its
       // own document.title between polls.
       this.applyTitleBadge();
       if (changed) {
@@ -1850,7 +1854,7 @@ if (window.getComputedStyle(document.body).transform) {
     Wrapper.prototype.applyTitleBadge = function () {
       var count = this.notif_count || 0;
       var title = window.document.title || "";
-      // Strip only the exact prefix we added last time, so a site's own
+      // Strip only the exact prefix we added last time, so a xite's own
       // "(2) ..." title is never clobbered.
       var prev = this._title_badge || "";
       if (prev && title.indexOf(prev) === 0) {
@@ -1923,10 +1927,10 @@ if (window.getComputedStyle(document.body).transform) {
           _this.address = site_info.address;
           _this.setSiteInfo(site_info);
           if (site_info.settings.size > site_info.size_limit * 1024 * 1024 && !_this.loading.screen_visible) {
-            _this.displayConfirm("Site is larger than allowed: " + ((site_info.settings.size / 1024 / 1024).toFixed(1)) + "MB/" + site_info.size_limit + "MB", "Set limit to " + site_info.next_size_limit + "MB", function () {
+            _this.displayConfirm("Xite is larger than allowed: " + ((site_info.settings.size / 1024 / 1024).toFixed(1)) + "MB/" + site_info.size_limit + "MB", "Set limit to " + site_info.next_size_limit + "MB", function () {
               return _this.ws.cmd("siteSetLimit", [site_info.next_size_limit], function (res) {
                 if (res === "ok") {
-                  return _this.notifications.add("size_limit", "done", "Site storage limit modified!", 5000);
+                  return _this.notifications.add("size_limit", "done", "Xite storage limit modified!", 5000);
                 }
               });
             });
@@ -2020,7 +2024,7 @@ if (window.getComputedStyle(document.body).transform) {
             return function () {
               _this.ws.cmd("siteSetLimit", [site_info.next_size_limit], function (res) {
                 if (res === "ok") {
-                  return _this.notifications.add("size_limit", "done", "Site storage limit modified!", 5000);
+                  return _this.notifications.add("size_limit", "done", "Xite storage limit modified!", 5000);
                 }
               });
               return false;
@@ -2037,13 +2041,13 @@ if (window.getComputedStyle(document.body).transform) {
       var was_own = prev_settings != null ? prev_settings.own : void 0;
       var modified_changed = ((ref2 = site_info.settings) != null ? ref2.modified : void 0) !== (prev_settings != null ? prev_settings.modified : void 0);
       // Refresh the "modified files - sign them" panel when the content
-      // changed OR when the user just claimed the site ("This is my site"),
+      // changed OR when the user just claimed the xite ("This is my xite"),
       // so the sign prompt appears immediately instead of after a refresh.
       if (now_own && (modified_changed || !was_own)) {
         this.updateModifiedPanel();
       }
       if (this.loading.screen_visible && site_info.settings.size > site_info.size_limit * 1024 * 1024) {
-        this.log("Site too large");
+        this.log("Xite too large");
         this.loading.showTooLarge(site_info);
       }
       this.site_info = site_info;

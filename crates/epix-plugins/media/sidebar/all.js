@@ -210,7 +210,7 @@
       added = "<span style='color: #dfd0fa'>" + added + "</span>";
       level = "<span style='color: " + (this.toColor(level, 100)) + ";'>" + level + "</span>";
       module = "<span style='color: " + (this.toColor(module, 60)) + "; font-weight: bold;'>" + module + "</span>";
-      text = text.replace(/(Site:[A-Za-z0-9\.]+)/g, "<span style='color: #AAAAFF'>$1</span>");
+      text = text.replace(/(Xite:[A-Za-z0-9\.]+)/g, "<span style='color: #AAAAFF'>$1</span>");
       text = text.replace(/\</g, "&lt;").replace(/\>/g, "&gt;");
       return added + " " + level + " " + module + " " + text;
     };
@@ -853,7 +853,7 @@ window.initScrollable = function () {
               if (res !== "ok") {
                 return _this.wrapper.notifications.add("privatekey", "error", "Private key not saved: " + (res && res.error ? res.error : "unknown error"));
               }
-              return _this.wrapper.notifications.add("privatekey", "done", "Private key saved for site signing", 5000);
+              return _this.wrapper.notifications.add("privatekey", "done", "Private key saved for xite signing", 5000);
             });
           });
           return false;
@@ -861,7 +861,7 @@ window.initScrollable = function () {
       })(this));
       this.tag.find("#privatekey-forget").off("click, touchend").on("click touchend", (function(_this) {
         return function(e) {
-          _this.wrapper.displayConfirm("Remove saved private key for this site?", "Forget", function(res) {
+          _this.wrapper.displayConfirm("Remove saved private key for this xite?", "Forget", function(res) {
             if (!res) {
               return false;
             }
@@ -1078,11 +1078,11 @@ window.initScrollable = function () {
     Sidebar.prototype.handleSiteDeleteClick = function() {
       var options, question;
       if (this.wrapper.site_info.privatekey) {
-        question = "Are you sure?<br>This site has a saved private key";
-        options = ["Forget private key and delete site"];
+        question = "Are you sure?<br>This xite has a saved private key";
+        options = ["Forget private key and delete xite"];
       } else {
         question = "Are you sure?";
-        options = ["Delete this site", "Blacklist"];
+        options = ["Delete this xite", "Blacklist"];
       }
       return this.wrapper.displayConfirm(question, options, (function(_this) {
         return function(confirmed) {
@@ -1092,7 +1092,7 @@ window.initScrollable = function () {
               return document.location = $(".fixbutton-bg").attr("href");
             });
           } else if (confirmed === 2) {
-            return _this.wrapper.displayPrompt("Blacklist this site", "text", "Delete and Blacklist", "Reason", function(reason) {
+            return _this.wrapper.displayPrompt("Blacklist this xite", "text", "Delete and Blacklist", "Reason", function(reason) {
               _this.tag.find("#button-delete").addClass("loading");
               _this.wrapper.ws.cmd("siteblockAdd", [_this.wrapper.site_info.address, reason]);
               return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.site_info.address, function() {
@@ -1119,7 +1119,7 @@ window.initScrollable = function () {
         return function() {
           _this.wrapper.ws.cmd("siteSetLimit", $("#input-sitelimit").val(), function(res) {
             if (res === "ok") {
-              _this.wrapper.notifications.add("done-sitelimit", "done", "Site storage limit modified!", 5000);
+              _this.wrapper.notifications.add("done-sitelimit", "done", "Xite storage limit modified!", 5000);
             }
             return _this.updateHtmlTag();
           });
@@ -1130,7 +1130,7 @@ window.initScrollable = function () {
         return function() {
           _this.wrapper.ws.cmd("siteSetAutodownloadBigfileLimit", $("#input-autodownload_bigfile_size_limit").val(), function(res) {
             if (res === "ok") {
-              _this.wrapper.notifications.add("done-bigfilelimit", "done", "Site bigfile auto download limit modified!", 5000);
+              _this.wrapper.notifications.add("done-bigfilelimit", "done", "Xite bigfile auto download limit modified!", 5000);
             }
             return _this.updateHtmlTag();
           });
@@ -1172,7 +1172,7 @@ window.initScrollable = function () {
         return function() {
           _this.tag.find("#button-update").addClass("loading");
           _this.wrapper.ws.cmd("siteUpdate", _this.wrapper.site_info.address, function() {
-            _this.wrapper.notifications.add("done-updated", "done", "Site updated!", 5000);
+            _this.wrapper.notifications.add("done-updated", "done", "Xite updated!", 5000);
             return _this.tag.find("#button-update").removeClass("loading");
           });
           return false;
@@ -1289,7 +1289,7 @@ window.initScrollable = function () {
               if (res !== "ok") {
                 return _this.wrapper.notifications.add("file-write", "error", "File write error: " + res);
               } else {
-                _this.wrapper.notifications.add("file-write", "done", "Site settings saved!", 5000);
+                _this.wrapper.notifications.add("file-write", "done", "Xite settings saved!", 5000);
                 if (_this.wrapper.site_info.privatekey) {
                   _this.wrapper.ws.cmd("siteSign", {
                     privatekey: "stored",
@@ -1306,7 +1306,7 @@ window.initScrollable = function () {
       })(this));
       this.tag.find("#link-directory").off("click touchend").on("click touchend", (function(_this) {
         return function() {
-          _this.wrapper.ws.cmd("serverShowdirectory", ["site", _this.wrapper.site_info.address]);
+          _this.wrapper.ws.cmd("serverShowdirectory", ["xite", _this.wrapper.site_info.address]);
           return false;
         };
       })(this));
@@ -1317,7 +1317,7 @@ window.initScrollable = function () {
           handler = function(e) {
             e.clipboardData.setData('text/plain', copy_text);
             e.preventDefault();
-            _this.wrapper.notifications.add("copy", "done", "Site address with peers copied to your clipboard", 5000);
+            _this.wrapper.notifications.add("copy", "done", "Xite address with peers copied to your clipboard", 5000);
             return document.removeEventListener('copy', handler, true);
           };
           document.addEventListener('copy', handler, true);
