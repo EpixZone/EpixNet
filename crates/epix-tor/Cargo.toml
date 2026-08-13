@@ -8,7 +8,7 @@ epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
 # rustls instead of the default native-tls: pure Rust, so the same build works
 # on desktop and Android (native-tls needs an OpenSSL for the NDK target).
-arti-client = { version = "0.44", default-features = false, features = [
+arti-client = { version = "0.45", default-features = false, features = [
     "tokio",
     "rustls",
     "compression",
