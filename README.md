@@ -10,8 +10,8 @@ Privacy comes built in. EpixNet can send your traffic through **Tor** and **I2P*
 
 - **A web that nobody owns.** Sites (EpixNet calls them *xites*) are signed by their author and copied from person to person, so they stay online even when computers switch off.
 - **Privacy without the setup.** Tor and I2P run inside EpixNet and are on by default. There is nothing extra to download or configure.
-- **You help hold it up.** Your node shares the sites you have visited and helps other people find each other, like a tiny piece of the network living on your machine.
-- **A dashboard.** See the sites you keep, live network activity, and a world map of the people you are connected to.
+- **You help hold it up.** Your node shares the xites you have visited and helps other people find each other, like a tiny piece of the network living on your machine.
+- **A dashboard.** See the xites you keep, live network activity, and a world map of the people you are connected to.
 - **Built-in apps.** A chat board, mail, and a newsfeed that all run on the network, with no account on anyone's server.
 - **Runs almost anywhere.** Windows, macOS, Linux, Android, and iOS.
 
@@ -43,7 +43,7 @@ cargo run -p epix-server
 EPIX_HEADLESS=1 cargo run -p epix-server
 ```
 
-The dashboard lives at **http://127.0.0.1:42222/**. Open a specific site by passing its name:
+The dashboard lives at **http://127.0.0.1:42222/**. Open a specific xite by passing its name:
 
 ```sh
 cargo run -p epix-server talk.epix
@@ -125,7 +125,7 @@ Set these before you start EpixNet to change how it runs:
 | `EPIX_HEADLESS=1` | Serve the network but never open a browser (for servers). | off |
 | `EPIX_UI_ADDR` | The address the dashboard listens on. | `127.0.0.1:42222` |
 | `EPIX_TOR` | Tor mode: `enable`, `disable`, or `always` (route everything through Tor). | `enable` |
-| `EPIX_DATA_DIR` | Where EpixNet keeps its data (sites, keys, settings). | see below |
+| `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). | see below |
 
 If port `42222` is already taken, EpixNet falls back to `43110`.
 
@@ -146,6 +146,6 @@ EpixNet is a set of small Rust pieces (in `crates/`) that fit together:
 - `epix-server` is the node you run on a desktop.
 - `epix-browser` wraps a real Firefox so `.epix` names load like normal web pages.
 - `epix-ffi` is the same node packaged for Android and iOS.
-- The rest handle the network, signing and verifying sites, storage, Tor, I2P, and the dashboard.
+- The rest handle the network, signing and verifying xites, storage, Tor, I2P, and the dashboard.
 
 Contributor notes for the phone and Firefox shells live in [`shells/README.md`](shells/README.md).

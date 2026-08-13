@@ -120,7 +120,7 @@ impl DbSchema {
 
 /// Validate a table name is a plain SQL identifier (letters, digits,
 /// underscore; not starting with a digit), since names come from a
-/// site-controlled `dbschema.json`. Rejects anything that could break out of
+/// xite-controlled `dbschema.json`. Rejects anything that could break out of
 /// the interpolated DDL. EpixNet's `safe_sql_identifier`.
 fn safe_identifier(name: &str) -> Result<()> {
     let ok = !name.is_empty()
@@ -137,9 +137,9 @@ fn safe_identifier(name: &str) -> Result<()> {
 /// meta-tables the populate step needs.
 ///
 /// Applies EpixNet's schema versioning: the schema's `version` is tracked in
-/// `keyvalue` (`db.version`). When the site bumps it, every table is **dropped
-/// and recreated** in the new shape (the data is repopulated from the site's
-/// content data files afterward), so a node follows a site's schema change
+/// `keyvalue` (`db.version`). When the xite bumps it, every table is **dropped
+/// and recreated** in the new shape (the data is repopulated from the xite's
+/// content data files afterward), so a node follows a xite's schema change
 /// instead of keeping a stale table layout. Otherwise this is idempotent
 /// (`IF NOT EXISTS`).
 pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
@@ -208,7 +208,7 @@ fn create_meta_tables(conn: &Connection, schema: &DbSchema) -> Result<()> {
     let db = |e: rusqlite::Error| Error::Db(e.to_string());
 
     // Base identity columns for a data file, by schema version. Version 3 adds
-    // a `site` column so a merger site's db can aggregate rows from many sites.
+    // a `xite` column so a merger xite's db can aggregate rows from many xites.
     let (id_cols, unique) = match schema.version {
         1 => ("path VARCHAR(255)", "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(path)"),
         3 => (

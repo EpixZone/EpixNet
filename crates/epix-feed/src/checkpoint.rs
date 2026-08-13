@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn a_tombstone_cannot_delete_another_authors_item() {
-        // Any authorized site user can self-sign a record in her OWN
+        // Any authorized xite user can self-sign a record in her OWN
         // directory carrying someone else's id, so a tombstone must only
         // remove its own author's item.
         let mut recs = records();

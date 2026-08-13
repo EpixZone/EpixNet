@@ -4,14 +4,14 @@
 //!
 //! Two shapes arrive, like the `.epix` proxy:
 //!
-//! - **`GET http://site.i2p/…`** (absolute-form, the norm - eepsites are
+//! - **`GET http://xite.i2p/…`** (absolute-form, the norm - eepsites are
 //!   plain http): resolve the host to a destination, open a SAM stream, and
 //!   forward the request in origin-form.
-//! - **`CONNECT site.i2p:443`** (the rare TLS eepsite, or an HTTPS-First
+//! - **`CONNECT xite.i2p:443`** (the rare TLS eepsite, or an HTTPS-First
 //!   probe): tunnel raw bytes over the SAM stream.
 //!
 //! Host resolution order: an `?i2paddresshelper=` jump-link destination
-//! (persisted, so the site works bare afterwards) > the local addressbook >
+//! (persisted, so the xite works bare afterwards) > the local addressbook >
 //! the router's naming service (`.b32.i2p` always resolves there; plain
 //! hostnames only if the router knows them). Unknown hosts get an explanatory
 //! page instead of a dead socket, as do requests while I2P is disabled or
@@ -126,7 +126,7 @@ async fn handle_conn(
         Err(page) => return respond_html(&mut sock, &page.0, &page.1, &page.2).await,
     };
     // A failed dial renders a page, not a dropped socket: the difference
-    // between "site down / stale saved address" and a browser network error.
+    // between "xite down / stale saved address" and a browser network error.
     let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, dialer.connect(sam_port, &dest))
         .await
     {

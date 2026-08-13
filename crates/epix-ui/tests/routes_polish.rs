@@ -8,7 +8,7 @@ use epix_xite::XiteStorage;
 use serde_json::json;
 use tower::ServiceExt;
 
-async fn router_with_site() -> axum::Router {
+async fn router_with_xite() -> axum::Router {
     let state = AppState::new("polish-test");
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
@@ -39,7 +39,7 @@ fn get(uri: &str) -> axum::extract::Request {
 
 #[tokio::test]
 async fn raw_serves_without_wrapper_under_noscript_csp() {
-    let router = router_with_site().await;
+    let router = router_with_xite().await;
     let resp = router.oneshot(get("/raw/1Polish/index.html")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let csp = resp.headers().get("content-security-policy").unwrap().to_str().unwrap();
@@ -50,7 +50,7 @@ async fn raw_serves_without_wrapper_under_noscript_csp() {
 
 #[tokio::test]
 async fn root_favicon_and_add_redirect() {
-    let router = router_with_site().await;
+    let router = router_with_xite().await;
     let resp = router.clone().oneshot(get("/favicon.ico")).await.unwrap();
     assert_eq!(resp.status(), 308);
     assert_eq!(resp.headers().get("location").unwrap(), "/uimedia/img/favicon.ico");
@@ -62,14 +62,14 @@ async fn root_favicon_and_add_redirect() {
 
 #[tokio::test]
 async fn content_type_table_covers_epixnet_entries() {
-    let router = router_with_site().await;
+    let router = router_with_xite().await;
     let resp = router.oneshot(get("/raw/1Polish/style.webp")).await.unwrap();
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/webp");
 }
 
 #[tokio::test]
 async fn wrapper_carries_content_json_page_hints() {
-    let router = router_with_site().await;
+    let router = router_with_xite().await;
     let resp = router.oneshot(get("/1Polish/")).await.unwrap();
     assert_eq!(resp.status(), 200);
     let html =

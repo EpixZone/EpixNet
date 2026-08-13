@@ -737,7 +737,7 @@ async fn serve_announce(
     let _ = conn.respond(stream, resp).await;
 }
 
-/// Send `Signed` across as many frames as it takes. A large site's
+/// Send `Signed` across as many frames as it takes. A large xite's
 /// content.json is bigger than one frame, and an oversize frame fails to
 /// encode in the writer task, which tears down the WHOLE multiplexed
 /// connection (not just this stream); refusing it instead simply made such
@@ -1587,7 +1587,7 @@ mod tests {
 
     /// A signed body too large for one frame is chunked, not refused. An
     /// oversize frame fails to encode inside the writer task and tears the
-    /// whole connection down, and refusing it instead made a big site's
+    /// whole connection down, and refusing it instead made a big xite's
     /// content.json unclonable, so the reply streams like SignedList does.
     #[tokio::test]
     async fn an_oversize_signed_body_is_chunked_across_frames() {

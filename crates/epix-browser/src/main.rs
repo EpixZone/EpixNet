@@ -1116,7 +1116,7 @@ fn write_profile(
     // `http://` homepage forever unless we overwrite them here - a healed
     // profile would still open the xite over http ("Not Secure"). We only
     // prefer https (https-first), never force it (https-only would break plain
-    // http clearnet sites the user browses through Tor).
+    // http clearnet xites the user browses through Tor).
     let https_prefs = if secure {
         "user_pref(\"dom.security.https_only_mode\", false);\n\
          user_pref(\"dom.security.https_first\", true);\n\

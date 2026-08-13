@@ -683,7 +683,7 @@ if (window.getComputedStyle(document.body).transform) {
       })(this)), 300);
     };
 
-    Loading.STAGES = ["Searching for peers", "Fetching site information", "Downloading files", "Opening the site"];
+    Loading.STAGES = ["Searching for peers", "Fetching xite information", "Downloading files", "Opening the xite"];
 
     // The centered stage ticker: previous action faded above, the current one
     // big in the middle with a live detail line, the next faded below.
@@ -725,16 +725,16 @@ if (window.getComputedStyle(document.body).transform) {
       return this.setStage(0, "");
     };
 
-    Loading.prototype.showTooLarge = function (site_info) {
+    Loading.prototype.showTooLarge = function (xite_info) {
       var button, line;
-      this.log("Displaying large site confirmation");
+      this.log("Displaying large xite confirmation");
       if ($(".console .button-setlimit").length === 0) {
-        line = this.printLine("Site size: <b>" + (parseInt(site_info.settings.size / 1024 / 1024)) + "MB</b> is larger than default allowed " + (parseInt(site_info.size_limit)) + "MB", "warning");
-        button = $("<a href='#Set+limit' class='button button-setlimit'>" + ("Open site and set size limit to " + site_info.next_size_limit + "MB") + "</a>");
+        line = this.printLine("Xite size: <b>" + (parseInt(xite_info.settings.size / 1024 / 1024)) + "MB</b> is larger than default allowed " + (parseInt(xite_info.size_limit)) + "MB", "warning");
+        button = $("<a href='#Set+limit' class='button button-setlimit'>" + ("Open xite and set size limit to " + xite_info.next_size_limit + "MB") + "</a>");
         button.on("click", (function (_this) {
           return function () {
             button.addClass("loading");
-            return _this.wrapper.setSizeLimit(site_info.next_size_limit);
+            return _this.wrapper.setSizeLimit(xite_info.next_size_limit);
           };
         })(this));
         line.after(button);
@@ -757,7 +757,7 @@ if (window.getComputedStyle(document.body).transform) {
             _this.wrapper.ws.cmd("configSet", ["tor_use_bridges", ""]);
             _this.wrapper.ws.cmd("configSet", ["trackers_proxy", "tor"]);
             _this.wrapper.ws.cmd("siteUpdate", {
-              address: _this.wrapper.site_info.address,
+              address: _this.wrapper.xite_info.address,
               announce: true
             });
             _this.wrapper.reloadIframe();
@@ -1033,13 +1033,13 @@ if (window.getComputedStyle(document.body).transform) {
       this.ws.connect();
       this.ws_error = null;
       this.next_cmd_message_id = -1;
-      this.site_info = null;
+      this.xite_info = null;
       this.server_info = null;
-      this.event_site_info = $.Deferred();
+      this.event_xite_info = $.Deferred();
       this.inner_loaded = false;
       this.inner_ready = false;
       this.wrapperWsInited = false;
-      this.site_error = null;
+      this.xite_error = null;
       this.address = null;
       this.opener_tested = false;
       this.announcer_line = null;
@@ -1123,7 +1123,7 @@ if (window.getComputedStyle(document.body).transform) {
       } else if (cmd === "setSiteInfo") {
         this.sendInner(message);
         if (message.params.address === this.address) {
-          this.setSiteInfo(message.params);
+          this.setXiteInfo(message.params);
         }
         return this.updateProgress(message.params);
       } else if (cmd === "setAnnouncerInfo") {
@@ -1260,7 +1260,7 @@ if (window.getComputedStyle(document.body).transform) {
         return this.actionCloseWebNotification(message);
       } else {
         if (message.id < 1000000) {
-          if (message.cmd === "fileWrite" && !this.modified_panel_updater_timer && (typeof site_info !== "undefined" && site_info !== null ? (ref = site_info.settings) != null ? ref.own : void 0 : void 0)) {
+          if (message.cmd === "fileWrite" && !this.modified_panel_updater_timer && (typeof xite_info !== "undefined" && xite_info !== null ? (ref = xite_info.settings) != null ? ref.own : void 0 : void 0)) {
             this.modified_panel_updater_timer = setTimeout(((function (_this) {
               return function () {
                 _this.updateModifiedPanel();
@@ -1290,7 +1290,7 @@ if (window.getComputedStyle(document.body).transform) {
       if (query.startsWith("#")) {
         back = query;
       } else if (query.startsWith("/")) {
-        // Site-relative path: keep the address segment, replace the rest, so
+        // Xite-relative path: keep the address segment, replace the rest, so
         // a page can put itself in the address bar (refresh + direct links).
         m = window.location.pathname.match(/^\/[^\/]+/);
         back = (m ? m[0] : "") + query;
@@ -1302,7 +1302,7 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.displayOpenerDialog = function () {
       var elem;
-      elem = $("<div class='opener-overlay'><div class='dialog'>You have opened this page by clicking on a link. Please, confirm if you want to load this site.<a href='?' target='_blank' class='button'>Open site</a></div></div>");
+      elem = $("<div class='opener-overlay'><div class='dialog'>You have opened this page by clicking on a link. Please, confirm if you want to load this xite.<a href='?' target='_blank' class='button'>Open xite</a></div></div>");
       elem.find('a').on("click", function () {
         window.open("?", "_blank");
         window.close();
@@ -1332,7 +1332,7 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.actionWebNotification = function (message) {
-      return $.when(this.event_site_info).done((function (_this) {
+      return $.when(this.event_xite_info).done((function (_this) {
         return function () {
           var res;
           if (Notification.permission === "granted") {
@@ -1358,7 +1358,7 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.actionCloseWebNotification = function (message) {
-      return $.when(this.event_site_info).done((function (_this) {
+      return $.when(this.event_xite_info).done((function (_this) {
         return function () {
           var id;
           id = message.params[0];
@@ -1412,13 +1412,13 @@ if (window.getComputedStyle(document.body).transform) {
     Wrapper.prototype.actionPermissionAdd = function (message) {
       var permission;
       permission = message.params;
-      return $.when(this.event_site_info).done((function (_this) {
+      return $.when(this.event_xite_info).done((function (_this) {
         return function () {
-          if (indexOf.call(_this.site_info.settings.permissions, permission) >= 0) {
+          if (indexOf.call(_this.xite_info.settings.permissions, permission) >= 0) {
             return false;
           }
           return _this.ws.cmd("permissionDetails", permission, function (permission_details) {
-            return _this.displayConfirm("This site requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", function () {
+            return _this.displayConfirm("This xite requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", function () {
               return _this.ws.cmd("permissionAdd", permission, function (res) {
                 return _this.sendInner({
                   "cmd": "response",
@@ -1652,16 +1652,20 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.actionGetLocalStorage = function (message) {
-      return $.when(this.event_site_info).done((function (_this) {
+      return $.when(this.event_xite_info).done((function (_this) {
         return function () {
           var data;
-          data = localStorage.getItem("site." + _this.site_info.address + "." + _this.site_info.auth_address);
+          data = localStorage.getItem("xite." + _this.xite_info.address + "." + _this.xite_info.auth_address);
           if (!data) {
-            data = localStorage.getItem("site." + _this.site_info.address);
+            // Legacy keys, newest first: the "site."-prefixed auth_address
+            // key, then the pre-auth_address global one. Both migrate forward
+            // to the "xite." prefix so no stored data is lost on the rename.
+            data = localStorage.getItem("site." + _this.xite_info.address + "." + _this.xite_info.auth_address) || localStorage.getItem("site." + _this.xite_info.address);
             if (data) {
-              localStorage.setItem("site." + _this.site_info.address + "." + _this.site_info.auth_address, data);
-              localStorage.removeItem("site." + _this.site_info.address);
-              _this.log("Migrated LocalStorage from global to auth_address based");
+              localStorage.setItem("xite." + _this.xite_info.address + "." + _this.xite_info.auth_address, data);
+              localStorage.removeItem("site." + _this.xite_info.address + "." + _this.xite_info.auth_address);
+              localStorage.removeItem("site." + _this.xite_info.address);
+              _this.log("Migrated LocalStorage to the xite. prefix");
             }
           }
           if (data) {
@@ -1677,10 +1681,10 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.actionSetLocalStorage = function (message) {
-      return $.when(this.event_site_info).done((function (_this) {
+      return $.when(this.event_xite_info).done((function (_this) {
         return function () {
           var back;
-          back = localStorage.setItem("site." + _this.site_info.address + "." + _this.site_info.auth_address, JSON.stringify(message.params));
+          back = localStorage.setItem("xite." + _this.xite_info.address + "." + _this.xite_info.auth_address, JSON.stringify(message.params));
           return _this.sendInner({
             "cmd": "response",
             "to": message.id,
@@ -1719,7 +1723,7 @@ if (window.getComputedStyle(document.body).transform) {
         })(this));
       }
       if (this.inner_loaded) {
-        this.reloadSiteInfo();
+        this.reloadXiteInfo();
       }
       // Nav-icon / tab notification badge: fetch the current unread total now
       // and keep it fresh on a light timer (the count is cheap on the node).
@@ -1733,8 +1737,8 @@ if (window.getComputedStyle(document.body).transform) {
       }
       setTimeout(((function (_this) {
         return function () {
-          if (!_this.site_info) {
-            return _this.reloadSiteInfo();
+          if (!_this.xite_info) {
+            return _this.reloadXiteInfo();
           }
         };
       })(this)), 2000);
@@ -1769,11 +1773,11 @@ if (window.getComputedStyle(document.body).transform) {
       // The iframe often finishes AFTER the first siteInfo response has
       // already been handled (with inner_loaded still false, so the screen
       // was not hidden). Without this re-check the overlay only goes away on
-      // the next site event - typically the announce finishing seconds later -
+      // the next xite event - typically the announce finishing seconds later -
       // and until then it invisibly swallows every click on the page.
-      if (this.site_info && this.loading.screen_visible && this.site_info.settings &&
-          this.site_info.settings.size > 0 &&
-          this.site_info.settings.size < this.site_info.size_limit * 1024 * 1024) {
+      if (this.xite_info && this.loading.screen_visible && this.xite_info.settings &&
+          this.xite_info.settings.size > 0 &&
+          this.xite_info.settings.size < this.xite_info.size_limit * 1024 * 1024) {
         this.log("Inner loaded with siteInfo already in - hiding loading screen");
         this.loading.hideScreen();
       }
@@ -1782,10 +1786,10 @@ if (window.getComputedStyle(document.body).transform) {
           "cmd": "wrapperReady"
         });
       }
-      if (this.ws.ws.readyState === 1 && !this.site_info) {
-        return this.reloadSiteInfo();
-      } else if (this.site_info && (((ref = this.site_info.content) != null ? ref.title : void 0) != null) && !this.is_title_changed) {
-        window.document.title = this.site_info.content.title + " - EpixNet";
+      if (this.ws.ws.readyState === 1 && !this.xite_info) {
+        return this.reloadXiteInfo();
+      } else if (this.xite_info && (((ref = this.xite_info.content) != null ? ref.title : void 0) != null) && !this.is_title_changed) {
+        window.document.title = this.xite_info.content.title + " - EpixNet";
         return this.log("Setting title to", window.document.title);
       }
     };
@@ -1816,7 +1820,7 @@ if (window.getComputedStyle(document.body).transform) {
       count = count || 0;
       var changed = count !== (this.notif_count || 0);
       this.notif_count = count;
-      // Re-applied every poll (cheap) so the count survives a site setting its
+      // Re-applied every poll (cheap) so the count survives a xite setting its
       // own document.title between polls.
       this.applyTitleBadge();
       if (changed) {
@@ -1850,7 +1854,7 @@ if (window.getComputedStyle(document.body).transform) {
     Wrapper.prototype.applyTitleBadge = function () {
       var count = this.notif_count || 0;
       var title = window.document.title || "";
-      // Strip only the exact prefix we added last time, so a site's own
+      // Strip only the exact prefix we added last time, so a xite's own
       // "(2) ..." title is never clobbered.
       var prev = this._title_badge || "";
       if (prev && title.indexOf(prev) === 0) {
@@ -1908,7 +1912,7 @@ if (window.getComputedStyle(document.body).transform) {
       return this.inner.postMessage(message, '*');
     };
 
-    Wrapper.prototype.reloadSiteInfo = function () {
+    Wrapper.prototype.reloadXiteInfo = function () {
       var params;
       if (this.loading.screen_visible) {
         params = {
@@ -1918,31 +1922,31 @@ if (window.getComputedStyle(document.body).transform) {
         params = {};
       }
       return this.ws.cmd("siteInfo", params, (function (_this) {
-        return function (site_info) {
+        return function (xite_info) {
           var ref;
-          _this.address = site_info.address;
-          _this.setSiteInfo(site_info);
-          if (site_info.settings.size > site_info.size_limit * 1024 * 1024 && !_this.loading.screen_visible) {
-            _this.displayConfirm("Site is larger than allowed: " + ((site_info.settings.size / 1024 / 1024).toFixed(1)) + "MB/" + site_info.size_limit + "MB", "Set limit to " + site_info.next_size_limit + "MB", function () {
-              return _this.ws.cmd("siteSetLimit", [site_info.next_size_limit], function (res) {
+          _this.address = xite_info.address;
+          _this.setXiteInfo(xite_info);
+          if (xite_info.settings.size > xite_info.size_limit * 1024 * 1024 && !_this.loading.screen_visible) {
+            _this.displayConfirm("Xite is larger than allowed: " + ((xite_info.settings.size / 1024 / 1024).toFixed(1)) + "MB/" + xite_info.size_limit + "MB", "Set limit to " + xite_info.next_size_limit + "MB", function () {
+              return _this.ws.cmd("siteSetLimit", [xite_info.next_size_limit], function (res) {
                 if (res === "ok") {
-                  return _this.notifications.add("size_limit", "done", "Site storage limit modified!", 5000);
+                  return _this.notifications.add("size_limit", "done", "Xite storage limit modified!", 5000);
                 }
               });
             });
           }
-          if ((((ref = site_info.content) != null ? ref.title : void 0) != null) && !_this.is_title_changed) {
-            window.document.title = site_info.content.title + " - EpixNet";
+          if ((((ref = xite_info.content) != null ? ref.title : void 0) != null) && !_this.is_title_changed) {
+            window.document.title = xite_info.content.title + " - EpixNet";
             return _this.log("Setting title to", window.document.title);
           }
         };
       })(this));
     };
 
-    Wrapper.prototype.setSiteInfo = function (site_info) {
+    Wrapper.prototype.setXiteInfo = function (xite_info) {
       var ref, ref1, ref2, ref3;
-      if (site_info.event != null) {
-        if (site_info.event[0] === "file_added" && site_info.bad_files) {
+      if (xite_info.event != null) {
+        if (xite_info.event[0] === "file_added" && xite_info.bad_files) {
           // Only the required core downloads before the page loads. The
           // optional set is deliberately NOT mentioned here: "+ 1,157 optional
           // files (234.3 GB)" on a first-visit screen reads as what is about
@@ -1954,73 +1958,73 @@ if (window.getComputedStyle(document.body).transform) {
             if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
             return Math.max(1, Math.round(bytes / 1024)) + " KB";
           };
-          var needed_line = site_info.bad_files + " files needed to load";
-          if (site_info.size_needed) needed_line = site_info.bad_files + " files (" + fmtSize(site_info.size_needed) + ") needed to load";
+          var needed_line = xite_info.bad_files + " files needed to load";
+          if (xite_info.size_needed) needed_line = xite_info.bad_files + " files (" + fmtSize(xite_info.size_needed) + ") needed to load";
           this.loading.printLine(needed_line);
-          this.loading.setStage(2, "0 / " + site_info.bad_files + " files");
-        } else if (site_info.event[0] === "file_done") {
-          this.loading.printLine(site_info.event[1] + " downloaded");
-          if (site_info.started_task_num > 0 && site_info.event[1] !== "content.json") {
+          this.loading.setStage(2, "0 / " + xite_info.bad_files + " files");
+        } else if (xite_info.event[0] === "file_done") {
+          this.loading.printLine(xite_info.event[1] + " downloaded");
+          if (xite_info.started_task_num > 0 && xite_info.event[1] !== "content.json") {
             // peers_serving is how many peers the files are actually coming
-            // from, which is not site_info.peers (how many were discovered).
-            var serving = site_info.peers_serving || 0;
+            // from, which is not xite_info.peers (how many were discovered).
+            var serving = xite_info.peers_serving || 0;
             var from = serving > 0 ? " from " + serving + (serving === 1 ? " peer" : " peers") : "";
-            var files_done = site_info.started_task_num - site_info.tasks;
+            var files_done = xite_info.started_task_num - xite_info.tasks;
             // Never step backwards (events can arrive out of order).
             if (files_done >= (this.max_files_done || 0)) {
               this.max_files_done = files_done;
-              this.loading.setStage(2, files_done + " / " + site_info.started_task_num + " files" + from + " - " + site_info.event[1]);
+              this.loading.setStage(2, files_done + " / " + xite_info.started_task_num + " files" + from + " - " + xite_info.event[1]);
             }
           }
-          if (site_info.event[1] === window.file_inner_path) {
+          if (xite_info.event[1] === window.file_inner_path) {
             this.loading.setStage(3, "");
             this.loading.hideScreen();
-            if (!this.site_info) {
-              this.reloadSiteInfo();
+            if (!this.xite_info) {
+              this.reloadXiteInfo();
             }
-            if (site_info.content && site_info.content.title && !this.is_title_changed) {
-              window.document.title = site_info.content.title + " - EpixNet";
+            if (xite_info.content && xite_info.content.title && !this.is_title_changed) {
+              window.document.title = xite_info.content.title + " - EpixNet";
               this.log("Required file " + window.file_inner_path + " done, setting title to", window.document.title);
             }
             if (!window.show_loadingscreen) {
               this.notifications.add("modified", "info", "New version of this page has just released.<br>Reload to see the modified content.");
             }
           }
-        } else if (site_info.event[0] === "file_failed") {
-          this.site_error = site_info.event[1];
-          if (site_info.settings.size > site_info.size_limit * 1024 * 1024) {
-            this.loading.showTooLarge(site_info);
+        } else if (xite_info.event[0] === "file_failed") {
+          this.xite_error = xite_info.event[1];
+          if (xite_info.settings.size > xite_info.size_limit * 1024 * 1024) {
+            this.loading.showTooLarge(xite_info);
           } else {
-            this.loading.printLine(site_info.event[1] + " download failed", "error");
+            this.loading.printLine(xite_info.event[1] + " download failed", "error");
             // Only show "No peers found" after a file download has failed
-            if (site_info.peers <= 1) {
-              this.site_error = "No peers found";
+            if (xite_info.peers <= 1) {
+              this.xite_error = "No peers found";
               this.loading.printLine("No peers found");
               this.loading.setStage(this.loading.stage_index || 0, "No peers found", true);
             } else {
-              this.loading.setStage(this.loading.stage_index || 0, site_info.event[1] + " download failed", true);
+              this.loading.setStage(this.loading.stage_index || 0, xite_info.event[1] + " download failed", true);
             }
           }
-        } else if (site_info.event[0] === "peers_added") {
-          this.loading.printLine("Peers found: " + site_info.peers);
-          this.loading.setStage(1, "peers found: " + site_info.peers);
+        } else if (xite_info.event[0] === "peers_added") {
+          this.loading.printLine("Peers found: " + xite_info.peers);
+          this.loading.setStage(1, "peers found: " + xite_info.peers);
         }
       }
-      if (this.loading.screen_visible && !this.site_info) {
-        if (site_info.peers > 1) {
-          this.loading.printLine("Peers found: " + site_info.peers);
+      if (this.loading.screen_visible && !this.xite_info) {
+        if (xite_info.peers > 1) {
+          this.loading.printLine("Peers found: " + xite_info.peers);
         } else {
           // Show "Searching for peers..." when no peers found yet (before any failures)
           this.loading.printLine("Searching for peers...");
         }
       }
-      if (!this.site_info && !this.loading.screen_visible && $("#inner-iframe").attr("src").replace("?wrapper=False", "").replace(/\?wrapper_nonce=[A-Za-z0-9]+/, "").indexOf("?") === -1) {
-        if (site_info.size_limit * 1.1 < site_info.next_size_limit) {
-          this.displayConfirm("Running out of size limit (" + ((site_info.settings.size / 1024 / 1024).toFixed(1)) + "MB/" + site_info.size_limit + "MB)", "Set limit to " + site_info.next_size_limit + "MB", (function (_this) {
+      if (!this.xite_info && !this.loading.screen_visible && $("#inner-iframe").attr("src").replace("?wrapper=False", "").replace(/\?wrapper_nonce=[A-Za-z0-9]+/, "").indexOf("?") === -1) {
+        if (xite_info.size_limit * 1.1 < xite_info.next_size_limit) {
+          this.displayConfirm("Running out of size limit (" + ((xite_info.settings.size / 1024 / 1024).toFixed(1)) + "MB/" + xite_info.size_limit + "MB)", "Set limit to " + xite_info.next_size_limit + "MB", (function (_this) {
             return function () {
-              _this.ws.cmd("siteSetLimit", [site_info.next_size_limit], function (res) {
+              _this.ws.cmd("siteSetLimit", [xite_info.next_size_limit], function (res) {
                 if (res === "ok") {
-                  return _this.notifications.add("size_limit", "done", "Site storage limit modified!", 5000);
+                  return _this.notifications.add("size_limit", "done", "Xite storage limit modified!", 5000);
                 }
               });
               return false;
@@ -2028,26 +2032,26 @@ if (window.getComputedStyle(document.body).transform) {
           })(this));
         }
       }
-      if (this.loading.screen_visible && this.inner_loaded && site_info.settings.size < site_info.size_limit * 1024 * 1024 && site_info.settings.size > 0) {
+      if (this.loading.screen_visible && this.inner_loaded && xite_info.settings.size < xite_info.size_limit * 1024 * 1024 && xite_info.settings.size > 0) {
         this.log("Loading screen visible, but inner loaded");
         this.loading.hideScreen();
       }
-      var now_own = (ref = site_info.settings) != null ? ref.own : void 0;
-      var prev_settings = (ref1 = this.site_info) != null ? ref1.settings : void 0;
+      var now_own = (ref = xite_info.settings) != null ? ref.own : void 0;
+      var prev_settings = (ref1 = this.xite_info) != null ? ref1.settings : void 0;
       var was_own = prev_settings != null ? prev_settings.own : void 0;
-      var modified_changed = ((ref2 = site_info.settings) != null ? ref2.modified : void 0) !== (prev_settings != null ? prev_settings.modified : void 0);
+      var modified_changed = ((ref2 = xite_info.settings) != null ? ref2.modified : void 0) !== (prev_settings != null ? prev_settings.modified : void 0);
       // Refresh the "modified files - sign them" panel when the content
-      // changed OR when the user just claimed the site ("This is my site"),
+      // changed OR when the user just claimed the xite ("This is my xite"),
       // so the sign prompt appears immediately instead of after a refresh.
       if (now_own && (modified_changed || !was_own)) {
         this.updateModifiedPanel();
       }
-      if (this.loading.screen_visible && site_info.settings.size > site_info.size_limit * 1024 * 1024) {
-        this.log("Site too large");
-        this.loading.showTooLarge(site_info);
+      if (this.loading.screen_visible && xite_info.settings.size > xite_info.size_limit * 1024 * 1024) {
+        this.log("Xite too large");
+        this.loading.showTooLarge(xite_info);
       }
-      this.site_info = site_info;
-      return this.event_site_info.resolve();
+      this.xite_info = xite_info;
+      return this.event_xite_info.resolve();
     };
 
     Wrapper.prototype.siteSign = function (inner_path, cb) {
@@ -2070,7 +2074,7 @@ if (window.getComputedStyle(document.body).transform) {
           return _this.infopanel.elem.find(".button").removeClass("loading");
         };
       })(this);
-      if (this.site_info.privatekey) {
+      if (this.xite_info.privatekey) {
         this.infopanel.elem.find(".button").addClass("loading");
         return this.ws.cmd("siteSign", {
           privatekey: "stored",
@@ -2104,7 +2108,7 @@ if (window.getComputedStyle(document.body).transform) {
           var closed, num, ref;
           num = (ref = res.modified_files) != null ? ref.length : void 0;
           if (num > 0) {
-            closed = _this.site_info.settings.modified_files_notification === false;
+            closed = _this.xite_info.settings.modified_files_notification === false;
             _this.infopanel.show(closed);
           } else {
             _this.infopanel.hide();
@@ -2152,14 +2156,14 @@ if (window.getComputedStyle(document.body).transform) {
       }
     };
 
-    Wrapper.prototype.updateProgress = function (site_info) {
-      if (!site_info || !(site_info.started_task_num > 0)) {
+    Wrapper.prototype.updateProgress = function (xite_info) {
+      if (!xite_info || !(xite_info.started_task_num > 0)) {
         // Events with no task info (peer additions, announces) say nothing
         // about download progress - leave the bar where it is.
         return;
       }
-      if (site_info.tasks > 0) {
-        return this.loading.setProgress(1 - (Math.max(site_info.tasks, site_info.bad_files) / site_info.started_task_num));
+      if (xite_info.tasks > 0) {
+        return this.loading.setProgress(1 - (Math.max(xite_info.tasks, xite_info.bad_files) / xite_info.started_task_num));
       } else {
         return this.loading.hideProgress();
       }
@@ -2256,7 +2260,7 @@ if (window.getComputedStyle(document.body).transform) {
 
   WrapperEpixFrame = (function () {
     function WrapperEpixFrame(wrapper) {
-      this.certSelectGotoSite = bind(this.certSelectGotoSite, this);
+      this.certSelectGotoXite = bind(this.certSelectGotoXite, this);
       this.response = bind(this.response, this);
       this.cmd = bind(this.cmd, this);
       this.wrapperCmd = wrapper.cmd;
@@ -2282,7 +2286,7 @@ if (window.getComputedStyle(document.body).transform) {
       return window.location.pathname === "/";
     };
 
-    WrapperEpixFrame.prototype.certSelectGotoSite = function (elem) {
+    WrapperEpixFrame.prototype.certSelectGotoXite = function (elem) {
       var href;
       href = $(elem).attr("href");
       if (this.isProxyRequest()) {

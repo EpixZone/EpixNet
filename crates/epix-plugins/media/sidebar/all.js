@@ -210,7 +210,7 @@
       added = "<span style='color: #dfd0fa'>" + added + "</span>";
       level = "<span style='color: " + (this.toColor(level, 100)) + ";'>" + level + "</span>";
       module = "<span style='color: " + (this.toColor(module, 60)) + "; font-weight: bold;'>" + module + "</span>";
-      text = text.replace(/(Site:[A-Za-z0-9\.]+)/g, "<span style='color: #AAAAFF'>$1</span>");
+      text = text.replace(/(Xite:[A-Za-z0-9\.]+)/g, "<span style='color: #AAAAFF'>$1</span>");
       text = text.replace(/\</g, "&lt;").replace(/\>/g, "&gt;");
       return added + " " + level + " " + module + " " + text;
     };
@@ -641,7 +641,7 @@ window.initScrollable = function () {
       this.preload_html = null;
       this.optional_expanded = false;
       this.optional_poll = null;
-      this.original_set_site_info = this.wrapper.setSiteInfo;
+      this.original_set_xite_info = this.wrapper.setXiteInfo;
       if (window.top.location.hash === "#EpixNet:OpenSidebar") {
         this.startDrag();
         this.moved("x");
@@ -783,17 +783,17 @@ window.initScrollable = function () {
           return _this.resized();
         };
       })(this));
-      this.wrapper.setSiteInfo = (function(_this) {
-        return function(site_info) {
-          _this.setSiteInfo(site_info);
-          return _this.original_set_site_info.apply(_this.wrapper, arguments);
+      this.wrapper.setXiteInfo = (function(_this) {
+        return function(xite_info) {
+          _this.setXiteInfo(xite_info);
+          return _this.original_set_xite_info.apply(_this.wrapper, arguments);
         };
       })(this);
       img = new Image();
       return img.src = "/uimedia/globe/world.jpg";
     };
 
-    Sidebar.prototype.setSiteInfo = function(site_info) {
+    Sidebar.prototype.setXiteInfo = function(xite_info) {
       RateLimit(1500, (function(_this) {
         return function() {
           return _this.updateHtmlTag();
@@ -853,7 +853,7 @@ window.initScrollable = function () {
               if (res !== "ok") {
                 return _this.wrapper.notifications.add("privatekey", "error", "Private key not saved: " + (res && res.error ? res.error : "unknown error"));
               }
-              return _this.wrapper.notifications.add("privatekey", "done", "Private key saved for site signing", 5000);
+              return _this.wrapper.notifications.add("privatekey", "done", "Private key saved for xite signing", 5000);
             });
           });
           return false;
@@ -861,7 +861,7 @@ window.initScrollable = function () {
       })(this));
       this.tag.find("#privatekey-forget").off("click, touchend").on("click touchend", (function(_this) {
         return function(e) {
-          _this.wrapper.displayConfirm("Remove saved private key for this site?", "Forget", function(res) {
+          _this.wrapper.displayConfirm("Remove saved private key for this xite?", "Forget", function(res) {
             if (!res) {
               return false;
             }
@@ -1075,27 +1075,27 @@ window.initScrollable = function () {
       })(this));
     };
 
-    Sidebar.prototype.handleSiteDeleteClick = function() {
+    Sidebar.prototype.handleXiteDeleteClick = function() {
       var options, question;
-      if (this.wrapper.site_info.privatekey) {
-        question = "Are you sure?<br>This site has a saved private key";
-        options = ["Forget private key and delete site"];
+      if (this.wrapper.xite_info.privatekey) {
+        question = "Are you sure?<br>This xite has a saved private key";
+        options = ["Forget private key and delete xite"];
       } else {
         question = "Are you sure?";
-        options = ["Delete this site", "Blacklist"];
+        options = ["Delete this xite", "Blacklist"];
       }
       return this.wrapper.displayConfirm(question, options, (function(_this) {
         return function(confirmed) {
           if (confirmed === 1) {
             _this.tag.find("#button-delete").addClass("loading");
-            return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.site_info.address, function() {
+            return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.xite_info.address, function() {
               return document.location = $(".fixbutton-bg").attr("href");
             });
           } else if (confirmed === 2) {
-            return _this.wrapper.displayPrompt("Blacklist this site", "text", "Delete and Blacklist", "Reason", function(reason) {
+            return _this.wrapper.displayPrompt("Blacklist this xite", "text", "Delete and Blacklist", "Reason", function(reason) {
               _this.tag.find("#button-delete").addClass("loading");
-              _this.wrapper.ws.cmd("siteblockAdd", [_this.wrapper.site_info.address, reason]);
-              return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.site_info.address, function() {
+              _this.wrapper.ws.cmd("siteblockAdd", [_this.wrapper.xite_info.address, reason]);
+              return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.xite_info.address, function() {
                 return document.location = $(".fixbutton-bg").attr("href");
               });
             });
@@ -1115,11 +1115,11 @@ window.initScrollable = function () {
           }), 300);
         };
       })(this));
-      this.tag.find("#button-sitelimit").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-xitelimit").off("click touchend").on("click touchend", (function(_this) {
         return function() {
-          _this.wrapper.ws.cmd("siteSetLimit", $("#input-sitelimit").val(), function(res) {
+          _this.wrapper.ws.cmd("siteSetLimit", $("#input-xitelimit").val(), function(res) {
             if (res === "ok") {
-              _this.wrapper.notifications.add("done-sitelimit", "done", "Site storage limit modified!", 5000);
+              _this.wrapper.notifications.add("done-xitelimit", "done", "Xite storage limit modified!", 5000);
             }
             return _this.updateHtmlTag();
           });
@@ -1130,7 +1130,7 @@ window.initScrollable = function () {
         return function() {
           _this.wrapper.ws.cmd("siteSetAutodownloadBigfileLimit", $("#input-autodownload_bigfile_size_limit").val(), function(res) {
             if (res === "ok") {
-              _this.wrapper.notifications.add("done-bigfilelimit", "done", "Site bigfile auto download limit modified!", 5000);
+              _this.wrapper.notifications.add("done-bigfilelimit", "done", "Xite bigfile auto download limit modified!", 5000);
             }
             return _this.updateHtmlTag();
           });
@@ -1140,7 +1140,7 @@ window.initScrollable = function () {
       this.tag.find("#button-autodownload_previous").off("click touchend").on("click touchend", (function(_this) {
         return function() {
           _this.wrapper.ws.cmd("siteUpdate", {
-            "address": _this.wrapper.site_info.address,
+            "address": _this.wrapper.xite_info.address,
             "check_files": true
           }, function() {
             return _this.wrapper.notifications.add("done-download_optional", "done", "Optional files downloaded", 5000);
@@ -1171,8 +1171,8 @@ window.initScrollable = function () {
       this.tag.find("#button-update").off("click touchend").on("click touchend", (function(_this) {
         return function() {
           _this.tag.find("#button-update").addClass("loading");
-          _this.wrapper.ws.cmd("siteUpdate", _this.wrapper.site_info.address, function() {
-            _this.wrapper.notifications.add("done-updated", "done", "Site updated!", 5000);
+          _this.wrapper.ws.cmd("siteUpdate", _this.wrapper.xite_info.address, function() {
+            _this.wrapper.notifications.add("done-updated", "done", "Xite updated!", 5000);
             return _this.tag.find("#button-update").removeClass("loading");
           });
           return false;
@@ -1181,14 +1181,14 @@ window.initScrollable = function () {
       this.tag.find("#button-pause").off("click touchend").on("click touchend", (function(_this) {
         return function() {
           _this.tag.find("#button-pause").addClass("hidden");
-          _this.wrapper.ws.cmd("sitePause", _this.wrapper.site_info.address);
+          _this.wrapper.ws.cmd("sitePause", _this.wrapper.xite_info.address);
           return false;
         };
       })(this));
       this.tag.find("#button-resume").off("click touchend").on("click touchend", (function(_this) {
         return function() {
           _this.tag.find("#button-resume").addClass("hidden");
-          _this.wrapper.ws.cmd("siteResume", _this.wrapper.site_info.address);
+          _this.wrapper.ws.cmd("siteResume", _this.wrapper.xite_info.address);
           return false;
         };
       })(this));
@@ -1196,7 +1196,7 @@ window.initScrollable = function () {
 	return function() {
 	  _this.tag.find("#button-favourite").addClass("hidden");
 	  _this.tag.find("#button-unfavourite").removeClass("hidden");
-	  _this.wrapper.ws.cmd("siteFavourite", _this.wrapper.site_info.address);
+	  _this.wrapper.ws.cmd("siteFavourite", _this.wrapper.xite_info.address);
 	  return false;
 	};
       })(this));
@@ -1204,13 +1204,13 @@ window.initScrollable = function () {
 	return function() {
 	  _this.tag.find("#button-favourite").removeClass("hidden");
 	  _this.tag.find("#button-unfavourite").addClass("hidden");
-	  _this.wrapper.ws.cmd("siteUnfavourite", _this.wrapper.site_info.address);
+	  _this.wrapper.ws.cmd("siteUnfavourite", _this.wrapper.xite_info.address);
 	  return false;
 	};
       })(this));
       this.tag.find("#button-delete").off("click touchend").on("click touchend", (function(_this) {
         return function() {
-          _this.handleSiteDeleteClick();
+          _this.handleXiteDeleteClick();
           return false;
         };
       })(this));
@@ -1289,8 +1289,8 @@ window.initScrollable = function () {
               if (res !== "ok") {
                 return _this.wrapper.notifications.add("file-write", "error", "File write error: " + res);
               } else {
-                _this.wrapper.notifications.add("file-write", "done", "Site settings saved!", 5000);
-                if (_this.wrapper.site_info.privatekey) {
+                _this.wrapper.notifications.add("file-write", "done", "Xite settings saved!", 5000);
+                if (_this.wrapper.xite_info.privatekey) {
                   _this.wrapper.ws.cmd("siteSign", {
                     privatekey: "stored",
                     inner_path: "content.json",
@@ -1306,7 +1306,7 @@ window.initScrollable = function () {
       })(this));
       this.tag.find("#link-directory").off("click touchend").on("click touchend", (function(_this) {
         return function() {
-          _this.wrapper.ws.cmd("serverShowdirectory", ["site", _this.wrapper.site_info.address]);
+          _this.wrapper.ws.cmd("serverShowdirectory", ["xite", _this.wrapper.xite_info.address]);
           return false;
         };
       })(this));
@@ -1317,7 +1317,7 @@ window.initScrollable = function () {
           handler = function(e) {
             e.clipboardData.setData('text/plain', copy_text);
             e.preventDefault();
-            _this.wrapper.notifications.add("copy", "done", "Site address with peers copied to your clipboard", 5000);
+            _this.wrapper.notifications.add("copy", "done", "Xite address with peers copied to your clipboard", 5000);
             return document.removeEventListener('copy', handler, true);
           };
           document.addEventListener('copy', handler, true);
@@ -1350,9 +1350,9 @@ window.initScrollable = function () {
             inner_path: inner_path
           }, function(rules) {
             var ref;
-            if (ref = _this.wrapper.site_info.auth_address, indexOf.call(rules.signers, ref) >= 0) {
+            if (ref = _this.wrapper.xite_info.auth_address, indexOf.call(rules.signers, ref) >= 0) {
               return _this.sign(inner_path);
-            } else if (_this.wrapper.site_info.privatekey) {
+            } else if (_this.wrapper.xite_info.privatekey) {
               return _this.sign(inner_path, "stored");
             } else {
               return _this.wrapper.displayPrompt("Enter your private key:", "password", "Sign", "", function(privatekey) {
@@ -1404,9 +1404,9 @@ window.initScrollable = function () {
             inner_path: inner_path
           }, function(rules) {
             var ref;
-            if (ref = _this.wrapper.site_info.auth_address, indexOf.call(rules.signers, ref) >= 0) {
+            if (ref = _this.wrapper.xite_info.auth_address, indexOf.call(rules.signers, ref) >= 0) {
               return _this.publish(inner_path, null);
-            } else if (_this.wrapper.site_info.privatekey) {
+            } else if (_this.wrapper.xite_info.privatekey) {
               return _this.publish(inner_path, "stored");
             } else {
               return _this.wrapper.displayPrompt("Enter your private key:", "password", "Sign", "", function(privatekey) {
@@ -1443,7 +1443,7 @@ window.initScrollable = function () {
           }
         };
       })(this));
-      return this.wrapper.setSiteInfo = this.original_set_site_info;
+      return this.wrapper.setXiteInfo = this.original_set_xite_info;
     };
 
     Sidebar.prototype.loadGlobe = function() {

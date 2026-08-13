@@ -13,7 +13,7 @@ Python client against the Rust server (port 26599):
 - `peerGetFile`: Python's streaming download path (`streamFile`) fetched the
   file byte-for-byte. This exercises the raw-stream framing fix - the reply
   carries `stream_bytes` with the file bytes following raw on the socket.
-- `listModified`: reports the site's content.json versions in the shape
+- `listModified`: reports the xite's content.json versions in the shape
   Python expects.
 - `pex`: answers with typed peer buckets; Python parses the reply.
 
@@ -54,8 +54,11 @@ Publish round-trip, both directions:
    node and takes the process down with it).
 3. Rust node: `EPIX_DATA_DIR=<dir> EPIX_TOR=disable EPIX_HEADLESS=1 cargo
    run -p epix-server`, with `fileserver_port`/`i2p`/`mesh` set in
-   `<dir>/private/config.json`. Both registries live in `private/sites.json`
-   (same layout, either node reads the other's).
+   `<dir>/private/config.json`. The xite registries share a
+   layout but not a filename: Python writes `private/sites.json`, the Rust
+   node writes `private/xites.json` and migrates a `sites.json` it finds on
+   first start. Point them at separate profiles, or expect the Rust node to
+   adopt Python's registry once and then diverge.
 4. Drive Python's client against the Rust server with `peerPing` /
    `peerGetFile` / `peerCmd`, publish with `siteSign` + `sitePublish
    <site> <ip> <port>`, and push Rust-signed updates with the

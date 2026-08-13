@@ -11,13 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The wrapper chrome (all.js) numbers its own WebSocket commands from this
-/// base; the inner site page numbers from 1. Commands at or above this id are
+/// base; the inner xite page numbers from 1. Commands at or above this id are
 /// treated as coming from the trusted wrapper and may run ADMIN actions.
 const WRAPPER_ID_BASE: i64 = 1_000_000;
 
 /// Commands that require the ADMIN permission, mirroring EpixNet's
-/// `@flag.admin` set. An inner site page can only run these once the user has
-/// granted that site ADMIN through the wrapper's permission prompt.
+/// `@flag.admin` set. An inner xite page can only run these once the user has
+/// granted that xite ADMIN through the wrapper's permission prompt.
 const ADMIN_COMMANDS: &[&str] = &[
     "announcerStats",
     "certList",
@@ -43,9 +43,9 @@ const ADMIN_COMMANDS: &[&str] = &[
     "optionalLimitSet",
     "optionalLimitStats",
     "peerAdd",
-    // permissionAdd is intentionally NOT admin-gated (matches EpixNet): a site
+    // permissionAdd is intentionally NOT admin-gated (matches EpixNet): a xite
     // grants itself a permission after the user confirms it in the wrapper,
-    // over its own non-admin WS. This is how a merger site (Git Epix) gets its
+    // over its own non-admin WS. This is how a merger xite (Git Epix) gets its
     // Merger:<type> permission.
     "permissionDetails",
     "permissionRemove",
@@ -95,23 +95,23 @@ pub fn is_admin_command(cmd: &str) -> bool {
     ADMIN_COMMANDS.contains(&cmd)
 }
 
-/// Commands that create or clone a new site - blocked by NoNewSites.
-const NEW_SITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
+/// Commands that create or clone a new xite - blocked by NoNewSites.
+const NEW_XITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
 
-/// Commands that remove a site - also blocked by NoNewSites, so an operator can
-/// lock the node's site set (no adds and no deletes) with one switch.
-const DELETE_SITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
+/// Commands that remove a xite - also blocked by NoNewSites, so an operator can
+/// lock the node's xite set (no adds and no deletes) with one switch.
+const DELETE_XITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 
 /// Commands that write or delete a xite's files/content. On a restricted
 /// (public gateway) node these need genuine ownership of the bound xite, never
 /// just the wrapper's elevated id - otherwise any visitor could rewrite or
-/// delete files on a site the gateway only serves.
+/// delete files on a xite the gateway only serves.
 const WRITE_COMMANDS: &[&str] =
     &["fileWrite", "fileDelete", "siteSign", "sitePublish", "certAdd"];
 
 /// ADMIN commands that are read-only and expose nothing sensitive, so a
 /// restricted (public gateway) node still answers them - the read-only
-/// dashboard a visitor sees needs the site list, network stats, peer info, and
+/// dashboard a visitor sees needs the xite list, network stats, peer info, and
 /// the news feed. Everything else in `ADMIN_COMMANDS` (mutations, node config,
 /// identities, logs, the master seed) stays server-side only. An allow-list, so
 /// a newly added admin command is refused on a gateway until it is vetted here.
@@ -146,7 +146,7 @@ pub struct WsSession {
     pub channels: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Channels joined via `channelJoinAllsite`: for these, the connection
     /// receives events for *every* xite, not just its bound one (the dashboard
-    /// uses this so its Sites panel updates for all sites).
+    /// uses this so its Xites panel updates for all xites).
     pub allsite_channels: std::sync::Mutex<std::collections::HashSet<String>>,
     /// A trusted local operator session (the admin Unix socket, reachable only
     /// with filesystem access to the data dir). Trusted sessions bypass the
@@ -184,18 +184,18 @@ impl WsSession {
     }
 
     /// Resolve a possibly cross-origin `inner_path` to `(address, inner_path)`.
-    /// A `cors-<address>/<path>` prefix routes to `<address>` when the bound site
+    /// A `cors-<address>/<path>` prefix routes to `<address>` when the bound xite
     /// holds the `Cors:<address>` permission (the Cors plugin); otherwise the
-    /// bound site + path is returned unchanged.
+    /// bound xite + path is returned unchanged.
     pub async fn cors_target(&self, inner_path: &str) -> Result<(String, String), String> {
         let bound = self.address()?.to_string();
         if let Some(rest) = inner_path.strip_prefix("cors-") {
             if let Some((addr, inner)) = rest.split_once('/') {
                 let perm = format!("Cors:{addr}");
-                if self.state.site_permissions(&bound).await.iter().any(|p| *p == perm) {
+                if self.state.xite_permissions(&bound).await.iter().any(|p| *p == perm) {
                     return Ok((addr.to_string(), inner.to_string()));
                 }
-                return Err(format!("This site has no permission to access site {addr}"));
+                return Err(format!("This xite has no permission to access xite {addr}"));
             }
         }
         Ok((bound, inner_path.to_string()))
@@ -206,7 +206,7 @@ impl WsSession {
     /// `cors-<address>/…` prefix (Cors permission) and a
     /// `merged-<type>/<address>/…` prefix (MergerSite, permission-checked by
     /// [`AppState::resolve_merged`]). So fileGet, fileRules, fileNeed, and
-    /// optionalFileInfo all reach a merged/cors site the same way.
+    /// optionalFileInfo all reach a merged/cors xite the same way.
     pub async fn resolve_target(&self, inner_path: &str) -> Result<(String, String), String> {
         let (address, inner) = self.cors_target(inner_path).await?;
         match self.state.resolve_merged(&address, &inner).await? {
@@ -220,14 +220,14 @@ impl WsSession {
         self.channels.lock().unwrap().contains(channel)
     }
 
-    /// Whether this connection joined `channel` for *all* sites.
+    /// Whether this connection joined `channel` for *all* xites.
     pub fn in_allsite(&self, channel: &str) -> bool {
         self.allsite_channels.lock().unwrap().contains(channel)
     }
 
     /// Record joined channel(s) from a `channelJoin`/`channelJoinAllsite` param
     /// (accepts `{channels: [...]}`, `{channel: "…"}`, a bare string, or array).
-    /// `allsite` also marks them as all-site subscriptions.
+    /// `allsite` also marks them as all-xite subscriptions.
     pub fn join_channels(&self, params: &Value, allsite: bool) {
         let names = channel_names(params);
         self.channels.lock().unwrap().extend(names.iter().cloned());
@@ -316,8 +316,8 @@ impl CommandRegistry {
 
     /// Dispatch one command. `req_id` is the request id from the xite: the
     /// trusted wrapper chrome sends `id >= 1_000_000` (which the model treats as
-    /// ADMIN), while an inner site page sends small ids and is only as
-    /// privileged as the permissions the user has granted that site.
+    /// ADMIN), while an inner xite page sends small ids and is only as
+    /// privileged as the permissions the user has granted that xite.
     pub async fn dispatch(
         &self,
         session: &WsSession,
@@ -340,17 +340,17 @@ impl CommandRegistry {
         if is_admin_command(cmd) {
             if restrict {
                 // A locked gateway still answers the safe read-only admin
-                // commands the public dashboard needs (site list, stats, peers,
+                // commands the public dashboard needs (xite list, stats, peers,
                 // feed); every mutation and sensitive read is server-side only.
                 if !GATEWAY_READ_COMMANDS.contains(&cmd) {
                     return Err(format!("{cmd} is disabled on this gateway"));
                 }
             } else {
                 // Allowed from the trusted admin socket, the wrapper (elevated
-                // id), or when the bound site actually holds ADMIN.
+                // id), or when the bound xite actually holds ADMIN.
                 let elevated = session.trusted || req_id >= WRAPPER_ID_BASE;
                 let has_admin = match &session.xite {
-                    Some(addr) => session.state.site_has_admin(addr).await,
+                    Some(addr) => session.state.xite_has_admin(addr).await,
                     None => false,
                 };
                 if !elevated && !has_admin {
@@ -359,9 +359,9 @@ impl CommandRegistry {
             }
         }
         // Restricted node: writing or deleting a xite's files needs the node to
-        // genuinely own it (hold the signing key). Serving a site never confers
+        // genuinely own it (hold the signing key). Serving a xite never confers
         // write access, and the dashboard's ADMIN grant must not either - the
-        // client chooses which site to bind to.
+        // client chooses which xite to bind to.
         if restrict && WRITE_COMMANDS.contains(&cmd) {
             let owns = match &session.xite {
                 Some(addr) => session.state.xite_owned(addr).await,
@@ -390,24 +390,24 @@ impl CommandRegistry {
         {
             return Err("The plugin manager is disabled on this node".into());
         }
-        // NoNewSites: when the operator sets `no_new_sites`, lock the node's site
-        // set - refuse commands that add/clone a new site or delete an existing
+        // NoNewSites: when the operator sets `no_new_xites`, lock the node's xite
+        // set - refuse commands that add/clone a new xite or delete an existing
         // one.
         if !session.trusted
-            && NEW_SITE_COMMANDS.contains(&cmd)
-            && session.state.no_new_sites().await
+            && NEW_XITE_COMMANDS.contains(&cmd)
+            && session.state.no_new_xites().await
         {
-            let msg = "Adding new sites is disabled on this node";
+            let msg = "Adding new xites is disabled on this node";
             // Also push a toast: the dashboard fires these without a callback,
             // so the plain error response alone is invisible to the user.
             session.state.push_notification("error", msg, 0);
             return Err(msg.into());
         }
         if !session.trusted
-            && DELETE_SITE_COMMANDS.contains(&cmd)
-            && session.state.no_new_sites().await
+            && DELETE_XITE_COMMANDS.contains(&cmd)
+            && session.state.no_new_xites().await
         {
-            let msg = "Deleting sites is disabled on this node";
+            let msg = "Deleting xites is disabled on this node";
             session.state.push_notification("error", msg, 0);
             return Err(msg.into());
         }
@@ -436,7 +436,7 @@ impl CommandRegistry {
             let caller_elevated = session.trusted
                 || req_id >= WRAPPER_ID_BASE
                 || match &session.xite {
-                    Some(addr) => session.state.site_has_admin(addr).await,
+                    Some(addr) => session.state.xite_has_admin(addr).await,
                     None => false,
                 };
             let allowed = caller_elevated || session.xite.as_deref() == Some(target.as_str());
@@ -470,41 +470,41 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
     let mut cmds: Vec<Arc<dyn WsCommand>> = vec![
         Arc::new(Ping),
         Arc::new(ServerInfo),
-        Arc::new(SiteInfo),
+        Arc::new(XiteInfo),
         Arc::new(ChannelJoin { cmd: "channelJoin" }),
         Arc::new(ChannelJoin { cmd: "channelJoinAllsite" }),
         Arc::new(AnnouncerInfo),
         Arc::new(PermissionAdd),
         Arc::new(PermissionRemove),
         Arc::new(PermissionDetails),
-        Arc::new(MergerSiteList),
-        Arc::new(MergerSiteAdd),
-        Arc::new(MergerSiteDelete),
+        Arc::new(MergerXiteList),
+        Arc::new(MergerXiteAdd),
+        Arc::new(MergerXiteDelete),
         Arc::new(ConfigSet),
-        Arc::new(SiteListModifiedFiles),
-        Arc::new(SiteAdd),
-        Arc::new(SiteClone),
+        Arc::new(XiteListModifiedFiles),
+        Arc::new(XiteAdd),
+        Arc::new(XiteClone),
         Arc::new(ServerPortcheck),
         Arc::new(ServerUpdate),
         Arc::new(ServerShutdown),
         Arc::new(FileQuery),
         Arc::new(BadCert),
-        Arc::new(SiteSetSettingsValue),
-        Arc::new(SiteSign),
-        Arc::new(SitePublish),
+        Arc::new(XiteSetSettingsValue),
+        Arc::new(XiteSign),
+        Arc::new(XitePublish),
         Arc::new(FileWrite),
         Arc::new(FileDelete),
         Arc::new(FileRules),
         Arc::new(CorsPermission),
-        Arc::new(SiteSetOwned),
-        Arc::new(SiteRecoverPrivatekey),
-        Arc::new(UserSetSitePrivatekey),
-        Arc::new(SiteUpdate),
-        Arc::new(SiteServing { cmd: "sitePause", serving: false }),
-        Arc::new(SiteServing { cmd: "siteResume", serving: true }),
-        Arc::new(SiteDelete),
-        Arc::new(SiteSetAutodownloadoptional),
-        Arc::new(SiteSetDownloadoptional),
+        Arc::new(XiteSetOwned),
+        Arc::new(XiteRecoverPrivatekey),
+        Arc::new(UserSetXitePrivatekey),
+        Arc::new(XiteUpdate),
+        Arc::new(XiteServing { cmd: "sitePause", serving: false }),
+        Arc::new(XiteServing { cmd: "siteResume", serving: true }),
+        Arc::new(XiteDelete),
+        Arc::new(XiteSetAutodownloadoptional),
+        Arc::new(XiteSetDownloadoptional),
         // The optionalHelp family answers both casings: EpixNet named the
         // commands lowercase, but the apps call them with a capital O.
         Arc::new(OptionalHelp { cmd: "optionalHelp" }),
@@ -517,12 +517,12 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalHelpAll { cmd: "OptionalHelpAll" }),
         Arc::new(DbRebuild { cmd: "dbReload" }),
         Arc::new(DbRebuild { cmd: "dbRebuild" }),
-        Arc::new(SiteFavourite { cmd: "siteFavourite", favorite: true }),
-        Arc::new(SiteFavourite { cmd: "siteUnfavourite", favorite: false }),
+        Arc::new(XiteFavourite { cmd: "siteFavourite", favorite: true }),
+        Arc::new(XiteFavourite { cmd: "siteUnfavourite", favorite: false }),
         Arc::new(PeerAdd),
         Arc::new(ServerShowdirectory),
         Arc::new(XidClearCache),
-        Arc::new(SiteblockIgnoreAddSite),
+        Arc::new(SiteblockIgnoreAddXite),
         // CryptMessage
         Arc::new(UserPublickey),
         Arc::new(EciesEncrypt),
@@ -573,7 +573,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(ConsoleLogStreamRemove),
         Arc::new(ChartGetPeerLocations),
         Arc::new(AnnouncerStats),
-        Arc::new(SiteList),
+        Arc::new(XiteList),
         Arc::new(ChartDbQuery),
         Arc::new(NotificationQuery),
         Arc::new(NotificationCount),
@@ -607,15 +607,15 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(CertSet),
         Arc::new(CertList),
         Arc::new(CertXid),
-        // File listing + site maintenance + feed search.
+        // File listing + xite maintenance + feed search.
         Arc::new(DirList),
         Arc::new(FileList),
-        Arc::new(SiteReload),
-        Arc::new(SiteBadFiles),
+        Arc::new(XiteReload),
+        Arc::new(XiteBadFiles),
         Arc::new(GetTrackers),
         // Bigfile authoring.
         Arc::new(BigfileUploadInit),
-        Arc::new(SiteSetAutodownloadBigfileLimit),
+        Arc::new(XiteSetAutodownloadBigfileLimit),
     ];
     // Multiuser: identity login/switch commands (desktop only).
     #[cfg(feature = "multiuser")]
@@ -679,7 +679,7 @@ impl WsCommand for FileGet {
             .to_string();
         // required defaults true when ABSENT, but an explicit null is falsy
         // (Python's `if required:`). EpixFS sends it positionally, often as
-        // null, and sites probe maybe-missing files that way (git.js reads
+        // null, and xites probe maybe-missing files that way (git.js reads
         // packed-refs, which many repos don't have) - treating null as true
         // made every probe wait out the miss timeout, turning an instant page
         // into a tens-of-seconds load.
@@ -702,12 +702,12 @@ impl WsCommand for FileGet {
             // the file arrives. Our command handling is serial per connection,
             // so a long wait here would freeze the session's other commands -
             // wait briefly (covers a file landing mid-clone), then answer null.
-            // A file the site doesn't declare can never arrive: answer now.
+            // A file the xite doesn't declare can never arrive: answer now.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while bytes.is_none() && std::time::Instant::now() < deadline {
                 if matches!(
                     s.state.loading_file(&target, &inner),
-                    crate::state::LoadingFile::NotInSite
+                    crate::state::LoadingFile::NotInXite
                 ) {
                     break;
                 }
@@ -716,7 +716,7 @@ impl WsCommand for FileGet {
             }
         }
         match bytes {
-            // base64 is how sites read binary files (git packs, images) over
+            // base64 is how xites read binary files (git packs, images) over
             // the WS; lossy text corrupts them.
             Some(b) if format == "base64" => Ok(Value::from(b64_encode(&b))),
             Some(b) => Ok(Value::from(String::from_utf8_lossy(&b).into_owned())),
@@ -750,7 +750,7 @@ impl WsCommand for ConfigList {
     }
 }
 
-/// `notificationSubscribe(subscriptions)` - save the current site's notification
+/// `notificationSubscribe(subscriptions)` - save the current xite's notification
 /// queries (`{name: [query, params]}`).
 struct NotificationSubscribe;
 #[async_trait]
@@ -759,18 +759,18 @@ impl WsCommand for NotificationSubscribe {
         "notificationSubscribe"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = s.address()?.to_string();
+        let xite = s.address()?.to_string();
         let subs = p
             .get("subscriptions")
             .cloned()
             .or_else(|| p.as_array().and_then(|a| a.first()).cloned())
             .unwrap_or_else(|| p.clone());
-        s.state.notification_subscribe(&site, subs).await;
+        s.state.notification_subscribe(&xite, subs).await;
         Ok(Value::from("ok"))
     }
 }
 
-/// `notificationList()` - the current site's notification subscriptions.
+/// `notificationList()` - the current xite's notification subscriptions.
 struct NotificationList;
 #[async_trait]
 impl WsCommand for NotificationList {
@@ -778,12 +778,12 @@ impl WsCommand for NotificationList {
         "notificationList"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let site = s.address()?.to_string();
-        Ok(s.state.notification_list(&site).await)
+        let xite = s.address()?.to_string();
+        Ok(s.state.notification_list(&xite).await)
     }
 }
 
-/// `notificationMute(muted, site_address=None)` - global or per-site mute.
+/// `notificationMute(muted, xite_address=None)` - global or per-xite mute.
 struct NotificationMute;
 #[async_trait]
 impl WsCommand for NotificationMute {
@@ -796,16 +796,16 @@ impl WsCommand for NotificationMute {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let site = p
+        let xite = p
             .get("site_address")
             .or_else(|| p.as_array().and_then(|a| a.get(1)))
             .and_then(|v| v.as_str());
-        s.state.notification_mute(muted, site).await;
+        s.state.notification_mute(muted, xite).await;
         Ok(Value::from("ok"))
     }
 }
 
-/// `notificationMuteStatus()` - `{global_muted, site_mutes}`.
+/// `notificationMuteStatus()` - `{global_muted, xite_mutes}`.
 struct NotificationMuteStatus;
 #[async_trait]
 impl WsCommand for NotificationMuteStatus {
@@ -817,7 +817,7 @@ impl WsCommand for NotificationMuteStatus {
     }
 }
 
-/// `notificationDismiss(site_address, name)` - mark a site's notification as
+/// `notificationDismiss(xite_address, name)` - mark a xite's notification as
 /// seen (admin; the dashboard bell's clear button).
 struct NotificationDismiss;
 #[async_trait]
@@ -826,17 +826,17 @@ impl WsCommand for NotificationDismiss {
         "notificationDismiss"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = arg_str(p, "site_address", 0)
+        let xite = arg_str(p, "site_address", 0)
             .ok_or("notificationDismiss: site_address required")?
             .to_string();
         let name =
             arg_str(p, "name", 1).ok_or("notificationDismiss: name required")?.to_string();
-        s.state.notification_mark_dismissed(&site, &name).await;
+        s.state.notification_mark_dismissed(&xite, &name).await;
         Ok(Value::from("ok"))
     }
 }
 
-/// `notificationDismissSelf(name)` - a site marks its own notification as seen
+/// `notificationDismissSelf(name)` - a xite marks its own notification as seen
 /// (non-admin: only its own subscriptions).
 struct NotificationDismissSelf;
 #[async_trait]
@@ -845,15 +845,15 @@ impl WsCommand for NotificationDismissSelf {
         "notificationDismissSelf"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = s.address()?.to_string();
+        let xite = s.address()?.to_string();
         let name =
             arg_str(p, "name", 0).ok_or("notificationDismissSelf: name required")?.to_string();
-        s.state.notification_mark_dismissed(&site, &name).await;
+        s.state.notification_mark_dismissed(&xite, &name).await;
         Ok(Value::from("ok"))
     }
 }
 
-/// `userGetSettings()` - the current site's stored per-user settings.
+/// `userGetSettings()` - the current xite's stored per-user settings.
 struct UserGetSettings;
 #[async_trait]
 impl WsCommand for UserGetSettings {
@@ -861,13 +861,13 @@ impl WsCommand for UserGetSettings {
         "userGetSettings"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let site = s.address()?.to_string();
-        Ok(s.state.user_site_settings(&site).await)
+        let xite = s.address()?.to_string();
+        Ok(s.state.user_xite_settings(&xite).await)
     }
 }
 
-/// `userSetSettings(settings)` - store the current site's per-user settings
-/// (EpixNet keeps them in users.json; sites use this for notification_seen
+/// `userSetSettings(settings)` - store the current xite's per-user settings
+/// (EpixNet keeps them in users.json; xites use this for notification_seen
 /// baselines, visited markers, and other private state).
 struct UserSetSettings;
 #[async_trait]
@@ -876,18 +876,18 @@ impl WsCommand for UserSetSettings {
         "userSetSettings"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = s.address()?.to_string();
+        let xite = s.address()?.to_string();
         let settings = p
             .get("settings")
             .cloned()
             .or_else(|| p.as_array().and_then(|a| a.first()).cloned())
             .unwrap_or_else(|| p.clone());
-        s.state.set_user_site_settings(&site, settings).await?;
+        s.state.set_user_xite_settings(&xite, settings).await?;
         Ok(Value::from("ok"))
     }
 }
 
-/// `notificationQuery()` - notification counts across subscribed sites.
+/// `notificationQuery()` - notification counts across subscribed xites.
 struct NotificationQuery;
 #[async_trait]
 impl WsCommand for NotificationQuery {
@@ -1101,9 +1101,9 @@ impl WsCommand for AnnouncerStats {
 
 /// `siteAdd(address)` - ADMIN: start serving + downloading a xite by
 /// address (EpixNet's `SiteManager.need`).
-struct SiteAdd;
+struct XiteAdd;
 #[async_trait]
-impl WsCommand for SiteAdd {
+impl WsCommand for XiteAdd {
     fn name(&self) -> &'static str {
         "siteAdd"
     }
@@ -1115,9 +1115,9 @@ impl WsCommand for SiteAdd {
             .ok_or("Missing address")?
             .to_string();
         if s.state.has_xite(&address).await {
-            return Ok(json!({ "error": "Site already added" }));
+            return Ok(json!({ "error": "Xite already added" }));
         }
-        // A trusted operator (the admin socket) may add a site even when
+        // A trusted operator (the admin socket) may add a xite even when
         // NoNewSites locks the set - that is the server-side `siteDownload`.
         let added = if s.trusted {
             s.state.ensure_xite_admin(&address).await
@@ -1133,10 +1133,10 @@ impl WsCommand for SiteAdd {
 }
 
 /// `siteClone(address, root_inner_path?, target_address?)` - copy a xite's
-/// template into a new site we own (EpixNet's Site.clone).
-struct SiteClone;
+/// template into a new xite we own (EpixNet's Site.clone).
+struct XiteClone;
 #[async_trait]
-impl WsCommand for SiteClone {
+impl WsCommand for XiteClone {
     fn name(&self) -> &'static str {
         "siteClone"
     }
@@ -1163,20 +1163,20 @@ impl WsCommand for SiteClone {
             .or_else(|| p.as_array().and_then(|a| a.get(2)))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        // A `target_address` is a source-code upgrade of an existing site, not a
-        // brand-new one; only the new-site path navigates the browser (matching
+        // A `target_address` is a source-code upgrade of an existing xite, not a
+        // brand-new one; only the new-xite path navigates the browser (matching
         // EpixNet's `cbSiteClone`, which redirects only when target is unset).
         let is_new = target.is_none();
         let address = s.state.clone_xite(&source, &root, target).await?;
         if is_new {
-            // Forward the wrapper to the freshly created site, like EpixNet's
+            // Forward the wrapper to the freshly created xite, like EpixNet's
             // `self.cmd("redirect", "/<new_address>")`. The redirect is routed to
-            // the source site so it reaches that site's wrapper connection (the
+            // the source xite so it reaches that xite's wrapper connection (the
             // one that handles wrapper commands), not just the app WS that issued
             // this command.
             s.state.push_redirect(&source, &format!("/{address}/"));
         } else {
-            s.state.push_notification("done", "Site source code upgraded!", 8000);
+            s.state.push_notification("done", "Xite source code upgraded!", 8000);
         }
         Ok(json!({ "address": address }))
     }
@@ -1282,9 +1282,9 @@ impl WsCommand for BadCert {
 
 /// `siteSetSettingsValue(key, value)` - ADMIN; EpixNet whitelists exactly one
 /// key.
-struct SiteSetSettingsValue;
+struct XiteSetSettingsValue;
 #[async_trait]
-impl WsCommand for SiteSetSettingsValue {
+impl WsCommand for XiteSetSettingsValue {
     fn name(&self) -> &'static str {
         "siteSetSettingsValue"
     }
@@ -1310,9 +1310,9 @@ impl WsCommand for SiteSetSettingsValue {
 
 /// `siteListModifiedFiles` - files whose on-disk bytes differ from the signed
 /// content.json (possibly-unsigned local changes).
-struct SiteListModifiedFiles;
+struct XiteListModifiedFiles;
 #[async_trait]
-impl WsCommand for SiteListModifiedFiles {
+impl WsCommand for XiteListModifiedFiles {
     fn name(&self) -> &'static str {
         "siteListModifiedFiles"
     }
@@ -1333,9 +1333,9 @@ impl WsCommand for WrapperNonce {
     }
 }
 
-struct SiteInfo;
+struct XiteInfo;
 #[async_trait]
-impl WsCommand for SiteInfo {
+impl WsCommand for XiteInfo {
     fn name(&self) -> &'static str {
         "siteInfo"
     }
@@ -1343,14 +1343,14 @@ impl WsCommand for SiteInfo {
         // A xite being cloned on demand is registered (empty) before the
         // download starts, so this is real - never null - during loading.
         let address = s.address()?;
-        let mut info = s.state.site_info(address).await;
+        let mut info = s.state.xite_info(address).await;
         // file_status (EpixNet's actionSiteInfo): the loading-screen wrapper
         // asks about its index.html on connect. If the file already landed
         // AND the core set is complete, answer with its file_done event - the
         // live event is missed when the WS connects after it fired, which
         // left the loading screen up forever. The core-complete gate matters
         // on a refresh mid-clone: index.html downloads first, and dismissing
-        // on it alone drops the user into a site with its styles and scripts
+        // on it alone drops the user into a xite with its styles and scripts
         // still missing.
         let file_status = p
             .get("file_status")
@@ -1377,8 +1377,8 @@ impl WsCommand for AnnouncerInfo {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        // EpixNet blanks the stats unless the asking site holds ADMIN.
-        let stats = if s.state.site_has_admin(&address).await {
+        // EpixNet blanks the stats unless the asking xite holds ADMIN.
+        let stats = if s.state.xite_has_admin(&address).await {
             s.state.announcer_stats().await
         } else {
             json!({})
@@ -1430,13 +1430,13 @@ impl WsCommand for ChannelJoin {
         self.cmd
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        // An ADMIN site's joins carry all-site scope. The dashboard sends
+        // An ADMIN xite's joins carry all-xite scope. The dashboard sends
         // channelJoinAllsite only once at page load; after a node restart the
         // wrapper auto-rejoins with plain channelJoin, and without this the
-        // dashboard silently stops receiving other sites' events (rows frozen,
+        // dashboard silently stops receiving other xites' events (rows frozen,
         // spinners stuck) until a manual refresh.
         let admin = match s.address() {
-            Ok(addr) => s.state.site_has_admin(addr).await,
+            Ok(addr) => s.state.xite_has_admin(addr).await,
             Err(_) => false,
         };
         s.join_channels(p, self.cmd == "channelJoinAllsite" || admin);
@@ -1456,15 +1456,15 @@ impl WsCommand for ChartGetPeerLocations {
     }
 }
 
-/// `siteList` - every served xite's siteInfo, for the dashboard's Sites panel.
-struct SiteList;
+/// `siteList` - every served xite's siteInfo, for the dashboard's Xites panel.
+struct XiteList;
 #[async_trait]
-impl WsCommand for SiteList {
+impl WsCommand for XiteList {
     fn name(&self) -> &'static str {
         "siteList"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(Value::Array(s.state.site_list().await))
+        Ok(Value::Array(s.state.xite_list().await))
     }
 }
 
@@ -1620,7 +1620,7 @@ fn feed_search_terms(v: &Value) -> Result<Vec<String>, String> {
 /// derived feed's sealed segments. Returns POINTERS (`segment_root`, `offset`,
 /// `len`, record address) that the caller fetches and verifies against the
 /// segment root; it never returns record bodies. Distinct from the legacy SQL
-/// newsfeed's `feedQuery`/`feedSearch`, which search the local site db.
+/// newsfeed's `feedQuery`/`feedSearch`, which search the local xite db.
 /// Read-only; not admin-gated, like `dbQuery`.
 struct FeedSegmentSearch;
 #[async_trait]
@@ -1665,7 +1665,7 @@ fn xid_info_value(info: &epix_chain::xid_identity::XidInfo) -> Value {
     })
 }
 
-/// First string out of `[value]` / `{key: value}` params (sites use both).
+/// First string out of `[value]` / `{key: value}` params (xites use both).
 fn xid_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.as_array()
         .and_then(|a| a.first())
@@ -1675,8 +1675,8 @@ fn xid_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
 
 /// `xidResolve(address)` - reverse-resolve a linked identity address to its
 /// xID name (chain-verified, cached). When the queried address is the user's
-/// own auth address for this site and it isn't linked, the user's other
-/// addresses (master + per-site auths) are tried too, matching EpixNet.
+/// own auth address for this xite and it isn't linked, the user's other
+/// addresses (master + per-xite auths) are tried too, matching EpixNet.
 /// Also registered as `xidResolveIdentity`, the name some apps call.
 struct XidResolve {
     cmd: &'static str,
@@ -1775,8 +1775,8 @@ impl WsCommand for FileWrite {
             .and_then(|v| v.as_str())
             .ok_or("fileWrite: content_base64 required")?;
         let bytes = b64_decode(b64).ok_or("fileWrite: invalid base64")?;
-        // Route merged-/cors- prefixed paths to their real site (a merger page
-        // writes into its merged sites, e.g. starring a repo in the index).
+        // Route merged-/cors- prefixed paths to their real xite (a merger page
+        // writes into its merged xites, e.g. starring a repo in the index).
         let (target, inner) = s.resolve_target(inner_path).await?;
         s.state.write_file(&target, &inner, &bytes).await?;
         // Ingest written data files into the xite's database right away (like
@@ -1812,9 +1812,9 @@ impl WsCommand for FileDelete {
 
 /// `siteSetOwned(owned)` - claim/relinquish ownership (reveals the owner
 /// sidebar sections; signing still needs the key).
-struct SiteSetOwned;
+struct XiteSetOwned;
 #[async_trait]
-impl WsCommand for SiteSetOwned {
+impl WsCommand for XiteSetOwned {
     fn name(&self) -> &'static str {
         "siteSetOwned"
     }
@@ -1847,7 +1847,7 @@ impl WsCommand for FileRules {
     }
 }
 
-/// `corsPermission(address)` - grant this site read access to another site's
+/// `corsPermission(address)` - grant this xite read access to another xite's
 /// files (the `Cors:<address>` permission), so it can load `cors-<address>/…`.
 struct CorsPermission;
 #[async_trait]
@@ -1856,7 +1856,7 @@ impl WsCommand for CorsPermission {
         "corsPermission"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = s.address()?.to_string();
+        let xite = s.address()?.to_string();
         // Accept a single address or a list.
         let addresses: Vec<String> = match p {
             Value::String(a) => vec![a.clone()],
@@ -1876,16 +1876,16 @@ impl WsCommand for CorsPermission {
         }
         for addr in addresses {
             let addr = require_address(&addr)?;
-            s.state.add_permission(&site, &format!("Cors:{addr}")).await;
+            s.state.add_permission(&xite, &format!("Cors:{addr}")).await;
         }
         Ok(Value::from("ok"))
     }
 }
 
-/// `siteRecoverPrivatekey()` - recover the site key from the master seed.
-struct SiteRecoverPrivatekey;
+/// `siteRecoverPrivatekey()` - recover the xite key from the master seed.
+struct XiteRecoverPrivatekey;
 #[async_trait]
-impl WsCommand for SiteRecoverPrivatekey {
+impl WsCommand for XiteRecoverPrivatekey {
     fn name(&self) -> &'static str {
         "siteRecoverPrivatekey"
     }
@@ -1895,10 +1895,10 @@ impl WsCommand for SiteRecoverPrivatekey {
     }
 }
 
-/// `userSetSitePrivatekey(privatekey)` - save the site key (marks owned).
-struct UserSetSitePrivatekey;
+/// `userSetSitePrivatekey(privatekey)` - save the xite key (marks owned).
+struct UserSetXitePrivatekey;
 #[async_trait]
-impl WsCommand for UserSetSitePrivatekey {
+impl WsCommand for UserSetXitePrivatekey {
     fn name(&self) -> &'static str {
         "userSetSitePrivatekey"
     }
@@ -1908,15 +1908,15 @@ impl WsCommand for UserSetSitePrivatekey {
             .as_str()
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("userSetSitePrivatekey: privatekey required")?;
-        s.state.set_site_privatekey(&address, pk).await?;
+        s.state.set_xite_privatekey(&address, pk).await?;
         Ok(Value::from("ok"))
     }
 }
 
 /// `siteUpdate(address)` - force a re-sync now.
-struct SiteUpdate;
+struct XiteUpdate;
 #[async_trait]
-impl WsCommand for SiteUpdate {
+impl WsCommand for XiteUpdate {
     fn name(&self) -> &'static str {
         "siteUpdate"
     }
@@ -1931,7 +1931,7 @@ impl WsCommand for SiteUpdate {
             None => s.address()?.to_string(),
         };
         // Run in the background (like EpixNet's updateThread) so this returns
-        // immediately. Progress shows inline on the dashboard's site row via
+        // immediately. Progress shows inline on the dashboard's xite row via
         // setSiteInfo events (`updating` -> spinner, `updated` -> done), not a
         // popup notification.
         let state = s.state.clone();
@@ -1939,8 +1939,8 @@ impl WsCommand for SiteUpdate {
             // Phase first, then the event carrying it: the row opens on the
             // quiet "Checking..." pill and only escalates to "Updating..." if a
             // peer actually has something newer.
-            state.begin_site_update(&address);
-            state.push_site_info_event(&address, crate::state::UPDATE_PHASE_CHECKING).await;
+            state.begin_xite_update(&address);
+            state.push_xite_info_event(&address, crate::state::UPDATE_PHASE_CHECKING).await;
             // Own task so a panic mid-sync still reaches the outcome push
             // below - without it the row's "Updating..." pill never clears.
             let joined = tokio::spawn({
@@ -1962,7 +1962,7 @@ impl WsCommand for SiteUpdate {
                             None
                         }
                     };
-                    // Root files alone miss a user_contents site's actual data
+                    // Root files alone miss a user_contents xite's actual data
                     // (topics and posts live in per-user files) - sync those
                     // too, like the periodic resync cycle does. Bytes pulled
                     // here count as an update: the user clicked Update and new
@@ -1986,7 +1986,7 @@ impl WsCommand for SiteUpdate {
                 }
             })
             .await;
-            state.end_site_update(&address);
+            state.end_xite_update(&address);
             // A panicked task lost its outcome; report the failure rather than
             // leaving the pill up forever.
             state
@@ -2002,11 +2002,11 @@ impl WsCommand for SiteUpdate {
 
 /// `siteSign(privatekey, inner_path)` - rebuild + sign content.json.
 /// `siteSign(privatekey, inner_path)` - sign the content.json governing
-/// `inner_path`: the root one with the site's own key, a user/include one as
+/// `inner_path`: the root one with the xite's own key, a user/include one as
 /// the current user (cert + auth key), like EpixNet's `actionSiteSign`.
-struct SiteSign;
+struct XiteSign;
 #[async_trait]
-impl WsCommand for SiteSign {
+impl WsCommand for XiteSign {
     fn name(&self) -> &'static str {
         "siteSign"
     }
@@ -2016,22 +2016,22 @@ impl WsCommand for SiteSign {
             .or_else(|| p.as_array().and_then(|a| a.get(1)))
             .and_then(|v| v.as_str())
             .unwrap_or("content.json");
-        // Merger sites sign into their merged site (`merged-…/` paths).
+        // Merger xites sign into their merged xite (`merged-…/` paths).
         let (address, inner_path) = s.resolve_target(inner_path).await?;
         sign_for(s, &address, &inner_path, sign_privatekey(p), sign_opts(p)).await?;
         // Push fresh siteInfo so the page re-renders with the new signed state -
         // EpixNet's `updateWebsocket(file_done=…)` after actionSiteSign. Without
         // it the sidebar keeps showing the pre-sign modified-files/sign panel.
-        s.state.push_site_info(&address).await;
+        s.state.push_xite_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
 
 /// `sitePublish(privatekey, inner_path, sign)` - sign (unless told not to) then
 /// push the governing content.json to peers.
-struct SitePublish;
+struct XitePublish;
 #[async_trait]
-impl WsCommand for SitePublish {
+impl WsCommand for XitePublish {
     fn name(&self) -> &'static str {
         "sitePublish"
     }
@@ -2045,22 +2045,22 @@ impl WsCommand for SitePublish {
         let sign = p.get("sign").and_then(|v| v.as_bool()).unwrap_or(true);
         let inner_path = s.state.content_inner_path(&address, &inner_path).await;
         if sign {
-            // `"stored"` = use the site key saved in users.json (see sign_for).
+            // `"stored"` = use the xite key saved in users.json (see sign_for).
             let privatekey = match sign_privatekey(p) {
                 Some(pk) if pk == "stored" => Some(
                     s.state
-                        .site_privatekey(&address)
+                        .xite_privatekey(&address)
                         .await
-                        .ok_or("Site sign failed: Private key not found in users.json")?,
+                        .ok_or("Xite sign failed: Private key not found in users.json")?,
                 ),
                 other => other,
             };
             if inner_path == "content.json" {
-                // Root: sign with the given key or the saved site key; with
+                // Root: sign with the given key or the saved xite key; with
                 // neither, the file is assumed already signed.
                 let key = match privatekey {
                     Some(pk) => Some(pk),
-                    None => s.state.site_privatekey(&address).await,
+                    None => s.state.xite_privatekey(&address).await,
                 };
                 if let Some(pk) = key {
                     s.state.sign_xite(&address, &pk).await?;
@@ -2076,8 +2076,8 @@ impl WsCommand for SitePublish {
         let published = s.state.publish(&address, &inner_path, Some(s.id), true).await?;
         // Fresh siteInfo so the page re-renders post-publish (the sidebar's
         // sign/publish panel and modified-files list reset) - EpixNet's
-        // `site.updateWebsocket()` at the end of cbSitePublish.
-        s.state.push_site_info(&address).await;
+        // `xite.updateWebsocket()` at the end of cbSitePublish.
+        s.state.push_xite_info(&address).await;
         // The page checks for the literal "ok" (EpixNet's actionSitePublish
         // responds "ok"; the peer count arrives as a notification - to the
         // publishing page only, like EpixNet's self.cmd).
@@ -2102,7 +2102,7 @@ impl WsCommand for SitePublish {
 }
 
 /// Sign the content.json governing `inner_path` and return its path: the root
-/// content.json needs the site's own key (explicit or stored); any other one
+/// content.json needs the xite's own key (explicit or stored); any other one
 /// is user/include content signed as the current user.
 async fn sign_for(
     s: &WsSession,
@@ -2111,15 +2111,15 @@ async fn sign_for(
     privatekey: Option<String>,
     opts: epix_xite::SignOpts,
 ) -> Result<String, String> {
-    // `"stored"` is EpixNet's sentinel for "use the site key saved in
+    // `"stored"` is EpixNet's sentinel for "use the xite key saved in
     // users.json" (the sidebar and wrapper infopanel send it when
-    // site_info.privatekey is true) - never a literal key.
+    // xite_info.privatekey is true) - never a literal key.
     let privatekey = match privatekey {
         Some(pk) if pk == "stored" => Some(
             s.state
-                .site_privatekey(address)
+                .xite_privatekey(address)
                 .await
-                .ok_or("Site sign failed: Private key not found in users.json")?,
+                .ok_or("Xite sign failed: Private key not found in users.json")?,
         ),
         other => other,
     };
@@ -2129,7 +2129,7 @@ async fn sign_for(
             Some(pk) => pk,
             None => s
                 .state
-                .site_privatekey(address)
+                .xite_privatekey(address)
                 .await
                 .ok_or("siteSign: privatekey required")?,
         };
@@ -2158,7 +2158,7 @@ fn sign_opts(p: &Value) -> epix_xite::SignOpts {
 }
 
 /// Pull the private key out of `[privatekey, ...]` or `{privatekey}` (a JSON
-/// null means "use the site's own key", which we don't hold - treated as none).
+/// null means "use the xite's own key", which we don't hold - treated as none).
 fn sign_privatekey(p: &Value) -> Option<String> {
     p.get("privatekey")
         .or_else(|| p.as_array().and_then(|a| a.first()))
@@ -2346,7 +2346,7 @@ fn aes_try_keys(iv: &[u8], ct: &[u8], keys: &[Vec<u8>]) -> Value {
 }
 
 /// `ecdsaSign(data, privatekey?)` - sign `data`. With no key, the user's auth
-/// private key for the bound site is used.
+/// private key for the bound xite is used.
 struct EcdsaSign;
 #[async_trait]
 impl WsCommand for EcdsaSign {
@@ -2562,9 +2562,9 @@ impl WsCommand for EccPubToAddr {
     }
 }
 
-// ---- Newsfeed: aggregate followed sites' feeds -----------------------------
+// ---- Newsfeed: aggregate followed xites' feeds -----------------------------
 
-/// `feedFollow(feeds)` - save `{feed_name: [query, params]}` for the current site.
+/// `feedFollow(feeds)` - save `{feed_name: [query, params]}` for the current xite.
 struct FeedFollow;
 #[async_trait]
 impl WsCommand for FeedFollow {
@@ -2579,7 +2579,7 @@ impl WsCommand for FeedFollow {
     }
 }
 
-/// `feedListFollow()` - the current site's follows.
+/// `feedListFollow()` - the current xite's follows.
 struct FeedListFollow;
 #[async_trait]
 impl WsCommand for FeedListFollow {
@@ -2591,8 +2591,8 @@ impl WsCommand for FeedListFollow {
     }
 }
 
-/// `feedQuery(limit, day_limit)` - run each followed site's feed queries against
-/// that site's db and merge the rows by `date_added` (newest first).
+/// `feedQuery(limit, day_limit)` - run each followed xite's feed queries against
+/// that xite's db and merge the rows by `date_added` (newest first).
 struct FeedQuery;
 #[async_trait]
 impl WsCommand for FeedQuery {
@@ -2604,10 +2604,10 @@ impl WsCommand for FeedQuery {
         let follows = s.state.all_follows().await;
 
         let mut rows: Vec<Value> = Vec::new();
-        let mut num_sites = 0;
-        for (site, feeds) in &follows {
+        let mut num_xites = 0;
+        for (xite, feeds) in &follows {
             let Some(feeds) = feeds.as_object() else { continue };
-            num_sites += 1;
+            num_xites += 1;
             for (name, query_set) in feeds {
                 let (raw, params) = split_feed(query_set);
                 if !is_safe_feed_sql(raw) {
@@ -2617,7 +2617,7 @@ impl WsCommand for FeedQuery {
                 if !is_safe_feed_sql(&full) {
                     continue;
                 }
-                let Ok(res) = s.state.db_query(site, &full, &Value::Null).await else { continue };
+                let Ok(res) = s.state.db_query(xite, &full, &Value::Null).await else { continue };
                 for mut row in res {
                     let Some(obj) = row.as_object_mut() else { continue };
                     // Normalize + sanity-check date_added (ms -> s; drop future items).
@@ -2629,7 +2629,7 @@ impl WsCommand for FeedQuery {
                         continue;
                     }
                     obj.insert("date_added".into(), json!(date));
-                    obj.insert("site".into(), json!(site));
+                    obj.insert("site".into(), json!(xite));
                     obj.insert("feed_name".into(), json!(name));
                     rows.push(row);
                 }
@@ -2643,14 +2643,14 @@ impl WsCommand for FeedQuery {
         });
         // No global cap: `limit` applies per feed query (in build_feed_query),
         // like EpixNet - a global truncate would let one busy feed crowd every
-        // other site out of the merged view.
-        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
+        // other xite out of the merged view.
+        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_xites }))
     }
 }
 
 /// `feedSearch(search, limit, day_limit)` - search every served xite's
 /// dbschema-declared feeds (EpixNet's `actionFeedSearch`): the text becomes a
-/// LIKE over the outer `body`/`title` aliases, with `site:` and `type:`
+/// LIKE over the outer `body`/`title` aliases, with `xite:` and `type:`
 /// filters parsed out of the search string.
 struct FeedSearch;
 #[async_trait]
@@ -2674,7 +2674,7 @@ impl WsCommand for FeedSearch {
         let (text, filters) = parse_search(&search);
 
         let mut rows: Vec<Value> = Vec::new();
-        let mut num_sites = 0;
+        let mut num_xites = 0;
         for (address, title, feeds) in s.state.feed_sources().await {
             if let Some(want) = filters.get("site") {
                 let want = want.to_lowercase();
@@ -2682,7 +2682,7 @@ impl WsCommand for FeedSearch {
                     continue;
                 }
             }
-            num_sites += 1;
+            num_xites += 1;
             for (feed_name, query) in feeds {
                 if !is_safe_feed_sql(&query) {
                     continue;
@@ -2742,11 +2742,11 @@ impl WsCommand for FeedSearch {
             let db = b["date_added"].as_f64().unwrap_or(0.0);
             db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_sites }))
+        Ok(json!({ "rows": rows, "num": rows.len(), "sites": num_xites }))
     }
 }
 
-/// Split `site:`/`type:` filters out of a feedSearch string (EpixNet's
+/// Split `xite:`/`type:` filters out of a feedSearch string (EpixNet's
 /// `parseSearch`): everything before the first marker is the search text.
 fn parse_search(search: &str) -> (String, std::collections::HashMap<String, String>) {
     let mut markers: Vec<(usize, &str)> = ["site:", "type:"]
@@ -2882,26 +2882,26 @@ impl WsCommand for OptionalFileList {
         "optionalFileList"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        // The dashboard's Files tab queries other sites by address; honor it
+        // The dashboard's Files tab queries other xites by address; honor it
         // with the same permission gate the optionalHelp commands use.
         let address = match p.get("address").and_then(|v| v.as_str()) {
             Some(a) => {
-                require_site_permission(s, a).await?;
+                require_xite_permission(s, a).await?;
                 a.to_string()
             }
             None => s.address()?.to_string(),
         };
         let filter = p.get("filter").and_then(|v| v.as_str()).unwrap_or("downloaded");
-        // The search box's LIKE pattern ("%name%"), applied per site.
+        // The search box's LIKE pattern ("%name%"), applied per xite.
         let filter_inner_path = p.get("filter_inner_path").and_then(|v| v.as_str());
         let orderby =
             p.get("orderby").and_then(|v| v.as_str()).unwrap_or("time_downloaded DESC");
         let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        // The dashboard's Files tab asks for every site at once (the legacy
+        // The dashboard's Files tab asks for every xite at once (the legacy
         // `address: "all"` contract; only admins get past the gate with it).
         // Answering an error here crashed the tab outright - the page maps
-        // over the rows unchecked. Aggregate the per-site lists, tag each row
-        // with its site, and order and trim the union.
+        // over the rows unchecked. Aggregate the per-xite lists, tag each row
+        // with its xite, and order and trim the union.
         if address == "all" {
             let mut rows = Vec::new();
             for addr in s.state.xite_addresses().await {
@@ -2934,7 +2934,7 @@ impl WsCommand for OptionalFileList {
 }
 
 /// Order an aggregated optional-file list by the first `orderby` clause
-/// (`field [DESC]`) - the per-site lists come back sorted, but the union
+/// (`field [DESC]`) - the per-xite lists come back sorted, but the union
 /// needs one more pass.
 fn sort_optional_rows(rows: &mut [Value], orderby: &str) {
     let mut parts = orderby.split_whitespace();
@@ -2973,7 +2973,7 @@ impl WsCommand for OptionalFileInfo {
 /// `fileTransferStats(inner_path)` - the live per-peer picture of how this
 /// node is pulling one file: rates, bytes, requests in flight, failures.
 ///
-/// Read-only and site-scoped (`resolve_target` binds it to the caller's own
+/// Read-only and xite-scoped (`resolve_target` binds it to the caller's own
 /// xite), so a page can show its own transfer without any grant. A media
 /// player polls it to explain a stall - which is the only way, from inside
 /// the page, to tell "no peers" from "one slow onion circuit" from "this
@@ -3012,9 +3012,9 @@ impl WsCommand for FileTransferStats {
 }
 
 /// `optionalFileDelete(inner_path, address?)`. The optional `address` (the
-/// dashboard's Files tab deletes other sites' files) targets that site with
+/// dashboard's Files tab deletes other xites' files) targets that xite with
 /// the same permission gate as `optionalFileList`; without it the path
-/// resolves against the session's own site as before (cors-/merged-
+/// resolves against the session's own xite as before (cors-/merged-
 /// prefixes included).
 struct OptionalFileDelete;
 #[async_trait]
@@ -3026,7 +3026,7 @@ impl WsCommand for OptionalFileDelete {
         let inner_path = arg_str(p, "inner_path", 0).ok_or("optionalFileDelete: inner_path required")?;
         let (address, inner_path) = match arg_str(p, "address", 1) {
             Some(a) => {
-                require_site_permission(s, a).await?;
+                require_xite_permission(s, a).await?;
                 (a.to_string(), inner_path.to_string())
             }
             None => s.resolve_target(inner_path).await?,
@@ -3038,8 +3038,8 @@ impl WsCommand for OptionalFileDelete {
 /// `optionalFilePin` / `optionalFileUnpin` - `inner_path` is a single path or
 /// an ARRAY of paths (the dashboard's bulk selectbar sends
 /// `[inner_paths, address]`), and the optional `address` targets another
-/// site's files with the same permission gate as `optionalFileList`
-/// (own site / admin / merger). No address = the session's own site,
+/// xite's files with the same permission gate as `optionalFileList`
+/// (own xite / admin / merger). No address = the session's own xite,
 /// single-string behavior unchanged.
 struct OptionalFilePin {
     pin: bool,
@@ -3052,7 +3052,7 @@ impl WsCommand for OptionalFilePin {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = match arg_str(p, "address", 1) {
             Some(a) => {
-                require_site_permission(s, a).await?;
+                require_xite_permission(s, a).await?;
                 a.to_string()
             }
             None => s.address()?.to_string(),
@@ -3111,7 +3111,7 @@ impl WsCommand for OptionalLimitSet {
 // ---- MergerSite ------------------------------------------------------------
 
 /// `permissionAdd(permission)` - grant a permission to the current xite (e.g.
-/// `Merger:EpixPost`, which makes it a merger site).
+/// `Merger:EpixPost`, which makes it a merger xite).
 struct PermissionAdd;
 #[async_trait]
 impl WsCommand for PermissionAdd {
@@ -3131,7 +3131,7 @@ impl WsCommand for PermissionAdd {
         if permission.starts_with("Merger:") {
             s.state.rebuild_merger_dbs().await;
         }
-        s.state.push_site_info(&address).await;
+        s.state.push_xite_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
@@ -3179,10 +3179,10 @@ impl WsCommand for PermissionDetails {
     }
 }
 
-/// `mergerSiteList(query_site_info)` - the sites merged into this merger site.
-struct MergerSiteList;
+/// `mergerSiteList(query_xite_info)` - the xites merged into this merger xite.
+struct MergerXiteList;
 #[async_trait]
-impl WsCommand for MergerSiteList {
+impl WsCommand for MergerXiteList {
     fn name(&self) -> &'static str {
         "mergerSiteList"
     }
@@ -3220,21 +3220,21 @@ fn arg_addresses(p: &Value) -> Vec<String> {
     }
 }
 
-/// `mergerSiteAdd(addresses)` - clone the requested sites into the node and
+/// `mergerSiteAdd(addresses)` - clone the requested xites into the node and
 /// link them into this merger's database (EpixNet's actionMergerSiteAdd,
 /// which needs each address via SiteManager). One address adds without
 /// asking; several ask the user first. Responds "ok" right away and clones
 /// in the background, like EpixNet.
-struct MergerSiteAdd;
+struct MergerXiteAdd;
 #[async_trait]
-impl WsCommand for MergerSiteAdd {
+impl WsCommand for MergerXiteAdd {
     fn name(&self) -> &'static str {
         "mergerSiteAdd"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
         if s.state.merger_types(&address).await.is_empty() {
-            return Err("Not a merger site".into());
+            return Err("Not a merger xite".into());
         }
         let mut targets = Vec::new();
         for a in arg_addresses(p) {
@@ -3247,7 +3247,7 @@ impl WsCommand for MergerSiteAdd {
         let merger = address.clone();
         tokio::spawn(async move {
             if targets.len() > 1 {
-                let body = format!("Add <b>{}</b> new site?", targets.len());
+                let body = format!("Add <b>{}</b> new xite?", targets.len());
                 if !state.confirm(&merger, &body, "Add").await {
                     return;
                 }
@@ -3268,10 +3268,10 @@ impl WsCommand for MergerSiteAdd {
                 state.rebuild_merger_dbs().await;
                 state.push_notification(
                     "done",
-                    &format!("Added <b>{added}</b> new site"),
+                    &format!("Added <b>{added}</b> new xite"),
                     5000,
                 );
-                state.push_site_info(&merger).await;
+                state.push_xite_info(&merger).await;
             }
             // The add is over (succeeded or not): say so per target, AFTER the
             // db rebuild so a page that re-queries on this signal sees the
@@ -3292,17 +3292,17 @@ impl WsCommand for MergerSiteAdd {
     }
 }
 
-/// `mergerSiteDelete(address)` - remove a merged site from the node.
-struct MergerSiteDelete;
+/// `mergerSiteDelete(address)` - remove a merged xite from the node.
+struct MergerXiteDelete;
 #[async_trait]
-impl WsCommand for MergerSiteDelete {
+impl WsCommand for MergerXiteDelete {
     fn name(&self) -> &'static str {
         "mergerSiteDelete"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
         if s.state.merger_types(&address).await.is_empty() {
-            return Err("Not a merger site".into());
+            return Err("Not a merger xite".into());
         }
         for target in arg_addresses(p) {
             s.state.remove_xite(&require_address(&target)?).await;
@@ -3389,16 +3389,16 @@ impl WsCommand for UserLogout {
     }
 }
 
-// ---- Site management actions (sidebar controls) ----------------------------
+// ---- Xite management actions (sidebar controls) ----------------------------
 
-/// The target xite for a site action: an explicit `address` param, else the
+/// The target xite for a xite action: an explicit `address` param, else the
 /// bound xite.
-/// Site commands reference a xite by its bech32 address only. A `.epix` name
+/// Xite commands reference a xite by its bech32 address only. A `.epix` name
 /// (xID) is rejected so commands, events, grants, and persistence all key off
 /// one identity; names are translated to addresses at the HTTP/WS edges.
 fn require_address(addr: &str) -> Result<String, String> {
     if addr.contains('.') {
-        return Err(format!("Site commands take the epix1 address, not a name: {addr}"));
+        return Err(format!("Xite commands take the epix1 address, not a name: {addr}"));
     }
     Ok(addr.to_string())
 }
@@ -3411,12 +3411,12 @@ fn target_address(s: &WsSession, p: &Value) -> Result<String, String> {
 }
 
 /// `sitePause`/`siteResume` - stop or resume re-syncing a xite.
-struct SiteServing {
+struct XiteServing {
     cmd: &'static str,
     serving: bool,
 }
 #[async_trait]
-impl WsCommand for SiteServing {
+impl WsCommand for XiteServing {
     fn name(&self) -> &'static str {
         self.cmd
     }
@@ -3425,15 +3425,15 @@ impl WsCommand for SiteServing {
         if s.state.set_serving(&address, self.serving).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
 
 /// `siteDelete` - remove a xite from the node and delete its files.
-struct SiteDelete;
+struct XiteDelete;
 #[async_trait]
-impl WsCommand for SiteDelete {
+impl WsCommand for XiteDelete {
     fn name(&self) -> &'static str {
         "siteDelete"
     }
@@ -3442,21 +3442,21 @@ impl WsCommand for SiteDelete {
         if s.state.remove_xite(&address).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
 
-/// The optionalHelp family may target another site (a hub the app helps
-/// distribute): allowed for the bound site itself, for anything while the
-/// bound site holds ADMIN, or for a site merged into the bound merger -
+/// The optionalHelp family may target another xite (a hub the app helps
+/// distribute): allowed for the bound xite itself, for anything while the
+/// bound xite holds ADMIN, or for a xite merged into the bound merger -
 /// MergerSite's `hasSitePermission`. Everything else is Forbidden.
-async fn require_site_permission(s: &WsSession, address: &str) -> Result<(), String> {
+async fn require_xite_permission(s: &WsSession, address: &str) -> Result<(), String> {
     let bound = s.address()?;
-    if address == bound || s.state.site_has_admin(bound).await {
+    if address == bound || s.state.xite_has_admin(bound).await {
         return Ok(());
     }
-    if let Some(merged_type) = s.state.site_merged_type(address).await {
+    if let Some(merged_type) = s.state.xite_merged_type(address).await {
         if s.state.merger_types(bound).await.contains(&merged_type) {
             return Ok(());
         }
@@ -3481,14 +3481,14 @@ impl WsCommand for OptionalHelp {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
-        require_site_permission(s, &address).await?;
+        require_xite_permission(s, &address).await?;
         let directory = arg_str(p, "directory", 0).ok_or("optionalHelp: directory required")?;
         let title = arg_str(p, "title", 1).unwrap_or_default();
         let (num, size) = s
             .state
             .optional_help_add(&address, &directory, &title)
             .await
-            .ok_or("Unknown site")?;
+            .ok_or("Unknown xite")?;
         s.state.push_notification(
             "done",
             &format!("You started to help distribute {title}. Directory: {directory}"),
@@ -3512,7 +3512,7 @@ impl WsCommand for OptionalHelpRemove {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
-        require_site_permission(s, &address).await?;
+        require_xite_permission(s, &address).await?;
         let directory = arg_str(p, "directory", 0).ok_or("optionalHelpRemove: directory required")?;
         if s.state.optional_help_remove(&address, &directory).await {
             Ok(Value::from("ok"))
@@ -3522,7 +3522,7 @@ impl WsCommand for OptionalHelpRemove {
     }
 }
 
-/// `optionalHelpList(address?)` - the directories being helped on a site,
+/// `optionalHelpList(address?)` - the directories being helped on a xite,
 /// as the `{directory: title}` map optionalHelp recorded.
 struct OptionalHelpList {
     cmd: &'static str,
@@ -3537,14 +3537,14 @@ impl WsCommand for OptionalHelpList {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
-        require_site_permission(s, &address).await?;
-        let map = s.state.optional_help_list(&address).await.ok_or("Unknown site")?;
+        require_xite_permission(s, &address).await?;
+        let map = s.state.optional_help_list(&address).await.ok_or("Unknown xite")?;
         Ok(Value::Object(map))
     }
 }
 
 /// `optionalHelpAll(value, address?)` - toggle auto-downloading every new
-/// optional file on the site.
+/// optional file on the xite.
 struct OptionalHelpAll {
     cmd: &'static str,
 }
@@ -3558,7 +3558,7 @@ impl WsCommand for OptionalHelpAll {
             Some(a) => a.to_string(),
             None => s.address()?.to_string(),
         };
-        require_site_permission(s, &address).await?;
+        require_xite_permission(s, &address).await?;
         let value = p
             .get("value")
             .or_else(|| p.as_array().and_then(|a| a.first()))
@@ -3569,9 +3569,9 @@ impl WsCommand for OptionalHelpAll {
     }
 }
 
-struct SiteSetDownloadoptional;
+struct XiteSetDownloadoptional;
 #[async_trait]
-impl WsCommand for SiteSetDownloadoptional {
+impl WsCommand for XiteSetDownloadoptional {
     fn name(&self) -> &'static str {
         "siteSetDownloadoptional"
     }
@@ -3589,9 +3589,9 @@ impl WsCommand for SiteSetDownloadoptional {
     }
 }
 
-struct SiteSetAutodownloadoptional;
+struct XiteSetAutodownloadoptional;
 #[async_trait]
-impl WsCommand for SiteSetAutodownloadoptional {
+impl WsCommand for XiteSetAutodownloadoptional {
     fn name(&self) -> &'static str {
         "siteSetAutodownloadoptional"
     }
@@ -3625,18 +3625,18 @@ impl WsCommand for DbRebuild {
         if s.state.rebuild_xite_db(&address).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
 
 /// `siteFavourite`/`siteUnfavourite` - toggle the sidebar favourite star.
-struct SiteFavourite {
+struct XiteFavourite {
     cmd: &'static str,
     favorite: bool,
 }
 #[async_trait]
-impl WsCommand for SiteFavourite {
+impl WsCommand for XiteFavourite {
     fn name(&self) -> &'static str {
         self.cmd
     }
@@ -3645,12 +3645,12 @@ impl WsCommand for SiteFavourite {
         if s.state.set_favorite(&address, self.favorite).await {
             Ok(Value::from("ok"))
         } else {
-            Err(format!("Unknown site: {address}"))
+            Err(format!("Unknown xite: {address}"))
         }
     }
 }
 
-/// `peerAdd(ip, port, site_address?)` - add a peer to a xite's known set.
+/// `peerAdd(ip, port, xite_address?)` - add a peer to a xite's known set.
 struct PeerAdd;
 #[async_trait]
 impl WsCommand for PeerAdd {
@@ -3690,7 +3690,7 @@ impl WsCommand for ServerShowdirectory {
                 Some(a) => a.to_string(),
                 None => s.address()?.to_string(),
             };
-            s.state.xite_root(&address).await.ok_or_else(|| format!("Unknown site: {address}"))?
+            s.state.xite_root(&address).await.ok_or_else(|| format!("Unknown xite: {address}"))?
         };
         open_path(&path);
         Ok(Value::from("ok"))
@@ -3723,10 +3723,10 @@ impl WsCommand for XidClearCache {
     }
 }
 
-/// `siteblockIgnoreAddSite(site_address)` - unblock a site so it can be added.
-struct SiteblockIgnoreAddSite;
+/// `siteblockIgnoreAddSite(xite_address)` - unblock a xite so it can be added.
+struct SiteblockIgnoreAddXite;
 #[async_trait]
-impl WsCommand for SiteblockIgnoreAddSite {
+impl WsCommand for SiteblockIgnoreAddXite {
     fn name(&self) -> &'static str {
         "siteblockIgnoreAddSite"
     }
@@ -3747,8 +3747,8 @@ fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
         .or_else(|| p.as_str())
 }
 
-/// `certAdd` - store a cert issued by an ID provider (bound to the site's auth
-/// address) and select it globally. Not admin (any site can offer a cert).
+/// `certAdd` - store a cert issued by an ID provider (bound to the xite's auth
+/// address) and select it globally. Not admin (any xite can offer a cert).
 struct CertAdd;
 #[async_trait]
 impl WsCommand for CertAdd {
@@ -3768,7 +3768,7 @@ impl WsCommand for CertAdd {
                     &format!("New certificate added: {auth_type}/{auth_user_name}@{domain}"),
                     5000,
                 );
-                s.state.push_site_info(&address).await;
+                s.state.push_xite_info(&address).await;
                 Ok(Value::from("ok"))
             }
             // A different cert already exists for this domain: ask the user to
@@ -3793,7 +3793,7 @@ impl WsCommand for CertAdd {
                     &format!("Certificate changed to {auth_type}/{auth_user_name}@{domain}"),
                     5000,
                 );
-                s.state.push_site_info(&address).await;
+                s.state.push_xite_info(&address).await;
                 Ok(Value::from("ok"))
             }
             None => Ok(Value::from("Not changed")),
@@ -3801,7 +3801,7 @@ impl WsCommand for CertAdd {
     }
 }
 
-/// `certSelect` - choose which stored identity to use on this site. Full picker
+/// `certSelect` - choose which stored identity to use on this xite. Full picker
 /// UI needs wrapper confirm/injectScript events (a follow-up); for now this
 /// selects the first acceptable cert (or leaves the current one) and returns the
 /// account list so a caller can display choices.
@@ -3830,7 +3830,7 @@ impl WsCommand for CertSelect {
         if let Some(cert) = choice {
             if let Some(domain) = cert["domain"].as_str() {
                 s.state.cert_set(domain).await;
-                s.state.push_site_info(&address).await;
+                s.state.push_xite_info(&address).await;
             }
         }
         // Return the accounts so a UI can present them (None + the certs).
@@ -3838,7 +3838,7 @@ impl WsCommand for CertSelect {
     }
 }
 
-/// `certSet {domain}` - select a cert on all sites (portable cert), or clear
+/// `certSet {domain}` - select a cert on all xites (portable cert), or clear
 /// with an empty domain. Admin.
 struct CertSet;
 #[async_trait]
@@ -3851,7 +3851,7 @@ impl WsCommand for CertSet {
         s.state.cert_set(domain).await;
         if let Ok(addr) = s.address() {
             let addr = addr.to_string();
-            s.state.push_site_info(&addr).await;
+            s.state.push_xite_info(&addr).await;
         }
         Ok(Value::from("ok"))
     }
@@ -3861,7 +3861,7 @@ impl WsCommand for CertSet {
 /// name, shows the account picker (discovered linked xID names + a "New"
 /// link) and acts on the choice; with a name, acquires that cert directly.
 /// Self-signs the cert once the chosen address is verified on chain as an
-/// active linked identity, else offers to open the xID site to link it.
+/// active linked identity, else offers to open the xID xite to link it.
 struct CertXid;
 #[async_trait]
 impl WsCommand for CertXid {
@@ -3876,7 +3876,7 @@ impl WsCommand for CertXid {
     }
 }
 
-/// `certList` - the user's certs with which is selected for this site. Admin.
+/// `certList` - the user's certs with which is selected for this xite. Admin.
 struct CertList;
 #[async_trait]
 impl WsCommand for CertList {
@@ -3919,9 +3919,9 @@ impl WsCommand for BigfileUploadInit {
 
 /// `siteSetAutodownloadBigfileLimit {limit}` - the max big-file size (MB) to
 /// auto-download; persisted in config. Admin.
-struct SiteSetAutodownloadBigfileLimit;
+struct XiteSetAutodownloadBigfileLimit;
 #[async_trait]
-impl WsCommand for SiteSetAutodownloadBigfileLimit {
+impl WsCommand for XiteSetAutodownloadBigfileLimit {
     fn name(&self) -> &'static str {
         "siteSetAutodownloadBigfileLimit"
     }
@@ -3977,26 +3977,26 @@ impl WsCommand for FileList {
     }
 }
 
-/// `siteReload {inner_path?}` - re-check the site for a newer content.json and
+/// `siteReload {inner_path?}` - re-check the xite for a newer content.json and
 /// download changes (EpixNet reloads content + downloads). Admin.
-struct SiteReload;
+struct XiteReload;
 #[async_trait]
-impl WsCommand for SiteReload {
+impl WsCommand for XiteReload {
     fn name(&self) -> &'static str {
         "siteReload"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
         s.state.resync_xite(&address).await?;
-        s.state.push_site_info(&address).await;
+        s.state.push_xite_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
 
-/// `siteBadFiles` - inner paths still missing/failed for this site.
-struct SiteBadFiles;
+/// `siteBadFiles` - inner paths still missing/failed for this xite.
+struct XiteBadFiles;
 #[async_trait]
-impl WsCommand for SiteBadFiles {
+impl WsCommand for XiteBadFiles {
     fn name(&self) -> &'static str {
         "siteBadFiles"
     }
@@ -4072,10 +4072,10 @@ impl WsCommand for SiteblockAdd {
         "siteblockAdd"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = arg_str(p, "site_address", 0).ok_or("siteblockAdd: site_address required")?;
-        let site = require_address(site)?;
+        let xite = arg_str(p, "site_address", 0).ok_or("siteblockAdd: site_address required")?;
+        let xite = require_address(xite)?;
         let reason = arg_str(p, "reason", 1).unwrap_or("");
-        s.state.siteblock_add(&site, reason).await;
+        s.state.siteblock_add(&xite, reason).await;
         Ok(Value::from("ok"))
     }
 }
@@ -4087,9 +4087,9 @@ impl WsCommand for SiteblockRemove {
         "siteblockRemove"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = arg_str(p, "site_address", 0).ok_or("siteblockRemove: site_address required")?;
-        let site = require_address(site)?;
-        s.state.siteblock_remove(&site).await;
+        let xite = arg_str(p, "site_address", 0).ok_or("siteblockRemove: site_address required")?;
+        let xite = require_address(xite)?;
+        s.state.siteblock_remove(&xite).await;
         Ok(Value::from("ok"))
     }
 }
@@ -4112,8 +4112,8 @@ impl WsCommand for SiteblockGet {
         "siteblockGet"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let site = arg_str(p, "site_address", 0).ok_or("siteblockGet: site_address required")?;
-        Ok(s.state.siteblock_get(site).await)
+        let xite = arg_str(p, "site_address", 0).ok_or("siteblockGet: site_address required")?;
+        Ok(s.state.siteblock_get(xite).await)
     }
 }
 
@@ -4174,11 +4174,11 @@ mod tests {
     }
 
     /// The dashboard's Files tab contracts: optionalFilePin/Unpin take
-    /// `[inner_paths_ARRAY, address]` (bulk, cross-site, gated like
+    /// `[inner_paths_ARRAY, address]` (bulk, cross-xite, gated like
     /// optionalFileList), optionalFileDelete honors a positional address,
     /// and the old single-string session-bound shapes keep working.
     #[tokio::test]
-    async fn optional_pin_unpin_delete_accept_arrays_and_cross_site_address() {
+    async fn optional_pin_unpin_delete_accept_arrays_and_cross_xite_address() {
         use tempfile::tempdir;
         let dash_dir = tempdir().unwrap();
         let files_dir = tempdir().unwrap();
@@ -4195,7 +4195,7 @@ mod tests {
             },
         });
         state.add_xite(target, XiteEntry { storage, content: Some(content) }).await;
-        // The dashboard runs on an ADMIN site.
+        // The dashboard runs on an ADMIN xite.
         state
             .add_xite(
                 "1dash",
@@ -4208,7 +4208,7 @@ mod tests {
         state.add_permission("1dash", "ADMIN").await;
         let session = WsSession::new(state.clone(), Some("1dash".into()));
 
-        // Bulk pin on another site: [paths_array, address].
+        // Bulk pin on another xite: [paths_array, address].
         OptionalFilePin { pin: true }
             .handle(&session, &json!([["a.bin", "b.bin"], target]))
             .await
@@ -4224,14 +4224,14 @@ mod tests {
         let list = state.optional_file_list(target, "all", "", 0).await.unwrap();
         assert!(list.iter().all(|f| f["is_pinned"] == false));
 
-        // Old shape: single string, no address = the session's own site.
+        // Old shape: single string, no address = the session's own xite.
         let own = WsSession::new(state.clone(), Some(target.into()));
         OptionalFilePin { pin: true }.handle(&own, &json!(["a.bin"])).await.unwrap();
         let list = state.optional_file_list(target, "all", "", 0).await.unwrap();
         let a = list.iter().find(|f| f["inner_path"] == "a.bin").unwrap();
         assert_eq!(a["is_pinned"], true);
 
-        // A non-admin bystander site cannot touch another site's pins/files.
+        // A non-admin bystander xite cannot touch another xite's pins/files.
         let outsider = WsSession::new(state.clone(), Some("1random".into()));
         let err = OptionalFilePin { pin: true }
             .handle(&outsider, &json!([["a.bin"], target]))
@@ -4245,7 +4245,7 @@ mod tests {
         assert_eq!(err, "Forbidden");
 
         // The Files search: `address: "all"` honors filter_inner_path and
-        // tags each row with its site.
+        // tags each row with its xite.
         let rows = OptionalFileList
             .handle(
                 &session,
@@ -4313,10 +4313,10 @@ mod tests {
     async fn ecdsa_sign_then_verify_roundtrips() {
         let state = AppState::new("test");
         let session = WsSession::new(state, Some("1site".into()));
-        // Sign with the user's auth key for the site (no explicit privatekey).
+        // Sign with the user's auth key for the xite (no explicit privatekey).
         let sig = EcdsaSign.handle(&session, &json!(["a message"])).await.unwrap();
         let sig = sig.as_str().unwrap();
-        // The signer address is the user's auth address for this site.
+        // The signer address is the user's auth address for this xite.
         let address = session.state.user_auth_address("1site").await.unwrap();
         assert!(epix_crypt::verify("a message", &address, sig));
     }
@@ -4488,10 +4488,10 @@ mod tests {
         assert!(session.in_channel("serverChanged"));
         assert!(!session.in_channel("announcerChanged"));
 
-        // channelJoin is site-scoped: not an all-site subscription.
+        // channelJoin is xite-scoped: not an all-xite subscription.
         assert!(!session.in_allsite("siteChanged"));
 
-        // channelJoinAllsite's {channel: "…"} form records + marks all-site, so
+        // channelJoinAllsite's {channel: "…"} form records + marks all-xite, so
         // the connection receives that channel's events for every xite.
         ChannelJoin { cmd: "channelJoinAllsite" }
             .handle(&session, &json!({ "channel": "siteChanged" }))
@@ -4512,7 +4512,7 @@ mod tests {
 
         // No Cors permission: a cors- path is rejected.
         assert!(session.cors_target("cors-1B/data.json").await.is_err());
-        // A normal path resolves to the bound site.
+        // A normal path resolves to the bound xite.
         assert_eq!(
             session.cors_target("index.html").await.unwrap(),
             ("1A".to_string(), "index.html".to_string())
@@ -4527,7 +4527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_new_sites_blocks_add_and_delete_commands() {
+    async fn no_new_xites_blocks_add_and_delete_commands() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
         state
@@ -4538,7 +4538,7 @@ mod tests {
         state.add_permission("1Existing", "ADMIN").await;
         state.set_plugin_enabled("NoNewSites", true).await;
 
-        // Deleting is refused while the node's site set is locked.
+        // Deleting is refused while the node's xite set is locked.
         let del = registry
             .dispatch(&session, "siteDelete", &json!({ "address": "1Existing" }), 1)
             .await;
@@ -4587,52 +4587,52 @@ mod tests {
         assert!(denied.is_err(), "siteList must be denied without ADMIN");
         assert!(denied.unwrap_err().contains("permission"));
 
-        // The trusted wrapper (elevated id) may run it even without a site grant.
+        // The trusted wrapper (elevated id) may run it even without a xite grant.
         assert!(registry.dispatch(&session, "siteList", &json!([]), 1_000_001).await.is_ok());
 
-        // Granting the site ADMIN (as the wrapper does after the user confirms)
+        // Granting the xite ADMIN (as the wrapper does after the user confirms)
         // then lets the inner page run admin commands too.
         state.add_permission(addr, "ADMIN").await;
         assert!(registry.dispatch(&session, "siteList", &json!([]), 6).await.is_ok());
 
-        // A non-admin command is always allowed for the bound site.
+        // A non-admin command is always allowed for the bound xite.
         assert!(registry.dispatch(&session, "siteInfo", &json!([]), 7).await.is_ok());
     }
 
     #[tokio::test]
-    async fn merger_site_lists_and_routes_merged_files() {
+    async fn merger_xite_lists_and_routes_merged_files() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
 
-        // A merger site granted `Merger:EpixPost`.
+        // A merger xite granted `Merger:EpixPost`.
         let merger = "1Merger";
         state.add_xite(merger, XiteEntry { storage: XiteStorage::new(dir.path().join("m")), content: None }).await;
         state.add_permission(merger, "Merger:EpixPost").await;
 
-        // A merged site of that type, with a file.
+        // A merged xite of that type, with a file.
         let merged = "1Merged";
         let mstore = XiteStorage::new(dir.path().join("d"));
         mstore.write("data.txt", b"merged file").unwrap();
         state
             .add_xite(merged, XiteEntry { storage: mstore, content: Some(json!({ "merged_type": "EpixPost" })) })
             .await;
-        // A site of a different merged type is excluded.
+        // A xite of a different merged type is excluded.
         state
             .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path().join("o")), content: Some(json!({ "merged_type": "OtherApp" })) })
             .await;
 
         let session = WsSession::new(state.clone(), Some(merger.into()));
-        let list = MergerSiteList.handle(&session, &json!([false])).await.unwrap();
+        let list = MergerXiteList.handle(&session, &json!([false])).await.unwrap();
         assert_eq!(list["1Merged"], "EpixPost");
         assert!(list.get("1Other").is_none(), "different merged type excluded");
 
-        // fileGet routes a merged-<type>/<address>/<path> read to the merged site.
+        // fileGet routes a merged-<type>/<address>/<path> read to the merged xite.
         let f = FileGet.handle(&session, &json!("merged-EpixPost/1Merged/data.txt")).await.unwrap();
         assert_eq!(f, "merged file");
 
-        // A non-merger site can't list.
+        // A non-merger xite can't list.
         let s2 = WsSession::new(state, Some(merged.into()));
-        assert!(MergerSiteList.handle(&s2, &json!([false])).await.is_err());
+        assert!(MergerXiteList.handle(&s2, &json!([false])).await.is_err());
     }
 
     #[tokio::test]
@@ -4700,7 +4700,7 @@ mod tests {
                 "1Big",
                 crate::state::XiteEntry {
                     storage,
-                    // Owned site so the upload permission check passes.
+                    // Owned xite so the upload permission check passes.
                     content: Some(json!({ "address": "1Big" })),
                 },
             )
@@ -4822,7 +4822,7 @@ mod tests {
         let list = CertList.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 0);
 
-        // certAdd stores + selects a cert for this site's identity.
+        // certAdd stores + selects a cert for this xite's identity.
         CertAdd
             .handle(&session, &json!({
                 "domain": "xid.epix",
@@ -4839,12 +4839,12 @@ mod tests {
         assert_eq!(list[0]["selected"], true);
 
         // siteInfo now reports the cert user id.
-        let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
+        let info = XiteInfo.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(info["cert_user_id"], "alice@xid.epix");
 
         // certSet "" clears it everywhere.
         CertSet.handle(&session, &json!([""])).await.unwrap();
-        let info = SiteInfo.handle(&session, &Value::Null).await.unwrap();
+        let info = XiteInfo.handle(&session, &Value::Null).await.unwrap();
         assert!(info["cert_user_id"].is_null());
     }
 
@@ -4860,7 +4860,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_search_splits_site_and_type_filters() {
+    fn parse_search_splits_xite_and_type_filters() {
         // EpixNet's parseSearch: everything before the first marker is the
         // text; marker values run to the next marker or the end.
         let (text, filters) = parse_search("hello world");
@@ -4904,7 +4904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feed_query_aggregates_followed_sites() {
+    async fn feed_query_aggregates_followed_xites() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         storage
@@ -4923,27 +4923,27 @@ mod tests {
             )
             .unwrap();
 
-        let site = "1BlogAddr";
+        let xite = "1BlogAddr";
         let state = AppState::new("test");
-        state.add_xite(site, XiteEntry { storage, content: None }).await;
+        state.add_xite(xite, XiteEntry { storage, content: None }).await;
         state
             .set_feed_follow(
-                site,
+                xite,
                 json!({ "posts": ["SELECT post_id, title, date_added FROM post", []] }),
             )
             .await;
 
-        let session = WsSession::new(state, Some(site.to_string()));
+        let session = WsSession::new(state, Some(xite.to_string()));
         // day_limit = 0 so ancient test timestamps aren't filtered.
         let out = FeedQuery.handle(&session, &json!([10, 0])).await.unwrap();
 
         assert_eq!(out["sites"], 1);
         assert_eq!(out["num"], 2);
         let rows = out["rows"].as_array().unwrap();
-        // Newest first, tagged with site + feed_name.
+        // Newest first, tagged with xite + feed_name.
         assert_eq!(rows[0]["title"], "New");
         assert_eq!(rows[1]["title"], "Old");
-        assert_eq!(rows[0]["site"], site);
+        assert_eq!(rows[0]["site"], xite);
         assert_eq!(rows[0]["feed_name"], "posts");
     }
 }

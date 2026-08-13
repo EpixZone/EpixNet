@@ -2,7 +2,7 @@
 //! enforces beyond a single root signature:
 //!
 //! - **Valid signers + `signers_sign`**: a root content.json may delegate signing
-//!   to extra `signers`; that signer list must itself be authorized by the site
+//!   to extra `signers`; that signer list must itself be authorized by the xite
 //!   owner (`signers_sign`), and the content must carry a valid signature from
 //!   one of the valid signers (`signs_required`, default 1).
 //! - **Certs** (`user_contents`): a user file under a `user_contents` node must
@@ -35,15 +35,15 @@ fn err<T>(msg: impl Into<String>) -> Result<T, VerifyError> {
     Err(VerifyError(msg.into()))
 }
 
-/// What a verifier needs from the surrounding site: the site address, the size
+/// What a verifier needs from the surrounding xite: the xite address, the size
 /// limit, and any already-loaded parent content.json values (to resolve the
 /// rules for an included/user file).
 pub trait VerifyContext {
-    /// The site's signed address (`epix1…`).
-    fn site_address(&self) -> &str;
+    /// The xite's signed address (`epix1…`).
+    fn xite_address(&self) -> &str;
     /// A loaded (already-verified) content.json by its inner_path, for rules.
     fn loaded_content(&self, inner_path: &str) -> Option<Value>;
-    /// The site's effective size limit in bytes (root content.json guard).
+    /// The xite's effective size limit in bytes (root content.json guard).
     fn size_limit_bytes(&self) -> i64 {
         i64::MAX
     }
@@ -64,7 +64,7 @@ pub trait VerifyContext {
 }
 
 /// The valid signer addresses for `inner_path`: the declared `signers` (root
-/// `signers`, or an include/user rule's `signers`) plus the site address, which
+/// `signers`, or an include/user rule's `signers`) plus the xite address, which
 /// is always valid. Mirrors `getValidSigners`.
 pub fn valid_signers(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> Vec<String> {
     let mut signers: Vec<String> = Vec::new();
@@ -89,9 +89,9 @@ pub fn valid_signers(inner_path: &str, content: &Value, ctx: &dyn VerifyContext)
         .flat_map(|name| ctx.resolve_xid(name))
         .collect();
     signers.extend(resolved);
-    let site = ctx.site_address().to_string();
-    if !signers.contains(&site) {
-        signers.push(site);
+    let xite = ctx.xite_address().to_string();
+    if !signers.contains(&xite) {
+        signers.push(xite);
     }
     signers
 }
@@ -176,7 +176,7 @@ fn user_content_rules(parent: &Value, inner_path: &str, content: &Value) -> Opti
 
     // permission_rules: regex-keyed defaults merged into the user's rules
     // (larger numbers and longer strings win, lists append). This is how a
-    // site grants extra rights across all users - EpixTalk lists its admins
+    // xite grants extra rights across all users - EpixTalk lists its admins
     // as additional `signers` on every user dir so moderation can re-sign
     // any user's content.json.
     let zeroed = serde_json::json!({ "max_size": 0, "max_size_optional": 0 });
@@ -253,7 +253,7 @@ fn merge_rule_value(cur: &mut Value, val: &Value) {
 /// The xID names whose chain-linked addresses a
 /// verifier must resolve before checking a user content.json: the user
 /// directory's own name plus any name-form signers the parent's
-/// `user_contents` rules grant (site admins for moderation). Callers resolve
+/// `user_contents` rules grant (xite admins for moderation). Callers resolve
 /// each and pass the map into verification / signing.
 pub fn user_content_xid_names(parent: &Value, inner_path: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
@@ -303,7 +303,7 @@ pub fn parent_content_path(inner_path: &str) -> String {
     }
 }
 
-/// `data/site/content.json` -> `data/site/` (EpixNet's `helper.getDirname`).
+/// `data/xite/content.json` -> `data/xite/` (EpixNet's `helper.getDirname`).
 fn dirname(path: &str) -> String {
     match path.rfind('/') {
         Some(i) => path[..=i].trim_start_matches('/').to_string(),
@@ -373,10 +373,10 @@ fn verify_content_rules(
     raw_len: i64,
     ctx: &dyn VerifyContext,
 ) -> Result<(), VerifyError> {
-    // Address must match the site.
+    // Address must match the xite.
     if let Some(addr) = content.get("address").and_then(|v| v.as_str()) {
-        if addr != ctx.site_address() {
-            return err(format!("Wrong site address: {addr} != {}", ctx.site_address()));
+        if addr != ctx.xite_address() {
+            return err(format!("Wrong xite address: {addr} != {}", ctx.xite_address()));
         }
     }
     // inner_path must match (normalizing backslashes).
@@ -516,7 +516,7 @@ pub fn verify_content_file(
         let joined = signers.join(",");
         let signers_data = format!("{required}:{joined}");
         let signers_sign = content.get("signers_sign").and_then(|v| v.as_str()).unwrap_or("");
-        if !epix_crypt::verify(&signers_data, ctx.site_address(), signers_sign) {
+        if !epix_crypt::verify(&signers_data, ctx.xite_address(), signers_sign) {
             return err("Invalid signers_sign!");
         }
     }
@@ -646,13 +646,13 @@ fn regex_prefix_match(pattern: &str, text: &str) -> bool {
     regex::Regex::new(&anchored).map(|re| re.is_match(text)).unwrap_or(false)
 }
 
-/// Convenience for verifying a root content.json that is signed by the site
+/// Convenience for verifying a root content.json that is signed by the xite
 /// address only (no delegated signers) - the common single-owner case. Used by
 /// `Xite::set_content` as a fast path; falls back to full verification when a
 /// `signers` list is present.
-pub fn is_single_owner_signed(content: &Value, site_address: &str) -> bool {
+pub fn is_single_owner_signed(content: &Value, xite_address: &str) -> bool {
     content.get("signers").and_then(|v| v.as_array()).is_none_or(|a| a.is_empty())
-        && verify_signer(content, site_address)
+        && verify_signer(content, xite_address)
 }
 
 #[cfg(test)]
@@ -661,7 +661,7 @@ mod tests {
         files: std::collections::HashMap<String, Value>,
     }
     impl VerifyContext for DiskCtx {
-        fn site_address(&self) -> &str { "epix1site" }
+        fn xite_address(&self) -> &str { "epix1site" }
         fn loaded_content(&self, inner_path: &str) -> Option<Value> {
             self.files.get(inner_path).cloned()
         }
@@ -696,7 +696,7 @@ mod tests {
         limit: i64,
     }
     impl VerifyContext for Ctx {
-        fn site_address(&self) -> &str {
+        fn xite_address(&self) -> &str {
             &self.address
         }
         fn loaded_content(&self, inner_path: &str) -> Option<Value> {
@@ -724,7 +724,7 @@ mod tests {
         let ctx = Ctx { address: addr.clone(), loaded: Default::default(), limit: i64::MAX };
         assert!(verify_content_file("content.json", &content, bytes.len() as i64, &ctx).is_ok());
 
-        // A content.json whose declared `address` differs from the site is
+        // A content.json whose declared `address` differs from the xite is
         // rejected (signed by the owner, so signatures pass; the address check
         // catches it). Sign with a mismatched declared address.
         let (mismatch, mbytes) = sign_content(
@@ -732,7 +732,7 @@ mod tests {
             &pk,
         );
         let e = verify_content_file("content.json", &mismatch, mbytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Wrong site address"), "{}", e.0);
+        assert!(e.0.contains("Wrong xite address"), "{}", e.0);
     }
 
     #[test]
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn permission_rules_grant_moderator_signing_over_user_dirs() {
-        // EpixTalk's moderation model: data/users/content.json lists the site
+        // EpixTalk's moderation model: data/users/content.json lists the xite
         // admins as extra `signers` under a permission_rules catch-all, so an
         // admin may re-sign any user's content.json (deleting their post).
         let user_pk = epix_crypt::new_seed();
@@ -896,7 +896,7 @@ mod tests {
         let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
         let (content, bytes) =
             sign_content(json!({ "address": addr, "inner_path": "content.json", "modified": 1, "files": {} }), &pk);
-        // Verify under a different site: the only valid signer is that site, and
+        // Verify under a different xite: the only valid signer is that xite, and
         // the content isn't signed by it -> no valid signatures.
         let other = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let ctx = Ctx { address: other, loaded: Default::default(), limit: i64::MAX };
@@ -1051,8 +1051,8 @@ mod tests {
         data: std::collections::HashMap<String, Vec<u8>>,
     }
     impl VerifyContext for DataCtx {
-        fn site_address(&self) -> &str {
-            self.inner.site_address()
+        fn xite_address(&self) -> &str {
+            self.inner.xite_address()
         }
         fn loaded_content(&self, inner_path: &str) -> Option<Value> {
             self.inner.loaded_content(inner_path)

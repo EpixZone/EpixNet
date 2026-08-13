@@ -9,7 +9,7 @@ use epix_selfenc::{encrypt_convergent, Hash};
 /// Distinctive plaintext we can grep the raw slab for.
 const SECRET: &[u8] = b"DISTINCTIVE-PLAINTEXT-MARKER-that-must-not-appear-on-a-cache-disk";
 
-/// A distinctive 32-byte "site address" that a shard-to-xite mapping leak
+/// A distinctive 32-byte "xite address" that a shard-to-xite mapping leak
 /// would embed on disk. The store has no xite parameter, so it never
 /// receives this; scanning every file for it turns "no shard-to-xite
 /// mapping" from a prose promise into a machine check.
@@ -63,7 +63,7 @@ fn shard_store_contains_only_ciphertext_and_addresses() {
     assert!(!contains(&index, SECRET), "plaintext found in index.redb");
 
     // Audit 2 (machine check): nothing anywhere under the store root maps a
-    // shard back to a site. Recursively byte-scan every file - index.redb,
+    // shard back to a xite. Recursively byte-scan every file - index.redb,
     // slabs/*.slab, sparse/* - and assert neither the plaintext marker nor
     // the distinctive xite-address marker appears. The only lookup key is
     // the ciphertext hash; there is no reverse path to a xite.
@@ -86,7 +86,7 @@ fn shard_store_contains_only_ciphertext_and_addresses() {
         let id = ObjId(*addr);
         assert!(store.contains(id).unwrap(), "shard addressable by its ciphertext hash");
         // The only key is the ciphertext hash; there is no xite index to
-        // query, so the store cannot answer "which site?".
+        // query, so the store cannot answer "which xite?".
     }
 
     // Audit 3: what IS on disk round-trips back to plaintext only for a

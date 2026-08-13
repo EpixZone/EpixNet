@@ -65,9 +65,9 @@ async fn serves_xite_files_over_http() {
         body.headers()["content-type"],
         "text/html; charset=utf-8"
     );
-    // Inner site files carry NO CSP (like EpixNet) - the wrapper's iframe
+    // Inner xite files carry NO CSP (like EpixNet) - the wrapper's iframe
     // sandbox attribute does the sandboxing; a `default-src 'none'` CSP here
-    // would block the site's own scripts + service worker. Referrer-Policy stays.
+    // would block the xite's own scripts + service worker. Referrer-Policy stays.
     assert!(
         body.headers().get("content-security-policy").is_none(),
         "inner file has no CSP",
@@ -93,8 +93,8 @@ async fn serves_xite_files_over_http() {
 }
 
 #[tokio::test]
-async fn site_scripts_revalidate_with_etag() {
-    // Site js/css is cached with `public, no-cache` + an ETag: stored, but
+async fn xite_scripts_revalidate_with_etag() {
+    // Xite js/css is cached with `public, no-cache` + an ETag: stored, but
     // revalidated on every use. The wrapper navigates its iframe from script,
     // so a hard reload never bypass-caches the inner assets - with the old
     // max-age=600 a freshly published script stayed stale for 10 minutes with
@@ -229,7 +229,7 @@ async fn transparent_proxy_serves_epix_host() {
 async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
     // In host (transparent-proxy) mode a document that targets a DIFFERENT
     // xite by path must land on that xite's own origin, not serve nested.
-    // Clicking a site on the dashboard links `/epix1talk…/`; without the
+    // Clicking a xite on the dashboard links `/epix1talk…/`; without the
     // redirect that page rendered under `https://dashboard.epix/epix1talk…/`
     // with path-mode links, so its home button then went to
     // `dashboard.epix/dashboard.epix/`.
@@ -262,7 +262,7 @@ async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
     }
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 
-    // A dashboard-style site link: another xite's address as the path.
+    // A dashboard-style xite link: another xite's address as the path.
     let talk = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
     let r = client
         .get(format!("http://{addr}/{talk}/"))
@@ -396,7 +396,7 @@ async fn rejects_cross_origin_websocket() {
 async fn own_write_is_not_echoed_back() {
     // EpixNet notifies `ws != self`: the connection whose fileWrite produced a
     // file_done must not receive the event (an echo re-renders the page
-    // mid-interaction), while every other connection on the site does.
+    // mid-interaction), while every other connection on the xite does.
     use base64::Engine;
     let (addr, _dir) = start_server().await;
     let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite");
@@ -443,11 +443,11 @@ async fn handles_epixframe_websocket_commands() {
     let info = call(&mut ws, "serverInfo", 2).await;
     assert_eq!(info["result"]["version"], "0.1.0");
 
-    let site = call(&mut ws, "siteInfo", 3).await;
-    assert_eq!(site["result"]["address"], "epix1xite");
-    assert_eq!(site["result"]["content"]["title"], "Test Xite");
+    let xite = call(&mut ws, "siteInfo", 3).await;
+    assert_eq!(xite["result"]["address"], "epix1xite");
+    assert_eq!(xite["result"]["content"]["title"], "Test Xite");
     // A xite holds no permissions until the user grants one.
-    assert!(site["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+    assert!(xite["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
 
     // An admin command from the inner page (small id) is refused...
     let denied = call(&mut ws, "siteList", 4).await;

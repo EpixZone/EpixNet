@@ -180,7 +180,7 @@ mod tests {
         tokio::spawn(PeerServer::new(echo_hook(hits.clone())).serve(listener));
 
         let mut sock = TcpStream::connect(addr).await.unwrap();
-        // A msgpack fixmap header, i.e. an old EpixNet/ZeroNet peer.
+        // A msgpack fixmap header, i.e. an old EpixNet peer.
         sock.write_all(&[0x83, 0x01, 0x02, 0x03]).await.unwrap();
         let back = wait_for_hangup(&mut sock).await;
         assert!(back.is_empty(), "nothing was written back, got {back:?}");

@@ -66,7 +66,7 @@ pub struct ConnEntry {
     ping_ms: AtomicI64,
     /// The peer's handshake identity, once known.
     peer: Mutex<Option<HandshakeInfo>>,
-    /// Xite addresses requests on this connection referenced (`site` param).
+    /// Xite addresses requests on this connection referenced (`xite` param).
     xites: Mutex<HashSet<String>>,
 }
 

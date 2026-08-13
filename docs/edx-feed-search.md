@@ -29,7 +29,7 @@ attester. Convergence needs only that someone hosts the records.
 - **Rollup** (`EDXROLL1`): `item → (comment_count, reaction_counts,
   newest_clock)`; tombstoned comments excluded.
 
-Planet scale: the site-wide post index is hierarchical/paginated (never a
+Planet scale: the xite-wide post index is hierarchical/paginated (never a
 flat list); hot objects get count-only reaction seals; global cross-corpus
 search is an optional indexer service (below), not the P2P read path.
 
@@ -97,4 +97,4 @@ search stays an optional indexer/app-view service.
   consent-gated on the xite's size limit, so it never ambushes a data
   cap; an owner who knows a path cannot be completed declares
   `retention:partial` (a feed) and that wins. Content-addressing already
-  gives #340's cross-site file-by-reference.
+  gives #340's cross-xite file-by-reference.

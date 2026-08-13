@@ -1,9 +1,9 @@
-//! The Sidebar plugin: the slide-out site-info panel.
+//! The Sidebar plugin: the slide-out xite-info panel.
 //!
 //! Client side, its `all.js`/`all.css` are appended to `/uimedia/all.js|css`
 //! (self-contained: morphdom, the drag handle, the WebGL globe loader) and its
 //! globe assets are served under `/uimedia/globe/`. Server side, it answers
-//! `sidebarGetHtmlTag` by rendering the panel HTML from the **real** site
+//! `sidebarGetHtmlTag` by rendering the panel HTML from the **real** xite
 //! runtime - peer counts, transfer totals, file/size stats, size limit, and the
 //! derived identity - plus the action commands the panel's buttons call.
 
@@ -26,7 +26,7 @@ impl Plugin for SidebarPlugin {
     }
 
     fn ws_commands(&self) -> Vec<Arc<dyn WsCommand>> {
-        vec![Arc::new(SidebarGetHtmlTag), Arc::new(SidebarGetPeers), Arc::new(SiteSetSizeLimit)]
+        vec![Arc::new(SidebarGetHtmlTag), Arc::new(SidebarGetPeers), Arc::new(XiteSetSizeLimit)]
     }
 
     fn append_js(&self) -> Option<&'static [u8]> {
@@ -60,7 +60,7 @@ impl WsCommand for SidebarGetHtmlTag {
 
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        let info = s.state.site_info(&address).await;
+        let info = s.state.xite_info(&address).await;
         let counts = s.state.peer_counts(&address).await;
         let (recv, sent) = s.state.transfer(&address).await;
         // The signable content.json list: the root plus its includes
@@ -92,7 +92,7 @@ impl WsCommand for SidebarGetPeers {
     }
 
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let address = s.address()?; // globe is per-site; require a bound xite
+        let address = s.address()?; // globe is per-xite; require a bound xite
         let globe_data = s.state.peer_globe_data(address).await;
         Ok(Value::Array(globe_data.into_iter().map(|f| json!(f)).collect()))
     }
@@ -100,10 +100,10 @@ impl WsCommand for SidebarGetPeers {
 
 /// `siteSetLimit` - set the per-xite size limit (MB). The sidebar's "Set" button
 /// sends the input value positionally, as a string.
-struct SiteSetSizeLimit;
+struct XiteSetSizeLimit;
 
 #[async_trait]
-impl WsCommand for SiteSetSizeLimit {
+impl WsCommand for XiteSetSizeLimit {
     fn name(&self) -> &'static str {
         "siteSetLimit"
     }
@@ -157,7 +157,7 @@ fn pct(part: f64, total: f64) -> String {
 }
 
 /// Live progress panel for a running bulk optional-file download, from the
-/// `optional_progress` snapshot in site_info (absent/`null` when idle → ""). A
+/// `optional_progress` snapshot in xite_info (absent/`null` when idle → ""). A
 /// spinner + status line + overall bar, and a collapsible per-file list where
 /// each file shows a state icon (spinner/check/dot/x). The list defaults
 /// collapsed; `all.js` toggles the `.expanded` class on `#optional-file-list`
@@ -226,7 +226,7 @@ fn render_optional_progress(progress: &Value) -> String {
     )
 }
 
-/// Build the sidebar panel HTML from the real site runtime. Mirrors EpixNet's
+/// Build the sidebar panel HTML from the real xite runtime. Mirrors EpixNet's
 /// `sidebarGetHtmlTag` structure (the classes the bundled `all.js`/`all.css`
 /// expect), populated with our data.
 fn render_sidebar(
@@ -315,7 +315,7 @@ fn render_sidebar(
         "<li><label>Files \
           <a href='/list/{addr}' class='link-right link-outline' id='browse-files'>Browse files</a>\
           <small class='label-right'>\
-           <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='link-right' download='site.zip'>Save as .zip</a>\
+           <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='link-right' download='xite.zip'>Save as .zip</a>\
           </small></label>\
          <ul class='graph graph-stacked'>\
           <li style='width: 100%' class='total back-black' title='Total size'></li>\
@@ -331,11 +331,11 @@ fn render_sidebar(
     let percent_used = pct(size_mb, size_limit as f64);
     b.push_str(&format!(
         "<li><label>Size limit <small>(limit used: {percent_used})</small></label>\
-         <input type='text' class='text text-num' value='{size_limit}' id='input-sitelimit'/><span class='text-post'>MB</span>\
-         <a href='#Set' class='button' id='button-sitelimit'>Set</a></li>",
+         <input type='text' class='text text-num' value='{size_limit}' id='input-xitelimit'/><span class='text-post'>MB</span>\
+         <a href='#Set' class='button' id='button-xitelimit'>Set</a></li>",
     ));
 
-    // Optional files (only when the site declares any).
+    // Optional files (only when the xite declares any).
     if size_optional > 0 {
         let opt_mb = size_optional as f64 / 1024.0 / 1024.0;
         let opt_dl_mb = optional_downloaded as f64 / 1024.0 / 1024.0;
@@ -368,7 +368,7 @@ fn render_sidebar(
         ));
     }
 
-    // Database - reload/rebuild the site's db from its files.
+    // Database - reload/rebuild the xite's db from its files.
     b.push_str(
         "<li><label>Database</label>\
          <a href='#DB-Reload' class='button' id='button-dbreload'>Reload</a>\
@@ -389,7 +389,7 @@ fn render_sidebar(
     // Controls - favourite/pause-resume shown by state; the sidebar JS toggles
     // the paired button's `hidden` class on click.
     b.push_str(&format!(
-        "<li><label>Site control \
+        "<li><label>Xite control \
           <a href='#Directory' id='link-directory' class='link-right'>Show directory</a></label>\
          <a href='#Update' class='button' id='button-update'>Update</a>\
          <a href='#Pause' class='button {pause_h}' id='button-pause'>Pause</a>\
@@ -403,7 +403,7 @@ fn render_sidebar(
         unfav_h = hidden(!favorite),
     ));
 
-    // "This is my site" - claim ownership. The owner panel below is always in
+    // "This is my xite" - claim ownership. The owner panel below is always in
     // the DOM; the checkbox reveals it via CSS (#checkbox-owned:checked ~
     // .settings-owned), matching EpixNet, so it shows the moment you check it.
     let owned = info["settings"]["own"].as_bool().unwrap_or(false);
@@ -411,17 +411,17 @@ fn render_sidebar(
     let description = content.get("description").and_then(|v| v.as_str()).unwrap_or("");
     let xid_name = content.get("domain").and_then(|v| v.as_str()).unwrap_or("");
     b.push_str(&format!(
-        "<h2 class='owned-title'>This is my site</h2>\
+        "<h2 class='owned-title'>This is my xite</h2>\
          <input type='checkbox' class='checkbox' id='checkbox-owned' {checked}/>\
          <div class='checkbox-skin'></div>\
          <div class='settings-owned'>\
-          <li><label for='settings-title'>Site title</label>\
+          <li><label for='settings-title'>Xite title</label>\
            <input type='text' class='text' value=\"{title}\" id='settings-title'/></li>\
-          <li><label for='settings-description'>Site description</label>\
+          <li><label for='settings-description'>Xite description</label>\
            <input type='text' class='text' value=\"{desc}\" id='settings-description'/></li>\
           <li><label for='settings-xid-name'>xID name <small class='label-right'>e.g. mysite.epix</small></label>\
            <input type='text' class='text' value=\"{xid}\" id='settings-xid-name' placeholder='name.epix'/></li>\
-          <li><a href='#Save' class='button' id='button-settings'>Save site settings</a></li>\
+          <li><a href='#Save' class='button' id='button-settings'>Save xite settings</a></li>\
           <li><label>Content publishing</label>\
            <div class='flex'>\
             <input type='text' class='text' value='content.json' id='input-contents'/>\
@@ -486,8 +486,8 @@ mod tests {
         assert!(html.contains("value='10'"), "size limit");
         assert!(html.contains("epix1abcauthaddress"), "identity");
         assert!(html.contains("button-update"));
-        // Owner sections (owned site).
-        assert!(html.contains("This is my site"));
+        // Owner sections (owned xite).
+        assert!(html.contains("This is my xite"));
         assert!(html.contains("checkbox-owned"));
         assert!(html.contains("checked='checked'"));
         assert!(html.contains("id='settings-title'"));

@@ -25,7 +25,7 @@ impl EepsiteDialer {
 
     /// Open a stream to `destination` (I2P base64) through the router at
     /// `sam_port`. A wedged session is dropped and rebuilt once, like the peer
-    /// transport; a clean per-site failure (unreachable destination) is
+    /// transport; a clean per-xite failure (unreachable destination) is
     /// surfaced as-is.
     pub async fn connect(&self, sam_port: u16, destination: &str) -> Result<PeerStream> {
         let mut guard = self.session.lock().await;

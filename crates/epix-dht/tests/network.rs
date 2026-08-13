@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use epix_core::PeerAddr;
-use epix_dht::{site_key, Contact, Node, NodeId, Request, Response, RpcClient};
+use epix_dht::{xite_key, Contact, Node, NodeId, Request, Response, RpcClient};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -57,8 +57,8 @@ async fn announce_then_lookup_finds_the_host() {
         }
     }
 
-    // Node 5 announces that a host serves a (rare) site.
-    let key = site_key("epix1somerareblog777777777777777777777777");
+    // Node 5 announces that a host serves a (rare) xite.
+    let key = xite_key("epix1somerareblog777777777777777777777777");
     let host = PeerAddr::parse("203.0.113.9:26552").unwrap();
     net.nodes
         .get(&contacts[5].id)
@@ -96,7 +96,7 @@ async fn announce_all_makes_every_self_address_discoverable() {
         }
     }
 
-    let key = site_key("epix1toronlypublisher7777777777777777777");
+    let key = xite_key("epix1toronlypublisher7777777777777777777");
     let claims = vec![
         PeerAddr::parse("203.0.113.9:48333").unwrap(),
         PeerAddr::parse("expyuzz4wqqyqhjn.onion:48333").unwrap(),
@@ -121,7 +121,7 @@ async fn announce_all_makes_every_self_address_discoverable() {
 }
 
 #[tokio::test]
-async fn lookup_of_unknown_site_returns_nothing() {
+async fn lookup_of_unknown_xite_returns_nothing() {
     let a = Node::new(NodeId::hash(b"solo"));
     struct Empty;
     #[async_trait]
@@ -130,6 +130,6 @@ async fn lookup_of_unknown_site_returns_nothing() {
             Err("no peers".into())
         }
     }
-    let peers = a.get_peers(site_key("epix1nobody"), &Empty).await;
+    let peers = a.get_peers(xite_key("epix1nobody"), &Empty).await;
     assert!(peers.is_empty());
 }

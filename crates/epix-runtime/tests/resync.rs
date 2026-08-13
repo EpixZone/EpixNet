@@ -130,7 +130,7 @@ async fn runtime_resyncs_a_published_update() {
     timeout(Duration::from_secs(15), async {
         loop {
             let applied =
-                state.site_info(&address).await["content_updated"].as_f64() == Some(200.0);
+                state.xite_info(&address).await["content_updated"].as_f64() == Some(200.0);
             if applied && std::fs::read(&post_path).ok().as_deref() == Some(post.as_slice()) {
                 return;
             }

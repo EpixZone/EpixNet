@@ -1,7 +1,7 @@
 //! The network-stats chart database, mirroring EpixNet's Chart plugin.
 //!
 //! A background collector snapshots node metrics into a small SQLite database
-//! with three tables - `type` (metric id -> name), `site` (site id -> address),
+//! with three tables - `type` (metric id -> name), `xite` (xite id -> address),
 //! and `data` (timestamped values) - and the dashboard's Stats page reads it
 //! through the `chartDbQuery` command. `date_added` is stored as unix seconds
 //! (the page divides and buckets by it), matching the Python collector.
@@ -46,7 +46,7 @@ impl Metric {
 pub struct ChartDb {
     db: Database,
     types: Mutex<HashMap<String, i64>>,
-    sites: Mutex<HashMap<String, i64>>,
+    xites: Mutex<HashMap<String, i64>>,
     last_values: Mutex<HashMap<String, f64>>,
 }
 
@@ -64,11 +64,11 @@ impl ChartDb {
     fn init(db: Database) -> Option<Self> {
         db.execute_batch(SCHEMA).ok()?;
         let types = load_ids(&db, "SELECT name, type_id AS id FROM type");
-        let sites = load_ids(&db, "SELECT address AS name, site_id AS id FROM site");
+        let xites = load_ids(&db, "SELECT address AS name, site_id AS id FROM site");
         Some(Self {
             db,
             types: Mutex::new(types),
-            sites: Mutex::new(sites),
+            xites: Mutex::new(xites),
             last_values: Mutex::new(HashMap::new()),
         })
     }
@@ -83,26 +83,26 @@ impl ChartDb {
         Some(id)
     }
 
-    /// The id of a site address, inserting it on first use.
-    pub fn site_id(&self, address: &str) -> Option<i64> {
-        if let Some(id) = self.sites.lock().unwrap().get(address) {
+    /// The id of a xite address, inserting it on first use.
+    pub fn xite_id(&self, address: &str) -> Option<i64> {
+        if let Some(id) = self.xites.lock().unwrap().get(address) {
             return Some(*id);
         }
         let id = self
             .db
             .execute("INSERT INTO site (address) VALUES (?)", &[Value::from(address)])
             .ok()?;
-        self.sites.lock().unwrap().insert(address.to_string(), id);
+        self.xites.lock().unwrap().insert(address.to_string(), id);
         Some(id)
     }
 
     /// Record one snapshot of metrics at `now` (unix seconds), optionally tagged
-    /// with a site. `|change` metrics are stored as the delta from last time.
-    pub fn record(&self, now: i64, site_id: Option<i64>, metrics: &[Metric]) {
+    /// with a xite. `|change` metrics are stored as the delta from last time.
+    pub fn record(&self, now: i64, xite_id: Option<i64>, metrics: &[Metric]) {
         for m in metrics {
             let mut value = m.value;
             if m.is_change {
-                let key = match site_id {
+                let key = match xite_id {
                     Some(id) => format!("{id}:{}", m.name),
                     None => m.name.clone(),
                 };
@@ -114,13 +114,13 @@ impl ChartDb {
             let Some(type_id) = self.type_id(&m.name) else { continue };
             let _ = self.db.execute(
                 "INSERT INTO data (type_id, site_id, value, date_added) VALUES (?, ?, ?, ?)",
-                &[Value::from(type_id), site_id.map(Value::from).unwrap_or(Value::Null), Value::from(value.round() as i64), Value::from(now)],
+                &[Value::from(type_id), xite_id.map(Value::from).unwrap_or(Value::Null), Value::from(value.round() as i64), Value::from(now)],
             );
         }
     }
 
     /// Enforce retention so the chart db does not grow without bound: drop
-    /// per-site datapoints older than one month and global datapoints older than
+    /// per-xite datapoints older than one month and global datapoints older than
     /// six months, then reclaim the space. Mirrors EpixNet's `ChartDb.archive`
     /// retention (without its downsampling of old rows).
     pub fn archive(&self, now: i64) {
@@ -172,13 +172,13 @@ mod tests {
         let db = ChartDb::memory().unwrap();
         let now: i64 = 2_000_000_000;
         let day = 60 * 60 * 24;
-        let site = db.site_id("1Site");
-        // Old global (7 months) + old per-site (2 months) should be dropped;
+        let xite = db.xite_id("1Site");
+        // Old global (7 months) + old per-xite (2 months) should be dropped;
         // recent points of each kind should stay.
         db.record(now - day * 210, None, &[Metric::now("a", 1.0)]);
-        db.record(now - day * 60, site, &[Metric::now("a", 2.0)]);
+        db.record(now - day * 60, xite, &[Metric::now("a", 2.0)]);
         db.record(now - day * 2, None, &[Metric::now("a", 3.0)]);
-        db.record(now - day * 2, site, &[Metric::now("a", 4.0)]);
+        db.record(now - day * 2, xite, &[Metric::now("a", 4.0)]);
         assert_eq!(count(&db), 4);
 
         db.archive(now);

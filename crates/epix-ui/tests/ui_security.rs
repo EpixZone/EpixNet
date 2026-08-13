@@ -174,7 +174,7 @@ async fn cross_origin_gate_and_cors_permission() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // /StatsJson is fetched cross-origin by the marketing site (through a
+    // /StatsJson is fetched cross-origin by the marketing xite (through a
     // reverse proxy that adds the CORS headers), so a foreign Origin passes
     // the gate for this one path...
     let resp = router
@@ -252,7 +252,7 @@ async fn backup_page_is_gated() {
     assert_eq!(resp.status(), 403, "restricted node has no /Backup");
     state.config_set("ui_restrict", json!(false)).await;
 
-    // ...as does one with NoNewSites (the gateway's locked-site-set mode)...
+    // ...as does one with NoNewSites (the gateway's locked-xite-set mode)...
     state.set_plugin_enabled("NoNewSites", true).await;
     let resp = router
         .clone()

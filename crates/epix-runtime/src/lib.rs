@@ -262,8 +262,8 @@ impl NodeRuntime {
             self.shutdown.clone(),
         )));
         // DHT: probe known peers into the routing table, announce every served
-        // site, and look up extra peers - a tracker-independent discovery path
-        // (works for rare sites and if the trackers go down). Also installs the
+        // xite, and look up extra peers - a tracker-independent discovery path
+        // (works for rare xites and if the trackers go down). Also installs the
         // PeerFinder hook so on-demand clones can query the DHT.
         //
         // In Tor-Always mode the DHT runs OVER Tor: it waits for the onion
@@ -503,7 +503,7 @@ async fn announce_loop(
         // Persist the freshly discovered peers so they survive a restart.
         state.persist_peers().await;
         // Persist the served-xite list (settings/size may have changed).
-        state.persist_sites().await;
+        state.persist_xites().await;
         // Drop tracker peers other nodes announced that have gone stale.
         state.tracker_expire().await;
     };
@@ -530,7 +530,7 @@ async fn announce_loop(
 }
 
 /// A [`epix_ui::PeerFinder`] backed by the runtime's DHT node, so the
-/// on-demand clone path can look up peers for sites the trackers don't know.
+/// on-demand clone path can look up peers for xites the trackers don't know.
 struct DhtPeerFinder {
     dht: Arc<epix_dht::Node>,
     rpc: Arc<epix_dht_net::WireRpcClient>,
@@ -539,7 +539,7 @@ struct DhtPeerFinder {
 #[async_trait::async_trait]
 impl epix_ui::PeerFinder for DhtPeerFinder {
     async fn find(&self, address: &str) -> Vec<PeerAddr> {
-        let mut peers = self.dht.get_peers(epix_dht::site_key(address), self.rpc.as_ref()).await;
+        let mut peers = self.dht.get_peers(epix_dht::xite_key(address), self.rpc.as_ref()).await;
         peers.retain(dialable_dht_peer);
         peers
     }
@@ -556,7 +556,7 @@ fn dialable_dht_peer(p: &PeerAddr) -> bool {
     !matches!(p, PeerAddr::Ip(s) if s.ip().is_unspecified())
 }
 
-/// The addresses this node claims to host sites at when announcing to the
+/// The addresses this node claims to host xites at when announcing to the
 /// DHT. Clearnet is claimed as `0.0.0.0:port` (a NAT'd node doesn't know its
 /// public IP; the serving side substitutes the connection's source IP - see
 /// `DhtService`). Overlay self-addresses pass through `rewrite_claimed_addr`
@@ -608,18 +608,18 @@ fn dht_dial_timeout(peer: &PeerAddr, tor_always: bool) -> Duration {
     }
 }
 
-/// Announce our self-claims for one site to the DHT and fold any peers the DHT
-/// returns into the site's registry. Returns how many usable peers it found.
-/// dht_loop spawns this per site (bounded concurrency) so a pass stays roughly
-/// one lookup deep instead of summing every site's round trips serially.
-async fn dht_announce_site(
+/// Announce our self-claims for one xite to the DHT and fold any peers the DHT
+/// returns into the xite's registry. Returns how many usable peers it found.
+/// dht_loop spawns this per xite (bounded concurrency) so a pass stays roughly
+/// one lookup deep instead of summing every xite's round trips serially.
+async fn dht_announce_xite(
     state: Arc<AppState>,
     dht: Arc<epix_dht::Node>,
     rpc: Arc<epix_dht_net::WireRpcClient>,
     claims: Arc<Vec<PeerAddr>>,
     address: String,
 ) -> usize {
-    let key = epix_dht::site_key(&address);
+    let key = epix_dht::xite_key(&address);
     if !claims.is_empty() {
         dht.announce_all(key, claims.as_slice(), rpc.as_ref()).await;
     }
@@ -633,7 +633,7 @@ async fn dht_announce_site(
     found
 }
 
-/// Tracker-independent discovery: a rare site findable from any peer that
+/// Tracker-independent discovery: a rare xite findable from any peer that
 /// serves it, even with every tracker down. Runs on the announce cadence.
 async fn dht_loop(
     state: Arc<AppState>,
@@ -745,7 +745,7 @@ async fn dht_loop(
             });
         }
         while probe_set.join_next().await.is_some() {}
-        // 2. Announce every served site and fold in any peers the DHT knows.
+        // 2. Announce every served xite and fold in any peers the DHT knows.
         // Self-claims are rebuilt every round: the onion service, I2P session,
         // and mesh come up minutes after start, and this is where they become
         // discoverable (Phase 4 - a Tor/I2P-only publisher is invisible to
@@ -758,17 +758,17 @@ async fn dht_loop(
             state.i2p_address().await,
             state.rns_address().await,
         ));
-        // Announce + look up each site concurrently, bounded. A lookup is
+        // Announce + look up each xite concurrently, bounded. A lookup is
         // several sequential round trips; over Tor each is far slower than
-        // clearnet, so a serial pass across ~dozens of sites would not fit the
+        // clearnet, so a serial pass across ~dozens of xites would not fit the
         // per-pass budget. A small cap keeps the pass roughly one lookup deep
         // without opening too many Tor streams at once.
-        const SITE_CONCURRENCY: usize = 4;
+        const XITE_CONCURRENCY: usize = 4;
         let mut found_total = 0usize;
         let mut set = tokio::task::JoinSet::new();
         let mut pending = addresses.iter().cloned();
-        for address in pending.by_ref().take(SITE_CONCURRENCY) {
-            set.spawn(dht_announce_site(
+        for address in pending.by_ref().take(XITE_CONCURRENCY) {
+            set.spawn(dht_announce_xite(
                 state.clone(),
                 dht.clone(),
                 rpc.clone(),
@@ -779,7 +779,7 @@ async fn dht_loop(
         while let Some(res) = set.join_next().await {
             found_total += res.unwrap_or(0);
             if let Some(address) = pending.next() {
-                set.spawn(dht_announce_site(
+                set.spawn(dht_announce_xite(
                     state.clone(),
                     dht.clone(),
                     rpc.clone(),
@@ -794,7 +794,7 @@ async fn dht_loop(
                 .log(
                     "INFO",
                     format!(
-                        "DHT: probed {probed} peer(s), {routing} node(s) in the routing table, {found_total} peer(s) found for {} site(s)",
+                        "DHT: probed {probed} peer(s), {routing} node(s) in the routing table, {found_total} peer(s) found for {} xite(s)",
                         addresses.len()
                     ),
                 )
@@ -1036,7 +1036,7 @@ async fn resync_loop(
     period: Duration,
 ) {
     // Initial user-content pass shortly after start (own task, so the resync
-    // ticker isn't delayed): sites cloned before the recursive-content
+    // ticker isn't delayed): xites cloned before the recursive-content
     // feature (or while this node was offline) backfill their included and
     // per-user data without waiting a full period.
     {
@@ -1081,8 +1081,8 @@ async fn resync_loop(
                     // The phase is registered BEFORE the event so the pushed
                     // siteInfo carries it. The pill only clears on a matching
                     // outcome event, never on a plain refresh.
-                    state.begin_site_update(&address);
-                    state.push_site_info_event(&address, UPDATE_PHASE_CHECKING).await;
+                    state.begin_xite_update(&address);
+                    state.push_xite_info_event(&address, UPDATE_PHASE_CHECKING).await;
                     // The pass runs on its own task so a panic in one xite's
                     // sync can't kill this loop (which would strand the pill
                     // and end all future resyncs) - it surfaces as a JoinError
@@ -1107,7 +1107,7 @@ async fn resync_loop(
                         }
                     })
                     .await;
-                    state.end_site_update(&address);
+                    state.end_xite_update(&address);
                     let outcome = match joined {
                         Ok(outcome) => outcome,
                         Err(e) => {
@@ -1228,12 +1228,12 @@ async fn propagation_loop(
                     // happening: a hint means a peer told us this xite moved,
                     // so the pill usually goes checking -> updating -> the file
                     // countdown rather than quietly retiring.
-                    state.begin_site_update(&address);
-                    state.push_site_info_event(&address, UPDATE_PHASE_CHECKING).await;
+                    state.begin_xite_update(&address);
+                    state.push_xite_info_event(&address, UPDATE_PHASE_CHECKING).await;
                     let applied = state.resync_xite(&address).await;
                     let user_bytes = state.sync_user_content(&address).await;
                     state.resync_merge_files_for(&address).await;
-                    state.end_site_update(&address);
+                    state.end_xite_update(&address);
                     let outcome = match applied {
                         Ok(true) => UpdateOutcome::Applied,
                         Ok(false) if user_bytes > 0 => UpdateOutcome::Applied,

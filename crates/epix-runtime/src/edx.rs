@@ -658,7 +658,7 @@ impl SignedProvider for AppStateProvider {
     ) -> Result<bool, String> {
         // Gossip the hint: record (xite, modified) so peers polling us learn a
         // new version exists and catch up fast. Done before (and regardless of)
-        // apply, so a node that only relays this site still hints it for
+        // apply, so a node that only relays this xite still hints it for
         // others - the store-and-forward reach a publish flood needs.
         self.state.record_update_hint(xite, modified as i64).await;
 
@@ -1243,7 +1243,7 @@ struct RuntimeEdxFetcher {
     /// Reused links for the short control RPCs. Arc-shared because the fetcher
     /// is Arc-shared and cloned per session, so every clone must pool into the
     /// same cache. Built once via [`RuntimeEdxFetcher::new`] so no construction
-    /// site (there are many, including tests) can forget to initialize it.
+    /// xite (there are many, including tests) can forget to initialize it.
     link_pool: Arc<LinkPool>,
     /// Streaming read-ahead bookkeeping, Arc-shared like the fetcher so every
     /// clone sees the same in-flight/anchor/warmed state.
@@ -2860,7 +2860,7 @@ impl RuntimeEdxFetcher {
     /// is swept across the others afterwards.
     ///
     /// The materialize runs CONCURRENTLY with the round trips, fed by the
-    /// per-object hook: a GetMany batch is a whole site's small files, so
+    /// per-object hook: a GetMany batch is a whole xite's small files, so
     /// materializing only after the last one arrived left the clone's loading
     /// bar pinned at 0 for the entire download and then jumped it to done, and
     /// kept a forum's posts out of the db (no `file_done`, no re-query) until
@@ -3191,7 +3191,7 @@ impl RuntimeEdxFetcher {
     /// A xite that declares NOTHING is sorted by file type instead
     /// (`policy::default_tier`): markup, styles, scripts and images first,
     /// media and archives last. It used to land in a single tier, which is
-    /// how a 1.21 GB site could finish downloading its index.html and still
+    /// how a 1.21 GB xite could finish downloading its index.html and still
     /// not draw - the page's own assets were queued behind a gigabyte of
     /// video nobody was waiting for.
     #[allow(clippy::too_many_arguments)]
@@ -4838,8 +4838,8 @@ mod tests {
     ) -> (String, Vec<u8>, serde_json::Value, Vec<u8>, std::net::SocketAddr, Vec<u8>) {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(site_dir.path());
+        let xite_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(xite_dir.path());
         storage.write("index.html", &vec![b'h'; 5_000]).unwrap();
         let movie: Vec<u8> = (0..movie_len).map(|i| (i % 251) as u8).collect();
         storage.write("movie.bin", &movie).unwrap();
@@ -4851,13 +4851,13 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
-            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
         assert!(state_b.load_content_from_disk(&address).await, "load registers files into the store");
-        std::mem::forget(site_dir); // keep the on-disk files for the test's life
+        std::mem::forget(xite_dir); // keep the on-disk files for the test's life
         std::mem::forget(store_dir);
 
         let server_key = epix_crypt::new_seed();
@@ -4928,8 +4928,8 @@ mod tests {
         // uploaded counter applies to it.
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(site_dir.path());
+        let xite_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(xite_dir.path());
         storage.write("index.html", &vec![b'h'; 5_000]).unwrap();
         let movie: Vec<u8> = (0..400_000usize).map(|i| (i % 251) as u8).collect();
         storage.write("movie.bin", &movie).unwrap();
@@ -4941,13 +4941,13 @@ mod tests {
 
         let state_b = AppState::new("uploader");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
-            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
         assert!(state_b.load_content_from_disk(&address).await, "load registers the files");
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5241,8 +5241,8 @@ mod tests {
     async fn the_default_ladder_beats_small_first_when_they_disagree() {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(site_dir.path());
+        let xite_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(xite_dir.path());
         // Renderable but large, vs bulk but small.
         storage.write("css/all.css", &vec![b'c'; 400_000]).unwrap();
         storage.write("docs/manual.pdf", &vec![b'p'; 5_000]).unwrap();
@@ -5254,13 +5254,13 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
-            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
         assert!(state_b.load_content_from_disk(&address).await);
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5298,8 +5298,8 @@ mod tests {
     ) -> (String, Vec<u8>, serde_json::Value, std::net::SocketAddr) {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(site_dir.path());
+        let xite_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(xite_dir.path());
         for i in 0..n {
             storage.write(&format!("post-{i}.json"), format!("{{\"n\":{i}}}").as_bytes()).unwrap();
         }
@@ -5310,16 +5310,16 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
             .add_xite(
                 &address,
-                XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None },
+                XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None },
             )
             .await;
         assert!(state_b.load_content_from_disk(&address).await);
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6048,14 +6048,14 @@ mod tests {
     async fn volunteer_node(seeder: std::net::SocketAddr, quota: u64) -> (Arc<AppState>, Arc<Store>, String) {
         let state = AppState::new("volunteer");
         let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
-        let site_path = site_dir.path().to_path_buf();
+        let xite_dir = tempfile::tempdir().unwrap();
+        let xite_path = xite_dir.path().to_path_buf();
         state
-            .add_xite(&addr, XiteEntry { storage: XiteStorage::new(&site_path), content: None })
+            .add_xite(&addr, XiteEntry { storage: XiteStorage::new(&xite_path), content: None })
             .await;
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         let store_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(test_store(store_dir.path(), &site_path));
+        let store = Arc::new(test_store(store_dir.path(), &xite_path));
         std::mem::forget(store_dir);
         state.set_edx_store(store.clone()).await;
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
@@ -6171,8 +6171,8 @@ mod tests {
     async fn a_per_user_child_file_transfers_over_edx() {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(site_dir.path());
+        let xite_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(xite_dir.path());
         storage.write("index.html", b"<h1>forum</h1>").unwrap();
         let post = b"a forum post by alice, delivered over EDX not msgpack".to_vec();
         storage.write("data/users/alice/data.json", &post).unwrap();
@@ -6195,15 +6195,15 @@ mod tests {
         // Node B: load (registers the root AND the child file) and serve.
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
-            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
         assert!(state_b.load_content_from_disk(&address).await);
         // The per-user file's object is now in the store (child recursion).
         assert!(store_b.contains(b3).unwrap(), "child file registered for serving");
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
         let server_key = epix_crypt::new_seed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6283,7 +6283,7 @@ mod tests {
 
     /// Gossip: an EDX update push records a `(xite, modified)` hint even on a
     /// node that does NOT host the xite (a pure relay), so peers polling it
-    /// still learn a new version exists. The apply itself fails (unknown site),
+    /// still learn a new version exists. The apply itself fails (unknown xite),
     /// but the hint must be recorded first.
     #[tokio::test]
     async fn an_edx_update_records_a_gossip_hint_even_when_not_hosting() {
@@ -6314,9 +6314,9 @@ mod tests {
     async fn edx_push_applies_a_forum_diff() {
         use epix_ui::state::XiteEntry;
 
-        // --- Node B (receiver): a forum site holding v1 of alice's posts ---
-        let site_pk = epix_crypt::new_seed();
-        let site_addr = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        // --- Node B (receiver): a forum xite holding v1 of alice's posts ---
+        let xite_pk = epix_crypt::new_seed();
+        let xite_addr = epix_crypt::privatekey_to_address(&xite_pk).unwrap();
         let user_pk = epix_crypt::new_seed();
         let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
         let user_dir = format!("data/users/{user_addr}");
@@ -6326,7 +6326,7 @@ mod tests {
         let storage = XiteStorage::new(b_dir.path());
         // Parent user_contents rules the pushed child verifies against.
         let parent = serde_json::json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": "data/users/content.json",
             "user_contents": {
                 "cert_signers": {},
@@ -6340,7 +6340,7 @@ mod tests {
         let data_v1: &[u8] = br#"{ "posts": [ {"post_id":1,"title":"First"} ] }"#;
         storage.write(&format!("{user_dir}/data.json"), data_v1).unwrap();
         let mut c1 = serde_json::json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": format!("{user_dir}/content.json"),
             "modified": 1000,
             "files": { "data.json": { "size": data_v1.len(), "sha512": XiteStorage::hash_bytes(data_v1) } },
@@ -6350,10 +6350,10 @@ mod tests {
             .write(&format!("{user_dir}/content.json"), &serde_json::to_vec(&c1).unwrap())
             .unwrap();
 
-        let root = serde_json::json!({ "address": site_addr, "modified": 1.0, "files": {} });
+        let root = serde_json::json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let state_b = AppState::new("node-b");
         state_b
-            .add_xite(&site_addr, XiteEntry { storage: XiteStorage::new(&b_path), content: Some(root) })
+            .add_xite(&xite_addr, XiteEntry { storage: XiteStorage::new(&b_path), content: Some(root) })
             .await;
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), b_dir.path()));
@@ -6383,7 +6383,7 @@ mod tests {
         let data_v2: &[u8] =
             br#"{ "posts": [ {"post_id":1,"title":"First"}, {"post_id":2,"title":"Reply"} ] }"#;
         let mut c2 = serde_json::json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": format!("{user_dir}/content.json"),
             "modified": 2000,
             "files": { "data.json": { "size": data_v2.len(), "sha512": XiteStorage::hash_bytes(data_v2) } },
@@ -6407,7 +6407,7 @@ mod tests {
         let pushed = fetcher
             .push_update(
                 epix_core::PeerAddr::Ip(addr),
-                &site_addr,
+                &xite_addr,
                 &format!("{user_dir}/content.json"),
                 Arc::new(serde_json::to_vec(&c2).unwrap()),
                 2000.0,
@@ -6439,7 +6439,7 @@ mod tests {
         // so peers polling it learn the new version exists.
         let (hints, _head) = prop_b.lock().await.since(0);
         assert!(
-            hints.iter().any(|h| h.xite == site_addr && h.modified == 2000),
+            hints.iter().any(|h| h.xite == xite_addr && h.modified == 2000),
             "the EDX update recorded a propagation hint, got {hints:?}"
         );
     }
@@ -6456,8 +6456,8 @@ mod tests {
         let privkey = epix_crypt::new_seed();
         let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
         let secret = b"the private note nobody but a viewer should read".to_vec();
-        let site_dir = tempfile::tempdir().unwrap();
-        let storage = XiteStorage::new(site_dir.path());
+        let xite_dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(xite_dir.path());
         storage.write("index.html", b"<h1>public</h1>").unwrap();
         storage.write("private/secret.txt", &secret).unwrap();
         let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
@@ -6472,13 +6472,13 @@ mod tests {
 
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
         state_b
-            .add_xite(&address, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
         assert!(state_b.load_content_from_disk(&address).await, "load stores shard ciphertext");
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
         let server_key = epix_crypt::new_seed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6599,12 +6599,12 @@ mod tests {
         // Seeder: a xite with a known peer, a tracker entry, a recorded
         // propagation hint, and its own DHT node.
         let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
+        let xite_dir = tempfile::tempdir().unwrap();
         let state_b = AppState::new("node-b");
         state_b
             .add_xite(
                 &address,
-                XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None },
+                XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None },
             )
             .await;
         let known = PeerAddr::parse("9.9.9.9:26552").unwrap();
@@ -6622,9 +6622,9 @@ mod tests {
         };
 
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6773,12 +6773,12 @@ mod tests {
         drop(dead_listener);
 
         let root = tempfile::tempdir().unwrap();
-        let site = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let xite = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         std::fs::create_dir_all(root.path().join("private")).unwrap();
         std::fs::write(
             root.path().join("private/peers.json"),
             serde_json::to_vec(&serde_json::json!({
-                site: [
+                xite: [
                     { "addr": alive.to_string(), "rep": -3, "errors": 3, "seen": 0 },
                     { "addr": dead.to_string(), "rep": -3, "errors": 3, "seen": 0 },
                 ],
@@ -6790,9 +6790,9 @@ mod tests {
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let store_dir = tempfile::tempdir().unwrap();
         state.set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap())).await;
-        let site_dir = tempfile::tempdir().unwrap();
+        let xite_dir = tempfile::tempdir().unwrap();
         state
-            .add_xite(site, XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None })
+            .add_xite(xite, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
 
         // Both restored peers are benched and due a probe.
@@ -6808,7 +6808,7 @@ mod tests {
         // streak waits for a real fetch to clear); the refusing one is in a
         // (grown) backoff, and neither is due another probe before its
         // re-armed cooldown.
-        let connectable = state.connectable_peers(site, 10).await;
+        let connectable = state.connectable_peers(xite, 10).await;
         assert!(connectable.contains(&alive), "recovered peer reinstated: {connectable:?}");
         assert!(!connectable.contains(&dead), "dead peer stays benched: {connectable:?}");
         assert!(state.probe_candidates(10).await.is_empty());
@@ -7264,8 +7264,8 @@ mod tests {
     async fn a_body_less_update_is_fetched_back_from_the_publisher() {
         use epix_ui::state::XiteEntry;
 
-        let site_pk = epix_crypt::new_seed();
-        let site_addr = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let xite_pk = epix_crypt::new_seed();
+        let xite_addr = epix_crypt::privatekey_to_address(&xite_pk).unwrap();
         let user_pk = epix_crypt::new_seed();
         let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
         let user_dir = format!("data/users/{user_addr}");
@@ -7273,7 +7273,7 @@ mod tests {
 
         // The rules the pushed child verifies against, on both nodes.
         let parent = serde_json::json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": "data/users/content.json",
             "user_contents": {
                 "cert_signers": {},
@@ -7285,7 +7285,7 @@ mod tests {
         let data: &[u8] = br#"{ "posts": [] }"#;
         let child = |modified: i64| {
             let mut c = serde_json::json!({
-                "address": site_addr,
+                "address": xite_addr,
                 "inner_path": child_path,
                 "modified": modified,
                 "files": {
@@ -7303,7 +7303,7 @@ mod tests {
         p_storage.write(&child_path, &child(2000)).unwrap();
         let state_p = AppState::new("publisher");
         state_p
-            .add_xite(&site_addr, XiteEntry { storage: XiteStorage::new(p_dir.path()), content: None })
+            .add_xite(&xite_addr, XiteEntry { storage: XiteStorage::new(p_dir.path()), content: None })
             .await;
         let p_store_dir = tempfile::tempdir().unwrap();
         let p_store = Arc::new(test_store(p_store_dir.path(), p_dir.path()));
@@ -7331,11 +7331,11 @@ mod tests {
         r_storage.write("data/users/content.json", &parent_bytes).unwrap();
         r_storage.write(&child_path, &child(1000)).unwrap();
         r_storage.write(&format!("{user_dir}/data.json"), data).unwrap();
-        let root = serde_json::json!({ "address": site_addr, "modified": 1.0, "files": {} });
+        let root = serde_json::json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let state_r = AppState::new("receiver");
         state_r
             .add_xite(
-                &site_addr,
+                &xite_addr,
                 XiteEntry { storage: XiteStorage::new(r_dir.path()), content: Some(root) },
             )
             .await;
@@ -7364,7 +7364,7 @@ mod tests {
         let provider = AppStateProvider { state: state_r.clone() };
         let applied = provider
             .apply_update(
-                &site_addr,
+                &xite_addr,
                 &child_path,
                 &[],
                 &[],
@@ -7422,18 +7422,18 @@ mod tests {
     #[tokio::test]
     async fn an_inbound_overlay_pex_records_the_requesters_advertised_address() {
         let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
-        let site_dir = tempfile::tempdir().unwrap();
+        let xite_dir = tempfile::tempdir().unwrap();
         let state_b = AppState::new("overlay-seeder");
         state_b
             .add_xite(
                 &address,
-                XiteEntry { storage: XiteStorage::new(site_dir.path()), content: None },
+                XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None },
             )
             .await;
         let store_dir = tempfile::tempdir().unwrap();
-        let store_b = Arc::new(test_store(store_dir.path(), site_dir.path()));
+        let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
         state_b.set_edx_store(store_b.clone()).await;
-        std::mem::forget(site_dir);
+        std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
 
         // Exactly what an inbound Tor link looks like to the accept loop.

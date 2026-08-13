@@ -1,7 +1,6 @@
 //! Noise-XX-first clearnet encryption with node-key channel binding.
 //!
-//! Today's clearnet peer TCP is plaintext (the ZeroNet `crypt` slot was
-//! never filled). EDX mandates Noise on `PeerAddr::Ip`: dial → magic →
+//! EDX mandates Noise on `PeerAddr::Ip`: dial → magic →
 //! Noise-XX → everything else inside the tunnel. No negotiation, no
 //! downgrade surface. Overlay transports (Tor/I2P/Reticulum) already
 //! encrypt and skip this layer entirely.

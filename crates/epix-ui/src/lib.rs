@@ -161,10 +161,10 @@ impl UiServer {
                 "/favicon.ico",
                 get(|| async { Redirect::permanent("/uimedia/img/favicon.ico") }),
             )
-            // EpixNet's /raw/<site>/<path>: the file without the wrapper,
+            // EpixNet's /raw/<xite>/<path>: the file without the wrapper,
             // under the restrictive noscript CSP.
             .route("/raw/{address}/{*path}", get(serve_raw))
-            // EpixNet's /add/<site> confirmation flow maps onto this node's
+            // EpixNet's /add/<xite> confirmation flow maps onto this node's
             // on-demand design: navigating to a xite already resolves +
             // clones it (gated by NoNewSites), so /add is a redirect.
             .route("/add/{address}", get(redirect_add))
@@ -465,15 +465,15 @@ Add it to the ui_host config key, or access the UI                  by IP."
 
 /// Whether a state-changing request came from this node's own UI.
 ///
-/// `Sec-Fetch-Site` is the primary signal (a browser sets it itself and script
+/// `Sec-Fetch-Xite` is the primary signal (a browser sets it itself and script
 /// cannot override it); `Origin` is the fallback for clients that do not send
 /// it. A request carrying neither is accepted only because non-browser clients
 /// (the desktop shell's own fetches, curl, the admin socket) have no ambient
 /// credentials to abuse - the browser-driven attack this blocks always carries
 /// at least one of the two.
 fn unsafe_method_is_same_origin(headers: &header::HeaderMap, host: &str) -> bool {
-    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-        return site == "same-origin" || site == "none";
+    if let Some(xite) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return xite == "same-origin" || xite == "none";
     }
     match headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         Some(origin) => url_is_same_host(origin, host),
@@ -535,17 +535,17 @@ async fn is_cross_origin_request(
     }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
-    // Untraceable requests are blocked for site paths (checked below for /).
+    // Untraceable requests are blocked for xite paths (checked below for /).
     if origin.is_none() && referer.is_none() && !is_public_ui_path(path) {
         return true;
     }
-    // A foreign origin never reads site content.
+    // A foreign origin never reads xite content.
     if let Some(origin) = origin {
         if !url_is_same_host(origin, host) {
             return true;
         }
     }
-    // Non-site-specific routes carry nothing to probe.
+    // Non-xite-specific routes carry nothing to probe.
     if is_public_ui_path(path) {
         return false;
     }
@@ -555,7 +555,7 @@ async fn is_cross_origin_request(
     };
     // Same-xite requests pass; cross-xite needs the Cors:<target> permission
     // on the source xite.
-    let source = referer.and_then(|r| referer_site(ctx, r, host));
+    let source = referer.and_then(|r| referer_xite(ctx, r, host));
     match source {
         Some(source) if source == target => false,
         Some(source) => {
@@ -595,7 +595,7 @@ fn url_is_same_host(url: &str, host: &str) -> bool {
 /// The xite a referer URL points at: the nested path segment if it is itself a
 /// xite (`/epix1…/` or `/name.epix/`), else - in transparent-proxy mode - the
 /// `.epix` host itself, else the first path segment.
-fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
+fn referer_xite(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
     let after_scheme = referer
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -612,7 +612,7 @@ fn referer_site(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
     let (ref_host, ref_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
     let ref_host = strip_port(ref_host);
     // A xite can be served nested under another xite's proxy host: clicking a
-    // site in the dashboard lands the iframe on `dashboard.epix/epix1talk…/`,
+    // xite in the dashboard lands the iframe on `dashboard.epix/epix1talk…/`,
     // so that page's OWN resources carry a referer like
     // `dashboard.epix/epix1talk…/index.html`. The nested path segment is the
     // real source xite (a page loading its own files is same-origin), so it
@@ -727,7 +727,7 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
         return req;
     }
     // A path that already targets a xite (`/epix1…/` or `/name.epix/`, as the
-    // dashboard's site links do) routes as-is instead of being nested under
+    // dashboard's xite links do) routes as-is instead of being nested under
     // this host's path; the wrapper redirects such a document to the xite's
     // own origin.
     let first_seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
@@ -916,7 +916,7 @@ async fn serve_wallet(State(ctx): State<Ctx>, Path(path): Path<String>) -> Respo
 }
 
 /// Serve the wrapper page for a xite (`GET /{address}/`).
-/// The page shown in place of a blocked site (ContentFilter).
+/// The page shown in place of a blocked xite (ContentFilter).
 fn blocklisted_html(address: &str, reason: &str) -> String {
     let reason_html = if reason.is_empty() {
         String::new()
@@ -924,8 +924,8 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
         format!("<p>Reason: {}</p>", html_escape(reason))
     };
     status_page_html(
-        "Site blocked",
-        "This site is blocked",
+        "Xite blocked",
+        "This xite is blocked",
         &format!(
             "<p style='color:#ABABB5;overflow-wrap:anywhere'>{}</p>{}",
             html_escape(address),
@@ -937,7 +937,7 @@ fn blocklisted_html(address: &str, reason: &str) -> String {
 /// The page shown when a locked-down node (NoNewSites) is asked for a xite it
 /// does not already serve. Distinct from the block page: nothing is wrong with
 /// the xite, this node just does not add new ones.
-fn no_new_sites_html(requested: &str) -> String {
+fn no_new_xites_html(requested: &str) -> String {
     status_page_html(
         "New xites disabled",
         "New xites are disabled",
@@ -1010,7 +1010,7 @@ async fn render_wrapper(
     // In transparent-proxy (host) mode, a document whose URL literally carries
     // a xite path segment (the rewrite marker is absent - see
     // [`PROXY_REWRITE_MARKER`]) is sent to that xite's own origin instead of
-    // serving nested under this host. Clicking a site on the dashboard links
+    // serving nested under this host. Clicking a xite on the dashboard links
     // `/epix1talk…/`, which used to land on `https://dashboard.epix/epix1talk…/`:
     // a page whose wrapper was in path mode, so its home button resolved to
     // `dashboard.epix/dashboard.epix/`, and whose origin was the dashboard's.
@@ -1063,13 +1063,13 @@ async fn render_wrapper(
         // resumes) a xite it already has, but a brand-new one gets a clear page
         // instead of an endless loading screen. Resolve first (chain allowed),
         // so following an xID to an already-served xite still works.
-        if ctx.state.no_new_sites().await {
+        if ctx.state.no_new_xites().await {
             let key = ctx.state.resolve_for_serving(&requested).await;
             if !ctx.state.has_xite(&key).await {
                 return (
                     StatusCode::FORBIDDEN,
                     [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    no_new_sites_html(&requested),
+                    no_new_xites_html(&requested),
                 )
                     .into_response();
             }
@@ -1131,7 +1131,7 @@ async fn render_wrapper(
     if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
         ctx.state.allow_ws_origin(host);
     }
-    // ContentFilter: a blocked site is not served - show the block page instead.
+    // ContentFilter: a blocked xite is not served - show the block page instead.
     if let Some(reason) = ctx.state.siteblock_reason(&address).await {
         return (
             StatusCode::FORBIDDEN,
@@ -1146,7 +1146,7 @@ async fn render_wrapper(
     // to that domain, so the address bar shows `talk.epix` instead of
     // `epix1talk…`, like DNS resolving a name for a link you clicked. The claim
     // is only trusted after the chain confirms the claimed name resolves BACK
-    // to this exact address (via the XidResolver Merkle-proof path), so a site
+    // to this exact address (via the XidResolver Merkle-proof path), so a xite
     // cannot hijack another's name. Only the top-level document redirects; a
     // failed/absent verification serves the address unchanged (fail closed).
     // Host (proxy) mode goes to the domain's origin; path mode (the mobile
@@ -1214,7 +1214,7 @@ async fn render_wrapper(
     // The xite's real permissions (empty until the user grants one). This is
     // only the wrapper's initial value; the authoritative list arrives over the
     // WebSocket via siteInfo.
-    let permissions = ctx.state.site_permissions(&address).await;
+    let permissions = ctx.state.xite_permissions(&address).await;
 
     // The corner home button returns to the node's homepage (the launch xite,
     // e.g. dashboard.epix), not the xite being viewed. In transparent-proxy
@@ -1293,7 +1293,7 @@ async fn render_wrapper(
     ];
     let mut html = render(WRAPPER_HTML, &vars);
     // NoNewSites gateway: every page carries the read-only banner.
-    if ctx.state.no_new_sites().await {
+    if ctx.state.no_new_xites().await {
         html = inject_gateway_banner(html);
     }
     (
@@ -1363,25 +1363,25 @@ async fn serve_plugins_page(State(ctx): State<Ctx>) -> Response {
 /// A short description for a known built-in plugin/feature.
 fn plugin_description(name: &str) -> &'static str {
     match name {
-        "Sidebar" => "Slide-out site info panel with peers, transfer stats, and the world globe.",
+        "Sidebar" => "Slide-out xite info panel with peers, transfer stats, and the world globe.",
         "Stats" => "Network stats charts and the peer world map on the dashboard.",
         "UiPluginManager" => "This plugin manager page.",
         "UiConfig" => "The node configuration page.",
         "UiBackup" => "The Backup & Restore wizard for keys, settings, and zites.",
-        "Cors" => "Cross-site file access via a Cors:<address> permission grant.",
+        "Cors" => "Cross-xite file access via a Cors:<address> permission grant.",
         "PeerDb" => "Remembers known peers across restarts.",
-        "Notification" => "Per-site notification subscriptions, muting, and counts.",
+        "Notification" => "Per-xite notification subscriptions, muting, and counts.",
         "FilePack" => "Serves files from inside .tar.gz / .zip archives.",
         "UiFileManager" => "Browse a xite's files from the dashboard.",
         "AnnounceLocal" => "Finds peers on the local network over UDP broadcast.",
         "AnnounceShare" => "Remembers working trackers and reuses them across restarts.",
         "Beacon" => "Announcer discovery: starts from the built-in bootstrap list, learns working announcers from peers, shares yours back, and keeps the set healthy. Can also follow a list published on a xite (trackers_xite) - and maintains that list automatically when this node owns the xite.",
         "AnnounceBitTorrent" => "Announces to HTTP(S) and UDP BitTorrent trackers.",
-        "NoNewSites" => "Locks the node's site set: blocks adding and deleting sites.",
-        "ContentFilter" => "Mute authors and block sites (enforced on serve + db).",
-        "MergerSite" => "Aggregates merged sites into one database.",
+        "NoNewSites" => "Locks the node's xite set: blocks adding and deleting xites.",
+        "ContentFilter" => "Mute authors and block xites (enforced on serve + db).",
+        "MergerSite" => "Aggregates merged xites into one database.",
         "OptionalManager" => "Manages optional (on-demand) files and the size limit.",
-        "Newsfeed" => "Cross-site news feed from followed sites.",
+        "Newsfeed" => "Cross-xite news feed from followed xites.",
         "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for zites.",
         "Chart" => "Collects the time-series data behind the Stats charts.",
         "Bigfile" => "Piecewise download of large files with piecefield exchange.",
@@ -1708,7 +1708,7 @@ fn inject_gateway_banner(html: String) -> String {
 }
 
 /// `GET /Stats` - the diagnostics page (EpixNet's `/Stats`): node identity,
-/// live connections, tracker stats, Tor state, and a per-site table.
+/// live connections, tracker stats, Tor state, and a per-xite table.
 async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
     // Each table gets an overflow-x scroll container so wide rows (peer
     // addresses) scroll inside the content card instead of the page.
@@ -2301,7 +2301,7 @@ fn render(template: &str, vars: &[(&str, String)]) -> String {
 }
 
 /// Serve a xite's own file (the inner iframe content + its assets).
-/// `/raw/<site>/<path>`: the file bytes with no wrapper and EpixNet's
+/// `/raw/<xite>/<path>`: the file bytes with no wrapper and EpixNet's
 /// noscript Content-Security-Policy, so active content cannot run - the
 /// share-a-file view (`actionSiteMedia(raw=True)`).
 async fn serve_raw(
@@ -2328,7 +2328,7 @@ async fn serve_raw(
     (headers, bytes).into_response()
 }
 
-/// `/add/<site>` -> `/<site>/`: the wrapper route resolves + clones unknown
+/// `/add/<xite>` -> `/<xite>/`: the wrapper route resolves + clones unknown
 /// xites on demand (and NoNewSites gates it), so the EpixNet add-confirmation
 /// page reduces to a redirect here.
 async fn redirect_add(Path(address): Path<String>) -> Redirect {
@@ -2379,9 +2379,9 @@ async fn serve_file(
     // A `.epix` name in the URL resolves to the bech32 serving key.
     let mut requested = address;
     let mut address = ctx.state.canonical_key(&requested).await;
-    // A merger site's `merged-<type>/<address>/<path>` URL serves the merged
-    // site's file (MergerSite's checkMergerPath): retarget everything below -
-    // the clone/wait loop, the Range branch, and the read - at the merged site.
+    // A merger xite's `merged-<type>/<address>/<path>` URL serves the merged
+    // xite's file (MergerSite's checkMergerPath): retarget everything below -
+    // the clone/wait loop, the Range branch, and the read - at the merged xite.
     match ctx.state.resolve_merged(&address, &path).await {
         Ok(Some((maddr, minner))) => {
             requested = maddr.clone();
@@ -2398,9 +2398,9 @@ async fn serve_file(
     // entry registers (empty) at clone start, so a registered entry whose
     // requested file is missing gets the same wait-for-disk treatment.
     let registered = ctx.state.has_xite(&address).await;
-    if !registered && ctx.state.no_new_sites().await {
+    if !registered && ctx.state.no_new_xites().await {
         // NoNewSites: don't start a clone for a file request either.
-        return (StatusCode::FORBIDDEN, "Adding new sites is disabled on this node")
+        return (StatusCode::FORBIDDEN, "Adding new xites is disabled on this node")
             .into_response();
     }
     // An html document is the page itself: while its xite's core set (every
@@ -2408,7 +2408,7 @@ async fn serve_file(
     // instead of serving it the moment it lands. index.html downloads first,
     // so serving it right away boots the page with its styles, scripts and
     // lazy chunks missing - and the wrapper drops its loading screen once the
-    // iframe loads, stranding the user in a half-downloaded site. Non-html
+    // iframe loads, stranding the user in a half-downloaded xite. Non-html
     // assets still serve as they land: only an already-running page asks for
     // them, and each request waits for its own file (EpixNet's needFile).
     let is_html = content_type(&path).starts_with("text/html");
@@ -2423,16 +2423,16 @@ async fn serve_file(
         && (ctx.state.bigfile_total(&address, &path).await.is_some()
             || ctx.state.edx_resolve(&address, &path).await.is_some());
     // An asset request for a file we don't hold but whose content.json (root
-    // or a child's - a per-user optional avatar, a merged site's lazy asset)
+    // or a child's - a per-user optional avatar, a merged xite's lazy asset)
     // declares: fetch just that file from peers (EpixNet's `needFile`) instead
-    // of falling into the whole-site clone path below.
+    // of falling into the whole-xite clone path below.
     if registered
         && !is_html
         && !range_bigfile
         && !ctx.state.xite_file_exists(&address, &path).await
     {
         if let Some((info, optional)) = ctx.state.file_info_any(&address, &path).await {
-            // Optional files are opt-in: without the site's download flag,
+            // Optional files are opt-in: without the xite's download flag,
             // never fetch silently - ask the user once (wrapper confirm) and
             // 404 this request; the page retries after they accept.
             if optional && !ctx.state.optional_fetch_allowed(&address).await {
@@ -2465,7 +2465,7 @@ async fn serve_file(
         // Kick the clone off; also resumes an interrupted clone (a registered
         // xite with core files missing). Keep the handle: the html gate must
         // lift when no clone can run (failed, NoNewSites, nothing to resume),
-        // or an incomplete-but-servable site would stall until the deadline.
+        // or an incomplete-but-servable xite would stall until the deadline.
         let ensure = {
             let state = ctx.state.clone();
             let target = requested.clone();
@@ -2505,7 +2505,7 @@ async fn serve_file(
                         let bytes = substitute_html_vars(&ctx.state, &k, &ct, bytes).await;
                         return serve_file_conditional(&ct, &headers, bytes);
                     }
-                    crate::state::LoadingFile::NotInSite => {
+                    crate::state::LoadingFile::NotInXite => {
                         return (StatusCode::NOT_FOUND, "not found").into_response();
                     }
                     crate::state::LoadingFile::Pending => {}
@@ -2633,7 +2633,7 @@ async fn serve_file(
 
 /// EpixNet substitutes wrapper variables in served .html files
 /// (`replaceHtmlVariables` + Translate): `{themeclass}` (the user's theme),
-/// `{site_modified}` (content.json's modified time) and the `lang={lang}`
+/// `{xite_modified}` (content.json's modified time) and the `lang={lang}`
 /// cache-buster. Xites key their styling off `body.theme-…`, so serving the
 /// raw placeholder leaves them unstyled.
 async fn substitute_html_vars(
@@ -2758,16 +2758,16 @@ fn parse_range(header: &str, total: u64) -> Option<(u64, Option<u64>)> {
     Some((start, end))
 }
 
-/// Security + caching headers for an inner site file, matching EpixNet's
+/// Security + caching headers for an inner xite file, matching EpixNet's
 /// `sendHeader`: Referrer-Policy, Cache-Control by type, and
 /// Content-Disposition:attachment for file types dangerous to render inline
 /// (svg/xml/pdf/flash).
 ///
-/// Normal site files carry **no** Content-Security-Policy - matching EpixNet,
+/// Normal xite files carry **no** Content-Security-Policy - matching EpixNet,
 /// which only sends the restrictive `sandbox` CSP for `raw`/noscript requests.
 /// The inner content is sandboxed by the wrapper's iframe `sandbox` attribute
 /// (`allow-scripts allow-same-origin …`); putting `default-src 'none'; sandbox
-/// (no allow-scripts)` on the file itself would block the site's own scripts and
+/// (no allow-scripts)` on the file itself would block the xite's own scripts and
 /// - now that we serve over https (a secure context) - its service worker.
 fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap {
     let mut pairs = vec![
@@ -2786,7 +2786,7 @@ fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap
     // `no-cache` = store, but revalidate before every use (the ETag the file
     // handler adds makes that a 304 while unchanged). EpixNet served these
     // with max-age=600, but the wrapper navigates its iframe from SCRIPT, so
-    // a user's hard reload never bypass-caches the inner site's assets: a
+    // a user's hard reload never bypass-caches the inner xite's assets: a
     // freshly published script kept running stale for up to 10 minutes with
     // no recourse. Revalidation makes a publish visible on the next reload.
     let cache = if matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) && cacheable {
@@ -2852,7 +2852,7 @@ async fn serve_bt_stream(
     }
 }
 
-/// Serve site-file bytes with an ETag, answering a matching `If-None-Match`
+/// Serve xite-file bytes with an ETag, answering a matching `If-None-Match`
 /// with `304 Not Modified` so the `no-cache` policy above stays cheap: an
 /// unchanged file revalidates with an empty response instead of a re-download.
 /// The tag is a content hash, so it changes exactly when a publish (or a local
@@ -3001,7 +3001,7 @@ enum Pumped {
     Event(state::UiEvent),
     /// The broadcast wrapped past this connection's cursor and events were
     /// lost. The forwarder repairs the damage it can: a lost `updated` event
-    /// would strand a site row's "Updating..." pill forever.
+    /// would strand a xite row's "Updating..." pill forever.
     Lagged,
 }
 
@@ -3108,11 +3108,11 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                         let target_ok = match (&ev.target, &ev.channel) {
                             (None, _) => true,
                             // Bound xite matches, or the connection joined this
-                            // channel for all sites (channelJoinAllsite), or the
-                            // event is for a site merged into this connection's
-                            // merger site (EpixNet forwards merged sites' events
+                            // channel for all xites (channelJoinAllsite), or the
+                            // event is for a xite merged into this connection's
+                            // merger xite (EpixNet forwards merged xites' events
                             // to their merger's sockets - Git Epix's repo pages
-                            // track their repo site's download this way).
+                            // track their repo xite's download this way).
                             (Some(addr), channel) => {
                                 session.xite.as_deref() == Some(addr.as_str())
                                     || channel.as_deref().is_some_and(|ch| session.in_allsite(ch))
@@ -3125,7 +3125,7 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
                     }
                     // Events were dropped before reaching this connection's
                     // queue. Re-send the closing `updated` event for every
-                    // finished site: if the drop swallowed one, its row's
+                    // finished xite: if the drop swallowed one, its row's
                     // "Updating..." pill would never clear (a harmless extra
                     // "Updated!" flash otherwise).
                     Some(Pumped::Lagged) => {
@@ -3144,9 +3144,9 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
 
 /// Whether a session bound to `session_xite` should also receive events
 /// targeted at `target` because `target` is merged into it: the session's
-/// site holds a `Merger:<type>` permission matching the target's
+/// xite holds a `Merger:<type>` permission matching the target's
 /// `merged_type`. Mirrors EpixNet's MergerSite plugin, which notifies a
-/// merger site's websockets about its merged sites' changes.
+/// merger xite's websockets about its merged xites' changes.
 async fn merger_receives(
     state: &Arc<AppState>,
     session_xite: Option<&str>,
@@ -3156,7 +3156,7 @@ async fn merger_receives(
     if merger == target {
         return false;
     }
-    let Some(merged_type) = state.site_merged_type(target).await else { return false };
+    let Some(merged_type) = state.xite_merged_type(target).await else { return false };
     state.merger_types(merger).await.contains(&merged_type)
 }
 
@@ -3183,7 +3183,7 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
     match ctx.registry.dispatch(session, cmd, &params, id).await {
         Ok(result) => json!({"cmd": "response", "to": id, "result": result}).to_string(),
         // EpixNet convention: a command error is the result being
-        // `{"error": ...}`, which is what site scripts and epixframe.js read
+        // `{"error": ...}`, which is what xite scripts and epixframe.js read
         // (a top-level `error` field is dropped by callback-mode ws.cmd).
         Err(error) => {
             json!({"cmd": "response", "to": id, "result": { "error": error }}).to_string()
@@ -3392,7 +3392,7 @@ mod csrf_tests {
         // node. The browser sets Origin itself and script cannot forge it.
         let h = headers(&[("origin", "https://evil.example")]);
         assert!(!unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
-        // Sec-Fetch-Site is decisive even when an Origin looks plausible.
+        // Sec-Fetch-Xite is decisive even when an Origin looks plausible.
         let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "http://127.0.0.1:42222")]);
         assert!(!unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
     }
@@ -3401,7 +3401,7 @@ mod csrf_tests {
     fn the_nodes_own_pages_still_post() {
         let h = headers(&[("sec-fetch-site", "same-origin")]);
         assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
-        // Older browsers send no Sec-Fetch-Site; Origin carries it instead.
+        // Older browsers send no Sec-Fetch-Xite; Origin carries it instead.
         let h = headers(&[("origin", "http://127.0.0.1:42222")]);
         assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
         // A LAN bind is the same case with a different host.

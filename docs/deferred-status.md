@@ -11,7 +11,7 @@ code.
 - Plugin toggles gate their features, not just command groups.
 - Tracker back-off and the wakeup watcher.
 - optionalHelp / optionalHelpRemove / optionalHelpAll (opt into distributing a
-  directory of optional files, or the whole site).
+  directory of optional files, or the whole xite).
 - Missing WS commands (siteAdd, siteClone, as, fileQuery, badCert,
   serverPortcheck/Update/Shutdown, siteSetSettingsValue, real
   siteListModifiedFiles).
@@ -30,7 +30,7 @@ code.
 ## Genuinely deferred (own layer, not a parity gap)
 
 - **i18n + TranslateSite.** A translation layer for the UI chrome plus the
-  per-site translation plugin. Large, self-contained, and orthogonal to the
+  per-xite translation plugin. Large, self-contained, and orthogonal to the
   network protocol; it changes no wire or storage behavior. Best done as one
   focused pass when the UI strings settle, especially since the xites are about
   to change shape for mobile anyway.

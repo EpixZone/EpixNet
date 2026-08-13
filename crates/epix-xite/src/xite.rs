@@ -5,14 +5,14 @@ use epix_content::VerifyContext;
 use epix_core::{Address, Error, Result};
 use serde_json::{json, Value};
 
-/// Verification context for a root content.json: only the site address and the
+/// Verification context for a root content.json: only the xite address and the
 /// size limit are needed (the root's rules bootstrap from itself).
 struct RootCtx {
     address: String,
     size_limit: i64,
 }
 impl VerifyContext for RootCtx {
-    fn site_address(&self) -> &str {
+    fn xite_address(&self) -> &str {
         &self.address
     }
     fn loaded_content(&self, _inner_path: &str) -> Option<Value> {
@@ -39,7 +39,7 @@ struct ChildCtx<'a> {
     xid_map: &'a std::collections::HashMap<String, Vec<String>>,
 }
 impl VerifyContext for ChildCtx<'_> {
-    fn site_address(&self) -> &str {
+    fn xite_address(&self) -> &str {
         &self.address
     }
     fn loaded_content(&self, inner_path: &str) -> Option<Value> {
@@ -259,7 +259,7 @@ impl Xite {
     /// Parse a stored `content.json` for serving the LOCAL copy, WITHOUT
     /// signature verification. Returns `false` if none is stored or it is not
     /// valid JSON. A signature is only required when fetching content from peers
-    /// (see [`Self::set_content`]); content already on disk - a site the
+    /// (see [`Self::set_content`]); content already on disk - a xite the
     /// operator authored, edited, or has not signed yet - is served as-is, so
     /// its files can be opened and then signed. Never call this on bytes
     /// received from a peer.
@@ -287,7 +287,7 @@ impl Xite {
     /// and adopt it IN MEMORY ONLY. Sync workers read `self.content`, so this
     /// is enough to start fetching the files it declares; nothing touches the
     /// stored content.json until [`Self::commit_content`], keeping the old
-    /// on-disk version authoritative (and the site serving) through the sync.
+    /// on-disk version authoritative (and the xite serving) through the sync.
     /// This is the full EpixNet `verifyFile` path, not just a single-owner
     /// signature.
     pub fn stage_content_limited(&mut self, bytes: &[u8], size_limit: i64) -> Result<()> {
@@ -584,7 +584,7 @@ impl Xite {
     }
 
     /// The `includes` a stored child content.json declares, as inner_paths
-    /// relative to the site root (for recursing into nested includes).
+    /// relative to the xite root (for recursing into nested includes).
     pub fn child_includes(&self, inner_path: &str) -> Vec<String> {
         let Ok(bytes) = self.storage.read(inner_path) else { return Vec::new() };
         let Ok(json) = serde_json::from_slice::<Value>(&bytes) else { return Vec::new() };
@@ -1479,15 +1479,15 @@ mod tests {
     #[test]
     fn add_content_verifies_includes_against_a_staged_root() {
         let privkey = epix_crypt::new_seed();
-        let site = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
-        let mut xite = Xite::new(Address::parse(site.clone()).unwrap(), storage);
+        let mut xite = Xite::new(Address::parse(address.clone()).unwrap(), storage);
 
         // The include, signed by the xite key.
         let include = signed(
             json!({
-                "address": site,
+                "address": address,
                 "inner_path": "data/users/content.json",
                 "files": {},
                 "modified": 1000,
@@ -1498,7 +1498,7 @@ mod tests {
 
         // Root staged in memory only - nothing on disk, exactly mid-clone.
         xite.content = Some(json!({
-            "address": site,
+            "address": address,
             "files": {},
             "includes": { "data/users/content.json": { "signers": [], "signers_required": 1 } },
         }));
@@ -1511,7 +1511,7 @@ mod tests {
         let bare = Xite {
             address: xite.address.clone(),
             storage: xite.storage.clone(),
-            content: Some(json!({ "address": site, "files": {}, "includes": {} })),
+            content: Some(json!({ "address": address, "files": {}, "includes": {} })),
         };
         assert!(
             bare.add_content("data/users/content.json", &include, &xid_map).is_err(),
@@ -1635,7 +1635,7 @@ mod tests {
     /// an empty inner_path; a pre-EDX entry (no b3) has no object to map.
     #[test]
     fn edx_object_paths_maps_declared_objects() {
-        let site = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         storage
@@ -1647,7 +1647,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let mut xite = Xite::new(Address::parse(site).unwrap(), storage);
+        let mut xite = Xite::new(Address::parse(address).unwrap(), storage);
         let bundle_hex = epix_blob::ObjId::of(b"bundle").to_string();
         xite.content = Some(json!({
             "files": {
@@ -1678,26 +1678,26 @@ mod tests {
         // A user_contents parent update that archives a user dir removes that
         // user's stored content.json and files (EpixNet's revocation path);
         // re-applying the same parent is a no-op for others.
-        let site_pk = epix_crypt::new_seed();
-        let site = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let xite_pk = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&xite_pk).unwrap();
         let user_pk = epix_crypt::new_seed();
         let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
-        let xite = Xite::new(Address::parse(site.clone()).unwrap(), storage.clone());
+        let xite = Xite::new(Address::parse(address.clone()).unwrap(), storage.clone());
         let none = std::collections::HashMap::new();
 
-        // Root delegates data/users/content.json to the site owner.
+        // Root delegates data/users/content.json to the xite owner.
         storage
             .write(
                 "content.json",
                 &signed(
                     serde_json::json!({
-                        "address": site, "modified": 1, "files": {},
+                        "address": address, "modified": 1, "files": {},
                         "includes": { "data/users/content.json": {} },
                     }),
-                    &site_pk,
+                    &xite_pk,
                 ),
             )
             .unwrap();
@@ -1705,11 +1705,11 @@ mod tests {
         // Parent v1: permissive user_contents, nothing archived.
         let parent_v1 = signed(
             serde_json::json!({
-                "address": site, "inner_path": "data/users/content.json",
+                "address": address, "inner_path": "data/users/content.json",
                 "modified": 10, "files": {},
                 "user_contents": { "permissions": {}, "cert_signers": {} },
             }),
-            &site_pk,
+            &xite_pk,
         );
         xite.add_content("data/users/content.json", &parent_v1, &none).unwrap();
 
@@ -1720,7 +1720,7 @@ mod tests {
         storage.write(&data_inner, data).unwrap();
         let child = signed(
             serde_json::json!({
-                "address": site, "inner_path": user_inner, "modified": 100,
+                "address": address, "inner_path": user_inner, "modified": 100,
                 "files": { "data.json": {
                     "size": data.len(),
                     "sha512": XiteStorage::hash_bytes(data),
@@ -1734,14 +1734,14 @@ mod tests {
         // Parent v2 archives the user dir at t=500 (> the child's 100).
         let parent_v2 = signed(
             serde_json::json!({
-                "address": site, "inner_path": "data/users/content.json",
+                "address": address, "inner_path": "data/users/content.json",
                 "modified": 20, "files": {},
                 "user_contents": {
                     "permissions": {}, "cert_signers": {},
                     "archived": { user.clone(): 500 },
                 },
             }),
-            &site_pk,
+            &xite_pk,
         );
         xite.add_content("data/users/content.json", &parent_v2, &none).unwrap();
         assert!(!storage.exists(&user_inner), "archived child content removed");
@@ -1757,14 +1757,14 @@ mod tests {
         // The EpixPost flow: a user content.json declares an `optional`
         // pattern, so a newly written photo signs as optional instead of
         // counting against the user's required size limit.
-        let site_pk = epix_crypt::new_seed();
-        let site = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let xite_pk = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&xite_pk).unwrap();
         let user_pk = epix_crypt::new_seed();
         let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
-        let xite = Xite::new(Address::parse(site.clone()).unwrap(), storage.clone());
+        let xite = Xite::new(Address::parse(address.clone()).unwrap(), storage.clone());
         let none = std::collections::HashMap::new();
 
         storage
@@ -1772,20 +1772,20 @@ mod tests {
                 "content.json",
                 &signed(
                     serde_json::json!({
-                        "address": site, "modified": 1, "files": {},
+                        "address": address, "modified": 1, "files": {},
                         "includes": { "data/users/content.json": {} },
                     }),
-                    &site_pk,
+                    &xite_pk,
                 ),
             )
             .unwrap();
         let parent = signed(
             serde_json::json!({
-                "address": site, "inner_path": "data/users/content.json",
+                "address": address, "inner_path": "data/users/content.json",
                 "modified": 10, "files": {},
                 "user_contents": { "permissions": {}, "cert_signers": {} },
             }),
-            &site_pk,
+            &xite_pk,
         );
         xite.add_content("data/users/content.json", &parent, &none).unwrap();
 

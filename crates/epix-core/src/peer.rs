@@ -117,7 +117,7 @@ impl PeerAddr {
     /// the OS TCP timeout is ~75s), 45s for an overlay peer - building a Tor
     /// circuit and finishing an onion rendezvous routinely takes 20-40s, so
     /// clearnet-sized bounds cut off reachable overlay peers mid-handshake.
-    /// Every per-peer dial site shares this so no path is overlay-blind.
+    /// Every per-peer dial xite shares this so no path is overlay-blind.
     /// In Tor-always mode ([`set_route_all_via_overlay`]) an Ip peer is dialed
     /// through an exit circuit, so it gets the overlay budget too - the
     /// clearnet 15s cut off every tracker dial and blacked out discovery.
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn overlay_peers_get_the_longer_timeouts() {
-        // Every dial site shares these bounds; an overlay peer (Tor/I2P/mesh)
+        // Every dial xite shares these bounds; an overlay peer (Tor/I2P/mesh)
         // must get the generous ones or it is cut off mid-handshake.
         let clearnet = PeerAddr::parse("1.2.3.4:20790").unwrap();
         assert!(!clearnet.is_overlay());

@@ -413,7 +413,7 @@ pub async fn push_update(
 }
 
 /// Fetch a signed content.json (raw bytes — caller verifies signature).
-/// A big site's content.json does not fit one frame (see `serve_signed`),
+/// A big xite's content.json does not fit one frame (see `serve_signed`),
 /// so this drains the stream until the terminal frame and concatenates,
 /// instead of taking the first response. Bounded by [`MAX_SIGNED_BYTES`]:
 /// the request carries no size hint, so without a cap a peer could stream
@@ -551,7 +551,7 @@ async fn store_many_items(
 /// in the response (the peer doesn't have them; try elsewhere).
 ///
 /// `on_obj` fires per object as it lands, mid-batch. A batch is a whole
-/// site's small files, so reporting only at the end left the loading bar at
+/// xite's small files, so reporting only at the end left the loading bar at
 /// zero for the entire download and a forum's posts invisible until the last
 /// one arrived.
 pub async fn fetch_many(

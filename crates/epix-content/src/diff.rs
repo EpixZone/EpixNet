@@ -1,5 +1,5 @@
 //! Line-based file diffs for publish updates (EpixNet's `util/Diff.py`). When a
-//! site update changes a data file, the publisher can send a compact diff of
+//! xite update changes a data file, the publisher can send a compact diff of
 //! that file instead of the whole thing; the receiver patches its old copy to
 //! get the new bytes without downloading. A diff that can't be applied cleanly
 //! just falls back to a normal file download, so this is a bandwidth

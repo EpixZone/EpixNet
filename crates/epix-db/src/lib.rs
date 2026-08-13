@@ -75,14 +75,14 @@ impl Database {
         exclude: &[String],
     ) -> Result<usize> {
         let conn = self.conn()?;
-        populate::populate_site_filtered(&conn, schema, db_dir.as_ref(), "", exclude, "")
+        populate::populate_xite_filtered(&conn, schema, db_dir.as_ref(), "", exclude, "")
     }
 
     /// Route ONE data file under `db_dir` into the db, per the schema's `maps`
     /// - EpixNet's `Db.updateJson` for a single file, so a file is queryable
     /// the moment it arrives instead of after a full-tree rescan. `rel_path`
     /// is the file's path relative to `db_dir`; `path_prefix` (a merged
-    /// site's address, or empty) is prepended for the regex match, and `site`
+    /// xite's address, or empty) is prepended for the regex match, and `xite`
     /// tags the rows for a version-3 merger db. Returns whether any map
     /// matched (false too when the file is missing or not JSON, mirroring the
     /// full scan, which skips such files).
@@ -91,7 +91,7 @@ impl Database {
         schema: &DbSchema,
         db_dir: impl AsRef<std::path::Path>,
         rel_path: &str,
-        site: &str,
+        xite: &str,
         path_prefix: &str,
     ) -> Result<bool> {
         let Ok(bytes) = std::fs::read(db_dir.as_ref().join(rel_path)) else {
@@ -106,21 +106,21 @@ impl Database {
             format!("{path_prefix}/{rel_path}")
         };
         let conn = self.conn()?;
-        populate::update_json(&conn, schema, &matched_path, &data, site)
+        populate::update_json(&conn, schema, &matched_path, &data, xite)
     }
 
-    /// Populate a version-3 merger db from one merged site's files, tagging the
-    /// rows with `site`. Every file's path is matched as `<site>/<relpath>`, so
+    /// Populate a version-3 merger db from one merged xite's files, tagging the
+    /// rows with `xite`. Every file's path is matched as `<xite>/<relpath>`, so
     /// the merger's address-scoped dbschema regexes match. Call once per
-    /// merged site.
-    pub fn populate_site(
+    /// merged xite.
+    pub fn populate_xite(
         &self,
         schema: &DbSchema,
         db_dir: impl AsRef<std::path::Path>,
-        site: &str,
+        xite: &str,
     ) -> Result<usize> {
         let conn = self.conn()?;
-        populate::populate_site_prefixed(&conn, schema, db_dir.as_ref(), site, site)
+        populate::populate_xite_prefixed(&conn, schema, db_dir.as_ref(), xite, xite)
     }
 
     /// Run a read query, returning rows as JSON objects.

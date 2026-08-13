@@ -8,9 +8,9 @@
 //! Requests the extension makes:
 //! - `{"cmd":"status"}` -> `{ serving, ui_port }`
 //! - `{"cmd":"resolve","name":"talk.epix"}` -> `{ address }` or `{ error }`
-//! - `{"cmd":"getClearnetAllow","site":"talk.epix"}` -> `{ allow: bool }`
-//! - `{"cmd":"setClearnetAllow","site":"talk.epix","allow":true}` -> `{ ok }`
-//! - `{"cmd":"listClearnetAllow"}` -> `{ sites: [..] }`
+//! - `{"cmd":"getClearnetAllow","xite":"talk.epix"}` -> `{ allow: bool }`
+//! - `{"cmd":"setClearnetAllow","xite":"talk.epix","allow":true}` -> `{ ok }`
+//! - `{"cmd":"listClearnetAllow"}` -> `{ xites: [..] }`
 //! - `{"cmd":"ledgerList"}` -> `{ devices: [..] }` (Ledger over HID)
 //! - `{"cmd":"ledgerExchange","apdu":"<hex>"}` -> `{ response: "<hex>" }`
 
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 pub mod ledger;
 
-/// Per-browser settings persisted next to the node data (which sites may reach
+/// Per-browser settings persisted next to the node data (which xites may reach
 /// clearnet). The extension enforces the block; this is the source of truth.
 pub struct Settings {
     path: PathBuf,
@@ -47,32 +47,32 @@ impl Settings {
         }
     }
 
-    pub fn clearnet_allowed(&self, site: &str) -> bool {
+    pub fn clearnet_allowed(&self, xite: &str) -> bool {
         self.read()
             .get("clearnet_allow")
-            .and_then(|m| m.get(site))
+            .and_then(|m| m.get(xite))
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     }
 
-    pub fn set_clearnet_allowed(&self, site: &str, allow: bool) {
+    pub fn set_clearnet_allowed(&self, xite: &str, allow: bool) {
         let mut v = self.read();
         let map = v
             .get_mut("clearnet_allow")
             .and_then(|m| m.as_object_mut());
         if let Some(map) = map {
             if allow {
-                map.insert(site.to_string(), json!(true));
+                map.insert(xite.to_string(), json!(true));
             } else {
-                map.remove(site);
+                map.remove(xite);
             }
         } else {
-            v["clearnet_allow"] = json!({ site: allow });
+            v["clearnet_allow"] = json!({ xite: allow });
         }
         self.write(&v);
     }
 
-    pub fn allowed_sites(&self) -> Vec<String> {
+    pub fn allowed_xites(&self) -> Vec<String> {
         self.read()
             .get("clearnet_allow")
             .and_then(|m| m.as_object())
@@ -183,18 +183,18 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             }
         }
         "getClearnetAllow" => {
-            let site = req.get("site").and_then(|v| v.as_str()).unwrap_or("");
-            json!({ "allow": settings.clearnet_allowed(site) })
+            let xite = req.get("site").and_then(|v| v.as_str()).unwrap_or("");
+            json!({ "allow": settings.clearnet_allowed(xite) })
         }
         "setClearnetAllow" => {
-            let site = req.get("site").and_then(|v| v.as_str()).unwrap_or("");
+            let xite = req.get("site").and_then(|v| v.as_str()).unwrap_or("");
             let allow = req.get("allow").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !site.is_empty() {
-                settings.set_clearnet_allowed(site, allow);
+            if !xite.is_empty() {
+                settings.set_clearnet_allowed(xite, allow);
             }
-            json!({ "ok": true, "site": site, "allow": allow })
+            json!({ "ok": true, "site": xite, "allow": allow })
         }
-        "listClearnetAllow" => json!({ "sites": settings.allowed_sites() }),
+        "listClearnetAllow" => json!({ "sites": settings.allowed_xites() }),
         // Ledger hardware wallet over HID (see src/ledger.rs). Blocking HID
         // I/O, so run it off the async runtime's worker.
         "ledgerList" => ledger::list(),

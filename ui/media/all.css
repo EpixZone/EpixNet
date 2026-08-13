@@ -296,7 +296,7 @@ a {
 }
 
 /* Unread-notification pill on the home/nav button, painted by the wrapper
-   when a site (e.g. Epix Mail) reports new items via notificationCount. */
+   when a xite (e.g. Epix Mail) reports new items via notificationCount. */
 .fixbutton-badge {
 	position: absolute;
 	top: -2px;
@@ -364,7 +364,7 @@ a {
 	max-height: 100vh;
 	overflow-y: auto;
 	z-index: 999;
-	/* the container never blocks the site; the cards take events back */
+	/* the container never blocks the xite; the cards take events back */
 	pointer-events: none;
 }
 
@@ -999,7 +999,7 @@ a {
 }
 
 /* Dismissal: fade the whole screen out in place; pointer-events off so the
-   invisible overlay never blocks the site while waiting for removal */
+   invisible overlay never blocks the xite while waiting for removal */
 .loadingscreen.done {
 	height: 100%;
 	opacity: 0;

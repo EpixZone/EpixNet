@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use epix_core::PeerAddr;
-use epix_dht::{site_key, Contact, Node, NodeId};
+use epix_dht::{xite_key, Contact, Node, NodeId};
 use epix_dht_net::{DhtService, KadSender, WireRpcClient};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -81,7 +81,7 @@ async fn dht_announce_and_lookup_over_the_kad_payload() {
     }
 
     // Node 4 announces that a host serves a rare xite.
-    let key = site_key("epix1rarexite000000000000000000000000000");
+    let key = xite_key("epix1rarexite000000000000000000000000000");
     let host = PeerAddr::parse("203.0.113.9:26552").unwrap();
     nodes[4].node.announce(key, host.clone(), &nodes[4].client).await;
 
@@ -106,7 +106,7 @@ async fn overlay_self_addresses_round_trip_over_the_wire() {
         }
     }
 
-    let key = site_key("epix1onionpublisher77777777777777777777");
+    let key = xite_key("epix1onionpublisher77777777777777777777");
     let claims = vec![
         PeerAddr::parse("0.0.0.0:48333").unwrap(),
         PeerAddr::parse("expyuzz4wqqyqhjn.onion:48333").unwrap(),
@@ -139,16 +139,16 @@ async fn overlay_self_addresses_round_trip_over_the_wire() {
 }
 
 #[tokio::test]
-async fn cold_start_probe_bootstraps_and_finds_a_site_with_no_tracker() {
-    // The rare-site scenario: A serves a xite, B knows A only by ADDRESS
-    // (e.g. learned from another site's swarm) - no node id, no tracker,
+async fn cold_start_probe_bootstraps_and_finds_a_xite_with_no_tracker() {
+    // The rare-xite scenario: A serves a xite, B knows A only by ADDRESS
+    // (e.g. learned from another xite's swarm) - no node id, no tracker,
     // empty routing tables on both sides.
     let net = Arc::new(Net::default());
     let a = spawn_node(100, &net);
     let b = spawn_node(101, &net);
 
-    // A announces the site into its own store (its dht_loop does this).
-    let key = site_key("epix1rarexite000000000000000000000000000");
+    // A announces the xite into its own store (its dht_loop does this).
+    let key = xite_key("epix1rarexite000000000000000000000000000");
     let host = PeerAddr::parse("203.0.113.9:26552").unwrap();
     a.node.announce(key, host.clone(), &a.client).await;
 

@@ -41,9 +41,9 @@ pub fn from_sql(v: ValueRef) -> Value {
     }
 }
 
-/// Get (or create) the `json_id` for a data file's relative path. `site` is the
-/// merged-site address for version-3 (merger) schemas, ignored otherwise.
-fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, site: &str) -> Result<i64> {
+/// Get (or create) the `json_id` for a data file's relative path. `xite` is the
+/// merged-xite address for version-3 (merger) schemas, ignored otherwise.
+fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, xite: &str) -> Result<i64> {
     let rel_path = rel_path.replace('\\', "/");
     match schema.version {
         1 => {
@@ -53,21 +53,21 @@ fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, site: &str) -> 
                 .map_err(db_err)
         }
         3 => {
-            // Merger paths are keyed `<site>/<inner path>` so the schema
+            // Merger paths are keyed `<xite>/<inner path>` so the schema
             // regexes match, but the json row's `directory` is stored WITHOUT
-            // the site segment (EpixNet's v3 getJsonRow splits the path into
-            // site / directory / file_name). Queries rely on that shape, e.g.
+            // the xite segment (EpixNet's v3 getJsonRow splits the path into
+            // xite / directory / file_name). Queries rely on that shape, e.g.
             // REPLACE(json.directory, 'data/users/', '') for the user name.
-            let inner = rel_path.strip_prefix(&format!("{site}/")).unwrap_or(rel_path.as_str());
+            let inner = rel_path.strip_prefix(&format!("{xite}/")).unwrap_or(rel_path.as_str());
             let (dir, name) = inner.rsplit_once('/').unwrap_or(("", inner));
             conn.execute(
                 "INSERT OR IGNORE INTO json (site, directory, file_name) VALUES (?1, ?2, ?3)",
-                [site, dir, name],
+                [xite, dir, name],
             )
             .map_err(db_err)?;
             conn.query_row(
                 "SELECT json_id FROM json WHERE site = ?1 AND directory = ?2 AND file_name = ?3",
-                [site, dir, name],
+                [xite, dir, name],
                 |r| r.get(0),
             )
             .map_err(db_err)
@@ -139,13 +139,13 @@ fn allowed_cols(schema: &DbSchema, entry: &ToTable) -> Vec<String> {
 }
 
 /// Route one already-loaded data file's JSON into the db per the matching maps.
-/// `site` tags the rows for a version-3 merger db (empty for a normal site).
+/// `xite` tags the rows for a version-3 merger db (empty for a normal xite).
 pub fn update_json(
     conn: &Connection,
     schema: &DbSchema,
     rel_path: &str,
     data: &Value,
-    site: &str,
+    xite: &str,
 ) -> Result<bool> {
     let mut matched = false;
     for (pattern, map) in &schema.maps {
@@ -154,7 +154,7 @@ pub fn update_json(
             continue;
         }
         matched = true;
-        let jid = json_id(conn, schema, rel_path, site)?;
+        let jid = json_id(conn, schema, rel_path, xite)?;
 
         // to_keyvalue
         for key in &map.to_keyvalue {
@@ -179,7 +179,7 @@ pub fn update_json(
                     } else {
                         format!("{dir}/{file_name}")
                     };
-                    json_id(conn, schema, &sibling, site)?
+                    json_id(conn, schema, &sibling, xite)?
                 }
                 None => jid,
             };
@@ -202,7 +202,7 @@ pub fn update_json(
                 let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                 let sibling =
                     if dir.is_empty() { fname.clone() } else { format!("{dir}/{fname}") };
-                json_id(conn, schema, &sibling, site)?
+                json_id(conn, schema, &sibling, xite)?
             }
             None => jid,
         };
@@ -272,39 +272,39 @@ pub fn update_json(
 /// that match a map. `db_dir` is the xite's content root; paths are matched
 /// relative to it (forward slashes), like EpixNet.
 pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<usize> {
-    populate_site_filtered(conn, schema, db_dir, "", &[], "")
+    populate_xite_filtered(conn, schema, db_dir, "", &[], "")
 }
 
-/// Like [`populate`], but tags every row with `site` - for a version-3 merger
-/// db aggregating data from several merged sites (call once per merged site).
-pub fn populate_site(conn: &Connection, schema: &DbSchema, db_dir: &Path, site: &str) -> Result<usize> {
-    populate_site_filtered(conn, schema, db_dir, site, &[], "")
+/// Like [`populate`], but tags every row with `xite` - for a version-3 merger
+/// db aggregating data from several merged xites (call once per merged xite).
+pub fn populate_xite(conn: &Connection, schema: &DbSchema, db_dir: &Path, xite: &str) -> Result<usize> {
+    populate_xite_filtered(conn, schema, db_dir, xite, &[], "")
 }
 
-/// Like [`populate_site`], but every scanned file's path is matched against the
+/// Like [`populate_xite`], but every scanned file's path is matched against the
 /// schema as `<path_prefix>/<relative path>`. Merger databases use this: a
-/// merged site's files are keyed under its address (e.g.
+/// merged xite's files are keyed under its address (e.g.
 /// `epix1…/data/users/x/data.json`), which is what the merger's dbschema
 /// regexes match on (a plain `data/users/x/data.json` matches nothing, since
 /// the patterns require an address segment before `data/`).
-pub fn populate_site_prefixed(
+pub fn populate_xite_prefixed(
     conn: &Connection,
     schema: &DbSchema,
     db_dir: &Path,
-    site: &str,
+    xite: &str,
     path_prefix: &str,
 ) -> Result<usize> {
-    populate_site_filtered(conn, schema, db_dir, site, &[], path_prefix)
+    populate_xite_filtered(conn, schema, db_dir, xite, &[], path_prefix)
 }
 
-/// Like [`populate_site`], but skips any data file whose path contains one of
+/// Like [`populate_xite`], but skips any data file whose path contains one of
 /// `exclude` - the ContentFilter mute enforcement point (muted authors'
 /// `data/<auth_address>/…` files are left out of the database).
-pub fn populate_site_filtered(
+pub fn populate_xite_filtered(
     conn: &Connection,
     schema: &DbSchema,
     db_dir: &Path,
-    site: &str,
+    xite: &str,
     exclude: &[String],
     path_prefix: &str,
 ) -> Result<usize> {
@@ -333,7 +333,7 @@ pub fn populate_site_filtered(
             }
             let Ok(bytes) = std::fs::read(&path) else { continue };
             let Ok(data) = serde_json::from_slice::<Value>(&bytes) else { continue };
-            if update_json(conn, schema, &rel_str, &data, site)? {
+            if update_json(conn, schema, &rel_str, &data, xite)? {
                 count += 1;
             }
         }
@@ -398,7 +398,7 @@ fn sql_quote(v: &Value) -> String {
 /// EpixNet's `WHERE ?` + dict convention (DbCursor.parseQuery): the LAST `?`
 /// in a SELECT/DELETE/UPDATE expands to conditions built from the dict -
 /// a list value becomes `key IN (...)`, scalars `key = ?`, with `not__`,
-/// `__like`, and trailing `>`/`<` key modifiers. Sites query this way
+/// `__like`, and trailing `>`/`<` key modifiers. Xites query this way
 /// (Epix Post: `... FROM comment ... WHERE ? AND date_added < n` with
 /// `{post_uri: [...]}`).
 fn expand_where_dict(sql: &str, map: &Map<String, Value>) -> Option<(String, Vec<SqlValue>)> {
@@ -529,9 +529,9 @@ mod merge_tests {
         let conn = Connection::open_in_memory().unwrap();
         let schema = epixpost_schema();
         apply(&conn, &schema).unwrap();
-        let site = "epix1hub";
+        let xite = "epix1hub";
         // The user's data.json (profile) creates its json row.
-        update_json(&conn, &schema, "epix1hub/data/users/u/data.json", &json!({"user_name":"alice"}), site).unwrap();
+        update_json(&conn, &schema, "epix1hub/data/users/u/data.json", &json!({"user_name":"alice"}), xite).unwrap();
         // posts.json: post 1 live, post 2 edited (v2 supersedes v1), post 3 tombstoned.
         let posts = json!({ "record_format":"epix-orset-1", "post":[
             {"post_id":1,"body":"one","clock":1,"supersedes":0,"deleted":false},
@@ -540,7 +540,7 @@ mod merge_tests {
             {"post_id":3,"body":"gone","clock":1,"supersedes":0,"deleted":false},
             {"post_id":3,"body":"","clock":5,"supersedes":1,"deleted":true}
         ]});
-        update_json(&conn, &schema, "epix1hub/data/users/u/posts.json", &posts, site).unwrap();
+        update_json(&conn, &schema, "epix1hub/data/users/u/posts.json", &posts, xite).unwrap();
 
         // Live winners only, joined to the data.json profile row.
         let mut stmt = conn

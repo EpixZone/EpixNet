@@ -11,10 +11,10 @@
 //! removed - or nodes on different releases stop seeing each other on the LAN.
 //!
 //! The exchange is the reference four-message flow:
-//! 1. `DiscoverRequest` (broadcast) -> 2. `DiscoverResponse {sites_changed}` ->
-//!    3. `SiteListRequest` (only if the peer's `sites_changed` differs from what
-//!    we last saw) -> 4. `SiteListResponse {sites, sites_changed}`. The
-//!    requester then adds the responder as a peer for every site hash they both
+//! 1. `DiscoverRequest` (broadcast) -> 2. `DiscoverResponse {xites_changed}` ->
+//!    3. `SiteListRequest` (only if the peer's `xites_changed` differs from what
+//!    we last saw) -> 4. `SiteListResponse {xites, xites_changed}`. The
+//!    requester then adds the responder as a peer for every xite hash they both
 //!    serve.
 //!
 //! Compiled into every build (`local-discovery`), phones included, so an
@@ -52,8 +52,8 @@ const REV: i64 = 8192;
 enum Cmd {
     DiscoverRequest,
     DiscoverResponse,
-    SiteListRequest,
-    SiteListResponse,
+    XiteListRequest,
+    XiteListResponse,
 }
 
 /// Who sent a datagram. APPEND-ONLY (postcard field order).
@@ -72,10 +72,10 @@ struct Sender {
 /// layout. APPEND-ONLY (postcard field order).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Params {
-    /// A change token over the sender's served-site set.
-    sites_changed: i64,
-    /// The sender's served-site hashes (`SiteListResponse` only).
-    sites: Vec<[u8; 32]>,
+    /// A change token over the sender's served-xite set.
+    xites_changed: i64,
+    /// The sender's served-xite hashes (`SiteListResponse` only).
+    xites: Vec<[u8; 32]>,
 }
 
 /// One datagram. APPEND-ONLY (postcard field order).
@@ -126,7 +126,7 @@ pub async fn local_discovery_loop(
     let recv_sock = socket.clone();
     let recv_id = id.clone();
     let receiver = tokio::spawn(async move {
-        // Per-peer last-seen `sites_changed`, so we only re-request a site list
+        // Per-peer last-seen `xites_changed`, so we only re-request a xite list
         // when the peer's set actually changed (matches known_peers).
         let mut known: HashMap<String, i64> = HashMap::new();
         let mut buf = vec![0u8; 8192];
@@ -179,8 +179,8 @@ fn random_peer_id() -> String {
     format!("{:012x}", h.finish() & 0xffff_ffff_ffff)
 }
 
-/// The hashes of every site we serve.
-async fn our_site_hashes(state: &AppState) -> HashMap<[u8; 32], String> {
+/// The hashes of every xite we serve.
+async fn our_xite_hashes(state: &AppState) -> HashMap<[u8; 32], String> {
     state
         .xite_addresses()
         .await
@@ -189,9 +189,9 @@ async fn our_site_hashes(state: &AppState) -> HashMap<[u8; 32], String> {
         .collect()
 }
 
-/// A cheap change-token over our served site set: it changes whenever a site is
+/// A cheap change-token over our served xite set: it changes whenever a xite is
 /// added or removed, so a peer knows to re-request our list.
-async fn our_sites_changed(state: &AppState) -> i64 {
+async fn our_xites_changed(state: &AppState) -> i64 {
     use std::hash::{BuildHasher, Hasher};
     let mut addrs = state.xite_addresses().await;
     addrs.sort();
@@ -228,36 +228,36 @@ async fn handle_message(
     match msg.cmd {
         Cmd::DiscoverRequest => {
             let params =
-                Params { sites_changed: our_sites_changed(state).await, ..Params::default() };
+                Params { xites_changed: our_xites_changed(state).await, ..Params::default() };
             let reply = encode_msg(Cmd::DiscoverResponse, params, id);
             let _ = sock.send_to(&reply, reply_to).await;
         }
         Cmd::DiscoverResponse => {
-            // Only pull the site list when the peer's set changed since last time.
-            if known.get(&msg.sender.peer_id) != Some(&msg.params.sites_changed) {
-                let reply = encode_msg(Cmd::SiteListRequest, Params::default(), id);
+            // Only pull the xite list when the peer's set changed since last time.
+            if known.get(&msg.sender.peer_id) != Some(&msg.params.xites_changed) {
+                let reply = encode_msg(Cmd::XiteListRequest, Params::default(), id);
                 let _ = sock.send_to(&reply, reply_to).await;
             }
         }
-        Cmd::SiteListRequest => {
+        Cmd::XiteListRequest => {
             let params = Params {
-                sites: our_site_hashes(state).await.into_keys().collect(),
-                sites_changed: our_sites_changed(state).await,
+                xites: our_xite_hashes(state).await.into_keys().collect(),
+                xites_changed: our_xites_changed(state).await,
             };
-            let reply = encode_msg(Cmd::SiteListResponse, params, id);
+            let reply = encode_msg(Cmd::XiteListResponse, params, id);
             let _ = sock.send_to(&reply, reply_to).await;
         }
-        Cmd::SiteListResponse => {
-            known.insert(msg.sender.peer_id.clone(), msg.params.sites_changed);
+        Cmd::XiteListResponse => {
+            known.insert(msg.sender.peer_id.clone(), msg.params.xites_changed);
             if msg.sender.port != 0 {
-                let ours = our_site_hashes(state).await;
-                add_local_peer(state, from.ip(), msg.sender.port, &msg.params.sites, &ours).await;
+                let ours = our_xite_hashes(state).await;
+                add_local_peer(state, from.ip(), msg.sender.port, &msg.params.xites, &ours).await;
             }
         }
     }
 }
 
-/// Add `ip:port` as a peer for every site whose hash both nodes share.
+/// Add `ip:port` as a peer for every xite whose hash both nodes share.
 async fn add_local_peer(
     state: &AppState,
     ip: IpAddr,
@@ -302,18 +302,18 @@ mod tests {
         let mut known = HashMap::new();
         let from: SocketAddr = "10.0.0.5:5000".parse().unwrap();
         let shared = Params {
-            sites: vec![address_hash("1LanSite")],
-            sites_changed: 7,
+            xites: vec![address_hash("1LanSite")],
+            xites_changed: 7,
         };
 
-        // Our own peer_id -> ignored, even though the site matches.
-        let mine = encode_msg(Cmd::SiteListResponse, shared.clone(), &id("aaaa", 15441));
+        // Our own peer_id -> ignored, even though the xite matches.
+        let mine = encode_msg(Cmd::XiteListResponse, shared.clone(), &id("aaaa", 15441));
         handle_message(&state, &sock, &me, &mut known, &mine, from).await;
         assert_eq!(state.peer_counts("1LanSite").await.total, 0);
 
         // Wrong service -> ignored.
         let mut wrong = Msg {
-            cmd: Cmd::SiteListResponse,
+            cmd: Cmd::XiteListResponse,
             params: shared,
             sender: id("bbbb", 15441).sender(),
         };
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn site_list_response_adds_peer_for_a_shared_site() {
+    async fn xite_list_response_adds_peer_for_a_shared_xite() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
         state
@@ -336,17 +336,17 @@ mod tests {
         let mut known = HashMap::new();
         let from: SocketAddr = "10.0.0.5:5000".parse().unwrap();
 
-        // A peer's SiteListResponse advertising our shared site at its port.
+        // A peer's SiteListResponse advertising our shared xite at its port.
         let peer = id("bbbb", 15441);
-        let params = Params { sites: vec![address_hash("1LanSite")], sites_changed: 7 };
-        let msg = encode_msg(Cmd::SiteListResponse, params, &peer);
+        let params = Params { xites: vec![address_hash("1LanSite")], xites_changed: 7 };
+        let msg = encode_msg(Cmd::XiteListResponse, params, &peer);
         handle_message(&state, &sock, &me, &mut known, &msg, from).await;
         assert_eq!(state.peer_counts("1LanSite").await.total, 1);
         assert_eq!(known.get("bbbb"), Some(&7));
 
-        // A response for a site we do not serve adds nothing.
-        let params = Params { sites: vec![[9u8; 32]], ..Params::default() };
-        let msg = encode_msg(Cmd::SiteListResponse, params, &peer);
+        // A response for a xite we do not serve adds nothing.
+        let params = Params { xites: vec![[9u8; 32]], ..Params::default() };
+        let msg = encode_msg(Cmd::XiteListResponse, params, &peer);
         handle_message(&state, &sock, &me, &mut known, &msg, from).await;
         assert_eq!(state.peer_counts("1LanSite").await.total, 1);
     }
@@ -355,13 +355,13 @@ mod tests {
     fn envelope_roundtrips_with_sender() {
         let me = id("cccc", 26552);
         let bytes =
-            encode_msg(Cmd::DiscoverResponse, Params { sites_changed: 3, ..Params::default() }, &me);
+            encode_msg(Cmd::DiscoverResponse, Params { xites_changed: 3, ..Params::default() }, &me);
         let parsed: Msg = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.cmd, Cmd::DiscoverResponse);
         assert_eq!(parsed.sender.service, "epixnet");
         assert_eq!(parsed.sender.peer_id, "cccc");
         assert_eq!(parsed.sender.port, 26552);
-        assert_eq!(parsed.params.sites_changed, 3);
+        assert_eq!(parsed.params.xites_changed, 3);
     }
 
     /// The postcard variant indices are the wire: pin them so an insertion in
@@ -372,8 +372,8 @@ mod tests {
         for (i, cmd) in [
             Cmd::DiscoverRequest,
             Cmd::DiscoverResponse,
-            Cmd::SiteListRequest,
-            Cmd::SiteListResponse,
+            Cmd::XiteListRequest,
+            Cmd::XiteListResponse,
         ]
         .into_iter()
         .enumerate()
