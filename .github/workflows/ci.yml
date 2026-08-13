@@ -34,7 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # --all-targets also compiles tests and examples, so a break in any of
       # them (like the RustCrypto bump) fails here.
       - name: Build (all targets)
@@ -73,7 +73,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The actual iOS/Android target builds need the Apple SDK / Android NDK on
       # a matching runner (release pipeline). Here we validate the FEATURE
       # PROFILES resolve and compile on the host - a dependency leaking into the
