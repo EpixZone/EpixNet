@@ -16,7 +16,7 @@ arti-client = { version = "0.44", default-features = false, features = [
     "onion-service-client",
     "onion-service-service",
 ] }
-tor-hsservice = "0.44"
+tor-hsservice = "0.45"
 safelog = "0.9"
 tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
 tor-cell = "0.45"
