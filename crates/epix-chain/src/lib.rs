@@ -195,7 +195,7 @@ pub mod xid_signers {
 /// then confirmed through the Merkle-verified forward resolve, so a rogue RPC
 /// can't attach an address to someone else's name. Negative answers cache
 /// briefly (transient failures don't cache at all), positives cache long -
-/// this is what stops sites from hammering the chain once per render.
+/// this is what stops xites from hammering the chain once per render.
 pub mod xid_identity {
     use super::DEFAULT_RPC_URL;
     use std::collections::HashMap;

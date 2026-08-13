@@ -6,7 +6,7 @@
 //! plugins and assembles their contributions.
 //!
 //! The first seam is the EpixFrame WebSocket API: a plugin can add commands that
-//! xites call. Further seams (site lifecycle, content verification, peer
+//! xites call. Further seams (xite lifecycle, content verification, peer
 //! discovery, worker priority, new FileRequest commands) hang off the same
 //! [`Plugin`] trait as additional methods.
 
@@ -49,7 +49,7 @@ pub trait Plugin: Send + Sync {
     fn start(&self, _state: &Arc<epix_ui::AppState>) {}
 
     // Future seams (added as the subsystems grow):
-    //   fn on_site_loaded(&self, ...) {}
+    //   fn on_xite_loaded(&self, ...) {}
     //   fn verify_content(&self, ...) -> HookOutcome { HookOutcome::Continue }
     //   fn priority_boost(&self, ...) -> i32 { 0 }
     //   fn file_request_handler(&self, cmd: &str, ...) -> Option<...> { None }

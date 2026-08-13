@@ -1,6 +1,6 @@
 //! Platform integration for a persistent desktop node: the data directory, a
 //! single-instance lock, and log-file rotation. Replaces the earlier
-//! temp-directory data location so a node keeps its identity, sites, and config
+//! temp-directory data location so a node keeps its identity, xites, and config
 //! across restarts in the conventional per-OS location.
 
 use std::path::PathBuf;

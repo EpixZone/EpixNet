@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 const WRAPPER_ID: i64 = 1_000_000;
 
-/// A data-dir-backed state with one owned, signed site holding a template
+/// A data-dir-backed state with one owned, signed xite holding a template
 /// layout (data-default/ + live data/) for the clone test.
-async fn state_with_site() -> (Arc<AppState>, tempfile::TempDir, String, String) {
+async fn state_with_xite() -> (Arc<AppState>, tempfile::TempDir, String, String) {
     let root = tempfile::tempdir().unwrap();
     let state = AppState::with_data_dir("ws-test", root.path());
     let privkey = epix_crypt::new_seed();
@@ -27,26 +27,26 @@ async fn state_with_site() -> (Arc<AppState>, tempfile::TempDir, String, String)
     state
         .add_xite(&address, XiteEntry { storage, content: Some(content) })
         .await;
-    state.set_site_privatekey(&address, &privkey).await.unwrap();
+    state.set_xite_privatekey(&address, &privkey).await.unwrap();
     state.sign_xite(&address, &privkey).await.unwrap();
     (state, root, address, privkey)
 }
 
 #[tokio::test]
-async fn site_add_reports_existing_site() {
-    let (state, _root, address, _key) = state_with_site().await;
+async fn xite_add_reports_existing_xite() {
+    let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state, Some(address.clone()));
     let res = registry
         .dispatch(&session, "siteAdd", &json!({ "address": address }), WRAPPER_ID)
         .await
         .unwrap();
-    assert_eq!(res, json!({ "error": "Site already added" }));
+    assert_eq!(res, json!({ "error": "Xite already added" }));
 }
 
 #[tokio::test]
 async fn file_query_wildcard_and_filter() {
-    let (state, _root, address, _key) = state_with_site().await;
+    let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state, Some(address));
 
@@ -82,7 +82,7 @@ async fn file_query_wildcard_and_filter() {
 
 #[tokio::test]
 async fn modified_files_and_settings_value() {
-    let (state, _root, address, _key) = state_with_site().await;
+    let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address.clone()));
 
@@ -126,9 +126,9 @@ async fn modified_files_and_settings_value() {
 }
 
 #[tokio::test]
-async fn as_runs_commands_for_other_sites_with_admin_only() {
-    let (state, _root, address, _key) = state_with_site().await;
-    // A second site the caller will reach via `as`.
+async fn as_runs_commands_for_other_xites_with_admin_only() {
+    let (state, _root, address, _key) = state_with_xite().await;
+    // A second xite the caller will reach via `as`.
     let dir = tempfile::tempdir().unwrap();
     state
         .add_xite("1Other", XiteEntry {
@@ -140,11 +140,11 @@ async fn as_runs_commands_for_other_sites_with_admin_only() {
     let session = WsSession::new(state.clone(), Some(address.clone()));
 
     let as_params = json!({ "address": "1Other", "cmd": "siteInfo", "params": [] });
-    // Without ADMIN on the caller's site: refused.
+    // Without ADMIN on the caller's xite: refused.
     let err = registry.dispatch(&session, "as", &as_params, 1).await.unwrap_err();
     assert!(err.contains("permission"), "{err}");
 
-    // With ADMIN granted to the caller's site: the inner command runs bound
+    // With ADMIN granted to the caller's xite: the inner command runs bound
     // to the target.
     state.add_permission(&address, "ADMIN").await;
     let res = registry.dispatch(&session, "as", &as_params, 1).await.unwrap();
@@ -152,8 +152,8 @@ async fn as_runs_commands_for_other_sites_with_admin_only() {
 
     let fav = json!({ "address": "1Other", "cmd": "siteFavourite", "params": [true] });
     let res = registry.dispatch(&session, "as", &fav, 1).await.unwrap();
-    assert_eq!(res, Value::from("ok"), "admin dashboard runs an admin command on another site");
-    assert_eq!(state.site_info("1Other").await["settings"]["favorite"], true);
+    assert_eq!(res, Value::from("ok"), "admin dashboard runs an admin command on another xite");
+    assert_eq!(state.xite_info("1Other").await["settings"]["favorite"], true);
 
     // Without ADMIN, the same as-command is refused at the outer gate.
     state.remove_permission(&address, "ADMIN").await;
@@ -163,7 +163,7 @@ async fn as_runs_commands_for_other_sites_with_admin_only() {
 
 #[tokio::test]
 async fn bad_cert_is_recorded() {
-    let (state, _root, address, _key) = state_with_site().await;
+    let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address));
     registry
@@ -176,7 +176,7 @@ async fn bad_cert_is_recorded() {
 
 #[tokio::test]
 async fn server_portcheck_reports_cached_status() {
-    let (state, _root, address, _key) = state_with_site().await;
+    let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address));
     let res =
@@ -189,13 +189,13 @@ async fn server_portcheck_reports_cached_status() {
 }
 
 #[tokio::test]
-async fn site_clone_copies_template_not_live_data() {
-    let (state, root, address, _key) = state_with_site().await;
+async fn xite_clone_copies_template_not_live_data() {
+    let (state, root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address.clone()));
 
-    // Watch for the wrapper `redirect` the dashboard's "Create new, empty site"
-    // relies on to forward the browser to the freshly cloned site.
+    // Watch for the wrapper `redirect` the dashboard's "Create new, empty xite"
+    // relies on to forward the browser to the freshly cloned xite.
     let mut events = state.subscribe_events();
 
     let res = registry
@@ -205,15 +205,15 @@ async fn site_clone_copies_template_not_live_data() {
     let new_address = res["address"].as_str().expect("new address").to_string();
     assert_ne!(new_address, address);
 
-    // A `redirect` to `/<new_address>/`, routed to the source site so it reaches
-    // that site's wrapper connection (EpixNet's `self.cmd("redirect", ...)`).
+    // A `redirect` to `/<new_address>/`, routed to the source xite so it reaches
+    // that xite's wrapper connection (EpixNet's `self.cmd("redirect", ...)`).
     let redirect = std::iter::from_fn(|| events.try_recv().ok())
         .find(|ev| ev.payload.contains("\"redirect\""))
         .expect("siteClone emits a redirect event");
     assert_eq!(redirect.target.as_deref(), Some(address.as_str()));
     assert!(
         redirect.payload.contains(&format!("/{new_address}/")),
-        "redirect targets the new site: {}",
+        "redirect targets the new xite: {}",
         redirect.payload
     );
 
@@ -234,16 +234,16 @@ async fn site_clone_copies_template_not_live_data() {
 
     // The clone is served and owned; its own privatekey is saved.
     assert!(state.has_xite(&new_address).await);
-    assert!(state.site_privatekey(&new_address).await.is_some());
+    assert!(state.xite_privatekey(&new_address).await.is_some());
 }
 
-/// The dashboard's "Create new, empty site" clones with a `template-new` root.
+/// The dashboard's "Create new, empty xite" clones with a `template-new` root.
 /// That directory holds only page files (an index.html), never its own
 /// content.json, so the clone must fall back to the source's ROOT content.json
 /// as the template - otherwise it fails with "Source has no content.json".
 #[tokio::test]
-async fn site_clone_from_template_root_uses_root_content() {
-    let (state, root, address, _key) = state_with_site().await;
+async fn xite_clone_from_template_root_uses_root_content() {
+    let (state, root, address, _key) = state_with_xite().await;
     // A blank starter page under a `template-new/` root, with NO content.json
     // in that directory (mirrors the real dashboard xite).
     let src_dir = root.path().join("data").join(&address);
@@ -268,7 +268,7 @@ async fn site_clone_from_template_root_uses_root_content() {
     assert_ne!(new_address, address);
 
     let dir = root.path().join("data").join(&new_address);
-    // The template-new page landed de-prefixed as the new site's index.html.
+    // The template-new page landed de-prefixed as the new xite's index.html.
     let index = std::fs::read_to_string(dir.join("index.html")).unwrap();
     assert_eq!(index, "<h1>blank starter</h1>");
 
@@ -283,13 +283,13 @@ async fn site_clone_from_template_root_uses_root_content() {
 
 /// "Upgrade code" (siteClone with a `target_address`) re-copies the source
 /// files onto the existing clone. Old clones recorded `clone_root: "."`, which
-/// must read as the whole site - it used to build a `./` prefix that matched
+/// must read as the whole xite - it used to build a `./` prefix that matched
 /// no file, so the upgrade rewrote content.json while silently copying
 /// nothing. The clone's own identity (title, domain claim) survives; only the
 /// code files come from the source.
 #[tokio::test]
-async fn site_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
-    let (state, root, address, _key) = state_with_site().await;
+async fn xite_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
+    let (state, root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address.clone()));
 
@@ -312,7 +312,7 @@ async fn site_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
     state
         .add_xite(&clone_addr, XiteEntry { storage: clone_storage, content: Some(clone_content) })
         .await;
-    state.set_site_privatekey(&clone_addr, &clone_key).await.unwrap();
+    state.set_xite_privatekey(&clone_addr, &clone_key).await.unwrap();
     state.sign_xite(&clone_addr, &clone_key).await.unwrap();
 
     let res = registry
@@ -328,7 +328,7 @@ async fn site_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
 
     // The source's code files replaced the fork's.
     let index = std::fs::read_to_string(clone_dir.join("index.html")).unwrap();
-    assert_eq!(index, "<h1>template</h1>", "'.' clone_root copies the whole site");
+    assert_eq!(index, "<h1>template</h1>", "'.' clone_root copies the whole xite");
     // -default landed de-suffixed; the clone's live user data survived; the
     // source's live user data still is not copied over.
     assert!(clone_dir.join("data/users/content.json").exists(), "-default landed de-suffixed");
@@ -339,7 +339,7 @@ async fn site_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
     let content: Value =
         serde_json::from_slice(&std::fs::read(clone_dir.join("content.json")).unwrap()).unwrap();
     assert_eq!(content["address"], clone_addr);
-    assert_eq!(content["title"], "Magyar Blog", "upgrade keeps the site's own title");
+    assert_eq!(content["title"], "Magyar Blog", "upgrade keeps the xite's own title");
     assert_eq!(content["domain"], "magyar.epix", "upgrade keeps the domain claim");
     assert_eq!(content["cloned_from"], address);
     assert!(epix_content::verify_signer(&content, &clone_addr), "signed by the clone's key");
@@ -349,7 +349,7 @@ async fn site_clone_upgrade_with_dot_root_copies_files_and_keeps_identity() {
 /// before it responds (the app's grant callback queries right away - python
 /// MergerSite rebuilds in actionPermissionAdd) and push the updated siteInfo.
 #[tokio::test]
-async fn permission_add_merger_rebuilds_db_and_pushes_site_info() {
+async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new("ws-test");
 
@@ -407,8 +407,8 @@ async fn permission_add_merger_rebuilds_db_and_pushes_site_info() {
 /// used to swallow it. An empty key forgets the saved one and must not persist
 /// as `""`, which would leave the xite still reporting `privatekey: true`.
 #[tokio::test]
-async fn set_site_privatekey_rejects_a_key_that_cannot_sign_the_xite() {
-    let (state, _root, address, privkey) = state_with_site().await;
+async fn set_xite_privatekey_rejects_a_key_that_cannot_sign_the_xite() {
+    let (state, _root, address, privkey) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
     let session = WsSession::new(state.clone(), Some(address.clone()));
 
@@ -426,7 +426,7 @@ async fn set_site_privatekey_rejects_a_key_that_cannot_sign_the_xite() {
     assert!(wrong_xite.contains("not to this xite"), "{wrong_xite}");
 
     // Neither refusal disturbed the key that was already saved.
-    assert_eq!(state.site_privatekey(&address).await.as_deref(), Some(privkey.as_str()));
+    assert_eq!(state.xite_privatekey(&address).await.as_deref(), Some(privkey.as_str()));
 
     // The xite's own key is accepted; an empty one clears it.
     registry
@@ -438,7 +438,7 @@ async fn set_site_privatekey_rejects_a_key_that_cannot_sign_the_xite() {
         .await
         .unwrap();
     assert_eq!(
-        state.site_privatekey(&address).await,
+        state.xite_privatekey(&address).await,
         None,
         "an empty key must clear the saved one, not store \"\""
     );

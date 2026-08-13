@@ -190,7 +190,7 @@ mod tests {
     fn sign_without_an_optional_pattern_declares_no_optional_files() {
         // EpixTalk regression guard: a content.json with no `optional` key
         // signs everything as required and gains no files_optional node, even
-        // for names another site's pattern would match.
+        // for names another xite's pattern would match.
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
 
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn load_content_local_serves_unverified_on_disk() {
         // A content.json signed for one address, stored under a DIFFERENT one
-        // (e.g. files copied into a new site's dir but not re-signed yet). The
+        // (e.g. files copied into a new xite's dir but not re-signed yet). The
         // verifying load rejects it; the local load parses it so the on-disk
         // copy still serves - a signature is only required from peers.
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";

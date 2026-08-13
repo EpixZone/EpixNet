@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 /// Default per-xite size limit, in MB. The Epix python client raised its
 /// `--size-limit` default from EpixNet's 10 to 1000; a growing xite stops
 /// syncing at this cap until the user raises it, so the old 10 broke any
-/// site past 10 MB out of the box.
+/// xite past 10 MB out of the box.
 pub const DEFAULT_SIZE_LIMIT_MB: i64 = 1000;
 
 /// Disk donated to the encrypted-shard cache by default.
@@ -95,7 +95,7 @@ pub trait OnDemandResolver: Send + Sync {
 
 /// Extra peer discovery beyond the trackers - the runtime installs a DHT
 /// lookup here so announces and on-demand clones can find peers for rare
-/// sites when the trackers come up short. Kept as a trait so `epix-ui` has
+/// xites when the trackers come up short. Kept as a trait so `epix-ui` has
 /// no dependency on the DHT crates.
 #[async_trait::async_trait]
 pub trait PeerFinder: Send + Sync {
@@ -103,10 +103,10 @@ pub trait PeerFinder: Send + Sync {
     async fn find(&self, address: &str) -> Vec<PeerAddr>;
 }
 
-/// Fetch a xite's included / per-user content (user_contents sites keep their
+/// Fetch a xite's included / per-user content (user_contents xites keep their
 /// data - topics, posts - outside the root's file list). Implemented by the
 /// node (it has the chain resolver for user xIDs); the resync loop calls it so
-/// existing sites pick up new and backfilled user content.
+/// existing xites pick up new and backfilled user content.
 #[async_trait::async_trait]
 pub trait ContentSyncer: Send + Sync {
     /// Sync `address`'s included/user content; returns bytes downloaded and
@@ -159,7 +159,7 @@ pub trait EdxFetcher: Send + Sync {
     /// Fetch a signed inner_path (content.json - the manifest, or a child
     /// content.json) of `address` from a single `peer` over an EDX link, via
     /// `GetSigned`. This is the EDX manifest channel that replaces the msgpack
-    /// `getFile` for content.json: it works for any site (the signed bytes are
+    /// `getFile` for content.json: it works for any xite (the signed bytes are
     /// served independent of per-file `b3`). `Ok(Some(bytes))` on success,
     /// `Ok(None)` if the peer served no such content, `Err` on dial/link
     /// failure so the caller can score the peer and try another.
@@ -171,7 +171,7 @@ pub trait EdxFetcher: Send + Sync {
     ) -> Result<Option<Vec<u8>>, String>;
 
     /// Fetch many signed inner_paths (the child/user content.json files a
-    /// user_contents site declares) in ONE session: dial `peers` once and
+    /// user_contents xite declares) in ONE session: dial `peers` once and
     /// `GetSigned` each path over the reused links. Returns the paths that were
     /// served, mapped to their signed bytes; a path no peer had is simply
     /// absent. The EDX analog of the msgpack `fetch_files_raw` for manifests,
@@ -432,7 +432,7 @@ pub enum LoadingFile {
     /// Expected but not downloaded yet - keep waiting.
     Pending,
     /// content.json is here and doesn't list this file - 404.
-    NotInSite,
+    NotInXite,
 }
 
 /// An update pass is asking peers whether a newer content.json exists. Nothing
@@ -610,12 +610,12 @@ struct ManagedXite {
     optional_progress: Option<OptionalProgress>,
     /// How many optional files this node has PROMISED to fetch for this xite
     /// and does not have yet - the dashboard row's countdown. The promise is
-    /// the user's own: the whole-site toggle, per-directory `optionalHelp`
+    /// the user's own: the whole-xite toggle, per-directory `optionalHelp`
     /// commitments, or the global full-retention setting. A xite the user
     /// never opted into owes nothing, however many optional files it declares.
     ///
     /// Cached because the real answer walks the xite's content.jsons on disk,
-    /// and `site_info` is built on every push. Refreshed by
+    /// and `xite_info` is built on every push. Refreshed by
     /// [`AppState::refresh_optional_owed`] at the few points where the answer
     /// can change: the retry loop's own scope check (which was already paying
     /// for that walk), a committed update, and the toggles themselves.
@@ -663,7 +663,7 @@ struct OptionalProgressFile {
 }
 
 /// Snapshot of a bulk optional-file download in flight, exposed via
-/// `site_info` (`optional_progress`) and rendered live by the sidebar. Bytes
+/// `xite_info` (`optional_progress`) and rendered live by the sidebar. Bytes
 /// drive the overall %, the file list drives the collapsible per-file view.
 #[derive(Clone)]
 struct OptionalProgress {
@@ -755,7 +755,7 @@ pub struct AppState {
     user: RwLock<User>,
     user_path: Option<PathBuf>,
     nonce_counter: AtomicU64,
-    /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {site: {...}} }`.
+    /// ContentFilter store: `{ "mutes": {auth_address: {...}}, "siteblocks": {xite: {...}} }`.
     filters: RwLock<Value>,
     filters_path: Option<PathBuf>,
     /// Transport used to publish updates to peers (set by the node). This is
@@ -899,7 +899,7 @@ pub struct AppState {
     /// In-memory announce tracker: peers other nodes announced to us, keyed by
     /// xite hash, so this node answers `announce` like a Bootstrapper.
     tracker: crate::tracker::TrackerDb,
-    /// Inbound updates currently being verified/downloaded (`site/inner:modified`
+    /// Inbound updates currently being verified/downloaded (`xite/inner:modified`
     /// URIs), so the same pushed version isn't processed twice concurrently
     /// (EpixNet's `files_parsing`).
     updates_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -913,16 +913,16 @@ pub struct AppState {
     /// Xite addresses with an update pass (periodic resync or `siteUpdate`)
     /// currently running, mapped to the phase it is in
     /// ([`UPDATE_PHASE_CHECKING`] -> [`UPDATE_PHASE_UPDATING`]), bracketed by
-    /// [`Self::begin_site_update`] / [`Self::end_site_update`].
+    /// [`Self::begin_xite_update`] / [`Self::end_xite_update`].
     ///
     /// Two readers: a websocket whose event stream lagged (dropped events
-    /// under load) re-sends the closing `updated` event for finished sites
-    /// only - an in-flight site's real outcome event is still coming, and a
-    /// premature one would clear its pill early. And `site_info` reports the
+    /// under load) re-sends the closing `updated` event for finished xites
+    /// only - an in-flight xite's real outcome event is still coming, and a
+    /// premature one would clear its pill early. And `xite_info` reports the
     /// phase as `update_phase`, so a dashboard that loads (or reloads)
     /// mid-pass renders the row's pill from the xite list instead of waiting
     /// for an event it already missed.
-    site_updates_in_flight: std::sync::Mutex<HashMap<String, &'static str>>,
+    xite_updates_in_flight: std::sync::Mutex<HashMap<String, &'static str>>,
     /// Xite addresses with an on-demand clone currently downloading files,
     /// bracketed by [`Self::begin_clone`] / [`Self::end_clone`]. The html
     /// serving gate reads this: while a clone runs, the page document waits
@@ -930,7 +930,7 @@ pub struct AppState {
     clones_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Xite addresses with a bulk optional-file download running
     /// ([`Self::download_optional_files`]), so overlapping triggers (the
-    /// sidebar toggle plus a resync tick) don't walk the same site twice.
+    /// sidebar toggle plus a resync tick) don't walk the same xite twice.
     optional_downloads_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Addresses whose optional-file state may have changed (new content
     /// landed, a toggle flipped): the background retry loop clears their
@@ -953,7 +953,7 @@ pub struct AppState {
     /// hash it was judged against, and the verdict. A file whose metadata and
     /// declared hash are both unchanged keeps its verdict without being
     /// re-read, so repeat scans are one stat per file instead of a full
-    /// read + sha512 of the whole site. The declared hash is part of the key
+    /// read + sha512 of the whole xite. The declared hash is part of the key
     /// because a re-sign changes the judgement without touching the file.
     modified_scan_cache: std::sync::Mutex<
         std::collections::HashMap<String, std::collections::HashMap<String, ((u64, i64), String, bool)>>,
@@ -966,7 +966,7 @@ pub struct AppState {
     /// Confirm/prompt payloads pushed for a xite while no connection was bound
     /// to it, flushed to the next connection that binds (delivered once). The
     /// callback ids are still live in [`Self::callbacks`], so the answer routes
-    /// back normally. Capped per address so an unwatched site can't grow it.
+    /// back normally. Capped per address so an unwatched xite can't grow it.
     pending_prompts: std::sync::Mutex<HashMap<String, Vec<String>>>,
     /// Per-file locks keyed by `(address, inner_path)` so concurrent
     /// `file_need`s for the same file download it once: later callers wait on
@@ -1006,7 +1006,7 @@ pub struct AppState {
     data_root: Option<PathBuf>,
     /// Path to `private/sites.json` (the persistent served-xite registry,
     /// EpixNet's SiteManager). None for in-memory nodes.
-    sites_path: Option<PathBuf>,
+    xites_path: Option<PathBuf>,
     /// Path to the `epixnet.conf` at the default per-OS location, when this
     /// node's data root is user-relocatable (a desktop node not pinned by
     /// `EPIX_DATA_DIR`). `set_data_dir` persists the choice there.
@@ -1413,7 +1413,7 @@ struct Persistence {
     peers_path: Option<PathBuf>,
     pins_path: Option<PathBuf>,
     data_root: Option<PathBuf>,
-    sites_path: Option<PathBuf>,
+    xites_path: Option<PathBuf>,
     #[cfg(feature = "multiuser")]
     multi_users: HashMap<String, User>,
     #[cfg(feature = "multiuser")]
@@ -1439,7 +1439,7 @@ impl Persistence {
             peers_path: None,
             pins_path: None,
             data_root: None,
-            sites_path: None,
+            xites_path: None,
             // No store to load and nowhere to write it: unlike the data-dir
             // case this is NOT seeded with the active user, matching what the
             // in-memory constructor has always done.
@@ -1519,7 +1519,7 @@ impl AppState {
             pins_path: persist.pins_path,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
-            site_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
+            xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1537,7 +1537,7 @@ impl AppState {
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
             data_root: persist.data_root,
-            sites_path: persist.sites_path,
+            xites_path: persist.xites_path,
             data_dir_conf: std::sync::Mutex::new(None),
             extra_trackers: RwLock::new(Vec::new()),
             gossip_trackers: RwLock::new(Vec::new()),
@@ -1626,7 +1626,7 @@ impl AppState {
             config_path: Some(config_path),
             peers_path: Some(dir.join("peers.json")),
             pins_path: Some(dir.join("pins.json")),
-            sites_path: Some(dir.join("sites.json")),
+            xites_path: Some(dir.join("sites.json")),
             data_root: Some(data_root),
             #[cfg(feature = "multiuser")]
             multi_users,
@@ -1766,10 +1766,10 @@ impl AppState {
         out
     }
 
-    // --- NoNewSites: refuse to clone/add new sites when set -----------------
+    // --- NoNewSites: refuse to clone/add new xites when set -----------------
 
-    /// Whether the operator has disabled adding new sites to this node.
-    pub async fn no_new_sites(&self) -> bool {
+    /// Whether the operator has disabled adding new xites to this node.
+    pub async fn no_new_xites(&self) -> bool {
         // The NoNewSites plugin toggle is the normal switch; the config key
         // remains as an operator override (headless/proxy deployments).
         self.plugin_enabled("NoNewSites").await
@@ -1913,7 +1913,7 @@ impl AppState {
     /// The full tracker set for an announce: the `bootstrap` list plus the
     /// operator's `shared_trackers` and the Beacon-discovered `extra_trackers`,
     /// deduped. The periodic announce loop and the on-demand resolver must use
-    /// the same set - a site whose only peers are registered on a
+    /// the same set - a xite whose only peers are registered on a
     /// Beacon-discovered tracker is otherwise invisible to on-demand clones,
     /// which is how an onion-only xite ends up "No peers found" even though a
     /// shared tracker knows its peer.
@@ -2029,41 +2029,41 @@ impl AppState {
     }
 
     /// A xite's stored per-user settings (`userGetSettings`).
-    pub async fn user_site_settings(&self, address: &str) -> Value {
-        self.user.read().await.site_settings(address)
+    pub async fn user_xite_settings(&self, address: &str) -> Value {
+        self.user.read().await.xite_settings(address)
     }
 
     /// Store a xite's per-user settings (`userSetSettings`), persisted to
     /// users.json like EpixNet's `setSiteSettings`.
-    pub async fn set_user_site_settings(&self, address: &str, settings: Value) -> Result<(), String> {
-        self.user.write().await.set_site_settings(address, settings)?;
+    pub async fn set_user_xite_settings(&self, address: &str, settings: Value) -> Result<(), String> {
+        self.user.write().await.set_xite_settings(address, settings)?;
         self.save_user().await;
         Ok(())
     }
 
     // --- Notification plugin -------------------------------------------------
 
-    /// `notificationSubscribe` - save a site's notification queries
-    /// (`{name: [query, params]}`), persisted per site.
-    pub async fn notification_subscribe(&self, site: &str, subscriptions: Value) {
+    /// `notificationSubscribe` - save a xite's notification queries
+    /// (`{name: [query, params]}`), persisted per xite.
+    pub async fn notification_subscribe(&self, xite: &str, subscriptions: Value) {
         let mut all = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
         if let Value::Object(m) = &mut all {
-            m.insert(site.to_string(), subscriptions);
+            m.insert(xite.to_string(), subscriptions);
         }
         self.config_set("notifications", all).await;
     }
 
-    /// `notificationList` - a site's saved notification subscriptions.
-    pub async fn notification_list(&self, site: &str) -> Value {
+    /// `notificationList` - a xite's saved notification subscriptions.
+    pub async fn notification_list(&self, xite: &str) -> Value {
         self.config_get("notifications")
             .await
-            .and_then(|v| v.get(site).cloned())
+            .and_then(|v| v.get(xite).cloned())
             .unwrap_or_else(|| json!({}))
     }
 
-    /// `notificationMute` - global (site = None) or per-site mute.
-    pub async fn notification_mute(&self, muted: bool, site: Option<&str>) {
-        match site {
+    /// `notificationMute` - global (xite = None) or per-xite mute.
+    pub async fn notification_mute(&self, muted: bool, xite: Option<&str>) {
+        match xite {
             None => self.config_set("notification_muted", json!(muted)).await,
             Some(addr) => {
                 let mut mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
@@ -2075,38 +2075,38 @@ impl AppState {
         }
     }
 
-    /// `notificationMuteStatus` - `{global_muted, site_mutes}`.
+    /// `notificationMuteStatus` - `{global_muted, xite_mutes}`.
     pub async fn notification_mute_status(&self) -> Value {
         let global = self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false);
-        let site_mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
-        json!({ "global_muted": global, "site_mutes": site_mutes })
+        let xite_mutes = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        json!({ "global_muted": global, "site_mutes": xite_mutes })
     }
 
-    /// `notificationQuery` - run every subscribed site's notification queries
+    /// `notificationQuery` - run every subscribed xite's notification queries
     /// and return the counts, mirroring EpixNet's `actionNotificationQuery`:
-    /// global/per-site mutes, `:params` inlining, the `{xid_directory}` and
+    /// global/per-xite mutes, `:params` inlining, the `{xid_directory}` and
     /// `{last_seen}` placeholders, the `notification_seen` baseline from the
-    /// site's per-user settings, and per-entry `site`/`title`/`icon` metadata
-    /// (icons from the site's `notification_icons` in content.json).
+    /// xite's per-user settings, and per-entry `xite`/`title`/`icon` metadata
+    /// (icons from the xite's `notification_icons` in content.json).
     pub async fn notification_query(&self) -> Value {
         if self.config_get("notification_muted").await.and_then(|v| v.as_bool()).unwrap_or(false) {
             return json!({ "results": [], "num": 0, "sites": 0, "muted": true });
         }
         let subs = self.config_get("notifications").await.unwrap_or_else(|| json!({}));
-        let site_muted = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
+        let xite_muted = self.config_get("notification_site_muted").await.unwrap_or_else(|| json!({}));
         let dismissed_all =
             self.config_get("notification_dismissed").await.unwrap_or_else(|| json!({}));
         let mut results = Vec::new();
-        let mut sites = 0i64;
-        let Value::Object(by_site) = &subs else {
+        let mut xite_count = 0i64;
+        let Value::Object(by_xite) = &subs else {
             return json!({ "results": [], "num": 0, "sites": 0, "muted": false });
         };
-        for (address, site_subs) in by_site {
-            if site_muted.get(address).and_then(|v| v.as_bool()).unwrap_or(false) {
+        for (address, xite_subs) in by_xite {
+            if xite_muted.get(address).and_then(|v| v.as_bool()).unwrap_or(false) {
                 continue;
             }
-            let Value::Object(queries) = site_subs else { continue };
-            // Like EpixNet, only sites that have (or can have) a database run.
+            let Value::Object(queries) = xite_subs else { continue };
+            // Like EpixNet, only xites that have (or can have) a database run.
             let (has_db, title, icons) = {
                 let xites = self.xites.read().await;
                 match xites.get(address) {
@@ -2130,9 +2130,9 @@ impl AppState {
             if !has_db {
                 continue;
             }
-            sites += 1;
+            xite_count += 1;
             let seen = self
-                .user_site_settings(address)
+                .user_xite_settings(address)
                 .await
                 .get("notification_seen")
                 .cloned()
@@ -2186,7 +2186,7 @@ impl AppState {
                             .and_then(|r| r.get("count").or_else(|| r.get("COUNT(*)")))
                             .and_then(|v| v.as_i64())
                             .unwrap_or(0);
-                        // Subtract the "seen" baseline the site stored via
+                        // Subtract the "seen" baseline the xite stored via
                         // userSetSettings when the user last visited.
                         let baseline =
                             seen.get(name).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -2205,11 +2205,11 @@ impl AppState {
                 results.push(entry);
             }
         }
-        json!({ "results": results, "num": results.len(), "sites": sites, "muted": false })
+        json!({ "results": results, "num": results.len(), "sites": xite_count, "muted": false })
     }
 
-    /// Aggregate unread notification count across every subscribed site,
-    /// honouring the global mute, per-site mutes, dismissals and the seen
+    /// Aggregate unread notification count across every subscribed xite,
+    /// honouring the global mute, per-xite mutes, dismissals and the seen
     /// baseline. Feeds the tray-icon badge and the wrapper's nav-icon badge
     /// (via the `notificationCount` command); it is the single-integer form of
     /// [`Self::notification_query`].
@@ -2227,10 +2227,10 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    /// `notificationDismiss` - record when the user cleared a site's
+    /// `notificationDismiss` - record when the user cleared a xite's
     /// notification, so `{last_seen}` queries can filter to newer items.
     /// Stored as milliseconds, like EpixNet.
-    pub async fn notification_mark_dismissed(&self, site: &str, name: &str) {
+    pub async fn notification_mark_dismissed(&self, xite: &str, name: &str) {
         let mut all =
             self.config_get("notification_dismissed").await.unwrap_or_else(|| json!({}));
         if !all.is_object() {
@@ -2239,7 +2239,7 @@ impl AppState {
         let entry = all
             .as_object_mut()
             .unwrap()
-            .entry(site.to_string())
+            .entry(xite.to_string())
             .or_insert_with(|| json!({}));
         if let Value::Object(m) = entry {
             m.insert(name.to_string(), json!(now_secs() * 1000));
@@ -2347,7 +2347,7 @@ impl AppState {
         )
         .await;
         self.persist_peers().await;
-        self.persist_sites().await;
+        self.persist_xites().await;
         let argv = if restart { self.restart_argv.lock().unwrap().clone() } else { None };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2538,7 +2538,7 @@ impl AppState {
         let root = self.data_root.as_ref().ok_or("no data dir")?;
         let dir = root.join("data").join(address);
         self.add_xite(address, XiteEntry { storage: XiteStorage::new(&dir), content: None }).await;
-        self.persist_sites().await;
+        self.persist_xites().await;
         Ok(())
     }
 
@@ -2548,16 +2548,16 @@ impl AppState {
         // A xite starts with no permissions. ADMIN (and other permissions) are
         // granted only when the xite requests one and the user approves the
         // wrapper's grant prompt; those grants are restored here from disk.
-        // Grants are keyed by the signed content address so a site served under
+        // Grants are keyed by the signed content address so a xite served under
         // both its raw address and a `.epix` alias shares one grant.
         let canonical = canonical_address(entry.content.as_ref(), &address);
         // A xite we've served before keeps its SAVED per-xite state - add_xite
         // re-runs for the launch xite every boot and for every restored xite,
         // and rebuilding settings from scratch silently undid the user's
-        // choices ("This is my site", favourite, size limit, the optional
-        // toggles, transfer totals), after which the persist_sites below wrote
+        // choices ("This is my xite", favourite, size limit, the optional
+        // toggles, transfer totals), after which the persist_xites below wrote
         // that loss back to disk. Prefer the live in-memory settings (a re-add
-        // of an already-served xite, where restore_sites has already reapplied
+        // of an already-served xite, where restore_xites has already reapplied
         // sites.json); fall back to the sites.json entry on disk. Only a
         // genuinely NEW xite inherits the node-wide defaults (Config page:
         // "Optional Files"); help-distribute implies downloading.
@@ -2628,7 +2628,7 @@ impl AppState {
             settings.apply_content_stats(&content_stats(content));
             // The node adds a xite after cloning+verifying it, so having content
             // means it was downloaded. Guards inbound `update`: arbitrary peers
-            // can't push content for sites we never voluntarily fetched.
+            // can't push content for xites we never voluntarily fetched.
             settings.downloaded = Some(now_secs());
         }
         let muted = self.muted_authors().await;
@@ -2688,7 +2688,7 @@ impl AppState {
             },
         );
         // Record the served-xite list so it is restored on the next start.
-        self.persist_sites().await;
+        self.persist_xites().await;
     }
 
     /// Record the `.epix` name (xID) a served xite was resolved from. Display
@@ -2702,7 +2702,7 @@ impl AppState {
             }
             x.display = Some(name.to_string());
         }
-        self.persist_sites().await;
+        self.persist_xites().await;
     }
 
     /// The `.epix` name a served xite was resolved from, if any.
@@ -2755,7 +2755,7 @@ impl AppState {
                 x.display = None;
             }
         }
-        self.persist_sites().await;
+        self.persist_xites().await;
         epix_chain::clear_xid_caches().await;
     }
 
@@ -2808,11 +2808,11 @@ impl AppState {
     /// The display alias (e.g. `dashboard.epix`) rides along as an extra
     /// `display` key inside the settings dict (Python preserves unknown keys).
     /// The settings persisted in sites.json for a canonical address, if the
-    /// site was served before. Consulted by [`Self::add_xite`] so a re-add
+    /// xite was served before. Consulted by [`Self::add_xite`] so a re-add
     /// (the launch xite every boot, a restore) keeps the user's saved state
     /// (ownership, toggles, counters) instead of resetting to the defaults.
     fn saved_settings(&self, canonical: &str) -> Option<XiteSettings> {
-        let path = self.sites_path.as_ref()?;
+        let path = self.xites_path.as_ref()?;
         let raw = std::fs::read(path).ok()?;
         let map: Value = serde_json::from_slice(&raw).ok()?;
         let entry = map.get(canonical)?;
@@ -2822,8 +2822,8 @@ impl AppState {
         serde_json::from_value(src).ok()
     }
 
-    pub async fn persist_sites(&self) {
-        let Some(path) = &self.sites_path else { return };
+    pub async fn persist_xites(&self) {
+        let Some(path) = &self.xites_path else { return };
         let xites = self.xites.read().await;
         let mut map: serde_json::Map<String, Value> = serde_json::Map::new();
         for (key, x) in xites.iter() {
@@ -2847,8 +2847,8 @@ impl AppState {
     /// (plus its display alias). Skips entries already served and any whose
     /// content.json is missing or fails verification. Returns how many were
     /// restored. Call once at startup before serving.
-    pub async fn restore_sites(self: &Arc<Self>) -> usize {
-        let (Some(path), Some(root)) = (&self.sites_path, &self.data_root) else { return 0 };
+    pub async fn restore_xites(self: &Arc<Self>) -> usize {
+        let (Some(path), Some(root)) = (&self.xites_path, &self.data_root) else { return 0 };
         let root = root.join("data");
         let map: serde_json::Map<String, Value> = match std::fs::read(path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
@@ -2937,7 +2937,7 @@ impl AppState {
                     x.settings.modified = x.settings.modified.max(saved.modified);
                 }
             }
-            // Per-user content already on disk counts too (sites synced before
+            // Per-user content already on disk counts too (xites synced before
             // settings.modified folded it in would show the root's old date
             // until the next post arrives): take the newest content.json
             // anywhere in the tree, once, at restore. New arrivals keep it
@@ -2953,10 +2953,10 @@ impl AppState {
             if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
                 if display != canonical {
                     self.set_display(&canonical, display).await;
-                    // Older builds keyed the per-site user identity (certs,
-                    // site keys) by the name; move it to the address so the
+                    // Older builds keyed the per-xite user identity (certs,
+                    // xite keys) by the name; move it to the address so the
                     // identity survives the switch to address-only keys.
-                    self.migrate_user_site_key(display, &canonical).await;
+                    self.migrate_user_xite_key(display, &canonical).await;
                 }
             }
             restored += 1;
@@ -3035,10 +3035,10 @@ impl AppState {
                 None => false,
             }
         };
-        // New peers discovered (announce/PEX/DHT/local): update the site's
+        // New peers discovered (announce/PEX/DHT/local): update the xite's
         // dashboard row live, like EpixNet's peers_added.
         if grew {
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
     }
 
@@ -3074,12 +3074,12 @@ impl AppState {
     /// xite yields no peers - the caller decides how to say so.
     pub async fn pex_exchange(
         &self,
-        site: &str,
+        xite: &str,
         need: usize,
         got: Vec<PeerAddr>,
         from: &PeerAddr,
     ) -> Vec<PeerAddr> {
-        if !self.has_any_alias(site).await {
+        if !self.has_any_alias(xite).await {
             return Vec::new();
         }
         let need = need.min(Self::PEX_NEED_CAP);
@@ -3112,9 +3112,9 @@ impl AppState {
         // addresses that burn a full dial timeout each. Same rule as
         // `adopt_dialback`.
         got.retain(|p| p.is_wellformed() && p.pack().is_some());
-        self.add_peers(site, got).await;
+        self.add_peers(xite, got).await;
 
-        let mut reply = self.pex_peers(site, need, &exclude).await;
+        let mut reply = self.pex_peers(xite, need, &exclude).await;
 
         // Advertise our own reachable overlay addresses (onion + i2p + mesh)
         // so peers can reach us over an anonymity network or mesh link and
@@ -3155,7 +3155,7 @@ impl AppState {
         let root = x.storage.root().to_path_buf();
         drop(xites);
         // Every content.json on disk (root + includes + per-user), keyed by its
-        // `modified` time - so a peer cloning a user_contents site learns about
+        // `modified` time - so a peer cloning a user_contents xite learns about
         // the included and per-user content.json files, not just the root.
         for path in walk_content_json(&root) {
             if let Ok(bytes) = std::fs::read(root.join(&path)) {
@@ -3269,13 +3269,13 @@ impl AppState {
     /// Mirrors EpixNet's `actionPushFile`. Returns an Ok/error message string.
     pub async fn apply_push_file(
         &self,
-        site: &str,
+        xite: &str,
         inner_path: &str,
         body: &[u8],
     ) -> Result<String, String> {
         let (key, info) = {
             let xites = self.xites.read().await;
-            let x = self.resolve_xite(&xites, site).ok_or("Unknown site")?;
+            let x = self.resolve_xite(&xites, xite).ok_or("Unknown site")?;
             if x.settings.downloaded.is_none() {
                 return Err("Site not yet downloaded".into());
             }
@@ -3295,7 +3295,7 @@ impl AppState {
             let key = xites
                 .iter()
                 .find(|(k, x)| {
-                    k.as_str() == site || canonical_address(x.content.as_ref(), k) == site
+                    k.as_str() == xite || canonical_address(x.content.as_ref(), k) == xite
                 })
                 .map(|(k, _)| k.clone())
                 .ok_or("Unknown site")?;
@@ -3329,8 +3329,8 @@ impl AppState {
             // Only entries with content can alias another address: a
             // registered-but-empty entry (content: None) would make
             // canonical_address fall back to the QUERIED address and match
-            // everything - restore_sites then silently skips every later
-            // site and the exit persist erases it from sites.json.
+            // everything - restore_xites then silently skips every later
+            // xite and the exit persist erases it from sites.json.
             xites.values().find(|x| {
                 x.content.is_some()
                     && canonical_address(x.content.as_ref(), address) == address
@@ -3347,7 +3347,7 @@ impl AppState {
 
     // --- PeerDb: persist known peers across restarts ------------------------
 
-    /// Load the peers persisted for a site (by signed content address), with
+    /// Load the peers persisted for a xite (by signed content address), with
     /// their persisted learning state. Entries are either bare address strings
     /// (the legacy format) or `{addr, rep, errors, seen}` objects; both parse,
     /// so an old peers.json upgrades in place. Malformed/placeholder shapes
@@ -3553,7 +3553,7 @@ impl AppState {
 
     // --- OptionalManager: persist optional-file pins across restarts ---------
 
-    /// Load the pinned optional-file paths for a site (by signed content address).
+    /// Load the pinned optional-file paths for a xite (by signed content address).
     fn load_persisted_pins(&self, canonical: &str) -> std::collections::HashSet<String> {
         let Some(path) = &self.pins_path else { return Default::default() };
         let map: serde_json::Map<String, Value> = std::fs::read(path)
@@ -3667,7 +3667,7 @@ impl AppState {
         let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
         self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len())).await;
         // Push the fresh peer count + tracker status to any connected UI.
-        self.push_site_info(address).await;
+        self.push_xite_info(address).await;
         self.push_announcer_info(&key).await;
         all
     }
@@ -3850,7 +3850,7 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.bytes_recv += recv;
             x.bytes_sent += sent;
-            // Cumulative across runs (persisted): the dashboard's per-site
+            // Cumulative across runs (persisted): the dashboard's per-xite
             // upload/download ratio badge reads settings.bytes_sent/recv.
             x.settings.bytes_recv += recv;
             x.settings.bytes_sent += sent;
@@ -3861,7 +3861,7 @@ impl AppState {
     /// [`Self::add_transfer`] for serving a file to a peer, also counting
     /// the per-optional-file upload bytes behind the dashboard Files tab's
     /// ratio dots (EpixNet's `file_optional.uploaded`). No per-peer
-    /// attribution: the EDX serve site that calls this knows the peer only
+    /// attribution: the EDX serve xite that calls this knows the peer only
     /// by its node_pk, not by a `PeerAddr` the peer table could hold.
     pub async fn record_upload(&self, address: &str, inner_path: &str, sent: u64) {
         self.add_transfer(address, 0, sent).await;
@@ -4220,13 +4220,13 @@ impl AppState {
     }
 
     /// EpixNet's `Site.clone`: copy the source xite's template files into a
-    /// brand-new site (or a given target we own), rewrite content.json for
+    /// brand-new xite (or a given target we own), rewrite content.json for
     /// the new owner, sign it with the new key, and serve it. Template
     /// convention: paths containing `-default` are the clean starting state -
     /// they are copied with the suffix stripped, and the source's live
     /// counterparts (e.g. `data/` next to `data-default/`) are NOT copied, so
     /// a cloned blog starts empty instead of with the author's posts.
-    /// Returns the new site's address.
+    /// Returns the new xite's address.
     pub async fn clone_xite(
         self: &Arc<Self>,
         source: &str,
@@ -4237,13 +4237,13 @@ impl AppState {
             let xites = self.xites.read().await;
             self.resolve_xite(&xites, source).map(|x| x.storage.clone()).ok_or("Unknown site")?
         };
-        // Refuse mid-sync sources (EpixNet: "Site still in sync").
+        // Refuse mid-sync sources (EpixNet: "Xite still in sync").
         let bad = self.bad_files(source).await;
         if bad.iter().any(|f| !f.ends_with("content.json") && !f.contains("data/users/")) {
             return Err("Site still in sync".into());
         }
         let root = root_inner_path.trim_matches('/');
-        // Old clones recorded `clone_root: "."` for a whole-site clone. Treat it
+        // Old clones recorded `clone_root: "."` for a whole-xite clone. Treat it
         // as the root, or the `<root>/` prefix below matches no source file and
         // an "Upgrade code" rewrites content.json while copying nothing.
         let root = if root == "." { "" } else { root };
@@ -4254,20 +4254,20 @@ impl AppState {
         let (address, privatekey) = match target_address {
             Some(target) => {
                 let key = self
-                    .site_privatekey(&target)
+                    .xite_privatekey(&target)
                     .await
                     .ok_or("Target site private key not known")?;
                 (target, key)
             }
             None => {
-                let pair = self.user.write().await.new_site_data()?;
+                let pair = self.user.write().await.new_xite_data()?;
                 self.save_user().await;
                 pair
             }
         };
 
         // The template content.json: `<root>/content.json-default` wins (template
-        // sites ship their clean copy there); otherwise fall back to the ROOT
+        // xites ship their clean copy there); otherwise fall back to the ROOT
         // content.json, NOT `<root>/content.json`. EpixNet's `Site.clone` does the
         // same - a clone root like `template-new/` holds only page files
         // (index.html), never its own content.json, so keying off the sub-path
@@ -4291,10 +4291,10 @@ impl AppState {
             format!("My {title}")
         };
         map.insert("title".into(), json!(new_title));
-        // An upgrade refreshes the code but keeps the site's own identity: the
+        // An upgrade refreshes the code but keeps the xite's own identity: the
         // owner's title/description and any domain / xid_name claim (all were
         // just reset to the template's above, and a lost domain claim would
-        // un-name the site until the owner re-claimed it).
+        // un-name the xite until the owner re-claimed it).
         if is_upgrade {
             if let Some(existing) = self.content(&address).await.and_then(|c| c.as_object().cloned()) {
                 for key in ["title", "description", "domain", "xid_name"] {
@@ -4372,7 +4372,7 @@ impl AppState {
     /// and owned. Returns (address, privatekey WIF) - the caller shows the
     /// key to the author once.
     pub async fn create_xite(self: &Arc<Self>) -> Result<(String, String), String> {
-        let (address, privatekey) = self.user.write().await.new_site_data()?;
+        let (address, privatekey) = self.user.write().await.new_xite_data()?;
         self.save_user().await;
         let dir = self.xite_dir(&address).ok_or("No data root")?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -4587,7 +4587,7 @@ impl AppState {
         let Some(content) = content else { return Vec::new() };
         // The scan reads (worst case) every declared file. The wrapper asks on
         // EVERY page open, and on a cold file cache those opens are real disk
-        // round-trips: a thousand-file site is ~10s of blocking syscalls. Run
+        // round-trips: a thousand-file xite is ~10s of blocking syscalls. Run
         // it on the blocking pool - a runtime worker pinned that long stalls
         // every session's commands, which shows up as the whole page (films,
         // likes, comments) arriving in one late burst.
@@ -4688,13 +4688,13 @@ impl AppState {
         Some((meta.len(), mtime))
     }
 
-    /// Set the one per-site settings key EpixNet lets a page change
+    /// Set the one per-xite settings key EpixNet lets a page change
     /// (`siteSetSettingsValue`): `modified_files_notification`.
     pub async fn set_modified_files_notification(&self, address: &str, value: bool) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.modified_files_notification = Some(value);
         }
-        self.persist_sites().await;
+        self.persist_xites().await;
     }
 
     /// Record a cert signature as bad (`badCert`): inbound user content
@@ -4715,10 +4715,10 @@ impl AppState {
     pub async fn has_cors_permission(&self, source: &str, target: &str) -> bool {
         let xites = self.xites.read().await;
         let Some(src) = self.resolve_xite(&xites, source) else { return false };
-        // An ADMIN site can already read any site's files over the WS API
+        // An ADMIN xite can already read any xite's files over the WS API
         // (fileGet et al.), so blocking its subresource loads adds no
         // security; allowing them lets the dashboard show other xites'
-        // favicons without per-site Cors grants.
+        // favicons without per-xite Cors grants.
         if src.settings.permissions.iter().any(|p| p == "ADMIN") {
             return true;
         }
@@ -5031,10 +5031,10 @@ impl AppState {
                 format!("{address}: content.json opts out of prefetch-by-default; Pre-download everything stays off"),
             )
             .await;
-            self.persist_sites().await;
+            self.persist_xites().await;
         }
         // build_xite_db leaves a version-3 merger db EMPTY (its rows come from
-        // the merged sites, not its own tree). Replacing a merger site's own
+        // the merged xites, not its own tree). Replacing a merger xite's own
         // content.json - a republish, or an inbound root update - must refill it
         // like rebuild_xite_db does, else the merger's feed goes blank until the
         // next restart or dbRebuild (the Epix Post missing-posts bug).
@@ -5069,7 +5069,7 @@ impl AppState {
     /// present (`failed` empty), commit it - atomic-rename the exact signed
     /// bytes over the stored content.json and adopt it under every alias key.
     /// Otherwise DEFER: keep the previous on-disk version authoritative (the
-    /// node keeps serving a consistent site instead of a loading screen),
+    /// node keeps serving a consistent xite instead of a loading screen),
     /// record the missing paths in `settings.cache.bad_files`, and hold the
     /// update as a [`PendingUpdate`] for [`Self::retry_pending_updates`].
     /// Returns whether the update committed.
@@ -5246,7 +5246,7 @@ impl AppState {
                 self.log("INFO", format!("Pending update for {} completed and committed", keys[0]))
                     .await;
                 for k in &keys {
-                    self.push_site_info_event(k, "updated").await;
+                    self.push_xite_info_event(k, "updated").await;
                 }
             }
         }
@@ -5309,7 +5309,7 @@ impl AppState {
         let staged = xite.content.clone();
         let total = needed.len();
         self.set_worker_stats(key, total, 1, total).await;
-        self.push_site_info(key).await;
+        self.push_xite_info(key).await;
         let on_file = self.track_update_progress(key, total);
         self.edx_first(key, needed, peers, staged.as_ref(), on_file).await;
         self.set_worker_stats(key, 0, 0, 0).await;
@@ -5341,7 +5341,7 @@ impl AppState {
             // reads the counter at push time so late pushes never raise it.
             tokio::spawn(async move {
                 state.set_worker_stats(&address, left.load(Ordering::Relaxed), 1, 0).await;
-                state.push_site_info(&address).await;
+                state.push_xite_info(&address).await;
             });
         }))
     }
@@ -5526,7 +5526,7 @@ impl AppState {
         let progressed = AtomicBool::new(false);
         let fetched = tokio::time::timeout(peer.connect_timeout(), async {
             // EDX manifest channel: GetSigned over an EDX link works for any
-            // site. A live link marks `progressed` so a post-handshake
+            // xite. A live link marks `progressed` so a post-handshake
             // failure scores the peer as alive-but-unserving, not dead.
             match self.edx_fetch_signed(peer.clone(), canonical, "content.json").await {
                 // Dialed and served the bytes.
@@ -5594,8 +5594,8 @@ impl AppState {
         // "Updating..." pill (and, once the file count is known below, the
         // "N left" countdown). Both the phase and the event, so open pages
         // switch now and a page loading later reads the same state.
-        if self.mark_site_update_applying(address) {
-            self.push_site_info_event(address, UPDATE_PHASE_UPDATING).await;
+        if self.mark_xite_update_applying(address) {
+            self.push_xite_info_event(address, UPDATE_PHASE_UPDATING).await;
         }
         let mut xite = Xite::new(
             Address::parse(canonical.to_string()).map_err(|e| e.to_string())?,
@@ -5617,7 +5617,7 @@ impl AppState {
         let total = needed.len();
         if total > 0 {
             self.set_worker_stats(address, total, 1, total).await;
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
         let on_file = self.track_update_progress(address, total);
         let _ = self.edx_first(address, needed, peers, staged.as_ref(), on_file).await;
@@ -5704,7 +5704,7 @@ impl AppState {
     }
 
     /// The peers a content/merge fetch should try, best sources first: reliable
-    /// tracker-seeds ([`Self::tracker_seed_peers`]) ahead of the site's
+    /// tracker-seeds ([`Self::tracker_seed_peers`]) ahead of the xite's
     /// connectable registry peers, deduped. Trying a known seed first means a
     /// freshly published record (a post/comment/upvote in a merge file, or a
     /// bumped content.json) is pulled in one shot instead of depending on the
@@ -5961,7 +5961,7 @@ impl AppState {
             // Lazy build, matching EpixNet's openDb: a dbQuery that arrives
             // before the db exists (a page served progressively mid-clone)
             // creates the schema and returns real (if still empty) rows.
-            // Sites crash on an error here - their query callbacks iterate
+            // Xites crash on an error here - their query callbacks iterate
             // the result - and their boot never recovers
             // EpixNet's needFile, WAIT for the schema (bounded) instead of
             // erroring - unless the root content.json is already known and
@@ -6025,46 +6025,46 @@ impl AppState {
             .collect()
     }
 
-    /// Set (and persist) a site's Newsfeed follows.
+    /// Set (and persist) a xite's Newsfeed follows.
     pub async fn set_feed_follow(&self, address: &str, feeds: Value) {
         self.user.write().await.set_feed_follow(address, feeds);
         self.save_user().await;
     }
 
-    /// A site's Newsfeed follows.
+    /// A xite's Newsfeed follows.
     pub async fn feed_follow(&self, address: &str) -> Value {
         self.user.read().await.feed_follow(address)
     }
 
-    /// All follows across sites (`site_address -> feeds`), for feed aggregation.
+    /// All follows across xites (`xite_address -> feeds`), for feed aggregation.
     pub async fn all_follows(&self) -> std::collections::HashMap<String, Value> {
         self.user.read().await.follows.clone()
     }
 
     /// All identity addresses this node's user controls: the master address
-    /// plus every per-site auth address. xidResolve's fallback tries them all
+    /// plus every per-xite auth address. xidResolve's fallback tries them all
     /// when the queried address is the user's own (EpixNet does the same, so
     /// an identity linked under any of the user's addresses is found).
     pub async fn user_all_addresses(&self) -> Vec<String> {
         let user = self.user.read().await;
         let mut out = vec![user.master_address.clone()];
-        out.extend(user.sites.values().map(|s| s.auth_address.clone()));
+        out.extend(user.xites.values().map(|s| s.auth_address.clone()));
         out
     }
 
     /// The user's CryptMessage encryption private key (WIF) for a xite.
     pub async fn user_encrypt_privatekey(&self, address: &str, index: u64) -> Result<String, String> {
         let mut user = self.user.write().await;
-        // Ensure the site entry exists with the active cert attached (Python's
+        // Ensure the xite entry exists with the active cert attached (Python's
         // getSiteData does this implicitly) - the cert shifts the derivation.
-        user.site_data(address)?;
+        user.xite_data(address)?;
         user.encrypt_privatekey(address, index)
     }
 
     /// The user's auth (identity) private key (WIF) for a xite - used by
     /// `ecdsaSign` when no explicit key is given.
     pub async fn user_auth_privatekey(&self, address: &str) -> Result<String, String> {
-        self.user.write().await.site_data(address).map(|d| d.auth_privatekey.clone())
+        self.user.write().await.xite_data(address).map(|d| d.auth_privatekey.clone())
     }
 
     /// The user's auth (identity) address for a xite.
@@ -6120,7 +6120,7 @@ impl AppState {
         Ok(())
     }
 
-    /// Select a cert domain on all sites (portable cert), or clear with an empty
+    /// Select a cert domain on all xites (portable cert), or clear with an empty
     /// domain. `certSet`. Persists.
     pub async fn cert_set(&self, domain: &str) {
         let d = if domain.is_empty() { None } else { Some(domain) };
@@ -6142,40 +6142,40 @@ impl AppState {
 
     // --- xID cert (certXid) --------------------------------------------------
 
-    /// The Epix chain's xID auth/linking site - where "New" and the
+    /// The Epix chain's xID auth/linking xite - where "New" and the
     /// not-yet-linked redirect send the user to link an identity address to
-    /// their xID name. EpixNet's `xid_site`.
-    const XID_SITE: &'static str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
+    /// their xID name. EpixNet's `xid_xite`.
+    const XID_XITE: &'static str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
 
     /// Show the xID cert-selection dialog and act on the choice (EpixNet's
     /// `actionCertXid`). Discovers which of the user's addresses already map
     /// to a registered xID name on chain, offers them plus a "New" option
     /// that links a fresh identity, and on selection acquires (self-signs) the
-    /// cert or redirects to the xID site to link. Returns the WS result the
-    /// site's callback expects (`"ok"`, `"Not changed"`, or an error object).
+    /// cert or redirects to the xID xite to link. Returns the WS result the
+    /// xite's callback expects (`"ok"`, `"Not changed"`, or an error object).
     ///
     /// With `xid_name` set, skips the dialog and goes straight to acquisition
     /// (EpixNet's direct-name path).
-    pub async fn cert_xid(&self, site_address: &str, xid_name: Option<&str>) -> Result<Value, String> {
+    pub async fn cert_xid(&self, xite_address: &str, xid_name: Option<&str>) -> Result<Value, String> {
         if let Some(name) = xid_name {
-            return self.cert_xid_acquire(site_address, name, None).await;
+            return self.cert_xid_acquire(xite_address, name, None).await;
         }
 
-        let auth_address = self.user.write().await.auth_address(site_address)?;
+        let auth_address = self.user.write().await.auth_address(xite_address)?;
         let (existing_cert, is_xid_active, identity_addresses) = {
             let user = self.user.read().await;
             let existing = user.certs.get("xid.epix").cloned();
-            let active = user.get_cert(site_address).map(|c| c.auth_type == "xid").unwrap_or(false);
+            let active = user.get_cert(xite_address).map(|c| c.auth_type == "xid").unwrap_or(false);
             (existing, active, user.identity_addresses())
         };
         let existing_name = existing_cert.as_ref().map(|c| c.auth_user_name.clone());
 
-        // Discover linked xID names across the user's addresses. The site's
+        // Discover linked xID names across the user's addresses. The xite's
         // own auth address first, then each standalone identity - stopping at
         // the first UNLINKED identity, which becomes the "New" candidate.
         let mut discovered: Vec<(String, String)> = Vec::new(); // (name, address)
         let mut new_addr: Option<String> = None;
-        self.push_inject_script(site_address, "$('#button-identity').text('Checking...')");
+        self.push_inject_script(xite_address, "$('#button-identity').text('Checking...')");
         if let Some(info) = epix_chain::xid_identity::resolve_identity(&auth_address).await {
             if existing_name.as_deref() != Some(info.name.as_str()) {
                 discovered.push((info.name.clone(), auth_address.clone()));
@@ -6196,7 +6196,7 @@ impl AppState {
                 }
             }
         }
-        self.push_inject_script(site_address, "$('#button-identity').text('Change')");
+        self.push_inject_script(xite_address, "$('#button-identity').text('Change')");
 
         // No spare unlinked identity: mint one so "New" always has an address.
         let new_addr = match new_addr {
@@ -6244,7 +6244,7 @@ impl AppState {
         };
         let new_link = format!(
             "/{}/?linkIdentity={}&returnTo=/{}",
-            Self::XID_SITE, new_addr, site_address
+            Self::XID_XITE, new_addr, xite_address
         );
         body.push_str(&format!(
             "<a href='{new_link}' target='_top' class='select'>\
@@ -6252,7 +6252,7 @@ impl AppState {
         ));
 
         // Ask, then act on the clicked option's title.
-        let choice = self.notification_ask(site_address, &body).await;
+        let choice = self.notification_ask(xite_address, &body).await;
         match choice.as_deref() {
             // "New" is a plain navigation link (no `.cert` class), so it never
             // resolves the callback - the wrapper just follows the href.
@@ -6261,19 +6261,19 @@ impl AppState {
                 // None: drop the global xID cert.
                 self.user.write().await.set_cert_global(None);
                 self.save_user().await;
-                self.push_cert_changed(site_address).await;
+                self.push_cert_changed(xite_address).await;
                 Ok(Value::from("ok"))
             }
             Some("xid.epix") => {
                 self.user.write().await.set_cert_global(Some("xid.epix"));
                 self.save_user().await;
-                self.push_cert_changed(site_address).await;
+                self.push_cert_changed(xite_address).await;
                 Ok(Value::from("ok"))
             }
             Some(choice) if choice.starts_with("acquire:") => {
                 let parts: Vec<&str> = choice.splitn(3, ':').collect();
                 if parts.len() == 3 {
-                    self.cert_xid_acquire(site_address, parts[1], Some(parts[2])).await
+                    self.cert_xid_acquire(xite_address, parts[1], Some(parts[2])).await
                 } else {
                     Err("Invalid acquire choice".to_string())
                 }
@@ -6284,12 +6284,12 @@ impl AppState {
 
     /// Acquire (self-sign) an xID cert for `xid_name`, verifying on chain that
     /// the auth address is an active linked identity of that name. If it isn't
-    /// linked, offers to open the xID site to link it. EpixNet's
-    /// `_processCertXid`. `linked_auth_address` overrides the site's own auth
+    /// linked, offers to open the xID xite to link it. EpixNet's
+    /// `_processCertXid`. `linked_auth_address` overrides the xite's own auth
     /// address (when the identity was discovered under a different one).
     async fn cert_xid_acquire(
         &self,
-        site_address: &str,
+        xite_address: &str,
         xid_name: &str,
         linked_auth_address: Option<&str>,
     ) -> Result<Value, String> {
@@ -6316,7 +6316,7 @@ impl AppState {
             }
             None => {
                 let mut user = self.user.write().await;
-                let sd = user.site_data(site_address)?.clone();
+                let sd = user.xite_data(xite_address)?.clone();
                 (sd.auth_address, sd.auth_privatekey)
             }
         };
@@ -6335,18 +6335,18 @@ impl AppState {
             .iter()
             .any(|i| i.address == auth_address && i.active);
         if !linked {
-            // Offer to open the xID site to link this address.
+            // Offer to open the xID xite to link this address.
             let url = format!(
                 "/{}/?linkIdentity={}&returnTo=/{}",
-                Self::XID_SITE, auth_address, site_address
+                Self::XID_XITE, auth_address, xite_address
             );
             let body = format!(
                 "Your address is not linked as an identity for <b>{}.{}</b>.<br><br>\
                  Open the xID site to link it?",
                 html_escape(label), html_escape(tld)
             );
-            if self.confirm(site_address, &body, "Open xID").await {
-                self.push_redirect(site_address, &url);
+            if self.confirm(xite_address, &body, "Open xID").await {
+                self.push_redirect(xite_address, &url);
             }
             return Ok(json!({ "error": "identity_not_linked", "auth_address": auth_address }));
         }
@@ -6367,14 +6367,14 @@ impl AppState {
                     &format!("xID certificate acquired: {label}@xid.epix"),
                     5000,
                 );
-                self.push_cert_changed(site_address).await;
+                self.push_cert_changed(xite_address).await;
                 Ok(Value::from("ok"))
             }
             Some(false) => {
                 // A different xID cert exists: confirm replacement.
                 drop(user);
                 let body = "You already have an xID cert. Replace it?".to_string();
-                if !self.confirm(site_address, &body, "Replace").await {
+                if !self.confirm(xite_address, &body, "Replace").await {
                     return Ok(Value::from("Not changed"));
                 }
                 let mut user = self.user.write().await;
@@ -6388,7 +6388,7 @@ impl AppState {
                     &format!("xID certificate updated: {label}@xid.epix"),
                     5000,
                 );
-                self.push_cert_changed(site_address).await;
+                self.push_cert_changed(xite_address).await;
                 Ok(Value::from("ok"))
             }
             None => {
@@ -6396,7 +6396,7 @@ impl AppState {
                 user.set_cert_global(Some("xid.epix"));
                 drop(user);
                 self.save_user().await;
-                self.push_cert_changed(site_address).await;
+                self.push_cert_changed(xite_address).await;
                 Ok(Value::from("ok"))
             }
         }
@@ -6436,10 +6436,10 @@ impl AppState {
         }
     }
 
-    /// Notify the site (and its wrapper) that the selected cert changed, so the
+    /// Notify the xite (and its wrapper) that the selected cert changed, so the
     /// page re-renders its identity - EpixNet's `updateWebsocket(cert_changed)`.
     async fn push_cert_changed(&self, address: &str) {
-        let mut info = self.site_info(address).await;
+        let mut info = self.xite_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!(["cert_changed", "xid.epix"]));
             self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
@@ -6493,7 +6493,7 @@ impl AppState {
     }
 
     /// Rebuild every served xite's database (e.g. after a mute change), so the
-    /// mute filter is re-applied across all sites.
+    /// mute filter is re-applied across all xites.
     async fn rebuild_all_dbs(&self) {
         for address in self.xite_addresses().await {
             self.rebuild_xite_db(&address).await;
@@ -6505,46 +6505,46 @@ impl AppState {
         self.filters.read().await["mutes"].clone()
     }
 
-    /// Block a site. `site_address -> {reason, date_added}`.
-    pub async fn siteblock_add(&self, site_address: &str, reason: &str) {
+    /// Block a xite. `xite_address -> {reason, date_added}`.
+    pub async fn siteblock_add(&self, xite_address: &str, reason: &str) {
         {
             let mut f = self.filters.write().await;
-            f["siteblocks"][site_address] = json!({ "reason": reason, "date_added": now_secs() });
+            f["siteblocks"][xite_address] = json!({ "reason": reason, "date_added": now_secs() });
         }
         self.save_filters().await;
     }
 
-    pub async fn siteblock_remove(&self, site_address: &str) {
+    pub async fn siteblock_remove(&self, xite_address: &str) {
         if let Some(m) = self.filters.write().await["siteblocks"].as_object_mut() {
-            m.remove(site_address);
+            m.remove(xite_address);
         }
         self.save_filters().await;
     }
 
-    /// The siteblock map (`site_address -> info`).
+    /// The siteblock map (`xite_address -> info`).
     pub async fn siteblock_list(&self) -> Value {
         self.filters.read().await["siteblocks"].clone()
     }
 
-    /// Whether a site is blocked.
-    pub async fn siteblock_get(&self, site_address: &str) -> Value {
-        self.filters.read().await["siteblocks"].get(site_address).cloned().unwrap_or(Value::Bool(false))
+    /// Whether a xite is blocked.
+    pub async fn siteblock_get(&self, xite_address: &str) -> Value {
+        self.filters.read().await["siteblocks"].get(xite_address).cloned().unwrap_or(Value::Bool(false))
     }
 
-    /// The block reason for a site, if it is blocked (`ContentFilter` enforcement
+    /// The block reason for a xite, if it is blocked (`ContentFilter` enforcement
     /// point). Checks both the plain address and its `sha256` hash, matching
     /// EpixNet's hashed-address blocklists.
-    pub async fn siteblock_reason(&self, site_address: &str) -> Option<String> {
+    pub async fn siteblock_reason(&self, xite_address: &str) -> Option<String> {
         if !self.plugin_enabled("ContentFilter").await {
             return None;
         }
         let hashed = {
             use sha2::{Digest, Sha256};
-            hex::encode(Sha256::digest(site_address.as_bytes()))
+            hex::encode(Sha256::digest(xite_address.as_bytes()))
         };
         let f = self.filters.read().await;
         let blocks = &f["siteblocks"];
-        for key in [site_address, hashed.as_str()] {
+        for key in [xite_address, hashed.as_str()] {
             if let Some(info) = blocks.get(key) {
                 return Some(
                     info.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_string(),
@@ -6627,7 +6627,7 @@ impl AppState {
     }
 
     /// Info for one declared file - required or optional, found through the
-    /// root or its governing child content.json - as a site-relative
+    /// root or its governing child content.json - as a xite-relative
     /// [`FileEntry`], plus whether it is optional.
     pub async fn file_info_any(&self, address: &str, inner_path: &str) -> Option<(FileEntry, bool)> {
         let (entry, _, optional) = self.declared_entry(address, inner_path).await?;
@@ -7010,7 +7010,7 @@ impl AppState {
         map.insert("piece_size".into(), json!(piece_size));
         map.insert("piece_num".into(), json!(piece_num));
         // A child content.json's piecemap path is relative to its own dir -
-        // return it site-relative like everything else.
+        // return it xite-relative like everything else.
         if let Some(pm) = entry.get("piecemap").and_then(|v| v.as_str()) {
             let pm = if dir.is_empty() { pm.to_string() } else { format!("{dir}/{pm}") };
             map.insert("piecemap".into(), json!(pm));
@@ -7039,7 +7039,7 @@ impl AppState {
     /// content.json; a piece counts as held when the on-disk bytes verify against
     /// the piecemap. Files without their piecemap on disk are skipped.
     /// Begin a Bigfile upload (`bigfileUploadInit`): check the user may write to
-    /// this site (owner, or their auth address is a valid signer), stash the
+    /// this xite (owner, or their auth address is a valid signer), stash the
     /// upload under a fresh nonce, and return `(nonce, piece_size,
     /// file_relative_path)`. The caller POSTs the bytes to
     /// `/EpixNet-Internal/BigfileUpload?upload_nonce=<nonce>`.
@@ -7054,7 +7054,7 @@ impl AppState {
         inner_path: &str,
         size: u64,
     ) -> Result<(String, usize, String), String> {
-        // Permission: own the site, or the user's auth address is a valid signer.
+        // Permission: own the xite, or the user's auth address is a valid signer.
         let owned = self.xites.read().await.get(address).map(|x| x.settings.own).unwrap_or(false);
         if !owned {
             let auth = self.user.write().await.auth_address(address).unwrap_or_default();
@@ -7274,7 +7274,7 @@ impl AppState {
     }
 
     /// Pin/unpin a batch of optional files in one pass (the dashboard's
-    /// selectbar sends every selected path of a site at once) - one persist
+    /// selectbar sends every selected path of a xite at once) - one persist
     /// for the whole batch instead of one write per file.
     pub async fn set_pins(&self, address: &str, inner_paths: &[String], pinned: bool) {
         if let Some(x) = self.xites.write().await.get_mut(address) {
@@ -7423,7 +7423,7 @@ impl AppState {
 
     /// Grant a permission to a xite (e.g. `ADMIN`, `Merger:EpixPost`). Idempotent.
     /// The grant is keyed by the signed content address (so every alias of the
-    /// same site shares it) and persisted so it survives restarts.
+    /// same xite shares it) and persisted so it survives restarts.
     pub async fn add_permission(&self, address: &str, permission: &str) {
         let mut xites = self.xites.write().await;
         let canonical = xites
@@ -7449,7 +7449,7 @@ impl AppState {
         self.save_grants().await;
     }
 
-    /// Revoke a permission from a xite (and every alias of the same site).
+    /// Revoke a permission from a xite (and every alias of the same xite).
     /// Persisted.
     pub async fn remove_permission(&self, address: &str, permission: &str) {
         let mut xites = self.xites.write().await;
@@ -7470,7 +7470,7 @@ impl AppState {
     }
 
     /// The permissions currently held by a xite (empty if it is not served).
-    pub async fn site_permissions(&self, address: &str) -> Vec<String> {
+    pub async fn xite_permissions(&self, address: &str) -> Vec<String> {
         self.xites
             .read()
             .await
@@ -7480,7 +7480,7 @@ impl AppState {
     }
 
     /// Whether a xite holds ADMIN.
-    pub async fn site_has_admin(&self, address: &str) -> bool {
+    pub async fn xite_has_admin(&self, address: &str) -> bool {
         self.xites
             .read()
             .await
@@ -7520,19 +7520,19 @@ impl AppState {
         self.peer_locations_impl(None).await
     }
 
-    /// The geolocated peers of a single xite - the sidebar's per-site globe.
-    /// EpixNet's `getPeerLocations(self.site.peers)`: a xite with no peers gets
+    /// The geolocated peers of a single xite - the sidebar's per-xite globe.
+    /// EpixNet's `getPeerLocations(self.xite.peers)`: a xite with no peers gets
     /// an empty globe rather than the whole node's peer set.
-    pub async fn site_peer_locations(&self, address: &str) -> Vec<Value> {
+    pub async fn xite_peer_locations(&self, address: &str) -> Vec<Value> {
         self.peer_locations_impl(Some(address)).await
     }
 
     /// The clearnet peer IPs of the selected xite(s), unpinged (`None`):
-    /// `only_site = None` pools every served xite, `Some(address)` just that
+    /// `only_xite = None` pools every served xite, `Some(address)` just that
     /// one. The first stage of the peer-location queries below.
-    async fn known_peer_ips(&self, only_site: Option<&str>) -> HashMap<std::net::IpAddr, Option<i64>> {
+    async fn known_peer_ips(&self, only_xite: Option<&str>) -> HashMap<std::net::IpAddr, Option<i64>> {
         let xites = self.xites.read().await;
-        let selected: Vec<&ManagedXite> = match only_site {
+        let selected: Vec<&ManagedXite> = match only_xite {
             Some(addr) => self.resolve_xite(&xites, addr).into_iter().collect(),
             None => xites.values().collect(),
         };
@@ -7547,21 +7547,21 @@ impl AppState {
         pings
     }
 
-    /// Shared body: `only_site = None` pools every xite's peers (the global
+    /// Shared body: `only_xite = None` pools every xite's peers (the global
     /// world map); `Some(address)` restricts to that one xite (the sidebar
-    /// globe), so an unconnected site doesn't borrow other sites' dots.
-    async fn peer_locations_impl(&self, only_site: Option<&str>) -> Vec<Value> {
+    /// globe), so an unconnected xite doesn't borrow other xites' dots.
+    async fn peer_locations_impl(&self, only_xite: Option<&str>) -> Vec<Value> {
         let Some(geoip) = self.geoip.read().await.clone() else { return Vec::new() };
         // Best ping seen per IP (ms), across the selected xite(s).
-        let mut pings = self.known_peer_ips(only_site).await;
+        let mut pings = self.known_peer_ips(only_xite).await;
         // Ping (ms) per connected clearnet peer, from the warm pool. For a single
-        // site, only annotate IPs that are actually this site's peers - the warm
+        // xite, only annotate IPs that are actually this xite's peers - the warm
         // pool is node-wide, so folding all of it in would re-introduce other
-        // sites' dots.
+        // xites' dots.
         for addr in self.conn_pool.connected_addrs().await {
             let PeerAddr::Ip(sa) = &addr else { continue };
             let ip = sa.ip();
-            if only_site.is_some() && !pings.contains_key(&ip) {
+            if only_xite.is_some() && !pings.contains_key(&ip) {
                 continue;
             }
             if let Some(ms) = self.conn_pool.ping_for(&addr).await {
@@ -7588,7 +7588,7 @@ impl AppState {
     /// EpixNet: connected peers rise with latency, unpinged peers sit slightly
     /// below the surface.
     pub async fn peer_globe_data(&self, address: &str) -> Vec<f64> {
-        let locs = self.site_peer_locations(address).await;
+        let locs = self.xite_peer_locations(address).await;
         let pings: Vec<f64> =
             locs.iter().filter_map(|l| l["ping"].as_f64()).filter(|p| *p > 0.0).collect();
         let ping_avg =
@@ -7647,7 +7647,7 @@ impl AppState {
         };
         // Push the updated connection/peer counts to any connected UI.
         for address in &addresses {
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
 
         // PEX: keep the peer set self-healing between announces. Cheap - a few
@@ -7763,7 +7763,7 @@ impl AppState {
             bytes_recv += x.bytes_recv;
             bytes_sent += x.bytes_sent;
         }
-        let sites = xites.len();
+        let xite_count = xites.len();
         drop(xites);
         let (port_opened, _) = self.port_status().await;
         // Wire totals cover ALL protocol traffic (handshakes, announces,
@@ -7801,7 +7801,7 @@ impl AppState {
         let conn_stats = self.connection_stats().await;
         json!({
             "version": self.version,
-            "sites": sites,
+            "sites": xite_count,
             "peers_total": peers_total,
             "peers_connected": peers_connected,
             "connections": conn_stats.total,
@@ -7816,7 +7816,7 @@ impl AppState {
     }
 
     /// Render the diagnostics Stats page (EpixNet's `/Stats`): node identity,
-    /// connection pool, trackers, Tor, and a per-site table. Returns the inner
+    /// connection pool, trackers, Tor, and a per-xite table. Returns the inner
     /// HTML body; the route wraps it in the shared page shell.
     pub async fn stats_html(&self) -> String {
         use std::fmt::Write;
@@ -8003,10 +8003,10 @@ impl AppState {
             }
         }
 
-        // Sites.
+        // Xites.
         h.push_str("<h2>Sites</h2><table><tr><th>address</th><th>peers (conn/able/total)</th><th>onion</th><th>local</th><th>out</th><th>in</th><th>serving</th></tr>");
         for address in self.xite_addresses().await {
-            // One row per site (skip the display-name alias key, if any).
+            // One row per xite (skip the display-name alias key, if any).
             if address.contains('.') {
                 continue;
             }
@@ -8177,28 +8177,28 @@ impl AppState {
     /// Push the latest `siteInfo` for a xite (`setSiteInfo`) on the `siteChanged`
     /// channel, only to that xite's connections, so the dashboard's
     /// peer/connection/content readouts update the moment they change.
-    pub async fn push_site_info(&self, address: &str) {
-        let info = self.site_info(address).await;
+    pub async fn push_xite_info(&self, address: &str) {
+        let info = self.xite_info(address).await;
         if !info.is_null() {
             self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()));
         }
     }
 
     /// Push `setSiteInfo` tagged with an `event` (`["updating"|"updated", true]`),
-    /// so the dashboard's site row shows the spinner + "Updating…"/"Updated!"
+    /// so the dashboard's xite row shows the spinner + "Updating…"/"Updated!"
     /// inline (matching EpixNet's `updateWebsocket(updating/updated)`).
-    pub async fn push_site_info_event(&self, address: &str, event: &str) {
-        self.push_site_info_event_excluding(address, event, None).await;
+    pub async fn push_xite_info_event(&self, address: &str, event: &str) {
+        self.push_xite_info_event_excluding(address, event, None).await;
     }
 
-    /// [`Self::push_site_info_event`] skipping the originating connection.
-    pub async fn push_site_info_event_excluding(
+    /// [`Self::push_xite_info_event`] skipping the originating connection.
+    pub async fn push_xite_info_event_excluding(
         &self,
         address: &str,
         event: &str,
         exclude: Option<u64>,
     ) {
-        let mut info = self.site_info(address).await;
+        let mut info = self.xite_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!([event, true]));
             self.push_event_routed(
@@ -8213,20 +8213,20 @@ impl AppState {
     }
 
     /// Push `setSiteInfo` tagged `["file_done", inner_path]`, EpixNet's
-    /// per-file signal. Sites re-query their db when a `.json` file lands
-    /// (EpixSites' site list, EpixTalk's topics), so push this only after the
+    /// per-file signal. Xites re-query their db when a `.json` file lands
+    /// (EpixSites' xite list, EpixTalk's topics), so push this only after the
     /// db is rebuilt or the page re-queries into the old data.
     ///
     /// `exclude` is the connection whose own write produced the file (EpixNet
     /// notifies `ws != self`): the page already knows what it wrote, and an
     /// echoed event re-renders it mid-interaction (detaching inline editors).
-    pub async fn push_site_info_file_done(
+    pub async fn push_xite_info_file_done(
         &self,
         address: &str,
         inner_path: &str,
         exclude: Option<u64>,
     ) {
-        let mut info = self.site_info(address).await;
+        let mut info = self.xite_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!(["file_done", inner_path]));
             self.push_event_routed(
@@ -8263,7 +8263,7 @@ impl AppState {
     /// `content_updated: false` marker the "Update failed"/"No peers" error
     /// pill reads. A plain eventless push would leave the old pill on screen.
     pub async fn push_update_result(&self, address: &str, outcome: UpdateOutcome) {
-        let mut info = self.site_info(address).await;
+        let mut info = self.xite_info(address).await;
         if let Value::Object(m) = &mut info {
             m.insert("event".to_string(), json!(["updated", true]));
             m.insert("update_applied".to_string(), json!(outcome == UpdateOutcome::Applied));
@@ -8276,10 +8276,10 @@ impl AppState {
 
     /// Mark an update pass (periodic resync or `siteUpdate`) as running for a
     /// xite, in its opening phase: asking peers whether a newer content.json
-    /// even exists. Pair with [`Self::end_site_update`] before pushing the
+    /// even exists. Pair with [`Self::end_xite_update`] before pushing the
     /// outcome.
-    pub fn begin_site_update(&self, address: &str) {
-        self.site_updates_in_flight
+    pub fn begin_xite_update(&self, address: &str) {
+        self.xite_updates_in_flight
             .lock()
             .unwrap()
             .insert(address.to_string(), UPDATE_PHASE_CHECKING);
@@ -8287,11 +8287,11 @@ impl AppState {
 
     /// A peer answered with a NEWER content.json: the pass moves from checking
     /// to actually updating. Returns whether the phase moved, which is false
-    /// for a caller that never bracketed the pass ([`Self::begin_site_update`])
+    /// for a caller that never bracketed the pass ([`Self::begin_xite_update`])
     /// - those get no phase and no event, because nothing would ever push the
     /// outcome that retires the pill.
-    pub fn mark_site_update_applying(&self, address: &str) -> bool {
-        let mut in_flight = self.site_updates_in_flight.lock().unwrap();
+    pub fn mark_xite_update_applying(&self, address: &str) -> bool {
+        let mut in_flight = self.xite_updates_in_flight.lock().unwrap();
         match in_flight.get_mut(address) {
             Some(phase) => {
                 *phase = UPDATE_PHASE_UPDATING;
@@ -8303,14 +8303,14 @@ impl AppState {
 
     /// The update pass for a xite finished (its outcome event is about to be
     /// pushed).
-    pub fn end_site_update(&self, address: &str) {
-        self.site_updates_in_flight.lock().unwrap().remove(address);
+    pub fn end_xite_update(&self, address: &str) {
+        self.xite_updates_in_flight.lock().unwrap().remove(address);
     }
 
     /// The phase of the update pass running for this xite, if any - what
-    /// `site_info` reports as `update_phase`.
-    pub fn site_update_phase(&self, address: &str) -> Option<&'static str> {
-        self.site_updates_in_flight.lock().unwrap().get(address).copied()
+    /// `xite_info` reports as `update_phase`.
+    pub fn xite_update_phase(&self, address: &str) -> Option<&'static str> {
+        self.xite_updates_in_flight.lock().unwrap().get(address).copied()
     }
 
     /// Mark an on-demand clone as downloading a xite's files. Pair with
@@ -8371,14 +8371,14 @@ impl AppState {
     /// with no update pass in flight. Called when that connection's event
     /// stream reports it dropped events (broadcast lag): the dashboard's
     /// "Updating..." pill only ever clears on an outcome event, so if the
-    /// dropped window held one the pill would stay up forever. Sites still
+    /// dropped window held one the pill would stay up forever. Xites still
     /// mid-update are skipped - their real outcome event is coming.
     pub async fn push_missed_update_results(&self, only: u64) {
         for address in self.xite_addresses().await {
-            if self.site_updates_in_flight.lock().unwrap().contains_key(&address) {
+            if self.xite_updates_in_flight.lock().unwrap().contains_key(&address) {
                 continue;
             }
-            let mut info = self.site_info(&address).await;
+            let mut info = self.xite_info(&address).await;
             if let Value::Object(m) = &mut info {
                 m.insert("event".to_string(), json!(["updated", true]));
                 // Recovery, not a result: retire whatever pill the dropped
@@ -8424,7 +8424,7 @@ impl AppState {
     /// the bar regresses when streams interleave.
     pub fn push_clone_event(&self, address: &str, event: Value, fields: Value) {
         // Once content.json has been verified mid-clone, the title is known:
-        // carry it so the dashboard's "Connecting sites" row shows the xite's
+        // carry it so the dashboard's "Connecting xites" row shows the xite's
         // name instead of its bech32 address (and the wrapper's tab title
         // doesn't read "undefined"). try_read because this is called from
         // sync per-file progress callbacks: under momentary write contention
@@ -8479,12 +8479,12 @@ impl AppState {
     /// with its declared size (the core set: html/css/js - not per-user
     /// content). The loading screen dismisses on this, not on index.html
     /// alone: index.html downloads first, and entering a half-downloaded
-    /// site with its styles and scripts still missing reads as broken.
+    /// xite with its styles and scripts still missing reads as broken.
     ///
     /// Size check only, EpixNet's quick_check: the files were hash-verified
     /// when the workers wrote them, and this runs on EVERY wrapper connect
-    /// (the file_status probe) - reading and SHA512ing a whole site per page
-    /// load would make big sites expensive to open.
+    /// (the file_status probe) - reading and SHA512ing a whole xite per page
+    /// load would make big xites expensive to open.
     pub async fn xite_core_complete(&self, address: &str) -> bool {
         let storage = {
             let xites = self.xites.read().await;
@@ -8545,7 +8545,7 @@ impl AppState {
         let Ok(addr) = Address::parse(address.to_string()) else { return false };
         let mut xite = Xite::new(addr, storage);
         // Verified load (a valid signature for this address); fall back to a
-        // local unsigned copy so an authored/edited site still populates.
+        // local unsigned copy so an authored/edited xite still populates.
         let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
         if !loaded {
             return false;
@@ -8593,8 +8593,8 @@ impl AppState {
                 }
             }
         }
-        self.persist_sites().await;
-        self.push_site_info(address).await;
+        self.persist_xites().await;
+        self.push_xite_info(address).await;
         true
     }
 
@@ -8621,7 +8621,7 @@ impl AppState {
                         .and_then(|f| f.get(inner_path))
                         .is_some();
                 if !listed {
-                    return LoadingFile::NotInSite;
+                    return LoadingFile::NotInXite;
                 }
             }
         }
@@ -8846,7 +8846,7 @@ impl AppState {
         self.push_event("setServerInfo", info, Some("serverChanged"), None);
     }
 
-    /// Push a file/site progress event (`progress [inner_path, done, total]`),
+    /// Push a file/xite progress event (`progress [inner_path, done, total]`),
     /// so the wrapper's loading bar advances during a download.
     pub fn push_progress(&self, address: &str, inner_path: &str, done: i64, total: i64) {
         self.push_event(
@@ -8883,7 +8883,7 @@ impl AppState {
         // `{cmd:"response", to: message.id}` - so the callback key must go out
         // as `id` (EpixNet's UiWebsocket.cmd does the same). Sent as `to`, the
         // reply comes back without an id and the waiting future times out
-        // silently: an "Add N new site?" dialog whose Add button does nothing.
+        // silently: an "Add N new xite?" dialog whose Add button does nothing.
         let payload = json!({ "cmd": cmd, "params": params, "id": id }).to_string();
         // If a connection for this xite is bound, broadcast reaches it. If
         // NONE is bound (the page is still loading its websocket, or a media
@@ -9037,8 +9037,8 @@ impl AppState {
                 }
                 unique_peers.insert(key);
             }
-            // Count distinct sites by signed content address (alias + raw key
-            // point at the same content), matching site_list.
+            // Count distinct xites by signed content address (alias + raw key
+            // point at the same content), matching xite_list.
             match x.content.as_ref().and_then(|c| c.get("address")).and_then(Value::as_str) {
                 Some(a) => { content.insert(a.to_string()); }
                 None => { content.insert(addr.clone()); }
@@ -9069,8 +9069,8 @@ impl AppState {
         self.chart.record(now, None, &global);
 
         for (addr, x) in xites.iter() {
-            let Some(site_id) = self.chart.site_id(addr) else { continue };
-            let site = [
+            let Some(xite_id) = self.chart.xite_id(addr) else { continue };
+            let xite = [
                 Metric::now("site_size", x.settings.size as f64),
                 Metric::now("site_size_optional", x.settings.size_optional as f64),
                 Metric::now("site_optional_downloaded", x.settings.optional_downloaded as f64),
@@ -9078,13 +9078,13 @@ impl AppState {
                 Metric::change("site_bytes_recv", x.bytes_recv as f64),
                 Metric::change("site_bytes_sent", x.bytes_sent as f64),
             ];
-            self.chart.record(now, Some(site_id), &site);
+            self.chart.record(now, Some(xite_id), &xite);
         }
     }
 
     /// The `merged_type` a xite's content.json declares, if any (the mark of a
-    /// site that belongs to a merger, e.g. a Git Epix repo).
-    pub async fn site_merged_type(&self, address: &str) -> Option<String> {
+    /// xite that belongs to a merger, e.g. a Git Epix repo).
+    pub async fn xite_merged_type(&self, address: &str) -> Option<String> {
         self.xites
             .read()
             .await
@@ -9095,7 +9095,7 @@ impl AppState {
             .map(String::from)
     }
 
-    /// The merger types a site declares (`Merger:<type>` permissions).
+    /// The merger types a xite declares (`Merger:<type>` permissions).
     pub async fn merger_types(&self, address: &str) -> Vec<String> {
         self.xites
             .read()
@@ -9111,10 +9111,10 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// `mergerSiteList`: the served sites whose content.json `merged_type` is one
+    /// `mergerSiteList`: the served xites whose content.json `merged_type` is one
     /// this merger accepts. `address -> merged_type`, or `-> siteInfo` when
-    /// `query_site_info`.
-    pub async fn merger_list(&self, address: &str, query_site_info: bool) -> Result<Value, String> {
+    /// `query_xite_info`.
+    pub async fn merger_list(&self, address: &str, query_xite_info: bool) -> Result<Value, String> {
         let merger_types = self.merger_types(address).await;
         if merger_types.is_empty() {
             return Err("Not a merger site".into());
@@ -9134,18 +9134,18 @@ impl AppState {
 
         let mut ret = serde_json::Map::new();
         for (addr, merged_type) in matches {
-            let value = if query_site_info { self.site_info(&addr).await } else { json!(merged_type) };
+            let value = if query_xite_info { self.xite_info(&addr).await } else { json!(merged_type) };
             ret.insert(addr, value);
         }
         Ok(Value::Object(ret))
     }
 
-    /// Fill every merger site's version-3 database from its merged sites: for
-    /// each merger, populate its db from each served site whose `merged_type`
-    /// the merger accepts, tagging rows with the merged site's address. Call
-    /// after the merged sites are served (or when they change).
+    /// Fill every merger xite's version-3 database from its merged xites: for
+    /// each merger, populate its db from each served xite whose `merged_type`
+    /// the merger accepts, tagging rows with the merged xite's address. Call
+    /// after the merged xites are served (or when they change).
     pub async fn rebuild_merger_dbs(&self) {
-        // Snapshot the merged sites (address, content dir, merged_type)…
+        // Snapshot the merged xites (address, content dir, merged_type)…
         let merged: Vec<(String, std::path::PathBuf, String)> = {
             let xites = self.xites.read().await;
             xites
@@ -9156,7 +9156,7 @@ impl AppState {
                 })
                 .collect()
         };
-        // …and the merger sites with a version-3 db (handle + schema + accepted types).
+        // …and the merger xites with a version-3 db (handle + schema + accepted types).
         let mergers: Vec<(Database, DbSchema, Vec<String>)> = {
             let xites = self.xites.read().await;
             xites
@@ -9183,20 +9183,20 @@ impl AppState {
         for (db, schema, types) in mergers {
             for (merged_addr, merged_dir, merged_type) in &merged {
                 if types.contains(merged_type) {
-                    // Scan the merged site's root and key every file under the
-                    // merged site's address. EpixNet nests merged sites
+                    // Scan the merged xite's root and key every file under the
+                    // merged xite's address. EpixNet nests merged xites
                     // physically at `merged-<type>/<address>/`, so its relative
                     // paths (and json.directory) begin with the address; we
                     // reproduce that with the prefix instead of nesting on disk.
                     // The `db_file` subdir is where the MERGER keeps its own db,
-                    // not a subdir of each merged site, so it is not joined here.
-                    let _ = db.populate_site(&schema, merged_dir, merged_addr);
+                    // not a subdir of each merged xite, so it is not joined here.
+                    let _ = db.populate_xite(&schema, merged_dir, merged_addr);
                 }
             }
         }
     }
 
-    /// The merged site + inner path for a `merged-<type>/<address>/<path>` path,
+    /// The merged xite + inner path for a `merged-<type>/<address>/<path>` path,
     /// if it is one (else `None`).
     pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
         Self::split_merged_path_typed(inner_path).map(|(_, address, inner)| (address, inner))
@@ -9214,10 +9214,10 @@ impl AppState {
         Some((merged_type, address, inner))
     }
 
-    /// Resolve a merger site's `merged-<type>/<address>/<path>` reference to
+    /// Resolve a merger xite's `merged-<type>/<address>/<path>` reference to
     /// the real `(address, inner_path)`, enforcing MergerSite's access rules
     /// (EpixNet's `checkMergerPath`): the merger must hold the
-    /// `Merger:<type>` permission and the target must be a served site whose
+    /// `Merger:<type>` permission and the target must be a served xite whose
     /// content.json declares that `merged_type`. `Ok(None)` when the path is
     /// not a merged path at all.
     pub async fn resolve_merged(
@@ -9237,8 +9237,8 @@ impl AppState {
         if !self.has_xite(&key).await {
             return Err(format!("Merged site not found: {address}"));
         }
-        if self.site_merged_type(&key).await.as_deref() != Some(merged_type.as_str()) {
-            // A site mid-clone has no verified content.json yet, so it cannot
+        if self.xite_merged_type(&key).await.as_deref() != Some(merged_type.as_str()) {
+            // A xite mid-clone has no verified content.json yet, so it cannot
             // declare its merged_type. Let it through so its files serve
             // progressively during the initial hub clone (the html wait loop
             // gates on this same signal) instead of erroring until it lands.
@@ -9332,7 +9332,7 @@ impl AppState {
     /// Look up peers for `address` via the installed [`PeerFinder`] (the DHT),
     /// or an empty list when none is installed. Drops this node's own addresses:
     /// we announce our onion/i2p/rns self-claims to the DHT, and a lookup for a
-    /// site we serve echoes them straight back. The clone/user-content dial
+    /// xite we serve echoes them straight back. The clone/user-content dial
     /// paths call this directly (bypassing [`Self::add_peers`]' own-peer
     /// filter), so without this a sole seeder would dial its own onion service
     /// and "sync" from itself, masking the no-peers condition.
@@ -9394,7 +9394,7 @@ impl AppState {
     /// Record that `xite` advanced to `modified` in the shared hint store, if
     /// one is installed. Called for every update we receive over EDX (the
     /// original push and every re-broadcast), so the hint spreads with the
-    /// flood - a node that only relays the site still records it for others.
+    /// flood - a node that only relays the xite still records it for others.
     /// No-op before the store is installed. Untrusted like the store itself:
     /// a bad hint only ever costs a poller one wasted (signature-verified)
     /// resync, and the store is bounded and evicts.
@@ -9791,15 +9791,15 @@ impl AppState {
         let (bytes, files) = hook.sync_user_content(address).await;
         if bytes > 0 {
             self.rebuild_xite_db(address).await;
-            // A merged site's fresh rows must reach its merger's db too (its
+            // A merged xite's fresh rows must reach its merger's db too (its
             // repos/issues live there; the merger page queries only its own db).
-            if self.site_merged_type(address).await.is_some() {
+            if self.xite_merged_type(address).await.is_some() {
                 self.rebuild_merger_dbs().await;
             }
             self.log("INFO", format!("Synced user content for {address} ({bytes} bytes)")).await;
             // Per-file file_done events already fired as each file landed
-            // (ingest_file); one site_info refreshes the aggregate counts.
-            self.push_site_info(address).await;
+            // (ingest_file); one xite_info refreshes the aggregate counts.
+            self.push_xite_info(address).await;
         }
         // Merge files (posts) are not hash-synced, so the pull never brings
         // them - but it now fetches them itself, per user dir, the moment that
@@ -9811,11 +9811,11 @@ impl AppState {
     }
 
     /// Ingest ONE just-arrived file into the xite's database (and, when the
-    /// xite is a merged site, into every merger database aggregating it),
+    /// xite is a merged xite, into every merger database aggregating it),
     /// then push its `file_done` event so open pages re-query. EpixNet does
     /// this per file as it is written (`SiteStorage.onUpdated` ->
     /// `Db.updateJson` -> websocket `file_done`), which is what makes
-    /// topics/posts pop in one by one while a site is still syncing; batching
+    /// topics/posts pop in one by one while a xite is still syncing; batching
     /// it into one rebuild at the end of the pass left pages empty until the
     /// whole sync (minutes when peers are slow) finished.
     pub async fn ingest_file(&self, address: &str, inner_path: &str) {
@@ -9853,7 +9853,7 @@ impl AppState {
         // and every query against the new schema dies with "no such table".
         if inner_path == "dbschema.json" {
             self.rebuild_xite_db(address).await;
-            self.push_site_info_file_done(address, inner_path, origin).await;
+            self.push_xite_info_file_done(address, inner_path, origin).await;
             return;
         }
         // Snapshot the db handle out of the lock; file + SQL work runs unlocked.
@@ -9863,7 +9863,7 @@ impl AppState {
             match xites.get(address) {
                 None => None,
                 Some(x) => match (&x.db, &x.db_schema) {
-                    // A version-3 merger db fills from its merged sites, not
+                    // A version-3 merger db fills from its merged xites, not
                     // its own tree - only the merger loop below applies.
                     (Some(db), Some(schema)) if schema.version != 3 => {
                         Some((db.clone(), schema.clone()))
@@ -9901,10 +9901,10 @@ impl AppState {
                 }
             }
         }
-        // A merged site's file must also reach the mergers aggregating it:
+        // A merged xite's file must also reach the mergers aggregating it:
         // their pages (Git Epix's repo list, Epix Post's feed) query only
         // their own version-3 db.
-        let merged_type = self.site_merged_type(address).await;
+        let merged_type = self.xite_merged_type(address).await;
         if let Some(mt) = merged_type {
             let root = {
                 let xites = self.xites.read().await;
@@ -9930,14 +9930,14 @@ impl AppState {
             };
             if let Some(root) = root {
                 for (db, schema) in mergers {
-                    // db_dir is the merged site's root; the regex match sees
-                    // the path keyed under the merged site's address, and the
-                    // rows are tagged with it (populate_site's convention).
+                    // db_dir is the merged xite's root; the regex match sees
+                    // the path keyed under the merged xite's address, and the
+                    // rows are tagged with it (populate_xite's convention).
                     let _ = db.update_file(&schema, &root, inner_path, address, address);
                 }
             }
         }
-        self.push_site_info_file_done(address, inner_path, origin).await;
+        self.push_xite_info_file_done(address, inner_path, origin).await;
     }
 
     /// Ensure `host` (a `.epix` name) is served, resolving + cloning it on demand
@@ -9949,7 +9949,7 @@ impl AppState {
     }
 
     /// Operator variant (the trusted admin socket): clone `host` even when
-    /// NoNewSites locks the site set, so `siteDownload` works server-side.
+    /// NoNewSites locks the xite set, so `siteDownload` works server-side.
     pub async fn ensure_xite_admin(&self, host: &str) -> bool {
         self.ensure_xite_inner(host, true).await
     }
@@ -9959,7 +9959,7 @@ impl AppState {
         // files are missing (an interrupted clone) still goes to the resolver
         // so its download resumes - the periodic resync only fetches files
         // when a newer content.json shows up, so it never heals one. Owned
-        // sites never re-download: local edits stay.
+        // xites never re-download: local edits stay.
         let key0 = self.canonical_key(host).await;
         if self.has_xite(&key0).await
             && (self.xite_owned(&key0).await || self.xite_core_complete(&key0).await)
@@ -9971,17 +9971,17 @@ impl AppState {
             self.load_content_from_disk(&key0).await;
             return true;
         }
-        // NoNewSites (unless an operator forces it): the site set is locked, but
+        // NoNewSites (unless an operator forces it): the xite set is locked, but
         // an xID must still RESOLVE and a xite already on this node must still
         // serve and resume/update. Only a brand-new xite (one we do not already
         // have) is refused - the caller shows the "new xites disabled" page.
-        if !force && self.no_new_sites().await {
+        if !force && self.no_new_xites().await {
             let key = self.resolve_for_serving(host).await;
             if !self.has_xite(&key).await {
                 return false;
             }
             // Registered but maybe incomplete: fall through so the resolver
-            // resumes its download. This adds no new site, it heals an existing
+            // resumes its download. This adds no new xite, it heals an existing
             // one.
         }
         let hook = self.on_demand.read().await.clone();
@@ -10020,19 +10020,19 @@ impl AppState {
         if let Some(x) = self.xites.write().await.get_mut(address) {
             x.settings.own = owned;
         }
-        self.persist_sites().await;
+        self.persist_xites().await;
         // Push the change so the wrapper/sidebar reflect it at once (reveal the
         // owner panel, re-check the box) instead of the toggle appearing to
         // revert on the next re-render - and so the wrapper can raise the
-        // "modified files - sign them" panel the moment you claim the site.
-        self.push_site_info(address).await;
+        // "modified files - sign them" panel the moment you claim the xite.
+        self.push_xite_info(address).await;
     }
 
     /// Try to recover a xite's private key from the user's master seed via its
-    /// `address_index` (only works for sites this user created). `"ok"` on
+    /// `address_index` (only works for xites this user created). `"ok"` on
     /// success (key saved + marked owned), else `{error}`. `siteRecoverPrivatekey`.
     pub async fn recover_privatekey(&self, address: &str) -> Value {
-        if self.user.read().await.site_privatekey(address).is_some() {
+        if self.user.read().await.xite_privatekey(address).is_some() {
             return json!({ "error": "This site already has a saved private key" });
         }
         let content = self.content(address).await;
@@ -10047,7 +10047,7 @@ impl AppState {
         };
         match epix_crypt::privatekey_to_address(&privatekey) {
             Ok(derived) if derived == address => {
-                let _ = self.user.write().await.set_site_privatekey(address, &privatekey);
+                let _ = self.user.write().await.set_xite_privatekey(address, &privatekey);
                 self.save_user().await;
                 self.set_owned(address, true).await;
                 json!("ok")
@@ -10064,7 +10064,7 @@ impl AppState {
     /// requires the signer to be the xite address), so accepting it would only
     /// store a key that fails later - after marking the xite owned and telling
     /// the user it was saved.
-    pub async fn set_site_privatekey(&self, address: &str, privatekey: &str) -> Result<(), String> {
+    pub async fn set_xite_privatekey(&self, address: &str, privatekey: &str) -> Result<(), String> {
         if !privatekey.is_empty() {
             let signer = epix_crypt::privatekey_to_address(privatekey)
                 .map_err(|_| "That is not a valid private key".to_string())?;
@@ -10074,7 +10074,7 @@ impl AppState {
                 ));
             }
         }
-        self.user.write().await.set_site_privatekey(address, privatekey)?;
+        self.user.write().await.set_xite_privatekey(address, privatekey)?;
         // Persist it - `recover_privatekey` saves, this path never did, so a key
         // added from the sidebar was silently lost on restart.
         self.save_user().await;
@@ -10082,7 +10082,7 @@ impl AppState {
             // Forgetting a key says nothing about ownership (a xite whose key
             // is recoverable from the master seed is still owned), so only
             // re-render rather than going through set_owned.
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         } else {
             self.set_owned(address, true).await;
         }
@@ -10090,8 +10090,8 @@ impl AppState {
     }
 
     /// The saved private key for a xite (used to auto-sign on publish).
-    pub async fn site_privatekey(&self, address: &str) -> Option<String> {
-        self.user.read().await.site_privatekey(address)
+    pub async fn xite_privatekey(&self, address: &str) -> Option<String> {
+        self.user.read().await.xite_privatekey(address)
     }
 
     /// The content rules for `inner_path` - chiefly the `signers` allowed to
@@ -10274,7 +10274,7 @@ impl AppState {
         } else if !is_optional {
             return Err("Delete error: file does not exist".into());
         }
-        self.push_site_info_event_excluding(address, "file_deleted", origin).await;
+        self.push_xite_info_event_excluding(address, "file_deleted", origin).await;
         Ok(())
     }
 
@@ -10339,7 +10339,7 @@ impl AppState {
         // `own` must reach sites.json NOW: the offline CLI sign exits without
         // any later flush, and a xite left `own: false` is evictable cache to
         // enforce_optional_limit - the authored originals can be deleted.
-        self.persist_sites().await;
+        self.persist_xites().await;
         // Re-register the freshly signed files and bundles into the EDX store.
         // Registration otherwise happens only at startup, so every re-sign on
         // a running node published a manifest whose new objects no peer could
@@ -10595,7 +10595,7 @@ impl AppState {
             files += f;
             unserved += u;
         }
-        // Every declared merge file failed on every tried peer: the site's
+        // Every declared merge file failed on every tried peer: the xite's
         // records CANNOT converge this pass. Say so once per sweep - each
         // fetch exit is individually silent, and the resulting "Updated!"
         // with stale posts is undebuggable without this line.
@@ -11051,7 +11051,7 @@ impl AppState {
     /// and ingest into the xite's database so the change shows immediately.
     /// Sign one post record with the user's CERT-AWARE auth key for `address`
     /// (the same key [`sign_user_content`](Self::sign_user_content) uses, NOT
-    /// the raw site key `user_auth_privatekey` returns), over the canonical
+    /// the raw xite key `user_auth_privatekey` returns), over the canonical
     /// record payload (`record` minus `sign`). Returns the record with `sign`
     /// embedded. Backs the `recordSign` WS command so record canonicalization
     /// only ever runs in Rust - no JS/Rust byte-parity surface for signing.
@@ -11063,7 +11063,7 @@ impl AppState {
             let mut user = self.user.write().await;
             user.auth_privatekey(address)?
         };
-        self.save_user().await; // auth_privatekey may have derived the site entry
+        self.save_user().await; // auth_privatekey may have derived the xite entry
         // The node sets `author` authoritatively to the address this key
         // recovers to, so a client can never claim another author. On creation
         // (no post_id yet) it derives the immutable CRDT key; edit/delete keep
@@ -11158,7 +11158,7 @@ impl AppState {
             };
             (extend, key)
         };
-        self.save_user().await; // auth_privatekey may have derived the site entry
+        self.save_user().await; // auth_privatekey may have derived the xite entry
 
         // Resolve every xID name verification will need (the user dir's own
         // name + any name-form signers the parent rules grant).
@@ -11509,7 +11509,7 @@ impl AppState {
 
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
     /// command - the receive half of the publish round-trip). Mirrors EpixNet's
-    /// `FileRequest.actionUpdate`: reject unknown/not-downloaded sites, skip
+    /// `FileRequest.actionUpdate`: reject unknown/not-downloaded xites, skip
     /// versions we already have, verify the signature before accepting, then
     /// download the changed files in the background and re-publish to a few
     /// peers so the update floods.
@@ -11521,7 +11521,7 @@ impl AppState {
     /// circuit without parsing. Returns whether the update was applied.
     pub async fn apply_inbound_update(
         self: &Arc<Self>,
-        site: &str,
+        xite: &str,
         inner_path: &str,
         body: Option<Vec<u8>>,
         modified_hint: Option<f64>,
@@ -11536,7 +11536,7 @@ impl AppState {
             xites
                 .iter()
                 .filter(|(k, x)| {
-                    k.as_str() == site || canonical_address(x.content.as_ref(), k) == site
+                    k.as_str() == xite || canonical_address(x.content.as_ref(), k) == xite
                 })
                 .map(|(k, _)| k.clone())
                 .collect()
@@ -11551,7 +11551,7 @@ impl AppState {
             return Err("Only content.json update allowed".into());
         }
         let is_root = inner_path == "content.json";
-        // Only accept pushes for sites we voluntarily downloaded. The version
+        // Only accept pushes for xites we voluntarily downloaded. The version
         // to beat is the root's in-memory clock, or - for an include / user
         // content.json - the on-disk child's own `modified`.
         let (downloaded, current_modified) = {
@@ -11595,7 +11595,7 @@ impl AppState {
                 // GetSigned. The sender may be an onion/i2p peer: use its dial
                 // deadline, not a flat clearnet one.
                 let mut fetched = match &sender {
-                    Some(s) => self.fetch_signed_from(s, site, inner_path).await,
+                    Some(s) => self.fetch_signed_from(s, xite, inner_path).await,
                     None => None,
                 };
                 // No sender wire address (or it turned out to be unreachable):
@@ -11606,7 +11606,7 @@ impl AppState {
                         if sender.as_ref() == Some(sp) {
                             continue; // already tried above
                         }
-                        fetched = self.fetch_signed_from(sp, site, inner_path).await;
+                        fetched = self.fetch_signed_from(sp, xite, inner_path).await;
                         if fetched.is_some() {
                             break;
                         }
@@ -11634,7 +11634,7 @@ impl AppState {
         }
 
         // Don't process the same pushed version twice concurrently.
-        let uri = format!("{site}/{inner_path}:{new_modified}");
+        let uri = format!("{xite}/{inner_path}:{new_modified}");
         if !self.updates_in_flight.lock().unwrap().insert(uri.clone()) {
             return Ok(InboundUpdate::NotChanged);
         }
@@ -11653,7 +11653,7 @@ impl AppState {
             // Verify + STAGE the pushed root in memory only. It is committed
             // (written to disk + adopted for serving) by finish_inbound_update
             // once every file it declares is present, so a push whose files
-            // can't all be fetched never regresses a working site.
+            // can't all be fetched never regresses a working xite.
             let limit = self.size_limit_bytes(&key).await;
             if let Err(e) = xite.stage_content_limited(&bytes, limit) {
                 self.updates_in_flight.lock().unwrap().remove(&uri);
@@ -11684,7 +11684,7 @@ impl AppState {
                 Ok(files) => {
                     child_files = Some(files);
                     // Fold the child's modified clock into settings and its
-                    // db columns (cert_user_id) into the site db.
+                    // db columns (cert_user_id) into the xite db.
                     self.ingest_file_from(&key, inner_path, None).await;
                     // A user content.json declaring merge files (posts.json):
                     // fetch + merge each from the sender. They are not in
@@ -11776,7 +11776,7 @@ impl AppState {
     /// Resolve every xID name that verifying `content_inner_path` may need -
     /// the user directory's own name (`data/users/user.epix/…` is signed by
     /// the identity that xID belongs to) plus any name-form signers the
-    /// parent's rules grant (a site's admins may sign every user's content
+    /// parent's rules grant (a xite's admins may sign every user's content
     /// for moderation) - to their on-chain signer addresses.
     async fn resolve_xid_map(
         storage: &XiteStorage,
@@ -11955,7 +11955,7 @@ impl AppState {
             self.mark_optional_dirty(&key);
             self.refresh_optional_owed(&key).await;
             for k in &keys {
-                self.push_site_info_event(k, "updated").await;
+                self.push_xite_info_event(k, "updated").await;
             }
         }
     }
@@ -12029,9 +12029,9 @@ impl AppState {
                 if path.is_dir() {
                     stack.push(path);
                 } else if let Ok(rel) = path.strip_prefix(&start) {
-                    // Relative to the REQUESTED dir, not the site root:
+                    // Relative to the REQUESTED dir, not the xite root:
                     // EpixNet's storage.walk(inner_path) yields the same, and
-                    // sites join the names back onto the dir they asked for
+                    // xites join the names back onto the dir they asked for
                     // (git.js builds "objects/pack/" + name to load pack
                     // indexes - root-relative paths broke that).
                     out.push(rel.to_string_lossy().replace('\\', "/"));
@@ -12071,7 +12071,7 @@ impl AppState {
             }
         };
         if changed {
-            self.persist_sites().await;
+            self.persist_xites().await;
         }
     }
 
@@ -12098,7 +12098,7 @@ impl AppState {
             false
         };
         if ok {
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
         ok
     }
@@ -12117,7 +12117,7 @@ impl AppState {
             false
         };
         if ok {
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
         ok
     }
@@ -12164,7 +12164,7 @@ impl AppState {
             let dir = child.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
             tally(child_json.get("files_optional"), dir);
         }
-        self.persist_sites().await;
+        self.persist_xites().await;
         // A new directory commitment changes what this node owes, and so the
         // dashboard row's countdown.
         self.refresh_optional_owed(address).await;
@@ -12193,11 +12193,11 @@ impl AppState {
             }
         };
         if removed {
-            self.persist_sites().await;
+            self.persist_xites().await;
             // Withdrawing the promise drops what this node owes, so the row's
             // countdown must shrink (usually to nothing) with it.
             self.refresh_optional_owed(address).await;
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
         removed
     }
@@ -12216,7 +12216,7 @@ impl AppState {
             None => false,
         };
         if found {
-            self.persist_sites().await;
+            self.persist_xites().await;
             // The promise just changed, and with it how many files this node
             // owes - which is what the dashboard row counts down. Recount here
             // so the row reacts to the toggle instead of to the retry tick.
@@ -12228,7 +12228,7 @@ impl AppState {
                 // withdraws it: the in-flight pass (if any) aborts at its next
                 // check; drop the lingering waiting panel now.
                 self.set_optional_progress(address, None).await;
-                self.push_site_info(address).await;
+                self.push_xite_info(address).await;
             }
         }
         found
@@ -12345,7 +12345,7 @@ impl AppState {
             None => false,
         };
         if found {
-            self.persist_sites().await;
+            self.persist_xites().await;
             if on {
                 if trigger_download {
                     self.spawn_optional_download(address, None);
@@ -12363,7 +12363,7 @@ impl AppState {
                 // in-flight pass aborts at its next between-files check; drop
                 // the lingering waiting panel now.
                 self.set_optional_progress(address, None).await;
-                self.push_site_info(address).await;
+                self.push_xite_info(address).await;
             }
         }
         found
@@ -12395,7 +12395,7 @@ impl AppState {
                 // optional set.
                 state.set_download_optional(&address, true, false).await;
                 let _ = state.file_need(&address, &inner_path).await;
-                state.push_site_info(&address).await;
+                state.push_xite_info(&address).await;
             }
         });
     }
@@ -12520,7 +12520,7 @@ impl AppState {
     }
 
     /// The xites the background optional-retry loop watches, with the scope
-    /// of each one's promise: `None` = whole-site (either sidebar toggle on),
+    /// of each one's promise: `None` = whole-xite (either sidebar toggle on),
     /// `Some(dirs)` = only the `optionalHelp` directories. Paused xites are
     /// left alone.
     async fn optional_retry_flagged(&self) -> Vec<(String, Option<Vec<String>>)> {
@@ -12529,7 +12529,7 @@ impl AppState {
             .iter()
             .filter(|(_, x)| x.settings.serving)
             .filter_map(|(a, x)| {
-                // Only the help-distribute toggle is a whole-site promise.
+                // Only the help-distribute toggle is a whole-xite promise.
                 // `download_optional` alone is the ON-DEMAND permission - the
                 // prompt path (prompt_optional_download) enables it to fetch
                 // exactly one requested file, and enrolling it here would
@@ -12550,7 +12550,7 @@ impl AppState {
     }
 
     /// The xites the reader's global `full_retention` setting watches: every
-    /// serving, non-own xite WITHOUT its own whole-site optional promise
+    /// serving, non-own xite WITHOUT its own whole-xite optional promise
     /// (those are already covered by [`Self::optional_retry_flagged`]; a xite
     /// with only directory-scoped `optionalHelp` commitments still needs the
     /// full-retention pass for the rest of its files). This is what makes
@@ -12628,7 +12628,7 @@ impl AppState {
     /// Recompute and cache how many optional files this node owes a xite - the
     /// number the dashboard row counts down - from the user's own preferences.
     ///
-    /// Three ways to have promised: the whole-site "help distribute" toggle,
+    /// Three ways to have promised: the whole-xite "help distribute" toggle,
     /// per-directory `optionalHelp` commitments a page registered, or the
     /// global full-retention setting (which only applies to xites without a
     /// promise of their own). A xite the user never opted into owes zero, so
@@ -12699,7 +12699,7 @@ impl AppState {
     }
 
     /// Record how far the update check has walked its candidate peers, and tell
-    /// open pages. Nothing clears this: `site_info` only reports it while the
+    /// open pages. Nothing clears this: `xite_info` only reports it while the
     /// pass is in its checking phase, so a stale pair is never read.
     async fn set_check_progress(&self, address: &str, probed: usize, total: usize) {
         {
@@ -12709,7 +12709,7 @@ impl AppState {
                 None => return,
             }
         }
-        self.push_site_info(address).await;
+        self.push_xite_info(address).await;
     }
 
     /// Cache the count [`Self::refresh_optional_owed`] computed, and tell open
@@ -12717,7 +12717,7 @@ impl AppState {
     /// on the back of some unrelated event: a xite waiting out a retry backoff
     /// (its seeder offline) pushes nothing of its own, so its countdown would
     /// sit in this cache unseen. The write guard is dropped before the push -
-    /// `site_info` takes the same lock for reading.
+    /// `xite_info` takes the same lock for reading.
     async fn set_optional_owed(&self, address: &str, owed: usize) {
         let changed = {
             let mut xites = self.xites.write().await;
@@ -12730,7 +12730,7 @@ impl AppState {
             }
         };
         if changed {
-            self.push_site_info(address).await;
+            self.push_xite_info(address).await;
         }
     }
 
@@ -12747,7 +12747,7 @@ impl AppState {
     ///
     /// Scheduling details, each load-bearing:
     /// - Complete xites re-verify only every 10 min (`missing_optional_files`
-    ///   walks the site's content.jsons on disk - too heavy for every 30s
+    ///   walks the xite's content.jsons on disk - too heavy for every 30s
     ///   tick times every xite now that the toggles default ON), EXCEPT when
     ///   marked dirty (new content landed) - then immediately.
     /// - Passes run as SPAWNED tasks: one xite grinding through a multi-GB
@@ -12855,7 +12855,7 @@ impl AppState {
         // or failed clone (the seeder was offline when siteAdd/siteDownload
         // ran) - keep resuming the clone with the same backoff, until it
         // lands or the user deletes the xite. Without this, one failed
-        // resolve left a permanently empty registered site that only a
+        // resolve left a permanently empty registered xite that only a
         // manual re-add would heal.
         let core_watch: Vec<String> = {
             let xites = self.xites.read().await;
@@ -13001,7 +13001,7 @@ impl AppState {
         // it has. Backing off to 10 minutes meant the node then SLEPT through
         // the seeder becoming reachable and the page sat on the loading screen
         // long after a retry would have worked. 20s doubling to 90s keeps a
-        // dead site cheap while catching a peer that just came up.
+        // dead xite cheap while catching a peer that just came up.
         let delay = (20i64 * (1i64 << fails.min(3))).min(90);
         schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
         let state = self.clone();
@@ -13018,7 +13018,7 @@ impl AppState {
 
     /// Whether a running bulk optional pass still has the user's mandate:
     /// the xite exists, is being served (not paused), and the grant that
-    /// started the pass still holds (either toggle for a whole-site pass; the
+    /// started the pass still holds (either toggle for a whole-xite pass; the
     /// helped directory for an `optionalHelp` pass). Checked between files
     /// and rounds so toggling off / pausing / deleting a xite ACTUALLY stops
     /// an in-flight multi-GB download instead of letting it run to the end.
@@ -13055,7 +13055,7 @@ impl AppState {
             return have;
         }
         self.set_optional_phase(address, "Announcing…").await;
-        self.push_site_info(address).await;
+        self.push_xite_info(address).await;
         let bootstrap = self.bootstrap_trackers.read().await.clone();
         let trackers = self.all_trackers(&bootstrap).await;
         let found = self.announce_to_trackers(address, &trackers).await;
@@ -13187,7 +13187,7 @@ impl AppState {
                 }
                 let Some(&(idx, path, size)) = pending.next() else { break };
                 self.mark_optional_file(address, idx, OptFileState::Active, path).await;
-                self.push_site_info(address).await;
+                self.push_xite_info(address).await;
                 active.lock().unwrap().insert(idx, (path.clone(), size));
                 assigned.push((idx, path.clone()));
                 fetching.insert(idx);
@@ -13263,7 +13263,7 @@ impl AppState {
                             .await;
                             // Per-file event: open pages re-query, the sidebar's
                             // downloaded-bytes counter moves while the pass runs.
-                            self.push_site_info_file_done(address, path, None).await;
+                            self.push_xite_info_file_done(address, path, None).await;
                         }
                         Err(e) => {
                             requeue.push((idx, path, size));
@@ -13338,7 +13338,7 @@ impl AppState {
         for idx in requeued {
             self.mark_optional_file(address, *idx, OptFileState::Pending, "").await;
         }
-        self.push_site_info(address).await;
+        self.push_xite_info(address).await;
         true
     }
 
@@ -13370,7 +13370,7 @@ impl AppState {
             self.set_optional_progress(address, None).await;
         }
         if fetched > 0 {
-            self.persist_sites().await; // optional_downloaded accounting
+            self.persist_xites().await; // optional_downloaded accounting
             // Snapshot the chart now instead of waiting up to a full sample
             // interval (~5 min): a user who just pulled a multi-MB optional
             // file expects the Stats download graph to move right away, not
@@ -13378,7 +13378,7 @@ impl AppState {
             // baseline, so the next scheduled snapshot isn't double-counted.
             self.collect_chart().await;
         }
-        self.push_site_info(address).await;
+        self.push_xite_info(address).await;
     }
 
     /// Fetch every missing optional file of a xite (or only those under
@@ -13395,7 +13395,7 @@ impl AppState {
         if self.transport.read().await.is_none() {
             return (0, 0); // offline state (CLI actions): nothing to dial
         }
-        // One bulk pass per site at a time: a resync tick landing mid-download
+        // One bulk pass per xite at a time: a resync tick landing mid-download
         // must not start a second walk. (file_need would dedupe the fetches;
         // the walk itself is what this skips.)
         if !self.optional_downloads_in_flight.lock().unwrap().insert(address.to_string()) {
@@ -13423,7 +13423,7 @@ impl AppState {
         self.log("INFO", format!("Downloading {total} optional file(s) for {address}")).await;
         self.set_worker_stats(address, total, 1, total).await;
         self.seed_optional_progress(address, &todo).await;
-        self.push_site_info(address).await;
+        self.push_xite_info(address).await;
         // A cold registry (right after a restart) has no peers to try yet -
         // announce NOW instead of failing the whole pass and telling the user
         // "could not fetch from any peer" before a single tracker was asked.
@@ -13499,7 +13499,7 @@ impl AppState {
     /// mop up only what EDX missed. Per-file bookkeeping (hashfield advertise,
     /// optional_downloaded, finished stamp) happens in edx_materialize_file, so
     /// an EDX-fetched optional file seeds just like a msgpack-fetched one. A
-    /// legacy site (no `b3`) resolves nothing and this returns at once, leaving
+    /// legacy xite (no `b3`) resolves nothing and this returns at once, leaving
     /// the whole queue to the rounds. What it fetched is dropped from `queue`
     /// and added to the counters, so the rounds never re-try a done file.
     ///
@@ -13552,7 +13552,7 @@ impl AppState {
                     *fetched += 1;
                     *bytes_done += *size;
                     self.mark_optional_file(address, *idx, OptFileState::Done, "").await;
-                    self.push_site_info_file_done(address, path, None).await;
+                    self.push_xite_info_file_done(address, path, None).await;
                 }
             }
             self.bump_optional_progress(address, *fetched, 0, *bytes_done).await;
@@ -13587,7 +13587,7 @@ impl AppState {
         .await;
     }
 
-    /// The declared optional files not present on disk, as site-relative inner
+    /// The declared optional files not present on disk, as xite-relative inner
     /// paths: the root content.json's `files_optional` plus every stored child
     /// content.json's (per-user optional files). `directory` narrows to a
     /// prefix (`optionalHelp`). Presence = a file at the declared size (no
@@ -13651,7 +13651,7 @@ impl AppState {
     /// [`Self::retention_completion_plan`] with the reader-override decision
     /// made by the CALLER. A pass that later re-checks its mandate must
     /// classify itself with the SAME snapshot the plan was built from - two
-    /// separate config reads let a mid-build toggle produce a site-sized
+    /// separate config reads let a mid-build toggle produce a xite-sized
     /// override plan whose pass believes it is owner-driven and so never
     /// stops when the setting goes off.
     async fn retention_completion_plan_as(
@@ -13687,7 +13687,7 @@ impl AppState {
         // optional-only walk missed the child units' required per-user data,
         // the dominant bytes on a hub). No hashing here - this runs from the
         // background retry tick, and hashing every declared file of every
-        // watched xite each pass reads and SHA512s entire sites forever
+        // watched xite each pass reads and SHA512s entire xites forever
         // (corruption is still caught at serve/verify/resync time).
         let mut missing: Vec<(String, u64)> = Vec::new();
         let mut present: u64 = 0;
@@ -13793,7 +13793,7 @@ impl AppState {
     /// mandate holds. Sequential and unhurried - this is background work
     /// behind an already-painted page, and `file_need` dedupes against any
     /// fetch the page itself started. The mandate is re-checked between
-    /// files: a plan can be site-sized, and pausing the xite or withdrawing
+    /// files: a plan can be xite-sized, and pausing the xite or withdrawing
     /// the setting/consent must stop it HERE, not only block the next pass.
     /// Returns how many paths were attempted (a withdrawal stops the walk).
     async fn run_retention_pass(
@@ -13827,7 +13827,7 @@ impl AppState {
     /// a reader-driven pass - is still on, and the optional-download consent,
     /// when the plan needed it, still stands. The bulk optional pass keeps the
     /// same promise through `optional_pass_should_continue`; without this a
-    /// site-sized pass would keep downloading for hours after the user said
+    /// xite-sized pass would keep downloading for hours after the user said
     /// stop.
     async fn retention_pass_should_continue(
         &self,
@@ -13871,10 +13871,10 @@ impl AppState {
             is_merger
         };
         // build_xite_db leaves a version-3 merger db EMPTY (its rows come from
-        // the merged sites, not its own tree). Refill it here, else every
+        // the merged xites, not its own tree). Refill it here, else every
         // caller that doesn't follow up itself - the dbRebuild/dbReload ws
         // command, db_query's lazy build, a mute change - leaves the merger
-        // site with no data until the next restart.
+        // xite with no data until the next restart.
         if is_merger {
             self.rebuild_merger_dbs().await;
         }
@@ -13882,10 +13882,10 @@ impl AppState {
     }
 
     /// Remove a xite from the node and delete its files on disk (`siteDelete`).
-    /// A site may be served under several keys (raw `epix1…` address plus a
+    /// A xite may be served under several keys (raw `epix1…` address plus a
     /// `.epix` alias) sharing one storage; all of them are removed, otherwise a
-    /// surviving alias keeps syncing and the periodic `persist_sites` writes
-    /// the site straight back into `sites.json`. Returns false if the xite
+    /// surviving alias keeps syncing and the periodic `persist_xites` writes
+    /// the xite straight back into `sites.json`. Returns false if the xite
     /// isn't served here.
     pub async fn remove_xite(&self, address: &str) -> bool {
         let mut roots = Vec::new();
@@ -13912,7 +13912,7 @@ impl AppState {
                         objects.extend(declared_object_ids(&x.storage, x.content.as_ref()));
                         roots.push(root);
                     }
-                    // The site's user data may be keyed by the display name in
+                    // The xite's user data may be keyed by the display name in
                     // stores written by older builds; purge both.
                     if let Some(display) = x.display {
                         removed_keys.push(display);
@@ -13922,7 +13922,7 @@ impl AppState {
             }
         }
         // Best-effort delete of the xite's storage directory (shared by all
-        // aliases), then drop the site from the persisted registries so it
+        // aliases), then drop the xite from the persisted registries so it
         // stays deleted across restarts.
         for root in roots {
             let _ = std::fs::remove_dir_all(&root);
@@ -13942,7 +13942,7 @@ impl AppState {
             }
         }
         // The derived feed artifacts hold the whole record set in memory; a
-        // deleted site's copy would stay resident until restart.
+        // deleted xite's copy would stay resident until restart.
         {
             let mut cache = self.feed_cache.write().await;
             cache.remove(&canonical);
@@ -13950,24 +13950,24 @@ impl AppState {
                 cache.remove(key);
             }
         }
-        // EpixNet parity (`user.deleteSiteData`): forget the site's derived
+        // EpixNet parity (`user.deleteSiteData`): forget the xite's derived
         // auth identity, cert selection, and feed follows. Harmless to the
-        // user - the keys re-derive from the master seed if the site returns.
-        self.delete_user_site_data(&removed_keys).await;
+        // user - the keys re-derive from the master seed if the xite returns.
+        self.delete_user_xite_data(&removed_keys).await;
         self.persist_peers().await;
-        self.persist_sites().await;
+        self.persist_xites().await;
         true
     }
 
-    /// Drop the per-site user data (derived auth keys, cert binding, feed
+    /// Drop the per-xite user data (derived auth keys, cert binding, feed
     /// follows) for the given serving keys and persist users.json if anything
     /// was removed. EpixNet's `User.deleteSiteData`.
-    async fn delete_user_site_data(&self, keys: &[String]) {
+    async fn delete_user_xite_data(&self, keys: &[String]) {
         let mut changed = false;
         {
             let mut user = self.user.write().await;
             for key in keys {
-                changed |= user.sites.remove(key).is_some();
+                changed |= user.xites.remove(key).is_some();
                 changed |= user.follows.remove(key).is_some();
             }
         }
@@ -13983,7 +13983,7 @@ impl AppState {
         Ok(())
     }
 
-    /// A xite's storage directory on disk (`serverShowdirectory` "site").
+    /// A xite's storage directory on disk (`serverShowdirectory` "xite").
     pub async fn xite_root(&self, address: &str) -> Option<PathBuf> {
         self.xites.read().await.get(address).map(|x| x.storage.root().to_path_buf())
     }
@@ -14004,14 +14004,14 @@ impl AppState {
     /// exact shape (guard held across the `user` lock calls below) froze a
     /// node for hours in the field. Copy what the response needs, drop the
     /// guard, then do the user work.
-    pub async fn site_info(&self, address: &str) -> Value {
+    pub async fn xite_info(&self, address: &str) -> Value {
         // Whether a bulk optional pass is running RIGHT NOW - not whether a
         // progress panel exists. A pass that ended with failures keeps its
         // panel up ("Waiting for peers…"), and using the panel as the signal
         // masked the owed count for exactly the xites that most need to show
         // one.
         let optional_pass_running = self.optional_pass_in_flight(address);
-        let update_phase = self.site_update_phase(address);
+        let update_phase = self.xite_update_phase(address);
         let (settings, display, content, known_peers, started_task_num, tasks_active, workers, optional_progress, optional_left, progress) = {
             let xites = self.xites.read().await;
             let Some(entry) = xites.get(address) else {
@@ -14049,8 +14049,8 @@ impl AppState {
                 entry.display.clone(),
                 // No verified content.json yet (registered mid-clone): an
                 // EMPTY object, not null - EpixNet's formatSiteInfo sends {}
-                // too, and dashboard site rows read `content.title` without a
-                // null check, so null kills the whole site list render.
+                // too, and dashboard xite rows read `content.title` without a
+                // null check, so null kills the whole xite list render.
                 entry.content.as_ref().map(summarize_content).unwrap_or_else(|| json!({})),
                 entry.peers.len() as i64,
                 entry.started_task_num,
@@ -14070,11 +14070,11 @@ impl AppState {
             .unwrap_or_default();
         let cert_user_id = self.user.read().await.cert_user_id(address);
         let xid_directory = self.user_directory(address, &auth_address).await;
-        // Whether users.json holds this site's own private key (a bool, never
+        // Whether users.json holds this xite's own private key (a bool, never
         // the key itself) - EpixNet's formatSiteInfo parity. The wrapper
         // infopanel and the sidebar sign/publish buttons key off this: true ->
         // sign with `privatekey: "stored"`, false -> prompt for the key.
-        let has_privatekey = self.user.read().await.site_privatekey(address).is_some();
+        let has_privatekey = self.user.read().await.xite_privatekey(address).is_some();
 
         let address_hash = hex::encode(Sha256::digest(address.as_bytes()));
         let short = if address.len() > 6 { &address[..6] } else { address };
@@ -14087,7 +14087,7 @@ impl AppState {
             peers += 1;
         }
 
-        // Newsfeed: `null` = the user never followed this site, else the
+        // Newsfeed: `null` = the user never followed this xite, else the
         // follow count. Xites key their one-time auto-follow off the null
         // (EpixNet's Newsfeed plugin injected this): without the key present
         // they never register their feed queries and the dashboard feed
@@ -14141,15 +14141,15 @@ impl AppState {
         })
     }
 
-    /// `siteList` - one siteInfo per served xite, for the dashboard's Sites
+    /// `siteList` - one siteInfo per served xite, for the dashboard's Xites
     /// panel. A xite served under both its raw address and a `.epix` alias is a
-    /// single site, so we collapse entries that share the same signed content
+    /// single xite, so we collapse entries that share the same signed content
     /// address (the alias points at the same storage + content).
-    pub async fn site_list(&self) -> Vec<Value> {
+    pub async fn xite_list(&self) -> Vec<Value> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for address in self.xite_addresses().await {
-            let info = self.site_info(&address).await;
+            let info = self.xite_info(&address).await;
             if info.is_null() {
                 continue;
             }
@@ -14244,16 +14244,16 @@ impl AppState {
         self.allowed_ws_origins.lock().unwrap().contains(origin_host)
     }
 
-    /// Move a per-site user identity (derived site keys, cert binding, feed
+    /// Move a per-xite user identity (derived xite keys, cert binding, feed
     /// follows) stored under an old serving key (a `.epix` name, from builds
-    /// that keyed sites by name as well as address) to the bech32 address.
+    /// that keyed xites by name as well as address) to the bech32 address.
     /// Never overwrites an existing address-keyed entry.
-    async fn migrate_user_site_key(&self, from: &str, to: &str) {
+    async fn migrate_user_xite_key(&self, from: &str, to: &str) {
         let mut changed = false;
         {
             let mut user = self.user.write().await;
-            if let Some(auth) = user.sites.remove(from) {
-                user.sites.entry(to.to_string()).or_insert(auth);
+            if let Some(auth) = user.xites.remove(from) {
+                user.xites.entry(to.to_string()).or_insert(auth);
                 changed = true;
             }
             if let Some(follows) = user.follows.remove(from) {
@@ -14471,7 +14471,7 @@ const MERGE_SWEEP_POOL: usize = 16;
 /// (the sender's copy is authoritative for the change it just pushed); the
 /// sweep unions a second copy so one stale-but-responsive peer cannot satisfy
 /// the whole pass. Kept small because every copy is a full file fetch, often
-/// over Tor, for every merge file of every site each sweep.
+/// over Tor, for every merge file of every xite each sweep.
 const MERGE_SWEEP_UNION: usize = 2;
 
 /// Fisher-Yates with a cheap xorshift seed. Merge sweeps shuffle their
@@ -14497,7 +14497,7 @@ fn shuffle_peers(peers: &mut [PeerAddr]) {
     }
 }
 
-/// Every `content.json` under `root`, as site-relative inner_paths.
+/// Every `content.json` under `root`, as xite-relative inner_paths.
 fn walk_content_json(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -14517,9 +14517,9 @@ fn walk_content_json(root: &std::path::Path) -> Vec<String> {
     out
 }
 
-/// The directory the db indexes files under: the site root joined with the
+/// The directory the db indexes files under: the xite root joined with the
 /// directory part of `db_file` (EpixNet's `db_dir = dirname(db_path)`), so
-/// json paths are relative to the db file, not the site root.
+/// json paths are relative to the db file, not the xite root.
 fn db_file_dir(root: &std::path::Path, db_file: &str) -> std::path::PathBuf {
     match db_file.replace('\\', "/").rsplit_once('/') {
         Some((dir, _)) if !dir.is_empty() => root.join(dir),
@@ -14532,7 +14532,7 @@ fn build_xite_db(storage: &XiteStorage, muted: &[String]) -> Option<(Database, D
     let schema = DbSchema::from_json(&String::from_utf8_lossy(&bytes)).ok()?;
     let db = Database::open_in_memory().ok()?;
     db.apply_schema(&schema).ok()?;
-    // A version-3 merger db is filled from its merged sites (rebuild_merger_dbs),
+    // A version-3 merger db is filled from its merged xites (rebuild_merger_dbs),
     // not from its own files; everything else populates from its own tree -
     // skipping muted authors' data files (ContentFilter enforcement).
     if schema.version != 3 {
@@ -14667,7 +14667,7 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 }
 
 /// The address a permission grant is keyed by: the xite's signed content
-/// address when known (so a site served under both its raw address and a
+/// address when known (so a xite served under both its raw address and a
 /// `.epix` alias shares one grant), otherwise the serving key.
 /// Build the optional-file hashfield from what's present on disk: for each
 /// `files_optional` entry we actually hold (present at its declared size),
@@ -14677,7 +14677,7 @@ fn log_line_matches(line: &Value, filter: &str) -> bool {
 /// "Downloaded" figure. Covers the root's `files_optional` AND every stored
 /// child content.json's (per-user optional files) - the root-only walk left
 /// child files out of the hashfield, so peers never learned we held them.
-/// One declared optional file, from any content.json of a site.
+/// One declared optional file, from any content.json of a xite.
 struct DeclaredOptional {
     inner_path: String,
     size: i64,
@@ -14763,7 +14763,7 @@ fn add_bigfile_row_fields(
     }
 }
 
-/// EVERY declared optional file of a site: the root content.json's
+/// EVERY declared optional file of a xite: the root content.json's
 /// `files_optional` plus every stored child content.json's (per-user
 /// optional files - avatars and the like), child paths prefixed with their
 /// directory. Root-only readers (`Xite::optional_files`) miss the per-user
@@ -14978,7 +14978,7 @@ fn summarize_content(content: &Value) -> Value {
     if let Value::Object(map) = &mut c {
         // If the xite doesn't declare a top-level `favicon`, fall back to a
         // conventional favicon file it ships (EpixTalk carries
-        // `img/favicon.ico` with no `favicon` key). The dashboard site rail
+        // `img/favicon.ico` with no `favicon` key). The dashboard xite rail
         // reads `content.favicon` to show the marker icon, so without this it
         // shows the plain brand dot even though a favicon exists. Do this
         // before `files` is replaced by a count below.
@@ -15447,9 +15447,9 @@ mod tests {
             .unwrap();
         assert_eq!(req_rows.len(), 1, "one request_num_sent datapoint per collect");
 
-        // The site table has our xite.
-        let sites = state.chart_query("SELECT * FROM site", &Value::Null).await.unwrap();
-        assert!(sites.iter().any(|s| s["address"] == "1SizeXite"));
+        // The xite table has our xite.
+        let xites = state.chart_query("SELECT * FROM site", &Value::Null).await.unwrap();
+        assert!(xites.iter().any(|s| s["address"] == "1SizeXite"));
 
         // The global `size` datapoint reflects the xite's content size (500).
         let rows = state
@@ -16010,13 +16010,13 @@ mod tests {
             .await;
 
         // Before: siteInfo has no title (the wrapper's perpetual download page).
-        assert!(state.site_info(addr).await["content"].get("title").is_none());
+        assert!(state.xite_info(addr).await["content"].get("title").is_none());
 
         // Heal it from disk.
         assert!(state.load_content_from_disk(addr).await);
 
         // After: content is loaded and siteInfo carries the real title + stats.
-        let info = state.site_info(addr).await;
+        let info = state.xite_info(addr).await;
         assert_eq!(info["content"]["title"], "Epix Test");
         assert_eq!(info["settings"]["size"], 100);
 
@@ -16080,7 +16080,7 @@ mod tests {
             .await;
         assert!(!committed);
         assert_eq!(storage.read("content.json").unwrap(), v1, "old version stays on disk");
-        assert_eq!(state.site_info(addr).await["content"]["title"], "V1", "old version serves");
+        assert_eq!(state.xite_info(addr).await["content"]["title"], "V1", "old version serves");
         assert_eq!(state.bad_files(addr).await, vec!["js/app.js"], "missing file recorded");
 
         // The files land later (any path): the same finalize now commits the
@@ -16089,8 +16089,8 @@ mod tests {
             state.finalize_root_update(&keys, addr, &storage, v2_content, &v2, &[]).await;
         assert!(committed);
         assert_eq!(storage.read("content.json").unwrap(), v2, "exact bytes committed");
-        assert_eq!(state.site_info(addr).await["content"]["title"], "V2");
-        assert_eq!(state.site_info("dash.epix").await["content"]["title"], "V2", "alias swapped");
+        assert_eq!(state.xite_info(addr).await["content"]["title"], "V2");
+        assert_eq!(state.xite_info("dash.epix").await["content"]["title"], "V2", "alias swapped");
         assert!(state.bad_files(addr).await.is_empty(), "bad_files cleared on commit");
     }
 
@@ -16139,14 +16139,14 @@ mod tests {
         // update stays pending, still serving v1.
         state.retry_pending_updates().await;
         assert_eq!(storage.read("content.json").unwrap(), v1);
-        assert_eq!(state.site_info(addr).await["content"]["title"], "V1");
+        assert_eq!(state.xite_info(addr).await["content"]["title"], "V1");
 
         // The file lands (a later push, another peer, any path): the next
         // retry pass verifies the set is complete and commits.
         storage.write("a.txt", body).unwrap();
         state.retry_pending_updates().await;
         assert_eq!(storage.read("content.json").unwrap(), v2);
-        assert_eq!(state.site_info(addr).await["content"]["title"], "V2");
+        assert_eq!(state.xite_info(addr).await["content"]["title"], "V2");
 
         // Committed pending entries are gone: another pass is a no-op.
         state.retry_pending_updates().await;
@@ -16154,7 +16154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn site_info_is_real_not_stubbed() {
+    async fn xite_info_is_real_not_stubbed() {
         let dir = tempdir().unwrap();
         let addr = "1HeLLo4uzjaLetFx6NH3PMwFP3qbRbTf3D";
         let state = AppState::new("test");
@@ -16162,7 +16162,7 @@ mod tests {
             .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(sample_content()) })
             .await;
 
-        let info = state.site_info(addr).await;
+        let info = state.xite_info(addr).await;
 
         // Real address hash = sha256(address).
         assert_eq!(
@@ -16197,7 +16197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn site_list_returns_one_entry_per_site_collapsing_aliases() {
+    async fn xite_list_returns_one_entry_per_xite_collapsing_aliases() {
         let dir = tempdir().unwrap();
         let state = AppState::new("test");
         // Same signed content served under a raw address and a `.epix` alias.
@@ -16208,13 +16208,13 @@ mod tests {
         state
             .add_xite("hello.epix", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
             .await;
-        // A second, distinct site.
+        // A second, distinct xite.
         let other = json!({ "address": "1Other", "modified": 1.0, "files": {}, "signs": {"1Other": "x"} });
         state
             .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(other) })
             .await;
 
-        let list = state.site_list().await;
+        let list = state.xite_list().await;
         assert_eq!(list.len(), 2, "alias collapses; two distinct sites remain");
         let addrs: std::collections::HashSet<_> =
             list.iter().map(|s| s["content"]["address"].as_str().unwrap()).collect();
@@ -16303,7 +16303,7 @@ mod tests {
 
     /// The modified-files scan must not re-read the world on every call: the
     /// wrapper asks on every page open, and the first cold scan of a
-    /// thousand-file site is seconds of IO. Verdicts are cached per
+    /// thousand-file xite is seconds of IO. Verdicts are cached per
     /// (size, mtime, declared hash); an edit re-hashes, a re-sign re-judges.
     #[tokio::test]
     async fn modified_scan_caches_verdicts_and_sees_edits() {
@@ -16762,8 +16762,8 @@ mod tests {
     /// reply on disk but invisible in the UI until a restart rebuilt the db.
     #[tokio::test]
     async fn inbound_diff_patched_data_file_is_ingested_into_the_db() {
-        let site_pk = epix_crypt::new_seed();
-        let site_addr = epix_crypt::privatekey_to_address(&site_pk).unwrap();
+        let xite_pk = epix_crypt::new_seed();
+        let xite_addr = epix_crypt::privatekey_to_address(&xite_pk).unwrap();
         let user_pk = epix_crypt::new_seed();
         let user_addr = epix_crypt::privatekey_to_address(&user_pk).unwrap();
         let user_dir = format!("data/users/{user_addr}");
@@ -16780,7 +16780,7 @@ mod tests {
             .unwrap();
         // The user_contents parent whose rules the pushed child verifies against.
         let parent = json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": "data/users/content.json",
             "user_contents": {
                 "cert_signers": {},
@@ -16796,7 +16796,7 @@ mod tests {
         let data_v1: &[u8] = br#"{ "posts": [ {"post_id":1,"title":"First"} ] }"#;
         storage.write(&format!("{user_dir}/data.json"), data_v1).unwrap();
         let mut c1 = json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": format!("{user_dir}/content.json"),
             "modified": 1000,
             "files": { "data.json": { "size": data_v1.len(), "sha512": XiteStorage::hash_bytes(data_v1) } },
@@ -16806,11 +16806,11 @@ mod tests {
             .write(&format!("{user_dir}/content.json"), &serde_json::to_vec(&c1).unwrap())
             .unwrap();
 
-        let root = json!({ "address": site_addr, "modified": 1.0, "files": {} });
+        let root = json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let state = AppState::new("test");
         state
             .add_xite(
-                &site_addr,
+                &xite_addr,
                 XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(root) },
             )
             .await;
@@ -16820,7 +16820,7 @@ mod tests {
         let data_v2: &[u8] =
             br#"{ "posts": [ {"post_id":1,"title":"First"}, {"post_id":2,"title":"Reply"} ] }"#;
         let mut c2 = json!({
-            "address": site_addr,
+            "address": xite_addr,
             "inner_path": format!("{user_dir}/content.json"),
             "modified": 2000,
             "files": { "data.json": { "size": data_v2.len(), "sha512": XiteStorage::hash_bytes(data_v2) } },
@@ -16834,7 +16834,7 @@ mod tests {
 
         let applied = state
             .apply_inbound_update(
-                &site_addr,
+                &xite_addr,
                 &format!("{user_dir}/content.json"),
                 Some(serde_json::to_vec(&c2).unwrap()),
                 None,
@@ -16852,7 +16852,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let rows = state
-                .db_query(&site_addr, "SELECT title FROM post ORDER BY post_id", &Value::Null)
+                .db_query(&xite_addr, "SELECT title FROM post ORDER BY post_id", &Value::Null)
                 .await
                 .unwrap();
             if rows.len() == 2 {
@@ -17431,7 +17431,7 @@ mod tests {
     }
 
     /// `full_retention_watch` is the set the retry loop drives the global
-    /// promise over: serving, not own, and no whole-site optional promise of
+    /// promise over: serving, not own, and no whole-xite optional promise of
     /// its own. A directory-scoped optionalHelp commitment does NOT exclude a
     /// xite - the rest of its files still need the retention pass. Empty when
     /// the setting is off.
@@ -17455,7 +17455,7 @@ mod tests {
         }
         {
             let mut xites = state.xites.write().await;
-            // [0] plain -> watched. [1] has its own whole-site promise.
+            // [0] plain -> watched. [1] has its own whole-xite promise.
             xites.get_mut(&addrs[1]).unwrap().settings.download_optional = true;
             // [2] own xite. [3] dir-scoped help only -> still watched.
             xites.get_mut(&addrs[2]).unwrap().settings.own = true;
@@ -17596,7 +17596,7 @@ mod tests {
     /// An in-flight retention pass loses its mandate when the xite stops
     /// serving, when a reader-driven pass's global setting is turned off, or
     /// when needed consent is withdrawn - checked between files so a
-    /// site-sized pass stops mid-way, mirroring the bulk optional pass.
+    /// xite-sized pass stops mid-way, mirroring the bulk optional pass.
     #[tokio::test]
     async fn retention_pass_mandate_follows_serving_setting_and_consent() {
         let dir = tempdir().unwrap();
@@ -18002,7 +18002,7 @@ mod tests {
         assert_eq!(helped, vec!["data/users/alice/video.mp4"]);
 
         // The toggle sets (and would persist) the flag, and reports unknown
-        // sites; with no transport the spawned fetch is a clean no-op.
+        // xites; with no transport the spawned fetch is a clean no-op.
         assert!(state.set_autodownloadoptional("1Opt", true).await);
         assert!(!state.set_autodownloadoptional("1Nope", true).await);
         assert!(
@@ -18045,7 +18045,7 @@ mod tests {
         assert_eq!((fetched, failed), (0, 2), "both files fail, counted once each");
         // Files are still missing and the background loop keeps chasing them,
         // so the panel STAYS - in a waiting state - instead of going blank.
-        let progress = state.site_info("1Opt").await["optional_progress"].clone();
+        let progress = state.xite_info("1Opt").await["optional_progress"].clone();
         assert!(!progress.is_null(), "waiting panel persists after a failed pass");
         assert!(
             progress["status"].as_str().unwrap_or("").contains("retrying in background"),
@@ -18055,7 +18055,7 @@ mod tests {
         // prefetch, and both switches must read as off switches for it.
         state.set_download_optional("1Opt", false, false).await;
         assert!(
-            state.site_info("1Opt").await["optional_progress"].is_null(),
+            state.xite_info("1Opt").await["optional_progress"].is_null(),
             "download toggle off -> mandate gone, panel clears"
         );
     }
@@ -18077,7 +18077,7 @@ mod tests {
         // Toggle off (and no optionalHelp) -> not watched, even with files missing.
         assert!(state.optional_retry_flagged().await.is_empty());
 
-        // Whole-site watching needs BOTH toggles: the prefetch mandate plus
+        // Whole-xite watching needs BOTH toggles: the prefetch mandate plus
         // the on-demand download permission. One alone is not enough.
         state.set_download_optional("1Opt", true, false).await;
         assert!(state.optional_retry_flagged().await.is_empty());
@@ -18100,7 +18100,7 @@ mod tests {
         storage.write("a.bin", b"12345").unwrap();
         assert_eq!(state.optional_scope_owed("1Opt", &None).await, 0);
 
-        // An optionalHelp commitment (whole-site mandate off) is watched
+        // An optionalHelp commitment (whole-xite mandate off) is watched
         // dir-scoped.
         state.set_download_optional("1Opt", false, false).await;
         if let Some(x) = state.xites.write().await.get_mut("1Opt") {
@@ -18136,14 +18136,14 @@ mod tests {
         // Three optional files declared, none on disk - but the user never
         // asked for any of them, so the row has nothing to count down.
         assert_eq!(state.refresh_optional_owed("1Owed").await, 0);
-        assert_eq!(state.site_info("1Owed").await["optional_left"], 0);
+        assert_eq!(state.xite_info("1Owed").await["optional_left"], 0);
 
         // Opting the whole xite in (both toggles - the prefetch mandate plus
         // the download permission) owes all three.
         state.set_download_optional("1Owed", true, false).await;
         state.set_autodownloadoptional("1Owed", true).await;
         assert_eq!(state.refresh_optional_owed("1Owed").await, 3);
-        assert_eq!(state.site_info("1Owed").await["optional_left"], 3);
+        assert_eq!(state.xite_info("1Owed").await["optional_left"], 3);
 
         // Files landing count down.
         storage.write("a.bin", b"12345").unwrap();
@@ -18160,7 +18160,7 @@ mod tests {
         // Withdrawing the promise empties the countdown even though the file is
         // still missing - nothing is going to fetch it now.
         assert!(state.optional_help_remove("1Owed", "media").await);
-        assert_eq!(state.site_info("1Owed").await["optional_left"], 0);
+        assert_eq!(state.xite_info("1Owed").await["optional_left"], 0);
 
         // A paused xite runs no passes, so it owes nothing either.
         state.set_download_optional("1Owed", true, false).await;
@@ -18324,7 +18324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn optional_progress_snapshot_surfaces_in_site_info() {
+    async fn optional_progress_snapshot_surfaces_in_xite_info() {
         let dir = tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         let content = json!({
@@ -18334,8 +18334,8 @@ mod tests {
         let state = AppState::new("test");
         state.add_xite("1Opt", XiteEntry { storage, content: Some(content) }).await;
 
-        // Idle: no snapshot -> null in site_info.
-        assert!(state.site_info("1Opt").await["optional_progress"].is_null());
+        // Idle: no snapshot -> null in xite_info.
+        assert!(state.xite_info("1Opt").await["optional_progress"].is_null());
 
         // Install a snapshot with one done + one active file mid-download.
         state
@@ -18360,7 +18360,7 @@ mod tests {
         state.mark_optional_file("1Opt", 1, OptFileState::Active, "b.bin").await;
         state.bump_optional_progress("1Opt", 1, 0, 10).await;
 
-        let info = state.site_info("1Opt").await;
+        let info = state.xite_info("1Opt").await;
         let p = &info["optional_progress"];
         assert_eq!(p["total_files"], 2);
         assert_eq!(p["done_files"], 1);
@@ -18372,7 +18372,7 @@ mod tests {
 
         // Clearing hides the panel again.
         state.set_optional_progress("1Opt", None).await;
-        assert!(state.site_info("1Opt").await["optional_progress"].is_null());
+        assert!(state.xite_info("1Opt").await["optional_progress"].is_null());
     }
 
     /// Build a xite of three 1000-byte optional files, with `retention` as
@@ -18596,7 +18596,7 @@ mod tests {
             })
             .await;
         // A COUNT(*) subscription must report the column value (3), not 1 row,
-        // with the EpixNet result shape (site/title/icon, num = entry count).
+        // with the EpixNet result shape (xite/title/icon, num = entry count).
         state
             .notification_subscribe(addr, json!({ "unread": ["SELECT COUNT(*) AS count FROM post", null] }))
             .await;
@@ -18626,7 +18626,7 @@ mod tests {
             .notification_subscribe(addr, json!({ "unread": ["SELECT COUNT(*) AS count FROM post", null] }))
             .await;
         state
-            .set_user_site_settings(addr, json!({ "notification_seen": { "unread": 2 } }))
+            .set_user_xite_settings(addr, json!({ "notification_seen": { "unread": 2 } }))
             .await
             .unwrap();
         let q = state.notification_query().await;
@@ -18634,7 +18634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_stops_resync_and_reflects_in_site_info() {
+    async fn pause_stops_resync_and_reflects_in_xite_info() {
         let content = json!({ "address": "1PauseMe", "files": {} });
         let state = AppState::new("test");
         let dir = tempdir().unwrap();
@@ -18647,14 +18647,14 @@ mod tests {
         assert!(!state.is_serving("1PauseMe").await);
         // A paused xite is not re-synced (returns Ok(false), even with no transport).
         assert_eq!(state.resync_xite("1PauseMe").await, Ok(false));
-        assert_eq!(state.site_info("1PauseMe").await["settings"]["serving"], false);
+        assert_eq!(state.xite_info("1PauseMe").await["settings"]["serving"], false);
 
         assert!(state.set_serving("1PauseMe", true).await);
-        assert_eq!(state.site_info("1PauseMe").await["settings"]["serving"], true);
+        assert_eq!(state.xite_info("1PauseMe").await["settings"]["serving"], true);
     }
 
     #[tokio::test]
-    async fn no_new_sites_plugin_toggle_locks_the_site_set() {
+    async fn no_new_xites_plugin_toggle_locks_the_xite_set() {
         struct AlwaysClone;
         #[async_trait::async_trait]
         impl OnDemandResolver for AlwaysClone {
@@ -18670,18 +18670,18 @@ mod tests {
 
         // Plugin off (default): resolver runs (returns false only because the
         // stub doesn't register anything).
-        assert!(!state.no_new_sites().await);
+        assert!(!state.no_new_xites().await);
 
-        // Plugin on: the site set is locked and the resolver is never asked.
+        // Plugin on: the xite set is locked and the resolver is never asked.
         state.set_plugin_enabled("NoNewSites", true).await;
-        assert!(state.no_new_sites().await);
+        assert!(state.no_new_xites().await);
         assert!(!state.ensure_xite("locked.epix").await);
 
         // The config key still works as an operator override.
         state.set_plugin_enabled("NoNewSites", false).await;
-        assert!(!state.no_new_sites().await);
+        assert!(!state.no_new_xites().await);
         state.config_set("no_new_sites", serde_json::json!(true)).await;
-        assert!(state.no_new_sites().await);
+        assert!(state.no_new_xites().await);
     }
 
     #[tokio::test]
@@ -18693,7 +18693,7 @@ mod tests {
             .add_xite("1FavMe", XiteEntry { storage: XiteStorage::new(dir.path()), content: Some(content) })
             .await;
         assert!(state.set_favorite("1FavMe", true).await);
-        assert_eq!(state.site_info("1FavMe").await["settings"]["favorite"], true);
+        assert_eq!(state.xite_info("1FavMe").await["settings"]["favorite"], true);
 
         // Delete removes the xite; a second delete reports not-found.
         assert!(state.remove_xite("1FavMe").await);
@@ -18702,41 +18702,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_all_aliases_files_and_sites_json_entry() {
-        // A site served under both its signed address and a `.epix` alias,
+    async fn delete_removes_all_aliases_files_and_xites_json_entry() {
+        // A xite served under both its signed address and a `.epix` alias,
         // like the browser sets up. Deleting by the signed address (what the
         // dashboard sends) must remove both entries, the files, and the
-        // sites.json record - a surviving alias used to re-sync the site and
+        // sites.json record - a surviving alias used to re-sync the xite and
         // write it back, so it came back after a restart.
         let root = tempdir().unwrap();
         let addr = "1DeleteMe";
         let state = AppState::with_data_dir("test", root.path());
-        let site_dir = root.path().join("data").join(addr);
-        std::fs::create_dir_all(&site_dir).unwrap();
-        std::fs::write(site_dir.join("index.html"), b"hi").unwrap();
+        let xite_dir = root.path().join("data").join(addr);
+        std::fs::create_dir_all(&xite_dir).unwrap();
+        std::fs::write(xite_dir.join("index.html"), b"hi").unwrap();
         let content = json!({ "address": addr, "files": {} });
         let entry = || XiteEntry {
-            storage: XiteStorage::new(&site_dir),
+            storage: XiteStorage::new(&xite_dir),
             content: Some(content.clone()),
         };
         state.add_xite(addr, entry()).await;
         state.add_xite("deleteme.epix", entry()).await;
-        assert_eq!(state.site_list().await.len(), 1, "alias collapses to one site");
+        assert_eq!(state.xite_list().await.len(), 1, "alias collapses to one site");
 
         assert!(state.remove_xite(addr).await);
         // Both serving keys gone, so nothing re-syncs it.
         assert!(!state.has_xite(addr).await);
         assert!(!state.has_xite("deleteme.epix").await);
-        assert!(state.site_list().await.is_empty());
+        assert!(state.xite_list().await.is_empty());
         // Files gone.
-        assert!(!site_dir.exists());
+        assert!(!xite_dir.exists());
         // sites.json no longer records it, so a restart won't restore it.
-        let sites: serde_json::Map<String, Value> =
+        let xites: serde_json::Map<String, Value> =
             std::fs::read(root.path().join("private/sites.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
-        assert!(!sites.contains_key(addr));
+        assert!(!xites.contains_key(addr));
 
         // Deleting by the alias works the same way.
         state.add_xite(addr, entry()).await;
@@ -18755,11 +18755,11 @@ mod tests {
         let root = tempdir().unwrap();
         let old_addr = "epix1oldaddress";
         let state = AppState::with_data_dir("test", root.path());
-        let site_dir = root.path().join("data").join(old_addr);
-        std::fs::create_dir_all(&site_dir).unwrap();
+        let xite_dir = root.path().join("data").join(old_addr);
+        std::fs::create_dir_all(&xite_dir).unwrap();
         state
             .add_xite(old_addr, XiteEntry {
-                storage: XiteStorage::new(&site_dir),
+                storage: XiteStorage::new(&xite_dir),
                 content: Some(json!({ "address": old_addr, "files": {} })),
             })
             .await;
@@ -18785,44 +18785,44 @@ mod tests {
         assert!(state.has_xite(old_addr).await);
         assert!(!root.path().join("resolve-cache.json").exists());
         // The cleared binding is persisted, so it stays gone after a restart.
-        let sites: serde_json::Map<String, Value> =
+        let xites: serde_json::Map<String, Value> =
             std::fs::read(root.path().join("private/sites.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
-        let entry = sites.get(old_addr).expect("xite still recorded");
+        let entry = xites.get(old_addr).expect("xite still recorded");
         assert!(entry.get("display").is_none(), "display binding must not persist");
     }
 
     #[tokio::test]
-    async fn delete_drops_user_site_data() {
-        // EpixNet parity: siteDelete also forgets the site's per-user data
+    async fn delete_drops_user_xite_data() {
+        // EpixNet parity: siteDelete also forgets the xite's per-user data
         // (derived auth identity, feed follows), like `user.deleteSiteData`.
         let root = tempdir().unwrap();
         let addr = "1ForgetMe";
         let state = AppState::with_data_dir("test", root.path());
-        let site_dir = root.path().join("data").join(addr);
-        std::fs::create_dir_all(&site_dir).unwrap();
+        let xite_dir = root.path().join("data").join(addr);
+        std::fs::create_dir_all(&xite_dir).unwrap();
         state
             .add_xite(addr, XiteEntry {
-                storage: XiteStorage::new(&site_dir),
+                storage: XiteStorage::new(&xite_dir),
                 content: Some(json!({ "address": addr, "files": {} })),
             })
             .await;
 
-        // Touch the site (siteInfo derives the auth identity) and follow a feed.
-        state.site_info(addr).await;
+        // Touch the xite (siteInfo derives the auth identity) and follow a feed.
+        state.xite_info(addr).await;
         state.set_feed_follow(addr, json!({ "posts": ["q", []] })).await;
-        assert!(state.user.read().await.sites.contains_key(addr));
+        assert!(state.user.read().await.xites.contains_key(addr));
         assert!(state.user.read().await.follows.contains_key(addr));
 
         assert!(state.remove_xite(addr).await);
-        assert!(!state.user.read().await.sites.contains_key(addr));
+        assert!(!state.user.read().await.xites.contains_key(addr));
         assert!(!state.user.read().await.follows.contains_key(addr));
     }
 
     #[tokio::test]
-    async fn file_write_then_site_sign_produces_owned_signed_content() {
+    async fn file_write_then_xite_sign_produces_owned_signed_content() {
         // A key that owns the xite (address == the xite address).
         let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let owner_addr = epix_crypt::privatekey_to_address(owner).unwrap();
@@ -18844,7 +18844,7 @@ mod tests {
         assert!(content["modified"].as_f64().unwrap() > 0.0);
 
         // siteInfo now reflects ownership + the real file count.
-        let info = state.site_info(&owner_addr).await;
+        let info = state.xite_info(&owner_addr).await;
         assert_eq!(info["settings"]["own"], true);
         assert_eq!(info["content"]["files"], 1);
 
@@ -18855,7 +18855,7 @@ mod tests {
 
     #[tokio::test]
     async fn editing_title_via_content_json_survives_signing() {
-        // The sidebar "Save site settings" flow: fileWrite content.json with a
+        // The sidebar "Save xite settings" flow: fileWrite content.json with a
         // new title, then siteSign. The title must survive - signing used to
         // re-sign the stale in-memory content and revert the edit on disk.
         let owner = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
@@ -18883,7 +18883,7 @@ mod tests {
 
         // The edit is visible immediately (siteInfo renders from memory, which
         // the write now refreshes) - not just on disk.
-        let info = state.site_info(&owner_addr).await;
+        let info = state.xite_info(&owner_addr).await;
         assert_eq!(info["content"]["title"], "New title", "edit visible before signing");
         assert_eq!(info["content"]["description"], "New description");
 
@@ -18895,7 +18895,7 @@ mod tests {
         assert!(signed["signs"].get(&owner_addr).is_some(), "signed by owner");
 
         // And it's what serves + persists on disk.
-        assert_eq!(state.site_info(&owner_addr).await["content"]["title"], "New title");
+        assert_eq!(state.xite_info(&owner_addr).await["content"]["title"], "New title");
         let on_disk: Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("content.json")).unwrap())
                 .unwrap();
@@ -19058,7 +19058,7 @@ mod tests {
         assert_eq!(state.notification_mute_status().await["global_muted"], true);
         assert_eq!(state.notification_query().await["muted"], true);
 
-        // Per-site mute.
+        // Per-xite mute.
         state.notification_mute(false, None).await;
         state.notification_mute(true, Some("1Chat")).await;
         assert_eq!(state.notification_mute_status().await["site_mutes"]["1Chat"], true);
@@ -19117,11 +19117,11 @@ mod tests {
         // content.json, hashes the dir, and signs as the user. A classic
         // auth-address-named user dir needs no chain resolution.
         let root = tempdir().unwrap();
-        let site = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let xite = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let state = AppState::with_data_dir("test", root.path());
-        let storage = XiteStorage::new(root.path().join("data").join(&site));
+        let storage = XiteStorage::new(root.path().join("data").join(&xite));
         let users_content = json!({
-            "address": site,
+            "address": xite,
             "inner_path": "data/users/content.json",
             "user_contents": { "permissions": {}, "cert_signers": {} }
         });
@@ -19129,66 +19129,66 @@ mod tests {
             .write("data/users/content.json", &serde_json::to_vec(&users_content).unwrap())
             .unwrap();
         state
-            .add_xite(&site, XiteEntry {
+            .add_xite(&xite, XiteEntry {
                 storage: storage.clone(),
-                content: Some(json!({ "address": site, "files": {} })),
+                content: Some(json!({ "address": xite, "files": {} })),
             })
             .await;
 
-        let auth = state.user.write().await.auth_address(&site).unwrap();
+        let auth = state.user.write().await.auth_address(&xite).unwrap();
         let dir = format!("data/users/{auth}");
         let data_path = format!("{dir}/data.json");
-        state.write_file(&site, &data_path, br#"{"topic":[{"topic_id":1}]}"#).await.unwrap();
+        state.write_file(&xite, &data_path, br#"{"topic":[{"topic_id":1}]}"#).await.unwrap();
 
         // The data file maps to the governing (user's own) content.json.
-        let content_path = state.content_inner_path(&site, &data_path).await;
+        let content_path = state.content_inner_path(&xite, &data_path).await;
         assert_eq!(content_path, format!("{dir}/content.json"));
 
-        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
+        state.sign_user_content(&xite, &content_path, None, None).await.unwrap();
         let signed: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(signed["signs"][&auth].is_string(), "signed by the user's auth key: {signed}");
         assert!(signed["files"]["data.json"]["sha512"].is_string(), "data.json hashed");
         assert_eq!(signed["inner_path"], json!(content_path));
-        assert_eq!(signed["address"], json!(site));
+        assert_eq!(signed["address"], json!(xite));
 
         // Re-signing after an edit bumps modified and re-verifies.
         let first = signed["modified"].as_f64().unwrap();
-        state.write_file(&site, &data_path, br#"{"topic":[{"topic_id":1},{"topic_id":2}]}"#).await.unwrap();
-        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
+        state.write_file(&xite, &data_path, br#"{"topic":[{"topic_id":1},{"topic_id":2}]}"#).await.unwrap();
+        state.sign_user_content(&xite, &content_path, None, None).await.unwrap();
         let resigned: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(resigned["modified"].as_f64().unwrap() > first);
     }
 
     #[tokio::test]
-    async fn merged_site_signing_uses_the_globally_selected_cert() {
-        // Python MergerSite copied the merger site's cert onto the merged site
-        // on every write because python certs were per-site. Rust certs are
-        // global: a site entry derived after certSelect auto-attaches the
-        // active cert, so a merged site first touched through a merger path
+    async fn merged_xite_signing_uses_the_globally_selected_cert() {
+        // Python MergerSite copied the merger xite's cert onto the merged xite
+        // on every write because python certs were per-xite. Rust certs are
+        // global: a xite entry derived after certSelect auto-attaches the
+        // active cert, so a merged xite first touched through a merger path
         // signs as the cert identity with no copy step. This pins that down
         // against a hub whose user_contents actually demands the cert.
         let root = tempdir().unwrap();
         let state = AppState::with_data_dir("test", root.path());
 
         // A provider issues a cert for the identity the user derived on the
-        // provider's own site, and the user selects it globally.
+        // provider's own xite, and the user selects it globally.
         let issuer_key = epix_crypt::new_seed();
         let issuer = epix_crypt::privatekey_to_address(&issuer_key).unwrap();
         let cert_auth = {
             let mut user = state.user.write().await;
-            let cert_auth = user.site_data("epix1certprovider").unwrap().auth_address.clone();
+            let cert_auth = user.xite_data("epix1certprovider").unwrap().auth_address.clone();
             let cert_sign =
                 epix_crypt::sign(&format!("{cert_auth}#web/tester"), &issuer_key).unwrap();
             user.add_cert(&cert_auth, "certs.epix", "web", "tester", &cert_sign).unwrap();
             user.set_cert_global(Some("certs.epix"));
             // A brand-new entry derived after the selection carries the cert.
-            assert_eq!(user.site_data("epix1fresh").unwrap().cert.as_deref(), Some("certs.epix"));
+            assert_eq!(user.xite_data("epix1fresh").unwrap().cert.as_deref(), Some("certs.epix"));
             cert_auth
         };
 
-        // A merger site and a hub whose user dirs require a certs.epix cert.
+        // A merger xite and a hub whose user dirs require a certs.epix cert.
         let hub = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let storage = XiteStorage::new(root.path().join("data").join(&hub));
         storage
@@ -19219,7 +19219,7 @@ mod tests {
             .await;
         state.add_permission("epix1merger", "Merger:PostHub").await;
 
-        // First touch of the merged site: it reports the cert's auth address,
+        // First touch of the merged xite: it reports the cert's auth address,
         // so the user dir the merger's xite writes into is the cert identity's.
         let auth = state.user.write().await.auth_address(&hub).unwrap();
         assert_eq!(auth, cert_auth, "the global cert reached the merged site");
@@ -19258,14 +19258,14 @@ mod tests {
         // back still get the change) and drops the snapshot; signing never
         // hashes snapshots into content.json.
         let root = tempdir().unwrap();
-        let site = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let xite = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
         let state = AppState::with_data_dir("test", root.path());
-        let storage = XiteStorage::new(root.path().join("data").join(&site));
+        let storage = XiteStorage::new(root.path().join("data").join(&xite));
         storage
             .write(
                 "data/users/content.json",
                 &serde_json::to_vec(&json!({
-                    "address": site,
+                    "address": xite,
                     "inner_path": "data/users/content.json",
                     "user_contents": { "permissions": {}, "cert_signers": {} }
                 }))
@@ -19273,38 +19273,38 @@ mod tests {
             )
             .unwrap();
         state
-            .add_xite(&site, XiteEntry {
+            .add_xite(&xite, XiteEntry {
                 storage: storage.clone(),
-                content: Some(json!({ "address": site, "files": {} })),
+                content: Some(json!({ "address": xite, "files": {} })),
             })
             .await;
 
-        let auth = state.user.write().await.auth_address(&site).unwrap();
+        let auth = state.user.write().await.auth_address(&xite).unwrap();
         let dir = format!("data/users/{auth}");
         let data_path = format!("{dir}/data.json");
         let content_path = format!("{dir}/content.json");
         let v1 = br#"{"topic":[]}"#.to_vec();
         let v2 = br#"{"topic":[{"topic_id":1,"title":"hello"}]}"#.to_vec();
 
-        state.write_file(&site, &data_path, &v1).await.unwrap();
-        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
+        state.write_file(&xite, &data_path, &v1).await.unwrap();
+        state.sign_user_content(&xite, &content_path, None, None).await.unwrap();
         // No previous file, so nothing to diff on the first publish.
-        assert!(state.take_diffs(&site, &content_path).await.is_empty());
+        assert!(state.take_diffs(&xite, &content_path).await.is_empty());
 
-        state.write_file(&site, &data_path, &v2).await.unwrap();
+        state.write_file(&xite, &data_path, &v2).await.unwrap();
         assert!(storage.exists(&format!("{data_path}-old")), "snapshot kept");
-        state.sign_user_content(&site, &content_path, None, None).await.unwrap();
+        state.sign_user_content(&xite, &content_path, None, None).await.unwrap();
         let signed: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
         assert!(signed["files"]["data.json-old"].is_null(), "snapshot never hashed: {signed}");
 
-        let diffs = state.take_diffs(&site, &content_path).await;
+        let diffs = state.take_diffs(&xite, &content_path).await;
         let actions = diffs.get("data.json").expect("diff for the changed file");
         // The diff reconstructs the new file from what peers hold (v1).
         assert_eq!(epix_content::patch(&v1, actions).unwrap(), v2);
         // The snapshot is consumed with the publish.
         assert!(!storage.exists(&format!("{data_path}-old")));
-        assert!(state.take_diffs(&site, &content_path).await.is_empty());
+        assert!(state.take_diffs(&xite, &content_path).await.is_empty());
     }
 
     #[tokio::test]
@@ -19584,8 +19584,8 @@ mod tests {
             .await;
         let mut rx = state.subscribe_events();
 
-        // A site event is on the siteChanged channel, targeted at that address.
-        state.push_site_info("1site").await;
+        // A xite event is on the siteChanged channel, targeted at that address.
+        state.push_xite_info("1site").await;
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.channel.as_deref(), Some("siteChanged"));
         assert_eq!(ev.target.as_deref(), Some("1site"));
@@ -19732,7 +19732,7 @@ mod tests {
         assert!(x.settings.cache.optional_stats.get("index.html").is_none(), "no optional stamp");
     }
 
-    /// A version-3 merger site (schema + `Merger:EpixPost` permission, no own
+    /// A version-3 merger xite (schema + `Merger:EpixPost` permission, no own
     /// data). Returns the live temp dir (keep it in scope - dropping it deletes
     /// the files), the state, and the merger address.
     async fn new_v3_merger() -> (tempfile::TempDir, std::sync::Arc<AppState>, &'static str) {
@@ -19744,7 +19744,7 @@ mod tests {
             .write(
                 "dbschema.json",
                 // A real merger schema keys merged files under the merged
-                // site's address (EpixNet nests them at merged-<type>/<addr>/),
+                // xite's address (EpixNet nests them at merged-<type>/<addr>/),
                 // so the map's leading `.+/` matches that address segment.
                 br#"{ "db_name":"Merger","db_file":"db.db","version":3,
                      "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
@@ -19756,7 +19756,7 @@ mod tests {
         (dir, state, merger)
     }
 
-    /// [`new_v3_merger`] plus one merged site holding a single post ("hello"),
+    /// [`new_v3_merger`] plus one merged xite holding a single post ("hello"),
     /// with the merger db rebuilt and asserted populated - the starting point
     /// for the tests that then perturb the merger and check its db refills.
     async fn merger_with_one_post() -> (tempfile::TempDir, std::sync::Arc<AppState>, &'static str) {
@@ -19773,10 +19773,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v3_merger_db_aggregates_merged_sites() {
+    async fn v3_merger_db_aggregates_merged_xites() {
         let (dir, state, merger) = new_v3_merger().await;
 
-        // Two merged sites of that type, each with a post.
+        // Two merged xites of that type, each with a post.
         for (addr, title) in [("1SiteA", "from A"), ("1SiteB", "from B")] {
             let s = XiteStorage::new(dir.path().join(addr));
             s.write(
@@ -19791,8 +19791,8 @@ mod tests {
 
         state.rebuild_merger_dbs().await;
 
-        // One query over the merger db returns rows from BOTH sites, tagged with
-        // their site via the json table (the point of a version-3 merger db).
+        // One query over the merger db returns rows from BOTH xites, tagged with
+        // their xite via the json table (the point of a version-3 merger db).
         let rows = state
             .db_query(
                 merger,
@@ -19813,7 +19813,7 @@ mod tests {
 
         // dbRebuild/dbReload (and a mute change) call rebuild_xite_db, which
         // replaces a version-3 merger db with a fresh EMPTY one - it must be
-        // refilled from the merged sites, not left empty until the next
+        // refilled from the merged xites, not left empty until the next
         // restart (the merger page would show no posts).
         assert!(state.rebuild_xite_db(merger).await);
         let rows =
@@ -19826,10 +19826,10 @@ mod tests {
     async fn update_content_on_merger_refills_db() {
         let (_dir, state, merger) = merger_with_one_post().await;
 
-        // Replacing the MERGER site's own content.json (a republish, or an
+        // Replacing the MERGER xite's own content.json (a republish, or an
         // inbound root update) rebuilds its db via build_xite_db, which leaves a
         // version-3 merger EMPTY. update_content must refill it from the merged
-        // sites, else the feed goes blank until the next restart or dbRebuild -
+        // xites, else the feed goes blank until the next restart or dbRebuild -
         // the Epix Post "all posts missing except the users who posted since the
         // last restart" bug.
         state.update_content(merger, Some(json!({ "title": "Merger v2", "files": {} }))).await;
@@ -19846,8 +19846,8 @@ mod tests {
         // and, critically, that a BLANK publish never wipes existing posts.
         let dir = tempdir().unwrap();
         let state = AppState::new("test");
-        let site = "1Site";
-        let storage = XiteStorage::new(dir.path().join(site));
+        let xite = "1Site";
+        let storage = XiteStorage::new(dir.path().join(xite));
         storage
             .write(
                 "dbschema.json",
@@ -19869,13 +19869,13 @@ mod tests {
             .unwrap();
         storage.write("data/users/u/data.json", br#"{"name":"alice"}"#).unwrap();
         state
-            .add_xite(site, XiteEntry { storage: storage.clone(), content: Some(json!({ "address": site })) })
+            .add_xite(xite, XiteEntry { storage: storage.clone(), content: Some(json!({ "address": xite })) })
             .await;
-        state.ingest_file_from(site, "data/users/u/data.json", None).await;
+        state.ingest_file_from(xite, "data/users/u/data.json", None).await;
 
         let path = "data/users/u/posts.json";
         // The node treats posts.json as a declared merge file.
-        assert!(state.is_declared_merge_file(site, path).await, "posts.json is a merge file");
+        assert!(state.is_declared_merge_file(xite, path).await, "posts.json is a merge file");
 
         // Build a signed-ish record (the local write path union-merges without
         // re-verifying; signatures are covered by verify_record's own tests).
@@ -19887,15 +19887,15 @@ mod tests {
             let state = state.clone();
             async move {
                 let container = json!({ "record_format": "epix-orset-1", "post": records });
-                state.write_file(site, path, &serde_json::to_vec(&container).unwrap()).await.unwrap();
-                state.ingest_file_from(site, path, None).await;
+                state.write_file(xite, path, &serde_json::to_vec(&container).unwrap()).await.unwrap();
+                state.ingest_file_from(xite, path, None).await;
             }
         };
         let bodies = |state: &Arc<AppState>| {
             let state = state.clone();
             async move {
                 let mut b: Vec<String> = state
-                    .db_query(site, "SELECT p.body FROM post p JOIN json j USING(json_id)", &Value::Null)
+                    .db_query(xite, "SELECT p.body FROM post p JOIN json j USING(json_id)", &Value::Null)
                     .await
                     .unwrap()
                     .into_iter()
@@ -19929,7 +19929,7 @@ mod tests {
 
         // The rows still join to the profile row (user_name available).
         let names = state
-            .db_query(site, "SELECT j.name FROM post p JOIN json j USING(json_id)", &Value::Null)
+            .db_query(xite, "SELECT j.name FROM post p JOIN json j USING(json_id)", &Value::Null)
             .await
             .unwrap();
         assert!(names.iter().all(|r| r["name"] == "alice"), "posts join the user's data.json profile row");
@@ -19942,13 +19942,13 @@ mod tests {
         let a1 = {
             let s = AppState::with_data_dir("test", dir.path());
             s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
-            s.site_info(addr).await["auth_address"].as_str().unwrap().to_string()
+            s.xite_info(addr).await["auth_address"].as_str().unwrap().to_string()
         };
         // A fresh node over the same data dir derives the same identity.
         let a2 = {
             let s = AppState::with_data_dir("test", dir.path());
             s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
-            s.site_info(addr).await["auth_address"].as_str().unwrap().to_string()
+            s.xite_info(addr).await["auth_address"].as_str().unwrap().to_string()
         };
         assert_eq!(a1, a2, "auth address is stable across restarts");
     }
@@ -19960,42 +19960,42 @@ mod tests {
         {
             let s = AppState::with_data_dir("test", dir.path());
             s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
-            assert!(!s.site_has_admin(addr).await, "no permission before a grant");
+            assert!(!s.xite_has_admin(addr).await, "no permission before a grant");
             s.add_permission(addr, "ADMIN").await;
-            assert!(s.site_has_admin(addr).await);
+            assert!(s.xite_has_admin(addr).await);
         }
         // A fresh node over the same data dir restores the grant.
         let s = AppState::with_data_dir("test", dir.path());
         s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
-        assert!(s.site_has_admin(addr).await, "ADMIN grant survives restart");
+        assert!(s.xite_has_admin(addr).await, "ADMIN grant survives restart");
         // A xite that was never granted anything stays unprivileged.
         s.add_xite("other.epix", XiteEntry { storage: XiteStorage::new(dir.path()), content: None }).await;
-        assert!(!s.site_has_admin("other.epix").await);
+        assert!(!s.xite_has_admin("other.epix").await);
     }
 
     #[tokio::test]
-    async fn grant_is_shared_across_a_sites_aliases() {
+    async fn grant_is_shared_across_a_xites_aliases() {
         let dir = tempdir().unwrap();
         let content = json!({ "address": "epix1dash", "files": {}, "signs": {"epix1dash": "x"} });
         let store = || XiteStorage::new(dir.path());
 
-        // First run: same site served under a raw address and a .epix alias.
+        // First run: same xite served under a raw address and a .epix alias.
         {
             let s = AppState::with_data_dir("test", dir.path());
             s.add_xite("epix1dash", XiteEntry { storage: store(), content: Some(content.clone()) }).await;
             s.add_xite("dashboard.epix", XiteEntry { storage: store(), content: Some(content.clone()) }).await;
             // Granting via the alias grants the raw address too.
             s.add_permission("dashboard.epix", "ADMIN").await;
-            assert!(s.site_has_admin("dashboard.epix").await);
-            assert!(s.site_has_admin("epix1dash").await, "grant applies to the raw alias");
+            assert!(s.xite_has_admin("dashboard.epix").await);
+            assert!(s.xite_has_admin("epix1dash").await, "grant applies to the raw alias");
         }
         // Second run: the grant is restored for both aliases from the single
         // canonical entry in permissions.json.
         let s = AppState::with_data_dir("test", dir.path());
         s.add_xite("epix1dash", XiteEntry { storage: store(), content: Some(content.clone()) }).await;
         s.add_xite("dashboard.epix", XiteEntry { storage: store(), content: Some(content) }).await;
-        assert!(s.site_has_admin("epix1dash").await);
-        assert!(s.site_has_admin("dashboard.epix").await);
+        assert!(s.xite_has_admin("epix1dash").await);
+        assert!(s.xite_has_admin("dashboard.epix").await);
     }
 
     #[tokio::test]
@@ -20046,17 +20046,17 @@ mod tests {
         )
         .await;
         // The root content.json sets the baseline.
-        assert_eq!(s.site_info("epix1x").await["settings"]["modified"], 1000.0);
+        assert_eq!(s.xite_info("epix1x").await["settings"]["modified"], 1000.0);
 
         // A per-user content.json lands (someone posted): the clock advances,
         // so the dashboard row reads "hours ago" instead of the root's date.
         storage.write("data/users/1A/content.json", br#"{"modified": 2000}"#).unwrap();
         s.ingest_file("epix1x", "data/users/1A/content.json").await;
-        assert_eq!(s.site_info("epix1x").await["settings"]["modified"], 2000.0);
+        assert_eq!(s.xite_info("epix1x").await["settings"]["modified"], 2000.0);
 
         // Reloading the (older) root does not walk it back.
         s.update_content("epix1x", Some(json!({ "modified": 1000.0, "files": {} }))).await;
-        assert_eq!(s.site_info("epix1x").await["settings"]["modified"], 2000.0);
+        assert_eq!(s.xite_info("epix1x").await["settings"]["modified"], 2000.0);
 
         // A far-future timestamp is capped at now + 10 minutes.
         let future = now_secs() as f64 + 100_000.0;
@@ -20068,7 +20068,7 @@ mod tests {
             .unwrap();
         s.ingest_file("epix1x", "data/users/1B/content.json").await;
         let capped =
-            s.site_info("epix1x").await["settings"]["modified"].as_f64().unwrap();
+            s.xite_info("epix1x").await["settings"]["modified"].as_f64().unwrap();
         assert!(capped <= now_secs() as f64 + 601.0, "capped: {capped}");
         assert!(capped >= 2000.0);
     }
@@ -20090,7 +20090,7 @@ mod tests {
         assert_eq!(p["params"]["content"], json!({}));
 
         // Once it is, every clone event names the row (the dashboard's
-        // "Connecting sites" list shows the name, not the bech32 address).
+        // "Connecting xites" list shows the name, not the bech32 address).
         s.update_content("epix1x", Some(json!({ "title": "xID" }))).await;
         s.push_clone_event("epix1x", json!(["file_done", "content.json"]), json!({}));
         let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
@@ -20121,13 +20121,13 @@ mod tests {
         s.set_on_demand(Arc::new(AlwaysClone)).await;
         // Incomplete on disk (no verified core set): the document waits.
         assert!(s.html_doc_gated("epix1x").await);
-        // But never for an owned site - local edits must keep serving.
+        // But never for an owned xite - local edits must keep serving.
         s.set_owned("epix1x", true).await;
         assert!(!s.html_doc_gated("epix1x").await);
     }
 
     #[tokio::test]
-    async fn lag_recovery_resends_closing_updates_for_finished_sites_only() {
+    async fn lag_recovery_resends_closing_updates_for_finished_xites_only() {
         let dir = tempfile::tempdir().unwrap();
         let s = AppState::new("test");
         s.add_xite(
@@ -20140,10 +20140,10 @@ mod tests {
             XiteEntry { storage: XiteStorage::new(dir.path().join("b")), content: None },
         )
         .await;
-        s.begin_site_update("epix1busy");
+        s.begin_xite_update("epix1busy");
         let mut events = s.subscribe_events();
 
-        // Only the finished site gets its closing event re-sent, and only to
+        // Only the finished xite gets its closing event re-sent, and only to
         // the asking connection - the busy one's real outcome is still coming.
         s.push_missed_update_results(7).await;
         let ev = events.try_recv().unwrap();
@@ -20157,7 +20157,7 @@ mod tests {
         assert!(events.try_recv().is_err(), "no event for the in-flight site");
 
         // Once its pass ends, a later recovery covers it too.
-        s.end_site_update("epix1busy");
+        s.end_xite_update("epix1busy");
         s.push_missed_update_results(7).await;
         let mut addrs = Vec::new();
         while let Ok(ev) = events.try_recv() {
@@ -20173,7 +20173,7 @@ mod tests {
     /// that watched it start) and `update_applied` on the closing event (so
     /// only a pass that brought something flashes "Updated!").
     #[tokio::test]
-    async fn update_phase_and_outcome_reach_site_info() {
+    async fn update_phase_and_outcome_reach_xite_info() {
         let dir = tempfile::tempdir().unwrap();
         let s = AppState::new("test");
         s.add_xite(
@@ -20183,48 +20183,48 @@ mod tests {
         .await;
 
         // Idle: no phase at all, so no pill.
-        assert_eq!(s.site_info("epix1p").await["update_phase"], Value::Null);
+        assert_eq!(s.xite_info("epix1p").await["update_phase"], Value::Null);
 
         // A pass opens on the quiet checking phase. No peers probed yet, so no
         // progress either - the row shows a bar only for something countable.
-        s.begin_site_update("epix1p");
-        assert_eq!(s.site_info("epix1p").await["update_phase"], UPDATE_PHASE_CHECKING);
-        assert_eq!(s.site_info("epix1p").await["progress"], Value::Null);
+        s.begin_xite_update("epix1p");
+        assert_eq!(s.xite_info("epix1p").await["update_phase"], UPDATE_PHASE_CHECKING);
+        assert_eq!(s.xite_info("epix1p").await["progress"], Value::Null);
 
         // The check walks its candidate peers; its position is the progress.
         s.set_check_progress("epix1p", 3, 10).await;
         assert_eq!(
-            s.site_info("epix1p").await["progress"],
+            s.xite_info("epix1p").await["progress"],
             json!({ "done": 3, "total": 10 })
         );
 
         // A peer answered with something newer: the pass escalates, and the
         // peer-walk progress no longer applies (it belongs to checking).
-        assert!(s.mark_site_update_applying("epix1p"), "bracketed pass escalates");
-        assert_eq!(s.site_info("epix1p").await["update_phase"], UPDATE_PHASE_UPDATING);
-        assert_eq!(s.site_info("epix1p").await["progress"], Value::Null);
+        assert!(s.mark_xite_update_applying("epix1p"), "bracketed pass escalates");
+        assert_eq!(s.xite_info("epix1p").await["update_phase"], UPDATE_PHASE_UPDATING);
+        assert_eq!(s.xite_info("epix1p").await["progress"], Value::Null);
 
         // A file batch primes the worker counters; progress = done/total files.
         s.set_worker_stats("epix1p", 8, 1, 8).await;
         assert_eq!(
-            s.site_info("epix1p").await["progress"],
+            s.xite_info("epix1p").await["progress"],
             json!({ "done": 0, "total": 8 })
         );
         s.set_worker_stats("epix1p", 2, 1, 0).await;
         assert_eq!(
-            s.site_info("epix1p").await["progress"],
+            s.xite_info("epix1p").await["progress"],
             json!({ "done": 6, "total": 8 })
         );
         // Batch drained: total clears with it.
         s.set_worker_stats("epix1p", 0, 0, 0).await;
-        assert_eq!(s.site_info("epix1p").await["progress"], Value::Null);
+        assert_eq!(s.xite_info("epix1p").await["progress"], Value::Null);
 
         // A caller that never bracketed gets no phase - nothing would push the
         // outcome that retires its pill, so it must not raise one.
-        assert!(!s.mark_site_update_applying("epix1other"), "unbracketed pass is ignored");
+        assert!(!s.mark_xite_update_applying("epix1other"), "unbracketed pass is ignored");
 
-        s.end_site_update("epix1p");
-        assert_eq!(s.site_info("epix1p").await["update_phase"], Value::Null);
+        s.end_xite_update("epix1p");
+        assert_eq!(s.xite_info("epix1p").await["update_phase"], Value::Null);
 
         // The three outcomes, as the row renders them.
         let mut events = s.subscribe_events();
@@ -20335,7 +20335,7 @@ mod tests {
         assert!(root["files"].get("data/users/u1/1.jpg").is_none());
         assert!(root.get("files_optional").is_none());
         // ...but its governing child content.json does, as optional, with the
-        // site-relative inner path kept.
+        // xite-relative inner path kept.
         let (info, optional) =
             state.file_info_any("epix1hub", "data/users/u1/1.jpg").await.unwrap();
         assert!(optional);
@@ -20397,7 +20397,7 @@ mod tests {
             Ok(Some(("epix1hub".to_string(), "avatar.jpg".to_string())))
         );
 
-        // The target must be a registered site.
+        // The target must be a registered xite.
         assert!(state
             .resolve_merged("epix1merger", "merged-EpixTalk/epix1nowhere/avatar.jpg")
             .await
@@ -20584,7 +20584,7 @@ mod tests {
 
     /// One `edx_fetch_files` call is a single uncancellable await, so the bulk
     /// optional pass must batch and re-check the user's mandate between batches
-    /// - otherwise toggling a 200 GB site off keeps pulling to the end of the
+    /// - otherwise toggling a 200 GB xite off keeps pulling to the end of the
     /// list.
     #[tokio::test]
     async fn the_edx_bulk_optional_pass_batches_and_stops_when_the_mandate_drops() {

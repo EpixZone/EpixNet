@@ -36,7 +36,7 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
     let address = epix_crypt::privatekey_to_address(priv_hex).unwrap();
 
     // --- Source: newer content.json (modified 200) + a new `b3` file, plus a
-    // propagation store already holding the "site advanced to 200" hint.
+    // propagation store already holding the "xite advanced to 200" hint.
     let post = b"a freshly published post";
     let src_dir = tempfile::tempdir().unwrap();
     let src = XiteStorage::new(src_dir.path());
@@ -56,7 +56,7 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
     let prop_store = Arc::new(Mutex::new(PropagationStore::new()));
     prop_store.lock().await.record(&address, 200);
 
-    // Source node: EDX store with the site registered so EDX serves content.json
+    // Source node: EDX store with the xite registered so EDX serves content.json
     // + the file, plus the propagation handler for the hint.
     let src_state = AppState::new("source");
     let store_dir = tempfile::tempdir().unwrap();
@@ -128,7 +128,7 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
     timeout(Duration::from_secs(15), async {
         loop {
             let applied =
-                state.site_info(&address).await["content_updated"].as_f64() == Some(200.0);
+                state.xite_info(&address).await["content_updated"].as_f64() == Some(200.0);
             if applied && std::fs::read(&post_path).ok().as_deref() == Some(post.as_slice()) {
                 return;
             }

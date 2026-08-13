@@ -1,4 +1,4 @@
-//! The value store: `key (site hash) -> peers hosting it`, with expiry.
+//! The value store: `key (xite hash) -> peers hosting it`, with expiry.
 
 use crate::id::NodeId;
 use epix_core::PeerAddr;
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 /// fabricated onion/i2p addresses and grow one key's list without bound. When
 /// full, the oldest entry is evicted - a genuine host re-announces every round,
 /// so real peers churn back in while a one-shot flood ages out. K-per-key is
-/// far above the K closest honest announcers a real site attracts.
+/// far above the K closest honest announcers a real xite attracts.
 const MAX_PEERS_PER_KEY: usize = 128;
 
 pub struct PeerStore {

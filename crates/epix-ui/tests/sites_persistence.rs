@@ -42,7 +42,7 @@ async fn served_xites_survive_a_restart() {
     {
         let state = AppState::with_data_dir("run-2", root.path());
         assert!(!state.has_any_alias(&address).await, "starts empty");
-        let restored = state.restore_sites().await;
+        let restored = state.restore_xites().await;
         assert_eq!(restored, 1);
         assert!(state.has_any_alias(&address).await, "xite restored");
         // The restored content.json is the signed one.
@@ -52,7 +52,7 @@ async fn served_xites_survive_a_restart() {
 }
 
 #[tokio::test]
-async fn sites_json_uses_the_epixnet_schema_and_restores_settings() {
+async fn xites_json_uses_the_epixnet_schema_and_restores_settings() {
     let root = tempfile::tempdir().unwrap();
     let privkey = epix_crypt::new_seed();
     let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
@@ -69,7 +69,7 @@ async fn sites_json_uses_the_epixnet_schema_and_restores_settings() {
             .await;
         state.set_owned(&address, true).await;
         state.set_size_limit(&address, 25).await;
-        state.persist_sites().await;
+        state.persist_xites().await;
     }
 
     // The written schema is EpixNet's SiteManager.save: settings flat at the
@@ -84,8 +84,8 @@ async fn sites_json_uses_the_epixnet_schema_and_restores_settings() {
 
     // A fresh node restores the persisted user-facing settings.
     let state = AppState::with_data_dir("run-2", root.path());
-    assert_eq!(state.restore_sites().await, 1);
-    let info = state.site_info(&address).await;
+    assert_eq!(state.restore_xites().await, 1);
+    let info = state.xite_info(&address).await;
     assert_eq!(info.get("settings").and_then(|s| s.get("own")), Some(&json!(true)));
     assert_eq!(info.get("size_limit").and_then(|v| v.as_i64()), Some(25));
 }
@@ -93,8 +93,8 @@ async fn sites_json_uses_the_epixnet_schema_and_restores_settings() {
 #[tokio::test]
 async fn re_adding_a_served_xite_keeps_its_settings() {
     // The launch xite goes through add_xite again every boot, AFTER
-    // restore_sites already registered it. Rebuilding its settings from
-    // scratch there used to reset "This is my site" (own), favourite, and the
+    // restore_xites already registered it. Rebuilding its settings from
+    // scratch there used to reset "This is my xite" (own), favourite, and the
     // size limit - and the persist at the end of add_xite then wrote the loss
     // back to sites.json, so the toggle never survived a restart.
     let root = tempfile::tempdir().unwrap();
@@ -116,13 +116,13 @@ async fn re_adding_a_served_xite_keeps_its_settings() {
         state.set_size_limit(&address, 25).await;
     }
 
-    // Second run, the boot sequence: restore_sites first, then the launch
+    // Second run, the boot sequence: restore_xites first, then the launch
     // xite is registered again via add_xite.
     let state = AppState::with_data_dir("run-2", root.path());
-    assert_eq!(state.restore_sites().await, 1);
+    assert_eq!(state.restore_xites().await, 1);
     state.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
 
-    let info = state.site_info(&address).await;
+    let info = state.xite_info(&address).await;
     assert_eq!(
         info.get("settings").and_then(|s| s.get("own")),
         Some(&json!(true)),
@@ -138,7 +138,7 @@ async fn re_adding_a_served_xite_keeps_its_settings() {
 }
 
 #[tokio::test]
-async fn restores_a_python_written_sites_json_entry() {
+async fn restores_a_python_written_xites_json_entry() {
     let root = tempfile::tempdir().unwrap();
     let privkey = epix_crypt::new_seed();
     let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
@@ -150,7 +150,7 @@ async fn restores_a_python_written_sites_json_entry() {
     // A sites.json as EpixNet's SiteManager writes it, in the place EpixNet
     // keeps it (private/sites.json): flat settings, no wrapper_key/ajax_key,
     // extra keys the Rust side doesn't model.
-    let python_sites = json!({
+    let python_xites = json!({
         &address: {
             "own": true,
             "serving": true,
@@ -169,13 +169,13 @@ async fn restores_a_python_written_sites_json_entry() {
     std::fs::create_dir_all(root.path().join("private")).unwrap();
     std::fs::write(
         root.path().join("private/sites.json"),
-        serde_json::to_vec_pretty(&python_sites).unwrap(),
+        serde_json::to_vec_pretty(&python_xites).unwrap(),
     )
     .unwrap();
 
     let state = AppState::with_data_dir("run-1", root.path());
-    assert_eq!(state.restore_sites().await, 1, "python-written entry restores");
-    let info = state.site_info(&address).await;
+    assert_eq!(state.restore_xites().await, 1, "python-written entry restores");
+    let info = state.xite_info(&address).await;
     assert_eq!(info.get("settings").and_then(|s| s.get("own")), Some(&json!(true)));
 }
 
@@ -205,10 +205,10 @@ async fn restore_falls_back_to_local_copy_for_unverified_content() {
     std::fs::write(xite_dir.join("content.json"), serde_json::to_vec(&edited).unwrap()).unwrap();
 
     let state = AppState::with_data_dir("run-2", root.path());
-    let restored = state.restore_sites().await;
+    let restored = state.restore_xites().await;
     assert_eq!(restored, 1, "unverified content.json restores as a local copy");
     assert!(state.has_any_alias(&address).await);
-    let info = state.site_info(&address).await;
+    let info = state.xite_info(&address).await;
     assert_eq!(info["content"]["modified"], json!(9999), "the local copy is what serves");
 }
 

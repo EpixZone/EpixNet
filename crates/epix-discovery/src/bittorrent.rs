@@ -1,6 +1,6 @@
-//! AnnounceBitTorrent - announce a site to HTTP(S) BitTorrent trackers and read
+//! AnnounceBitTorrent - announce a xite to HTTP(S) BitTorrent trackers and read
 //! the peers they report (compact format). The `info_hash` is `sha1(address)`,
-//! matching how EpixNet maps a site onto the BitTorrent DHT/tracker space.
+//! matching how EpixNet maps a xite onto the BitTorrent DHT/tracker space.
 
 use epix_core::PeerAddr;
 use sha1::{Digest, Sha1};

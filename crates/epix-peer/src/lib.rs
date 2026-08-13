@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn overlay_publisher_gets_selected_despite_a_clearnet_majority() {
         // The gateway stall: ~19 connectable clearnet peers serving the OLD
-        // site version and one onion publisher holding a pending update's
+        // xite version and one onion publisher holding a pending update's
         // files, selection limit 10. Every pass the clearnet peers connect
         // fine but fail the file hashes (reputation drops, no backoff). The
         // publisher must be selected after the first failed pass - with the

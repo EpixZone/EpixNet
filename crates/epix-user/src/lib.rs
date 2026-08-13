@@ -24,7 +24,7 @@
 //! ```json
 //! { "<master_address>": {
 //!     "master_seed": "…",
-//!     "sites":  { "<addr>": { "auth_address", "auth_privatekey", "cert"?, "privatekey"?, "settings"? } },
+//!     "xites":  { "<addr>": { "auth_address", "auth_privatekey", "cert"?, "privatekey"?, "settings"? } },
 //!     "certs":  { "<domain>": { "auth_address", "auth_privatekey", "auth_type", "auth_user_name", "cert_sign" } },
 //!     "settings": { "next_identity_index": 100000001, … },
 //!     "follows": { … }   // Rust-only (Newsfeed); EpixNet preserves unknown keys
@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// The dedicated index range for standalone identity addresses (separate from
-/// site-derived keys), matching EpixNet's `generateNewIdentityAddress`.
+/// xite-derived keys), matching EpixNet's `generateNewIdentityAddress`.
 const IDENTITY_INDEX_START: u64 = 100_000_001;
 
 /// A cert: an identity issued by an ID-provider xite, bound to a user auth key.
@@ -56,7 +56,7 @@ pub struct Cert {
 
 /// The user's identity for one xite.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct SiteAuth {
+pub struct XiteAuth {
     pub auth_address: String,
     pub auth_privatekey: String,
     /// The domain of the selected cert (a key into [`User::certs`]), if any.
@@ -65,7 +65,7 @@ pub struct SiteAuth {
     /// The xite's own private key, once saved/recovered (owners only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privatekey: Option<String>,
-    /// Arbitrary per-site settings a xite stored.
+    /// Arbitrary per-xite settings a xite stored.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub settings: Map<String, Value>,
 }
@@ -75,15 +75,16 @@ pub struct SiteAuth {
 pub struct User {
     pub master_seed: String,
     pub master_address: String,
-    #[serde(default)]
-    pub sites: HashMap<String, SiteAuth>,
+    // Persisted under the legacy `sites` key: users.json stays Python-EpixNet-compatible.
+    #[serde(default, rename = "sites")]
+    pub xites: HashMap<String, XiteAuth>,
     /// Certs the user obtained, keyed by provider domain.
     #[serde(default)]
     pub certs: HashMap<String, Cert>,
     /// User-level settings (e.g. `next_identity_index`).
     #[serde(default)]
     pub settings: Map<String, Value>,
-    /// Newsfeed follows: `site_address -> {feed_name: [query, params]}`.
+    /// Newsfeed follows: `xite_address -> {feed_name: [query, params]}`.
     #[serde(default)]
     pub follows: HashMap<String, Value>,
 }
@@ -100,19 +101,19 @@ impl User {
         Ok(Self {
             master_seed: master_seed.to_string(),
             master_address,
-            sites: HashMap::new(),
+            xites: HashMap::new(),
             certs: HashMap::new(),
             settings: Map::new(),
             follows: HashMap::new(),
         })
     }
 
-    /// Set the Newsfeed follows for a site (`{feed_name: [query, params]}`).
+    /// Set the Newsfeed follows for a xite (`{feed_name: [query, params]}`).
     pub fn set_feed_follow(&mut self, address: &str, feeds: Value) {
         self.follows.insert(address.to_string(), feeds);
     }
 
-    /// The Newsfeed follows for a site (empty object if none).
+    /// The Newsfeed follows for a xite (empty object if none).
     pub fn feed_follow(&self, address: &str) -> Value {
         self.follows.get(address).cloned().unwrap_or_else(|| Value::Object(Default::default()))
     }
@@ -131,35 +132,35 @@ impl User {
     /// The user's identity for `address`, creating (deriving) it on first use.
     /// On creation, an active global cert is auto-attached (portable cert),
     /// matching EpixNet's `getSiteData`.
-    pub fn site_data(&mut self, address: &str) -> Result<&SiteAuth, String> {
-        if !self.sites.contains_key(address) {
+    pub fn xite_data(&mut self, address: &str) -> Result<&XiteAuth, String> {
+        if !self.xites.contains_key(address) {
             let index = Self::address_auth_index(address);
             let auth_privatekey = epix_crypt::hd_privatekey(&self.master_seed, index)?;
             let auth_address = epix_crypt::privatekey_to_address(&auth_privatekey)?;
             let cert = self.active_cert_domain();
-            self.sites.insert(
+            self.xites.insert(
                 address.to_string(),
-                SiteAuth { auth_address, auth_privatekey, cert, ..Default::default() },
+                XiteAuth { auth_address, auth_privatekey, cert, ..Default::default() },
             );
         }
-        Ok(&self.sites[address])
+        Ok(&self.xites[address])
     }
 
-    /// Derive a brand-new owned-site keypair from the master seed (EpixNet's
+    /// Derive a brand-new owned-xite keypair from the master seed (EpixNet's
     /// `getNewSiteData`): a random index into `hd_privatekey`, recorded with
     /// the privatekey so publishes auto-sign. Returns (address, privatekey).
-    pub fn new_site_data(&mut self) -> Result<(String, String), String> {
+    pub fn new_xite_data(&mut self) -> Result<(String, String), String> {
         // Index from fresh key entropy (no extra RNG dependency).
         let entropy = epix_crypt::new_seed();
         let index = u64::from_str_radix(&entropy[..12], 16).map_err(|e| e.to_string())?
             % 100_000_000;
         let privatekey = epix_crypt::hd_privatekey(&self.master_seed, index)?;
         let address = epix_crypt::privatekey_to_address(&privatekey)?;
-        if self.sites.contains_key(&address) {
+        if self.xites.contains_key(&address) {
             return Err("Random collision: site already exists".into());
         }
-        self.site_data(&address)?;
-        if let Some(auth) = self.sites.get_mut(&address) {
+        self.xite_data(&address)?;
+        if let Some(auth) = self.xites.get_mut(&address) {
             auth.privatekey = Some(privatekey.clone());
         }
         Ok((address, privatekey))
@@ -168,8 +169,8 @@ impl User {
     /// The auth address shown for `address` - the selected cert's if one is
     /// active, otherwise the xite's own derived auth address.
     pub fn auth_address(&mut self, address: &str) -> Result<String, String> {
-        // Derive the site first (so the entry exists), then resolve the cert.
-        let own = self.site_data(address)?.auth_address.clone();
+        // Derive the xite first (so the entry exists), then resolve the cert.
+        let own = self.xite_data(address)?.auth_address.clone();
         Ok(match self.get_cert(address) {
             Some(cert) => cert.auth_address.clone(),
             None => own,
@@ -180,7 +181,7 @@ impl User {
     /// cert's if one is active, otherwise the xite's own derived key. Mirrors
     /// EpixNet's `getAuthPrivatekey` (what signs the user's content.json).
     pub fn auth_privatekey(&mut self, address: &str) -> Result<String, String> {
-        let own = self.site_data(address)?.auth_privatekey.clone();
+        let own = self.xite_data(address)?.auth_privatekey.clone();
         Ok(match self.get_cert(address) {
             Some(cert) => cert.auth_privatekey.clone(),
             None => own,
@@ -194,7 +195,7 @@ impl User {
     /// certified identity keeps one stable encryption key per provider, and
     /// mail encrypted to it on another node still decrypts here.
     pub fn encrypt_privatekey(&self, address: &str, param_index: u64) -> Result<String, String> {
-        let index = match self.sites.get(address).and_then(|s| s.cert.as_deref()) {
+        let index = match self.xites.get(address).and_then(|s| s.cert.as_deref()) {
             Some(domain) => param_index + Self::address_auth_index(domain),
             None => param_index,
         };
@@ -202,20 +203,20 @@ impl User {
         epix_crypt::hd_privatekey(&self.master_seed, crypt_index)
     }
 
-    /// The per-site settings a xite stored via `userSetSettings` (EpixNet's
-    /// `site_data["settings"]` - e.g. notification_seen baselines).
-    pub fn site_settings(&self, address: &str) -> Value {
-        self.sites
+    /// The per-xite settings a xite stored via `userSetSettings` (EpixNet's
+    /// `xite_data["settings"]` - e.g. notification_seen baselines).
+    pub fn xite_settings(&self, address: &str) -> Value {
+        self.xites
             .get(address)
             .map(|s| Value::Object(s.settings.clone()))
             .unwrap_or_else(|| Value::Object(Default::default()))
     }
 
-    /// Replace a xite's stored per-site settings (`userSetSettings`).
-    pub fn set_site_settings(&mut self, address: &str, settings: Value) -> Result<(), String> {
-        self.site_data(address)?;
-        if let Some(site) = self.sites.get_mut(address) {
-            site.settings = settings.as_object().cloned().unwrap_or_default();
+    /// Replace a xite's stored per-xite settings (`userSetSettings`).
+    pub fn set_xite_settings(&mut self, address: &str, settings: Value) -> Result<(), String> {
+        self.xite_data(address)?;
+        if let Some(xite) = self.xites.get_mut(address) {
+            xite.settings = settings.as_object().cloned().unwrap_or_default();
         }
         Ok(())
     }
@@ -223,20 +224,20 @@ impl User {
     /// Save the xite's own private key (from recovery or user input). An empty
     /// key clears it - that is what the sidebar's "forget private key" sends,
     /// and storing `Some("")` would leave the xite still claiming to hold one.
-    pub fn set_site_privatekey(&mut self, address: &str, privatekey: &str) -> Result<(), String> {
-        self.site_data(address)?;
-        if let Some(site) = self.sites.get_mut(address) {
-            site.privatekey =
+    pub fn set_xite_privatekey(&mut self, address: &str, privatekey: &str) -> Result<(), String> {
+        self.xite_data(address)?;
+        if let Some(xite) = self.xites.get_mut(address) {
+            xite.privatekey =
                 if privatekey.is_empty() { None } else { Some(privatekey.to_string()) };
         }
         Ok(())
     }
 
     /// The saved xite private key, if any. An empty stored value is no key -
-    /// users.json written before `set_site_privatekey` cleared properly can
+    /// users.json written before `set_xite_privatekey` cleared properly can
     /// still hold `""`, and every caller would otherwise try to sign with it.
-    pub fn site_privatekey(&self, address: &str) -> Option<String> {
-        self.sites.get(address).and_then(|s| s.privatekey.clone()).filter(|k| !k.is_empty())
+    pub fn xite_privatekey(&self, address: &str) -> Option<String> {
+        self.xites.get(address).and_then(|s| s.privatekey.clone()).filter(|k| !k.is_empty())
     }
 
     // --- Certs --------------------------------------------------------------
@@ -253,11 +254,11 @@ impl User {
         auth_user_name: &str,
         cert_sign: &str,
     ) -> Result<Option<bool>, String> {
-        // Find the private key for this auth address (master or a derived site).
+        // Find the private key for this auth address (master or a derived xite).
         let auth_privatekey = if auth_address == self.master_address {
             self.master_seed.clone()
         } else {
-            self.sites
+            self.xites
                 .values()
                 .find(|s| s.auth_address == auth_address)
                 .map(|s| s.auth_privatekey.clone())
@@ -287,30 +288,30 @@ impl User {
 
     /// Select (or clear, with `None`) the cert domain for one xite.
     pub fn set_cert(&mut self, address: &str, domain: Option<&str>) -> Result<(), String> {
-        self.site_data(address)?;
-        if let Some(site) = self.sites.get_mut(address) {
-            site.cert = domain.map(str::to_string);
+        self.xite_data(address)?;
+        if let Some(xite) = self.xites.get_mut(address) {
+            xite.cert = domain.map(str::to_string);
         }
         Ok(())
     }
 
-    /// Select (or clear) a cert on **all** existing sites (portable cert).
+    /// Select (or clear) a cert on **all** existing xites (portable cert).
     pub fn set_cert_global(&mut self, domain: Option<&str>) {
-        for (addr, site) in self.sites.iter_mut() {
+        for (addr, xite) in self.xites.iter_mut() {
             if addr.starts_with("_identity_") {
                 continue;
             }
-            site.cert = domain.map(str::to_string);
+            xite.cert = domain.map(str::to_string);
         }
     }
 
-    /// The globally active cert domain, if any site has a valid cert selected.
+    /// The globally active cert domain, if any xite has a valid cert selected.
     pub fn active_cert_domain(&self) -> Option<String> {
-        for (addr, site) in &self.sites {
+        for (addr, xite) in &self.xites {
             if addr.starts_with("_identity_") {
                 continue;
             }
-            if let Some(domain) = &site.cert {
+            if let Some(domain) = &xite.cert {
                 if self.certs.contains_key(domain) {
                     return Some(domain.clone());
                 }
@@ -319,23 +320,23 @@ impl User {
         None
     }
 
-    /// The cert selected for `address`, if any (looked up by the site's cert
+    /// The cert selected for `address`, if any (looked up by the xite's cert
     /// domain).
     pub fn get_cert(&self, address: &str) -> Option<&Cert> {
-        let domain = self.sites.get(address)?.cert.as_ref()?;
+        let domain = self.xites.get(address)?.cert.as_ref()?;
         self.certs.get(domain)
     }
 
     /// The cert user id (`name@provider`) for `address`, if a cert is selected.
     pub fn cert_user_id(&self, address: &str) -> Option<String> {
-        let domain = self.sites.get(address)?.cert.as_ref()?;
+        let domain = self.xites.get(address)?.cert.as_ref()?;
         let cert = self.certs.get(domain)?;
         Some(format!("{}@{}", cert.auth_user_name, domain))
     }
 
     /// All certs as `[{auth_address, auth_type, auth_user_name, domain,
     /// selected}]` for `certList`; `selected` is true for the cert whose auth
-    /// address matches the site's current one.
+    /// address matches the xite's current one.
     pub fn cert_list(&mut self, address: &str) -> Vec<Value> {
         let current = self.auth_address(address).unwrap_or_default();
         self.certs
@@ -352,7 +353,7 @@ impl User {
             .collect()
     }
 
-    /// The content directory name for user content on a site: the xID name with
+    /// The content directory name for user content on a xite: the xID name with
     /// TLD if an xID cert is active, else the auth address (EpixNet's
     /// `getUserDirectory`).
     pub fn user_directory(&mut self, address: &str) -> Result<String, String> {
@@ -367,10 +368,10 @@ impl User {
     /// The standalone identity addresses (`_identity_*` entries), in index
     /// order. These are the addresses a user links to an xID name; the cert
     /// dialog checks them for an already-linked name and offers the first
-    /// unlinked one as "New". Site-derived auth addresses are not included.
+    /// unlinked one as "New". Xite-derived auth addresses are not included.
     pub fn identity_addresses(&self) -> Vec<String> {
         let mut entries: Vec<(u64, String)> = self
-            .sites
+            .xites
             .iter()
             .filter_map(|(key, s)| {
                 let idx = key.strip_prefix("_identity_")?.parse::<u64>().ok()?;
@@ -381,13 +382,13 @@ impl User {
         entries.into_iter().map(|(_, addr)| addr).collect()
     }
 
-    /// The private key (WIF) for `address`: the master key, or a site/identity
+    /// The private key (WIF) for `address`: the master key, or a xite/identity
     /// auth key. `None` if this user doesn't control it.
     pub fn privatekey_for(&self, address: &str) -> Option<String> {
         if address == self.master_address {
             return Some(self.master_seed.clone());
         }
-        self.sites
+        self.xites
             .values()
             .find(|s| s.auth_address == address)
             .map(|s| s.auth_privatekey.clone())
@@ -405,10 +406,10 @@ impl User {
         let privatekey = epix_crypt::hd_privatekey(&self.master_seed, index)?;
         let address = epix_crypt::privatekey_to_address(&privatekey)?;
         // Store under a synthetic key so add_cert can find the private key.
-        if !self.sites.values().any(|s| s.auth_address == address) {
-            self.sites.insert(
+        if !self.xites.values().any(|s| s.auth_address == address) {
+            self.xites.insert(
                 format!("_identity_{index}"),
-                SiteAuth {
+                XiteAuth {
                     auth_address: address.clone(),
                     auth_privatekey: privatekey.clone(),
                     ..Default::default()
@@ -425,7 +426,7 @@ impl User {
     fn to_file_entry(&self) -> Value {
         serde_json::json!({
             "master_seed": self.master_seed,
-            "sites": self.sites,
+            "sites": self.xites,
             "certs": self.certs,
             "settings": self.settings,
             "follows": self.follows,
@@ -435,7 +436,7 @@ impl User {
     /// Build a user from a `users.json` entry (its master address + the object).
     fn from_file_entry(master_address: &str, entry: &Value) -> Option<Self> {
         let master_seed = entry.get("master_seed")?.as_str()?.to_string();
-        let sites = entry
+        let xites = entry
             .get("sites")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
@@ -451,13 +452,13 @@ impl User {
             .get("follows")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        // Migration: Python EpixNet stored Newsfeed follows per-site
-        // (`sites.<addr>.follow`), which the typed SiteAuth parse drops. Merge
+        // Migration: Python EpixNet stored Newsfeed follows per-xite
+        // (`xites.<addr>.follow`), which the typed SiteAuth parse drops. Merge
         // them into our top-level map (ours wins on conflict) so a data dir
         // copied from the Python client keeps its dashboard feed.
-        if let Some(sites_obj) = entry.get("sites").and_then(|v| v.as_object()) {
-            for (addr, site_data) in sites_obj {
-                if let Some(f) = site_data.get("follow") {
+        if let Some(xites_obj) = entry.get("sites").and_then(|v| v.as_object()) {
+            for (addr, xite_data) in xites_obj {
+                if let Some(f) = xite_data.get("follow") {
                     if f.is_object() && !follows.contains_key(addr) {
                         follows.insert(addr.clone(), f.clone());
                     }
@@ -467,7 +468,7 @@ impl User {
         Some(Self {
             master_seed,
             master_address: master_address.to_string(),
-            sites,
+            xites,
             certs,
             settings,
             follows,
@@ -529,17 +530,17 @@ mod tests {
     }
 
     #[test]
-    fn auth_address_is_deterministic_and_per_site() {
+    fn auth_address_is_deterministic_and_per_xite() {
         let seed = "5f5e100000000000000000000000000000000000000000000000000000000001";
         let mut u = User::from_seed(seed).unwrap();
-        let a1 = u.site_data("talk.epix").unwrap().clone();
-        let a2 = u.site_data("blog.epix").unwrap().clone();
+        let a1 = u.xite_data("talk.epix").unwrap().clone();
+        let a2 = u.xite_data("blog.epix").unwrap().clone();
         assert!(a1.auth_address.starts_with("epix1"));
         assert!(a2.auth_address.starts_with("epix1"));
         assert_ne!(a1.auth_address, a2.auth_address, "different xite -> different identity");
 
         let mut u2 = User::from_seed(seed).unwrap();
-        assert_eq!(u2.site_data("talk.epix").unwrap().auth_address, a1.auth_address);
+        assert_eq!(u2.xite_data("talk.epix").unwrap().auth_address, a1.auth_address);
     }
 
     #[test]
@@ -550,7 +551,7 @@ mod tests {
         // encrypted to the Python-derived key can't be decrypted here.
         let seed = "5f5e100000000000000000000000000000000000000000000000000000000001";
         let mut u = User::from_seed(seed).unwrap();
-        u.site_data("talk.epix").unwrap();
+        u.xite_data("talk.epix").unwrap();
         let plain = u.encrypt_privatekey("talk.epix", 0).unwrap();
         let expected_plain = epix_crypt::hd_privatekey(
             seed,
@@ -576,15 +577,15 @@ mod tests {
     fn cert_add_select_overrides_auth_address() {
         let mut u = User::generate();
         let auth = u.auth_address("talk.epix").unwrap();
-        let own = u.site_data("talk.epix").unwrap().auth_address.clone();
+        let own = u.xite_data("talk.epix").unwrap().auth_address.clone();
         assert_eq!(auth, own);
         assert_eq!(u.cert_user_id("talk.epix"), None);
 
-        // Add a cert bound to the site's own auth address, then select it.
+        // Add a cert bound to the xite's own auth address, then select it.
         assert_eq!(u.add_cert(&own, "xid.epix", "xid", "alice", "sig").unwrap(), Some(true));
         u.set_cert("talk.epix", Some("xid.epix")).unwrap();
         assert_eq!(u.cert_user_id("talk.epix").as_deref(), Some("alice@xid.epix"));
-        // Cert shares the site's auth address here (bound to it), so auth is same.
+        // Cert shares the xite's auth address here (bound to it), so auth is same.
         assert_eq!(u.auth_address("talk.epix").unwrap(), own);
 
         // Re-adding the same cert is a no-op; a different one needs confirmation.
@@ -595,7 +596,7 @@ mod tests {
     #[test]
     fn cert_list_marks_selected() {
         let mut u = User::generate();
-        let own = u.site_data("talk.epix").unwrap().auth_address.clone();
+        let own = u.xite_data("talk.epix").unwrap().auth_address.clone();
         u.add_cert(&own, "xid.epix", "xid", "alice", "s").unwrap();
         u.set_cert("talk.epix", Some("xid.epix")).unwrap();
         let list = u.cert_list("talk.epix");
@@ -612,28 +613,28 @@ mod tests {
         // The index advanced.
         assert_eq!(u.settings["next_identity_index"], 100_000_002);
         // Stored so add_cert can bind to it.
-        assert!(u.sites.values().any(|s| s.auth_address == addr));
+        assert!(u.xites.values().any(|s| s.auth_address == addr));
     }
 
     #[test]
-    fn identity_addresses_are_ordered_and_exclude_site_auths() {
+    fn identity_addresses_are_ordered_and_exclude_xite_auths() {
         let mut u = User::generate();
-        // A site-derived auth key (not an identity).
-        u.site_data("talk.epix").unwrap();
-        let site_auth = u.sites["talk.epix"].auth_address.clone();
+        // A xite-derived auth key (not an identity).
+        u.xite_data("talk.epix").unwrap();
+        let xite_auth = u.xites["talk.epix"].auth_address.clone();
         // Two standalone identities, minted in order.
         let (id1, pk1) = u.generate_new_identity_address().unwrap();
         let (id2, _pk2) = u.generate_new_identity_address().unwrap();
 
         let ids = u.identity_addresses();
         assert_eq!(ids, vec![id1.clone(), id2.clone()], "identity order by index");
-        assert!(!ids.contains(&site_auth), "site auth is not an identity");
+        assert!(!ids.contains(&xite_auth), "site auth is not an identity");
 
-        // privatekey_for finds identity keys, the site auth key, and master.
+        // privatekey_for finds identity keys, the xite auth key, and master.
         assert_eq!(u.privatekey_for(&id1).as_deref(), Some(pk1.as_str()));
         assert_eq!(
-            u.privatekey_for(&site_auth).as_deref(),
-            Some(u.sites["talk.epix"].auth_privatekey.as_str())
+            u.privatekey_for(&xite_auth).as_deref(),
+            Some(u.xites["talk.epix"].auth_privatekey.as_str())
         );
         assert_eq!(u.privatekey_for(&u.master_address).as_deref(), Some(u.master_seed.as_str()));
         assert_eq!(u.privatekey_for("epix1nope"), None);
@@ -644,8 +645,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.json");
         let mut u = User::generate();
-        u.site_data("talk.epix").unwrap();
-        let own = u.sites["talk.epix"].auth_address.clone();
+        u.xite_data("talk.epix").unwrap();
+        let own = u.xites["talk.epix"].auth_address.clone();
         u.add_cert(&own, "xid.epix", "xid", "alice", "sig").unwrap();
         u.set_cert("talk.epix", Some("xid.epix")).unwrap();
         u.save(&path).unwrap();
@@ -663,10 +664,10 @@ mod tests {
     }
 
     #[test]
-    fn python_per_site_follows_migrate_on_load() {
+    fn python_per_xite_follows_migrate_on_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("users.json");
-        // A Python-style users.json: follows live inside each site entry, and
+        // A Python-style users.json: follows live inside each xite entry, and
         // one address also has a Rust-style top-level follow that must win.
         let seed_user = User::generate();
         std::fs::write(
@@ -721,7 +722,7 @@ mod tests {
         .unwrap();
 
         let mut u = User::generate();
-        u.site_data("talk.epix").unwrap();
+        u.xite_data("talk.epix").unwrap();
         u.save(&path).unwrap();
 
         // Both identities are present after save.

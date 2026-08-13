@@ -455,7 +455,7 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
 /// engine's host, so it keeps working if the user changes their default search
 /// engine (DuckDuckGo, Google, Bing, Brave, Ecosia, Startpage, Yahoo, Baidu,
 /// Yandex, or a custom one). The term rides in a handful of well-known query
-/// keys; `epix1…` never legitimately appears as another site's query value, so a
+/// keys; `epix1…` never legitimately appears as another xite's query value, so a
 /// term match is unambiguous. Non-matching navigations fall straight through.
 ///
 /// The redirect target is the dotted ALIAS `https://<addr>.epix/`, never the

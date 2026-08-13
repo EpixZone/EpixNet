@@ -57,11 +57,11 @@ async fn dispatch(
             let state = open_state(data_root, version).await;
             let (address, privatekey) = state.create_xite().await?;
             println!("----------------------------------------------------------------------");
-            println!("Site private key: {privatekey}");
-            println!("          !!! ^ Save it now, required to modify the site ^ !!!");
-            println!("Site address:     {address}");
+            println!("Xite private key: {privatekey}");
+            println!("          !!! ^ Save it now, required to modify the xite ^ !!!");
+            println!("Xite address:     {address}");
             println!("----------------------------------------------------------------------");
-            println!("Site created! You can find it in {}", data_root.join("data").join(&address).display());
+            println!("Xite created! You can find it in {}", data_root.join("data").join(&address).display());
             Ok(())
         }
         "siteSign" => {
@@ -96,16 +96,16 @@ async fn dispatch(
             }
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
-                return Err(format!("Site not found: {address}"));
+                return Err(format!("Xite not found: {address}"));
             }
             let content_path = state.content_inner_path(address, &inner_path).await;
             if content_path == "content.json" {
                 let key = match privatekey {
                     Some(k) => k,
                     None => state
-                        .site_privatekey(address)
+                        .xite_privatekey(address)
                         .await
-                        .ok_or("No saved private key for this site; pass one")?,
+                        .ok_or("No saved private key for this xite; pass one")?,
                 };
                 state
                     .sign_xite_with(
@@ -141,7 +141,7 @@ async fn dispatch(
             // Offline path: no node running, so this command drives the publish.
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
-                return Err(format!("Site not found: {address}"));
+                return Err(format!("Xite not found: {address}"));
             }
             // Offline CLI: dial clearnet peers directly. Onion/i2p peers need
             // the node's Tor/I2P clients, so the dialable-networks filter
@@ -179,7 +179,7 @@ async fn dispatch(
             let [address] = args else { return Err("usage: siteVerify <address>".into()) };
             let state = open_state(data_root, version).await;
             if !state.has_any_alias(address).await {
-                return Err(format!("Site not found: {address}"));
+                return Err(format!("Xite not found: {address}"));
             }
             // The restore already verified the root signature (an invalid one
             // would not have loaded); check every declared file's bytes.
@@ -211,7 +211,7 @@ async fn dispatch(
                 println!("Db rebuilt in {:.3}s", started.elapsed().as_secs_f64());
                 Ok(())
             } else {
-                Err("No db for this site (no dbschema.json?)".into())
+                Err("No db for this xite (no dbschema.json?)".into())
             }
         }
         "dbQuery" => {
@@ -230,11 +230,11 @@ async fn dispatch(
             for address in &imported {
                 println!("Imported {address}");
             }
-            println!("{} site(s) imported", imported.len());
+            println!("{} xite(s) imported", imported.len());
             Ok(())
         }
 
-        // --- site admin: one path, run live via the admin socket when the node
+        // --- xite admin: one path, run live via the admin socket when the node
         // is up, else the offline data-dir equivalent. `siteList` takes no arg;
         // the others take an address.
         "siteList" | "siteDelete" | "siteDownload" => {
@@ -253,13 +253,13 @@ async fn dispatch(
             match admin_call(data_root, live_cmd, None, params).await? {
                 Some(reply) => match action {
                     "siteList" => {
-                        let sites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
-                        for s in sites {
+                        let xites = reply.as_array().map(Vec::as_slice).unwrap_or_default();
+                        for s in xites {
                             let addr = s.get("address").and_then(|v| v.as_str()).unwrap_or("?");
                             let peers = s.get("peers").and_then(|v| v.as_i64()).unwrap_or(0);
                             println!("{addr}  ({peers} peers)");
                         }
-                        println!("{} site(s) [live]", sites.len());
+                        println!("{} xite(s) [live]", xites.len());
                     }
                     "siteDelete" => println!("Deleted {address} [live]"),
                     _ => println!("Downloading {address} [live] - watch the node log"),
@@ -268,14 +268,14 @@ async fn dispatch(
                     let state = open_state(data_root, version).await;
                     match action {
                         "siteList" => {
-                            let sites = state.xite_addresses().await;
-                            for addr in &sites {
+                            let xites = state.xite_addresses().await;
+                            for addr in &xites {
                                 println!("{addr}");
                             }
-                            println!("{} site(s) [offline]", sites.len());
+                            println!("{} xite(s) [offline]", xites.len());
                         }
                         "siteDelete" if !state.remove_xite(&address).await => {
-                            return Err(format!("Unknown site: {address}"));
+                            return Err(format!("Unknown xite: {address}"));
                         }
                         "siteDelete" => println!("Deleted {address} [offline]"),
                         // No network stack offline: register it so the node
@@ -338,7 +338,7 @@ async fn dispatch(
         }
 
         // --- run any WS command against a running node, bound to one xite ---
-        // Per-site commands (feedItemQuery, feedSegmentSearch, dbQuery, ...)
+        // Per-xite commands (feedItemQuery, feedSegmentSearch, dbQuery, ...)
         // read their target from the CONNECTION, not from params, so they are
         // unreachable without a bound xite. The admin socket binds one from the
         // request's `xite` key; this exposes that from the shell.
@@ -358,7 +358,7 @@ async fn dispatch(
                     );
                     Ok(())
                 }
-                // Unlike the site-admin actions there is no offline equivalent:
+                // Unlike the xite-admin actions there is no offline equivalent:
                 // these commands read live node state.
                 None => Err("node is not running (no admin socket)".into()),
             }
@@ -396,7 +396,7 @@ async fn admin_call(
     Ok(None)
 }
 
-/// `xite` binds the trusted session to a site, needed by commands that resolve
+/// `xite` binds the trusted session to a xite, needed by commands that resolve
 /// their target from the connection (e.g. `sitePublish`); pass `None` for
 /// commands that carry the address in `params` (siteList/siteDelete/...).
 #[cfg(unix)]
@@ -450,10 +450,10 @@ async fn admin_call(
     Ok(Some(result))
 }
 
-/// Open the node state offline: data dir + user + the served-site registry.
+/// Open the node state offline: data dir + user + the served-xite registry.
 async fn open_state(data_root: &std::path::Path, version: &str) -> Arc<AppState> {
     let state = AppState::with_data_dir(version, data_root);
-    state.restore_sites().await;
+    state.restore_xites().await;
     state
 }
 
@@ -482,18 +482,18 @@ mod tests {
         let state = open_state(root.path(), "test").await;
         let (address, _privatekey) = state.create_xite().await.unwrap();
         assert!(state.has_xite(&address).await);
-        assert!(state.site_privatekey(&address).await.is_some(), "key saved for later signs");
-        assert!(state.list_modified_files(&address).await.is_empty(), "fresh site verifies");
+        assert!(state.xite_privatekey(&address).await.is_some(), "key saved for later signs");
+        assert!(state.list_modified_files(&address).await.is_empty(), "fresh xite verifies");
 
         // Edit + re-sign via the same paths the CLI uses.
         let dir = state.xite_dir(&address).unwrap();
         std::fs::write(dir.join("index.html"), b"<h1>edited</h1>").unwrap();
         assert_eq!(state.list_modified_files(&address).await, vec!["index.html".to_string()]);
-        let key = state.site_privatekey(&address).await.unwrap();
+        let key = state.xite_privatekey(&address).await.unwrap();
         state.sign_xite(&address, &key).await.unwrap();
         assert!(state.list_modified_files(&address).await.is_empty(), "signed clean again");
 
-        // A second state over the same data dir restores the site (what a
+        // A second state over the same data dir restores the xite (what a
         // fresh CLI invocation does).
         let state2 = open_state(root.path(), "test").await;
         assert!(state2.has_xite(&address).await, "registry persisted");

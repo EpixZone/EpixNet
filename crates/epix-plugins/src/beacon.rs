@@ -216,7 +216,7 @@ async fn publish_owned_list(state: &Arc<AppState>, book: &mut TrackerBook) -> bo
     };
     let Some((address, inner_path)) = spec.trim().split_once('/') else { return false };
     // Consume-only unless this node holds the xite's signing key.
-    let Some(key) = state.site_privatekey(address).await else { return false };
+    let Some(key) = state.xite_privatekey(address).await else { return false };
 
     let (epix, bt) = canonical_groups(&book.working());
     if epix.is_empty() && bt.is_empty() {

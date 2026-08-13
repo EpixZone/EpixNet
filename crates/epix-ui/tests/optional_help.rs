@@ -1,5 +1,5 @@
 //! optionalHelp: opt into distributing a directory of optional files, remove
-//! it, and toggle whole-site auto-download.
+//! it, and toggle whole-xite auto-download.
 
 use epix_ui::command::{CommandRegistry, WsSession};
 use epix_ui::state::{AppState, XiteEntry};
@@ -81,7 +81,7 @@ async fn capital_o_aliases_match_the_app_call_shapes() {
 }
 
 #[tokio::test]
-async fn optional_help_family_is_forbidden_for_unrelated_sites() {
+async fn optional_help_family_is_forbidden_for_unrelated_xites() {
     let (s, reg, _addr) = session().await;
     let dir = tempfile::tempdir().unwrap();
     s.state
@@ -103,10 +103,10 @@ async fn optional_help_family_is_forbidden_for_unrelated_sites() {
     assert_eq!(err, "Forbidden");
 }
 
-/// A merger reaches the sites merged into it (MergerSite's hasSitePermission):
+/// A merger reaches the xites merged into it (MergerSite's hasSitePermission):
 /// holding `Merger:Test` opens a `merged_type: Test` hub to the family.
 #[tokio::test]
-async fn merger_can_use_optional_help_on_its_merged_sites() {
+async fn merger_can_use_optional_help_on_its_merged_xites() {
     let (s, reg, addr) = session().await;
     let dir = tempfile::tempdir().unwrap();
     s.state

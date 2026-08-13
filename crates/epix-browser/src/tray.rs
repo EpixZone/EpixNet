@@ -60,7 +60,7 @@ struct Snapshot {
     /// Our I2P host (without `.i2p`), once the inbound session is ready.
     i2p: Option<String>,
     tor_status: String,
-    /// Aggregate unread notification count across sites (drives the tray dot).
+    /// Aggregate unread notification count across xites (drives the tray dot).
     notif_count: i64,
 }
 
@@ -178,7 +178,7 @@ fn spawn_stats_refresh(
         let mut tick: u64 = 0;
         let mut notif_count: i64 = 0;
         loop {
-            // The unread total costs a SQL COUNT per subscribed site; refresh it
+            // The unread total costs a SQL COUNT per subscribed xite; refresh it
             // every ~5s rather than on every 1s stats tick.
             if tick % 5 == 0 {
                 notif_count = state.notification_total().await;

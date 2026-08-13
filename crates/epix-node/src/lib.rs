@@ -862,7 +862,7 @@ async fn clone_xite_with_progress(
             let size_needed: i64 = needed.iter().map(|f| f.size).sum();
             // Optional files are NOT part of the clone; surface their count +
             // bytes separately so the loading screen can say "on demand"
-            // instead of looking like the whole site is about to download.
+            // instead of looking like the whole xite is about to download.
             let (optional_files, size_optional) = xite
                 .content
                 .as_ref()
@@ -961,7 +961,7 @@ async fn clone_xite_with_progress(
     // pinned to the pre-fetch core total - so the bar climbs monotonically
     // 0..total no matter which layer fetched each file. Without the shared
     // emitter the EDX prepass materialized files silently and the bar sat at 0
-    // then jumped on well-seeded sites (exactly EDX's target).
+    // then jumped on well-seeded xites (exactly EDX's target).
     let clone_total = xite.files_needed().len();
     let emit_done: Option<Arc<dyn Fn(&str, usize) + Send + Sync>> = progress.map(|state| {
         let state = state.clone();
@@ -978,7 +978,7 @@ async fn clone_xite_with_progress(
             from_peers.fetch_max(serving, std::sync::atomic::Ordering::SeqCst);
             // The wrapper hides the loading screen on index.html's file_done
             // - and index.html downloads FIRST (priority queue). Firing it
-            // mid-sync dropped the user into a half-downloaded site (styles
+            // mid-sync dropped the user into a half-downloaded xite (styles
             // and scripts still missing, forum data not even started), which
             // reads as broken. Hold it back unless it is the last core file;
             // the pass below pushes it when the core set is complete.
@@ -1008,7 +1008,7 @@ async fn clone_xite_with_progress(
     // peer, so a dead peer sinks and the next pass pulls fresh candidates rather
     // than redialing the same unreachable top-N and giving up. It ends when
     // every core file is on disk, or after a few passes make no progress (a
-    // legacy no-b3 site never completes; nor does a b3 site whose seeder is
+    // legacy no-b3 xite never completes; nor does a b3 xite whose seeder is
     // simply unreachable). The shared emitter advances the loading bar as EDX
     // materializes each file.
     drop(sync_rx); // the registry (fetch_candidate_peers) carries discovered peers
@@ -1089,7 +1089,7 @@ async fn clone_xite_with_progress(
         }
         xite.commit_content(bytes).map_err(|e| format!("commit content.json: {e}"))?;
     }
-    // Core set done: NOW dismiss the loading screen. The site opens fully
+    // Core set done: NOW dismiss the loading screen. The xite opens fully
     // styled, and the user-content pass below streams topics/posts into the
     // already-rendered page (db ingest + file_done per file).
     if let Some(state) = progress {
@@ -1106,7 +1106,7 @@ async fn clone_xite_with_progress(
         state.spawn_retention_completion(address);
     }
 
-    // Recursive content: user_contents sites (EpixTalk, EpixPost, ...) keep their
+    // Recursive content: user_contents xites (EpixTalk, EpixPost, ...) keep their
     // real data (topics, comments) in INCLUDED and per-user content.json files
     // that the root's `files` map never lists. The concurrent pass spawned at
     // content-staging time has usually finished by now; join it. Without a
@@ -1145,7 +1145,7 @@ async fn state_peers(progress: Option<&Arc<AppState>>, _xite: &Xite, address: &s
 }
 
 /// Download every included / per-user content.json (and the data files they
-/// declare) for a user_contents site, parent-first so each verifies against
+/// declare) for a user_contents xite, parent-first so each verifies against
 /// its parent's rules. Returns the bytes downloaded and the inner paths of
 /// the files that arrived from peers (for `file_done` events after the db
 /// rebuild).
@@ -1338,7 +1338,7 @@ async fn sync_included_content(
             let mut streamed: HashSet<String> = HashSet::new();
             match progress {
                 Some(state) => {
-                    // Announce the pass BEFORE dialing: peers for a fresh site
+                    // Announce the pass BEFORE dialing: peers for a fresh xite
                     // take tens of seconds to dial over Tor with no other
                     // event, and a page indicator keyed on event traffic
                     // (EpixPost's hub bar) would take itself down mid-dial.
@@ -1493,7 +1493,7 @@ async fn sync_included_content(
         .collect();
     // A file declared with no `b3` was last signed before the EDX migration
     // and can never arrive (EDX is the only transfer path). Skip it rather
-    // than count it as pending: retrying it every pass kept these sites
+    // than count it as pending: retrying it every pass kept these xites
     // re-dialing peers each resync tick and looking mid-sync forever.
     if let Some(state) = progress {
         let mut fetchable = Vec::with_capacity(needed.len());
@@ -1628,7 +1628,7 @@ fn user_dir_name(inner_path: &str) -> Option<&str> {
 /// addresses allowed to sign it: the user directory's own name (EpixTalk
 /// stores each user's posts under their xID and signs with the identity that
 /// xID belongs to) plus any name-form signers the parent's `user_contents`
-/// rules grant (site admins, for moderation). Resolution is chain-verified
+/// rules grant (xite admins, for moderation). Resolution is chain-verified
 /// (Merkle proof) and cached.
 async fn resolve_user_signers(
     xite: &Xite,
@@ -1687,7 +1687,7 @@ async fn fetch_content(
     // connect_timeout() already folds in route_all_via_overlay.
     let budget = peer.connect_timeout();
     // EDX manifest channel: GetSigned returns the signed content.json over an
-    // EDX link, and works for ANY site (the signed bytes are served independent
+    // EDX link, and works for ANY xite (the signed bytes are served independent
     // of per-file `b3`). With no state there is no fetcher, so nothing to do.
     let state = state?;
     match tokio::time::timeout(budget, state.edx_fetch_signed(peer, &address, "content.json")).await
@@ -1724,7 +1724,7 @@ impl epix_ui::OnDemandResolver for OnDemand {
         // A registered xite whose core files are still missing (an interrupted
         // clone - the periodic resync only fetches files when a NEWER
         // content.json shows up, so it never heals one) falls through and
-        // resumes its download. Never for owned sites: their local edits must
+        // resumes its download. Never for owned xites: their local edits must
         // not be overwritten with the signed versions from peers.
         let key = self.state.canonical_key(host).await;
         if self.state.has_xite(&key).await
@@ -1832,13 +1832,13 @@ impl epix_ui::ContentSyncer for OnDemand {
         let dir = self.data_root.join("data").join(address);
         let Ok(addr) = Address::parse(address.to_string()) else { return (0, Vec::new()) };
         let mut xite = Xite::new(addr, XiteStorage::new(dir));
-        // Only user_contents sites (with includes) have out-of-tree content.
+        // Only user_contents xites (with includes) have out-of-tree content.
         if !xite.load_content().unwrap_or(false) || xite.includes().is_empty() {
             return (0, Vec::new());
         }
         let mut peers = self.state.connectable_peers(address, 20).await;
         if peers.is_empty() {
-            // A rarely-visited site may have no warm peers yet: announce for
+            // A rarely-visited xite may have no warm peers yet: announce for
             // some, then fall back to the DHT. Use the full tracker set (shared
             // + Beacon-discovered), not just the bootstrap list, or a peer known
             // only to a shared tracker is never found.
@@ -1864,7 +1864,7 @@ impl epix_ui::ContentSyncer for OnDemand {
 
 impl OnDemand {
     /// Block (bounded) until the in-process Tor transport is installed, so a
-    /// cold-start clone of an onion-seeded site dials through Tor instead of
+    /// cold-start clone of an onion-seeded xite dials through Tor instead of
     /// the plain TCP transport the node holds until Arti finishes bootstrapping.
     ///
     /// Fresh installs hit this hard, Windows worst of all: opening the
@@ -1944,7 +1944,7 @@ impl OnDemand {
         let data_dir = self.data_root.join("data").join(address);
         // Clone when the address isn't served yet, or resume when it is served
         // but its core files are incomplete (an interrupted earlier clone).
-        // Owned sites never re-clone: local edits stay.
+        // Owned xites never re-clone: local edits stay.
         let was_registered = self.state.has_xite(address).await;
         if was_registered && host != address {
             self.state.set_display(address, host).await;
@@ -1987,7 +1987,7 @@ impl OnDemand {
                 self.state.set_display(address, host).await;
             }
         }
-        // Onion-seeded sites are only reachable once Tor is up. On a cold
+        // Onion-seeded xites are only reachable once Tor is up. On a cold
         // start the plain TCP transport is still installed, so wait for the
         // onion-capable transport before dialing - otherwise a fresh
         // install's first open fails every peer and shows "index.html
@@ -2014,7 +2014,7 @@ impl OnDemand {
                 // even on a first-load failure: add_xite already persisted
                 // it to sites.json, so it survives a restart and resumes on
                 // a later visit (the resume path re-attempts an incomplete
-                // clone). Dropping it here used to lose a freshly-added site
+                // clone). Dropping it here used to lose a freshly-added xite
                 // whose first load failed - e.g. no peers online yet.
                 self.state.push_clone_event(
                     address,
@@ -2027,13 +2027,13 @@ impl OnDemand {
         self.state.update_content(address, content.clone()).await;
         self.state.add_transfer(address, bytes, 0).await;
         // Rebuild the db now that the included / per-user data files are on
-        // disk, so a user_contents site's topics/comments are queryable.
+        // disk, so a user_contents xite's topics/comments are queryable.
         self.state.rebuild_xite_db(address).await;
-        // A merged site (e.g. a Git Epix repo) also feeds its merger's db.
+        // A merged xite (e.g. a Git Epix repo) also feeds its merger's db.
         if content.as_ref().and_then(|c| c.get("merged_type")).is_some() {
             self.state.rebuild_merger_dbs().await;
         }
-        self.state.push_site_info(address).await;
+        self.state.push_xite_info(address).await;
         // file_done per user-content file already fired as each file
         // landed (ingest_file), with the db updated first - the page,
         // served progressively, re-queried and showed each one live.
@@ -2070,7 +2070,7 @@ impl OnDemand {
     /// round can return only dead/unreachable peers this second while the
     /// node's background announce loop keeps turning up live seeders. Each
     /// attempt re-announces and re-seeds from the node's grown peer set, so a
-    /// thinly seeded site (the dashboard has few seeders) isn't doomed by one
+    /// thinly seeded xite (the dashboard has few seeders) isn't doomed by one
     /// unlucky round. Cheap when it works: a live peer makes the first try
     /// land. Announces go to the full tracker set (shared +
     /// Beacon-discovered), not just the bootstrap list, so a peer registered
@@ -2144,7 +2144,7 @@ async fn serve(
     }
 
     // Restore xites served in a previous run (from sites.json).
-    let restored = state.restore_sites().await;
+    let restored = state.restore_xites().await;
     if restored > 0 {
         state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
     }
@@ -2172,7 +2172,7 @@ async fn serve(
     state.set_homepage(&display);
 
     // Xite dbs are in-memory, so merger databases (Git Epix, Epix Post) are
-    // empty on every boot until filled from their merged sites - do it now
+    // empty on every boot until filled from their merged xites - do it now
     // that all restored xites are registered, or merger pages show nothing
     // until some merger action happens to trigger a rebuild.
     state.rebuild_merger_dbs().await;
@@ -2220,7 +2220,7 @@ async fn serve(
         tor_always: std::sync::atomic::AtomicBool::new(false),
     });
     state.set_on_demand(on_demand.clone()).await;
-    // The same component syncs included/user content for existing sites
+    // The same component syncs included/user content for existing xites
     // (called by the resync loop, so EpixTalk-style posts stay fresh).
     state.set_content_syncer(on_demand.clone()).await;
 
@@ -2405,7 +2405,7 @@ async fn serve(
     // rides Tor via the always-mode transport.
     //
     // Cold-start gap: Tor takes ~10-40s to bootstrap. Any chain RPC that runs
-    // before this fires (e.g. resolving the site named on the command line at
+    // before this fires (e.g. resolving the xite named on the command line at
     // startup) goes direct. Steady-state resolves - on-demand navigation, the
     // native host, re-verification - all wait until the proxy is set and route
     // through Tor.
@@ -2822,7 +2822,7 @@ mod tests {
 /// per-OS application-data location (`~/Library/Application Support/EpixNet`
 /// on macOS, `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
 /// `~/.local/share/EpixNet` on Linux). Shared by the server binary and the
-/// desktop browser so they use one identity, site set, and Tor state.
+/// desktop browser so they use one identity, xite set, and Tor state.
 pub fn data_root() -> PathBuf {
     epix_ui::paths::data_root()
 }

@@ -43,16 +43,16 @@ fn component_label(key: &str) -> &'static str {
     match key {
         "keys" => "Keys & identity",
         "config" => "Node settings",
-        "zites" => "Zites & site data",
+        "zites" => "Zites & xite data",
         _ => "Unknown",
     }
 }
 
 fn component_description(key: &str) -> &'static str {
     match key {
-        "keys" => "Your master seed and per-site private keys (private/users.json). This is what recovers your identity.",
+        "keys" => "Your master seed and per-xite private keys (private/users.json). This is what recovers your identity.",
         "config" => "The node configuration (private/config.json).",
-        "zites" => "All zite content and the served-sites list, so this node serves the same sites again.",
+        "zites" => "All zite content and the served-xites list, so this node serves the same xites again.",
         _ => "",
     }
 }
@@ -68,7 +68,7 @@ pub struct Manifest {
     pub created: String,
     pub encrypted: bool,
     /// Component key -> what the archive holds for it. Only listed files (and
-    /// `data/<address>/` trees for the listed sites) are ever restored.
+    /// `data/<address>/` trees for the listed xites) are ever restored.
     pub components: BTreeMap<String, ComponentEntry>,
 }
 
@@ -76,9 +76,10 @@ pub struct Manifest {
 pub struct ComponentEntry {
     /// Data-root-relative file paths with `/` separators.
     pub files: Vec<String>,
-    /// For `zites`: the site addresses whose `data/<address>/` trees are included.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sites: Vec<String>,
+    /// For `zites`: the xite addresses whose `data/<address>/` trees are included.
+    // Persisted under the legacy `sites` key so older backups keep restoring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "sites")]
+    pub xites: Vec<String>,
 }
 
 /// One stored backup, as listed on the page.
@@ -169,7 +170,7 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
     out
 }
 
-/// The site addresses under `data/` (only valid `epix1…` bech32 dirs count -
+/// The xite addresses under `data/` (only valid `epix1…` bech32 dirs count -
 /// anything else there is not zite content we can safely restore).
 fn zite_addresses(data_root: &Path) -> Vec<String> {
     let mut addrs: Vec<String> = std::fs::read_dir(data_root.join("data"))
@@ -218,9 +219,9 @@ fn join_rel(base: &Path, rel: &str) -> PathBuf {
 
 /// Whether a zip entry name is safe and expected: relative, forward slashes
 /// only, no `..`/empty segments, and within the whitelist - either a file
-/// listed in the manifest's selected components or under a listed site's
+/// listed in the manifest's selected components or under a listed xite's
 /// `data/<address>/` tree.
-fn entry_allowed(name: &str, allowed_files: &[String], allowed_sites: &[String]) -> bool {
+fn entry_allowed(name: &str, allowed_files: &[String], allowed_xites: &[String]) -> bool {
     if name.is_empty()
         || name.starts_with('/')
         || name.contains('\\')
@@ -232,7 +233,7 @@ fn entry_allowed(name: &str, allowed_files: &[String], allowed_sites: &[String])
     if allowed_files.iter().any(|f| f == name) {
         return true;
     }
-    allowed_sites.iter().any(|addr| {
+    allowed_xites.iter().any(|addr| {
         epix_crypt::is_valid_address(addr)
             && name.strip_prefix(&format!("data/{addr}/")).is_some_and(|rest| !rest.is_empty())
     })
@@ -285,7 +286,7 @@ pub fn create_backup(
                 .map(|(_, rel)| rel.clone())
                 .filter(|rel| !rel.starts_with("data/"))
                 .collect(),
-            sites: if *comp == "zites" { zite_addresses(data_root) } else { Vec::new() },
+            xites: if *comp == "zites" { zite_addresses(data_root) } else { Vec::new() },
         };
         manifest.components.insert(comp.to_string(), entry);
         all_files.extend(files);
@@ -430,7 +431,7 @@ pub fn stage_restore(
 ) -> Result<(), String> {
     let manifest = read_manifest(backup_path)?;
     let selected = validate_restore(&manifest, components, password)?;
-    let (allowed_files, allowed_sites) = restore_whitelist(&manifest, &selected);
+    let (allowed_files, allowed_xites) = restore_whitelist(&manifest, &selected);
 
     let pending = data_root.join(PENDING_DIR);
     // A previous staging (crashed or superseded) is discarded.
@@ -443,7 +444,7 @@ pub fn stage_restore(
         manifest.encrypted,
         &pending,
         &allowed_files,
-        &allowed_sites,
+        &allowed_xites,
         &selected,
     )
     .and_then(|plan| finalize_staging(data_root, &pending, &plan, app_version));
@@ -482,19 +483,19 @@ fn validate_restore(
 }
 
 /// What the selection allows out of the archive: the manifest-listed file
-/// names, and the site addresses whose `data/<address>/` trees may extract.
+/// names, and the xite addresses whose `data/<address>/` trees may extract.
 fn restore_whitelist(manifest: &Manifest, selected: &[String]) -> (Vec<String>, Vec<String>) {
     let files = selected
         .iter()
         .filter_map(|c| manifest.components.get(c))
         .flat_map(|e| e.files.iter().cloned())
         .collect();
-    let sites = if selected.iter().any(|c| c == "zites") {
-        manifest.components.get("zites").map(|e| e.sites.clone()).unwrap_or_default()
+    let xites = if selected.iter().any(|c| c == "zites") {
+        manifest.components.get("zites").map(|e| e.xites.clone()).unwrap_or_default()
     } else {
         Vec::new()
     };
-    (files, sites)
+    (files, xites)
 }
 
 type BackupArchive = zip::ZipArchive<std::io::BufReader<std::fs::File>>;
@@ -507,7 +508,7 @@ fn stage_archive(
     encrypted: bool,
     pending: &Path,
     allowed_files: &[String],
-    allowed_sites: &[String],
+    allowed_xites: &[String],
     selected: &[String],
 ) -> Result<ApplyPlan, String> {
     let file = std::fs::File::open(backup_path).map_err(|e| e.to_string())?;
@@ -516,7 +517,7 @@ fn stage_archive(
     let names: Vec<String> = zip.file_names().map(str::to_string).collect();
     let mut staged_files = Vec::new();
     for name in names {
-        if name == "manifest.json" || !entry_allowed(&name, allowed_files, allowed_sites) {
+        if name == "manifest.json" || !entry_allowed(&name, allowed_files, allowed_xites) {
             continue;
         }
         if stage_entry(&mut zip, &name, password, encrypted, pending)? {
@@ -526,7 +527,7 @@ fn stage_archive(
     if staged_files.is_empty() {
         return Err("The backup holds nothing for the selected items".to_string());
     }
-    let replace_dirs = allowed_sites
+    let replace_dirs = allowed_xites
         .iter()
         .filter(|addr| staged_files.iter().any(|f| f.starts_with(&format!("data/{addr}/"))))
         .map(|addr| format!("data/{addr}"))
@@ -632,7 +633,7 @@ pub fn apply_pending_restore(data_root: &Path) {
         let _ = std::fs::remove_dir_all(&pending);
         return;
     };
-    // Replaced site trees go away first, so a restored site holds exactly the
+    // Replaced xite trees go away first, so a restored xite holds exactly the
     // backup's files (no stale leftovers merged in).
     for rel in &plan.replace_dirs {
         let dir = join_rel(data_root, rel);
@@ -702,7 +703,7 @@ async fn backup_gate(state: &AppState) -> Result<PathBuf, Response> {
             (StatusCode::FORBIDDEN, "The backup page is disabled on this node").into_response()
         );
     }
-    if state.ui_restrict().await || state.no_new_sites().await {
+    if state.ui_restrict().await || state.no_new_xites().await {
         return Err((
             StatusCode::FORBIDDEN,
             "Backup & restore is not available on a restricted node",
@@ -1387,8 +1388,8 @@ fn render_restore_page(
     ));
     for comp in COMPONENTS {
         let Some(entry) = manifest.components.get(*comp) else { continue };
-        let extra = if *comp == "zites" && !entry.sites.is_empty() {
-            format!(" This backup holds {} zite(s).", entry.sites.len())
+        let extra = if *comp == "zites" && !entry.xites.is_empty() {
+            format!(" This backup holds {} zite(s).", entry.xites.len())
         } else {
             String::new()
         };
@@ -1464,10 +1465,10 @@ mod tests {
         std::fs::write(root.join("private/config.json"), b"{\"language\":\"en\"}").unwrap();
         std::fs::write(root.join("private/sites.json"), b"{}").unwrap();
         let addr = test_addr();
-        let site = root.join("data").join(&addr);
-        std::fs::create_dir_all(site.join("sub")).unwrap();
-        std::fs::write(site.join("content.json"), b"{}").unwrap();
-        std::fs::write(site.join("sub/index.html"), b"<html>").unwrap();
+        let xite = root.join("data").join(&addr);
+        std::fs::create_dir_all(xite.join("sub")).unwrap();
+        std::fs::write(xite.join("content.json"), b"{}").unwrap();
+        std::fs::write(xite.join("sub/index.html"), b"<html>").unwrap();
         // Stuff that must never end up in a backup:
         std::fs::create_dir_all(root.join("tor")).unwrap();
         std::fs::write(root.join("tor/state"), b"x").unwrap();
@@ -1502,7 +1503,7 @@ mod tests {
         assert_eq!(m.format_version, SUPPORTED_BACKUP_FORMAT);
         assert!(!m.encrypted);
         assert_eq!(m.components.len(), 3);
-        assert_eq!(m.components["zites"].sites.len(), 1);
+        assert_eq!(m.components["zites"].xites.len(), 1);
 
         // No caches, no backups dir, forward slashes only.
         let f = std::fs::File::open(root.join("backups").join(&name)).unwrap();
@@ -1717,15 +1718,15 @@ mod tests {
     fn entry_allowed_rules() {
         let addr = test_addr();
         let files = vec!["private/users.json".to_string()];
-        let sites = vec![addr.clone()];
-        assert!(entry_allowed("private/users.json", &files, &sites));
-        assert!(entry_allowed(&format!("data/{addr}/x/y.txt"), &files, &sites));
-        assert!(!entry_allowed("private/other.json", &files, &sites));
-        assert!(!entry_allowed(&format!("data/{addr}/../x"), &files, &sites));
-        assert!(!entry_allowed("data/notanaddress/x", &files, &sites));
-        assert!(!entry_allowed("/private/users.json", &files, &sites));
-        assert!(!entry_allowed("private\\users.json", &files, &sites));
-        assert!(!entry_allowed(&format!("data/{addr}/"), &files, &sites));
-        assert!(!entry_allowed("", &files, &sites));
+        let xites = vec![addr.clone()];
+        assert!(entry_allowed("private/users.json", &files, &xites));
+        assert!(entry_allowed(&format!("data/{addr}/x/y.txt"), &files, &xites));
+        assert!(!entry_allowed("private/other.json", &files, &xites));
+        assert!(!entry_allowed(&format!("data/{addr}/../x"), &files, &xites));
+        assert!(!entry_allowed("data/notanaddress/x", &files, &xites));
+        assert!(!entry_allowed("/private/users.json", &files, &xites));
+        assert!(!entry_allowed("private\\users.json", &files, &xites));
+        assert!(!entry_allowed(&format!("data/{addr}/"), &files, &xites));
+        assert!(!entry_allowed("", &files, &xites));
     }
 }

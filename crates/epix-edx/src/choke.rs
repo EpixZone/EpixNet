@@ -8,7 +8,7 @@
 //! - **generous by default, choking only under real contention**: home
 //!   uplinks are ~1 Gbps now, so every peer gets a large free serving
 //!   budget (~10 MB/s sustained) and the unchoke set is wide. A fresh
-//!   visitor's first paint AND an ordinary site sync ride the free budget;
+//!   visitor's first paint AND an ordinary xite sync ride the free budget;
 //!   reciprocity only decides who keeps getting served when more peers
 //!   compete than there are slots.
 //! - **global upload governance**: a global cap (min(share of measured
@@ -493,7 +493,7 @@ mod tests {
     }
 
     /// The free budget sustains ~10 MB/s for a whole window: a fresh peer
-    /// syncing a site at home-connection speed never hits the choke.
+    /// syncing a xite at home-connection speed never hits the choke.
     #[test]
     fn a_fresh_peer_draws_ten_megabytes_per_second_free() {
         let mut c = Choker::new(1_000_000_000);

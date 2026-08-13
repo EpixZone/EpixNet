@@ -56,7 +56,7 @@ pub struct XiteSettings {
     /// Unix time the last file finished downloading (None until first sync).
     #[serde(default)]
     pub downloaded: Option<i64>,
-    /// content.json `modified` (the site's version clock).
+    /// content.json `modified` (the xite's version clock).
     #[serde(default)]
     pub modified: f64,
     /// Total size of required files, bytes.
@@ -69,7 +69,7 @@ pub struct XiteSettings {
     #[serde(default)]
     pub optional_downloaded: i64,
     /// Cumulative bytes served to peers, across runs (EpixNet's
-    /// `settings.bytes_sent`). The dashboard's per-site upload/download
+    /// `settings.bytes_sent`). The dashboard's per-xite upload/download
     /// ratio badge divides these two.
     #[serde(default)]
     pub bytes_sent: u64,
@@ -98,7 +98,7 @@ pub struct XiteSettings {
     pub download_optional: bool,
     /// Directories the user opted to help distribute (optionalHelp):
     /// `{dir_prefix: title}`. Files under these auto-download like
-    /// autodownloadoptional does for the whole site.
+    /// autodownloadoptional does for the whole xite.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub optional_help: Map<String, Value>,
     /// Whether the user favourited this xite (sidebar star).
@@ -145,7 +145,7 @@ impl XiteSettings {
 
     /// Fold in sizes/modified computed from content.json. `modified` only
     /// advances (EpixNet semantics): it is the newest `modified` seen across
-    /// EVERY content.json of the site, per-user ones included - a hub whose
+    /// EVERY content.json of the xite, per-user ones included - a hub whose
     /// root rarely changes still reads "hours ago" on the dashboard when
     /// users post. Reloading the (older) root must not walk it back.
     pub fn apply_content_stats(&mut self, stats: &ContentStats) {

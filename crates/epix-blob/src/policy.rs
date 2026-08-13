@@ -14,7 +14,7 @@
 //! - **Distribution units** ([`DistributionUnit`], [`Retention`]):
 //!   per-path `distribution_unit` (package | file-refs | feed) +
 //!   `retention` (complete | partial). Content-addressing already gives
-//!   #340's cross-site file-by-reference; this declares the completion
+//!   #340's cross-xite file-by-reference; this declares the completion
 //!   policy. `retention:complete` is consent-gated (reuses the existing
 //!   size-limit prompt) so it never ambushes first paint or a data cap.
 

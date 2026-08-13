@@ -13,7 +13,7 @@ Python client against the Rust server (port 26599):
 - `peerGetFile`: Python's streaming download path (`streamFile`) fetched the
   file byte-for-byte. This exercises the raw-stream framing fix - the reply
   carries `stream_bytes` with the file bytes following raw on the socket.
-- `listModified`: reports the site's content.json versions in the shape
+- `listModified`: reports the xite's content.json versions in the shape
   Python expects.
 - `pex`: answers with typed peer buckets; Python parses the reply.
 
