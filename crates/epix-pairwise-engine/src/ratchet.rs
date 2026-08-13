@@ -92,7 +92,28 @@ impl Drop for Session {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test-only queue of fixed randomness. When non-empty, `rand32` returns
+    /// its values in order instead of OS entropy, so `begin`/`dh_ratchet`/`seal`
+    /// become deterministic for byte-exact record vectors.
+    static TEST_RNG: std::cell::RefCell<std::collections::VecDeque<[u8; 32]>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Load fixed randomness for the current thread (test-only).
+#[cfg(test)]
+pub(crate) fn set_test_rng(vals: Vec<[u8; 32]>) {
+    TEST_RNG.with(|r| *r.borrow_mut() = vals.into());
+}
+
 fn rand32() -> [u8; 32] {
+    #[cfg(test)]
+    {
+        if let Some(v) = TEST_RNG.with(|r| r.borrow_mut().pop_front()) {
+            return v;
+        }
+    }
     let mut b = [0u8; 32];
     getrandom::fill(&mut b).expect("os rng");
     b
@@ -571,6 +592,71 @@ mod prod_vectors {
         assert_eq!(h(&tag_of(&[6u8; 32])), "8aeb69a9e6d6c8a5ceea4c3cb3b4bb3a3105618f4ab4c44edc0c97ed837cb019");
         assert_eq!(h(&hk_of(&[6u8; 32])), "3be96623d46e35c79610a2661f42870789da88c4e996b75f7be71cdf73a6c565");
         assert_eq!(h(&next_tck(&[6u8; 32])), "338efb5edc8126379eaca1b12416387721c20b069619768057f04a7f1be770c4");
+    }
+
+    /// A representable ephemeral + a fixed Bob bundle, so `begin`/`seal` run
+    /// deterministically. Shared by the record KAT and its print helper.
+    fn kat_setup() -> ([u8; 32], [u8; 32], serde_json::Value, [u8; 16]) {
+        let alice_seed = [11u8; 32];
+        let bob_seed = [22u8; 32];
+        let idx = 2954u32;
+        let eph = (0u8..=255)
+            .map(|i| [i; 32])
+            .find(|e| crate::curve::elligator_encode(e, 0).is_some())
+            .expect("some [i;32] is elligator-representable");
+        let bundle = serde_json::json!({
+            "v": 2, "xid": "bob.epix",
+            "ik": keys::b64(&crate::curve::public_key(&keys::ik_priv(&bob_seed))),
+            "spk": keys::b64(&crate::curve::public_key(&keys::spk_priv(&bob_seed, idx))),
+            "spk_idx": idx,
+        });
+        (alice_seed, eph, bundle, [3u8; 16])
+    }
+
+    fn kat_records() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (alice_seed, eph, bundle, conv) = kat_setup();
+        // begin consumes: ephemeral, tweak (uses [0]), dhs_priv.
+        set_test_rng(vec![eph, [7u8; 32], [42u8; 32]]);
+        let (session, _recv) = begin(&alice_seed, &bundle, conv).unwrap();
+        let buckets = [512usize, 2048];
+        // Alice's first (first-contact) record, then her second (established).
+        let (t1, c1, session) = seal(&session, "alice.epix", &[], "s1", "body-one", 1000, &buckets).unwrap();
+        let (t2, c2, _session) = seal(&session, "alice.epix", &[], "s2", "body-two", 2000, &buckets).unwrap();
+        (t1.to_vec(), c1, t2.to_vec(), c2)
+    }
+
+    /// Byte-exact record vectors (C1). Unlike the round-trip tests, these pin the
+    /// full on-wire record — Elligator tag, FC/EST header layout, `ad = tag`,
+    /// nonce labels, padding, bucket choice, AND the X3DH/tck contexts that a
+    /// symmetric seal/open change would otherwise hide — because `begin`/`seal`
+    /// are made deterministic via the injected RNG. A second implementation must
+    /// reproduce these exactly. Regenerate deliberately via `record_kat_print`.
+    #[test]
+    fn record_level_kat() {
+        let (t1, c1, t2, c2) = kat_records();
+        assert_eq!(h(&t1), "d3f7e7bd26d7c49640e15d6fa86a8d108bed3c9479479a78e2472f07044b8711", "FC tag");
+        assert_eq!(h(&c1), "4cb3045e4b1c5582fae3f15887ee9fd6216e9ddaf331454bc8cbcc838a4e87c4df8eaef806f140584a45a848642c7aa101d076faaffbba3997b69ac50031626816eed8416922bdd611103cbbca9137b520e33601be58fbe54be6b7a5628d8dee161c00aa252a5457801f1425ec8345ecc29b7b84ed5d088b4208f0ca103429f3d9a27bda6c8974b10fb918c9c48e09341a198a8ebb10108a7e9ed3675e53360b9f88990baf0d2390de52ca16a112747bec569f53d11228c422f4078228d0d5727059bc8e6e59f77cb5e90a2c2e8eafb4f1abfddddb74697a05ae8d2dbb84dc933a9171f176f8141692d9d5b4fa7593c2b85dec57585dccd032d3e168ef17ca205c5f268b84ef8ad24392c0617b8599e043177e1752f32cbc56f64387340a3088385c2cc5c476f5cd2821b27c29e752f29b45acda309770aed86c88359b93069c57103cbd5e15cbcd44644416fe5813a5b27aada7f3db1abd9221e48eece88696ba1c23a5c65ee0e65e1c817ccf435bfa4bfdeea59e92559e5b8d02b97b8999fefe47bfed16882897a940835a497bdea09057f4473e8c90bac26d73babbb40d2fa8dff29aa56d022bc84fe00327329e48394a2b9e6ac700ae558514e6a473c9df319dd55b48d958e1f71ae568c3fbaeca1db6646579bb27efdcebeb8cf4a82accaf8cf21e8a89de98ee3d4ce0b12c4b0030daf63c3d6ec13a0b508d8a9e164574", "FC ct");
+        assert_eq!(h(&t2), "d9aee1169f1bcb8af6c108bfb11f91a773b1fe47cc7e263b14ed19f9adc8ed3a", "EST tag");
+        assert_eq!(h(&c2), "69b39dab22a48fe370ead4c1ba2e72e545d901f3085ce73529f4ac0b6ff0c468a870e8b2c795b4c096d75b68c90dc91fca7cde1fa962dd98401520a297391ab67d56b59fe0c1c658223740e56f61b137a0f0f5f446e1a7814c550d11ac8614c2d2c72b3f8e9e0b3abafe3cf31b84d2ff3e461d91e7a04fe38f48d297e3cac3a9ae8d26dfec60d523139c975ae514e0783a21fe3fd85cd859bd719bc26212b616c8ada04d3f3cff142ee1ea3cce4e9a5d9a1ea4a481b1ade0daee090a22468ea493c9a6060ad0a931315614e249f7f1e568d3e77da9feb9f58e1a0b57b5caa5387a3b1f05337211251d5381c06edd8b7d7158685589b23da66f3d6b495e7a8830f63bb86ebbae8cd6dda173e768e33c71a27529b1f609ae077a67ab5eed3fc89ecd8b096dd61ee1a445127855cef4a5a559f0f97f3d132037e68ad5e1fd72c32f1e366c2615906ba097bb63fa6e97c2bca211473e3c01237d2123ff1c76f12a43021c2d353223b72198b29720c5c75eab2a648441a628ff2dc08b7c4cb8dcddd9ece02f6cd40d3f6f58485c4ef41071059171cfd74e344faefd1b2bfec95caddd795a23baf3946a79fdb5f50a8cb729f3f77de3f1f396fe95dc862a5d358e92119a18384469c8cd0db6d765f96acf1520ddd25c28d52b01681e99b412d6e2b42bcb50e13c6ec10f399297ce4916ba1071dd69a4be1e7b7614674f5ba0a3e73cc1", "EST ct");
+
+        // The frozen first-contact record actually decrypts for Bob (proves the
+        // bytes are a valid record, not just a hash we froze).
+        let bob_seed = [22u8; 32];
+        let tag: [u8; 32] = t1.clone().try_into().unwrap();
+        let (_s, _conv, sender, _ik_a, payload, _n) = open_first(&bob_seed, &tag, &c1).unwrap();
+        assert_eq!(sender, "alice.epix");
+        let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(v["b"].as_str(), Some("body-one"));
+    }
+
+    #[test]
+    #[ignore]
+    fn record_kat_print() {
+        let (t1, c1, t2, c2) = kat_records();
+        println!("FC_TAG {}", h(&t1));
+        println!("FC_CT {}", h(&c1));
+        println!("EST_TAG {}", h(&t2));
+        println!("EST_CT {}", h(&c2));
     }
 }
 
