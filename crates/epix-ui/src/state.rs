@@ -2551,17 +2551,48 @@ impl AppState {
         // Grants are keyed by the signed content address so a site served under
         // both its raw address and a `.epix` alias shares one grant.
         let canonical = canonical_address(entry.content.as_ref(), &address);
-        // Optional-file toggles: a xite we've served before keeps its SAVED
-        // per-xite choice (sites.json) - add_xite re-runs for the launch xite
-        // every boot and for every restored xite, and clobbering with the
-        // node defaults would silently undo a user's opt-out (and persist the
-        // wrong value). Only a genuinely NEW xite inherits the node-wide
-        // defaults (Config page: "Optional Files"); help-distribute implies
-        // downloading.
-        match self.saved_optional_flags(&canonical) {
-            Some((dl, auto)) => {
-                settings.download_optional = dl;
-                settings.autodownloadoptional = auto;
+        // A xite we've served before keeps its SAVED per-xite state - add_xite
+        // re-runs for the launch xite every boot and for every restored xite,
+        // and rebuilding settings from scratch silently undid the user's
+        // choices ("This is my site", favourite, size limit, the optional
+        // toggles, transfer totals), after which the persist_sites below wrote
+        // that loss back to disk. Prefer the live in-memory settings (a re-add
+        // of an already-served xite, where restore_sites has already reapplied
+        // sites.json); fall back to the sites.json entry on disk. Only a
+        // genuinely NEW xite inherits the node-wide defaults (Config page:
+        // "Optional Files"); help-distribute implies downloading.
+        let prev = {
+            let xites = self.xites.read().await;
+            xites
+                .get(&address)
+                .or_else(|| xites.get(&canonical))
+                .map(|x| x.settings.clone())
+        };
+        match prev.or_else(|| self.saved_settings(&canonical)) {
+            Some(prev) => {
+                settings.own = prev.own;
+                settings.serving = prev.serving;
+                settings.size_limit = prev.size_limit;
+                settings.download_optional = prev.download_optional;
+                settings.autodownloadoptional = prev.autodownloadoptional;
+                settings.optional_help = prev.optional_help;
+                settings.modified_files_notification = prev.modified_files_notification;
+                settings.favorite = prev.favorite;
+                // Lifetime transfer totals (the ratio badge) and the per-file
+                // optional counters survive the re-add.
+                settings.bytes_sent = prev.bytes_sent;
+                settings.bytes_recv = prev.bytes_recv;
+                settings.cache = prev.cache;
+                // apply_content_stats below only advances modified (max), so
+                // seeding the saved value keeps per-user content seen last run.
+                settings.modified = prev.modified;
+                if prev.added > 0 {
+                    settings.added = prev.added;
+                }
+                // Keep the wrapper/AJAX keys: pages already open in the
+                // browser hold them, and a mid-run re-add must not 403 them.
+                settings.wrapper_key = prev.wrapper_key;
+                settings.ajax_key = prev.ajax_key;
             }
             None => {
                 // Default OFF. This is not "seed what you have" - a node
@@ -2776,19 +2807,19 @@ impl AppState {
     /// flat at the top level - so a Python node can read it and vice versa.
     /// The display alias (e.g. `dashboard.epix`) rides along as an extra
     /// `display` key inside the settings dict (Python preserves unknown keys).
-    /// The optional-download toggles persisted in sites.json for a canonical
-    /// address, if the site was served before. Consulted by [`Self::add_xite`]
-    /// so a re-add (the launch xite every boot, a restore) keeps the user's
-    /// saved choice instead of resetting to the node defaults.
-    fn saved_optional_flags(&self, canonical: &str) -> Option<(bool, bool)> {
+    /// The settings persisted in sites.json for a canonical address, if the
+    /// site was served before. Consulted by [`Self::add_xite`] so a re-add
+    /// (the launch xite every boot, a restore) keeps the user's saved state
+    /// (ownership, toggles, counters) instead of resetting to the defaults.
+    fn saved_settings(&self, canonical: &str) -> Option<XiteSettings> {
         let path = self.sites_path.as_ref()?;
         let raw = std::fs::read(path).ok()?;
         let map: Value = serde_json::from_slice(&raw).ok()?;
         let entry = map.get(canonical)?;
-        Some((
-            entry.get("download_optional").and_then(|v| v.as_bool()).unwrap_or(false),
-            entry.get("autodownloadoptional").and_then(|v| v.as_bool()).unwrap_or(false),
-        ))
+        // Settings live flat in the entry (EpixNet schema); accept the old
+        // nested `{"settings": {…}}` form too.
+        let src = entry.get("settings").cloned().unwrap_or_else(|| entry.clone());
+        serde_json::from_value(src).ok()
     }
 
     pub async fn persist_sites(&self) {
