@@ -794,6 +794,25 @@ pub struct AppState {
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
+    /// Per-xite cached anonymous-envelope-pool descriptors, parsed from the root
+    /// content.json and rebuilt when it changes. A derived read cache, like
+    /// `feed_cache`. GENERIC — any xite may declare a `pool` (see `crate::pool`).
+    pub(crate) pool_rules: RwLock<HashMap<String, Vec<epix_content::PoolRule>>>,
+    /// Broadcast bus of newly-landed pool records `(address, records)`. GENERIC:
+    /// any consumer (the mail indexer, or another xite's handler) subscribes via
+    /// [`Self::subscribe_pool_deltas`] and filters by address. Decoupled so the
+    /// pool machinery has no knowledge of its consumers.
+    pub(crate) pool_events: tokio::sync::broadcast::Sender<crate::pool::PoolDelta>,
+    /// Generic typed capability registry: a plugin installs its own state (e.g.
+    /// the mail plugin's private index + engine) under a string key so its WS
+    /// commands can retrieve it from the bound `AppState`, keeping the core free
+    /// of any per-feature fields. See [`Self::install_capability`].
+    capabilities: std::sync::RwLock<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Generic local (never-shared) feed/notification sources contributed by
+    /// plugins. `feedQuery`/`notification_query` fold these in after the shared
+    /// queries so private data (like decrypted mail) reaches the dashboard and
+    /// badge without any shared-DB footprint. See [`crate::local_feed`].
+    local_sources: RwLock<Vec<Arc<dyn crate::local_feed::LocalFeedSource>>>,
     /// Opens the warm pool's EDX links, installed by the node alongside the
     /// fetcher. Separate from `edx_fetcher` because the pool needs only a
     /// ping, and a mock of one should not have to mock the other.
@@ -1484,6 +1503,10 @@ impl AppState {
             edx_store: RwLock::new(None),
             edx_paths: std::sync::RwLock::new(HashMap::new()),
             edx_fetcher: RwLock::new(None),
+            pool_rules: RwLock::new(HashMap::new()),
+            pool_events: tokio::sync::broadcast::channel(1024).0,
+            capabilities: std::sync::RwLock::new(HashMap::new()),
+            local_sources: RwLock::new(Vec::new()),
             link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
@@ -2226,6 +2249,13 @@ impl AppState {
                 }
                 results.push(entry);
             }
+        }
+        // Fold in generic local (never-shared) sources — e.g. the decrypted
+        // mail badge — so private data reaches the badge with no shared footprint.
+        let mut xite_count = xite_count;
+        for entry in self.local_notification_entries().await {
+            results.push(entry);
+            xite_count += 1;
         }
         json!({ "results": results, "num": results.len(), "sites": xite_count, "muted": false })
     }
@@ -8198,6 +8228,102 @@ impl AppState {
         self.events.subscribe()
     }
 
+    /// Subscribe to the generic anonymous-envelope-pool delta bus: every newly
+    /// landed pool record (from a local append or an inbound merge) is broadcast
+    /// as `(address, records)`. Consumers filter by address. See `crate::pool`.
+    pub fn subscribe_pool_deltas(&self) -> tokio::sync::broadcast::Receiver<crate::pool::PoolDelta> {
+        self.pool_events.subscribe()
+    }
+
+    /// The xite storage handle for `address`, if served (a cheap `Arc` clone).
+    /// A `pub(crate)` accessor so the generic pool and mail modules can read and
+    /// write shard files without reaching the private `xites` field directly.
+    pub(crate) async fn xite_storage(&self, address: &str) -> Option<XiteStorage> {
+        self.xites.read().await.get(address).map(|x| x.storage.clone())
+    }
+
+    /// The node master seed (hex), for deriving per-consumer identity seeds.
+    pub(crate) async fn master_seed(&self) -> String {
+        self.user.read().await.master_seed.clone()
+    }
+
+    // --- generic plugin capability registry -------------------------------
+
+    /// Install typed plugin state under `key`. A plugin's WS commands can later
+    /// retrieve it from the bound `AppState` via [`Self::capability`], so the
+    /// core needs no per-feature fields. Overwrites any prior value for `key`.
+    pub fn install_capability(&self, key: &str, cap: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(mut caps) = self.capabilities.write() {
+            caps.insert(key.to_string(), cap);
+        }
+    }
+
+    /// Retrieve typed plugin state installed under `key`, if present and of type
+    /// `T`. Returns `None` before the owning plugin's `start()` has installed it.
+    pub fn capability<T: std::any::Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
+        let caps = self.capabilities.read().ok()?;
+        caps.get(key)?.clone().downcast::<T>().ok()
+    }
+
+    pub(crate) async fn local_sources_mut(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Vec<Arc<dyn crate::local_feed::LocalFeedSource>>> {
+        self.local_sources.write().await
+    }
+
+    pub(crate) async fn local_sources_snapshot(
+        &self,
+    ) -> Vec<Arc<dyn crate::local_feed::LocalFeedSource>> {
+        self.local_sources.read().await.clone()
+    }
+
+    /// Derive a stable, secret 32-byte per-consumer seed from the node master
+    /// seed, domain-separated by `domain` and `key` (e.g. an auth address). Lets
+    /// a plugin get key material bound to the node identity WITHOUT the master
+    /// seed ever leaving the node. Recomputable across restarts / restore-from-seed.
+    pub async fn derive_consumer_seed(&self, domain: &str, key: &str) -> [u8; 32] {
+        let seed = self.master_seed().await;
+        let mut material = hex::decode(&seed).unwrap_or_else(|_| seed.into_bytes());
+        material.extend_from_slice(domain.as_bytes());
+        material.push(0);
+        material.extend_from_slice(key.as_bytes());
+        blake3::derive_key("epix/consumer-seed/v1", &material)
+    }
+
+    /// Read one file from a served xite's storage (generic; used by plugins that
+    /// need a xite's published data, e.g. a recipient's mail key bundle).
+    pub async fn read_xite_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
+        self.xite_storage(address).await?.read(inner_path).ok()
+    }
+
+    /// Every file currently on disk under a served xite's root, as relative
+    /// inner paths. Generic; a plugin uses it to enumerate published data (e.g.
+    /// every user's legacy `messages.json` for a one-shot migration).
+    pub async fn list_xite_files(&self, address: &str) -> Vec<String> {
+        match self.xite_storage(address).await {
+            Some(storage) => storage.list_files(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The node's own auth address for a xite (ensuring the per-xite identity
+    /// entry exists). Generic; a plugin uses it to name its per-xite identity.
+    pub async fn xite_auth_address(&self, address: &str) -> Option<String> {
+        let mut user = self.user.write().await;
+        user.xite_data(address).ok()?;
+        user.xites.get(address).map(|x| x.auth_address.clone())
+    }
+
+    /// Push an unsolicited `{cmd, params}` event to a xite's bound page(s),
+    /// gated to the `siteChanged` channel. Generic wrapper a plugin can call
+    /// (the routed primitive is crate-private).
+    pub fn push_site_event(&self, xite: &str, cmd: &str, params: Value) {
+        if xite.is_empty() {
+            return;
+        }
+        self.push_event_routed(cmd, params, Some("siteChanged"), Some(xite.to_string()), None, None);
+    }
+
     /// Push an unsolicited `{cmd, params}` event. `channel` gates by
     /// subscription (`None` = ungated); `target` gates by xite (`None` = any).
     /// No-op if nothing is listening.
@@ -8207,7 +8333,7 @@ impl AppState {
 
     /// [`Self::push_event`] with per-connection routing: `exclude` skips the
     /// originating connection, `only` delivers to a single one.
-    fn push_event_routed(
+    pub(crate) fn push_event_routed(
         &self,
         cmd: &str,
         params: Value,
@@ -11547,7 +11673,7 @@ impl AppState {
     /// bounded by that peer's dial deadline (an onion/i2p peer needs far more
     /// than a flat clearnet one). `None` on any failure, so callers can just
     /// try the next address.
-    async fn fetch_signed_from(
+    pub(crate) async fn fetch_signed_from(
         &self,
         peer: &PeerAddr,
         address: &str,

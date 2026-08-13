@@ -118,7 +118,7 @@ fn insert_row(
 /// Allowed columns for a `to_table` entry: its `import_cols`, else the table's
 /// schema columns. The `key_col`/`val_col` names always pass: EpixNet applies
 /// `import_cols` to a dict entry's VALUE fields before adding the dict key, so
-/// a schema like EpixMail's (`key_col: conv_id`, `import_cols` without it)
+/// a schema like a channel app's (`key_col: conv_id`, `import_cols` without it)
 /// still stores the key - filtering it out left every conv_id NULL and the
 /// inbox unable to look conversations up.
 fn allowed_cols(schema: &DbSchema, entry: &ToTable) -> Vec<String> {

@@ -603,6 +603,7 @@ impl SignedProvider for AppStateProvider {
         }
         if !is_content_json(inner_path)
             && !self.state.is_declared_merge_file(xite, inner_path).await
+            && !self.state.is_pool_shard(xite, inner_path).await
         {
             return None;
         }
@@ -661,6 +662,13 @@ impl SignedProvider for AppStateProvider {
         // apply, so a node that only relays this xite still hints it for
         // others - the store-and-forward reach a publish flood needs.
         self.state.record_update_hint(xite, modified as i64).await;
+
+        // Anonymous envelope pool shards are not content.json and self-verify
+        // per-record (PoW + self-signature); route them to the pool merge path,
+        // which unions grow-only and never touches the content.json apply gate.
+        if self.state.is_pool_shard(xite, inner_path).await {
+            return self.state.apply_inbound_pool_update(xite, inner_path, signed).await;
+        }
 
         // `inline` is not consumed: nothing sends it yet, and inserting pushed
         // objects into the store before apply_inbound_update authorizes the

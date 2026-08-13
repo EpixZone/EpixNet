@@ -2454,6 +2454,7 @@ async fn serve(
     let mut plugins = epix_plugin::PluginRegistry::new();
     plugins.register(Arc::new(epix_plugins::SidebarPlugin));
     plugins.register(Arc::new(epix_plugins::BeaconPlugin));
+    plugins.register(Arc::new(epix_plugins::ChannelPlugin));
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
     plugin_names.sort();

@@ -2636,6 +2636,10 @@ impl WsCommand for FeedQuery {
             }
         }
 
+        // Fold in generic local (never-shared) feed sources — e.g. decrypted
+        // mail — computed and rendered only on this node (zero shared footprint).
+        rows.extend(s.state.local_feed_rows(limit as i64).await);
+
         rows.sort_by(|a, b| {
             let da = a["date_added"].as_f64().unwrap_or(0.0);
             let db = b["date_added"].as_f64().unwrap_or(0.0);

@@ -178,6 +178,17 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Epix Chain Config", "chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
     ("Epix Chain Config", "chain_block_explorer_url", "Block Explorer URL", "https://scan.epix.zone", "text"),
     ("Epix Chain Config", "xid_clear_cache", "Clear xID Cache", "", "button:xidClearCache"),
+    // --- Channels (metadata-private mail / DMs / forum over the envelope pool)
+    ("Channels", "channel_enabled", "Enable metadata-private channels", "false", "bool"),
+    ("Channels", "channel_xite", "Channel xite address", "", "text"),
+    ("Channels", "channel_backfill_weeks", "Weeks of channel history to backfill (0 = all)", "4", "text"),
+    ("Channels", "channel_pow_threads", "Threads for channel proof-of-work", "1", "text"),
+    ("Channels", "channel_send_jitter_max_secs", "Max random send delay (metadata privacy)", "0", "text"),
+    ("Channels", "channel_encrypt_at_rest", "Encrypt the local channel index at rest", "true", "bool"),
+    ("Channels", "channel_feed_snippets", "Show message snippets in the dashboard feed", "false", "bool"),
+    // Test/dev only: run mail on the INSECURE FakeEngine when no secure engine
+    // is compiled in. Never enable for real mail — it provides no confidentiality.
+    ("Channels", "channel_allow_insecure_engine", "DEV: allow the insecure test channel engine", "false", "bool"),
 ];
 
 /// True for schema entries that aren't stored config keys (action buttons), so

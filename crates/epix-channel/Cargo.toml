@@ -1,0 +1,20 @@
+[package]
+name = "epix-channel"
+version = "0.1.0"
+edition = "2021"
+description = "Metadata-private channels: the private local index, the crypto Engine boundary, and the trial-decrypt indexer for the anonymous envelope pool."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-crypt = { path = "../epix-crypt" }
+epix-content = { path = "../epix-content" }
+epix-envelope = { path = "../epix-envelope" }
+epix-db = { path = "../epix-db" }
+serde_json = "1"
+blake3 = "1"
+base64 = "0.23"
+hex = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

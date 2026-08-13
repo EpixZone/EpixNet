@@ -15,7 +15,9 @@ pub mod config_schema;
 pub mod conn_pool;
 pub mod feed;
 pub mod geoip;
+pub mod local_feed;
 pub mod paths;
+pub mod pool;
 pub mod state;
 
 /// Re-exported for callers (the CLI) that hold sign options without a

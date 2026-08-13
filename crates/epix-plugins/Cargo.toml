@@ -10,9 +10,19 @@ epix-discovery = { path = "../epix-discovery" }
 epix-ui = { path = "../epix-ui" }
 epix-plugin = { path = "../epix-plugin" }
 epix-peer = { path = "../epix-peer" }
+# The mail plugin: metadata-private mail as a consumer of the generic pool.
+# epix-envelope = the app-neutral engine trait + trial-decrypt indexer;
+# epix-channel = the mail-specific private index (its EnvelopeStore impl).
+epix-envelope = { path = "../epix-envelope" }
+epix-channel = { path = "../epix-channel" }
+# The real mail crypto engine (X3DH + Double Ratchet). The node ships this as
+# the default mail engine; the FakeEngine remains only for dev/testing.
+epix-pairwise-engine = { path = "../epix-pairwise-engine" }
 async-trait = "0.1"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+base64 = "0.23"
+hex = "0.4"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
 
 [dev-dependencies]
 epix-xite = { path = "../epix-xite" }

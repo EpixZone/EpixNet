@@ -2166,9 +2166,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-channel"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "blake3",
+ "epix-content",
+ "epix-core",
+ "epix-crypt",
+ "epix-db",
+ "epix-envelope",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "epix-content"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "epix-core",
  "epix-crypt",
  "regex",
@@ -2279,6 +2297,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-envelope"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "blake3",
+ "epix-content",
+ "epix-core",
+ "epix-crypt",
+ "hex",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "epix-feed"
 version = "0.1.0"
 dependencies = [
@@ -2355,6 +2388,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-pairwise-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "chacha20poly1305 0.10.1",
+ "curve25519-elligator2",
+ "epix-envelope",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf",
+ "hmac 0.12.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "zeroize",
+]
+
+[[package]]
 name = "epix-peer"
 version = "0.1.0"
 dependencies = [
@@ -2376,12 +2427,17 @@ name = "epix-plugins"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
+ "epix-channel",
  "epix-core",
  "epix-discovery",
+ "epix-envelope",
+ "epix-pairwise-engine",
  "epix-peer",
  "epix-plugin",
  "epix-ui",
  "epix-xite",
+ "hex",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2530,6 +2586,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "blake3",
  "epix-blob",
  "epix-bt",
  "epix-chain",

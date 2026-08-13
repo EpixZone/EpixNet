@@ -6,7 +6,9 @@
 //! media automatically.
 
 pub mod beacon;
+pub mod channel;
 pub mod sidebar;
 
 pub use beacon::BeaconPlugin;
+pub use channel::ChannelPlugin;
 pub use sidebar::SidebarPlugin;
