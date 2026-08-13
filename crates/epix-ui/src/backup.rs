@@ -77,8 +77,9 @@ pub struct ComponentEntry {
     /// Data-root-relative file paths with `/` separators.
     pub files: Vec<String>,
     /// For `zites`: the xite addresses whose `data/<address>/` trees are included.
-    // Persisted under the legacy `sites` key so older backups keep restoring.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "sites")]
+    // Written as `xites`; the legacy `sites` key is still accepted on read, so
+    // archives made by older nodes keep restoring.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "sites")]
     pub xites: Vec<String>,
 }
 
@@ -158,6 +159,9 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
             push_if_exists("private/config.json");
         }
         "zites" => {
+            push_if_exists("private/xites.json");
+            // Legacy registry name: still archived when present, so a backup
+            // taken before the first start on a new build is complete.
             push_if_exists("private/sites.json");
             push_if_exists("private/permissions.json");
             push_if_exists("private/filters.json");

@@ -75,8 +75,10 @@ pub struct XiteAuth {
 pub struct User {
     pub master_seed: String,
     pub master_address: String,
-    // Persisted under the legacy `sites` key: users.json stays Python-EpixNet-compatible.
-    #[serde(default, rename = "sites")]
+    // Written as `xites`; the legacy `sites` key is still accepted on read, so
+    // a users.json from an older node (or from Python EpixNet) loads as-is and
+    // is rewritten under the new name on the next save.
+    #[serde(default, alias = "sites")]
     pub xites: HashMap<String, XiteAuth>,
     /// Certs the user obtained, keyed by provider domain.
     #[serde(default)]
@@ -426,7 +428,7 @@ impl User {
     fn to_file_entry(&self) -> Value {
         serde_json::json!({
             "master_seed": self.master_seed,
-            "sites": self.xites,
+            "xites": self.xites,
             "certs": self.certs,
             "settings": self.settings,
             "follows": self.follows,
@@ -436,8 +438,11 @@ impl User {
     /// Build a user from a `users.json` entry (its master address + the object).
     fn from_file_entry(master_address: &str, entry: &Value) -> Option<Self> {
         let master_seed = entry.get("master_seed")?.as_str()?.to_string();
-        let xites = entry
-            .get("sites")
+        // Written as `xites`; `sites` is the legacy name (older builds, and
+        // Python EpixNet). Read either - the per-xite auth keys and certs in
+        // here are not reproducible, so dropping them would lose identities.
+        let xites_entry = entry.get("xites").or_else(|| entry.get("sites"));
+        let xites = xites_entry
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         let certs = entry
@@ -456,7 +461,7 @@ impl User {
         // (`xites.<addr>.follow`), which the typed SiteAuth parse drops. Merge
         // them into our top-level map (ours wins on conflict) so a data dir
         // copied from the Python client keeps its dashboard feed.
-        if let Some(xites_obj) = entry.get("sites").and_then(|v| v.as_object()) {
+        if let Some(xites_obj) = xites_entry.and_then(|v| v.as_object()) {
             for (addr, xite_data) in xites_obj {
                 if let Some(f) = xite_data.get("follow") {
                     if f.is_object() && !follows.contains_key(addr) {
@@ -656,7 +661,7 @@ mod tests {
         let entry = &raw[&u.master_address];
         assert_eq!(entry["master_seed"], u.master_seed);
         assert_eq!(entry["certs"]["xid.epix"]["auth_user_name"], "alice");
-        assert_eq!(entry["sites"]["talk.epix"]["cert"], "xid.epix");
+        assert_eq!(entry["xites"]["talk.epix"]["cert"], "xid.epix");
 
         let loaded = User::load_or_create(&path).unwrap();
         assert_eq!(loaded.master_seed, u.master_seed);

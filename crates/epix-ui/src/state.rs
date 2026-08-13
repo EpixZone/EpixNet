@@ -1004,7 +1004,7 @@ pub struct AppState {
     /// The shared data root, laid out like Python EpixNet: node files under
     /// `private/`, per-xite dirs under `data/`. None for in-memory nodes.
     data_root: Option<PathBuf>,
-    /// Path to `private/sites.json` (the persistent served-xite registry,
+    /// Path to `private/xites.json` (the persistent served-xite registry,
     /// EpixNet's SiteManager). None for in-memory nodes.
     xites_path: Option<PathBuf>,
     /// Path to the `epixnet.conf` at the default per-OS location, when this
@@ -1552,7 +1552,7 @@ impl AppState {
     }
 
     /// Node backed by a persistent data root, laid out exactly like Python
-    /// EpixNet: node-level files (users.json, sites.json, config, permissions)
+    /// EpixNet: node-level files (users.json, xites.json, config, permissions)
     /// live in `<root>/private/` and each xite's files in `<root>/data/<addr>/`.
     /// Upgrading from the Python client to this node therefore needs no
     /// migration - the identity, certs, and downloaded xites are read in place.
@@ -1563,6 +1563,28 @@ impl AppState {
         let _ = std::fs::create_dir_all(data_root.join("data"));
         let user_path = dir.join("users.json");
         let user = User::load_or_create(&user_path).unwrap_or_else(|_| User::generate());
+        // The xite registry is `xites.json`. A node written by an older build
+        // (or by Python EpixNet) has it under the legacy `sites.json`; copy it
+        // across once, so every read and write below names a single file
+        // instead of threading a fallback through each call site. The legacy
+        // file is left in place - it costs nothing and makes a downgrade a
+        // matter of deleting the new one.
+        let xites_path = dir.join("xites.json");
+        let legacy_xites_path = dir.join("sites.json");
+        if !xites_path.exists() && legacy_xites_path.exists() {
+            match std::fs::copy(&legacy_xites_path, &xites_path) {
+                Ok(_) => eprintln!(
+                    "[INFO] migrated {} to {}",
+                    legacy_xites_path.display(),
+                    xites_path.display()
+                ),
+                Err(e) => eprintln!(
+                    "[ERROR] could not migrate {} to {} ({e}); starting with no restored xites",
+                    legacy_xites_path.display(),
+                    xites_path.display()
+                ),
+            }
+        }
         let filters_path = dir.join("filters.json");
         let filters = std::fs::read(&filters_path)
             .ok()
@@ -1626,7 +1648,7 @@ impl AppState {
             config_path: Some(config_path),
             peers_path: Some(dir.join("peers.json")),
             pins_path: Some(dir.join("pins.json")),
-            xites_path: Some(dir.join("sites.json")),
+            xites_path: Some(xites_path),
             data_root: Some(data_root),
             #[cfg(feature = "multiuser")]
             multi_users,
@@ -2558,7 +2580,7 @@ impl AppState {
         // toggles, transfer totals), after which the persist_xites below wrote
         // that loss back to disk. Prefer the live in-memory settings (a re-add
         // of an already-served xite, where restore_xites has already reapplied
-        // sites.json); fall back to the sites.json entry on disk. Only a
+        // xites.json); fall back to the xites.json entry on disk. Only a
         // genuinely NEW xite inherits the node-wide defaults (Config page:
         // "Optional Files"); help-distribute implies downloading.
         let prev = {
@@ -2649,7 +2671,7 @@ impl AppState {
         // advertise held optional files immediately (getHashfield/findHashIds)
         // - and recompute the downloaded-bytes counter from the same walk, so
         // the sidebar's "Downloaded" figure heals itself instead of trusting
-        // a stale sites.json. (Piecewise-partial bigfiles re-count on their
+        // a stale xites.json. (Piecewise-partial bigfiles re-count on their
         // next fetch pass; whole files are the common case.)
         let (hashfield, optional_on_disk, optional_declared) = compute_optional_state(
             &entry.storage,
@@ -2801,13 +2823,13 @@ impl AppState {
 
     // --- SiteManager: persist the served-xite list across restarts ----------
 
-    /// Persist the served xites to `sites.json` (keyed by signed content
+    /// Persist the served xites to `xites.json` (keyed by signed content
     /// address; aliases collapse to one entry). The file is EpixNet's
     /// `SiteManager.save` schema - `{address: {…settings…}}` with the settings
     /// flat at the top level - so a Python node can read it and vice versa.
     /// The display alias (e.g. `dashboard.epix`) rides along as an extra
     /// `display` key inside the settings dict (Python preserves unknown keys).
-    /// The settings persisted in sites.json for a canonical address, if the
+    /// The settings persisted in xites.json for a canonical address, if the
     /// xite was served before. Consulted by [`Self::add_xite`] so a re-add
     /// (the launch xite every boot, a restore) keeps the user's saved state
     /// (ownership, toggles, counters) instead of resetting to the defaults.
@@ -2842,7 +2864,7 @@ impl AppState {
         }
     }
 
-    /// Restore xites recorded in `sites.json`: for each, point storage at
+    /// Restore xites recorded in `xites.json`: for each, point storage at
     /// `<root>/data/<canonical>`, load + verify the on-disk content.json, and add it
     /// (plus its display alias). Skips entries already served and any whose
     /// content.json is missing or fails verification. Returns how many were
@@ -3330,7 +3352,7 @@ impl AppState {
             // registered-but-empty entry (content: None) would make
             // canonical_address fall back to the QUERIED address and match
             // everything - restore_xites then silently skips every later
-            // xite and the exit persist erases it from sites.json.
+            // xite and the exit persist erases it from xites.json.
             xites.values().find(|x| {
                 x.content.is_some()
                     && canonical_address(x.content.as_ref(), address) == address
@@ -10336,7 +10358,7 @@ impl AppState {
             }
             x.content = signed;
         }
-        // `own` must reach sites.json NOW: the offline CLI sign exits without
+        // `own` must reach xites.json NOW: the offline CLI sign exits without
         // any later flush, and a xite left `own: false` is evictable cache to
         // enforce_optional_limit - the authored originals can be deleted.
         self.persist_xites().await;
@@ -13885,7 +13907,7 @@ impl AppState {
     /// A xite may be served under several keys (raw `epix1…` address plus a
     /// `.epix` alias) sharing one storage; all of them are removed, otherwise a
     /// surviving alias keeps syncing and the periodic `persist_xites` writes
-    /// the xite straight back into `sites.json`. Returns false if the xite
+    /// the xite straight back into `xites.json`. Returns false if the xite
     /// isn't served here.
     pub async fn remove_xite(&self, address: &str) -> bool {
         let mut roots = Vec::new();
@@ -18706,7 +18728,7 @@ mod tests {
         // A xite served under both its signed address and a `.epix` alias,
         // like the browser sets up. Deleting by the signed address (what the
         // dashboard sends) must remove both entries, the files, and the
-        // sites.json record - a surviving alias used to re-sync the xite and
+        // xites.json record - a surviving alias used to re-sync the xite and
         // write it back, so it came back after a restart.
         let root = tempdir().unwrap();
         let addr = "1DeleteMe";
@@ -18730,9 +18752,9 @@ mod tests {
         assert!(state.xite_list().await.is_empty());
         // Files gone.
         assert!(!xite_dir.exists());
-        // sites.json no longer records it, so a restart won't restore it.
+        // xites.json no longer records it, so a restart won't restore it.
         let xites: serde_json::Map<String, Value> =
-            std::fs::read(root.path().join("private/sites.json"))
+            std::fs::read(root.path().join("private/xites.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
@@ -18786,7 +18808,7 @@ mod tests {
         assert!(!root.path().join("resolve-cache.json").exists());
         // The cleared binding is persisted, so it stays gone after a restart.
         let xites: serde_json::Map<String, Value> =
-            std::fs::read(root.path().join("private/sites.json"))
+            std::fs::read(root.path().join("private/xites.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();

@@ -41,7 +41,7 @@ fn random_key() -> String {
 
 /// The persisted per-xite state, mirroring EpixNet's `Site.settings`. Every
 /// field Python doesn't write has a serde default, so an EpixNet-written
-/// `sites.json` entry deserializes as-is.
+/// `xites.json` entry deserializes as-is.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct XiteSettings {
     #[serde(default = "default_true")]

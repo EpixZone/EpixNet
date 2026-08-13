@@ -206,13 +206,13 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
 .sidebar .button.hidden { padding: 0px; max-width: 0px; opacity: 0; pointer-events: none; margin: 0px; border-width: 0px; }
 
 /* Primary actions */
-.sidebar #button-sitelimit, .sidebar #button-settings, .sidebar #button-sign-publish {
+.sidebar #button-xitelimit, .sidebar #button-settings, .sidebar #button-sign-publish {
     background-color: #8A4BDB; border-color: #8A4BDB; color: #FEFEFE;
 }
-.sidebar #button-sitelimit:hover, .sidebar #button-settings:hover, .sidebar #button-sign-publish:hover {
+.sidebar #button-xitelimit:hover, .sidebar #button-settings:hover, .sidebar #button-sign-publish:hover {
     background-color: #5954CD; border-color: #5954CD;
 }
-.sidebar #button-sitelimit { margin-left: 12px; }
+.sidebar #button-xitelimit { margin-left: 12px; }
 
 /* Delete stays danger */
 .sidebar #button-delete { background-color: transparent; border: 1px solid rgba(240, 34, 75, 0.5); color: #F0224B; margin-left: 4px; }

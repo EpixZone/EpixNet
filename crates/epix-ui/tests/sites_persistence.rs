@@ -34,7 +34,7 @@ async fn served_xites_survive_a_restart() {
             .await;
         assert!(state.has_any_alias(&address).await);
         // sites.json written where Python's SiteManager keeps it.
-        assert!(root.path().join("private/sites.json").exists());
+        assert!(root.path().join("private/xites.json").exists());
     }
 
     // Second run: a fresh node on the same data dir restores the xite with no
@@ -75,7 +75,7 @@ async fn xites_json_uses_the_epixnet_schema_and_restores_settings() {
     // The written schema is EpixNet's SiteManager.save: settings flat at the
     // top level of each entry (a Python node can read this file directly).
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("private/sites.json")).unwrap())
+        serde_json::from_slice(&std::fs::read(root.path().join("private/xites.json")).unwrap())
             .unwrap();
     let entry = saved.get(&address).expect("entry keyed by address");
     assert!(entry.get("serving").is_some(), "settings are flat, not nested: {entry}");
@@ -132,7 +132,7 @@ async fn re_adding_a_served_xite_keeps_its_settings() {
 
     // And the persist at the end of add_xite kept it on disk too.
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("private/sites.json")).unwrap())
+        serde_json::from_slice(&std::fs::read(root.path().join("private/xites.json")).unwrap())
             .unwrap();
     assert_eq!(saved[&address]["own"], json!(true));
 }
@@ -177,6 +177,85 @@ async fn restores_a_python_written_xites_json_entry() {
     assert_eq!(state.restore_xites().await, 1, "python-written entry restores");
     let info = state.xite_info(&address).await;
     assert_eq!(info.get("settings").and_then(|s| s.get("own")), Some(&json!(true)));
+
+    // That entry arrived under the legacy `sites.json` name, so starting on
+    // this data dir migrated it to `xites.json` - and left the original alone.
+    assert!(root.path().join("private/xites.json").exists(), "legacy registry migrated");
+    assert!(root.path().join("private/sites.json").exists(), "legacy registry left in place");
+}
+
+#[tokio::test]
+async fn the_registry_prefers_xites_json_over_a_stale_legacy_sites_json() {
+    // Both files present: the new name wins and the legacy one is NOT copied
+    // over it, so a downgrade-then-upgrade cannot resurrect stale state.
+    let root = tempfile::tempdir().unwrap();
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let (_content, bytes) = signed_content(&address, &privkey, 1000);
+    XiteStorage::new(&root.path().join("data").join(&address)).write("content.json", &bytes).unwrap();
+
+    std::fs::create_dir_all(root.path().join("private")).unwrap();
+    // Legacy says "not owned"; the current file says "owned".
+    std::fs::write(
+        root.path().join("private/sites.json"),
+        serde_json::to_vec(&json!({ &address: { "own": false, "serving": true } })).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("private/xites.json"),
+        serde_json::to_vec(&json!({ &address: { "own": true, "serving": true } })).unwrap(),
+    )
+    .unwrap();
+
+    let state = AppState::with_data_dir("run-1", root.path());
+    assert_eq!(state.restore_xites().await, 1);
+    let info = state.xite_info(&address).await;
+    assert_eq!(
+        info.get("settings").and_then(|s| s.get("own")),
+        Some(&json!(true)),
+        "xites.json wins over the legacy sites.json"
+    );
+}
+
+#[tokio::test]
+async fn users_json_reads_the_legacy_sites_key_and_writes_xites() {
+    // users.json moved its per-xite map from "sites" to "xites". An older file
+    // must still load (the identity and its certs are not reproducible), and
+    // the next save must write it under the new name.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("private")).unwrap();
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let seed = epix_crypt::new_seed();
+    let master_address = epix_crypt::privatekey_to_address(&seed).unwrap();
+
+    std::fs::write(
+        root.path().join("private/users.json"),
+        serde_json::to_vec_pretty(&json!({
+            &master_address: {
+                "master_seed": seed,
+                "sites": { &address: { "auth_address": "epix1auth", "auth_privatekey": "k" } },
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let state = AppState::with_data_dir("run-1", root.path());
+    // The legacy key loaded: the saved per-xite auth survived. (Had it not,
+    // this would mint a fresh auth address from the master seed instead.)
+    assert_eq!(state.user_auth_address(&address).await.unwrap(), "epix1auth");
+
+    // Any save rewrites the file under the new key.
+    state.save_user().await;
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("private/users.json")).unwrap())
+            .unwrap();
+    // users.json entries nest under the master address.
+    let entry = &saved[&master_address];
+    assert!(entry.get("xites").is_some(), "written under the new name: {entry}");
+    assert!(entry.get("sites").is_none(), "legacy key not written back");
+    assert_eq!(entry["xites"][&address]["auth_address"], json!("epix1auth"));
 }
 
 #[tokio::test]

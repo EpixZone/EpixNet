@@ -331,8 +331,8 @@ fn render_sidebar(
     let percent_used = pct(size_mb, size_limit as f64);
     b.push_str(&format!(
         "<li><label>Size limit <small>(limit used: {percent_used})</small></label>\
-         <input type='text' class='text text-num' value='{size_limit}' id='input-sitelimit'/><span class='text-post'>MB</span>\
-         <a href='#Set' class='button' id='button-sitelimit'>Set</a></li>",
+         <input type='text' class='text text-num' value='{size_limit}' id='input-xitelimit'/><span class='text-post'>MB</span>\
+         <a href='#Set' class='button' id='button-xitelimit'>Set</a></li>",
     ));
 
     // Optional files (only when the xite declares any).
