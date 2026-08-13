@@ -18,7 +18,7 @@ arti-client = { version = "0.45", default-features = false, features = [
 ] }
 tor-hsservice = "0.45"
 safelog = "0.9"
-tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "0.45", features = ["tokio", "rustls"] }
 tor-cell = "0.45"
 tor-proto = "0.45"
 # rustls 0.23 won't auto-pick a crypto provider when several are in the tree;
