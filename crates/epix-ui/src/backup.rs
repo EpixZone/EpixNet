@@ -37,13 +37,29 @@ const BACKUPS_DIR: &str = "backups";
 const PENDING_DIR: &str = "restore-pending";
 
 /// The component keys, in display order.
-const COMPONENTS: &[&str] = &["keys", "config", "zites"];
+const COMPONENTS: &[&str] = &["keys", "config", "zites", "transport"];
+
+/// The onion service's permanent identity key in the Arti keystore (the
+/// `.onion` address derives from it). "epix" is the nickname the runtime
+/// launches the service under (`launch_onion_service("epix", ...)`). The
+/// sibling `ks_hs_blind_id`/`ks_hs_desc_sign` files are time-bound keys
+/// derived from this one - they regenerate, so they are NOT backed up, and
+/// neither is any other Tor state (guards, circuits: transient, and wrong to
+/// move between machines).
+const ONION_KEY_REL: &str = "tor/state/keystore/hss/epix/ks_hs_id.ed25519_expanded_private";
+
+/// The I2P destination keypair (the `.b32.i2p` address derives from it). The
+/// embedded router's own transport keys (`ntcp2.keys`, `ssu2.keys`,
+/// `static.key`, `signing.key`) are a router identity, not the hosting
+/// address, and must stay per-machine.
+const I2P_KEY_REL: &str = "i2p/destination.key";
 
 fn component_label(key: &str) -> &'static str {
     match key {
         "keys" => "Keys & identity",
         "config" => "Node settings",
         "zites" => "Zites & xite data",
+        "transport" => "Onion & I2P address keys",
         _ => "Unknown",
     }
 }
@@ -53,6 +69,9 @@ fn component_description(key: &str) -> &'static str {
         "keys" => "Your master seed and per-xite private keys (private/users.json). This is what recovers your identity.",
         "config" => "The node configuration (private/config.json).",
         "zites" => "All zite content and the served-xites list, so this node serves the same xites again.",
+        "transport" => "The Tor onion-service and I2P destination private keys. Restoring them on \
+                        another computer keeps your .onion and .b32.i2p addresses, so the node \
+                        continues hosting under the same addresses after a move.",
         _ => "",
     }
 }
@@ -169,6 +188,10 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
                 collect_files(&data_root.join("data").join(&addr), &format!("data/{addr}"), &mut out);
             }
         }
+        "transport" => {
+            push_if_exists(ONION_KEY_REL);
+            push_if_exists(I2P_KEY_REL);
+        }
         _ => {}
     }
     out
@@ -284,6 +307,12 @@ pub fn create_backup(
             continue;
         }
         let files = component_files(data_root, comp);
+        // A node without Tor/I2P has no address keys: skip the component
+        // rather than record an empty entry, whose restore checkbox (and
+        // duplicate-hosting warning) would promise keys the archive lacks.
+        if *comp == "transport" && files.is_empty() {
+            continue;
+        }
         let entry = ComponentEntry {
             files: files
                 .iter()
@@ -649,6 +678,8 @@ pub fn apply_pending_restore(data_root: &Path) {
     for rel in &plan.files {
         if !place_restored_file(&pending, data_root, rel) {
             errors += 1;
+        } else if rel.starts_with("tor/") || rel.starts_with("i2p/") {
+            tighten_key_permissions(data_root, rel);
         }
     }
     errors += normalize_legacy_registry(data_root, &plan);
@@ -666,6 +697,30 @@ pub fn apply_pending_restore(data_root: &Path) {
             plan.source
         );
     }
+}
+
+/// Owner-only permissions for a restored key file and the directories above
+/// it. Zip extraction leaves umask permissions (0644 files, 0755 dirs), but
+/// the Arti keystore is owner-only on disk and Arti's fs-mistrust check
+/// refuses key material other users could touch; the I2P keys get the same
+/// treatment. No-op outside Unix.
+fn tighten_key_permissions(data_root: &Path, rel: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |path: &Path, mode: u32| {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+        };
+        set(&join_rel(data_root, rel), 0o600);
+        // Every directory strictly between the data root and the file
+        // (tor/, tor/state/, ... - the data root itself stays as-is).
+        let mut dir = join_rel(data_root, rel);
+        while dir.pop() && dir != data_root {
+            set(&dir, 0o700);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (data_root, rel);
 }
 
 /// Move one staged file into its final place. Returns false on failure.
@@ -1264,7 +1319,7 @@ fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
          <div class='config'>\
            <div class='plugin'>\
              <div class='title'><h3>Everything</h3>\
-               <div class='description'>Keys, node settings, and all zites in one archive.</div></div>\
+               <div class='description'>Keys, node settings, zites, and your onion &amp; I2P addresses in one archive.</div></div>\
              <label class='value value-right checkbox'>\
                <input type='checkbox' id='comp-all' checked/>\
                <div class='checkbox-skin'></div></label>\
@@ -1446,6 +1501,19 @@ fn render_restore_page(
         ));
     }
     body.push_str("</div>");
+    // Restoring address keys onto a second machine while the first still runs
+    // means two nodes publishing the same .onion / .b32.i2p address - their
+    // descriptors overwrite each other and the address flaps or goes dark.
+    if manifest.components.get("transport").is_some_and(|e| !e.files.is_empty()) {
+        body.push_str(
+            "<div class='warn-box'><b>This backup contains your onion &amp; I2P address \
+             keys.</b> Before restarting with them restored, make sure the node they came \
+             from is offline. Two nodes announcing the same .onion or .b32.i2p address \
+             fight over it: peers reach one or the other unpredictably, and the address \
+             can effectively go dark until one of the nodes stops. Move the address, \
+             don't share it.</div>",
+        );
+    }
     if manifest.encrypted {
         body.push_str(
             "<div class='config-item'>\
@@ -1709,6 +1777,90 @@ mod tests {
         // Staging dir cleaned up.
         assert!(!root.join(PENDING_DIR).exists());
         assert!(restore_pending(root).is_none());
+    }
+
+    /// Write address keys into a scratch profile (Arti keystore layout + I2P
+    /// destination), returning their absolute paths.
+    fn write_address_keys(root: &Path) -> (PathBuf, PathBuf) {
+        // scratch_root plants `tor/state` as a file (its "never in a backup"
+        // fixture); the real layout has it as the Arti state DIRECTORY.
+        let _ = std::fs::remove_file(root.join("tor/state"));
+        let onion = join_rel(root, ONION_KEY_REL);
+        std::fs::create_dir_all(onion.parent().unwrap()).unwrap();
+        std::fs::write(&onion, b"onion-identity").unwrap();
+        let i2p = join_rel(root, I2P_KEY_REL);
+        std::fs::create_dir_all(i2p.parent().unwrap()).unwrap();
+        std::fs::write(&i2p, b"dest\nprivkey").unwrap();
+        (onion, i2p)
+    }
+
+    #[test]
+    fn transport_component_backs_up_and_restores_the_address_keys() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let (onion, i2p) = write_address_keys(root);
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let path = root.join("backups").join(&name);
+
+        // The move-to-a-new-server case: the keys are different (fresh install
+        // minted its own) and must come back as the backup's.
+        std::fs::write(&onion, b"fresh-machine-key").unwrap();
+        std::fs::remove_file(&i2p).unwrap();
+
+        stage_restore(root, &path, &all_components(), None, "0.9").unwrap();
+        apply_pending_restore(root);
+
+        assert_eq!(std::fs::read(&onion).unwrap(), b"onion-identity");
+        assert_eq!(std::fs::read(&i2p).unwrap(), b"dest\nprivkey");
+        // Restored key material is owner-only again (Arti's fs-mistrust
+        // refuses key files other users could touch); so is the dir chain.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&onion), 0o600);
+            assert_eq!(mode(&i2p), 0o600);
+            assert_eq!(mode(onion.parent().unwrap()), 0o700);
+            assert_eq!(mode(&root.join("tor")), 0o700);
+        }
+    }
+
+    #[test]
+    fn transport_component_is_skipped_when_the_node_has_no_address_keys() {
+        // Tor/I2P disabled: an "Everything" backup must not record an empty
+        // transport entry (its restore checkbox and duplicate-hosting warning
+        // would promise keys the archive does not hold).
+        let dir = scratch_root();
+        let root = dir.path();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let manifest = read_manifest(&root.join("backups").join(&name)).unwrap();
+        assert!(!manifest.components.contains_key("transport"));
+        assert!(manifest.components.contains_key("keys"));
+    }
+
+    #[test]
+    fn restore_page_warns_about_duplicate_address_hosting() {
+        let dir = scratch_root();
+        let root = dir.path();
+        write_address_keys(root);
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let manifest = read_manifest(&root.join("backups").join(&name)).unwrap();
+        let page = render_restore_page(&name, &manifest, None, "", "dark");
+        assert!(page.contains("Onion &amp; I2P address keys"), "component row present");
+        assert!(
+            page.contains("make sure the node they came from is offline"),
+            "duplicate-hosting warning shown"
+        );
+
+        // Without the keys the backup has no transport entry - no checkbox,
+        // no warning.
+        let dir2 = scratch_root();
+        let root2 = dir2.path();
+        let name2 = create_backup(root2, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let manifest2 = read_manifest(&root2.join("backups").join(&name2)).unwrap();
+        let page2 = render_restore_page(&name2, &manifest2, None, "", "dark");
+        assert!(!page2.contains("Onion &amp; I2P address keys"));
+        assert!(!page2.contains("make sure the node they came from is offline"));
     }
 
     #[test]
