@@ -649,6 +649,27 @@ mod prod_vectors {
         assert_eq!(v["b"].as_str(), Some("body-one"));
     }
 
+    /// C4: the `MAX_SKIP` fail-closed boundary on the header-key (tag) chain.
+    /// A gap of exactly `MAX_SKIP` still opens; one more is refused (`None`), so
+    /// `open()` fails closed rather than skipping unboundedly. (Not reachable via
+    /// the public API, which is gated by the 32-tag publish window, so it's
+    /// exercised directly here.)
+    #[test]
+    fn header_key_for_max_skip_boundary() {
+        let (alice_seed, _eph, bundle, conv) = kat_setup();
+        let (session_bytes, _recv) = begin(&alice_seed, &bundle, conv).unwrap();
+        let s = from_bytes(&session_bytes).unwrap();
+        let base = s.i_recv; // 0 on a fresh session
+        assert!(base == 0);
+
+        // Gap == MAX_SKIP: allowed.
+        let mut s_ok = s.clone();
+        assert!(header_key_for(&mut s_ok, base + MAX_SKIP).is_some(), "gap == MAX_SKIP opens");
+        // Gap == MAX_SKIP + 1: refused, fail-closed.
+        let mut s_bad = s.clone();
+        assert!(header_key_for(&mut s_bad, base + MAX_SKIP + 1).is_none(), "gap > MAX_SKIP refused");
+    }
+
     #[test]
     #[ignore]
     fn record_kat_print() {
