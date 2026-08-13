@@ -663,6 +663,26 @@ pub fn apply_pending_restore(data_root: &Path) {
             }
         }
     }
+    // A backup made before the registry rename holds `private/sites.json` and
+    // no `private/xites.json`. Normalize at restore time: copy the restored
+    // legacy file over xites.json so it is authoritative on the next boot.
+    // Without this, a node that already had an xites.json would keep its OWN
+    // xite list (the startup migration only runs when xites.json is absent)
+    // while the xite data trees were just replaced from the backup. When the
+    // archive carried both names, the restored xites.json already won.
+    let legacy = "private/sites.json";
+    if plan.files.iter().any(|f| f == legacy) && !plan.files.iter().any(|f| f == "private/xites.json")
+    {
+        let from = join_rel(data_root, legacy);
+        let to = data_root.join("private").join("xites.json");
+        match std::fs::copy(&from, &to) {
+            Ok(_) => eprintln!("[INFO] Restored legacy {legacy} as private/xites.json"),
+            Err(e) => {
+                errors += 1;
+                eprintln!("[ERROR] Could not place restored {legacy} as private/xites.json: {e}");
+            }
+        }
+    }
     let _ = std::fs::remove_dir_all(&pending);
     if errors == 0 {
         eprintln!(
@@ -1674,6 +1694,66 @@ mod tests {
         // Staging dir cleaned up.
         assert!(!root.join(PENDING_DIR).exists());
         assert!(restore_pending(root).is_none());
+    }
+
+    #[test]
+    fn restoring_a_legacy_backup_normalizes_the_registry_to_xites_json() {
+        // A backup from before the registry rename holds private/sites.json
+        // and no xites.json. Restoring it onto a node that ALREADY has an
+        // xites.json must make the backup's registry authoritative - the
+        // startup migration alone would skip it (xites.json exists) and the
+        // node would keep its own xite list over freshly restored xite data.
+        let dir = scratch_root();
+        let root = dir.path();
+        std::fs::write(root.join("private/sites.json"), b"{\"backup\":\"registry\"}").unwrap();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let path = root.join("backups").join(&name);
+
+        // The node has since migrated and diverged: xites.json is the live
+        // registry, and the legacy file was left behind at its old content.
+        std::fs::write(root.join("private/xites.json"), b"{\"current\":\"registry\"}").unwrap();
+        std::fs::write(root.join("private/sites.json"), b"{\"stale\":\"legacy\"}").unwrap();
+
+        stage_restore(root, &path, &all_components(), None, "0.9").unwrap();
+        apply_pending_restore(root);
+
+        // The restored legacy registry landed under BOTH names: its own, and
+        // normalized over xites.json so the next boot serves the backup's
+        // xite list.
+        assert_eq!(
+            std::fs::read(root.join("private/xites.json")).unwrap(),
+            b"{\"backup\":\"registry\"}",
+            "restored legacy registry is authoritative"
+        );
+        assert_eq!(
+            std::fs::read(root.join("private/sites.json")).unwrap(),
+            b"{\"backup\":\"registry\"}"
+        );
+    }
+
+    #[test]
+    fn restoring_a_new_format_backup_does_not_clobber_xites_json_with_legacy() {
+        // A backup taken by the current build archives both names. The
+        // restored xites.json must win; the legacy copy restores beside it
+        // without being normalized over it.
+        let dir = scratch_root();
+        let root = dir.path();
+        std::fs::write(root.join("private/xites.json"), b"{\"new\":\"registry\"}").unwrap();
+        std::fs::write(root.join("private/sites.json"), b"{\"old\":\"registry\"}").unwrap();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let path = root.join("backups").join(&name);
+
+        std::fs::write(root.join("private/xites.json"), b"{\"changed\":1}").unwrap();
+
+        stage_restore(root, &path, &all_components(), None, "0.9").unwrap();
+        apply_pending_restore(root);
+
+        assert_eq!(
+            std::fs::read(root.join("private/xites.json")).unwrap(),
+            b"{\"new\":\"registry\"}",
+            "the archived xites.json wins over the archived legacy file"
+        );
+        assert_eq!(std::fs::read(root.join("private/sites.json")).unwrap(), b"{\"old\":\"registry\"}");
     }
 
     #[test]
