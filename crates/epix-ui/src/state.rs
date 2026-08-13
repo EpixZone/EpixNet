@@ -2881,109 +2881,116 @@ impl AppState {
             if self.has_any_alias(&canonical).await {
                 continue;
             }
-            let dir = root.join(&canonical);
-            let storage = XiteStorage::new(&dir);
-            // Load the on-disk content.json under the canonical address. Prefer
-            // the verified copy; if it doesn't verify but parses, serve it as a
-            // local copy anyway (the same fallback boot() uses for the launch
-            // xite) - it's already-downloaded content in the operator's own data
-            // dir. Dropping it here used to make a registered xite vanish on
-            // restart, and under NoNewSites the wrapper then 403s before the
-            // on-demand heal can run. Only skip when there's no content.json at
-            // all (a bare registration whose clone never landed).
-            let Ok(addr) = Address::parse(canonical.clone()) else { continue };
-            let mut xite = Xite::new(addr, storage.clone());
-            let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
-            if !loaded {
-                // No content.json on disk yet: a requested xite whose clone
-                // never landed (seeder offline at siteAdd time). Restore it
-                // REGISTERED-BUT-EMPTY - the background retry loop keeps
-                // resuming its clone until the seeder returns - instead of
-                // silently forgetting the user's request on restart.
-                self.log(
-                    "INFO",
-                    format!("{canonical}: no content yet; keeping it registered, download resumes in background"),
-                )
-                .await;
-                self.add_xite(&canonical, XiteEntry { storage: storage.clone(), content: None })
-                    .await;
+            if self.restore_one_xite(&root, &canonical, &entry).await {
                 restored += 1;
-                continue;
             }
-            // Legacy persisted-ahead state: older builds wrote content.json to
-            // disk before its files, so a crash or failed sync could leave a
-            // stored content.json whose files are missing. New code commits
-            // content.json only after its files (staged adopt), so this only
-            // flags dirs written by older builds; the resync loop heals them.
-            let missing = xite.files_needed().len();
-            if missing > 0 {
-                self.log(
-                    "INFO",
-                    format!(
-                        "{canonical}: stored content.json declares {missing} file(s) not on disk; resync will fetch them"
-                    ),
-                )
-                .await;
-            }
-            let content = xite.content.clone();
-            // Settings live flat in the entry (EpixNet schema); accept the old
-            // nested `{"settings": {…}}` form too.
-            let settings_src = entry.get("settings").cloned().unwrap_or_else(|| entry.clone());
-            let saved: Option<XiteSettings> = serde_json::from_value(settings_src).ok();
-            self.add_xite(&canonical, XiteEntry { storage: storage.clone(), content: content.clone() })
-                .await;
-            // Reapply the persisted user-facing settings (ownership, serving,
-            // size limit, favourite, added time) that add_xite can't derive
-            // from content.json.
-            if let Some(saved) = saved {
-                let mut xites = self.xites.write().await;
-                if let Some(x) = xites.get_mut(&canonical) {
-                    x.settings.own = saved.own;
-                    x.settings.serving = saved.serving;
-                    x.settings.size_limit = saved.size_limit;
-                    x.settings.autodownloadoptional = saved.autodownloadoptional;
-                    x.settings.download_optional = saved.download_optional;
-                    x.settings.optional_help = saved.optional_help;
-                    x.settings.modified_files_notification = saved.modified_files_notification;
-                    x.settings.favorite = saved.favorite;
-                    // Lifetime transfer totals (the ratio badge) carry across
-                    // restarts.
-                    x.settings.bytes_sent = saved.bytes_sent;
-                    x.settings.bytes_recv = saved.bytes_recv;
-                    if saved.added > 0 {
-                        x.settings.added = saved.added;
-                    }
-                    // add_xite derived modified from the ROOT content.json;
-                    // the saved value also folds in per-user content seen
-                    // last run (user posts), so keep whichever is newest.
-                    x.settings.modified = x.settings.modified.max(saved.modified);
-                }
-            }
-            // Per-user content already on disk counts too (xites synced before
-            // settings.modified folded it in would show the root's old date
-            // until the next post arrives): take the newest content.json
-            // anywhere in the tree, once, at restore. New arrivals keep it
-            // fresh incrementally from here.
-            let newest = walk_content_json(&dir)
-                .into_iter()
-                .filter_map(|p| std::fs::read(dir.join(&p)).ok())
-                .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
-                .filter_map(|c| c.get("modified").and_then(|v| v.as_f64()))
-                .fold(0.0_f64, f64::max);
-            self.bump_modified(&canonical, newest).await;
-            // The `.epix` name is display metadata, not a second serving key.
-            if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
-                if display != canonical {
-                    self.set_display(&canonical, display).await;
-                    // Older builds keyed the per-xite user identity (certs,
-                    // xite keys) by the name; move it to the address so the
-                    // identity survives the switch to address-only keys.
-                    self.migrate_user_xite_key(display, &canonical).await;
-                }
-            }
-            restored += 1;
         }
         restored
+    }
+
+    /// Restore a single `xites.json` entry (see [`Self::restore_xites`]).
+    /// Returns whether the xite was registered.
+    async fn restore_one_xite(&self, root: &Path, canonical: &str, entry: &Value) -> bool {
+        let dir = root.join(canonical);
+        let storage = XiteStorage::new(&dir);
+        // Load the on-disk content.json under the canonical address. Prefer
+        // the verified copy; if it doesn't verify but parses, serve it as a
+        // local copy anyway (the same fallback boot() uses for the launch
+        // xite) - it's already-downloaded content in the operator's own data
+        // dir. Dropping it here used to make a registered xite vanish on
+        // restart, and under NoNewSites the wrapper then 403s before the
+        // on-demand heal can run. Only skip when there's no content.json at
+        // all (a bare registration whose clone never landed).
+        let Ok(addr) = Address::parse(canonical.to_string()) else { return false };
+        let mut xite = Xite::new(addr, storage.clone());
+        let loaded = xite.load_content().unwrap_or(false) || xite.load_content_local();
+        if !loaded {
+            // No content.json on disk yet: a requested xite whose clone
+            // never landed (seeder offline at siteAdd time). Restore it
+            // REGISTERED-BUT-EMPTY - the background retry loop keeps
+            // resuming its clone until the seeder returns - instead of
+            // silently forgetting the user's request on restart.
+            self.log(
+                "INFO",
+                format!("{canonical}: no content yet; keeping it registered, download resumes in background"),
+            )
+            .await;
+            self.add_xite(canonical, XiteEntry { storage, content: None }).await;
+            return true;
+        }
+        // Legacy persisted-ahead state: older builds wrote content.json to
+        // disk before its files, so a crash or failed sync could leave a
+        // stored content.json whose files are missing. New code commits
+        // content.json only after its files (staged adopt), so this only
+        // flags dirs written by older builds; the resync loop heals them.
+        let missing = xite.files_needed().len();
+        if missing > 0 {
+            self.log(
+                "INFO",
+                format!(
+                    "{canonical}: stored content.json declares {missing} file(s) not on disk; resync will fetch them"
+                ),
+            )
+            .await;
+        }
+        let content = xite.content.clone();
+        // Settings live flat in the entry (EpixNet schema); accept the old
+        // nested `{"settings": {…}}` form too.
+        let settings_src = entry.get("settings").cloned().unwrap_or_else(|| entry.clone());
+        let saved: Option<XiteSettings> = serde_json::from_value(settings_src).ok();
+        self.add_xite(canonical, XiteEntry { storage, content }).await;
+        if let Some(saved) = saved {
+            self.reapply_saved_settings(canonical, saved).await;
+        }
+        // Per-user content already on disk counts too (xites synced before
+        // settings.modified folded it in would show the root's old date
+        // until the next post arrives): take the newest content.json
+        // anywhere in the tree, once, at restore. New arrivals keep it
+        // fresh incrementally from here.
+        let newest = walk_content_json(&dir)
+            .into_iter()
+            .filter_map(|p| std::fs::read(dir.join(&p)).ok())
+            .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
+            .filter_map(|c| c.get("modified").and_then(|v| v.as_f64()))
+            .fold(0.0_f64, f64::max);
+        self.bump_modified(canonical, newest).await;
+        // The `.epix` name is display metadata, not a second serving key.
+        if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
+            if display != canonical {
+                self.set_display(canonical, display).await;
+                // Older builds keyed the per-xite user identity (certs,
+                // xite keys) by the name; move it to the address so the
+                // identity survives the switch to address-only keys.
+                self.migrate_user_xite_key(display, canonical).await;
+            }
+        }
+        true
+    }
+
+    /// Reapply the persisted user-facing settings (ownership, serving, size
+    /// limit, favourite, added time) that add_xite can't derive from
+    /// content.json.
+    async fn reapply_saved_settings(&self, canonical: &str, saved: XiteSettings) {
+        let mut xites = self.xites.write().await;
+        let Some(x) = xites.get_mut(canonical) else { return };
+        x.settings.own = saved.own;
+        x.settings.serving = saved.serving;
+        x.settings.size_limit = saved.size_limit;
+        x.settings.autodownloadoptional = saved.autodownloadoptional;
+        x.settings.download_optional = saved.download_optional;
+        x.settings.optional_help = saved.optional_help;
+        x.settings.modified_files_notification = saved.modified_files_notification;
+        x.settings.favorite = saved.favorite;
+        // Lifetime transfer totals (the ratio badge) carry across restarts.
+        x.settings.bytes_sent = saved.bytes_sent;
+        x.settings.bytes_recv = saved.bytes_recv;
+        if saved.added > 0 {
+            x.settings.added = saved.added;
+        }
+        // add_xite derived modified from the ROOT content.json; the saved
+        // value also folds in per-user content seen last run (user posts),
+        // so keep whichever is newest.
+        x.settings.modified = x.settings.modified.max(saved.modified);
     }
 
     /// Whether `addr` is one of this node's OWN addresses (external ip:port,
@@ -6192,32 +6199,13 @@ impl AppState {
         };
         let existing_name = existing_cert.as_ref().map(|c| c.auth_user_name.clone());
 
-        // Discover linked xID names across the user's addresses. The xite's
-        // own auth address first, then each standalone identity - stopping at
-        // the first UNLINKED identity, which becomes the "New" candidate.
-        let mut discovered: Vec<(String, String)> = Vec::new(); // (name, address)
-        let mut new_addr: Option<String> = None;
         self.push_inject_script(xite_address, "$('#button-identity').text('Checking...')");
-        if let Some(info) = epix_chain::xid_identity::resolve_identity(&auth_address).await {
-            if existing_name.as_deref() != Some(info.name.as_str()) {
-                discovered.push((info.name.clone(), auth_address.clone()));
-            }
-        }
-        for addr in &identity_addresses {
-            if *addr == auth_address {
-                continue;
-            }
-            match epix_chain::xid_identity::resolve_identity(addr).await {
-                Some(info) if existing_name.as_deref() != Some(info.name.as_str()) => {
-                    discovered.push((info.name.clone(), addr.clone()));
-                }
-                Some(_) => {}
-                None => {
-                    new_addr = Some(addr.clone());
-                    break;
-                }
-            }
-        }
+        let (discovered, new_addr) = Self::discover_xid_names(
+            &auth_address,
+            &identity_addresses,
+            existing_name.as_deref(),
+        )
+        .await;
         self.push_inject_script(xite_address, "$('#button-identity').text('Change')");
 
         // No spare unlinked identity: mint one so "New" always has an address.
@@ -6230,7 +6218,57 @@ impl AppState {
             }
         };
 
-        // Build the picker (EpixNet's dialog markup + classes/titles).
+        let body = Self::xid_picker_body(
+            xite_address,
+            existing_name.as_deref(),
+            is_xid_active,
+            &discovered,
+            &new_addr,
+        );
+
+        // Ask, then act on the clicked option's title.
+        let choice = self.notification_ask(xite_address, &body).await;
+        self.apply_xid_choice(xite_address, choice.as_deref()).await
+    }
+
+    /// Discover linked xID names across the user's addresses. The xite's own
+    /// auth address first, then each standalone identity - stopping at the
+    /// first UNLINKED identity, which becomes the "New" candidate. Returns
+    /// `(discovered (name, address) pairs, unlinked address if any)`.
+    async fn discover_xid_names(
+        auth_address: &str,
+        identity_addresses: &[String],
+        existing_name: Option<&str>,
+    ) -> (Vec<(String, String)>, Option<String>) {
+        let mut discovered: Vec<(String, String)> = Vec::new();
+        if let Some(info) = epix_chain::xid_identity::resolve_identity(auth_address).await {
+            if existing_name != Some(info.name.as_str()) {
+                discovered.push((info.name.clone(), auth_address.to_string()));
+            }
+        }
+        for addr in identity_addresses {
+            if addr == auth_address {
+                continue;
+            }
+            match epix_chain::xid_identity::resolve_identity(addr).await {
+                Some(info) if existing_name != Some(info.name.as_str()) => {
+                    discovered.push((info.name.clone(), addr.clone()));
+                }
+                Some(_) => {}
+                None => return (discovered, Some(addr.clone())),
+            }
+        }
+        (discovered, None)
+    }
+
+    /// The account-picker dialog markup (EpixNet's classes/titles).
+    fn xid_picker_body(
+        xite_address: &str,
+        existing_name: Option<&str>,
+        is_xid_active: bool,
+        discovered: &[(String, String)],
+        new_addr: &str,
+    ) -> String {
         let mut body = String::from(
             "<span style='padding-bottom: 5px; display: inline-block'>\
              Select the xID account you want to use on this site:</span>",
@@ -6241,18 +6279,16 @@ impl AppState {
             "<a href='#Select+account' class='select select-close cert{none_active}' title=''>\
              <b>None</b>{none_current}</a>"
         ));
-        if let Some(name) = &existing_name {
-            if !name.is_empty() {
-                let cur = if is_xid_active { " <small>(currently selected)</small>" } else { "" };
-                let act = if is_xid_active { " active" } else { "" };
-                body.push_str(&format!(
-                    "<a href='#Select+account' class='select select-close cert{act}' title='xid.epix'>\
-                     <b>{}@xid.epix</b>{cur}</a>",
-                    html_escape(name)
-                ));
-            }
+        if let Some(name) = existing_name.filter(|n| !n.is_empty()) {
+            let cur = if is_xid_active { " <small>(currently selected)</small>" } else { "" };
+            let act = if is_xid_active { " active" } else { "" };
+            body.push_str(&format!(
+                "<a href='#Select+account' class='select select-close cert{act}' title='xid.epix'>\
+                 <b>{}@xid.epix</b>{cur}</a>",
+                html_escape(name)
+            ));
         }
-        for (name, addr) in &discovered {
+        for (name, addr) in discovered {
             body.push_str(&format!(
                 "<a href='#Select+account' class='select select-close cert' title='acquire:{}:{}'>\
                  <b>{}.epix</b> <small>(acquire certificate)</small></a>",
@@ -6262,32 +6298,31 @@ impl AppState {
         let short = if new_addr.len() > 14 {
             format!("{}...{}", &new_addr[..10], &new_addr[new_addr.len() - 4..])
         } else {
-            new_addr.clone()
+            new_addr.to_string()
         };
-        let new_link = format!(
-            "/{}/?linkIdentity={}&returnTo=/{}",
-            Self::XID_XITE, new_addr, xite_address
-        );
+        let new_link =
+            format!("/{}/?linkIdentity={}&returnTo=/{}", Self::XID_XITE, new_addr, xite_address);
         body.push_str(&format!(
             "<a href='{new_link}' target='_top' class='select'>\
              <b>New</b> {short} <small>Register &raquo;</small></a>"
         ));
+        body
+    }
 
-        // Ask, then act on the clicked option's title.
-        let choice = self.notification_ask(xite_address, &body).await;
-        match choice.as_deref() {
+    /// Act on the picker option the user clicked (its `title` attribute).
+    async fn apply_xid_choice(
+        &self,
+        xite_address: &str,
+        choice: Option<&str>,
+    ) -> Result<Value, String> {
+        match choice {
             // "New" is a plain navigation link (no `.cert` class), so it never
             // resolves the callback - the wrapper just follows the href.
             None => Ok(Value::from("Not changed")),
-            Some("") => {
-                // None: drop the global xID cert.
-                self.user.write().await.set_cert_global(None);
-                self.save_user().await;
-                self.push_cert_changed(xite_address).await;
-                Ok(Value::from("ok"))
-            }
-            Some("xid.epix") => {
-                self.user.write().await.set_cert_global(Some("xid.epix"));
+            // "" = None option: drop the global xID cert.
+            Some("") | Some("xid.epix") => {
+                let selected = choice.filter(|c| !c.is_empty());
+                self.user.write().await.set_cert_global(selected);
                 self.save_user().await;
                 self.push_cert_changed(xite_address).await;
                 Ok(Value::from("ok"))

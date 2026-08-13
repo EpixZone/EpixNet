@@ -647,42 +647,11 @@ pub fn apply_pending_restore(data_root: &Path) {
     }
     let mut errors = 0;
     for rel in &plan.files {
-        let from = join_rel(&pending, rel);
-        let to = join_rel(data_root, rel);
-        if let Some(parent) = to.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Windows can't rename over an existing file.
-        let _ = std::fs::remove_file(&to);
-        if std::fs::rename(&from, &to).is_err() {
-            // Cross-device staging (unusual, but possible with a symlinked
-            // data dir): fall back to copy.
-            if std::fs::copy(&from, &to).is_err() {
-                errors += 1;
-                eprintln!("[ERROR] Restore could not place {}", to.display());
-            }
+        if !place_restored_file(&pending, data_root, rel) {
+            errors += 1;
         }
     }
-    // A backup made before the registry rename holds `private/sites.json` and
-    // no `private/xites.json`. Normalize at restore time: copy the restored
-    // legacy file over xites.json so it is authoritative on the next boot.
-    // Without this, a node that already had an xites.json would keep its OWN
-    // xite list (the startup migration only runs when xites.json is absent)
-    // while the xite data trees were just replaced from the backup. When the
-    // archive carried both names, the restored xites.json already won.
-    let legacy = "private/sites.json";
-    if plan.files.iter().any(|f| f == legacy) && !plan.files.iter().any(|f| f == "private/xites.json")
-    {
-        let from = join_rel(data_root, legacy);
-        let to = data_root.join("private").join("xites.json");
-        match std::fs::copy(&from, &to) {
-            Ok(_) => eprintln!("[INFO] Restored legacy {legacy} as private/xites.json"),
-            Err(e) => {
-                errors += 1;
-                eprintln!("[ERROR] Could not place restored {legacy} as private/xites.json: {e}");
-            }
-        }
-    }
+    errors += normalize_legacy_registry(data_root, &plan);
     let _ = std::fs::remove_dir_all(&pending);
     if errors == 0 {
         eprintln!(
@@ -696,6 +665,52 @@ pub fn apply_pending_restore(data_root: &Path) {
             "[ERROR] Restore from {} finished with {errors} error(s); check the data dir",
             plan.source
         );
+    }
+}
+
+/// Move one staged file into its final place. Returns false on failure.
+fn place_restored_file(pending: &Path, data_root: &Path, rel: &str) -> bool {
+    let from = join_rel(pending, rel);
+    let to = join_rel(data_root, rel);
+    if let Some(parent) = to.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Windows can't rename over an existing file.
+    let _ = std::fs::remove_file(&to);
+    // Cross-device staging (unusual, but possible with a symlinked data dir)
+    // makes the rename fail: fall back to copy.
+    if std::fs::rename(&from, &to).is_ok() || std::fs::copy(&from, &to).is_ok() {
+        return true;
+    }
+    eprintln!("[ERROR] Restore could not place {}", to.display());
+    false
+}
+
+/// A backup made before the registry rename holds `private/sites.json` and no
+/// `private/xites.json`. Normalize at restore time: copy the restored legacy
+/// file over xites.json so it is authoritative on the next boot. Without this,
+/// a node that already had an xites.json would keep its OWN xite list (the
+/// startup migration only runs when xites.json is absent) while the xite data
+/// trees were just replaced from the backup. When the archive carried both
+/// names, the restored xites.json already won. Returns the number of errors.
+fn normalize_legacy_registry(data_root: &Path, plan: &ApplyPlan) -> usize {
+    let legacy = "private/sites.json";
+    if !plan.files.iter().any(|f| f == legacy)
+        || plan.files.iter().any(|f| f == "private/xites.json")
+    {
+        return 0;
+    }
+    let from = join_rel(data_root, legacy);
+    let to = data_root.join("private").join("xites.json");
+    match std::fs::copy(&from, &to) {
+        Ok(_) => {
+            eprintln!("[INFO] Restored legacy {legacy} as private/xites.json");
+            0
+        }
+        Err(e) => {
+            eprintln!("[ERROR] Could not place restored {legacy} as private/xites.json: {e}");
+            1
+        }
     }
 }
 
