@@ -8,7 +8,7 @@ description = "EDX verified blob core: BLAKE3/bao outboard trees, verified range
 # (future) consensus-level contract. Bumping it requires re-running the
 # golden vectors in tests/ and a deliberate spec revision.
 [dependencies]
-blake3 = "=1.8.5"
+blake3 = "=1.8.6"
 bao-tree = "=0.16.0"
 positioned-io = "=0.3.5"
 # default-features off: postcard's default heapless support drags the
