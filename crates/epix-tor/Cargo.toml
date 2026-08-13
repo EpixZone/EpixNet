@@ -19,7 +19,7 @@ arti-client = { version = "0.44", default-features = false, features = [
 tor-hsservice = "0.44"
 safelog = "0.9"
 tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
-tor-cell = "0.44"
+tor-cell = "0.45"
 tor-proto = "0.45"
 # rustls 0.23 won't auto-pick a crypto provider when several are in the tree;
 # we install `ring` explicitly before bootstrap (see `install_crypto_provider`).
