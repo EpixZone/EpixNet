@@ -77,11 +77,18 @@ payload; **public material only**:
 ```
 
 `verify_bundle` checks structure only. **Bundle authenticity** is *not* self-contained:
-it rests on (a) the node verifying the signature on the per-user `data.json`, and
+it rests on (a) the node verifying the signature on the per-user `data.json`
+(only **active, non-revoked** linked keys are accepted signers — `xid_signers::resolve`),
 (b) the sealed-sender cross-check in §6.3 (the first message's inner `IK_a` must
-match the sender's published bundle, enforced at the node layer). A reviewer
-should treat "does bundle X belong to xid Y" as delegated to those two layers,
-not to the engine.
+match the sender's published bundle, enforced at the node layer), and (c) an
+on-chain **revocation gate**: the channel bundle path (`load_published_bundles` →
+M1, `channelSend`, `channelKeyLookup`) drops any bundle whose xID has no active
+linked identity, via the Merkle-verified `xid_identity::name_has_active_identity`,
+failing OPEN when the chain is unreachable. A reviewer should treat "does bundle X
+belong to a still-valid xid Y" as delegated to those layers, not to the engine.
+**Residual:** the channel IK is node-seed-derived, not bound to the linked chain
+key, so the gate retires the *bundle/attribution* of a revoked identity, not the
+IK itself; true per-key IK retirement would require binding IK to the linked key.
 
 ---
 

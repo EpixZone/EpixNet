@@ -181,8 +181,15 @@ pub mod xid_signers {
         let Ok(domain) = super::shared_resolver().resolve(name, tld).await else {
             return Vec::new();
         };
-        let signers: Vec<String> =
-            domain.identities.iter().map(|i| i.address.clone()).collect();
+        // Only ACTIVE, non-revoked linked identities may sign the domain's
+        // content. A revoked key (lost/stolen device) must not remain a valid
+        // signer — otherwise it can keep re-publishing/replacing signed files.
+        let signers: Vec<String> = domain
+            .identities
+            .iter()
+            .filter(|i| i.active && i.revoked_at == 0)
+            .map(|i| i.address.clone())
+            .collect();
         store(key, signers.clone());
         signers
     }
@@ -327,6 +334,84 @@ pub mod xid_identity {
         };
         store(fqdn.to_string(), Some(info.clone()));
         Some(info)
+    }
+
+    /// Whether `fqdn` currently has at least one ACTIVE, non-revoked linked
+    /// identity, Merkle-verified. `Some(true)` = a valid identity exists;
+    /// `Some(false)` = the name is registered but EVERY linked key is
+    /// revoked/inactive; `None` = indeterminate (not registered, chain
+    /// unreachable, or Tor-not-ready). Callers enforcing revocation should
+    /// **fail OPEN on `None`** so channel mail keeps working when the chain is
+    /// unavailable — a definite `Some(false)` is what cuts a revoked key off.
+    /// (`resolve_name` can't answer this: it hard-codes `active: true`.)
+    pub async fn name_has_active_identity(fqdn: &str) -> Option<bool> {
+        let (name, tld) = fqdn.rsplit_once('.')?;
+        if name.is_empty() || tld.is_empty() {
+            return None;
+        }
+        let ck = format!("active?:{fqdn}");
+        if let Some(hit) = cached(&ck) {
+            return hit.map(|info| info.active);
+        }
+        match super::shared_resolver().resolve(name, tld).await {
+            Ok(domain) => {
+                let active = domain.identities.iter().any(|i| i.active && i.revoked_at == 0);
+                // Reuse XidInfo.active as the cached bool carrier.
+                store(
+                    ck,
+                    Some(XidInfo {
+                        name: name.to_string(),
+                        tld: tld.to_string(),
+                        owner: String::new(),
+                        active,
+                        revoked_at: 0,
+                        revoked_at_time: 0,
+                        avatar: String::new(),
+                        bio: String::new(),
+                    }),
+                );
+                Some(active)
+            }
+            // Not registered: cache a short negative; indeterminate to the caller.
+            Err(super::ChainError::NotFound(_)) => {
+                store(ck, None);
+                None
+            }
+            // Transient/unreachable: don't cache; indeterminate → caller fails open.
+            Err(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn info(active: bool) -> XidInfo {
+            XidInfo {
+                name: "x".into(),
+                tld: "epix".into(),
+                owner: String::new(),
+                active,
+                revoked_at: 0,
+                revoked_at_time: 0,
+                avatar: String::new(),
+                bio: String::new(),
+            }
+        }
+
+        // Pre-seed the resolver cache so no network is touched: the active flag
+        // maps through to the three-valued answer the channel gate relies on.
+        #[tokio::test]
+        async fn name_active_maps_cached_flag_without_network() {
+            clear();
+            store("active?:alice.epix".into(), Some(info(true)));
+            assert_eq!(name_has_active_identity("alice.epix").await, Some(true), "active → keep");
+            store("active?:bob.epix".into(), Some(info(false)));
+            assert_eq!(name_has_active_identity("bob.epix").await, Some(false), "revoked → cut off");
+            store("active?:ghost.epix".into(), None);
+            assert_eq!(name_has_active_identity("ghost.epix").await, None, "unknown → fail open");
+            clear();
+        }
     }
 }
 

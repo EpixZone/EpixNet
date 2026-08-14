@@ -114,8 +114,14 @@ async fn load_published_bundles(
         let Some(dir) = rest.strip_suffix("/data.json") else { continue };
         let Some(bytes) = state.read_xite_file(xite, &path).await else { continue };
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
-        let key = v.get("xid").and_then(|x| x.as_str()).unwrap_or(dir);
-        bundles.insert(norm_xid(key), v);
+        let key = norm_xid(v.get("xid").and_then(|x| x.as_str()).unwrap_or(dir));
+        // Honor on-chain revocation: drop a bundle whose xID has NO active linked
+        // identity. Fail OPEN on an indeterminate result (chain unreachable /
+        // unregistered) so mail keeps working when the chain is down.
+        if state.xid_name_active(&key).await == Some(false) {
+            continue;
+        }
+        bundles.insert(key, v);
     }
     bundles
 }
@@ -482,14 +488,17 @@ impl WsCommand for ChannelKeyLookup {
         for x in xids {
             let Some(xid) = x.as_str() else { continue };
             let dir = norm_xid(xid);
-            let has = s
-                .state
-                .read_xite_file(&ms.xite, &format!("data/users/{dir}/data.json"))
-                .await
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                .map(|bundle| ms.engine.verify_bundle(&bundle))
-                .unwrap_or(false);
-            out.insert(dir, json!({ "has_bundle": has }));
+            // A revoked identity has no usable bundle, even if a stale data.json
+            // is still on disk (fail open on an indeterminate chain result).
+            let revoked = s.state.xid_name_active(&dir).await == Some(false);
+            let has = !revoked
+                && s.state
+                    .read_xite_file(&ms.xite, &format!("data/users/{dir}/data.json"))
+                    .await
+                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .map(|bundle| ms.engine.verify_bundle(&bundle))
+                    .unwrap_or(false);
+            out.insert(dir, json!({ "has_bundle": has, "revoked": revoked }));
         }
         Ok(Value::Object(out))
     }
@@ -566,6 +575,11 @@ impl WsCommand for ChannelSend {
 
         let mut records: Vec<Value> = Vec::new();
         for (i, recip) in recipients.iter().enumerate() {
+            // Don't seal to a recipient whose xID has been revoked on chain (fail
+            // open on an indeterminate result so a chain outage doesn't block mail).
+            if s.state.xid_name_active(recip).await == Some(false) {
+                return Err(format!("{recip}'s identity has been revoked"));
+            }
             let bundle_bytes = s
                 .state
                 .read_xite_file(&ms.xite, &format!("data/users/{recip}/data.json"))

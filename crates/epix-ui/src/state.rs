@@ -2786,6 +2786,15 @@ impl AppState {
             .map(str::to_string)
     }
 
+    /// Whether an xID name currently has an active (non-revoked) linked identity
+    /// on chain, Merkle-verified. `Some(true)`/`Some(false)` are definite;
+    /// `None` = indeterminate (unregistered / chain unreachable) → callers
+    /// enforcing revocation should fail OPEN. Used to cut a revoked identity off
+    /// from channel mail (see the channel plugin's bundle gate).
+    pub async fn xid_name_active(&self, fqdn: &str) -> Option<bool> {
+        epix_chain::xid_identity::name_has_active_identity(fqdn).await
+    }
+
     /// Clear every xID resolution cache, so the next visit to any `.epix` name
     /// does a fresh chain lookup instead of reusing a remembered address:
     ///   - the on-disk resolve cache (`resolve-cache.json`),
