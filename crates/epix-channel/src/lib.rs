@@ -11,6 +11,7 @@
 //! WebSocket commands, and no key material crosses that boundary.
 
 pub mod db;
+pub mod enc;
 pub mod legacy;
 
 pub use db::{IdentityRow, ChannelDb};

@@ -195,12 +195,28 @@ async fn build_engine(state: &Arc<AppState>) -> Option<Arc<dyn Engine>> {
     }
 }
 
-fn open_db(state: &Arc<AppState>) -> Option<Arc<ChannelDb>> {
+async fn open_db(state: &Arc<AppState>) -> Option<Arc<ChannelDb>> {
+    // Opt-in at-rest encryption: seal message content + ratchet blobs under a
+    // key derived from the node master seed (recomputable across restarts /
+    // restore-from-seed, never leaves the node).
+    let key = if state.config_bool("channel_encrypt_at_rest", false).await {
+        Some(state.derive_consumer_seed("channel-at-rest", "channels.db").await)
+    } else {
+        None
+    };
     let db = match state.data_root_path() {
         Some(root) => {
-            ChannelDb::open(root.join("private").join("channels.db")).ok().or_else(|| ChannelDb::memory().ok())
+            let path = root.join("private").join("channels.db");
+            match key {
+                Some(k) => ChannelDb::open_encrypted(&path, k).ok(),
+                None => ChannelDb::open(&path).ok(),
+            }
+            .or_else(|| ChannelDb::memory().ok())
         }
-        None => ChannelDb::memory().ok(),
+        None => match key {
+            Some(k) => ChannelDb::memory_encrypted(k).ok(),
+            None => ChannelDb::memory().ok(),
+        },
     };
     db.map(Arc::new)
 }
@@ -306,7 +322,7 @@ impl Plugin for ChannelPlugin {
                 return;
             }
             let Some(engine) = build_engine(&state).await else { return };
-            let Some(db) = open_db(&state) else {
+            let Some(db) = open_db(&state).await else {
                 state.log("ERROR", "could not open the channel index").await;
                 return;
             };

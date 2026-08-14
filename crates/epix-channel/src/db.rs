@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS thread (
     unread        INTEGER NOT NULL DEFAULT 0,
     starred       INTEGER NOT NULL DEFAULT 0,
     archived      INTEGER NOT NULL DEFAULT 0,
+    enc           INTEGER NOT NULL DEFAULT 0,
     UNIQUE(identity_id, conv_id));
 CREATE INDEX IF NOT EXISTS thread_identity_last ON thread(identity_id, last_ms);
 
@@ -116,6 +117,9 @@ pub struct IdentityRow {
 #[derive(Clone)]
 pub struct ChannelDb {
     db: Database,
+    /// When set, message content and ratchet blobs are sealed at rest under this
+    /// key (see [`crate::enc`]); `None` = plaintext at rest.
+    enc_key: Option<[u8; 32]>,
 }
 
 fn db_err(e: rusqlite::Error) -> Error {
@@ -123,18 +127,118 @@ fn db_err(e: rusqlite::Error) -> Error {
 }
 
 impl ChannelDb {
-    /// Open (creating if needed) the file-backed index.
+    /// Open (creating if needed) the file-backed index, plaintext at rest.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let me = Self { db: Database::open(path)? };
-        me.db.execute_batch(SCHEMA)?;
-        Ok(me)
+        Self::open_inner(Database::open(path)?, None)
+    }
+
+    /// Open the file-backed index with at-rest encryption under `key`.
+    pub fn open_encrypted(path: impl AsRef<std::path::Path>, key: [u8; 32]) -> Result<Self> {
+        Self::open_inner(Database::open(path)?, Some(key))
     }
 
     /// An in-memory index (tests, and nodes with no data dir).
     pub fn memory() -> Result<Self> {
-        let me = Self { db: Database::open_in_memory()? };
+        Self::open_inner(Database::open_in_memory()?, None)
+    }
+
+    /// An in-memory index with at-rest encryption (tests).
+    pub fn memory_encrypted(key: [u8; 32]) -> Result<Self> {
+        Self::open_inner(Database::open_in_memory()?, Some(key))
+    }
+
+    fn open_inner(db: Database, enc_key: Option<[u8; 32]>) -> Result<Self> {
+        let me = Self { db, enc_key };
         me.db.execute_batch(SCHEMA)?;
         Ok(me)
+    }
+
+    /// Whether content is sealed at rest (drives the search fallback).
+    pub fn is_encrypted(&self) -> bool {
+        self.enc_key.is_some()
+    }
+
+    // --- at-rest sealing helpers ------------------------------------------
+    // `enc_*` turn plaintext into what is stored (+ the row's `enc` flag);
+    // `dec_*` reverse it based on that flag, so a db can hold a mix during an
+    // enable/disable transition.
+
+    /// Plaintext text → (stored text, enc flag). Stored form is base64 of the
+    /// sealed bytes when encryption is on, so it still fits a TEXT column.
+    fn enc_text(&self, s: &str) -> (String, i64) {
+        use base64::Engine as _;
+        match &self.enc_key {
+            Some(k) => {
+                let b = base64::engine::general_purpose::STANDARD.encode(crate::enc::seal(k, s.as_bytes()));
+                (b, 1)
+            }
+            None => (s.to_string(), 0),
+        }
+    }
+
+    /// Stored text + enc flag → plaintext (best-effort; a decrypt failure yields "").
+    fn dec_text(&self, stored: &str, enc: i64) -> String {
+        use base64::Engine as _;
+        if enc == 0 {
+            return stored.to_string();
+        }
+        let Some(k) = &self.enc_key else { return String::new() };
+        base64::engine::general_purpose::STANDARD
+            .decode(stored)
+            .ok()
+            .and_then(|b| crate::enc::open(k, &b))
+            .and_then(|p| String::from_utf8(p).ok())
+            .unwrap_or_default()
+    }
+
+    /// Plaintext blob → (stored blob, enc flag). Used for the ratchet session state.
+    fn enc_blob(&self, b: &[u8]) -> (Vec<u8>, i64) {
+        match &self.enc_key {
+            Some(k) => (crate::enc::seal(k, b), 1),
+            None => (b.to_vec(), 0),
+        }
+    }
+
+    /// Stored blob + enc flag → plaintext blob.
+    fn dec_blob(&self, b: &[u8], enc: i64) -> Vec<u8> {
+        if enc == 0 {
+            return b.to_vec();
+        }
+        match &self.enc_key {
+            Some(k) => crate::enc::open(k, b).unwrap_or_default(),
+            None => b.to_vec(),
+        }
+    }
+
+    /// Seal a message's `(subject, body)` for storage → `(subject_stored,
+    /// body_stored, snippet_stored, enc)`. The snippet is a preview of the
+    /// PLAINTEXT body, sealed too so the thread list leaks nothing at rest.
+    fn seal_content(&self, subject: &str, body: &str) -> (String, String, String, i64) {
+        let snippet: String = body.chars().take(140).collect();
+        let (subject_stored, enc) = self.enc_text(subject);
+        let (body_stored, _) = self.enc_text(body);
+        let (snippet_stored, _) = self.enc_text(&snippet);
+        (subject_stored, body_stored, snippet_stored, enc)
+    }
+
+    /// Decrypt the named text `fields` in each result row per its `enc` marker,
+    /// then drop the marker from the output. A no-op on plaintext rows.
+    fn decrypt_rows(&self, mut rows: Vec<Value>, fields: &[&str]) -> Vec<Value> {
+        for row in rows.iter_mut() {
+            let enc = row.get("enc").and_then(|v| v.as_i64()).unwrap_or(0);
+            if enc != 0 {
+                for f in fields {
+                    if let Some(s) = row.get(*f).and_then(|v| v.as_str()) {
+                        let dec = self.dec_text(s, enc);
+                        row[*f] = Value::from(dec);
+                    }
+                }
+            }
+            if let Some(obj) = row.as_object_mut() {
+                obj.remove("enc");
+            }
+        }
+        rows
     }
 
     /// The underlying pool (read queries go straight through it).
@@ -231,35 +335,47 @@ impl ChannelDb {
     /// Find the session an inbound `tag` is expected by (Tier-1 O(1) lookup).
     pub fn session_for_tag(&self, tag: &[u8]) -> Result<Option<SessionMatch>> {
         let conn = self.db.conn()?;
-        conn.query_row(
-            "SELECT s.session_id, s.identity_id, s.conv_id, s.peer_xid, s.ratchet, e.n
-             FROM expected_tag e JOIN session s ON s.session_id = e.session_id
-             WHERE e.tag = ?1",
-            rusqlite::params![tag],
-            |r| {
-                Ok(SessionMatch {
-                    session_id: r.get(0)?,
-                    identity_id: r.get(1)?,
-                    conv_id: r.get(2)?,
-                    peer_xid: r.get::<_, Option<String>>(3)?,
-                    ratchet: r.get::<_, Vec<u8>>(4)?,
-                    n: r.get::<_, i64>(5)? as u32,
-                })
-            },
-        )
-        .optional()
-        .map_err(db_err)
+        let row = conn
+            .query_row(
+                "SELECT s.session_id, s.identity_id, s.conv_id, s.peer_xid, s.ratchet, e.n, s.enc
+                 FROM expected_tag e JOIN session s ON s.session_id = e.session_id
+                 WHERE e.tag = ?1",
+                rusqlite::params![tag],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Vec<u8>>(4)?,
+                        r.get::<_, i64>(5)?,
+                        r.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_err)?;
+        Ok(row.map(|(session_id, identity_id, conv_id, peer_xid, ratchet, n, enc)| SessionMatch {
+            session_id,
+            identity_id,
+            conv_id,
+            peer_xid,
+            ratchet: self.dec_blob(&ratchet, enc),
+            n: n as u32,
+        }))
     }
 
-    /// The raw ratchet blob for a session (typed BLOB read).
+    /// The ratchet blob for a session (decrypted if sealed at rest).
     pub fn session_ratchet(&self, session_id: i64) -> Result<Vec<u8>> {
         let conn = self.db.conn()?;
-        conn.query_row(
-            "SELECT ratchet FROM session WHERE session_id=?",
-            [session_id],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .map_err(db_err)
+        let (blob, enc) = conn
+            .query_row(
+                "SELECT ratchet, enc FROM session WHERE session_id=?",
+                [session_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(db_err)?;
+        Ok(self.dec_blob(&blob, enc))
     }
 
     // --- session creation (for the send/first-contact paths) --------------
@@ -278,11 +394,13 @@ impl ChannelDb {
     ) -> Result<i64> {
         let mut conn = self.db.conn()?;
         let tx = conn.transaction().map_err(db_err)?;
+        let (ratchet_stored, enc) = self.enc_blob(ratchet);
         tx.execute(
-            "INSERT INTO session (identity_id, conv_id, peer_xid, role, ratchet, established_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(identity_id, conv_id, peer_xid) DO UPDATE SET ratchet=excluded.ratchet",
-            rusqlite::params![identity_id, conv_id, peer_xid, role, ratchet, established_ms],
+            "INSERT INTO session (identity_id, conv_id, peer_xid, role, ratchet, enc, established_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(identity_id, conv_id, peer_xid)
+               DO UPDATE SET ratchet=excluded.ratchet, enc=excluded.enc",
+            rusqlite::params![identity_id, conv_id, peer_xid, role, ratchet_stored, enc, established_ms],
         )
         .map_err(db_err)?;
         let session_id: i64 = tx
@@ -306,9 +424,10 @@ impl ChannelDb {
     /// Persist an advanced ratchet for an existing session (own send path).
     pub fn update_session_ratchet(&self, session_id: i64, ratchet: &[u8]) -> Result<()> {
         let conn = self.db.conn()?;
+        let (ratchet_stored, enc) = self.enc_blob(ratchet);
         conn.execute(
-            "UPDATE session SET ratchet=?1 WHERE session_id=?2",
-            rusqlite::params![ratchet, session_id],
+            "UPDATE session SET ratchet=?1, enc=?2 WHERE session_id=?3",
+            rusqlite::params![ratchet_stored, enc, session_id],
         )
         .map_err(db_err)?;
         Ok(())
@@ -359,14 +478,16 @@ impl ChannelDb {
 
         let members_json =
             if c.members.is_empty() { None } else { serde_json::to_string(&c.members).ok() };
+        let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(&c.subject, &c.body);
         let thread_id = upsert_thread_tx(
             &tx,
             c.identity_id,
             &c.conv_id,
             c.peer_xid.as_deref(),
             members_json.as_deref(),
-            &c.subject,
-            &c.body,
+            &subject_stored,
+            &snippet_stored,
+            enc,
             c.sent_ms,
             /*incr_unread=*/ 1,
             /*incr_count=*/ 1,
@@ -375,16 +496,17 @@ impl ChannelDb {
         let msg_id: i64 = {
             tx.execute(
                 "INSERT INTO msg
-                    (identity_id, thread_id, conv_id, dir, sender_xid, subject, body,
+                    (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
                      sent_ms, received_ms, epoch, read, sign_h)
-                 VALUES (?1, ?2, ?3, 'in', ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+                 VALUES (?1, ?2, ?3, 'in', ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
                 rusqlite::params![
                     c.identity_id,
                     thread_id,
                     c.conv_id,
                     c.sender_xid,
-                    c.subject,
-                    c.body,
+                    subject_stored,
+                    body_stored,
+                    enc,
                     c.sent_ms,
                     c.received_ms,
                     c.epoch,
@@ -395,9 +517,10 @@ impl ChannelDb {
             tx.last_insert_rowid()
         };
 
+        let (ratchet_stored, renc) = self.enc_blob(&c.ratchet_after);
         tx.execute(
-            "UPDATE session SET ratchet=?1, peer_xid=COALESCE(peer_xid, ?2) WHERE session_id=?3",
-            rusqlite::params![c.ratchet_after, c.peer_xid, c.session_id],
+            "UPDATE session SET ratchet=?1, enc=?2, peer_xid=COALESCE(peer_xid, ?3) WHERE session_id=?4",
+            rusqlite::params![ratchet_stored, renc, c.peer_xid, c.session_id],
         )
         .map_err(db_err)?;
 
@@ -442,17 +565,18 @@ impl ChannelDb {
         let tx = conn.transaction().map_err(db_err)?;
         let members_json =
             if members.is_empty() { None } else { serde_json::to_string(members).ok() };
+        let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(subject, body);
         let thread_id = upsert_thread_tx(
-            &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), subject, body, sent_ms,
-            /*unread=*/ 0, /*count=*/ 1,
+            &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), &subject_stored,
+            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1,
         )?;
         tx.execute(
             "INSERT INTO msg
-                (identity_id, thread_id, conv_id, dir, sender_xid, subject, body,
+                (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
                  sent_ms, received_ms, epoch, read, sign_h)
-             VALUES (?1, ?2, ?3, 'out', ?4, ?5, ?6, ?7, ?7, 0, 1, NULL)",
+             VALUES (?1, ?2, ?3, 'out', ?4, ?5, ?6, ?7, ?8, ?8, 0, 1, NULL)",
             rusqlite::params![
-                identity_id, thread_id, conv_id, sender_xid, subject, body, sent_ms
+                identity_id, thread_id, conv_id, sender_xid, subject_stored, body_stored, enc, sent_ms
             ],
         )
         .map_err(db_err)?;
@@ -497,18 +621,20 @@ impl ChannelDb {
         // On a received message the peer is the sender; on a sent one there is
         // no single peer (the thread's members carry the audience).
         let peer_xid = if is_out { None } else { Some(sender_xid) };
+        let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(subject, body);
         let thread_id = upsert_thread_tx(
-            &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), subject, body, sent_ms,
-            /*unread=*/ 0, /*count=*/ 1,
+            &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), &subject_stored,
+            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1,
         )?;
         let dir = if is_out { "out" } else { "in" };
         tx.execute(
             "INSERT INTO msg
-                (identity_id, thread_id, conv_id, dir, sender_xid, subject, body,
+                (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
                  sent_ms, received_ms, epoch, read, sign_h)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, 1, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 0, 1, ?10)",
             rusqlite::params![
-                identity_id, thread_id, conv_id, dir, sender_xid, subject, body, sent_ms, dedup_h
+                identity_id, thread_id, conv_id, dir, sender_xid, subject_stored, body_stored, enc,
+                sent_ms, dedup_h
             ],
         )
         .map_err(db_err)?;
@@ -533,24 +659,32 @@ impl ChannelDb {
         };
         let sql = format!(
             "SELECT thread_id, conv_id, peer_xid, members, subject, snippet, last_ms, msg_count,
-                    unread, starred, archived
+                    unread, starred, archived, enc
              FROM thread WHERE identity_id=? AND {filter}
              ORDER BY last_ms DESC LIMIT ? OFFSET ?"
         );
-        self.db.query(&sql, &[Value::from(identity_id), Value::from(limit), Value::from(offset)])
+        let rows =
+            self.db.query(&sql, &[Value::from(identity_id), Value::from(limit), Value::from(offset)])?;
+        Ok(self.decrypt_rows(rows, &["subject", "snippet"]))
     }
 
     /// Messages of a conversation, oldest first.
     pub fn messages(&self, identity_id: i64, conv_id: &str) -> Result<Vec<Value>> {
-        self.db.query(
-            "SELECT msg_id, dir, sender_xid, subject, body, sent_ms, received_ms, read
+        let rows = self.db.query(
+            "SELECT msg_id, dir, sender_xid, subject, body, sent_ms, received_ms, read, enc
              FROM msg WHERE identity_id=? AND conv_id=? ORDER BY sent_ms ASC, msg_id ASC",
             &[Value::from(identity_id), Value::from(conv_id)],
-        )
+        )?;
+        Ok(self.decrypt_rows(rows, &["subject", "body"]))
     }
 
-    /// Full-text search over subjects+bodies for an identity, newest first.
+    /// Full-text search over subjects+bodies for an identity, newest first. When
+    /// at-rest encryption is on, FTS indexes ciphertext (useless), so search
+    /// falls back to a decrypt-then-scan over the identity's messages.
     pub fn search(&self, identity_id: i64, query: &str, limit: i64) -> Result<Vec<Value>> {
+        if self.is_encrypted() {
+            return self.search_scan(identity_id, query, limit);
+        }
         self.db.query(
             "SELECT m.msg_id, m.conv_id, m.dir, m.sender_xid, m.subject, m.sent_ms,
                     snippet(msg_fts, 1, '[', ']', '…', 12) AS snippet
@@ -559,6 +693,40 @@ impl ChannelDb {
              ORDER BY m.sent_ms DESC LIMIT ?",
             &[Value::from(query), Value::from(identity_id), Value::from(limit)],
         )
+    }
+
+    /// Decrypt-then-scan search used when content is sealed at rest. Linear in
+    /// the identity's message count; a substring (case-insensitive) match, which
+    /// is what the site's own client-side search does anyway.
+    fn search_scan(&self, identity_id: i64, query: &str, limit: i64) -> Result<Vec<Value>> {
+        let rows = self.db.query(
+            "SELECT msg_id, conv_id, dir, sender_xid, subject, body, sent_ms, enc
+             FROM msg WHERE identity_id=? ORDER BY sent_ms DESC",
+            &[Value::from(identity_id)],
+        )?;
+        let q = query.to_lowercase();
+        let mut out = Vec::new();
+        for row in rows {
+            let enc = row.get("enc").and_then(|v| v.as_i64()).unwrap_or(0);
+            let subject = self.dec_text(row.get("subject").and_then(|v| v.as_str()).unwrap_or(""), enc);
+            let body = self.dec_text(row.get("body").and_then(|v| v.as_str()).unwrap_or(""), enc);
+            if subject.to_lowercase().contains(&q) || body.to_lowercase().contains(&q) {
+                let snippet: String = body.chars().take(80).collect();
+                out.push(serde_json::json!({
+                    "msg_id": row.get("msg_id").cloned().unwrap_or(Value::Null),
+                    "conv_id": row.get("conv_id").cloned().unwrap_or(Value::Null),
+                    "dir": row.get("dir").cloned().unwrap_or(Value::Null),
+                    "sender_xid": row.get("sender_xid").cloned().unwrap_or(Value::Null),
+                    "subject": subject,
+                    "sent_ms": row.get("sent_ms").cloned().unwrap_or(Value::Null),
+                    "snippet": snippet,
+                }));
+                if out.len() >= limit as usize {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Mark a conversation read/unread (per-device state).
@@ -638,9 +806,9 @@ impl ChannelDb {
 }
 
 /// Upsert a thread inside a transaction and return its id. `incr_unread` /
-/// `incr_count` are added to the running totals; `subject`/snippet are set when
+/// `incr_count` are added to the running totals; `subject_stored`/`snippet_stored`
+/// (already sealed if at-rest encryption is on, with `enc` the flag) are set when
 /// the thread is new or this message is newer than the stored `last_ms`.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn upsert_thread_tx(
     tx: &rusqlite::Transaction,
@@ -648,32 +816,34 @@ fn upsert_thread_tx(
     conv_id: &str,
     peer_xid: Option<&str>,
     members: Option<&str>,
-    subject: &str,
-    body: &str,
+    subject_stored: &str,
+    snippet_stored: &str,
+    enc: i64,
     sent_ms: i64,
     incr_unread: i64,
     incr_count: i64,
 ) -> Result<i64> {
-    let snippet: String = body.chars().take(140).collect();
     tx.execute(
         "INSERT INTO thread
-            (identity_id, conv_id, peer_xid, members, subject, snippet, last_ms, msg_count, unread)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            (identity_id, conv_id, peer_xid, members, subject, snippet, enc, last_ms, msg_count, unread)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(identity_id, conv_id) DO UPDATE SET
             peer_xid = COALESCE(thread.peer_xid, excluded.peer_xid),
             members  = COALESCE(excluded.members, thread.members),
             subject  = CASE WHEN excluded.last_ms >= thread.last_ms THEN excluded.subject ELSE thread.subject END,
             snippet  = CASE WHEN excluded.last_ms >= thread.last_ms THEN excluded.snippet ELSE thread.snippet END,
+            enc      = CASE WHEN excluded.last_ms >= thread.last_ms THEN excluded.enc ELSE thread.enc END,
             last_ms  = MAX(thread.last_ms, excluded.last_ms),
-            msg_count = thread.msg_count + ?8,
-            unread   = thread.unread + ?9",
+            msg_count = thread.msg_count + ?9,
+            unread   = thread.unread + ?10",
         rusqlite::params![
             identity_id,
             conv_id,
             peer_xid,
             members,
-            subject,
-            snippet,
+            subject_stored,
+            snippet_stored,
+            enc,
             sent_ms,
             incr_count,
             incr_unread,
@@ -918,5 +1088,63 @@ mod tests {
         d.set_conv_state(idn, "cs", None, Some(false)).unwrap();
         assert_eq!(d.threads(idn, "all", 0, 10).unwrap().len(), 1);
         assert_eq!(d.threads(idn, "starred", 0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn at_rest_encryption_seals_content_but_reads_and_search_still_work() {
+        let d = ChannelDb::memory_encrypted([3u8; 32]).unwrap();
+        let idn = d.upsert_identity("mud.epix", "epix1mud", 0, None).unwrap();
+        d.insert_sent(idn, "cx", Some("p.epix"), &[], "mud.epix", "Secret Subj", "TOP SECRET ZQ9", 100)
+            .unwrap();
+
+        // Reads decrypt transparently.
+        let msgs = d.messages(idn, "cx").unwrap();
+        assert_eq!(msgs[0]["body"].as_str(), Some("TOP SECRET ZQ9"));
+        assert_eq!(msgs[0]["subject"].as_str(), Some("Secret Subj"));
+        let threads = d.threads(idn, "all", 0, 10).unwrap();
+        assert_eq!(threads[0]["subject"].as_str(), Some("Secret Subj"));
+        assert!(threads[0]["snippet"].as_str().unwrap().contains("TOP SECRET"));
+        // Search works via decrypt-then-scan.
+        assert_eq!(d.search(idn, "secret", 10).unwrap().len(), 1);
+        assert_eq!(d.search(idn, "nomatch", 10).unwrap().len(), 0);
+
+        // The RAW columns hold ciphertext, never the plaintext, and enc=1.
+        let conn = d.database().conn().unwrap();
+        let raw_body: String =
+            conn.query_row("SELECT body FROM msg WHERE identity_id=?", [idn], |r| r.get(0)).unwrap();
+        assert_ne!(raw_body, "TOP SECRET ZQ9");
+        assert!(!raw_body.contains("SECRET"));
+        let raw_snip: String =
+            conn.query_row("SELECT snippet FROM thread WHERE identity_id=?", [idn], |r| r.get(0)).unwrap();
+        assert!(!raw_snip.contains("SECRET"), "thread preview is sealed too");
+        let enc: i64 =
+            conn.query_row("SELECT enc FROM msg WHERE identity_id=?", [idn], |r| r.get(0)).unwrap();
+        assert_eq!(enc, 1);
+    }
+
+    #[test]
+    fn at_rest_encryption_seals_the_ratchet_blob() {
+        let d = ChannelDb::memory_encrypted([4u8; 32]).unwrap();
+        let idn = d.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
+        let sid = d.create_session(idn, "cv", Some("b.epix"), "init", b"RATCHET-STATE-XYZ", 1, &[]).unwrap();
+        assert_eq!(d.session_ratchet(sid).unwrap(), b"RATCHET-STATE-XYZ");
+
+        // The raw ratchet column is sealed. Scoped so the single in-memory
+        // connection is released before the next db method (pool size 1).
+        {
+            let conn = d.database().conn().unwrap();
+            let raw: Vec<u8> = conn
+                .query_row("SELECT ratchet FROM session WHERE session_id=?", [sid], |r| r.get(0))
+                .unwrap();
+            assert_ne!(raw.as_slice(), b"RATCHET-STATE-XYZ".as_slice());
+            assert!(!raw.windows(7).any(|w| w == b"RATCHET"));
+        }
+
+        // An advance re-seals and still decrypts, and session_for_tag decrypts too.
+        d.update_session_ratchet(sid, b"RATCHET-STATE-2").unwrap();
+        assert_eq!(d.session_ratchet(sid).unwrap(), b"RATCHET-STATE-2");
+        d.create_session(idn, "cv", Some("b.epix"), "init", b"RS3", 1, &[(0, vec![7u8; 32])]).unwrap();
+        let sm = d.session_for_tag(&[7u8; 32]).unwrap().unwrap();
+        assert_eq!(sm.ratchet, b"RS3");
     }
 }

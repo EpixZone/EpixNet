@@ -2171,11 +2171,13 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
+ "chacha20poly1305 0.10.1",
  "epix-content",
  "epix-core",
  "epix-crypt",
  "epix-db",
  "epix-envelope",
+ "getrandom 0.4.3",
  "hex",
  "rusqlite",
  "serde",

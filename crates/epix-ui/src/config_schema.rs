@@ -186,6 +186,9 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Channels", "channel_send_jitter_max_secs", "Max random send delay (metadata privacy)", "0", "text"),
     ("Channels", "channel_encrypt_at_rest", "Encrypt the local channel index at rest", "true", "bool"),
     ("Channels", "channel_feed_snippets", "Show message snippets in the dashboard feed", "false", "bool"),
+    // Seal message content + ratchet state at rest under a seed-derived key.
+    // Trade-off: full-text search falls back to a slower decrypt-then-scan.
+    ("Channels", "channel_encrypt_at_rest", "Encrypt the private channel index at rest", "false", "bool"),
     // Test/dev only: run mail on the INSECURE FakeEngine when no secure engine
     // is compiled in. Never enable for real mail — it provides no confidentiality.
     ("Channels", "channel_allow_insecure_engine", "DEV: allow the insecure test channel engine", "false", "bool"),
