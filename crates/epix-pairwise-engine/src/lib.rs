@@ -107,6 +107,7 @@ impl Engine for PairwiseEngine {
             sent_ms,
             session_after,
             next_recv_tags: next,
+            pending: 0,
         })
     }
 
@@ -117,7 +118,7 @@ impl Engine for PairwiseEngine {
         tag: &[u8; 32],
         ct: &[u8],
     ) -> Result<Opened, EngineError> {
-        let (session_after, payload, sender, next) =
+        let (session_after, payload, sender, next, pending) =
             ratchet::open(session, n, tag, ct).ok_or(EngineError::NotForMe)?;
         let (conv, members, subject, body, sent_ms) =
             parse_payload(&payload).ok_or(EngineError::Malformed)?;
@@ -131,6 +132,7 @@ impl Engine for PairwiseEngine {
             sent_ms,
             session_after,
             next_recv_tags: next,
+            pending,
         })
     }
 }
@@ -307,6 +309,8 @@ mod tests {
         assert!(n >= 32, "the gap exceeds the old 32-tag window (n = {n})");
         let o = e.open(&bob_sess, n, &tag, &ct).unwrap();
         assert_eq!(o.body, format!("m{i}"));
+        // Receiving message #59 first reports the earlier ones as still pending.
+        assert!(o.pending >= 32, "delivery-gap hint surfaced (pending = {})", o.pending);
     }
 
     /// The load-bearing no-OPK mechanism: a first contact against a bundle whose

@@ -34,6 +34,8 @@ pub enum ProcessOutcome {
         snippet: String,
         unread: i64,
         first_contact: bool,
+        /// Outstanding skipped messages after this open (a delivery-gap hint).
+        pending: u32,
     },
 }
 
@@ -272,6 +274,7 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
         snippet: snippet_of(&op.body),
         unread,
         first_contact: false,
+        pending: op.pending,
     }))
 }
 
@@ -361,6 +364,7 @@ where
         snippet: snippet_of(&op.body),
         unread,
         first_contact: true,
+        pending: op.pending,
     }))
 }
 

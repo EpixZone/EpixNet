@@ -89,6 +89,10 @@ pub struct Opened {
     pub session_after: Vec<u8>,
     /// The next `(n, tag)` receive slots to register for this session.
     pub next_recv_tags: Vec<(u32, [u8; 32])>,
+    /// Outstanding skipped messages after this open — records known to exist
+    /// (their keys were stored) but not yet received. Drives a "N messages still
+    /// arriving" hint in the UI; 0 on a fresh first-contact session.
+    pub pending: u32,
 }
 
 /// The crypto engine. All methods are pure w.r.t. the passed-in state — the node
@@ -326,6 +330,7 @@ fn opened_from_payload(v: &Value, session_after: Vec<u8>) -> Result<Opened, Engi
         sent_ms: v.get("t").and_then(|x| x.as_i64()).unwrap_or(0),
         session_after,
         next_recv_tags: Vec::new(),
+        pending: 0,
     })
 }
 

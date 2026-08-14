@@ -696,13 +696,15 @@ mod prod_vectors {
     }
 }
 
-/// Open an established-session record whose `tag` matched at index `n`.
+/// Open an established-session record whose `tag` matched at index `n`. The
+/// trailing `u32` is the outstanding skipped-message count after opening (records
+/// known to exist but not yet received) — a delivery-gap hint for the UI.
 pub fn open(
     session_bytes: &[u8],
     n: u32,
     tag: &[u8; 32],
     ct: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>, Option<String>, Vec<(u32, [u8; 32])>)> {
+) -> Option<(Vec<u8>, Vec<u8>, Option<String>, Vec<(u32, [u8; 32])>, u32)> {
     let mut s = from_bytes(session_bytes)?;
     if ct.len() < EST_HDR_BLOCK {
         return None;
@@ -720,6 +722,7 @@ pub fn open(
     let body_plain = aead_open(&mk_key, &mk_nonce, tag, &ct[EST_HDR_BLOCK..])?;
     let payload = unpad_payload(&body_plain)?;
     let sender = if s.peer_xid.is_empty() { None } else { Some(s.peer_xid.clone()) };
+    let pending = s.skipped_mk.len() as u32;
     let next = window_tags(&s.tck_recv, s.i_recv);
-    Some((to_bytes(&s), payload, sender, next))
+    Some((to_bytes(&s), payload, sender, next, pending))
 }

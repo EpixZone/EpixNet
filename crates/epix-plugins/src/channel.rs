@@ -144,6 +144,7 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
                 snippet,
                 unread,
                 first_contact,
+                pending,
                 ..
             }) = epix_envelope::process_record(&db, engine.as_ref(), &identities, rec, now, &resolve)
             {
@@ -157,6 +158,9 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
                     "subject": subject,
                     "snippet": snippet,
                     "unread": unread,
+                    // >0 means earlier messages in this conversation are still
+                    // arriving (received out of order) — a delivery-gap hint.
+                    "pending": pending,
                 }));
             }
         }
