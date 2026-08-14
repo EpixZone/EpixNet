@@ -61,9 +61,13 @@ fn b64d(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
-/// 32 fresh random bytes via the crypt RNG.
+/// 32 fresh random bytes via the crypt RNG. Panics rather than degrading to a
+/// zero vector on RNG failure: a zero `K_msg` under the fixed zero nonce would be
+/// catastrophic keystream reuse across messages, so a silent fallback is a footgun
+/// we refuse. `new_seed()` already panics on OS-RNG failure and always returns
+/// valid hex, so this is unreachable in practice — but fail closed regardless.
 fn rand32() -> [u8; 32] {
-    let v = hex::decode(epix_crypt::new_seed()).unwrap_or_else(|_| vec![0u8; 32]);
+    let v = hex::decode(epix_crypt::new_seed()).expect("crypt RNG returned invalid hex");
     let mut o = [0u8; 32];
     o.copy_from_slice(&v[..32]);
     o
@@ -77,6 +81,19 @@ fn rand_bytes(len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// Fisher-Yates shuffle of the paired (tag, keyslot) slots in lockstep, using
+/// fresh RNG bytes. Only reorders positions (not a security primitive) — SLOTS is
+/// small so 32 random bytes are ample.
+fn shuffle_pairs(tags: &mut [[u8; 32]], keyslots: &mut [Vec<u8>]) {
+    let r = rand32();
+    let n = tags.len();
+    for i in (1..n).rev() {
+        let j = (r[i % 32] as usize) % (i + 1);
+        tags.swap(i, j);
+        keyslots.swap(i, j);
+    }
 }
 
 // --- shared body AEAD -------------------------------------------------------
@@ -307,6 +324,13 @@ pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
         tags.push(rand32());
         keyslots.push(rand_bytes(KEYSLOT_LEN));
     }
+
+    // Defense-in-depth: shuffle real and dummy slots together so real slots are
+    // NOT a fixed 0..n prefix. Count-hiding rests on real/dummy content being
+    // indistinguishable; shuffling means even if that ever regressed, the count
+    // could not be read off slot positions. The receiver scans all slots, so
+    // order is irrelevant to delivery.
+    shuffle_pairs(&mut tags, &mut keyslots);
 
     let ct = pack_ct(&tags, &keyslots, &body_ct, &rule.pad_buckets)?;
 

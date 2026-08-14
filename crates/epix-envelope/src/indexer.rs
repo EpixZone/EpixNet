@@ -287,12 +287,14 @@ where
         if !matches {
             // No matching bundle: either a forgery, or a genuine message from a
             // device whose bundle this node has not synced YET. We cannot tell
-            // the two apart from the transcript alone, so DEFER (NoMatch, left
-            // unprocessed) rather than dropping for good — a real message becomes
+            // the two apart from the transcript alone, so DEFER by returning `None`
+            // (this slot didn't deliver) — NOT `Some(NoMatch)`, which would abort
+            // scanning the record's OTHER slots. The record is left unprocessed by
+            // process_record if nothing else delivers, so a real message becomes
             // indexable once that device's bundle syncs, while a forgery is simply
             // re-probed (a bounded, PoW-gated cost) and never trusted. The IK
             // never matches for a forgery, so it can never be indexed.
-            return Ok(Some(ProcessOutcome::NoMatch));
+            return Ok(None);
         }
     }
 

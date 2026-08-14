@@ -78,13 +78,33 @@ independently opens its own slot of the *same* record (tested).
 - **Tier-2 first-contact probing is SLOTS× per foreign record** (probe each slot).
   Only records that miss Tier-1 pay it, and each probe is one cheap DH; still, at
   scale it is 8× the pre-multislot first-contact cost.
-- **Groups > SLOTS destinations** still reveal ">SLOTS" via the record count.
+- **Groups > SLOTS destinations** span `ceil(N/SLOTS)` records, appended
+  back-to-back. They are cryptographically unlinkable (fresh routing tag / author /
+  `K_msg` / shard each), but a peer watching the flood can correlate the
+  simultaneous same-size records by transport timing+size and read off a *bucketed*
+  destination count (e.g. 3 records ⇒ 17–24 destinations) — slightly stronger than
+  a bare ">SLOTS". Mitigation (not yet implemented): space/jitter the multi-record
+  burst. Below SLOTS there is no such leak (one record).
 - **Send origin** to a directly-connected peer (that you sent *something*) is
   unchanged — closed only by Tor-Always + send jitter, as before. This fix removes
   the *recipient* count from what that peer can infer, not the fact of a send.
-- **Multiple local identities on one node**: `process_record` indexes the first
-  matching slot per record; a node hosting two identities both addressed in one
-  record indexes only one. Rare (a node has one channel identity); documented.
+- Slots are **shuffled** (real + dummy), so real slots are not a fixed prefix —
+  defense-in-depth in case real/dummy content indistinguishability ever regresses.
+
+### Known limitation — multiple channel identities on ONE node
+
+`process_record` indexes at most ONE slot per record, and idempotency is keyed on
+the record's `sign` (record-wide). A node that hosts **two or more channel
+identities both addressed in the same record** (e.g. two personas of one operator
+on one machine — NOT two *devices* of a name, which are separate nodes) will index
+only the first and **silently drop the rest**. This does not affect the current
+one-identity-per-node deployment, but it is a real correctness gap for the
+multi-identity config the code otherwise supports. **Fix (deferred, needs a schema
+change):** scan every (identity × slot), emit one outcome per delivered slot, and
+key idempotency on `(sign_h, identity_id)` instead of `sign_h` alone (drop the
+record-wide `msg.sign_h` UNIQUE). Until then, run one channel identity per node.
+The related first-contact **scan-abort** bug (a deferred slot masking later slots)
+*is* fixed: the anti-spoof deferral returns `None` so the scan falls through.
 
 ## Tests
 
