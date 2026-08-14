@@ -89,30 +89,41 @@ UI surfaces over one channel store. The group engine is `epix-group-proto`
   shard signals nothing (full replication, exhaustively enumerable paths).
 - **Content**: X3DH + Double Ratchet → forward secrecy and post-compromise
   security; ChaCha20-Poly1305 AEAD.
-- **Residuals** (honest): account existence + bundle per xID; coarse liveness
-  from bundle-update times; total pool volume + per-record size bucket + day;
-  **send-origin visible to directly-connected peers** (mitigated by Tor-Always +
-  publish jitter); a seed compromise exposes the *first* message of a session
+- **Residuals** (honest): account existence + bundle per xID, published on-chain
+  (strictly more than "has an account" — the identity key, current prekey, and
+  linked-device count are public); coarse liveness from bundle-update times; total
+  pool volume + per-record size bucket + day; **send-origin visible to
+  directly-connected peers** — closed by Tor-Always, with optional
+  `channel_send_jitter_max_secs` decorrelating send time from the pool write on
+  non-Tor deployments; a seed compromise exposes the *first* message of a session
   (no one-time prekeys) — every later message stays protected by the ratchet.
-- **Deviations to review before production**: BLAKE3 KDFs instead of
-  HKDF-SHA256 (not Signal-wire-compatible); no OPKs; alpha `curve25519-elligator2`.
-  Freeze test vectors + external crypto review before real cutover.
+- **Deviations to review before production**: HKDF-SHA256/HMAC-SHA256 chains (an
+  early BLAKE3 build was switched to HKDF so review is a line-diff against Signal;
+  blake3 now survives only as the multi-slot body-binding hash); no OPKs (the first
+  message of a session has no forward secrecy); alpha `curve25519-elligator2` for
+  first-contact tags; the count-hiding multi-slot construction. Freeze test vectors
+  and get external crypto review before real cutover.
 
 ## Config (node)
 
 `channel_enabled`, `channel_xite`, `channel_backfill_weeks` (0=all, newest-first),
-`channel_send_jitter_max_secs`, `channel_burst_jitter_max_secs` (default 60; the
-random per-record gap that spaces the SECOND-and-later records of a >SLOTS
-multi-record send so the flood can't be counted as one send — `0` disables; see
-[`channel-count-privacy.md`](channel-count-privacy.md)), `channel_feed_snippets`,
-and `channel_allow_insecure_engine` (DEV only — runs the FakeEngine, which provides
-no confidentiality).
+`channel_send_jitter_max_secs` (default 0 = off; when set, the WHOLE send is
+delayed by a random `0..=max` seconds and detached from the send handler so a
+directly-connected peer can't bind "user pressed send" to the pool write —
+recommended on non-Tor deployments), `channel_burst_jitter_max_secs` (default 60;
+the random per-record gap that spaces the second-and-later records of an
+over-`SLOTS` multi-record send so the flood can't be counted as one send — `0`
+disables; see [`channel-count-privacy.md`](channel-count-privacy.md)),
+`channel_feed_snippets`, and `channel_allow_insecure_engine` (DEV only — runs the
+FakeEngine, which provides no confidentiality).
 
 ## Site (mail xite) changes
 
 - **content.json**: `pool.channels` descriptor (dir `pool`, class `epix-pool-1`,
-  `since_week`, `fanout` 16, `pow_bits` 20, `pad_buckets` [512,2048,8192],
-  `sync_order` newest_first); `distribution.paths["pool/"]` complete retention;
+  `since_week`, `fanout` 16, `pow_bits` 20, `pad_buckets` [8192,32768,131072],
+  `max_record_bytes` 200000 (widened for the count-hiding multi-slot record — the
+  fixed slot overhead is ~4.4KB, smallest record ~8KB), `sync_order` newest_first);
+  `distribution.paths["pool/"]` complete retention;
   `ignore` excludes `pool/`. Re-sign + publish via the node UI.
 - **dbschema.json** → v3 (drops the old `message`/`conversation` tables on
   rebuild); shrinks to keyvalue bundle-discovery only. Pool shards are NOT

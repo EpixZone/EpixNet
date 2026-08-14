@@ -95,8 +95,12 @@ independently opens its own slot of the *same* record (tested).
   shutdown may only fail to *deliver* a large-group send to some recipients, and a
   resend re-posts on the advanced ratchet (no key reuse).
 - **Send origin** to a directly-connected peer (that you sent *something*) is
-  unchanged — closed only by Tor-Always + send jitter, as before. This fix removes
-  the *recipient* count from what that peer can infer, not the fact of a send.
+  unchanged by count-hiding — closed by Tor-Always, plus the now-implemented
+  optional send-origin jitter (`channel_send_jitter_max_secs`, default off): when
+  set, the whole pool injection is delayed by a random `0..=max` seconds and
+  detached from the send handler, so the pool write is decorrelated from the user's
+  send action. This removes the *recipient* count from what that peer can infer;
+  the *fact* of a send is covered by Tor-Always (primary) and the send jitter.
 - Slots are **shuffled** (real + dummy), so real slots are not a fixed prefix —
   defense-in-depth in case real/dummy content indistinguishability ever regresses.
 

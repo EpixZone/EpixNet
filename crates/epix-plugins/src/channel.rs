@@ -661,15 +661,25 @@ async fn resolve_destinations(
     Ok(dests)
 }
 
-/// A random inter-record burst gap in `1..=max_secs`, from the crypt RNG.
-/// `max_secs == 0` disables jitter (the caller handles that).
-fn jitter_gap_secs(max_secs: u64) -> u64 {
-    if max_secs == 0 {
+/// Uniform-ish `0..n` from the crypt RNG (8 bytes big-endian mod n); `n == 0` → 0.
+/// Jitter is a privacy timing knob, not a cryptographic primitive, so a modulo
+/// draw is fine.
+fn rand_u64_below(n: u64) -> u64 {
+    if n == 0 {
         return 0;
     }
     let bytes = hex::decode(epix_crypt::new_seed()).unwrap_or_default();
     let r = bytes.iter().take(8).fold(0u64, |acc, &b| (acc << 8) | b as u64);
-    1 + (r % max_secs)
+    r % n
+}
+
+/// A random inter-record burst gap in `1..=max_secs`; `max_secs == 0` → 0 (the
+/// caller disables jitter).
+fn jitter_gap_secs(max_secs: u64) -> u64 {
+    if max_secs == 0 {
+        return 0;
+    }
+    1 + rand_u64_below(max_secs)
 }
 
 /// The max per-record burst-jitter gap (seconds); default 60, `0` disables. Only
@@ -682,22 +692,52 @@ async fn burst_jitter_max_secs(state: &Arc<AppState>) -> u64 {
         .unwrap_or(60)
 }
 
-/// Append + flood the sealed records. The FIRST record goes out immediately — a
-/// single-record send is byte-identical to the first record of a multi-record
-/// send, so this leaks nothing new. When a send spanned MORE THAN ONE record
-/// (>SLOTS destinations) and burst jitter is enabled, the remaining records are
-/// dribbled out from a detached task with random gaps, so a peer watching the
-/// flood can't bind the simultaneous same-size records into one send and read off
-/// a bucketed destination count (see `docs/channel-count-privacy.md`). The records
-/// are already sealed with their ratchet state persisted, so a deferred append is
-/// crash-safe: on an unlucky shutdown a large-group send may simply not reach some
-/// recipients, and a resend re-posts on the advanced ratchet.
+/// The max whole-send origin-jitter delay (seconds); default `0` (off — Tor-Always
+/// is the primary send-origin mitigation). When set, the ENTIRE pool injection is
+/// delayed by a random `0..=max` and fully detached from the send handler, so a
+/// directly-connected clearnet peer can't bind "user pressed send" to "node
+/// injected a record". Recommended on non-Tor deployments.
+async fn send_jitter_max_secs(state: &Arc<AppState>) -> u64 {
+    state
+        .config_get("channel_send_jitter_max_secs")
+        .await
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .unwrap_or(0)
+}
+
+/// Append + flood the sealed records, applying two independent privacy timers:
+///
+/// - **send-origin jitter** (`send_jitter_max`): when non-zero the WHOLE injection
+///   is delayed by a random `0..=max` and runs from a detached task, decorrelating
+///   the pool write from the user's send action for a directly-connected peer. The
+///   handler returns immediately; the sender's own copy is already in the private
+///   index, so the UI is unaffected.
+/// - **burst jitter** (`burst_jitter_max`): the second-and-later records of a
+///   multi-record (over-`SLOTS`) send are spaced by a random gap so the flood
+///   can't be counted as one send.
+///
+/// The records are already sealed with their ratchet state persisted, so any
+/// deferred append is crash-safe: on an unlucky shutdown a send may simply not
+/// reach some recipients, and a resend re-posts on the advanced ratchet.
 async fn append_records_jittered(
     state: Arc<AppState>,
     xite: String,
     records: Vec<Value>,
-    jitter_max_secs: u64,
+    send_jitter_max: u64,
+    burst_jitter_max: u64,
 ) -> Result<(), String> {
+    // Send-origin jitter: detach the entire injection behind a random initial
+    // delay. The handler has already returned, so errors are logged, not surfaced.
+    if send_jitter_max > 0 {
+        tokio::spawn(async move {
+            let delay = rand_u64_below(send_jitter_max + 1);
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            post_records(&state, &xite, records, burst_jitter_max, true).await;
+        });
+        return Ok(());
+    }
+    // No send jitter: post the first record now (surfacing an immediate error to
+    // the caller), then burst-jitter the rest from a detached task.
     let mut it = records.into_iter();
     if let Some(first) = it.next() {
         state.clone().append_pool_record(&xite, first).await?;
@@ -706,22 +746,33 @@ async fn append_records_jittered(
     if rest.is_empty() {
         return Ok(());
     }
-    if jitter_max_secs == 0 {
-        for record in rest {
-            state.clone().append_pool_record(&xite, record).await?;
-        }
-        return Ok(());
-    }
+    let (s, x) = (state.clone(), xite.clone());
     tokio::spawn(async move {
-        for record in rest {
-            let gap = jitter_gap_secs(jitter_max_secs);
-            tokio::time::sleep(std::time::Duration::from_secs(gap)).await;
-            if let Err(e) = state.clone().append_pool_record(&xite, record).await {
-                state.log("WARNING", &format!("deferred channel record append failed: {e}")).await;
-            }
-        }
+        post_records(&s, &x, rest, burst_jitter_max, false).await;
     });
     Ok(())
+}
+
+/// Post `records` to the pool, spacing consecutive ones by `burst_jitter_max`.
+/// `first_immediate` posts `records[0]` with no gap (used by the send-jitter path,
+/// where the initial delay already elapsed); otherwise every record is gapped
+/// (used for the tail of a no-send-jitter send). Runs detached: errors are logged.
+async fn post_records(
+    state: &Arc<AppState>,
+    xite: &str,
+    records: Vec<Value>,
+    burst_jitter_max: u64,
+    first_immediate: bool,
+) {
+    for (i, record) in records.into_iter().enumerate() {
+        let gap = if i == 0 && first_immediate { 0 } else { jitter_gap_secs(burst_jitter_max) };
+        if gap > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(gap)).await;
+        }
+        if let Err(e) = state.clone().append_pool_record(xite, record).await {
+            state.log("WARNING", &format!("deferred channel record append failed: {e}")).await;
+        }
+    }
 }
 
 struct ChannelSend;
@@ -830,8 +881,10 @@ impl WsCommand for ChannelSend {
         // >SLOTS send are spaced by burst jitter so a peer watching the flood can't
         // count the simultaneous same-size records as one send.
         let envelopes = records.len();
-        let jitter = burst_jitter_max_secs(&s.state).await;
-        append_records_jittered(s.state.clone(), ms.xite.clone(), records, jitter).await?;
+        let send_jitter = send_jitter_max_secs(&s.state).await;
+        let burst_jitter = burst_jitter_max_secs(&s.state).await;
+        append_records_jittered(s.state.clone(), ms.xite.clone(), records, send_jitter, burst_jitter)
+            .await?;
 
         // `envelopes` is the record count — independent of the true recipient/device
         // count (which is hidden inside each fixed-width record).

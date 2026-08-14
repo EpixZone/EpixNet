@@ -184,6 +184,7 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Channels", "channel_backfill_weeks", "Weeks of channel history to backfill (0 = all)", "4", "text"),
     ("Channels", "channel_pow_threads", "Threads for channel proof-of-work", "1", "text"),
     ("Channels", "channel_send_jitter_max_secs", "Max random send delay (metadata privacy)", "0", "text"),
+    ("Channels", "channel_burst_jitter_max_secs", "Max per-record gap for >8-recipient sends (metadata privacy)", "60", "text"),
     ("Channels", "channel_encrypt_at_rest", "Encrypt the local channel index at rest", "true", "bool"),
     ("Channels", "channel_feed_snippets", "Show message snippets in the dashboard feed", "false", "bool"),
     // Seal message content + ratchet state at rest under a seed-derived key.
