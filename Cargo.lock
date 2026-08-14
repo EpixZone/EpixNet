@@ -2336,6 +2336,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-group-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "chacha20poly1305 0.10.1",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf",
+ "hmac 0.12.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "zeroize",
+]
+
+[[package]]
 name = "epix-i2p"
 version = "0.1.0"
 dependencies = [
