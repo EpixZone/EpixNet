@@ -80,12 +80,19 @@ payload; **public material only**:
 it rests on (a) the node verifying the signature on the per-user `data.json`
 (only **active, non-revoked** linked keys are accepted signers — `xid_signers::resolve`),
 (b) the sealed-sender cross-check in §6.3 (the first message's inner `IK_a` must
-match the sender's published bundle, enforced at the node layer), and (c) an
-on-chain **revocation gate**: the channel bundle path (`load_published_bundles` →
-M1, `channelSend`, `channelKeyLookup`) drops any bundle whose xID has no active
-linked identity, via the Merkle-verified `xid_identity::name_has_active_identity`,
-failing OPEN when the chain is unreachable. A reviewer should treat "does bundle X
-belong to a still-valid xid Y" as delegated to those layers, not to the engine.
+match **one of** the sender's published bundles — a name may have several linked
+**devices**, each with its own bundle; see `channel-multi-device.md` — enforced at
+the node layer), and (c) an on-chain **revocation gate**: the channel bundle path
+(`load_published_bundles` → M1, `channelSend`, `channelKeyLookup`) drops any bundle
+whose xID has no active linked identity (name-level, via the Merkle-verified
+`xid_identity::name_has_active_identity`) AND drops an individual device bundle
+whose own `auth` is absent from the chain-attested active-address set
+(per-device, via `xid_signers::resolve`), both failing OPEN when the chain is
+unreachable. A reviewer should treat "does bundle X belong to a still-valid device
+of xid Y" as delegated to those layers, not to the engine. Note the anti-spoof
+**defers** (never mis-attributes) an unmatched first-contact rather than dropping
+it, so a genuine message from a not-yet-synced device indexes once its bundle
+arrives — while a forgery, whose `IK_a` never matches, is never trusted.
 **Residual:** the channel IK is node-seed-derived, not bound to the linked chain
 key, so the gate retires the *bundle/attribution* of a revoked identity, not the
 IK itself; true per-key IK retirement would require binding IK to the linked key.

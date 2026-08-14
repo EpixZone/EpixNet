@@ -158,11 +158,12 @@ pub fn send_message<E: Engine + ?Sized, S: EnvelopeStore>(
 /// `identities` is `(identity_id, secret, my_xid)`. The record is assumed to
 /// have already passed [`pool::verify_pool_record`] at the node's ingest seam;
 /// this only decrypts and indexes.
-/// `resolve_bundle(xid)` returns the published key bundle for `xid` (the node
-/// reads `data/users/<xid>/data.json`), or `None` if it isn't available. It is
-/// the sealed-sender anti-spoof oracle: a first-contact message is only trusted
-/// if the claimed sender's published bundle's identity key equals the record's
-/// transcript-bound `ik_a`.
+/// `resolve_bundle(xid)` returns ALL currently-published key bundles for `xid`
+/// — one per active linked identity/device the node has synced (the node reads
+/// every `data/users/<xid>/data*.json`). An empty vec means none are available
+/// yet. It is the sealed-sender anti-spoof oracle: a first-contact message is
+/// trusted iff the record's transcript-bound `ik_a` equals the identity key of
+/// ONE of the claimed sender's published bundles (any of their devices).
 pub fn process_record<E, S, R>(
     store: &S,
     engine: &E,
@@ -174,7 +175,7 @@ pub fn process_record<E, S, R>(
 where
     E: Engine + ?Sized,
     S: EnvelopeStore,
-    R: Fn(&str) -> Option<Value>,
+    R: Fn(&str) -> Vec<Value>,
 {
     let sign = match record.get("sign").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -297,7 +298,7 @@ fn open_first_contact<E, S, R>(
 where
     E: Engine + ?Sized,
     S: EnvelopeStore,
-    R: Fn(&str) -> Option<Value>,
+    R: Fn(&str) -> Vec<Value>,
 {
     if !engine.first_contact_candidate(secret, tag, ct_vec) {
         return Ok(None);
@@ -309,17 +310,20 @@ where
     // bundle proves it owns that identity key. Only one identity can open a given
     // record (DH2 binds it), so a failed check ends processing (returns Some).
     if let (Some(claimed), Some(ik_a)) = (op.sender_xid.as_deref(), op.ik_a.as_ref()) {
-        match resolve_bundle(claimed) {
-            // Published bundle's IK matches the transcript key → authentic.
-            Some(bundle) if engine.sender_ik(&bundle).as_ref() == Some(ik_a) => {}
-            // Bundle exists but does NOT match → forged sender. Drop for good.
-            Some(_) => {
-                store.mark_processed(h)?;
-                return Ok(Some(ProcessOutcome::NoMatch));
-            }
-            // No published bundle yet → cannot verify. Defer WITHOUT marking
-            // processed, so it becomes indexable once the bundle syncs.
-            None => return Ok(Some(ProcessOutcome::NoMatch)),
+        // Authentic iff the transcript key matches ANY of the sender's published
+        // device bundles (a multi-device sender may seal from any linked key).
+        let matches = resolve_bundle(claimed)
+            .iter()
+            .any(|b| engine.sender_ik(b).as_ref() == Some(ik_a));
+        if !matches {
+            // No matching bundle: either a forgery, or a genuine message from a
+            // device whose bundle this node has not synced YET. We cannot tell
+            // the two apart from the transcript alone, so DEFER (NoMatch, left
+            // unprocessed) rather than dropping for good — a real message becomes
+            // indexable once that device's bundle syncs, while a forgery is simply
+            // re-probed (a bounded, PoW-gated cost) and never trusted. The IK
+            // never matches for a forgery, so it can never be indexed.
+            return Ok(Some(ProcessOutcome::NoMatch));
         }
     }
 

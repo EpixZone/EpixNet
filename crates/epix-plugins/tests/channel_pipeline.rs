@@ -113,7 +113,9 @@ async fn channel_message_flows_through_the_pool_leaking_no_metadata() {
     // --- Bob (a second identity) trial-decrypts the delta record end-to-end. ---
     // The anti-spoof check resolves the sender's (Alice's) published bundle.
     let alice_bundle = engine.publish_bundle(&alice, "alice.epix");
-    let resolve = |xid: &str| (xid == "alice.epix").then(|| alice_bundle.clone());
+    let resolve = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() }
+    };
     let out = process_record(
         &bob_db,
         &engine,

@@ -55,10 +55,12 @@ fn end_to_end_first_contact_and_reply() {
 
     // The node's sealed-sender anti-spoof oracle: resolve a sender's published
     // bundle so process_record can bind the transcript ik_a to a name.
-    let resolve = |xid: &str| match xid {
-        "alice.epix" => Some(alice_bundle.clone()),
-        "bob.epix" => Some(bob_bundle.clone()),
-        _ => None,
+    let resolve = |xid: &str| -> Vec<serde_json::Value> {
+        match xid {
+            "alice.epix" => vec![alice_bundle.clone()],
+            "bob.epix" => vec![bob_bundle.clone()],
+            _ => Vec::new(),
+        }
     };
 
     // Alice sends to Bob.
@@ -160,7 +162,7 @@ fn record_addressed_to_someone_else_does_not_match() {
     // Eve cannot open a record addressed to Bob.
     let out = process_record(
         &eve_db, &e, &[(eve_id, eve, "eve.epix".into())], &sent.record, now,
-        |_: &str| None::<serde_json::Value>,
+        |_: &str| Vec::<serde_json::Value>::new(),
     )
     .unwrap();
     assert_eq!(out, ProcessOutcome::NoMatch);
@@ -217,7 +219,7 @@ fn group_thread_fans_out_with_shared_conv_and_members() {
         (&carol_db, carol_id, carol, "carol.epix", &to_carol.record),
     ];
     for (db, id, secret, my_xid, rec) in recips {
-        let resolve = |xid: &str| (xid == "alice.epix").then(|| alice_bundle.clone());
+        let resolve = |xid: &str| -> Vec<serde_json::Value> { if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() } };
         let out = process_record(db, &e, &[(id, secret, my_xid.into())], rec, now + 10, &resolve)
             .unwrap();
         match out {
@@ -265,7 +267,7 @@ fn first_contact_sender_spoof_is_rejected() {
     // Alice IS a real, published user (so her bundle resolves and its ik differs
     // from Mallory's transcript ik_a) — the check must catch the mismatch.
     let alice_bundle = e.publish_bundle(&alice, "alice.epix");
-    let resolve = |xid: &str| (xid == "alice.epix").then(|| alice_bundle.clone());
+    let resolve = |xid: &str| -> Vec<serde_json::Value> { if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() } };
     let out = process_record(
         &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now + 10, &resolve,
     )
@@ -283,9 +285,101 @@ fn first_contact_sender_spoof_is_rejected() {
     .unwrap();
     let out2 = process_record(
         &bob_db, &e, &[(bob_id, bob, "bob.epix".into())], &sent2.record, now + 10,
-        |_: &str| None::<serde_json::Value>,
+        |_: &str| Vec::<serde_json::Value>::new(),
     )
     .unwrap();
     assert_eq!(out2, ProcessOutcome::NoMatch, "unverifiable sender is deferred, not trusted");
     assert!(bob_db.threads(bob_id, "all", 0, 10).unwrap().is_empty(), "still no thread");
+}
+
+/// Multi-device delivery: a sender with MORE THAN ONE linked identity/device may
+/// seal from any of them, and the receiver's anti-spoof must accept the message
+/// as long as the transcript key matches ONE of the sender's published bundles
+/// (not only the first). It must still refuse a device whose bundle it hasn't
+/// seen — deferring (never falsely attributing), so the message indexes once
+/// that device's bundle syncs.
+#[test]
+fn multi_device_sender_any_linked_key_accepted() {
+    let e = FakeEngine;
+    let r = rule();
+    let now = 1_780_000_000_000i64;
+
+    let alice_db = ChannelDb::memory().unwrap();
+    let bob_db = ChannelDb::memory().unwrap();
+
+    // Alice's TWO devices: distinct secrets → distinct identity keys, same name.
+    let alice_d1 = rand_id();
+    let alice_d2 = rand_id();
+    let bob = rand_id();
+    let alice_d2_id = alice_db.upsert_identity("alice.epix", "epix1a2", 0, None).unwrap();
+    let bob_id = bob_db.upsert_identity("bob.epix", "epix1bob", 0, None).unwrap();
+
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    let d1_bundle = e.publish_bundle(&alice_d1, "alice.epix");
+    let d2_bundle = e.publish_bundle(&alice_d2, "alice.epix");
+    // FakeEngine carries the identity key as `pub`; the real engine uses `ik`.
+    assert_ne!(d1_bundle["pub"], d2_bundle["pub"], "two devices have distinct IKs");
+
+    // Alice sends to Bob FROM DEVICE 2.
+    let sent = send_message(
+        &alice_db, &e, alice_d2_id, &alice_d2, "alice.epix", &[], &bob_bundle, conv16(),
+        "hi", "from my second device ZXQ2", now, &r, true,
+    )
+    .unwrap();
+
+    // Bob has synced BOTH of Alice's device bundles → the device-2 message is
+    // accepted even though device 1 is listed first.
+    let resolve_both = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "alice.epix" { vec![d1_bundle.clone(), d2_bundle.clone()] } else { Vec::new() }
+    };
+    let out = process_record(
+        &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now + 10,
+        &resolve_both,
+    )
+    .unwrap();
+    match out {
+        ProcessOutcome::Indexed { sender_xid, conv_id, .. } => {
+            assert_eq!(sender_xid.as_deref(), Some("alice.epix"));
+            let msgs = bob_db.messages(bob_id, &conv_id).unwrap();
+            assert_eq!(msgs[0]["body"].as_str(), Some("from my second device ZXQ2"));
+        }
+        other => panic!("device-2 message must be accepted, got {other:?}"),
+    }
+
+    // A DIFFERENT node that has synced ONLY device 1's bundle must NOT index the
+    // device-2 message (it can't yet prove the key) — and must DEFER, not drop:
+    // no thread now, but re-probeable once device 2's bundle arrives.
+    let bob2_db = ChannelDb::memory().unwrap();
+    let bob2_id = bob2_db.upsert_identity("bob.epix", "epix1bob", 0, None).unwrap();
+    let bob2 = rand_id();
+    // Re-seal to bob2's bundle so it's addressed to this node.
+    let bob2_bundle = e.publish_bundle(&bob2, "bob.epix");
+    let sent2 = send_message(
+        &alice_db, &e, alice_d2_id, &alice_d2, "alice.epix", &[], &bob2_bundle, conv16(),
+        "hi", "second device again ZXQ3", now, &r, false,
+    )
+    .unwrap();
+    let resolve_d1_only = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "alice.epix" { vec![d1_bundle.clone()] } else { Vec::new() }
+    };
+    let deferred = process_record(
+        &bob2_db, &e, &[(bob2_id, bob2.clone(), "bob.epix".into())], &sent2.record, now + 10,
+        &resolve_d1_only,
+    )
+    .unwrap();
+    assert_eq!(deferred, ProcessOutcome::NoMatch, "unseen device is deferred, not attributed");
+    assert!(bob2_db.threads(bob2_id, "all", 0, 10).unwrap().is_empty(), "no thread while unproven");
+
+    // Once device 2's bundle syncs, the SAME record indexes (deferred, not dropped).
+    let now_indexed = process_record(
+        &bob2_db, &e, &[(bob2_id, bob2, "bob.epix".into())], &sent2.record, now + 20,
+        &resolve_both,
+    )
+    .unwrap();
+    match now_indexed {
+        ProcessOutcome::Indexed { sender_xid, .. } => {
+            assert_eq!(sender_xid.as_deref(), Some("alice.epix"), "indexed after bundle syncs");
+        }
+        other => panic!("deferred message must index once the device bundle syncs, got {other:?}"),
+    }
 }

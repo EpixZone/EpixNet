@@ -2795,6 +2795,21 @@ impl AppState {
         epix_chain::xid_identity::name_has_active_identity(fqdn).await
     }
 
+    /// The chain-attested set of ACTIVE, non-revoked linked-identity addresses
+    /// for `fqdn` (each an `epix1…` device/key the name currently authorizes).
+    /// Empty means either "chain unreachable/unregistered" or "all revoked" —
+    /// callers must NOT treat empty as "definitely revoked"; use
+    /// [`Self::xid_name_active`] for that three-valued question and reserve this
+    /// for the finer per-device refinement (drop a bundle only when its `auth`
+    /// is positively absent from a NON-empty set).
+    pub async fn xid_active_addrs(&self, fqdn: &str) -> Vec<String> {
+        let Some((name, tld)) = fqdn.rsplit_once('.') else { return Vec::new() };
+        if name.is_empty() || tld.is_empty() {
+            return Vec::new();
+        }
+        epix_chain::xid_signers::resolve(name, tld).await
+    }
+
     /// Clear every xID resolution cache, so the next visit to any `.epix` name
     /// does a fresh chain lookup instead of reusing a remembered address:
     ///   - the on-disk resolve cache (`resolve-cache.json`),

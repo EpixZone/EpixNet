@@ -104,26 +104,88 @@ async fn build_identities(
 /// Every user's published key bundle on the xite, keyed by normalized xid. The
 /// map is bounded by the number of xite users; used by the first-contact
 /// anti-spoof check (sender_xid → bundle.ik).
+/// The per-device bundle filename for a linked-identity address. `epix1…`
+/// addresses are bech32 (`[0-9a-z]` only), so this is filesystem- and
+/// permission-regex-safe: `data-<auth>.json` matches `data-[0-9a-z]+\.json`.
+fn device_bundle_file(auth: &str) -> String {
+    let safe: String = auth.chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).collect();
+    format!("data-{safe}.json")
+}
+
+/// Whether `path` is a channel key-bundle file (`data/users/<dir>/data.json`
+/// or a per-device `.../data-<auth>.json`), returning `(dir, filename)`.
+fn bundle_path_parts(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("data/users/")?;
+    let (dir, file) = rest.rsplit_once('/')?;
+    if dir.contains('/') {
+        return None; // only the immediate user directory
+    }
+    let is_bundle =
+        file == "data.json" || (file.starts_with("data-") && file.ends_with(".json"));
+    is_bundle.then_some((dir, file))
+}
+
+/// Every currently-published key bundle, grouped by xID name → the name's active
+/// device bundles. A name may publish MORE THAN ONE bundle (one per linked
+/// identity/device); a send fans out to all of them and the anti-spoof accepts
+/// any. Revocation is honored two ways, both fail-OPEN when the chain is down:
+///   - name-level: drop every bundle of a name with NO active linked identity;
+///   - per-device: when the chain returns a NON-empty active-address set, drop a
+///     bundle whose own `auth` is positively absent from it (that one device was
+///     revoked while its siblings stayed valid).
 async fn load_published_bundles(
     state: &Arc<AppState>,
     xite: &str,
-) -> std::collections::HashMap<String, Value> {
-    let mut bundles = std::collections::HashMap::new();
+) -> std::collections::HashMap<String, Vec<Value>> {
+    let mut by_name: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
     for path in state.list_xite_files(xite).await {
-        let Some(rest) = path.strip_prefix("data/users/") else { continue };
-        let Some(dir) = rest.strip_suffix("/data.json") else { continue };
+        let Some((dir, _file)) = bundle_path_parts(&path) else { continue };
         let Some(bytes) = state.read_xite_file(xite, &path).await else { continue };
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
         let key = norm_xid(v.get("xid").and_then(|x| x.as_str()).unwrap_or(dir));
-        // Honor on-chain revocation: drop a bundle whose xID has NO active linked
-        // identity. Fail OPEN on an indeterminate result (chain unreachable /
-        // unregistered) so mail keeps working when the chain is down.
-        if state.xid_name_active(&key).await == Some(false) {
-            continue;
-        }
-        bundles.insert(key, v);
+        by_name.entry(key).or_default().push(v);
     }
-    bundles
+    // Apply revocation per name (one chain lookup each, both cached).
+    let mut out: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    for (name, devs) in by_name {
+        if state.xid_name_active(&name).await == Some(false) {
+            continue; // whole name revoked
+        }
+        let active = state.xid_active_addrs(&name).await;
+        let devs = refine_device_bundles(devs, &active);
+        if !devs.is_empty() {
+            out.insert(name, devs);
+        }
+    }
+    out
+}
+
+/// Filter one name's raw device bundles down to the usable, deduplicated set:
+///   - per-device revocation: when `active` is NON-empty (a positively-known
+///     active-signer set), drop a bundle whose own `auth` is absent from it; a
+///     legacy bundle with no `auth`, or an empty/indeterminate `active`, is kept
+///     (fail open — the name-level gate already handled full revocation);
+///   - dedup by identity key, keeping the FRESHEST (highest `spk_idx`) copy so a
+///     rotated prekey wins over a stale `data.json` left beside `data-<auth>.json`.
+fn refine_device_bundles(mut devs: Vec<Value>, active: &[String]) -> Vec<Value> {
+    if !active.is_empty() {
+        devs.retain(|b| match b.get("auth").and_then(|a| a.as_str()) {
+            Some(auth) => active.iter().any(|a| a == auth),
+            None => true,
+        });
+    }
+    devs.sort_by(|a, b| {
+        let sk = |v: &Value| v.get("spk_idx").and_then(|x| x.as_u64()).unwrap_or(0);
+        sk(b).cmp(&sk(a))
+    });
+    let mut seen = std::collections::HashSet::new();
+    devs.retain(|b| match b.get("ik").and_then(|k| k.as_str()) {
+        Some(ik) => seen.insert(ik.to_string()),
+        None => false, // a bundle with no IK is unusable
+    });
+    devs
 }
 
 async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec<Value>) -> bool {
@@ -139,7 +201,8 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
     let bundles = load_published_bundles(state, &ms.xite).await;
 
     let (events, new_session) = tokio::task::spawn_blocking(move || {
-        let resolve = |xid: &str| -> Option<Value> { bundles.get(&norm_xid(xid)).cloned() };
+        let resolve =
+            |xid: &str| -> Vec<Value> { bundles.get(&norm_xid(xid)).cloned().unwrap_or_default() };
         let mut out: Vec<Value> = Vec::new();
         let mut new_session = false;
         for rec in &records {
@@ -462,12 +525,30 @@ impl WsCommand for ChannelKeyBundlePublish {
         let auth = s.state.xite_auth_address(&ms.xite).await.ok_or("no identity for this xite")?;
         let xid = s.state.user_directory(&ms.xite, &auth).await;
         let seed = s.state.derive_consumer_seed("channel", &auth).await;
-        let bundle = ms.engine.publish_bundle(&IdentitySecret::new(seed), &xid);
+        let mut bundle = ms.engine.publish_bundle(&IdentitySecret::new(seed), &xid);
+        // Stamp the device's linked-identity address so the reader can (a) fan a
+        // send out to every one of a name's devices and (b) drop just the one
+        // device whose linked key was revoked on chain (per-device revocation).
+        if let Some(obj) = bundle.as_object_mut() {
+            obj.insert("auth".into(), json!(auth));
+        }
         ms.db
             .upsert_identity(&xid, &auth, 0, Some(&bundle.to_string()))
             .map_err(|e| e.to_string())?;
-        // The site writes this to `data/users/<xid>/data.json` and signs it.
-        Ok(json!({ "ok": true, "xid": xid, "bundle": bundle }))
+        // Cutover-safe multi-device: the site publishes to the primary
+        // `data/users/<xid>/data.json` when that slot is free or already this
+        // device's (so nodes that only read `data.json` keep working), and to the
+        // per-device `device_path` only when a DIFFERENT device already holds the
+        // primary slot — so two devices never clobber each other.
+        let device_path = format!("data/users/{xid}/{}", device_bundle_file(&auth));
+        Ok(json!({
+            "ok": true,
+            "xid": xid,
+            "auth": auth,
+            "primary_path": format!("data/users/{xid}/data.json"),
+            "device_path": device_path,
+            "bundle": bundle,
+        }))
     }
 }
 
@@ -484,6 +565,9 @@ impl WsCommand for ChannelKeyLookup {
             .and_then(|a| a.first())
             .and_then(|v| v.as_array())
             .ok_or("channelKeyLookup: [xids] required")?;
+        // One resolve covers every looked-up name: grouped, active-filtered,
+        // deduped device bundles (the same view the send fan-out uses).
+        let published = load_published_bundles(&s.state, &ms.xite).await;
         let mut out = serde_json::Map::new();
         for x in xids {
             let Some(xid) = x.as_str() else { continue };
@@ -491,14 +575,14 @@ impl WsCommand for ChannelKeyLookup {
             // A revoked identity has no usable bundle, even if a stale data.json
             // is still on disk (fail open on an indeterminate chain result).
             let revoked = s.state.xid_name_active(&dir).await == Some(false);
-            let has = !revoked
-                && s.state
-                    .read_xite_file(&ms.xite, &format!("data/users/{dir}/data.json"))
-                    .await
-                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                    .map(|bundle| ms.engine.verify_bundle(&bundle))
-                    .unwrap_or(false);
-            out.insert(dir, json!({ "has_bundle": has, "revoked": revoked }));
+            let devices = published
+                .get(&dir)
+                .map(|d| d.iter().filter(|b| ms.engine.verify_bundle(b)).count())
+                .unwrap_or(0);
+            out.insert(
+                dir,
+                json!({ "has_bundle": !revoked && devices > 0, "revoked": revoked, "devices": devices }),
+            );
         }
         Ok(Value::Object(out))
     }
@@ -573,64 +657,80 @@ impl WsCommand for ChannelSend {
         // reuse an AEAD nonce and a detection tag). Held until this send returns.
         let _send_guard = ms.send_lock.lock().await;
 
+        // One resolve of every published bundle (grouped per name, active-filtered,
+        // deduped) drives the fan-out: a recipient with N linked devices gets N
+        // sealed envelopes — one per device bundle — so whichever device they read
+        // on can open the mail. Unlinkable to each other; sharing conv + members.
+        let published = load_published_bundles(&s.state, &ms.xite).await;
         let mut records: Vec<Value> = Vec::new();
-        for (i, recip) in recipients.iter().enumerate() {
+        let mut first_leg = true; // the sender's own copy is recorded on leg #0 only
+        for recip in recipients.iter() {
             // Don't seal to a recipient whose xID has been revoked on chain (fail
             // open on an indeterminate result so a chain outage doesn't block mail).
             if s.state.xid_name_active(recip).await == Some(false) {
                 return Err(format!("{recip}'s identity has been revoked"));
             }
-            let bundle_bytes = s
-                .state
-                .read_xite_file(&ms.xite, &format!("data/users/{recip}/data.json"))
-                .await
-                .ok_or_else(|| format!("{recip} has not published channel keys"))?;
-            let bundle: Value = serde_json::from_slice(&bundle_bytes).map_err(|e| e.to_string())?;
-            if !ms.engine.verify_bundle(&bundle) {
-                return Err(format!("{recip} has an invalid channel key bundle"));
+            let devices: Vec<Value> = published
+                .get(recip)
+                .into_iter()
+                .flatten()
+                .filter(|b| ms.engine.verify_bundle(b))
+                .cloned()
+                .collect();
+            if devices.is_empty() {
+                return Err(format!("{recip} has not published channel keys"));
             }
-            // Sealing runs a proof-of-work that is seconds of hashing at
-            // production `pow_bits`. Doing it inline would pin an async runtime
-            // worker for the whole solve and starve every other connection, so
-            // run the (fully synchronous) seal on the blocking pool. Record the
-            // sender's own copy exactly once (on the first leg).
-            let db = ms.db.clone();
-            let engine = ms.engine.clone();
-            let secret = secret.clone();
-            let my_xid_c = my_xid.clone();
-            let members_c = members.clone();
-            let rule_c = rule.clone();
-            let subject_c = subject.to_string();
-            let body_c = body.to_string();
-            let record_own = i == 0;
-            let now = now_ms();
-            let res = tokio::task::spawn_blocking(move || {
-                epix_envelope::send_message(
-                    db.as_ref(),
-                    engine.as_ref(),
-                    identity_id,
-                    &secret,
-                    &my_xid_c,
-                    &members_c,
-                    &bundle,
-                    conv,
-                    &subject_c,
-                    &body_c,
-                    now,
-                    &rule_c,
-                    record_own,
-                )
-            })
-            .await
-            .map_err(|e| format!("channelSend seal task failed: {e}"))?
-            .map_err(|e| e.to_string())?;
-            records.push(res.record);
+            for bundle in devices {
+                // Sealing runs a proof-of-work that is seconds of hashing at
+                // production `pow_bits`. Doing it inline would pin an async runtime
+                // worker for the whole solve and starve every other connection, so
+                // run the (fully synchronous) seal on the blocking pool.
+                let db = ms.db.clone();
+                let engine = ms.engine.clone();
+                let secret = secret.clone();
+                let my_xid_c = my_xid.clone();
+                let members_c = members.clone();
+                let rule_c = rule.clone();
+                let subject_c = subject.to_string();
+                let body_c = body.to_string();
+                let record_own = first_leg;
+                first_leg = false;
+                let now = now_ms();
+                let res = tokio::task::spawn_blocking(move || {
+                    epix_envelope::send_message(
+                        db.as_ref(),
+                        engine.as_ref(),
+                        identity_id,
+                        &secret,
+                        &my_xid_c,
+                        &members_c,
+                        &bundle,
+                        conv,
+                        &subject_c,
+                        &body_c,
+                        now,
+                        &rule_c,
+                        record_own,
+                    )
+                })
+                .await
+                .map_err(|e| format!("channelSend seal task failed: {e}"))?
+                .map_err(|e| e.to_string())?;
+                records.push(res.record);
+            }
         }
         // Append + flood each fan-out envelope.
+        let envelopes = records.len();
         for record in records {
             s.state.clone().append_pool_record(&ms.xite, record).await?;
         }
-        Ok(json!({ "ok": true, "conv_id": hex::encode(conv), "recipients": recipients.len() }))
+        // `envelopes` ≥ `recipients` when a recipient has multiple linked devices.
+        Ok(json!({
+            "ok": true,
+            "conv_id": hex::encode(conv),
+            "recipients": recipients.len(),
+            "envelopes": envelopes,
+        }))
     }
 }
 
@@ -787,5 +887,73 @@ impl WsCommand for ChannelMigrateLegacy {
             "skipped": report.skipped,
             "scanned": report.scanned,
         }))
+    }
+}
+
+#[cfg(test)]
+mod multi_device_tests {
+    use super::{bundle_path_parts, device_bundle_file, refine_device_bundles};
+    use serde_json::json;
+
+    #[test]
+    fn device_filename_is_regex_safe() {
+        // bech32 stays as-is; any stray char is stripped so it matches the
+        // site's `data-[0-9a-z]+\.json` permission rule.
+        // A real lowercase bech32 address passes through unchanged.
+        assert_eq!(device_bundle_file("epix1abc0"), "data-epix1abc0.json");
+        // Any path-traversal / non-[0-9a-z] char is stripped (defense in depth).
+        assert_eq!(device_bundle_file("epix1abc/../x"), "data-epix1abcx.json");
+    }
+
+    #[test]
+    fn bundle_path_parts_matches_data_and_per_device() {
+        assert_eq!(bundle_path_parts("data/users/mud.epix/data.json"), Some(("mud.epix", "data.json")));
+        assert_eq!(
+            bundle_path_parts("data/users/mud.epix/data-epix1x.json"),
+            Some(("mud.epix", "data-epix1x.json"))
+        );
+        // Not a bundle file / not directly under a user dir.
+        assert_eq!(bundle_path_parts("data/users/mud.epix/content.json"), None);
+        assert_eq!(bundle_path_parts("data/users/mud.epix/sub/data.json"), None);
+        assert_eq!(bundle_path_parts("content.json"), None);
+    }
+
+    fn dev(auth: &str, ik: &str, spk_idx: u64) -> serde_json::Value {
+        json!({ "v": 2, "xid": "mud.epix", "auth": auth, "ik": ik, "spk": "s", "spk_idx": spk_idx })
+    }
+
+    #[test]
+    fn keeps_all_devices_when_active_set_indeterminate() {
+        // Empty `active` = chain down / unregistered → fail open, keep both devices.
+        let devs = vec![dev("epix1a", "IKA", 1), dev("epix1b", "IKB", 1)];
+        let out = refine_device_bundles(devs, &[]);
+        assert_eq!(out.len(), 2, "both devices kept when the active set is unknown");
+    }
+
+    #[test]
+    fn drops_only_the_revoked_device() {
+        // Device B's key was revoked; A stays. Per-device revocation.
+        let devs = vec![dev("epix1a", "IKA", 1), dev("epix1b", "IKB", 1)];
+        let out = refine_device_bundles(devs, &["epix1a".to_string()]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["ik"], "IKA", "only the still-active device survives");
+    }
+
+    #[test]
+    fn legacy_bundle_without_auth_is_kept() {
+        // A pre-multi-device bundle (no `auth`) must not be dropped by the filter.
+        let legacy = json!({ "v": 2, "xid": "mud.epix", "ik": "IKL", "spk": "s", "spk_idx": 3 });
+        let out = refine_device_bundles(vec![legacy], &["epix1a".to_string()]);
+        assert_eq!(out.len(), 1, "legacy no-auth bundle survives the per-device filter");
+    }
+
+    #[test]
+    fn dedups_same_ik_keeping_freshest_spk() {
+        // Same device published as legacy `data.json` (spk 1) and `data-<auth>.json`
+        // (spk 5). Collapse to one, keeping the newer prekey.
+        let devs = vec![dev("epix1a", "IKA", 1), dev("epix1a", "IKA", 5)];
+        let out = refine_device_bundles(devs, &[]);
+        assert_eq!(out.len(), 1, "duplicate IK collapsed");
+        assert_eq!(out[0]["spk_idx"], 5, "freshest prekey wins");
     }
 }
