@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use epix_channel::ChannelDb;
-use epix_envelope::{process_record, send_message, Engine, IdentitySecret, ProcessOutcome};
+use epix_envelope::{process_record_one, send_message, Engine, IdentitySecret, ProcessOutcome};
 use epix_pairwise_engine::PairwiseEngine;
 use epix_ui::state::{AppState, XiteEntry};
 use epix_xite::XiteStorage;
@@ -116,7 +116,7 @@ async fn channel_message_flows_through_the_pool_leaking_no_metadata() {
     let resolve = |xid: &str| -> Vec<serde_json::Value> {
         if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() }
     };
-    let out = process_record(
+    let out = process_record_one(
         &bob_db,
         &engine,
         &[(bob_id, bob.clone(), "bob.epix".into())],

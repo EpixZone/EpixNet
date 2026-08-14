@@ -20,3 +20,4 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"

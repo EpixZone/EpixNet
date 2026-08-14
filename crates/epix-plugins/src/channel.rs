@@ -206,31 +206,37 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
         let mut out: Vec<Value> = Vec::new();
         let mut new_session = false;
         for rec in &records {
-            if let Ok(ProcessOutcome::Indexed {
-                conv_id,
-                sender_xid,
-                subject,
-                snippet,
-                unread,
-                first_contact,
-                pending,
-                ..
-            }) = epix_envelope::process_record(&db, engine.as_ref(), &identities, rec, now, &resolve)
-            {
-                if first_contact {
-                    new_session = true;
+            // One record can now deliver to SEVERAL local identities (one slot
+            // each), so process_record returns a Vec — fire an event per message.
+            let outcomes = epix_envelope::process_record(&db, engine.as_ref(), &identities, rec, now, &resolve)
+                .unwrap_or_default();
+            for outcome in outcomes {
+                if let ProcessOutcome::Indexed {
+                    conv_id,
+                    sender_xid,
+                    subject,
+                    snippet,
+                    unread,
+                    first_contact,
+                    pending,
+                    ..
+                } = outcome
+                {
+                    if first_contact {
+                        new_session = true;
+                    }
+                    out.push(json!({
+                        "type": "new_message",
+                        "conv_id": conv_id,
+                        "from_xid": sender_xid,
+                        "subject": subject,
+                        "snippet": snippet,
+                        "unread": unread,
+                        // >0 means earlier messages in this conversation are still
+                        // arriving (received out of order) — a delivery-gap hint.
+                        "pending": pending,
+                    }));
                 }
-                out.push(json!({
-                    "type": "new_message",
-                    "conv_id": conv_id,
-                    "from_xid": sender_xid,
-                    "subject": subject,
-                    "snippet": snippet,
-                    "unread": unread,
-                    // >0 means earlier messages in this conversation are still
-                    // arriving (received out of order) — a delivery-gap hint.
-                    "pending": pending,
-                }));
             }
         }
         (out, new_session)

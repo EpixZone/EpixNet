@@ -61,10 +61,12 @@ pub struct InboundCommit {
 /// indexer and send path need — nothing app-specific (threads, search, folders)
 /// belongs here; those stay on the concrete store.
 pub trait EnvelopeStore {
-    /// Whether a pool signature (16-byte prefix) has already been indexed.
-    fn is_processed(&self, sign_h: &[u8]) -> Result<bool>;
-    /// Record a signature as processed (for records matching no identity).
-    fn mark_processed(&self, sign_h: &[u8]) -> Result<()>;
+    /// Whether a pool signature (16-byte prefix) has already been indexed FOR
+    /// `identity_id`. Per-identity because one count-hiding record carries slots
+    /// for several recipients, so it can deliver once per local identity.
+    fn is_processed(&self, sign_h: &[u8], identity_id: i64) -> Result<bool>;
+    /// Record a signature as processed for one identity.
+    fn mark_processed(&self, sign_h: &[u8], identity_id: i64) -> Result<()>;
     /// Find the session an inbound tag is expected by (Tier-1 O(1) lookup).
     fn session_for_tag(&self, tag: &[u8]) -> Result<Option<SessionMatch>>;
     /// The raw ratchet blob of a session.

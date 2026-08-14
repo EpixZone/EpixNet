@@ -3,8 +3,8 @@
 
 use epix_content::pool::{self, PoolRule};
 use epix_envelope::{
-    process_record, send_message, send_multi, Dest, Engine, FakeEngine, IdentitySecret,
-    ProcessOutcome, SLOTS,
+    process_record, process_record_one, send_message, send_multi, Dest, Engine, FakeEngine,
+    IdentitySecret, ProcessOutcome, SLOTS,
 };
 use epix_channel::ChannelDb;
 
@@ -89,7 +89,7 @@ fn end_to_end_first_contact_and_reply() {
     assert_eq!(alice_db.messages(alice_id, &hex::encode(conv)).unwrap().len(), 1);
 
     // Bob processes the record → first contact indexed.
-    let out = process_record(
+    let out = process_record_one(
         &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now + 10,
         &resolve,
     )
@@ -111,12 +111,14 @@ fn end_to_end_first_contact_and_reply() {
     assert_eq!(msgs[0]["body"].as_str(), Some("pizza at eight ZXQ1"));
     assert_eq!(bob_db.search(bob_id, "pizza", 10).unwrap().len(), 1);
 
-    // Reprocessing is idempotent.
+    // Reprocessing is idempotent: the record is `processed` for bob's identity, so
+    // a rescan delivers nothing new (empty → NoMatch) and no duplicate row appears.
     assert_eq!(
-        process_record(&bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now, &resolve)
+        process_record_one(&bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now, &resolve)
             .unwrap(),
-        ProcessOutcome::AlreadyProcessed
+        ProcessOutcome::NoMatch
     );
+    assert_eq!(bob_db.messages(bob_id, &bob_conv).unwrap().len(), 1, "no duplicate on rescan");
 
     // Bob replies; Alice detects it via Tier-1 (her begin tags).
     let conv_arr: [u8; 16] = hex::decode(&bob_conv).unwrap().try_into().unwrap();
@@ -125,7 +127,7 @@ fn end_to_end_first_contact_and_reply() {
         "sounds good", now + 100, &r, true,
     )
     .unwrap();
-    let out2 = process_record(
+    let out2 = process_record_one(
         &alice_db, &e, &[(alice_id, alice.clone(), "alice.epix".into())], &reply.record, now + 110,
         &resolve,
     )
@@ -161,7 +163,7 @@ fn record_addressed_to_someone_else_does_not_match() {
     .unwrap();
 
     // Eve cannot open a record addressed to Bob.
-    let out = process_record(
+    let out = process_record_one(
         &eve_db, &e, &[(eve_id, eve, "eve.epix".into())], &sent.record, now,
         |_: &str| Vec::<serde_json::Value>::new(),
     )
@@ -221,7 +223,7 @@ fn group_thread_fans_out_with_shared_conv_and_members() {
     ];
     for (db, id, secret, my_xid, rec) in recips {
         let resolve = |xid: &str| -> Vec<serde_json::Value> { if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() } };
-        let out = process_record(db, &e, &[(id, secret, my_xid.into())], rec, now + 10, &resolve)
+        let out = process_record_one(db, &e, &[(id, secret, my_xid.into())], rec, now + 10, &resolve)
             .unwrap();
         match out {
             ProcessOutcome::Indexed { conv_id, subject, .. } => {
@@ -269,7 +271,7 @@ fn first_contact_sender_spoof_is_rejected() {
     // from Mallory's transcript ik_a) — the check must catch the mismatch.
     let alice_bundle = e.publish_bundle(&alice, "alice.epix");
     let resolve = |xid: &str| -> Vec<serde_json::Value> { if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() } };
-    let out = process_record(
+    let out = process_record_one(
         &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now + 10, &resolve,
     )
     .unwrap();
@@ -284,7 +286,7 @@ fn first_contact_sender_spoof_is_rejected() {
         "unverifiable", now, &r, true,
     )
     .unwrap();
-    let out2 = process_record(
+    let out2 = process_record_one(
         &bob_db, &e, &[(bob_id, bob, "bob.epix".into())], &sent2.record, now + 10,
         |_: &str| Vec::<serde_json::Value>::new(),
     )
@@ -333,7 +335,7 @@ fn multi_device_sender_any_linked_key_accepted() {
     let resolve_both = |xid: &str| -> Vec<serde_json::Value> {
         if xid == "alice.epix" { vec![d1_bundle.clone(), d2_bundle.clone()] } else { Vec::new() }
     };
-    let out = process_record(
+    let out = process_record_one(
         &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &sent.record, now + 10,
         &resolve_both,
     )
@@ -363,7 +365,7 @@ fn multi_device_sender_any_linked_key_accepted() {
     let resolve_d1_only = |xid: &str| -> Vec<serde_json::Value> {
         if xid == "alice.epix" { vec![d1_bundle.clone()] } else { Vec::new() }
     };
-    let deferred = process_record(
+    let deferred = process_record_one(
         &bob2_db, &e, &[(bob2_id, bob2.clone(), "bob.epix".into())], &sent2.record, now + 10,
         &resolve_d1_only,
     )
@@ -372,7 +374,7 @@ fn multi_device_sender_any_linked_key_accepted() {
     assert!(bob2_db.threads(bob2_id, "all", 0, 10).unwrap().is_empty(), "no thread while unproven");
 
     // Once device 2's bundle syncs, the SAME record indexes (deferred, not dropped).
-    let now_indexed = process_record(
+    let now_indexed = process_record_one(
         &bob2_db, &e, &[(bob2_id, bob2, "bob.epix".into())], &sent2.record, now + 20,
         &resolve_both,
     )
@@ -467,7 +469,7 @@ fn multislot_one_record_reaches_multiple_recipients() {
         if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() }
     };
     // Bob opens HIS slot in the shared record.
-    let ob = process_record(&bob_db, &e, &[(bob_id, bob, "bob.epix".into())], &sent.record, now + 10, &resolve).unwrap();
+    let ob = process_record_one(&bob_db, &e, &[(bob_id, bob, "bob.epix".into())], &sent.record, now + 10, &resolve).unwrap();
     match ob {
         ProcessOutcome::Indexed { sender_xid, conv_id, .. } => {
             assert_eq!(sender_xid.as_deref(), Some("alice.epix"));
@@ -476,7 +478,7 @@ fn multislot_one_record_reaches_multiple_recipients() {
         other => panic!("bob must index his slot of the shared record, got {other:?}"),
     }
     // Carol opens HER slot in the SAME record.
-    let oc = process_record(&carol_db, &e, &[(carol_id, carol, "carol.epix".into())], &sent.record, now + 10, &resolve).unwrap();
+    let oc = process_record_one(&carol_db, &e, &[(carol_id, carol, "carol.epix".into())], &sent.record, now + 10, &resolve).unwrap();
     match oc {
         ProcessOutcome::Indexed { sender_xid, conv_id, .. } => {
             assert_eq!(sender_xid.as_deref(), Some("alice.epix"));
@@ -489,4 +491,70 @@ fn multislot_one_record_reaches_multiple_recipients() {
 fn base64_decode(s: &str) -> Vec<u8> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
+/// The Defect-A fix: a node hosting TWO channel identities, both addressed in the
+/// SAME count-hiding record, delivers the message to BOTH (one inbox row each) —
+/// not just the first. Idempotency is per (record, identity), so a rescan adds no
+/// duplicates and doesn't lose the second identity.
+#[test]
+fn one_record_delivers_to_two_local_identities() {
+    let e = FakeEngine;
+    let r = rule();
+    let now = 1_780_000_000_000i64;
+
+    // One node, ONE private index, TWO channel identities (two personas).
+    let node_db = ChannelDb::memory().unwrap();
+    let id_mud = node_db.upsert_identity("mud.epix", "epix1mud", 0, None).unwrap();
+    let id_work = node_db.upsert_identity("work.epix", "epix1work", 0, None).unwrap();
+    let mud = rand_id();
+    let work = rand_id();
+    let mud_bundle = e.publish_bundle(&mud, "mud.epix");
+    let work_bundle = e.publish_bundle(&work, "work.epix");
+
+    // Bob (separate node) sends ONE record addressed to BOTH of the node's identities.
+    let bob_db = ChannelDb::memory().unwrap();
+    let bob = rand_id();
+    let bob_id = bob_db.upsert_identity("bob.epix", "epix1bob", 0, None).unwrap();
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    let members = vec!["bob.epix".to_string(), "mud.epix".into(), "work.epix".into()];
+    let conv = conv16();
+    let conv_hex = hex::encode(conv);
+    let sent = send_multi(
+        &bob_db, &e, bob_id, &bob, "bob.epix", &members,
+        &[Dest { bundle: mud_bundle }, Dest { bundle: work_bundle }],
+        conv, "Hi", "for both personas ZXQ", now, &r, true,
+    )
+    .unwrap();
+
+    let resolve = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "bob.epix" { vec![bob_bundle.clone()] } else { Vec::new() }
+    };
+    let identities = [
+        (id_mud, mud, "mud.epix".to_string()),
+        (id_work, work, "work.epix".to_string()),
+    ];
+    let outcomes = process_record(&node_db, &e, &identities, &sent.record, now + 10, &resolve).unwrap();
+
+    // BOTH identities got the message — one outcome each.
+    assert_eq!(outcomes.len(), 2, "one record delivers to both local identities");
+    let mut got: Vec<i64> = outcomes
+        .iter()
+        .map(|o| match o {
+            ProcessOutcome::Indexed { identity_id, .. } => *identity_id,
+            other => panic!("expected Indexed, got {other:?}"),
+        })
+        .collect();
+    got.sort();
+    let mut want = vec![id_mud, id_work];
+    want.sort();
+    assert_eq!(got, want, "both mud and work identities delivered");
+    assert_eq!(node_db.messages(id_mud, &conv_hex).unwrap().len(), 1);
+    assert_eq!(node_db.messages(id_work, &conv_hex).unwrap().len(), 1);
+
+    // Rescan is idempotent for BOTH identities — no duplicates, none lost.
+    let again = process_record(&node_db, &e, &identities, &sent.record, now + 20, &resolve).unwrap();
+    assert!(again.is_empty(), "rescan delivers nothing new to either identity");
+    assert_eq!(node_db.messages(id_mud, &conv_hex).unwrap().len(), 1);
+    assert_eq!(node_db.messages(id_work, &conv_hex).unwrap().len(), 1);
 }

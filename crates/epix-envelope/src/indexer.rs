@@ -115,68 +115,104 @@ pub fn process_record<E, S, R>(
     record: &Value,
     now_ms: i64,
     resolve_bundle: R,
+) -> Result<Vec<ProcessOutcome>>
+where
+    E: Engine + ?Sized,
+    S: EnvelopeStore,
+    R: Fn(&str) -> Vec<Value>,
+{
+    let Some(sign) = record.get("sign").and_then(|v| v.as_str()) else {
+        return Ok(Vec::new());
+    };
+    let h = sign_h(sign);
+
+    // The record's public `tag` is a random routing value; the real detection
+    // tags live inside the multi-slot `ct` (see `multislot`). Unpack it into
+    // SLOTS (tag, keyslot) pairs plus the one shared body. A record that isn't a
+    // well-formed multi-slot ct (foreign/truncated) is never ours — return nothing
+    // WITHOUT marking processed (a truncated sync may complete later).
+    let Some(ct_vec) = record.get("ct").and_then(|v| v.as_str()).and_then(b64d) else {
+        return Ok(Vec::new());
+    };
+    let Some(unpacked) = crate::multislot::unpack_ct(&ct_vec) else {
+        return Ok(Vec::new());
+    };
+    let epoch = record.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    // A single count-hiding record carries up to SLOTS recipient slots, so a node
+    // hosting more than one channel identity can legitimately deliver it to SEVERAL
+    // local identities — one message each. Scan every identity; idempotency and
+    // "processed" are keyed per identity, so an undelivered slot for one identity is
+    // re-checked independently of another's delivered slot in the same record.
+    let mut outcomes = Vec::new();
+    let mut delivered: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    // Tier 1 — established session: each session tag belongs to a specific
+    // identity. O(SLOTS) hashset lookups; open the keyslot whose tag we expect.
+    for (j, tag) in unpacked.tags.iter().enumerate() {
+        let tag_vec = tag.to_vec();
+        if let Some(sm) = store.session_for_tag(&tag_vec)? {
+            if delivered.contains(&sm.identity_id) || store.is_processed(&h, sm.identity_id)? {
+                continue;
+            }
+            if let Some(out) = open_established(
+                store, engine, &sm, tag, &tag_vec, &unpacked.keyslots[j], &unpacked.body_ct, &h,
+                epoch, now_ms,
+            )? {
+                delivered.insert(sm.identity_id);
+                outcomes.push(out);
+            }
+            // `None` = tag matched but the ratchet couldn't open it: leave the
+            // identity undelivered so Tier-2 can still probe it.
+        }
+    }
+
+    // Tier 2 — first contact: for each identity not already delivered/processed,
+    // probe each slot. A dummy slot's random keyslot fails `open_first` and is
+    // skipped cheaply; the anti-spoof defers by returning `None`, which lets the
+    // scan continue to other slots rather than aborting the record.
+    for (identity_id, secret, _my_xid) in identities {
+        if delivered.contains(identity_id) || store.is_processed(&h, *identity_id)? {
+            continue;
+        }
+        for (j, tag) in unpacked.tags.iter().enumerate() {
+            if let Some(out) = open_first_contact(
+                store, engine, *identity_id, secret, tag, &unpacked.keyslots[j], &unpacked.body_ct,
+                &h, epoch, now_ms, &resolve_bundle,
+            )? {
+                delivered.insert(*identity_id);
+                outcomes.push(out);
+                break; // one slot per identity
+            }
+        }
+    }
+
+    // Empty = nothing delivered; the record is left unprocessed so a session or
+    // bundle that syncs later makes it matchable on the next rescan.
+    Ok(outcomes)
+}
+
+/// Convenience for callers/tests that expect a record to deliver to at most one
+/// local identity (the single-identity-per-node norm): the first outcome, or
+/// [`ProcessOutcome::NoMatch`] if nothing was delivered.
+#[allow(clippy::too_many_arguments)]
+pub fn process_record_one<E, S, R>(
+    store: &S,
+    engine: &E,
+    identities: &[(i64, IdentitySecret, String)],
+    record: &Value,
+    now_ms: i64,
+    resolve_bundle: R,
 ) -> Result<ProcessOutcome>
 where
     E: Engine + ?Sized,
     S: EnvelopeStore,
     R: Fn(&str) -> Vec<Value>,
 {
-    let sign = match record.get("sign").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return Ok(ProcessOutcome::NoMatch),
-    };
-    let h = sign_h(sign);
-    if store.is_processed(&h)? {
-        return Ok(ProcessOutcome::AlreadyProcessed);
-    }
-
-    // The record's public `tag` is a random routing value; the real detection
-    // tags live inside the multi-slot `ct` (see `multislot`). Unpack it into
-    // SLOTS (tag, keyslot) pairs plus the one shared body.
-    let Some(ct_vec) = record.get("ct").and_then(|v| v.as_str()).and_then(b64d) else {
-        store.mark_processed(&h)?;
-        return Ok(ProcessOutcome::NoMatch);
-    };
-    let Some(unpacked) = crate::multislot::unpack_ct(&ct_vec) else {
-        // Not a well-formed multi-slot record (foreign/truncated). It can never be
-        // ours; don't mark processed (a truncated sync may complete later).
-        return Ok(ProcessOutcome::NoMatch);
-    };
-    let epoch = record.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
-
-    // Tier 1 — established session: scan the SLOTS detection tags (O(SLOTS)
-    // hashset lookups) and open the one keyslot whose tag we expect.
-    for (j, tag) in unpacked.tags.iter().enumerate() {
-        let tag_vec = tag.to_vec();
-        if let Some(sm) = store.session_for_tag(&tag_vec)? {
-            if let Some(out) = open_established(
-                store, engine, &sm, tag, &tag_vec, &unpacked.keyslots[j], &unpacked.body_ct, &h,
-                epoch, now_ms,
-            )? {
-                return Ok(out);
-            }
-            // Tag matched but the ratchet couldn't open it: fall through.
-        }
-    }
-
-    // Tier 2 — first contact: probe each slot for each local identity. Only a
-    // record that missed Tier-1 reaches here; a dummy slot's random keyslot fails
-    // `open_first` and is skipped cheaply.
-    for (identity_id, secret, _my_xid) in identities {
-        for (j, tag) in unpacked.tags.iter().enumerate() {
-            if let Some(out) = open_first_contact(
-                store, engine, *identity_id, secret, tag, &unpacked.keyslots[j], &unpacked.body_ct,
-                &h, epoch, now_ms, &resolve_bundle,
-            )? {
-                return Ok(out);
-            }
-        }
-    }
-
-    // No match. Deliberately NOT marked processed: a session established later
-    // (e.g. a first-contact record that arrived after this reply) makes this
-    // record matchable on the next rescan.
-    Ok(ProcessOutcome::NoMatch)
+    Ok(process_record(store, engine, identities, record, now_ms, resolve_bundle)?
+        .into_iter()
+        .next()
+        .unwrap_or(ProcessOutcome::NoMatch))
 }
 
 /// Tier-1 established-session open + commit. `Ok(Some(_))` = handled (indexed or

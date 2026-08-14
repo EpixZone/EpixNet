@@ -76,7 +76,11 @@ CREATE TABLE IF NOT EXISTS msg (
     received_ms   INTEGER NOT NULL DEFAULT 0,
     epoch         INTEGER NOT NULL DEFAULT 0,
     read          INTEGER NOT NULL DEFAULT 0,
-    sign_h        BLOB UNIQUE);            -- 16B blake3 prefix of the pool sig (null for own sent)
+    sign_h        BLOB,                    -- 16B blake3 prefix of the pool sig (null for own sent)
+    -- Idempotency is PER IDENTITY: one count-hiding record legitimately carries a
+    -- slot for several recipients, so a node hosting more than one channel identity
+    -- can index the SAME record once per addressed identity (not once per record).
+    UNIQUE(sign_h, identity_id));
 CREATE INDEX IF NOT EXISTS msg_conv ON msg(identity_id, conv_id, sent_ms);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS msg_fts USING fts5(
@@ -93,7 +97,12 @@ CREATE TRIGGER IF NOT EXISTS msg_au AFTER UPDATE ON msg BEGIN
     INSERT INTO msg_fts(rowid, subject, body) VALUES (new.msg_id, new.subject, new.body);
 END;
 
-CREATE TABLE IF NOT EXISTS processed (sign_h BLOB PRIMARY KEY NOT NULL);
+-- Per-identity so a deferred/undelivered slot for one identity is re-checked
+-- independently of another identity's delivered slot in the same record.
+CREATE TABLE IF NOT EXISTS processed (
+    sign_h        BLOB NOT NULL,
+    identity_id   INTEGER NOT NULL,
+    PRIMARY KEY(sign_h, identity_id));
 
 CREATE TABLE IF NOT EXISTS shard_cursor (
     shard_path    TEXT PRIMARY KEY NOT NULL,
@@ -147,10 +156,94 @@ impl ChannelDb {
         Self::open_inner(Database::open_in_memory()?, Some(key))
     }
 
+    /// Bump on any change that a pre-existing db must be MIGRATED for (not just a
+    /// new `CREATE TABLE IF NOT EXISTS`). v2 = per-identity idempotency on `msg`
+    /// (drop the record-wide `sign_h UNIQUE`) + `processed`.
+    const SCHEMA_VERSION: i64 = 2;
+
     fn open_inner(db: Database, enc_key: Option<[u8; 32]>) -> Result<Self> {
         let me = Self { db, enc_key };
-        me.db.execute_batch(SCHEMA)?;
+        let prior = me.user_version()?;
+        me.db.execute_batch(SCHEMA)?; // creates anything missing (fresh db → done)
+        if prior < 2 {
+            me.migrate_to_v2()?; // rebuild the two tables whose constraints changed
+        }
+        me.set_user_version(Self::SCHEMA_VERSION)?;
         Ok(me)
+    }
+
+    fn user_version(&self) -> Result<i64> {
+        let conn = self.db.conn()?;
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).map_err(db_err)
+    }
+
+    fn set_user_version(&self, v: i64) -> Result<()> {
+        let conn = self.db.conn()?;
+        conn.execute_batch(&format!("PRAGMA user_version = {v}")).map_err(db_err)
+    }
+
+    /// Migrate a pre-v2 db in place, PRESERVING all messages and ratchet sessions.
+    /// Only `msg` (its record-wide `sign_h UNIQUE` had to become
+    /// `UNIQUE(sign_h, identity_id)`, which SQLite can only change by rebuilding the
+    /// table) and `processed` (record-wide → per-identity; its old rows carry no
+    /// identity so they are dropped — harmless, a re-processed record is idempotent
+    /// via the msg uniqueness) are rebuilt. Runs once (guarded by user_version);
+    /// on a fresh db the tables are already new-shaped so the copy is a no-op.
+    fn migrate_to_v2(&self) -> Result<()> {
+        let mut conn = self.db.conn()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        tx.execute_batch(
+            "\
+            DROP TRIGGER IF EXISTS msg_ai;
+            DROP TRIGGER IF EXISTS msg_ad;
+            DROP TRIGGER IF EXISTS msg_au;
+            ALTER TABLE msg RENAME TO msg_old_v1;
+            CREATE TABLE msg (
+                msg_id        INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                identity_id   INTEGER NOT NULL REFERENCES identity(identity_id),
+                thread_id     INTEGER NOT NULL REFERENCES thread(thread_id),
+                conv_id       TEXT NOT NULL,
+                dir           TEXT NOT NULL,
+                sender_xid    TEXT,
+                subject       TEXT,
+                body          TEXT,
+                enc           INTEGER NOT NULL DEFAULT 0,
+                sent_ms       INTEGER NOT NULL DEFAULT 0,
+                received_ms   INTEGER NOT NULL DEFAULT 0,
+                epoch         INTEGER NOT NULL DEFAULT 0,
+                read          INTEGER NOT NULL DEFAULT 0,
+                sign_h        BLOB,
+                UNIQUE(sign_h, identity_id));
+            INSERT INTO msg
+                (msg_id, identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
+                 sent_ms, received_ms, epoch, read, sign_h)
+                SELECT msg_id, identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
+                 sent_ms, received_ms, epoch, read, sign_h FROM msg_old_v1;
+            DROP TABLE msg_old_v1;
+            CREATE INDEX IF NOT EXISTS msg_conv ON msg(identity_id, conv_id, sent_ms);
+            DROP TABLE IF EXISTS msg_fts;
+            CREATE VIRTUAL TABLE msg_fts USING fts5(subject, body, content='msg', content_rowid='msg_id');
+            INSERT INTO msg_fts(msg_fts) VALUES('rebuild');
+            CREATE TRIGGER msg_ai AFTER INSERT ON msg BEGIN
+                INSERT INTO msg_fts(rowid, subject, body) VALUES (new.msg_id, new.subject, new.body);
+            END;
+            CREATE TRIGGER msg_ad AFTER DELETE ON msg BEGIN
+                INSERT INTO msg_fts(msg_fts, rowid, subject, body) VALUES('delete', old.msg_id, old.subject, old.body);
+            END;
+            CREATE TRIGGER msg_au AFTER UPDATE ON msg BEGIN
+                INSERT INTO msg_fts(msg_fts, rowid, subject, body) VALUES('delete', old.msg_id, old.subject, old.body);
+                INSERT INTO msg_fts(rowid, subject, body) VALUES (new.msg_id, new.subject, new.body);
+            END;
+            DROP TABLE IF EXISTS processed;
+            CREATE TABLE processed (
+                sign_h        BLOB NOT NULL,
+                identity_id   INTEGER NOT NULL,
+                PRIMARY KEY(sign_h, identity_id));
+            ",
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// Whether content is sealed at rest (drives the search fallback).
@@ -305,12 +398,12 @@ impl ChannelDb {
     /// Whether a pool signature (16-byte prefix) has already been indexed. BLOB
     /// columns must be bound with typed rusqlite params (the generic `Value`
     /// path would encode the bytes as a JSON array, never matching the BLOB).
-    pub fn is_processed(&self, sign_h: &[u8]) -> Result<bool> {
+    pub fn is_processed(&self, sign_h: &[u8], identity_id: i64) -> Result<bool> {
         let conn = self.db.conn()?;
         let found = conn
             .query_row(
-                "SELECT 1 FROM processed WHERE sign_h=?1",
-                rusqlite::params![sign_h],
+                "SELECT 1 FROM processed WHERE sign_h=?1 AND identity_id=?2",
+                rusqlite::params![sign_h, identity_id],
                 |_| Ok(()),
             )
             .optional()
@@ -318,13 +411,14 @@ impl ChannelDb {
         Ok(found.is_some())
     }
 
-    /// Mark a pool signature processed (for records that matched no identity, so
-    /// a plain rescan skips them; a new session triggers an explicit re-scan).
-    pub fn mark_processed(&self, sign_h: &[u8]) -> Result<()> {
+    /// Mark a pool signature processed FOR ONE IDENTITY (a record carries slots for
+    /// several recipients, so "processed" is per addressed identity — another
+    /// identity's undelivered slot in the same record is re-checked independently).
+    pub fn mark_processed(&self, sign_h: &[u8], identity_id: i64) -> Result<()> {
         let conn = self.db.conn()?;
         conn.execute(
-            "INSERT OR IGNORE INTO processed (sign_h) VALUES (?1)",
-            rusqlite::params![sign_h],
+            "INSERT OR IGNORE INTO processed (sign_h, identity_id) VALUES (?1, ?2)",
+            rusqlite::params![sign_h, identity_id],
         )
         .map_err(db_err)?;
         Ok(())
@@ -463,11 +557,12 @@ impl ChannelDb {
         let mut conn = self.db.conn()?;
         let tx = conn.transaction().map_err(db_err)?;
 
-        // Idempotency: a duplicate signature is a no-op.
+        // Idempotency is PER IDENTITY: the same record delivered to a DIFFERENT
+        // local identity's slot is a distinct inbox row, not a duplicate.
         if tx
             .query_row(
-                "SELECT 1 FROM msg WHERE sign_h=?",
-                rusqlite::params![c.sign_h],
+                "SELECT 1 FROM msg WHERE sign_h=? AND identity_id=?",
+                rusqlite::params![c.sign_h, c.identity_id],
                 |_| Ok(()),
             )
             .is_ok()
@@ -538,8 +633,8 @@ impl ChannelDb {
         }
 
         tx.execute(
-            "INSERT OR IGNORE INTO processed (sign_h) VALUES (?1)",
-            rusqlite::params![c.sign_h],
+            "INSERT OR IGNORE INTO processed (sign_h, identity_id) VALUES (?1, ?2)",
+            rusqlite::params![c.sign_h, c.identity_id],
         )
         .map_err(db_err)?;
 
@@ -865,11 +960,11 @@ fn upsert_thread_tx(
 /// The methods forward to the inherent ones above; the app-specific reads
 /// (threads/messages/search/…) are NOT part of the trait and stay inherent.
 impl EnvelopeStore for ChannelDb {
-    fn is_processed(&self, sign_h: &[u8]) -> Result<bool> {
-        ChannelDb::is_processed(self, sign_h)
+    fn is_processed(&self, sign_h: &[u8], identity_id: i64) -> Result<bool> {
+        ChannelDb::is_processed(self, sign_h, identity_id)
     }
-    fn mark_processed(&self, sign_h: &[u8]) -> Result<()> {
-        ChannelDb::mark_processed(self, sign_h)
+    fn mark_processed(&self, sign_h: &[u8], identity_id: i64) -> Result<()> {
+        ChannelDb::mark_processed(self, sign_h, identity_id)
     }
     fn session_for_tag(&self, tag: &[u8]) -> Result<Option<SessionMatch>> {
         ChannelDb::session_for_tag(self, tag)
@@ -949,10 +1044,12 @@ mod tests {
     fn processed_set_roundtrips() {
         let d = db();
         let h = vec![1u8; 16];
-        assert!(!d.is_processed(&h).unwrap());
-        d.mark_processed(&h).unwrap();
-        assert!(d.is_processed(&h).unwrap());
-        d.mark_processed(&h).unwrap(); // idempotent
+        // Per-identity: processed for id 1 does NOT imply processed for id 2.
+        assert!(!d.is_processed(&h, 1).unwrap());
+        d.mark_processed(&h, 1).unwrap();
+        assert!(d.is_processed(&h, 1).unwrap());
+        assert!(!d.is_processed(&h, 2).unwrap(), "processed is keyed per identity");
+        d.mark_processed(&h, 1).unwrap(); // idempotent
     }
 
     #[test]
@@ -1146,5 +1243,65 @@ mod tests {
         d.create_session(idn, "cv", Some("b.epix"), "init", b"RS3", 1, &[(0, vec![7u8; 32])]).unwrap();
         let sm = d.session_for_tag(&[7u8; 32]).unwrap().unwrap();
         assert_eq!(sm.ratchet, b"RS3");
+    }
+
+    #[test]
+    fn migrates_v1_db_preserving_data_and_gaining_per_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("channels.db");
+        // Seed a v1-shaped db: record-wide `msg.sign_h UNIQUE` + `processed(sign_h PK)`,
+        // one indexed message, user_version 0.
+        {
+            let raw = epix_db::Database::open(&path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE identity (identity_id INTEGER PRIMARY KEY AUTOINCREMENT, xid TEXT,
+                     auth_address TEXT, derive_index INTEGER, bundle_json TEXT, scan_cursor INTEGER DEFAULT 0);
+                 CREATE TABLE thread (thread_id INTEGER PRIMARY KEY AUTOINCREMENT, identity_id INTEGER,
+                     conv_id TEXT, peer_xid TEXT, members TEXT, subject TEXT, snippet TEXT,
+                     last_ms INTEGER DEFAULT 0, msg_count INTEGER DEFAULT 0, unread INTEGER DEFAULT 0,
+                     starred INTEGER DEFAULT 0, archived INTEGER DEFAULT 0, enc INTEGER DEFAULT 0);
+                 CREATE TABLE msg (msg_id INTEGER PRIMARY KEY AUTOINCREMENT, identity_id INTEGER,
+                     thread_id INTEGER, conv_id TEXT, dir TEXT, sender_xid TEXT, subject TEXT, body TEXT,
+                     enc INTEGER DEFAULT 0, sent_ms INTEGER DEFAULT 0, received_ms INTEGER DEFAULT 0,
+                     epoch INTEGER DEFAULT 0, read INTEGER DEFAULT 0, sign_h BLOB UNIQUE);
+                 CREATE TABLE processed (sign_h BLOB PRIMARY KEY NOT NULL);
+                 INSERT INTO identity (identity_id, xid, auth_address, derive_index) VALUES (1,'mud.epix','epix1mud',0);
+                 INSERT INTO identity (identity_id, xid, auth_address, derive_index) VALUES (2,'work.epix','epix1work',0);
+                 INSERT INTO thread (thread_id, identity_id, conv_id) VALUES (1,1,'abcd');
+                 INSERT INTO msg (identity_id, thread_id, conv_id, dir, subject, body, sign_h)
+                     VALUES (1,1,'abcd','in','Hi','v1 body keep', X'0102');
+                 INSERT INTO processed (sign_h) VALUES (X'0102');
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        }
+
+        // Opening via ChannelDb runs the v1→v2 migration.
+        let d = ChannelDb::open(&path).unwrap();
+        assert_eq!(d.user_version().unwrap(), 2, "migrated to v2");
+
+        // The v1 message survived the msg-table rebuild, FTS included.
+        let msgs = d.messages(1, "abcd").unwrap();
+        assert_eq!(msgs.len(), 1, "v1 message preserved through migration");
+        assert_eq!(msgs[0]["body"].as_str(), Some("v1 body keep"));
+        assert_eq!(d.search(1, "keep", 10).unwrap().len(), 1, "FTS rebuilt for the migrated row");
+
+        // Per-identity now: the SAME sign_h under a DIFFERENT identity is allowed
+        // (was impossible under v1's record-wide UNIQUE), while a same-identity
+        // duplicate is still rejected.
+        let conn = d.db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO msg (identity_id, thread_id, conv_id, dir, sign_h) VALUES (2, 1, 'abcd', 'in', X'0102')",
+            [],
+        )
+        .expect("same sign_h under a different identity is allowed after v2");
+        assert!(
+            conn.execute(
+                "INSERT INTO msg (identity_id, thread_id, conv_id, dir, sign_h) VALUES (1, 1, 'abcd', 'in', X'0102')",
+                [],
+            )
+            .is_err(),
+            "a same-(sign_h, identity) duplicate is still rejected"
+        );
     }
 }

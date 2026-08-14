@@ -91,20 +91,22 @@ independently opens its own slot of the *same* record (tested).
 - Slots are **shuffled** (real + dummy), so real slots are not a fixed prefix —
   defense-in-depth in case real/dummy content indistinguishability ever regresses.
 
-### Known limitation — multiple channel identities on ONE node
+### Multiple channel identities on ONE node — supported
 
-`process_record` indexes at most ONE slot per record, and idempotency is keyed on
-the record's `sign` (record-wide). A node that hosts **two or more channel
-identities both addressed in the same record** (e.g. two personas of one operator
-on one machine — NOT two *devices* of a name, which are separate nodes) will index
-only the first and **silently drop the rest**. This does not affect the current
-one-identity-per-node deployment, but it is a real correctness gap for the
-multi-identity config the code otherwise supports. **Fix (deferred, needs a schema
-change):** scan every (identity × slot), emit one outcome per delivered slot, and
-key idempotency on `(sign_h, identity_id)` instead of `sign_h` alone (drop the
-record-wide `msg.sign_h` UNIQUE). Until then, run one channel identity per node.
-The related first-contact **scan-abort** bug (a deferred slot masking later slots)
-*is* fixed: the anti-spoof deferral returns `None` so the scan falls through.
+A single count-hiding record legitimately carries a slot for several recipients, so
+a node hosting **two or more channel identities** (e.g. two personas of one
+operator on one machine — distinct from two *devices* of a name, which are separate
+nodes) that are both addressed in the same record delivers the message to **every**
+addressed local identity, one inbox row each. `process_record` returns
+`Vec<ProcessOutcome>` (one per delivered slot); it scans every (identity × slot),
+and idempotency + the `processed` set are keyed on **`(sign_h, identity_id)`** —
+so a slot still deferred for one identity (its sender bundle not yet synced) is
+re-checked independently of another identity's delivered slot in the same record,
+and a rescan produces no duplicates. The record-wide `msg.sign_h` UNIQUE became
+`UNIQUE(sign_h, identity_id)`; a pre-existing db is migrated in place
+(`ChannelDb` schema v2) preserving all messages and ratchet state. The related
+first-contact **scan-abort** bug (a deferred slot aborting the record's remaining
+slots) is fixed too: the anti-spoof deferral returns `None` so the scan continues.
 
 ## Tests
 

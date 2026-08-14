@@ -33,6 +33,8 @@ pub mod multislot;
 pub mod store;
 
 pub use engine::{Begun, Engine, EngineError, FakeEngine, IdentitySecret, Opened, Sealed};
-pub use indexer::{new_conv_id, process_record, send_message, ProcessOutcome, SendResult};
+pub use indexer::{
+    new_conv_id, process_record, process_record_one, send_message, ProcessOutcome, SendResult,
+};
 pub use multislot::{send_multi, Dest, SLOTS};
 pub use store::{EnvelopeStore, InboundCommit, SessionMatch, TAG_LOOKAHEAD};
