@@ -3,8 +3,9 @@
 **Status: landed** (node + site). A channel name (`mud.epix`) can have more than
 one **linked identity/device**, and a message sent to that name reaches *every*
 active device, so the recipient can read and reply on whichever one they use —
-the send fans out one sealed envelope per device, and the receiver's anti-spoof
-accepts a message sealed from **any** of the sender's linked keys.
+the send seals a per-device slot for every device into ONE fixed-width record
+(see [`channel-count-privacy.md`](channel-count-privacy.md)), and the receiver's
+anti-spoof accepts a message sealed from **any** of the sender's linked keys.
 
 This closes the "adding a linked identity is cosmetic" half of the xID audit:
 before this, a name had exactly one channel identity (IK derived from a single
@@ -18,12 +19,13 @@ resolved only that one bundle.
   so two devices already have distinct IKs. What was missing was a place to put
   the second bundle. Now the bundle carries its device's linked address as
   `auth`, and devices write to distinct files (below).
-- **Send = fan-out across the recipient's devices.** `channelSend` resolves every
-  published bundle for each recipient name (grouped, active-filtered, deduped)
-  and seals one `epix-pool-1` envelope per device — the same unlinkable per-leg
-  fan-out already used across *recipients*, now also across a recipient's
-  *devices*. The sender's own copy is still recorded exactly once. The result
-  reports `envelopes` (≥ `recipients`).
+- **Send reaches every device — in ONE record.** `channelSend` resolves every
+  published bundle for each recipient name (grouped, active-filtered, deduped) and
+  packs them all into a single fixed-width **multi-slot** record via `send_multi`.
+  (The first cut sealed one record *per device*, which leaked the recipient's
+  device count to a peer counting the burst; that is now closed — see
+  [`channel-count-privacy.md`](channel-count-privacy.md).) The sender's own copy is
+  still recorded exactly once.
 - **Receive already handles multiplicity.** The indexer trial-decrypts against
   every local identity, so a device opens its own leg with no change.
 

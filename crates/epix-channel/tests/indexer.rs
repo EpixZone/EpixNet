@@ -3,7 +3,8 @@
 
 use epix_content::pool::{self, PoolRule};
 use epix_envelope::{
-    process_record, send_message, Engine, FakeEngine, IdentitySecret, ProcessOutcome,
+    process_record, send_message, send_multi, Dest, Engine, FakeEngine, IdentitySecret,
+    ProcessOutcome, SLOTS,
 };
 use epix_channel::ChannelDb;
 
@@ -14,8 +15,8 @@ fn rule() -> PoolRule {
         since_week: 0,
         fanout: 16,
         pow_bits: 6, // cheap for tests
-        pad_buckets: vec![256, 1024, 4096],
-        max_record_bytes: 8192,
+        pad_buckets: vec![8192, 32768],
+        max_record_bytes: 60000,
         max_shard_bytes: 6_000_000,
         newest_first: true,
     }
@@ -382,4 +383,110 @@ fn multi_device_sender_any_linked_key_accepted() {
         }
         other => panic!("deferred message must index once the device bundle syncs, got {other:?}"),
     }
+}
+
+/// The count-hiding property: a send that reaches 1 destination and a send that
+/// reaches 3 destinations produce ONE pool record each, of the SAME public size
+/// (same pad bucket) with the SAME fixed number of slots — so a peer counting
+/// records or measuring sizes cannot recover the recipient/device count.
+#[test]
+fn multislot_hides_destination_count() {
+    let e = FakeEngine;
+    let r = rule();
+    let now = 1_780_000_000_000i64;
+    let alice_db = ChannelDb::memory().unwrap();
+    let alice_id = alice_db.upsert_identity("alice.epix", "epix1a", 0, None).unwrap();
+    let alice = rand_id();
+
+    let d1 = e.publish_bundle(&rand_id(), "bob.epix");
+    let d2 = e.publish_bundle(&rand_id(), "bob.epix");
+    let d3 = e.publish_bundle(&rand_id(), "bob.epix");
+
+    let one = send_multi(
+        &alice_db, &e, alice_id, &alice, "alice.epix", &[], &[Dest { bundle: d1.clone() }],
+        conv16(), "s", "hi ZXQ", now, &r, true,
+    )
+    .unwrap();
+    let three = send_multi(
+        &alice_db, &e, alice_id, &alice, "alice.epix", &[],
+        &[Dest { bundle: d1 }, Dest { bundle: d2 }, Dest { bundle: d3 }],
+        conv16(), "s", "hi ZXQ", now, &r, false,
+    )
+    .unwrap();
+
+    // Each send is exactly ONE record...
+    let ct_one = one.record["ct"].as_str().unwrap();
+    let ct_three = three.record["ct"].as_str().unwrap();
+    // ...of identical public size (same pad bucket) — the 3-device send is
+    // byte-indistinguishable in width from the 1-device send.
+    assert_eq!(ct_one.len(), ct_three.len(), "1-dest and 3-dest records are the same size");
+
+    // And every record always carries the full fixed slot count (reals + dummies).
+    let bytes = |s: &str| base64_decode(s);
+    let u1 = epix_envelope::multislot::unpack_ct(&bytes(ct_one)).unwrap();
+    let u3 = epix_envelope::multislot::unpack_ct(&bytes(ct_three)).unwrap();
+    assert_eq!(u1.tags.len(), SLOTS);
+    assert_eq!(u3.tags.len(), SLOTS);
+    assert_eq!(u1.keyslots.len(), SLOTS);
+    assert_eq!(u3.keyslots.len(), SLOTS);
+    // Every keyslot is the same fixed length (real seals padded == random dummies).
+    let lens1: std::collections::HashSet<usize> = u1.keyslots.iter().map(|k| k.len()).collect();
+    assert_eq!(lens1.len(), 1, "all keyslots (real + dummy) are one fixed size");
+}
+
+/// ONE record reaches MULTIPLE recipients: alice sends to bob AND carol in a
+/// single pool record; each of their nodes processes the SAME record and indexes
+/// its own message. This is the mechanism that hides recipient count too.
+#[test]
+fn multislot_one_record_reaches_multiple_recipients() {
+    let e = FakeEngine;
+    let r = rule();
+    let now = 1_780_000_000_000i64;
+    let alice_db = ChannelDb::memory().unwrap();
+    let bob_db = ChannelDb::memory().unwrap();
+    let carol_db = ChannelDb::memory().unwrap();
+    let alice_id = alice_db.upsert_identity("alice.epix", "epix1a", 0, None).unwrap();
+    let bob_id = bob_db.upsert_identity("bob.epix", "epix1b", 0, None).unwrap();
+    let carol_id = carol_db.upsert_identity("carol.epix", "epix1c", 0, None).unwrap();
+    let alice = rand_id();
+    let bob = rand_id();
+    let carol = rand_id();
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    let carol_bundle = e.publish_bundle(&carol, "carol.epix");
+    let alice_bundle = e.publish_bundle(&alice, "alice.epix");
+
+    let members = vec!["alice.epix".to_string(), "bob.epix".into(), "carol.epix".into()];
+    let sent = send_multi(
+        &alice_db, &e, alice_id, &alice, "alice.epix", &members,
+        &[Dest { bundle: bob_bundle }, Dest { bundle: carol_bundle }],
+        conv16(), "Party", "at 8 ZXQ", now, &r, true,
+    )
+    .unwrap();
+
+    let resolve = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() }
+    };
+    // Bob opens HIS slot in the shared record.
+    let ob = process_record(&bob_db, &e, &[(bob_id, bob, "bob.epix".into())], &sent.record, now + 10, &resolve).unwrap();
+    match ob {
+        ProcessOutcome::Indexed { sender_xid, conv_id, .. } => {
+            assert_eq!(sender_xid.as_deref(), Some("alice.epix"));
+            assert_eq!(bob_db.messages(bob_id, &conv_id).unwrap()[0]["body"].as_str(), Some("at 8 ZXQ"));
+        }
+        other => panic!("bob must index his slot of the shared record, got {other:?}"),
+    }
+    // Carol opens HER slot in the SAME record.
+    let oc = process_record(&carol_db, &e, &[(carol_id, carol, "carol.epix".into())], &sent.record, now + 10, &resolve).unwrap();
+    match oc {
+        ProcessOutcome::Indexed { sender_xid, conv_id, .. } => {
+            assert_eq!(sender_xid.as_deref(), Some("alice.epix"));
+            assert_eq!(carol_db.messages(carol_id, &conv_id).unwrap()[0]["body"].as_str(), Some("at 8 ZXQ"));
+        }
+        other => panic!("carol must index her slot of the shared record, got {other:?}"),
+    }
+}
+
+fn base64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).unwrap()
 }

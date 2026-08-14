@@ -12,10 +12,9 @@
 use crate::engine::{Engine, EngineError, IdentitySecret};
 use crate::store::{EnvelopeStore, InboundCommit};
 use base64::Engine as _;
-use epix_content::pool::{self, PoolRule};
-use epix_content::record::record_signed_data;
+use epix_content::pool::PoolRule;
 use epix_core::{Error, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// The outcome of trial-processing one pool record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,12 +51,8 @@ pub struct SendResult {
     pub msg_id: i64,
 }
 
-fn eng_err(e: EngineError) -> Error {
+pub(crate) fn eng_err(e: EngineError) -> Error {
     Error::Protocol(format!("envelope engine: {e:?}"))
-}
-
-fn b64(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn b64d(s: &str) -> Option<Vec<u8>> {
@@ -69,13 +64,16 @@ fn sign_h(sign: &str) -> Vec<u8> {
     blake3::hash(sign.as_bytes()).as_bytes()[..16].to_vec()
 }
 
-fn to_tag_vecs(tags: &[(u32, [u8; 32])]) -> Vec<(u32, Vec<u8>)> {
+pub(crate) fn to_tag_vecs(tags: &[(u32, [u8; 32])]) -> Vec<(u32, Vec<u8>)> {
     tags.iter().map(|(n, t)| (*n, t.to_vec())).collect()
 }
 
-/// Seal `subject`/`body` to `peer_bundle` on conversation `conv_id`, build the
-/// pool record, and record the sender's own copy. `id_secret`/`my_xid` are the
-/// sending identity; the session is created on first send to a new `conv_id`.
+/// Seal `subject`/`body` to a SINGLE `peer_bundle` on conversation `conv_id`.
+/// A thin convenience wrapper over [`crate::multislot::send_multi`] with one
+/// destination — it produces a normal fixed-width multi-slot record (one real
+/// slot + dummies), so the receiver's [`process_record`] reads it unchanged.
+/// Real sends fan out via `send_multi` directly (all a recipient's devices, all
+/// recipients) so the record count never leaks the destination count.
 #[allow(clippy::too_many_arguments)]
 pub fn send_message<E: Engine + ?Sized, S: EnvelopeStore>(
     store: &S,
@@ -92,65 +90,11 @@ pub fn send_message<E: Engine + ?Sized, S: EnvelopeStore>(
     rule: &PoolRule,
     record_own: bool,
 ) -> Result<SendResult> {
-    let conv_hex = hex::encode(conv_id);
-    let peer_xid = peer_bundle.get("xid").and_then(|v| v.as_str());
-
-    // Reuse this leg's session, or begin one as the initiator. A group thread
-    // has one pairwise session PER peer, so the lookup is keyed by (conv, peer).
-    let existing = match peer_xid {
-        Some(p) => store.session_id_for_leg(identity_id, &conv_hex, p)?,
-        None => None,
-    };
-    let (session_id, session_blob) = match existing {
-        Some(sid) => (sid, store.session_ratchet(sid)?),
-        None => {
-            let begun = engine.begin_session(id_secret, peer_bundle, conv_id).map_err(eng_err)?;
-            let recv = to_tag_vecs(&begun.recv_tags);
-            let sid = store.create_session(
-                identity_id,
-                &conv_hex,
-                peer_xid,
-                "init",
-                &begun.session,
-                now_ms,
-                &recv,
-            )?;
-            (sid, begun.session)
-        }
-    };
-
-    let sealed = engine
-        .seal(&session_blob, my_xid, members, subject, body, now_ms, &rule.pad_buckets)
-        .map_err(eng_err)?;
-    store.update_session_ratchet(session_id, &sealed.session_after)?;
-
-    // Build the anonymous pool record under a FRESH throwaway author.
-    let epoch = pool::epoch_now(now_ms);
-    let author_pk = epix_crypt::new_seed();
-    let author = epix_crypt::privatekey_to_address(&author_pk).map_err(Error::Crypt)?;
-    let mut record = json!({
-        "v": 1,
-        "epoch": epoch,
-        "tag": b64(&sealed.tag),
-        "ct": b64(&sealed.ct),
-        "pow": 0,
-        "author": author,
-    });
-    pool::solve_pow(&mut record, rule.pow_bits);
-    let sig = epix_crypt::sign(&record_signed_data(&record), &author_pk).map_err(Error::Crypt)?;
-    record["sign"] = json!(sig);
-
-    // The sender's own copy — written locally, never posted encrypted-to-self.
-    // For an N-recipient fan-out, only ONE leg records the own copy (the thread
-    // is shared), so the caller passes `record_own = true` on exactly one leg.
-    let msg_id = if record_own {
-        store.insert_sent(identity_id, &conv_hex, peer_xid, members, my_xid, subject, body, now_ms)?
-    } else {
-        0
-    };
-
-    let shard_path = pool::shard_path(rule, epoch, &sealed.tag);
-    Ok(SendResult { record, shard_path, epoch, msg_id })
+    let dests = [crate::multislot::Dest { bundle: peer_bundle.clone() }];
+    crate::multislot::send_multi(
+        store, engine, identity_id, id_secret, my_xid, members, &dests, conv_id, subject, body,
+        now_ms, rule, record_own,
+    )
 }
 
 /// Trial-process one inbound pool record against every local identity.
@@ -186,39 +130,46 @@ where
         return Ok(ProcessOutcome::AlreadyProcessed);
     }
 
-    let (tag_vec, ct_vec) = match (
-        record.get("tag").and_then(|v| v.as_str()).and_then(b64d),
-        record.get("ct").and_then(|v| v.as_str()).and_then(b64d),
-    ) {
-        (Some(t), Some(c)) if t.len() == 32 => (t, c),
-        // A malformed record (should never reach here post-verify) is marked
-        // processed so it is not retried forever.
-        _ => {
-            store.mark_processed(&h)?;
-            return Ok(ProcessOutcome::NoMatch);
-        }
+    // The record's public `tag` is a random routing value; the real detection
+    // tags live inside the multi-slot `ct` (see `multislot`). Unpack it into
+    // SLOTS (tag, keyslot) pairs plus the one shared body.
+    let Some(ct_vec) = record.get("ct").and_then(|v| v.as_str()).and_then(b64d) else {
+        store.mark_processed(&h)?;
+        return Ok(ProcessOutcome::NoMatch);
     };
-    let mut tag = [0u8; 32];
-    tag.copy_from_slice(&tag_vec);
+    let Some(unpacked) = crate::multislot::unpack_ct(&ct_vec) else {
+        // Not a well-formed multi-slot record (foreign/truncated). It can never be
+        // ours; don't mark processed (a truncated sync may complete later).
+        return Ok(ProcessOutcome::NoMatch);
+    };
     let epoch = record.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    // Tier 1 — established session (O(1) tag lookup).
-    if let Some(sm) = store.session_for_tag(&tag_vec)? {
-        if let Some(out) =
-            open_established(store, engine, &sm, &tag, &tag_vec, &ct_vec, &h, epoch, now_ms)?
-        {
-            return Ok(out);
+    // Tier 1 — established session: scan the SLOTS detection tags (O(SLOTS)
+    // hashset lookups) and open the one keyslot whose tag we expect.
+    for (j, tag) in unpacked.tags.iter().enumerate() {
+        let tag_vec = tag.to_vec();
+        if let Some(sm) = store.session_for_tag(&tag_vec)? {
+            if let Some(out) = open_established(
+                store, engine, &sm, tag, &tag_vec, &unpacked.keyslots[j], &unpacked.body_ct, &h,
+                epoch, now_ms,
+            )? {
+                return Ok(out);
+            }
+            // Tag matched but the ratchet couldn't open it: fall through.
         }
-        // Tag matched but the ratchet could not open it (corrupt / replayed under
-        // a re-used tag): fall through to first-contact probing.
     }
 
-    // Tier 2 — first contact (one cheap probe per identity).
+    // Tier 2 — first contact: probe each slot for each local identity. Only a
+    // record that missed Tier-1 reaches here; a dummy slot's random keyslot fails
+    // `open_first` and is skipped cheaply.
     for (identity_id, secret, _my_xid) in identities {
-        if let Some(out) = open_first_contact(
-            store, engine, *identity_id, secret, &tag, &ct_vec, &h, epoch, now_ms, &resolve_bundle,
-        )? {
-            return Ok(out);
+        for (j, tag) in unpacked.tags.iter().enumerate() {
+            if let Some(out) = open_first_contact(
+                store, engine, *identity_id, secret, tag, &unpacked.keyslots[j], &unpacked.body_ct,
+                &h, epoch, now_ms, &resolve_bundle,
+            )? {
+                return Ok(out);
+            }
         }
     }
 
@@ -238,23 +189,33 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
     sm: &crate::store::SessionMatch,
     tag: &[u8; 32],
     tag_vec: &[u8],
-    ct_vec: &[u8],
+    keyslot: &[u8],
+    body_ct: &[u8],
     h: &[u8],
     epoch: i64,
     now_ms: i64,
 ) -> Result<Option<ProcessOutcome>> {
-    let Ok(op) = engine.open(&sm.ratchet, sm.n, tag, ct_vec) else { return Ok(None) };
-    let sender = op.sender_xid.clone().or_else(|| sm.peer_xid.clone());
+    // The keyslot opens to `K_msg ‖ H(body)`; the message itself is the ONE shared
+    // body decrypted under K_msg (bound by the hash, so no substituted body).
+    let Ok(op) = engine.open(&sm.ratchet, sm.n, tag, keyslot) else { return Ok(None) };
+    let Some((k_msg, body_hash)) = crate::multislot::parse_keyslot_plain(&op.body) else {
+        return Ok(None);
+    };
+    let Some(bp) = crate::multislot::open_shared_body(&k_msg, &body_hash, body_ct) else {
+        return Ok(None);
+    };
+    // Established sender is the verified session peer (fall back to the body's).
+    let sender = sm.peer_xid.clone().or(Some(bp.sender_xid.clone()));
     let commit = InboundCommit {
         identity_id: sm.identity_id,
         session_id: sm.session_id,
         conv_id: sm.conv_id.clone(),
         peer_xid: sm.peer_xid.clone(),
         sender_xid: sender.clone(),
-        members: op.members.clone(),
-        subject: op.subject.clone(),
-        body: op.body.clone(),
-        sent_ms: op.sent_ms,
+        members: bp.members.clone(),
+        subject: bp.subject.clone(),
+        body: bp.body.clone(),
+        sent_ms: bp.sent_ms,
         received_ms: now_ms,
         epoch,
         sign_h: h.to_vec(),
@@ -271,8 +232,8 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
         identity_id: sm.identity_id,
         conv_id: sm.conv_id.clone(),
         sender_xid: sender,
-        subject: op.subject,
-        snippet: snippet_of(&op.body),
+        subject: bp.subject,
+        snippet: snippet_of(&bp.body),
         unread,
         first_contact: false,
         pending: op.pending,
@@ -289,7 +250,8 @@ fn open_first_contact<E, S, R>(
     identity_id: i64,
     secret: &IdentitySecret,
     tag: &[u8; 32],
-    ct_vec: &[u8],
+    keyslot: &[u8],
+    body_ct: &[u8],
     h: &[u8],
     epoch: i64,
     now_ms: i64,
@@ -300,19 +262,26 @@ where
     S: EnvelopeStore,
     R: Fn(&str) -> Vec<Value>,
 {
-    if !engine.first_contact_candidate(secret, tag, ct_vec) {
+    if !engine.first_contact_candidate(secret, tag, keyslot) {
         return Ok(None);
     }
-    let Ok(op) = engine.open_first(secret, tag, ct_vec) else { return Ok(None) };
+    let Ok(op) = engine.open_first(secret, tag, keyslot) else { return Ok(None) };
+    // The keyslot yields `K_msg ‖ H(body)` + the transcript-bound `ik_a`; the
+    // message (incl. the claimed sender) is the shared body decrypted under K_msg.
+    let Some((k_msg, body_hash)) = crate::multislot::parse_keyslot_plain(&op.body) else {
+        return Ok(None);
+    };
+    let Some(bp) = crate::multislot::open_shared_body(&k_msg, &body_hash, body_ct) else {
+        return Ok(None);
+    };
 
-    // M1 anti-spoof: the header carries an attacker-controlled `sender_xid` plus a
-    // transcript-bound `ik_a`. Trust the attribution ONLY if the sender's PUBLISHED
-    // bundle proves it owns that identity key. Only one identity can open a given
-    // record (DH2 binds it), so a failed check ends processing (returns Some).
-    if let (Some(claimed), Some(ik_a)) = (op.sender_xid.as_deref(), op.ik_a.as_ref()) {
+    // M1 anti-spoof: the body carries an attacker-controlled `sender_xid`, but the
+    // keyslot carries a transcript-bound `ik_a`. Trust the attribution ONLY if the
+    // sender's PUBLISHED bundle proves it owns that identity key.
+    if let Some(ik_a) = op.ik_a.as_ref() {
         // Authentic iff the transcript key matches ANY of the sender's published
         // device bundles (a multi-device sender may seal from any linked key).
-        let matches = resolve_bundle(claimed)
+        let matches = resolve_bundle(&bp.sender_xid)
             .iter()
             .any(|b| engine.sender_ik(b).as_ref() == Some(ik_a));
         if !matches {
@@ -327,12 +296,13 @@ where
         }
     }
 
+    let sender = Some(bp.sender_xid.clone());
     let conv_hex = hex::encode(op.conv_id);
     let recv = to_tag_vecs(&op.next_recv_tags);
     let session_id = store.create_session(
         identity_id,
         &conv_hex,
-        op.sender_xid.as_deref(),
+        sender.as_deref(),
         "resp",
         &op.session_after,
         now_ms,
@@ -342,12 +312,12 @@ where
         identity_id,
         session_id,
         conv_id: conv_hex.clone(),
-        peer_xid: op.sender_xid.clone(),
-        sender_xid: op.sender_xid.clone(),
-        members: op.members.clone(),
-        subject: op.subject.clone(),
-        body: op.body.clone(),
-        sent_ms: op.sent_ms,
+        peer_xid: sender.clone(),
+        sender_xid: sender.clone(),
+        members: bp.members.clone(),
+        subject: bp.subject.clone(),
+        body: bp.body.clone(),
+        sent_ms: bp.sent_ms,
         received_ms: now_ms,
         epoch,
         sign_h: h.to_vec(),
@@ -363,9 +333,9 @@ where
         msg_id,
         identity_id,
         conv_id: conv_hex,
-        sender_xid: op.sender_xid,
-        subject: op.subject,
-        snippet: snippet_of(&op.body),
+        sender_xid: sender,
+        subject: bp.subject,
+        snippet: snippet_of(&bp.body),
         unread,
         first_contact: true,
         pending: op.pending,

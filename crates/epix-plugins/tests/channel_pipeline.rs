@@ -32,7 +32,7 @@ fn pool_descriptor() -> serde_json::Value {
         "address": XITE,
         "pool": { "channels": {
             "dir": "pool", "class": "epix-pool-1", "since_week": 0, "fanout": 16,
-            "pow_bits": 6, "pad_buckets": [512, 2048], "max_record_bytes": 16000,
+            "pow_bits": 6, "pad_buckets": [8192, 32768], "max_record_bytes": 60000,
             "max_shard_bytes": 6_000_000, "sync_order": "newest_first"
         }}
     })

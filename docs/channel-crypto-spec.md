@@ -174,6 +174,16 @@ peer to resend" signal needs node-level session-liveness tracking; §10).
 Established and first-contact records are byte-indistinguishable to an observer
 (both are `tag ‖ opaque bucket-padded ct`; header type is not in cleartext).
 
+> **Transport note (multi-key).** A per-recipient seal above is one **keyslot**.
+> On the wire, a send does not post one pool record per recipient/device — that
+> would leak the destination count. Instead every send is ONE fixed-width record
+> whose opaque `ct` carries `SLOTS` keyslots (real + random dummies) plus a single
+> shared AEAD body under a fresh `K_msg`; each real keyslot is exactly the seal
+> described here, of the tiny `K_msg ‖ H(body)` payload. The public record `tag` is
+> then a random routing value; the real detection tags live inside `ct`. This is
+> additive to everything below (same tag chains, same anti-spoof) — see
+> [`channel-count-privacy.md`](channel-count-privacy.md).
+
 ---
 
 ## 5. Detection tag chains

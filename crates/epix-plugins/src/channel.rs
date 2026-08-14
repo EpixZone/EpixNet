@@ -657,13 +657,14 @@ impl WsCommand for ChannelSend {
         // reuse an AEAD nonce and a detection tag). Held until this send returns.
         let _send_guard = ms.send_lock.lock().await;
 
-        // One resolve of every published bundle (grouped per name, active-filtered,
-        // deduped) drives the fan-out: a recipient with N linked devices gets N
-        // sealed envelopes — one per device bundle — so whichever device they read
-        // on can open the mail. Unlinkable to each other; sharing conv + members.
+        // Resolve every recipient's active device bundles, then flatten to ONE list
+        // of destinations. Instead of one pool record per device (which would leak
+        // the recipient device+group count to a peer counting the burst), all
+        // destinations are packed into fixed-width `SLOTS`-slot records — so the
+        // observable record count is independent of how many devices/recipients the
+        // message actually reaches. See `docs/channel-count-privacy.md`.
         let published = load_published_bundles(&s.state, &ms.xite).await;
-        let mut records: Vec<Value> = Vec::new();
-        let mut first_leg = true; // the sender's own copy is recorded on leg #0 only
+        let mut dests: Vec<Value> = Vec::new();
         for recip in recipients.iter() {
             // Don't seal to a recipient whose xID has been revoked on chain (fail
             // open on an indeterminate result so a chain outage doesn't block mail).
@@ -680,51 +681,57 @@ impl WsCommand for ChannelSend {
             if devices.is_empty() {
                 return Err(format!("{recip} has not published channel keys"));
             }
-            for bundle in devices {
-                // Sealing runs a proof-of-work that is seconds of hashing at
-                // production `pow_bits`. Doing it inline would pin an async runtime
-                // worker for the whole solve and starve every other connection, so
-                // run the (fully synchronous) seal on the blocking pool.
-                let db = ms.db.clone();
-                let engine = ms.engine.clone();
-                let secret = secret.clone();
-                let my_xid_c = my_xid.clone();
-                let members_c = members.clone();
-                let rule_c = rule.clone();
-                let subject_c = subject.to_string();
-                let body_c = body.to_string();
-                let record_own = first_leg;
-                first_leg = false;
-                let now = now_ms();
-                let res = tokio::task::spawn_blocking(move || {
-                    epix_envelope::send_message(
-                        db.as_ref(),
-                        engine.as_ref(),
-                        identity_id,
-                        &secret,
-                        &my_xid_c,
-                        &members_c,
-                        &bundle,
-                        conv,
-                        &subject_c,
-                        &body_c,
-                        now,
-                        &rule_c,
-                        record_own,
-                    )
-                })
-                .await
-                .map_err(|e| format!("channelSend seal task failed: {e}"))?
-                .map_err(|e| e.to_string())?;
-                records.push(res.record);
-            }
+            dests.extend(devices);
         }
-        // Append + flood each fan-out envelope.
+
+        // One record per chunk of up to SLOTS destinations (a send to ≤ SLOTS total
+        // devices is a single record; larger sends span the minimum number of
+        // fixed-width records). The sender's own copy is recorded on the first
+        // chunk only. PoW runs on the blocking pool so it can't starve the runtime.
+        let mut records: Vec<Value> = Vec::new();
+        for (ci, chunk) in dests.chunks(epix_envelope::SLOTS).enumerate() {
+            let db = ms.db.clone();
+            let engine = ms.engine.clone();
+            let secret = secret.clone();
+            let my_xid_c = my_xid.clone();
+            let members_c = members.clone();
+            let rule_c = rule.clone();
+            let subject_c = subject.to_string();
+            let body_c = body.to_string();
+            let record_own = ci == 0;
+            let now = now_ms();
+            let chunk_dests: Vec<epix_envelope::Dest> =
+                chunk.iter().map(|b| epix_envelope::Dest { bundle: b.clone() }).collect();
+            let res = tokio::task::spawn_blocking(move || {
+                epix_envelope::send_multi(
+                    db.as_ref(),
+                    engine.as_ref(),
+                    identity_id,
+                    &secret,
+                    &my_xid_c,
+                    &members_c,
+                    &chunk_dests,
+                    conv,
+                    &subject_c,
+                    &body_c,
+                    now,
+                    &rule_c,
+                    record_own,
+                )
+            })
+            .await
+            .map_err(|e| format!("channelSend seal task failed: {e}"))?
+            .map_err(|e| e.to_string())?;
+            records.push(res.record);
+        }
+
+        // Append + flood each fixed-width record.
         let envelopes = records.len();
         for record in records {
             s.state.clone().append_pool_record(&ms.xite, record).await?;
         }
-        // `envelopes` ≥ `recipients` when a recipient has multiple linked devices.
+        // `envelopes` is the record count — independent of the true recipient/device
+        // count (which is hidden inside each fixed-width record).
         Ok(json!({
             "ok": true,
             "conv_id": hex::encode(conv),
