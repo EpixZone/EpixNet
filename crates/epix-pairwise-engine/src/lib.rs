@@ -273,6 +273,42 @@ mod tests {
         assert!(e.open_first(&eve, &fc.tag, &fc.ct).is_err());
     }
 
+    /// F3: a head-of-chain gap far larger than the OLD 32-tag window now
+    /// self-heals — the widened window (== MAX_SKIP) registers the far tag, so
+    /// the record is matchable and the ratchet skips to it, instead of the tag
+    /// silently missing forever.
+    #[test]
+    fn large_head_gap_within_window_self_heals() {
+        let e = PairwiseEngine;
+        let alice = IdentitySecret::new(rand_seed());
+        let bob = IdentitySecret::new(rand_seed());
+        let begun = e.begin_session(&alice, &e.publish_bundle(&bob, "bob.epix"), [5u8; 16]).unwrap();
+        let mut a_sess = begun.session.clone();
+        let fc = e.seal(&a_sess, "alice.epix", &[], "s", "fc", 1, BUCKETS).unwrap();
+        a_sess = fc.session_after;
+        let bo = e.open_first(&bob, &fc.tag, &fc.ct).unwrap();
+        let bob_sess = bo.session_after;
+        let bob_window = bo.next_recv_tags;
+
+        // Alice sends 60 established messages; only the last reaches Bob. Its
+        // tag index (~59) is past the OLD 32-window but inside the new 64.
+        let mut last = None;
+        for i in 0..60 {
+            let s = e.seal(&a_sess, "alice.epix", &[], "t", &format!("m{i}"), 10 + i, BUCKETS).unwrap();
+            a_sess = s.session_after;
+            last = Some((i, s.tag, s.ct));
+        }
+        let (i, tag, ct) = last.unwrap();
+        let n = bob_window
+            .iter()
+            .find(|(_, t)| *t == tag)
+            .map(|(n, _)| *n)
+            .expect("far tag is registered in the widened window (would miss at LOOKAHEAD=32)");
+        assert!(n >= 32, "the gap exceeds the old 32-tag window (n = {n})");
+        let o = e.open(&bob_sess, n, &tag, &ct).unwrap();
+        assert_eq!(o.body, format!("m{i}"));
+    }
+
     /// The load-bearing no-OPK mechanism: a first contact against a bundle whose
     /// signed prekey is from an OLD week must still open — the responder
     /// recomputes `spk_priv(seed, idx)` from the `spk_idx` carried in the header,

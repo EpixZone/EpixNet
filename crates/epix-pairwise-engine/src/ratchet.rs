@@ -18,11 +18,20 @@ use crate::keys;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Lookahead: how many future receive tags a session publishes at once
-/// (tolerates this much reordering / loss before a chain stalls).
-const LOOKAHEAD: u32 = 32;
-/// Hard cap on skipped message keys / header keys retained per session.
-const MAX_SKIP: u32 = 512;
+/// Lookahead: how many future receive tags a session publishes at once. Kept
+/// EQUAL to `MAX_SKIP` so the published window matches the ratchet's skip
+/// tolerance — any record whose tag is registered is also openable, and vice
+/// versa. (Previously 32 while the skip cap was 512, so a head-of-chain gap of
+/// 33..512 records was recoverable by the ratchet but its tag was never
+/// registered, so the record silently missed forever.) 64 self-heals any
+/// realistic reordering/loss while keeping the per-received-message cost — the
+/// node re-registers a window of this many tags on each open — modest, so a
+/// large backfill stays cheap. A contiguous head loss beyond `MAX_SKIP` stalls
+/// that direction until the peer resends (a rare, hard case; see the spec).
+const LOOKAHEAD: u32 = 64;
+/// Hard cap on skipped message keys / header keys retained per session, and the
+/// largest head-of-chain gap a direction can self-heal.
+const MAX_SKIP: u32 = 64;
 /// Fixed plaintext width of a first-contact header.
 const FC_HDR_PLAIN: usize = 128;
 /// Fixed plaintext width of an established (DH-ratchet) header.
@@ -281,6 +290,12 @@ fn ratchet_decrypt_key(s: &mut Session, dh: [u8; 32], pn: u32, n: u32) -> Option
         dh_ratchet(s, dh);
     }
     skip_message_keys(s, n);
+    // Fail closed if the skip was refused (gap > MAX_SKIP): `skip_message_keys`
+    // leaves `nr` short of `n`, so deriving here would produce a wrong-index key
+    // that only AEAD would (silently) reject. Return None explicitly instead.
+    if s.nr < n {
+        return None;
+    }
     let ckr = s.ckr?;
     let (ckr1, mk) = kdf_ck(&ckr);
     s.ckr = Some(ckr1);

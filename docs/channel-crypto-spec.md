@@ -136,14 +136,18 @@ reset counters, `(rk, ckr) = kdf_rk(rk, DH(dhs_priv, dhr))`, generate a fresh
 `dhs`, `(rk, cks) = kdf_rk(rk, DH(dhs_priv', dhr))`.
 
 **Skipped keys.** `skip_message_keys` advances the receive chain storing `mk`s for
-gaps; `MAX_SKIP = 512` refuses absurd jumps. **Both** skipped stores are hard-capped
-and evicted oldest-first: skipped message keys (`skipped_mk`, `ratchet.rs`) and
-skipped header keys (`skipped_hk`, in `header_key_for`) are each bounded to
-`MAX_SKIP` entries. So a message whose key was evicted (a gap wider than 512 that
-later fills, or head-of-chain loss past the `LOOKAHEAD = 32` window) is
-undecryptable — it currently surfaces as an ordinary `NoMatch`, not a distinct
-"session stalled" signal (see §5.1 and the §10 checklist). This bound is what
-keeps the retained-key set from growing without limit over the indefinite pool.
+gaps; `MAX_SKIP = 64` refuses absurd jumps, and `ratchet_decrypt_key` returns
+`None` explicitly when a skip is refused (rather than deriving a wrong-index key
+that only the AEAD would reject). **Both** skipped stores are hard-capped and
+evicted oldest-first: skipped message keys (`skipped_mk`) and skipped header keys
+(`skipped_hk`, in `header_key_for`) are each bounded to `MAX_SKIP` entries — this
+is what keeps the retained-key set from growing without limit over the indefinite
+pool. The published tag window (`LOOKAHEAD`) is kept **equal** to `MAX_SKIP` (§5.1),
+so any record whose tag is registered is also openable and vice-versa: there is no
+longer a "recoverable-by-the-ratchet but never-registered" gap. A head-of-chain
+loss only stalls a direction past `MAX_SKIP` consecutive records — a rare, hard
+case that still surfaces as an ordinary `NoMatch` (a UI "session stalled, ask the
+peer to resend" signal needs node-level session-liveness tracking; §10).
 
 **Headers** (plaintext, fixed width, then AEAD):
 
@@ -177,7 +181,7 @@ Seeds (`begin`/`open_first`): `tck_send = KDF32("epix-channel/tck/v1", salt=SK, 
 `tck_recv` the mirror. Alice sends on `a2b`; Bob sends on `b2a`.
 
 **Detection = O(1)** exact-match of `tag_i` against a stored set of expected tags.
-A session publishes a **window** of the next `LOOKAHEAD = 32` receive tags
+A session publishes a **window** of the next `LOOKAHEAD = 64` receive tags
 (`window_tags`) to that set; `header_key_for` fast-forwards over gaps (storing
 skipped `hk`s, bounded by `MAX_SKIP`). Past tags are unlinkable (PRF outputs from
 a deleted chain state).
@@ -186,7 +190,9 @@ a deleted chain state).
 > account). This is bespoke. It is *not* Fuzzy Message Detection: full replication
 > already makes *fetching* signal-free, so exact-match tags suffice. Review focus:
 > the tag is a PRF output that leaks nothing about the key; a stalled chain past
-> `LOOKAHEAD`/`MAX_SKIP` must surface as "session stalled", never a silent drop.
+> `LOOKAHEAD`/`MAX_SKIP` must fail closed (it does), and ideally surface a
+> "session stalled" signal (a node-level follow-up). `LOOKAHEAD == MAX_SKIP`, so
+> a registered tag is always openable.
 
 ### 5.2 First contact (Tier 2) — Elligator2 tag
 
@@ -281,8 +287,8 @@ not seed-derivable.
 
 | Name | Value | Where |
 |---|---|---|
-| `LOOKAHEAD` | 32 | published receive-tag window |
-| `MAX_SKIP` | 512 | skipped message/header keys, jump bound |
+| `LOOKAHEAD` | 64 | published receive-tag window (== `MAX_SKIP`) |
+| `MAX_SKIP` | 64 | skipped keys, jump bound, self-healable head gap |
 | `FC_HDR_PLAIN` / block | 128 / 144 | first-contact header |
 | `EST_HDR_PLAIN` / block | 40 / 56 | established header |
 | AEAD tag | 16 | ChaCha20-Poly1305 |
