@@ -101,8 +101,12 @@ UI surfaces over one channel store. The group engine is `epix-group-proto`
 ## Config (node)
 
 `channel_enabled`, `channel_xite`, `channel_backfill_weeks` (0=all, newest-first),
-`channel_send_jitter_max_secs`, `channel_feed_snippets`, and `channel_allow_insecure_engine`
-(DEV only — runs the FakeEngine, which provides no confidentiality).
+`channel_send_jitter_max_secs`, `channel_burst_jitter_max_secs` (default 60; the
+random per-record gap that spaces the SECOND-and-later records of a >SLOTS
+multi-record send so the flood can't be counted as one send — `0` disables; see
+[`channel-count-privacy.md`](channel-count-privacy.md)), `channel_feed_snippets`,
+and `channel_allow_insecure_engine` (DEV only — runs the FakeEngine, which provides
+no confidentiality).
 
 ## Site (mail xite) changes
 

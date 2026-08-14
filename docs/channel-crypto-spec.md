@@ -264,6 +264,13 @@ focus:** confirm using `DH2` for both `SK` (inside a 3-DH KDF) and `fc_key`
   `n=0` body, record `conv_id` from the payload, publish the next receive window.
 - **`open`** — established: recover `hk` for the tag index, decrypt the header,
   advance/ratchet to the message key, decrypt the body, publish the next window.
+- **re-wrap dedup** — a first-contact-openable record for a conversation leg that
+  **already has a session** is a re-opener (a send retry, or a second opener that
+  raced the first before this node had the session), never a distinct message —
+  genuine follow-ups arrive as Tier-1, tag-matched records. The indexer detects
+  this (`session_id_for_leg` returns `Some` before `create_session`) and drops it
+  idempotently — marking it processed so it is not re-probed — instead of forking a
+  second ratchet and double-indexing the opener.
 
 Sent messages are recorded to the sender's private index directly and **never**
 posted encrypted-to-self.

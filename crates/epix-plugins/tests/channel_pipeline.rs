@@ -98,11 +98,37 @@ async fn channel_message_flows_through_the_pool_leaking_no_metadata() {
     let shard = alice_node.append_pool_record(XITE, sent.record.clone()).await.unwrap();
 
     // --- The shard is a real file on disk, and it leaks no metadata. ---
+    // The only large field is the opaque `ct` (encrypted body + per-slot key seals
+    // + random pad); `tag`/`sign`/`author` are opaque too. A short marker can occur
+    // by chance inside those random bytes — that is NOT a leak — so grepping the raw
+    // base64 blob is non-deterministic. Check the two real leak vectors precisely.
     let bytes = std::fs::read(alice_root.join(&shard)).expect("shard written to disk");
-    let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("epix-pool-1"), "shard is a pool container");
+    let container: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("epix-pool-1"), "shard is a pool container");
+    let b64 = |s: &str| {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    };
+    let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+    // (1) No plaintext CONTENT survives inside the ciphertext: decode each record's
+    //     `ct` and confirm the whole body/subject bytes never appear contiguously.
+    for rec in container["env"].as_array().unwrap() {
+        let ct = b64(rec["ct"].as_str().unwrap());
+        for secret in ["pizza at eight ZXQ1", "Dinner?"] {
+            assert!(!contains(&ct, secret.as_bytes()), "ct must not expose plaintext {secret:?}");
+        }
+    }
+    // (2) No identity/name metadata in cleartext: blank the opaque fields and grep
+    //     the human-readable remainder for any name or content marker.
+    let mut redacted = container.clone();
+    for rec in redacted["env"].as_array_mut().unwrap() {
+        for k in ["ct", "tag", "sign", "author"] {
+            rec[k] = serde_json::Value::Null;
+        }
+    }
+    let human = redacted.to_string();
     for forbidden in ["ZXQ1", "Dinner", "pizza", ".epix", "alice", "bob"] {
-        assert!(!text.contains(forbidden), "shard must not contain {forbidden:?}");
+        assert!(!human.contains(forbidden), "cleartext structure must not contain {forbidden:?}");
     }
 
     // --- The append broadcast a delta (append → bus wiring). ---
@@ -122,7 +148,7 @@ async fn channel_message_flows_through_the_pool_leaking_no_metadata() {
         &[(bob_id, bob.clone(), "bob.epix".into())],
         &delta.records[0],
         now + 10,
-        &resolve,
+        resolve,
     )
     .unwrap();
     match out {

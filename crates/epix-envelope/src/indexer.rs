@@ -139,46 +139,89 @@ where
     };
     let epoch = record.get("epoch").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    // A single count-hiding record carries up to SLOTS recipient slots, so a node
-    // hosting more than one channel identity can legitimately deliver it to SEVERAL
-    // local identities — one message each. Scan every identity; idempotency and
-    // "processed" are keyed per identity, so an undelivered slot for one identity is
-    // re-checked independently of another's delivered slot in the same record.
+    // A single count-hiding record can carry slots for SEVERAL local identities, so
+    // a node hosting more than one channel identity delivers one message to EACH.
+    // Idempotency and "processed" are keyed per identity, so an undelivered slot for
+    // one identity is re-checked independently of another's delivered slot in the
+    // same record. The two tiers are factored out to keep this dispatch readable;
+    // `delivered` guards against a second slot re-delivering to an already-served
+    // identity.
     let mut outcomes = Vec::new();
     let mut delivered: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    // Tier 1 — established session: each session tag belongs to a specific
-    // identity. O(SLOTS) hashset lookups; open the keyslot whose tag we expect.
+    scan_established(store, engine, &unpacked, &h, epoch, now_ms, &mut outcomes, &mut delivered)?;
+    scan_first_contact(
+        store, engine, identities, &unpacked, &h, epoch, now_ms, &resolve_bundle, &mut outcomes,
+        &mut delivered,
+    )?;
+
+    // Empty = nothing delivered; the record is left unprocessed so a session or
+    // bundle that syncs later makes it matchable on the next rescan.
+    Ok(outcomes)
+}
+
+/// Tier 1 — established sessions. Each detection tag that matches a session opens
+/// that session's keyslot; O(SLOTS) hashset lookups. A `None` open means the tag
+/// matched but the ratchet couldn't open it (e.g. a dummy tag collision) — the
+/// identity is left undelivered so Tier-2 can still probe it.
+#[allow(clippy::too_many_arguments)]
+fn scan_established<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    unpacked: &crate::multislot::Unpacked,
+    h: &[u8],
+    epoch: i64,
+    now_ms: i64,
+    outcomes: &mut Vec<ProcessOutcome>,
+    delivered: &mut std::collections::HashSet<i64>,
+) -> Result<()> {
     for (j, tag) in unpacked.tags.iter().enumerate() {
         let tag_vec = tag.to_vec();
-        if let Some(sm) = store.session_for_tag(&tag_vec)? {
-            if delivered.contains(&sm.identity_id) || store.is_processed(&h, sm.identity_id)? {
-                continue;
-            }
-            if let Some(out) = open_established(
-                store, engine, &sm, tag, &tag_vec, &unpacked.keyslots[j], &unpacked.body_ct, &h,
-                epoch, now_ms,
-            )? {
-                delivered.insert(sm.identity_id);
-                outcomes.push(out);
-            }
-            // `None` = tag matched but the ratchet couldn't open it: leave the
-            // identity undelivered so Tier-2 can still probe it.
+        let Some(sm) = store.session_for_tag(&tag_vec)? else { continue };
+        if delivered.contains(&sm.identity_id) || store.is_processed(h, sm.identity_id)? {
+            continue;
+        }
+        if let Some(out) = open_established(
+            store, engine, &sm, tag, &tag_vec, &unpacked.keyslots[j], &unpacked.body_ct, h, epoch,
+            now_ms,
+        )? {
+            delivered.insert(sm.identity_id);
+            outcomes.push(out);
         }
     }
+    Ok(())
+}
 
-    // Tier 2 — first contact: for each identity not already delivered/processed,
-    // probe each slot. A dummy slot's random keyslot fails `open_first` and is
-    // skipped cheaply; the anti-spoof defers by returning `None`, which lets the
-    // scan continue to other slots rather than aborting the record.
+/// Tier 2 — first contact. For each identity not already delivered/processed,
+/// probe each slot. A dummy slot's random keyslot fails `open_first` and is
+/// skipped cheaply; the anti-spoof defers by returning `None`, which lets the scan
+/// continue to other slots rather than aborting the record.
+#[allow(clippy::too_many_arguments)]
+fn scan_first_contact<E, S, R>(
+    store: &S,
+    engine: &E,
+    identities: &[(i64, IdentitySecret, String)],
+    unpacked: &crate::multislot::Unpacked,
+    h: &[u8],
+    epoch: i64,
+    now_ms: i64,
+    resolve_bundle: &R,
+    outcomes: &mut Vec<ProcessOutcome>,
+    delivered: &mut std::collections::HashSet<i64>,
+) -> Result<()>
+where
+    E: Engine + ?Sized,
+    S: EnvelopeStore,
+    R: Fn(&str) -> Vec<Value>,
+{
     for (identity_id, secret, _my_xid) in identities {
-        if delivered.contains(identity_id) || store.is_processed(&h, *identity_id)? {
+        if delivered.contains(identity_id) || store.is_processed(h, *identity_id)? {
             continue;
         }
         for (j, tag) in unpacked.tags.iter().enumerate() {
             if let Some(out) = open_first_contact(
                 store, engine, *identity_id, secret, tag, &unpacked.keyslots[j], &unpacked.body_ct,
-                &h, epoch, now_ms, &resolve_bundle,
+                h, epoch, now_ms, resolve_bundle,
             )? {
                 delivered.insert(*identity_id);
                 outcomes.push(out);
@@ -186,10 +229,7 @@ where
             }
         }
     }
-
-    // Empty = nothing delivered; the record is left unprocessed so a session or
-    // bundle that syncs later makes it matchable on the next rescan.
-    Ok(outcomes)
+    Ok(())
 }
 
 /// Convenience for callers/tests that expect a record to deliver to at most one
@@ -336,6 +376,21 @@ where
 
     let sender = Some(bp.sender_xid.clone());
     let conv_hex = hex::encode(op.conv_id);
+
+    // Re-wrap dedup: a first-contact-openable record for a conversation leg that
+    // ALREADY has a session is a re-opener — a send retry, or a second opener that
+    // raced the first before this node had the session — NOT a distinct message
+    // (genuine follow-ups arrive as Tier-1, tag-matched records). Creating a second
+    // session here would fork the ratchet and double-index the opener. Drop it
+    // idempotently: mark it processed for this identity so it is not re-probed on
+    // every rescan, and report no new message.
+    if !bp.sender_xid.is_empty()
+        && store.session_id_for_leg(identity_id, &conv_hex, &bp.sender_xid)?.is_some()
+    {
+        store.mark_processed(h, identity_id)?;
+        return Ok(Some(ProcessOutcome::AlreadyProcessed));
+    }
+
     let recv = to_tag_vecs(&op.next_recv_tags);
     let session_id = store.create_session(
         identity_id,

@@ -78,13 +78,22 @@ independently opens its own slot of the *same* record (tested).
 - **Tier-2 first-contact probing is SLOTS× per foreign record** (probe each slot).
   Only records that miss Tier-1 pay it, and each probe is one cheap DH; still, at
   scale it is 8× the pre-multislot first-contact cost.
-- **Groups > SLOTS destinations** span `ceil(N/SLOTS)` records, appended
-  back-to-back. They are cryptographically unlinkable (fresh routing tag / author /
-  `K_msg` / shard each), but a peer watching the flood can correlate the
+- **Groups > SLOTS destinations** span `ceil(N/SLOTS)` records. They are
+  cryptographically unlinkable (fresh routing tag / author / `K_msg` / shard each),
+  but if appended back-to-back a peer watching the flood could correlate the
   simultaneous same-size records by transport timing+size and read off a *bucketed*
   destination count (e.g. 3 records ⇒ 17–24 destinations) — slightly stronger than
-  a bare ">SLOTS". Mitigation (not yet implemented): space/jitter the multi-record
-  burst. Below SLOTS there is no such leak (one record).
+  a bare ">SLOTS". **Now mitigated (`channel.rs::append_records_jittered`):** the
+  first record is posted immediately (byte-identical to a normal single-record
+  send, so it adds no signal), and the remaining records are dribbled out from a
+  detached task with a random per-record gap (`channel_burst_jitter_max_secs`,
+  default 60s), so they are no longer a simultaneous same-size burst. A determined
+  global observer with long-window statistics can still infer *something* (jitter ≠
+  mixnet), but the real-time burst-count is gone. Below SLOTS there is no such leak
+  (one record) and no delay. The deferred records are already sealed with their
+  ratchet advanced+persisted, so a deferred append is crash-safe: an unlucky
+  shutdown may only fail to *deliver* a large-group send to some recipients, and a
+  resend re-posts on the advanced ratchet (no key reuse).
 - **Send origin** to a directly-connected peer (that you sent *something*) is
   unchanged — closed only by Tor-Always + send jitter, as before. This fix removes
   the *recipient* count from what that peer can infer, not the fact of a send.

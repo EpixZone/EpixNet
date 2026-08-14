@@ -188,6 +188,59 @@ fn refine_device_bundles(mut devs: Vec<Value>, active: &[String]) -> Vec<Value> 
     devs
 }
 
+/// Map one process outcome to a `channelEvent` payload; a first-contact hit flags
+/// that a NEW session formed (so the caller can re-scan for out-of-order records).
+fn indexed_event(outcome: ProcessOutcome, new_session: &mut bool) -> Option<Value> {
+    let ProcessOutcome::Indexed {
+        conv_id, sender_xid, subject, snippet, unread, first_contact, pending, ..
+    } = outcome
+    else {
+        return None;
+    };
+    if first_contact {
+        *new_session = true;
+    }
+    Some(json!({
+        "type": "new_message",
+        "conv_id": conv_id,
+        "from_xid": sender_xid,
+        "subject": subject,
+        "snippet": snippet,
+        "unread": unread,
+        // >0 means earlier messages in this conversation are still arriving
+        // (received out of order) — a delivery-gap hint.
+        "pending": pending,
+    }))
+}
+
+/// Trial-decrypt a batch of records into the private index (the blocking core of
+/// [`index_batch`]); collect a `channelEvent` per newly-indexed message and whether
+/// a NEW session formed. One record can deliver to SEVERAL local identities (one
+/// slot each), so `process_record` returns a Vec.
+fn process_batch_blocking(
+    db: &ChannelDb,
+    engine: &dyn Engine,
+    identities: &[(i64, IdentitySecret, String)],
+    records: &[Value],
+    now: i64,
+    bundles: &std::collections::HashMap<String, Vec<Value>>,
+) -> (Vec<Value>, bool) {
+    let resolve =
+        |xid: &str| -> Vec<Value> { bundles.get(&norm_xid(xid)).cloned().unwrap_or_default() };
+    let mut events: Vec<Value> = Vec::new();
+    let mut new_session = false;
+    for rec in records {
+        let outcomes = epix_envelope::process_record(db, engine, identities, rec, now, resolve)
+            .unwrap_or_default();
+        for outcome in outcomes {
+            if let Some(ev) = indexed_event(outcome, &mut new_session) {
+                events.push(ev);
+            }
+        }
+    }
+    (events, new_session)
+}
+
 async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec<Value>) -> bool {
     let identities = build_identities(state, &ms.db).await;
     if identities.is_empty() || records.is_empty() {
@@ -201,45 +254,7 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
     let bundles = load_published_bundles(state, &ms.xite).await;
 
     let (events, new_session) = tokio::task::spawn_blocking(move || {
-        let resolve =
-            |xid: &str| -> Vec<Value> { bundles.get(&norm_xid(xid)).cloned().unwrap_or_default() };
-        let mut out: Vec<Value> = Vec::new();
-        let mut new_session = false;
-        for rec in &records {
-            // One record can now deliver to SEVERAL local identities (one slot
-            // each), so process_record returns a Vec — fire an event per message.
-            let outcomes = epix_envelope::process_record(&db, engine.as_ref(), &identities, rec, now, &resolve)
-                .unwrap_or_default();
-            for outcome in outcomes {
-                if let ProcessOutcome::Indexed {
-                    conv_id,
-                    sender_xid,
-                    subject,
-                    snippet,
-                    unread,
-                    first_contact,
-                    pending,
-                    ..
-                } = outcome
-                {
-                    if first_contact {
-                        new_session = true;
-                    }
-                    out.push(json!({
-                        "type": "new_message",
-                        "conv_id": conv_id,
-                        "from_xid": sender_xid,
-                        "subject": subject,
-                        "snippet": snippet,
-                        "unread": unread,
-                        // >0 means earlier messages in this conversation are still
-                        // arriving (received out of order) — a delivery-gap hint.
-                        "pending": pending,
-                    }));
-                }
-            }
-        }
-        (out, new_session)
+        process_batch_blocking(&db, engine.as_ref(), &identities, &records, now, &bundles)
     })
     .await
     .unwrap_or((Vec::new(), false));
@@ -614,6 +629,101 @@ impl WsCommand for ChannelContacts {
     }
 }
 
+/// Resolve every recipient name to its active, verified device bundles, flattened
+/// into one destination list (one slot per device). Errors if a recipient is
+/// revoked on chain, or has published no usable channel keys. Touches no ratchet
+/// state, so the caller runs it BEFORE taking the send lock.
+async fn resolve_destinations(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    recipients: &[String],
+    published: &std::collections::HashMap<String, Vec<Value>>,
+) -> Result<Vec<Value>, String> {
+    let mut dests: Vec<Value> = Vec::new();
+    for recip in recipients {
+        // Don't seal to a recipient whose xID has been revoked on chain (fail open
+        // on an indeterminate result so a chain outage doesn't block messaging).
+        if state.xid_name_active(recip).await == Some(false) {
+            return Err(format!("{recip}'s identity has been revoked"));
+        }
+        let devices: Vec<Value> = published
+            .get(recip)
+            .into_iter()
+            .flatten()
+            .filter(|b| ms.engine.verify_bundle(b))
+            .cloned()
+            .collect();
+        if devices.is_empty() {
+            return Err(format!("{recip} has not published channel keys"));
+        }
+        dests.extend(devices);
+    }
+    Ok(dests)
+}
+
+/// A random inter-record burst gap in `1..=max_secs`, from the crypt RNG.
+/// `max_secs == 0` disables jitter (the caller handles that).
+fn jitter_gap_secs(max_secs: u64) -> u64 {
+    if max_secs == 0 {
+        return 0;
+    }
+    let bytes = hex::decode(epix_crypt::new_seed()).unwrap_or_default();
+    let r = bytes.iter().take(8).fold(0u64, |acc, &b| (acc << 8) | b as u64);
+    1 + (r % max_secs)
+}
+
+/// The max per-record burst-jitter gap (seconds); default 60, `0` disables. Only
+/// spaces the SECOND-and-later records of a >SLOTS multi-record send.
+async fn burst_jitter_max_secs(state: &Arc<AppState>) -> u64 {
+    state
+        .config_get("channel_burst_jitter_max_secs")
+        .await
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .unwrap_or(60)
+}
+
+/// Append + flood the sealed records. The FIRST record goes out immediately — a
+/// single-record send is byte-identical to the first record of a multi-record
+/// send, so this leaks nothing new. When a send spanned MORE THAN ONE record
+/// (>SLOTS destinations) and burst jitter is enabled, the remaining records are
+/// dribbled out from a detached task with random gaps, so a peer watching the
+/// flood can't bind the simultaneous same-size records into one send and read off
+/// a bucketed destination count (see `docs/channel-count-privacy.md`). The records
+/// are already sealed with their ratchet state persisted, so a deferred append is
+/// crash-safe: on an unlucky shutdown a large-group send may simply not reach some
+/// recipients, and a resend re-posts on the advanced ratchet.
+async fn append_records_jittered(
+    state: Arc<AppState>,
+    xite: String,
+    records: Vec<Value>,
+    jitter_max_secs: u64,
+) -> Result<(), String> {
+    let mut it = records.into_iter();
+    if let Some(first) = it.next() {
+        state.clone().append_pool_record(&xite, first).await?;
+    }
+    let rest: Vec<Value> = it.collect();
+    if rest.is_empty() {
+        return Ok(());
+    }
+    if jitter_max_secs == 0 {
+        for record in rest {
+            state.clone().append_pool_record(&xite, record).await?;
+        }
+        return Ok(());
+    }
+    tokio::spawn(async move {
+        for record in rest {
+            let gap = jitter_gap_secs(jitter_max_secs);
+            tokio::time::sleep(std::time::Duration::from_secs(gap)).await;
+            if let Err(e) = state.clone().append_pool_record(&xite, record).await {
+                state.log("WARNING", &format!("deferred channel record append failed: {e}")).await;
+            }
+        }
+    });
+    Ok(())
+}
+
 struct ChannelSend;
 #[async_trait]
 impl WsCommand for ChannelSend {
@@ -650,92 +760,79 @@ impl WsCommand for ChannelSend {
 
         // ONE conversation id shared across the whole thread (a 1:1 or a group),
         // and the full participant list (recipients + me) so every recipient can
-        // reply-all. The message is fanned out as one pairwise-sealed envelope
-        // per OTHER member — unlinkable to each other, but sharing conv + members.
+        // reply-all.
         let conv = conv_hint.unwrap_or_else(epix_envelope::new_conv_id);
         let mut members: Vec<String> = recipients.clone();
         members.push(norm_xid(&my_xid));
         members.sort();
         members.dedup();
 
-        // Serialize the whole seal→persist→append critical section: two
-        // concurrent sends must not read the same ratchet state (which would
-        // reuse an AEAD nonce and a detection tag). Held until this send returns.
-        let _send_guard = ms.send_lock.lock().await;
-
-        // Resolve every recipient's active device bundles, then flatten to ONE list
-        // of destinations. Instead of one pool record per device (which would leak
-        // the recipient device+group count to a peer counting the burst), all
+        // Resolve every recipient's active device bundles, flattened to ONE list of
+        // destinations. Instead of one pool record per device (which would leak the
+        // recipient device+group count to a peer counting the burst), all
         // destinations are packed into fixed-width `SLOTS`-slot records — so the
         // observable record count is independent of how many devices/recipients the
-        // message actually reaches. See `docs/channel-count-privacy.md`.
+        // message actually reaches. Resolving touches no ratchet state, so it runs
+        // BEFORE the send lock. See `docs/channel-count-privacy.md`.
         let published = load_published_bundles(&s.state, &ms.xite).await;
-        let mut dests: Vec<Value> = Vec::new();
-        for recip in recipients.iter() {
-            // Don't seal to a recipient whose xID has been revoked on chain (fail
-            // open on an indeterminate result so a chain outage doesn't block mail).
-            if s.state.xid_name_active(recip).await == Some(false) {
-                return Err(format!("{recip}'s identity has been revoked"));
-            }
-            let devices: Vec<Value> = published
-                .get(recip)
-                .into_iter()
-                .flatten()
-                .filter(|b| ms.engine.verify_bundle(b))
-                .cloned()
-                .collect();
-            if devices.is_empty() {
-                return Err(format!("{recip} has not published channel keys"));
-            }
-            dests.extend(devices);
-        }
+        let dests = resolve_destinations(&s.state, &ms, &recipients, &published).await?;
 
-        // One record per chunk of up to SLOTS destinations (a send to ≤ SLOTS total
-        // devices is a single record; larger sends span the minimum number of
-        // fixed-width records). The sender's own copy is recorded on the first
-        // chunk only. PoW runs on the blocking pool so it can't starve the runtime.
-        let mut records: Vec<Value> = Vec::new();
-        for (ci, chunk) in dests.chunks(epix_envelope::SLOTS).enumerate() {
-            let db = ms.db.clone();
-            let engine = ms.engine.clone();
-            let secret = secret.clone();
-            let my_xid_c = my_xid.clone();
-            let members_c = members.clone();
-            let rule_c = rule.clone();
-            let subject_c = subject.to_string();
-            let body_c = body.to_string();
-            let record_own = ci == 0;
-            let now = now_ms();
-            let chunk_dests: Vec<epix_envelope::Dest> =
-                chunk.iter().map(|b| epix_envelope::Dest { bundle: b.clone() }).collect();
-            let res = tokio::task::spawn_blocking(move || {
-                epix_envelope::send_multi(
-                    db.as_ref(),
-                    engine.as_ref(),
-                    identity_id,
-                    &secret,
-                    &my_xid_c,
-                    &members_c,
-                    &chunk_dests,
-                    conv,
-                    &subject_c,
-                    &body_c,
-                    now,
-                    &rule_c,
-                    record_own,
-                )
-            })
-            .await
-            .map_err(|e| format!("channelSend seal task failed: {e}"))?
-            .map_err(|e| e.to_string())?;
-            records.push(res.record);
-        }
+        // Seal each chunk of up to SLOTS destinations into one fixed-width record
+        // (≤ SLOTS total devices is a single record; larger sends span the minimum
+        // number of records). The sender's own copy is recorded on the first chunk
+        // only. PoW runs on the blocking pool so it can't starve the runtime. The
+        // send lock serializes the seal→persist section: two concurrent sends must
+        // not read the same ratchet state (which would reuse an AEAD nonce and a
+        // detection tag). It is held ONLY across sealing — appends touch no ratchet
+        // state — so the jittered append below never blocks another send.
+        let records = {
+            let _send_guard = ms.send_lock.lock().await;
+            let mut records: Vec<Value> = Vec::new();
+            for (ci, chunk) in dests.chunks(epix_envelope::SLOTS).enumerate() {
+                let db = ms.db.clone();
+                let engine = ms.engine.clone();
+                let secret = secret.clone();
+                let my_xid_c = my_xid.clone();
+                let members_c = members.clone();
+                let rule_c = rule.clone();
+                let subject_c = subject.to_string();
+                let body_c = body.to_string();
+                let record_own = ci == 0;
+                let now = now_ms();
+                let chunk_dests: Vec<epix_envelope::Dest> =
+                    chunk.iter().map(|b| epix_envelope::Dest { bundle: b.clone() }).collect();
+                let res = tokio::task::spawn_blocking(move || {
+                    epix_envelope::send_multi(
+                        db.as_ref(),
+                        engine.as_ref(),
+                        identity_id,
+                        &secret,
+                        &my_xid_c,
+                        &members_c,
+                        &chunk_dests,
+                        conv,
+                        &subject_c,
+                        &body_c,
+                        now,
+                        &rule_c,
+                        record_own,
+                    )
+                })
+                .await
+                .map_err(|e| format!("channelSend seal task failed: {e}"))?
+                .map_err(|e| e.to_string())?;
+                records.push(res.record);
+            }
+            records
+        };
 
-        // Append + flood each fixed-width record.
+        // Append + flood. The first record goes out now; any extra records of a
+        // >SLOTS send are spaced by burst jitter so a peer watching the flood can't
+        // count the simultaneous same-size records as one send.
         let envelopes = records.len();
-        for record in records {
-            s.state.clone().append_pool_record(&ms.xite, record).await?;
-        }
+        let jitter = burst_jitter_max_secs(&s.state).await;
+        append_records_jittered(s.state.clone(), ms.xite.clone(), records, jitter).await?;
+
         // `envelopes` is the record count — independent of the true recipient/device
         // count (which is hidden inside each fixed-width record).
         Ok(json!({

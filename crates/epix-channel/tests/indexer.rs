@@ -493,6 +493,88 @@ fn base64_decode(s: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD.decode(s).unwrap()
 }
 
+/// Re-wrap dedup: two first-contact-openable records for the SAME conversation leg
+/// (a send retry, or a second opener that raced the first before this node had the
+/// session) must NOT create a second session or double-index the opener. The first
+/// is indexed; the second is dropped idempotently (`AlreadyProcessed`).
+#[test]
+fn first_contact_rewrap_does_not_duplicate_session() {
+    let e = FakeEngine;
+    let r = rule();
+    let now = 1_780_000_000_000i64;
+
+    let bob_db = ChannelDb::memory().unwrap();
+    let bob = rand_id();
+    let bob_id = bob_db.upsert_identity("bob.epix", "epix1bob", 0, None).unwrap();
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+
+    // Alice's identity is fixed (same secret/name/bundle), but each opener is sealed
+    // from a FRESH sender store with no persisted session — so both are first-contact
+    // openers for the SAME conversation id, exactly as a resend / raced opener is.
+    let alice = rand_id();
+    let alice_bundle = e.publish_bundle(&alice, "alice.epix");
+    let conv = conv16();
+    let seal_opener = || {
+        let a_db = ChannelDb::memory().unwrap();
+        let a_id = a_db.upsert_identity("alice.epix", "epix1alice", 0, None).unwrap();
+        send_message(
+            &a_db, &e, a_id, &alice, "alice.epix", &[], &bob_bundle, conv, "Hi",
+            "first message ZXQ", now, &r, false,
+        )
+        .unwrap()
+    };
+    let r1 = seal_opener();
+    let r2 = seal_opener();
+
+    let resolve = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() }
+    };
+
+    // First opener → a new first-contact conversation.
+    let o1 = process_record_one(
+        &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &r1.record, now + 10, &resolve,
+    )
+    .unwrap();
+    let conv_hex = match o1 {
+        ProcessOutcome::Indexed { first_contact, conv_id, .. } => {
+            assert!(first_contact, "the first opener is a first contact");
+            conv_id
+        }
+        other => panic!("expected the first opener to index, got {other:?}"),
+    };
+    assert_eq!(bob_db.messages(bob_id, &conv_hex).unwrap().len(), 1);
+    let threads_before = bob_db.threads(bob_id, "all", 0, 10).unwrap().len();
+
+    // Second opener for the SAME leg → deduped: no new session, no duplicate row.
+    let o2 = process_record_one(
+        &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &r2.record, now + 20, &resolve,
+    )
+    .unwrap();
+    assert_eq!(
+        o2,
+        ProcessOutcome::AlreadyProcessed,
+        "a re-wrap opener for an existing leg is deduped, not re-indexed"
+    );
+    assert_eq!(
+        bob_db.messages(bob_id, &conv_hex).unwrap().len(),
+        1,
+        "no duplicate message from the re-wrap opener"
+    );
+    assert_eq!(
+        bob_db.threads(bob_id, "all", 0, 10).unwrap().len(),
+        threads_before,
+        "no duplicate thread/session from the re-wrap opener"
+    );
+
+    // And it stays deduped on a rescan (marked processed, not re-probed).
+    let o3 = process_record_one(
+        &bob_db, &e, &[(bob_id, bob, "bob.epix".into())], &r2.record, now + 30, &resolve,
+    )
+    .unwrap();
+    assert_eq!(o3, ProcessOutcome::NoMatch, "the re-wrap opener is skipped on rescan");
+    assert_eq!(bob_db.messages(bob_id, &conv_hex).unwrap().len(), 1);
+}
+
 /// The Defect-A fix: a node hosting TWO channel identities, both addressed in the
 /// SAME count-hiding record, delivers the message to BOTH (one inbox row each) —
 /// not just the first. Idempotency is per (record, identity), so a rescan adds no

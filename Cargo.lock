@@ -2450,6 +2450,7 @@ dependencies = [
  "base64 0.23.1",
  "epix-channel",
  "epix-core",
+ "epix-crypt",
  "epix-discovery",
  "epix-envelope",
  "epix-pairwise-engine",
