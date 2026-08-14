@@ -17,3 +17,20 @@ paths-ignore:
   - "**/benches/**"
   - "**/examples/**"
   - "**/src/tests.rs"
+
+# `rust/hard-coded-cryptographic-value` fires on every fixed value that reaches a
+# salt/nonce/key/IV sink. In the metadata-private messaging engine
+# (crates/epix-pairwise-engine) those are, by construction, almost entirely
+# DOMAIN-SEPARATION CONSTANTS that MUST be fixed and public, not secrets:
+#   * HKDF `info` contexts (e.g. "epix-channel/rk/v1", "…/x3dh/v1", "…/tck/v1"),
+#   * HMAC chain-key labels (0x01 / 0x02) and tag-chain labels ("tag"/"hdr"/"chain"),
+#   * AEAD nonce domain labels ("est-hdr" / "fc-hdr") — the actual nonce is
+#     DERIVED from a per-record varying tag, so nothing is reused,
+#   * the fixed public X3DH salt 0xFF^32 (as in the Signal X3DH spec).
+# The query cannot distinguish a public domain separator from a leaked key, so it
+# is a false positive here for every hit. The whole construction is specified and
+# external-review-gated in docs/channel-crypto-spec.md with frozen KAT vectors,
+# and hard-coded SECRETS are caught separately by the required gitleaks check.
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value

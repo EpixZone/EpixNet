@@ -201,123 +201,167 @@ where
 
     // Tier 1 — established session (O(1) tag lookup).
     if let Some(sm) = store.session_for_tag(&tag_vec)? {
-        if let Ok(op) = engine.open(&sm.ratchet, sm.n, &tag, &ct_vec) {
-            let sender = op.sender_xid.clone().or_else(|| sm.peer_xid.clone());
-            let commit = InboundCommit {
-                identity_id: sm.identity_id,
-                session_id: sm.session_id,
-                conv_id: sm.conv_id.clone(),
-                peer_xid: sm.peer_xid.clone(),
-                sender_xid: sender.clone(),
-                members: op.members.clone(),
-                subject: op.subject.clone(),
-                body: op.body.clone(),
-                sent_ms: op.sent_ms,
-                received_ms: now_ms,
-                epoch,
-                sign_h: h.clone(),
-                ratchet_after: op.session_after.clone(),
-                consumed_tag: tag_vec.clone(),
-                new_tags: to_tag_vecs(&op.next_recv_tags),
-            };
-            if let Some(msg_id) = store.commit_inbound(&commit)? {
-                let unread = store.unread_count(sm.identity_id)?;
-                return Ok(ProcessOutcome::Indexed {
-                    msg_id,
-                    identity_id: sm.identity_id,
-                    conv_id: sm.conv_id,
-                    sender_xid: sender,
-                    subject: op.subject.clone(),
-                    snippet: snippet_of(&op.body),
-                    unread,
-                    first_contact: false,
-                });
-            }
-            return Ok(ProcessOutcome::AlreadyProcessed);
+        if let Some(out) =
+            open_established(store, engine, &sm, &tag, &tag_vec, &ct_vec, &h, epoch, now_ms)?
+        {
+            return Ok(out);
         }
-        // Tag matched but the ratchet could not open it (corrupt/replayed under
+        // Tag matched but the ratchet could not open it (corrupt / replayed under
         // a re-used tag): fall through to first-contact probing.
     }
 
     // Tier 2 — first contact (one cheap probe per identity).
     for (identity_id, secret, _my_xid) in identities {
-        if !engine.first_contact_candidate(secret, &tag, &ct_vec) {
-            continue;
+        if let Some(out) = open_first_contact(
+            store, engine, *identity_id, secret, &tag, &ct_vec, &h, epoch, now_ms, &resolve_bundle,
+        )? {
+            return Ok(out);
         }
-        let op = match engine.open_first(secret, &tag, &ct_vec) {
-            Ok(op) => op,
-            Err(_) => continue,
-        };
-
-        // M1 anti-spoof: the first-contact header carries an attacker-controlled
-        // `sender_xid` plus a transcript-bound `ik_a`. Trust the attribution ONLY
-        // if the sender's PUBLISHED bundle proves it owns that identity key.
-        // Only one identity can open a given first-contact record (DH2 binds it),
-        // so a failed check ends processing for this record — no `continue`.
-        if let (Some(claimed), Some(ik_a)) = (op.sender_xid.as_deref(), op.ik_a.as_ref()) {
-            match resolve_bundle(claimed) {
-                // Published bundle's IK matches the transcript key → authentic.
-                Some(bundle) if engine.sender_ik(&bundle).as_ref() == Some(ik_a) => {}
-                // Bundle exists but does NOT match → forged sender. Drop for good
-                // (mark processed so a forgery isn't retried every rescan).
-                Some(_) => {
-                    store.mark_processed(&h)?;
-                    return Ok(ProcessOutcome::NoMatch);
-                }
-                // No published bundle yet → cannot verify. Defer WITHOUT marking
-                // processed, so it becomes indexable once the bundle syncs.
-                None => return Ok(ProcessOutcome::NoMatch),
-            }
-        }
-
-        let conv_hex = hex::encode(op.conv_id);
-        let recv = to_tag_vecs(&op.next_recv_tags);
-        let session_id = store.create_session(
-            *identity_id,
-            &conv_hex,
-            op.sender_xid.as_deref(),
-            "resp",
-            &op.session_after,
-            now_ms,
-            &recv,
-        )?;
-        let commit = InboundCommit {
-            identity_id: *identity_id,
-            session_id,
-            conv_id: conv_hex.clone(),
-            peer_xid: op.sender_xid.clone(),
-            sender_xid: op.sender_xid.clone(),
-            members: op.members.clone(),
-            subject: op.subject.clone(),
-            body: op.body.clone(),
-            sent_ms: op.sent_ms,
-            received_ms: now_ms,
-            epoch,
-            sign_h: h.clone(),
-            ratchet_after: op.session_after.clone(),
-            consumed_tag: Vec::new(),
-            new_tags: Vec::new(),
-        };
-        if let Some(msg_id) = store.commit_inbound(&commit)? {
-            let unread = store.unread_count(*identity_id)?;
-            return Ok(ProcessOutcome::Indexed {
-                msg_id,
-                identity_id: *identity_id,
-                conv_id: conv_hex,
-                sender_xid: op.sender_xid.clone(),
-                subject: op.subject.clone(),
-                snippet: snippet_of(&op.body),
-                unread,
-                first_contact: true,
-            });
-        }
-        return Ok(ProcessOutcome::AlreadyProcessed);
     }
 
     // No match. Deliberately NOT marked processed: a session established later
     // (e.g. a first-contact record that arrived after this reply) makes this
     // record matchable on the next rescan.
     Ok(ProcessOutcome::NoMatch)
+}
+
+/// Tier-1 established-session open + commit. `Ok(Some(_))` = handled (indexed or
+/// already-processed); `Ok(None)` = the tag matched but the ratchet couldn't open
+/// it, so the caller should fall through to first-contact probing.
+#[allow(clippy::too_many_arguments)]
+fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    sm: &crate::store::SessionMatch,
+    tag: &[u8; 32],
+    tag_vec: &[u8],
+    ct_vec: &[u8],
+    h: &[u8],
+    epoch: i64,
+    now_ms: i64,
+) -> Result<Option<ProcessOutcome>> {
+    let Ok(op) = engine.open(&sm.ratchet, sm.n, tag, ct_vec) else { return Ok(None) };
+    let sender = op.sender_xid.clone().or_else(|| sm.peer_xid.clone());
+    let commit = InboundCommit {
+        identity_id: sm.identity_id,
+        session_id: sm.session_id,
+        conv_id: sm.conv_id.clone(),
+        peer_xid: sm.peer_xid.clone(),
+        sender_xid: sender.clone(),
+        members: op.members.clone(),
+        subject: op.subject.clone(),
+        body: op.body.clone(),
+        sent_ms: op.sent_ms,
+        received_ms: now_ms,
+        epoch,
+        sign_h: h.to_vec(),
+        ratchet_after: op.session_after.clone(),
+        consumed_tag: tag_vec.to_vec(),
+        new_tags: to_tag_vecs(&op.next_recv_tags),
+    };
+    let Some(msg_id) = store.commit_inbound(&commit)? else {
+        return Ok(Some(ProcessOutcome::AlreadyProcessed));
+    };
+    let unread = store.unread_count(sm.identity_id)?;
+    Ok(Some(ProcessOutcome::Indexed {
+        msg_id,
+        identity_id: sm.identity_id,
+        conv_id: sm.conv_id.clone(),
+        sender_xid: sender,
+        subject: op.subject,
+        snippet: snippet_of(&op.body),
+        unread,
+        first_contact: false,
+    }))
+}
+
+/// Tier-2 first-contact probe + anti-spoof + commit for ONE identity.
+/// `Ok(None)` = not for this identity (try the next); `Ok(Some(_))` = this
+/// identity handled it (indexed, already-processed, or rejected/deferred).
+#[allow(clippy::too_many_arguments)]
+fn open_first_contact<E, S, R>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    secret: &IdentitySecret,
+    tag: &[u8; 32],
+    ct_vec: &[u8],
+    h: &[u8],
+    epoch: i64,
+    now_ms: i64,
+    resolve_bundle: &R,
+) -> Result<Option<ProcessOutcome>>
+where
+    E: Engine + ?Sized,
+    S: EnvelopeStore,
+    R: Fn(&str) -> Option<Value>,
+{
+    if !engine.first_contact_candidate(secret, tag, ct_vec) {
+        return Ok(None);
+    }
+    let Ok(op) = engine.open_first(secret, tag, ct_vec) else { return Ok(None) };
+
+    // M1 anti-spoof: the header carries an attacker-controlled `sender_xid` plus a
+    // transcript-bound `ik_a`. Trust the attribution ONLY if the sender's PUBLISHED
+    // bundle proves it owns that identity key. Only one identity can open a given
+    // record (DH2 binds it), so a failed check ends processing (returns Some).
+    if let (Some(claimed), Some(ik_a)) = (op.sender_xid.as_deref(), op.ik_a.as_ref()) {
+        match resolve_bundle(claimed) {
+            // Published bundle's IK matches the transcript key → authentic.
+            Some(bundle) if engine.sender_ik(&bundle).as_ref() == Some(ik_a) => {}
+            // Bundle exists but does NOT match → forged sender. Drop for good.
+            Some(_) => {
+                store.mark_processed(h)?;
+                return Ok(Some(ProcessOutcome::NoMatch));
+            }
+            // No published bundle yet → cannot verify. Defer WITHOUT marking
+            // processed, so it becomes indexable once the bundle syncs.
+            None => return Ok(Some(ProcessOutcome::NoMatch)),
+        }
+    }
+
+    let conv_hex = hex::encode(op.conv_id);
+    let recv = to_tag_vecs(&op.next_recv_tags);
+    let session_id = store.create_session(
+        identity_id,
+        &conv_hex,
+        op.sender_xid.as_deref(),
+        "resp",
+        &op.session_after,
+        now_ms,
+        &recv,
+    )?;
+    let commit = InboundCommit {
+        identity_id,
+        session_id,
+        conv_id: conv_hex.clone(),
+        peer_xid: op.sender_xid.clone(),
+        sender_xid: op.sender_xid.clone(),
+        members: op.members.clone(),
+        subject: op.subject.clone(),
+        body: op.body.clone(),
+        sent_ms: op.sent_ms,
+        received_ms: now_ms,
+        epoch,
+        sign_h: h.to_vec(),
+        ratchet_after: op.session_after.clone(),
+        consumed_tag: Vec::new(),
+        new_tags: Vec::new(),
+    };
+    let Some(msg_id) = store.commit_inbound(&commit)? else {
+        return Ok(Some(ProcessOutcome::AlreadyProcessed));
+    };
+    let unread = store.unread_count(identity_id)?;
+    Ok(Some(ProcessOutcome::Indexed {
+        msg_id,
+        identity_id,
+        conv_id: conv_hex,
+        sender_xid: op.sender_xid,
+        subject: op.subject,
+        snippet: snippet_of(&op.body),
+        unread,
+        first_contact: true,
+    }))
 }
 
 fn snippet_of(body: &str) -> String {

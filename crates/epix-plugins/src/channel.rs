@@ -101,6 +101,25 @@ async fn build_identities(
 /// Trial-decrypt a batch of pool records into the private index; push a
 /// `channelEvent` per newly-indexed message. Returns whether a NEW session formed
 /// (so the caller can re-scan for out-of-order records). Does not itself re-scan.
+/// Every user's published key bundle on the xite, keyed by normalized xid. The
+/// map is bounded by the number of xite users; used by the first-contact
+/// anti-spoof check (sender_xid → bundle.ik).
+async fn load_published_bundles(
+    state: &Arc<AppState>,
+    xite: &str,
+) -> std::collections::HashMap<String, Value> {
+    let mut bundles = std::collections::HashMap::new();
+    for path in state.list_xite_files(xite).await {
+        let Some(rest) = path.strip_prefix("data/users/") else { continue };
+        let Some(dir) = rest.strip_suffix("/data.json") else { continue };
+        let Some(bytes) = state.read_xite_file(xite, &path).await else { continue };
+        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
+        let key = v.get("xid").and_then(|x| x.as_str()).unwrap_or(dir);
+        bundles.insert(norm_xid(key), v);
+    }
+    bundles
+}
+
 async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec<Value>) -> bool {
     let identities = build_identities(state, &ms.db).await;
     if identities.is_empty() || records.is_empty() {
@@ -109,21 +128,9 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
     let db = (*ms.db).clone();
     let engine = ms.engine.clone();
     let now = now_ms();
-
-    // Pre-load every published key bundle so the first-contact anti-spoof check
-    // (a sender_xid → bundle.ik lookup) can run synchronously inside spawn_blocking.
-    // Keyed by normalized xid; the map is bounded by the number of xite users.
-    let mut bundles: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
-    for path in state.list_xite_files(&ms.xite).await {
-        let Some(rest) = path.strip_prefix("data/users/") else { continue };
-        let Some(dir) = rest.strip_suffix("/data.json") else { continue };
-        if let Some(bytes) = state.read_xite_file(&ms.xite, &path).await {
-            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                let key = v.get("xid").and_then(|x| x.as_str()).unwrap_or(dir);
-                bundles.insert(norm_xid(key), v);
-            }
-        }
-    }
+    // Published bundles, so the first-contact anti-spoof check can resolve a
+    // sender_xid → bundle.ik synchronously inside spawn_blocking.
+    let bundles = load_published_bundles(state, &ms.xite).await;
 
     let (events, new_session) = tokio::task::spawn_blocking(move || {
         let resolve = |xid: &str| -> Option<Value> { bundles.get(&norm_xid(xid)).cloned() };
