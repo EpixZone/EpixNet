@@ -1,69 +1,62 @@
 //! Client-side finality verification for the xID state digest.
 //!
-//! The chain has validators sign the current state digest (via ABCI++ vote
-//! extensions, with a per-validator *attestation key* registered on-chain). This
-//! module verifies that bundle **against a config-pinned validator set** so a
-//! resolved `name → digest` is proven finalized by a supermajority of validator
-//! voting power — WITHOUT trusting an RPC boolean, and WITHOUT a CometBFT light
-//! client (no ics23/tendermint-rs). It is deliberately thin: a handful of
-//! `ed25519` verifies + a power sum, so it is cheap on mobile.
+//! Validators attest the digest with **ZERO extra setup** — CometBFT signs each
+//! validator's vote-extension payload with its **consensus key** as part of the
+//! precommit (the `ExtensionSignature`). So validators only upgrade; there is no
+//! separate attest key and no on-chain registration. This module verifies those
+//! signatures against a **config-pinned CONSENSUS validator set**, so a resolved
+//! `name → digest` is proven finalized by a supermajority of voting power WITHOUT
+//! a CometBFT light client (no ics23/tendermint-rs — just N ed25519 verifies + a
+//! small protobuf reconstruction).
 //!
-//! Trust model (see `docs/xid-lightclient-finality.md`): weak subjectivity. The
-//! caller pins `{valcons → (pubkey, voting_power)}` + `chain_id` from a signed app
-//! release; this module fails closed when the pin is older than `ws_period`. There
-//! is no equivocation slashing, so the honest claim is "signed by >2/3 of a pinned
-//! set", backed by a power safety-buffer (`min_power_bps`, default 80%) so a stale
-//! pin whose power has drifted cannot be cleared by a bare 2/3.
+//! For each attestation the client reproduces exactly what CometBFT signed —
+//! `MarshalDelimited(CanonicalVoteExtension{extension, height, round, chain_id})` —
+//! and verifies it against the pinned consensus pubkey (mirrors
+//! `baseapp.ValidateVoteExtensions`). The `extension` bytes carry the signed
+//! `(height, block_time, digest)`; the client binds `digest` to the resolved name's
+//! `proof_root` and enforces freshness.
 //!
-//! Security rules enforced here (each has a test):
-//! - verify each signature against the **PINNED** pubkey, never the RPC-supplied
-//!   one (else an attacker pairs a pinned valcons with its own key);
-//! - **dedup by valcons** (a repeated validator counts once);
-//! - **strict** supermajority `sum*3 > total*2` AND the `min_power_bps` buffer;
-//! - freshness `|now − block_time| ≤ skew` and **monotonic** height;
-//! - pin not expired (`now − pinned_at ≤ ws_period`) and bundle height ≥ pin height.
+//! Trust model (see `docs/xid-lightclient-finality.md`): weak subjectivity — the
+//! caller pins `{valcons → (consensus pubkey, voting_power)}` + `chain_id` from a
+//! signed app release, and this module fails closed when the pin is older than
+//! `ws_period`. Because each attestation IS a consensus precommit, equivocation is
+//! covered by CometBFT double-sign slashing. Security rules (each has a test):
+//! verify against the PINNED pubkey; dedup by valcons; strict `sum*3 > total*2` +
+//! a `min_power_bps` buffer; freshness + monotonic height; WS pin-expiry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
-/// Domain tag mixed into the attestation sign-bytes — a fixed 16 bytes so a
-/// validator attestation signature can never be reinterpreted as a CometBFT
-/// consensus vote (which has entirely different sign-bytes) or vice versa. MUST
-/// match the chain's `x/xid` signer byte-for-byte.
-pub const ATTEST_DOMAIN: &[u8; 16] = b"EPIX-XID-ATTEST1";
-
-/// Default power safety-buffer: require ≥80% of pinned voting power, not a bare
-/// 2/3, so a pinned set whose real power has partly migrated away cannot be
-/// cleared by exactly-2/3 of the (over-credited) pinned total between re-pins.
+/// Default power safety-buffer: require ≥80% of pinned voting power (not a bare
+/// 2/3), so a pinned set whose real power has partly migrated can't be cleared by
+/// exactly-2/3 between re-pins.
 pub const DEFAULT_MIN_POWER_BPS: u32 = 8000;
 
-/// One pinned validator: its attestation `ed25519` pubkey and voting power. Keyed
-/// by consensus address (`valcons…`) in [`PinnedSet`].
+/// One pinned validator: its **consensus** ed25519 pubkey and voting power.
 #[derive(Clone, Debug)]
 pub struct PinnedValidator {
     pub pubkey: [u8; 32],
     pub voting_power: u64,
 }
 
-/// The pinned validator set — the client's root of trust, shipped in signed
-/// config and re-pinned within the weak-subjectivity window.
+/// The pinned CONSENSUS validator set — the client's root of trust, shipped in
+/// signed config and re-pinned within the weak-subjectivity window.
 #[derive(Clone, Debug)]
 pub struct PinnedSet {
     /// `valcons` → pinned validator.
     pub validators: HashMap<String, PinnedValidator>,
-    /// Sum of `voting_power` over `validators` (the finality denominator).
+    /// Sum of `voting_power` (the finality denominator).
     pub total_power: u64,
-    /// The chain id these keys belong to (bound into every sign-bytes).
+    /// The chain id (bound into every CanonicalVoteExtension).
     pub chain_id: String,
-    /// Unix seconds when this pin was captured (weak-subjectivity clock).
+    /// Unix seconds this pin was captured (weak-subjectivity clock).
     pub pinned_at_unix: i64,
     /// Chain height the pin was captured at; bundles older than this are rejected.
     pub pinned_at_height: u64,
 }
 
 impl PinnedSet {
-    /// Build a pinned set, computing `total_power`.
     pub fn new(
         validators: HashMap<String, PinnedValidator>,
         chain_id: impl Into<String>,
@@ -75,131 +68,207 @@ impl PinnedSet {
     }
 }
 
-/// One validator's attestation as served by the RPC. `pubkey`/`voting_power` here
-/// are UNTRUSTED (attacker-controlled); verification uses the pinned values keyed
-/// by `valcons`, never these.
+/// One validator's attestation from the RPC: its `valcons`, CometBFT's
+/// `ExtensionSignature` (64 bytes), and the raw vote-extension payload bytes that
+/// were signed.
 #[derive(Clone, Debug)]
 pub struct AttestationEntry {
     pub valcons: String,
     pub signature: Vec<u8>,
+    pub vote_extension: Vec<u8>,
 }
 
-/// The finality bundle the client fetches for a digest.
+/// The finality bundle the client fetches for a digest. `height`/`round` are the
+/// consensus height/round the extensions were signed at (shared across the commit);
+/// `block_time_unix` is the canonical (≥2/3-agreed) signed time.
 #[derive(Clone, Debug)]
 pub struct FinalityBundle {
-    /// The attested state digest (hex of the 32-byte tree root).
     pub digest_hex: String,
     pub height: u64,
+    pub round: u64,
     pub block_time_unix: i64,
     pub attestations: Vec<AttestationEntry>,
 }
 
-/// Verification parameters (client clock + policy).
 #[derive(Clone, Copy, Debug)]
 pub struct VerifyParams {
     pub now_unix: i64,
-    /// Max |now − block_time| accepted (freshness). Size ≥ block time + consensus
-    /// synchrony precision; `block_time` is BFT-time, not honest wall time.
     pub skew_secs: i64,
-    /// Max pin age before finality fails closed (< unbonding/2).
     pub ws_period_secs: i64,
-    /// Required fraction of pinned power, in basis points (10000 = 100%).
     pub min_power_bps: u32,
-    /// Highest bundle height already accepted (monotonic anti-replay floor).
     pub max_height_seen: u64,
 }
 
-/// Why a bundle was rejected. All are fail-closed.
+/// Why a bundle was rejected. All fail-closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FinalityError {
-    /// The pin is older than `ws_period` — must re-pin from a trusted source.
     PinExpired,
-    /// The bundle is for a height older than the pin (can't verify pre-pin state).
     HeightBeforePin,
-    /// `block_time` is outside the freshness window.
     Stale,
-    /// The bundle height is below the monotonic floor (replay of an old digest).
     HeightRollback,
-    /// The digest field is not valid 32-byte hex.
     BadDigest,
-    /// Verified voting power did not reach the required threshold.
     InsufficientPower { got: u64, total: u64, need_bps: u32 },
 }
 
-/// The exact bytes a validator signs for `(chain_id, height, block_time, digest)`.
-/// Fully length-delimited and fixed-width so no two distinct tuples share a
-/// preimage (the chain must produce identical bytes). `digest` is the raw 32-byte
-/// tree root (not its hex).
-pub fn attest_sign_bytes(chain_id: &str, height: u64, block_time_unix: i64, digest: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(16 + 4 + chain_id.len() + 8 + 8 + 4 + digest.len());
-    m.extend_from_slice(ATTEST_DOMAIN);
-    m.extend_from_slice(&(chain_id.len() as u32).to_be_bytes());
-    m.extend_from_slice(chain_id.as_bytes());
-    m.extend_from_slice(&height.to_be_bytes());
-    m.extend_from_slice(&block_time_unix.to_be_bytes());
-    m.extend_from_slice(&(digest.len() as u32).to_be_bytes());
-    m.extend_from_slice(digest);
-    m
+// --- protobuf wire helpers (just enough for CanonicalVoteExtension + the payload) ---
+
+fn put_uvarint(mut n: u64, out: &mut Vec<u8>) {
+    loop {
+        let mut b = (n & 0x7f) as u8;
+        n >>= 7;
+        if n != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if n == 0 {
+            break;
+        }
+    }
 }
 
-/// Verify a finality bundle against the pinned set. On success returns the bundle
-/// height (the caller advances its `max_height_seen`). Fails closed on any rule.
-///
-/// `expected_digest_hex`, if given, must equal the bundle's digest — the caller
-/// passes the digest it independently bound to the name's Merkle `proof_root`, so
-/// a bundle for a *different* (but validly-signed) digest cannot be substituted.
+fn read_uvarint(b: &[u8]) -> Option<(u64, usize)> {
+    let mut x = 0u64;
+    let mut s = 0u32;
+    for (i, &byte) in b.iter().enumerate().take(10) {
+        if byte < 0x80 {
+            return Some((x | ((byte as u64) << s), i + 1));
+        }
+        x |= ((byte & 0x7f) as u64) << s;
+        s += 7;
+    }
+    None
+}
+
+/// Reproduce exactly what CometBFT signs for a vote extension:
+/// `MarshalDelimited(CanonicalVoteExtension{ bytes extension=1; sfixed64 height=2;
+/// sfixed64 round=3; string chain_id=4 })` — proto3, so a zero `height`/`round`
+/// field is OMITTED (must match the Go side, which is why round 0 drops the field).
+pub fn canonical_vote_ext_bytes(extension: &[u8], height: i64, round: i64, chain_id: &str) -> Vec<u8> {
+    let mut inner = Vec::new();
+    if !extension.is_empty() {
+        inner.push(0x0a); // field 1, wire type 2 (len-delimited)
+        put_uvarint(extension.len() as u64, &mut inner);
+        inner.extend_from_slice(extension);
+    }
+    if height != 0 {
+        inner.push(0x11); // field 2, wire type 1 (64-bit)
+        inner.extend_from_slice(&height.to_le_bytes());
+    }
+    if round != 0 {
+        inner.push(0x19); // field 3, wire type 1 (64-bit)
+        inner.extend_from_slice(&round.to_le_bytes());
+    }
+    if !chain_id.is_empty() {
+        inner.push(0x22); // field 4, wire type 2 (len-delimited)
+        put_uvarint(chain_id.len() as u64, &mut inner);
+        inner.extend_from_slice(chain_id.as_bytes());
+    }
+    // MarshalDelimited = uvarint(len) ‖ message.
+    let mut out = Vec::with_capacity(inner.len() + 2);
+    put_uvarint(inner.len() as u64, &mut out);
+    out.extend_from_slice(&inner);
+    out
+}
+
+/// Parse the AttestationVoteExtension payload (`uint64 height=1; int64 block_time=2;
+/// string digest=3`) → `(height, block_time, digest)`. Unknown fields are skipped.
+fn parse_vote_extension(ext: &[u8]) -> Option<(u64, i64, String)> {
+    let mut i = 0;
+    let (mut height, mut block_time, mut digest) = (0u64, 0i64, String::new());
+    while i < ext.len() {
+        let tag = ext[i];
+        i += 1;
+        let field = tag >> 3;
+        let wire = tag & 0x7;
+        match (field, wire) {
+            (1, 0) => {
+                let (v, n) = read_uvarint(&ext[i..])?;
+                height = v;
+                i += n;
+            }
+            (2, 0) => {
+                let (v, n) = read_uvarint(&ext[i..])?;
+                block_time = v as i64;
+                i += n;
+            }
+            (3, 2) => {
+                let (len, n) = read_uvarint(&ext[i..])?;
+                i += n;
+                let end = i.checked_add(len as usize)?;
+                digest = String::from_utf8(ext.get(i..end)?.to_vec()).ok()?;
+                i = end;
+            }
+            // skip unknown fields by wire type
+            (_, 0) => {
+                let (_, n) = read_uvarint(&ext[i..])?;
+                i += n;
+            }
+            (_, 2) => {
+                let (len, n) = read_uvarint(&ext[i..])?;
+                i += n + len as usize;
+            }
+            (_, 1) => i += 8,
+            (_, 5) => i += 4,
+            _ => return None,
+        }
+    }
+    Some((height, block_time, digest))
+}
+
+/// Verify a finality bundle against the pinned consensus set. On success returns
+/// the bundle height (the caller advances `max_height_seen`). Fails closed.
 pub fn verify_finality(
     bundle: &FinalityBundle,
     pinned: &PinnedSet,
     params: &VerifyParams,
 ) -> Result<u64, FinalityError> {
-    // Weak-subjectivity: refuse to verify against a pin that may be past unbonding.
     if params.now_unix.saturating_sub(pinned.pinned_at_unix) > params.ws_period_secs {
         return Err(FinalityError::PinExpired);
     }
-    // Can't prove a state older than the pin.
     if bundle.height < pinned.pinned_at_height {
         return Err(FinalityError::HeightBeforePin);
     }
-    // Freshness (both directions) and monotonic height (anti-replay).
     if (params.now_unix - bundle.block_time_unix).abs() > params.skew_secs {
         return Err(FinalityError::Stale);
     }
     if bundle.height < params.max_height_seen {
         return Err(FinalityError::HeightRollback);
     }
-    // The digest is the raw 32-byte tree root; decode it once for the sign-bytes.
-    let digest = match hex::decode(&bundle.digest_hex) {
-        Ok(d) if d.len() == 32 => d,
+    // The digest must be valid 32-byte hex (it is what a name's Merkle proof roots at).
+    match hex::decode(&bundle.digest_hex) {
+        Ok(d) if d.len() == 32 => {}
         _ => return Err(FinalityError::BadDigest),
-    };
-    let msg = attest_sign_bytes(&pinned.chain_id, bundle.height, bundle.block_time_unix, &digest);
+    }
 
-    // Sum the voting power of PINNED validators with a valid signature, each
-    // counted at most once. Validators not in the pin are ignored; the RPC-supplied
-    // pubkey is never used — we verify against the pinned pubkey.
-    let mut counted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut counted: HashSet<&str> = HashSet::new();
     let mut power: u64 = 0;
     for att in &bundle.attestations {
+        // The payload must be for THIS bundle's digest + canonical block_time.
+        let Some((_h, ext_bt, ext_digest)) = parse_vote_extension(&att.vote_extension) else {
+            continue;
+        };
+        if ext_digest != bundle.digest_hex || ext_bt != bundle.block_time_unix {
+            continue;
+        }
         let Some(v) = pinned.validators.get(&att.valcons) else { continue };
         if counted.contains(att.valcons.as_str()) {
-            continue; // dedup: one vote per validator
+            continue;
         }
         let Ok(vk) = VerifyingKey::from_bytes(&v.pubkey) else { continue };
-        let sig = match sig_from_bytes(&att.signature) {
-            Some(s) => s,
-            None => continue,
-        };
-        // verify_strict rejects non-canonical signatures (malleability).
+        let Some(sig) = sig_from_bytes(&att.signature) else { continue };
+        // The exact bytes CometBFT signed, reproduced from the pinned chain_id.
+        let msg = canonical_vote_ext_bytes(
+            &att.vote_extension,
+            bundle.height as i64,
+            bundle.round as i64,
+            &pinned.chain_id,
+        );
         if vk.verify_strict(&msg, &sig).is_ok() {
             counted.insert(att.valcons.as_str());
             power = power.saturating_add(v.voting_power);
         }
     }
 
-    // Require BOTH a strict supermajority (sum*3 > total*2) and the power buffer
-    // (sum*10000 ≥ total*min_power_bps). The buffer (default 80%) subsumes 2/3, but
-    // the strict check is the floor if a caller lowers the buffer.
     let total = pinned.total_power;
     let strict_supermajority = (power as u128) * 3 > (total as u128) * 2;
     let meets_buffer = (power as u128) * 10_000 >= (total as u128) * (params.min_power_bps as u128);
@@ -213,42 +282,57 @@ pub fn verify_finality(
     Ok(bundle.height)
 }
 
-/// Parse a 64-byte ed25519 signature.
 fn sig_from_bytes(bytes: &[u8]) -> Option<Signature> {
     let arr: [u8; 64] = bytes.try_into().ok()?;
     Some(Signature::from_bytes(&arr))
 }
 
-/// A u64 that Cosmos proto-JSON may encode as a number or a string ("5011899").
 fn num_u64(v: Option<&serde_json::Value>) -> Option<u64> {
     let v = v?;
     v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
-/// Likewise for a signed int64 (e.g. a unix `block_time`).
 fn num_i64(v: Option<&serde_json::Value>) -> Option<i64> {
     let v = v?;
     v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
+fn b64_or_hex(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .ok()
+        .or_else(|| hex::decode(s.trim()).ok())
+}
+
 /// Parse the `/xid/v1/attestations` response into a [`FinalityBundle`] for
-/// `digest_hex`. Signatures are hex. The per-validator RPC `ed25519_pubkey` /
-/// `voting_power` are intentionally IGNORED here — [`verify_finality`] uses the
-/// pinned values keyed by `valcons`, never the RPC-supplied ones — so only
-/// `validator_cons_addr` + `signature` are consumed. Returns `None` if the
-/// required top-level fields are missing.
+/// `digest_hex`. `signature` is hex; `vote_extension` is base64 (proto `bytes` via
+/// the gateway); `round` is read per-attestation (shared across the commit).
+/// Legacy `auto:consensus` entries (non-hex signature / empty extension) are dropped.
 pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityBundle> {
     let height = num_u64(v.get("height"))?;
     let block_time_unix = num_i64(v.get("block_time"))?;
     let atts = v.get("attestations")?.as_array()?;
+    let mut round = 0u64;
     let mut attestations = Vec::with_capacity(atts.len());
     for a in atts {
-        let valcons = a.get("validator_cons_addr").and_then(|x| x.as_str())?.to_string();
-        let sig_hex = a.get("signature").and_then(|x| x.as_str())?;
-        let Ok(signature) = hex::decode(sig_hex.trim()) else { continue };
-        attestations.push(AttestationEntry { valcons, signature });
+        let valcons = match a.get("validator_cons_addr").and_then(|x| x.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let Some(sig_hex) = a.get("signature").and_then(|x| x.as_str()) else { continue };
+        let Ok(signature) = hex::decode(sig_hex.trim()) else { continue }; // drops "auto:consensus"
+        let Some(vote_extension) =
+            a.get("vote_extension").and_then(|x| x.as_str()).and_then(b64_or_hex)
+        else {
+            continue;
+        };
+        if let Some(r) = num_u64(a.get("round")) {
+            round = r;
+        }
+        attestations.push(AttestationEntry { valcons, signature, vote_extension });
     }
-    Some(FinalityBundle { digest_hex: digest_hex.to_string(), height, block_time_unix, attestations })
+    Some(FinalityBundle { digest_hex: digest_hex.to_string(), height, round, block_time_unix, attestations })
 }
 
 #[cfg(test)]
@@ -260,8 +344,26 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    /// Build a pinned set of `n` validators with the given powers, chain id, pinned
-    /// now, at height 100. Returns (set, signing keys keyed by valcons).
+    const DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const CHAIN: &str = "epix_1916-1";
+    const HEIGHT: u64 = 200;
+    const ROUND: u64 = 0;
+    const BT: i64 = 1_000_090;
+
+    /// Encode an AttestationVoteExtension payload (height=1, block_time=2, digest=3).
+    fn vote_ext(height: u64, block_time: i64, digest_hex: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(0x08);
+        put_uvarint(height, &mut b);
+        b.push(0x10);
+        put_uvarint(block_time as u64, &mut b);
+        b.push(0x1a);
+        put_uvarint(digest_hex.len() as u64, &mut b);
+        b.extend_from_slice(digest_hex.as_bytes());
+        b
+    }
+
+    /// A pinned set of `n` validators with the given powers + the signing keys.
     fn setup(powers: &[u64]) -> (PinnedSet, Vec<(String, SigningKey)>) {
         let mut validators = HashMap::new();
         let mut keys = Vec::new();
@@ -274,7 +376,7 @@ mod tests {
             );
             keys.push((valcons, sk));
         }
-        (PinnedSet::new(validators, "epix_1916-1", 1_000_000, 100), keys)
+        (PinnedSet::new(validators, CHAIN, 1_000_000, 100), keys)
     }
 
     fn params() -> VerifyParams {
@@ -287,49 +389,50 @@ mod tests {
         }
     }
 
-    const DIGEST: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-
-    /// Sign the canonical bytes for `signers` (subset of keys) at a height/time.
+    /// Build a bundle where `signers` (indices) sign the CanonicalVoteExtension.
     fn bundle(
         set: &PinnedSet,
         keys: &[(String, SigningKey)],
         signers: &[usize],
         height: u64,
+        round: u64,
         block_time: i64,
         digest_hex: &str,
     ) -> FinalityBundle {
-        let digest = hex::decode(digest_hex).unwrap();
-        let msg = attest_sign_bytes(&set.chain_id, height, block_time, &digest);
+        let ext = vote_ext(height, block_time, digest_hex);
+        let msg = canonical_vote_ext_bytes(&ext, height as i64, round as i64, &set.chain_id);
         let attestations = signers
             .iter()
             .map(|&i| {
                 let (valcons, sk) = &keys[i];
-                AttestationEntry { valcons: valcons.clone(), signature: sk.sign(&msg).to_bytes().to_vec() }
+                AttestationEntry {
+                    valcons: valcons.clone(),
+                    signature: sk.sign(&msg).to_bytes().to_vec(),
+                    vote_extension: ext.clone(),
+                }
             })
             .collect();
-        FinalityBundle { digest_hex: digest_hex.into(), height, block_time_unix: block_time, attestations }
+        FinalityBundle { digest_hex: digest_hex.into(), height, round, block_time_unix: block_time, attestations }
     }
 
     #[test]
     fn all_validators_sign_verifies() {
         let (set, keys) = setup(&[1, 1, 1]);
-        let b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST);
-        assert_eq!(verify_finality(&b, &set, &params()), Ok(200));
+        let b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, DIGEST);
+        assert_eq!(verify_finality(&b, &set, &params()), Ok(HEIGHT));
     }
 
     #[test]
-    fn four_of_five_equal_power_meets_80_percent() {
+    fn four_of_five_meets_80_percent() {
         let (set, keys) = setup(&[1, 1, 1, 1, 1]);
-        let b = bundle(&set, &keys, &[0, 1, 2, 3], 200, 1_000_090, DIGEST);
-        // 80% exactly, strict 2/3 (12 > 10) → accepts.
-        assert_eq!(verify_finality(&b, &set, &params()), Ok(200));
+        let b = bundle(&set, &keys, &[0, 1, 2, 3], HEIGHT, ROUND, BT, DIGEST);
+        assert_eq!(verify_finality(&b, &set, &params()), Ok(HEIGHT));
     }
 
     #[test]
     fn exactly_two_thirds_is_rejected() {
         let (set, keys) = setup(&[1, 1, 1]);
-        // 2 of 3 = 66.6%: fails the strict supermajority (6 > 6 is false) AND the buffer.
-        let b = bundle(&set, &keys, &[0, 1], 200, 1_000_090, DIGEST);
+        let b = bundle(&set, &keys, &[0, 1], HEIGHT, ROUND, BT, DIGEST);
         assert!(matches!(
             verify_finality(&b, &set, &params()),
             Err(FinalityError::InsufficientPower { .. })
@@ -338,11 +441,8 @@ mod tests {
 
     #[test]
     fn power_buffer_rejects_a_strict_two_thirds_pass() {
-        // A(100)+B..D(100 each)+E(600) total 1000. E+A = 700 (70%): passes strict
-        // 2/3 (2100 > 2000) but fails the 80% buffer → reject. This is the stale-pin
-        // safety the buffer exists for.
         let (set, keys) = setup(&[100, 100, 100, 100, 600]);
-        let b = bundle(&set, &keys, &[4, 0], 200, 1_000_090, DIGEST);
+        let b = bundle(&set, &keys, &[4, 0], HEIGHT, ROUND, BT, DIGEST); // 700/1000 = 70%
         assert!(matches!(
             verify_finality(&b, &set, &params()),
             Err(FinalityError::InsufficientPower { got: 700, total: 1000, .. })
@@ -350,60 +450,11 @@ mod tests {
     }
 
     #[test]
-    fn rpc_pubkey_different_from_pinned_is_not_credited() {
-        let (set, keys) = setup(&[1, 1, 1]);
-        // Validator 0 signs with a DIFFERENT key than pinned (attacker's key).
-        let digest = hex::decode(DIGEST).unwrap();
-        let msg = attest_sign_bytes(&set.chain_id, 200, 1_000_090, &digest);
-        let attacker = key(200);
-        let mut b = bundle(&set, &keys, &[1, 2], 200, 1_000_090, DIGEST); // 2 legit
-        b.attestations.push(AttestationEntry {
-            valcons: keys[0].0.clone(),
-            signature: attacker.sign(&msg).to_bytes().to_vec(),
-        });
-        // Validator 0's forged sig is verified against the PINNED key → fails, not
-        // counted. Only 2 of 3 legit remain → reject.
-        assert!(matches!(
-            verify_finality(&b, &set, &params()),
-            Err(FinalityError::InsufficientPower { got: 2, total: 3, .. })
-        ));
-    }
-
-    #[test]
-    fn duplicate_valcons_counts_once() {
-        let (set, keys) = setup(&[1, 1, 1]);
-        let mut b = bundle(&set, &keys, &[0], 200, 1_000_090, DIGEST);
-        // List validator 0 THREE times — must still count as power 1, not 3.
-        let dup = b.attestations[0].clone();
-        b.attestations.push(dup.clone());
-        b.attestations.push(dup);
-        assert!(matches!(
-            verify_finality(&b, &set, &params()),
-            Err(FinalityError::InsufficientPower { got: 1, total: 3, .. })
-        ));
-    }
-
-    #[test]
-    fn validator_not_in_pinned_set_is_ignored() {
-        let (set, keys) = setup(&[1, 1, 1]);
-        let mut b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST);
-        // Add a stranger with huge claimed power — ignored (not in pin).
-        let stranger = key(250);
-        let digest = hex::decode(DIGEST).unwrap();
-        let msg = attest_sign_bytes(&set.chain_id, 200, 1_000_090, &digest);
-        b.attestations.push(AttestationEntry {
-            valcons: "epixvalconsSTRANGER".into(),
-            signature: stranger.sign(&msg).to_bytes().to_vec(),
-        });
-        // The 3 real validators still verify → accepts; stranger contributes nothing.
-        assert_eq!(verify_finality(&b, &set, &params()), Ok(200));
-    }
-
-    #[test]
-    fn tampered_signature_is_rejected() {
-        let (set, keys) = setup(&[1, 1, 1]);
-        let mut b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST);
-        b.attestations[0].signature[10] ^= 0xff; // flip a byte
+    fn wrong_pinned_pubkey_not_credited() {
+        let (mut set, keys) = setup(&[1, 1, 1]);
+        // Repin validator 0 with an attacker key -> its signature won't verify.
+        set.validators.get_mut(&keys[0].0).unwrap().pubkey = [9u8; 32];
+        let b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, DIGEST);
         assert!(matches!(
             verify_finality(&b, &set, &params()),
             Err(FinalityError::InsufficientPower { got: 2, .. })
@@ -411,12 +462,35 @@ mod tests {
     }
 
     #[test]
-    fn wrong_digest_breaks_every_signature() {
+    fn duplicate_valcons_counts_once() {
         let (set, keys) = setup(&[1, 1, 1]);
-        // Sign over DIGEST but present a different digest → sign-bytes differ → all fail.
-        let other = "2222222222222222222222222222222222222222222222222222222222222222";
-        let mut b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST);
-        b.digest_hex = other.into();
+        let mut b = bundle(&set, &keys, &[0], HEIGHT, ROUND, BT, DIGEST);
+        let dup = b.attestations[0].clone();
+        b.attestations.push(dup.clone());
+        b.attestations.push(dup);
+        assert!(matches!(
+            verify_finality(&b, &set, &params()),
+            Err(FinalityError::InsufficientPower { got: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn tampered_signature_is_rejected() {
+        let (set, keys) = setup(&[1, 1, 1]);
+        let mut b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, DIGEST);
+        b.attestations[0].signature[10] ^= 0xff;
+        assert!(matches!(
+            verify_finality(&b, &set, &params()),
+            Err(FinalityError::InsufficientPower { got: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn wrong_round_breaks_signatures() {
+        let (set, keys) = setup(&[1, 1, 1]);
+        // Signed at round 0, but the bundle claims round 5 -> sign-bytes differ -> all fail.
+        let mut b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, 0, BT, DIGEST);
+        b.round = 5;
         assert!(matches!(
             verify_finality(&b, &set, &params()),
             Err(FinalityError::InsufficientPower { got: 0, .. })
@@ -424,25 +498,33 @@ mod tests {
     }
 
     #[test]
-    fn stale_block_time_is_rejected() {
+    fn digest_not_matching_bundle_is_skipped() {
         let (set, keys) = setup(&[1, 1, 1]);
-        let b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_100 - 500, DIGEST); // 500s old, skew 120
-        assert_eq!(verify_finality(&b, &set, &params()), Err(FinalityError::Stale));
+        // The signed extension is for a DIFFERENT digest than the bundle claims.
+        let other = "2222222222222222222222222222222222222222222222222222222222222222";
+        let mut b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, other);
+        b.digest_hex = DIGEST.into();
+        assert!(matches!(
+            verify_finality(&b, &set, &params()),
+            Err(FinalityError::InsufficientPower { got: 0, .. })
+        ));
     }
 
     #[test]
-    fn future_block_time_is_rejected() {
+    fn stale_and_future_block_time_rejected() {
         let (set, keys) = setup(&[1, 1, 1]);
-        let b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_100 + 500, DIGEST);
-        assert_eq!(verify_finality(&b, &set, &params()), Err(FinalityError::Stale));
+        let old = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, 1_000_100 - 500, DIGEST);
+        assert_eq!(verify_finality(&old, &set, &params()), Err(FinalityError::Stale));
+        let fut = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, 1_000_100 + 500, DIGEST);
+        assert_eq!(verify_finality(&fut, &set, &params()), Err(FinalityError::Stale));
     }
 
     #[test]
-    fn non_monotonic_height_is_rejected() {
+    fn non_monotonic_height_rejected() {
         let (set, keys) = setup(&[1, 1, 1]);
         let mut p = params();
-        p.max_height_seen = 300; // we've already accepted height 300
-        let b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST); // replay of older 200
+        p.max_height_seen = 300;
+        let b = bundle(&set, &keys, &[0, 1, 2], 200, ROUND, BT, DIGEST);
         assert_eq!(verify_finality(&b, &set, &p), Err(FinalityError::HeightRollback));
     }
 
@@ -450,89 +532,63 @@ mod tests {
     fn expired_pin_fails_closed() {
         let (set, keys) = setup(&[1, 1, 1]);
         let mut p = params();
-        p.now_unix = set.pinned_at_unix + p.ws_period_secs + 1; // pin too old
-        let b = bundle(&set, &keys, &[0, 1, 2], 200, p.now_unix, DIGEST);
+        p.now_unix = set.pinned_at_unix + p.ws_period_secs + 1;
+        let b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, p.now_unix, DIGEST);
         assert_eq!(verify_finality(&b, &set, &p), Err(FinalityError::PinExpired));
     }
 
     #[test]
-    fn height_before_pin_is_rejected() {
+    fn height_before_pin_rejected() {
         let (set, keys) = setup(&[1, 1, 1]);
-        let b = bundle(&set, &keys, &[0, 1, 2], 50, 1_000_090, DIGEST); // pin at 100
+        let b = bundle(&set, &keys, &[0, 1, 2], 50, ROUND, BT, DIGEST); // pin at 100
         assert_eq!(verify_finality(&b, &set, &params()), Err(FinalityError::HeightBeforePin));
     }
 
     #[test]
-    fn bad_digest_hex_is_rejected() {
-        let (set, keys) = setup(&[1, 1, 1]);
-        let mut b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST);
-        b.digest_hex = "not-hex".into();
-        assert_eq!(verify_finality(&b, &set, &params()), Err(FinalityError::BadDigest));
+    fn round_zero_is_omitted_from_canonical_bytes() {
+        // proto3: a zero sfixed64 field is omitted. round 0 vs round 1 must differ,
+        // and round 0's encoding must NOT contain the round tag (0x19).
+        let ext = vote_ext(HEIGHT, BT, DIGEST);
+        let r0 = canonical_vote_ext_bytes(&ext, HEIGHT as i64, 0, CHAIN);
+        let r1 = canonical_vote_ext_bytes(&ext, HEIGHT as i64, 1, CHAIN);
+        assert_ne!(r0, r1);
+        assert!(!r0.contains(&0x19), "round 0 must be omitted");
     }
 
     #[test]
-    fn parse_bundle_round_trips_and_verifies() {
+    fn parse_bundle_round_trips() {
+        use base64::Engine as _;
         let (set, keys) = setup(&[1, 1, 1]);
-        // Craft the RPC JSON as the gateway would (uint64 as STRINGS, sigs as hex,
-        // rpc pubkey/power present but ignored).
-        let digest = hex::decode(DIGEST).unwrap();
-        let msg = attest_sign_bytes(&set.chain_id, 200, 1_000_090, &digest);
-        let atts: Vec<serde_json::Value> = keys
+        let b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, DIGEST);
+        let atts: Vec<serde_json::Value> = b
+            .attestations
             .iter()
-            .map(|(valcons, sk)| {
+            .map(|a| {
                 serde_json::json!({
-                    "validator_cons_addr": valcons,
-                    "ed25519_pubkey": "00", // bogus rpc-supplied key — must be ignored
-                    "voting_power": "999",   // bogus rpc-supplied power — must be ignored
-                    "signature": hex::encode(sk.sign(&msg).to_bytes()),
+                    "validator_cons_addr": a.valcons,
+                    "signature": hex::encode(&a.signature),
+                    "vote_extension": base64::engine::general_purpose::STANDARD.encode(&a.vote_extension),
+                    "round": ROUND.to_string(),
                 })
             })
             .collect();
         let json = serde_json::json!({
-            "digest": DIGEST,
-            "height": "200",          // string, as Cosmos encodes uint64
-            "block_time": "1000090",  // string
+            "height": HEIGHT.to_string(),
+            "block_time": BT.to_string(),
             "attestations": atts,
         });
-        let bundle = parse_bundle(DIGEST, &json).expect("bundle parses");
-        assert_eq!(bundle.height, 200);
-        assert_eq!(bundle.block_time_unix, 1_000_090);
-        assert_eq!(bundle.attestations.len(), 3);
-        // And the parsed bundle verifies against the pinned set (rpc pubkey ignored).
-        assert_eq!(verify_finality(&bundle, &set, &params()), Ok(200));
+        let parsed = parse_bundle(DIGEST, &json).expect("parses");
+        assert_eq!(parsed.attestations.len(), 3);
+        assert_eq!(verify_finality(&parsed, &set, &params()), Ok(HEIGHT));
     }
 
     #[test]
-    fn parse_bundle_rejects_missing_fields() {
-        assert!(parse_bundle("d", &serde_json::json!({ "height": "1" })).is_none());
-    }
-
-    #[test]
-    fn attest_sign_bytes_kat() {
-        // Frozen cross-repo Known-Answer Test — the SAME vector is asserted in
-        // EpixChain x/xid/types/attestation_signbytes_test.go. If either side's
-        // encoding drifts, one of these two KATs breaks. Vector: chain_id
-        // "epix_1916-1", height 200, block_time 1000090, digest = 32 bytes of 0x11.
-        let digest = [0x11u8; 32];
-        let got = hex::encode(attest_sign_bytes("epix_1916-1", 200, 1_000_090, &digest));
-        let want = concat!(
-            "455049582d5849442d41545445535431", // domain "EPIX-XID-ATTEST1"
-            "0000000b",                         // len(chain_id)=11
-            "657069785f313931362d31",           // "epix_1916-1"
-            "00000000000000c8",                 // height=200 (u64 BE)
-            "00000000000f429a",                 // block_time=1000090 (i64 BE)
-            "00000020",                         // len(digest)=32
-            "1111111111111111111111111111111111111111111111111111111111111111",
-        );
-        assert_eq!(got, want, "attest sign-bytes KAT must match the Go chain signer");
-    }
-
-    #[test]
-    fn sign_bytes_are_unambiguous_across_chain_id_boundary() {
-        // A boundary-shift pair must not collide (length-prefixing prevents it).
-        let d = [7u8; 32];
-        let a = attest_sign_bytes("epix_1916", 1, 0, &d);
-        let b = attest_sign_bytes("epix_1916-1", 1, 0, &d);
-        assert_ne!(a, b);
+    fn parse_bundle_drops_auto_consensus() {
+        let json = serde_json::json!({
+            "height": "5", "block_time": "1",
+            "attestations": [{ "validator_cons_addr": "", "signature": "auto:consensus", "vote_extension": "" }],
+        });
+        let parsed = parse_bundle("d", &json).unwrap();
+        assert!(parsed.attestations.is_empty());
     }
 }

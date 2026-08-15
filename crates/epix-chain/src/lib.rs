@@ -16,8 +16,8 @@ mod vrf;
 pub use attestation::{ChainAttestation, StateDigest};
 pub use leaf::verify_and_parse_leaf;
 pub use finality::{
-    attest_sign_bytes, parse_bundle, verify_finality, AttestationEntry, FinalityBundle,
-    FinalityError, PinnedSet, PinnedValidator, VerifyParams, ATTEST_DOMAIN, DEFAULT_MIN_POWER_BPS,
+    canonical_vote_ext_bytes, parse_bundle, verify_finality, AttestationEntry, FinalityBundle,
+    FinalityError, PinnedSet, PinnedValidator, VerifyParams, DEFAULT_MIN_POWER_BPS,
 };
 pub use resolver::{XidResolver, DEFAULT_RPC_URL};
 pub use types::{DomainSnapshot, Identity};
