@@ -53,22 +53,34 @@ landed as a single reviewed unit.
 Full findings: workflow `w7fh379aw` synthesis. The body below is the v2 design the
 above amends.
 
-### Implementation status
+### Implementation status — COMPLETE + devnet-verified (2026-08-15)
 
-- ✅ **Client verifier core** — `crates/epix-chain/src/finality.rs`: pure
-  `verify_finality()` + canonical `attest_sign_bytes()` (domain tag
-  `EPIX-XID-ATTEST1`, fixed-width/length-prefixed) enforcing pinned-pubkey
-  verification, valcons dedup, strict `sum*3 > total*2` + ≥80% buffer, freshness,
-  monotonic height, WS pin-expiry, height-≥-pin. 16 unit vectors (all the review's
-  negatives). `ed25519-dalek` only — no ics23/tendermint-rs.
-- ⬜ Client: leaf-binding fix (parse+hash the chain's canonical leaf preimage +
-  name binding) and the `attestation.rs` record-trust path.
-- ⬜ Client: config plumbing (pinned set / chain_id / skew / ws_period / monotonic
-  height / `xid_verify_finality` gate) + wire into `resolver.rs`.
-- ⬜ Chain (`x/xid`): `MsgRegisterAttestKey`, vote-extension signing, `PreBlocker`
-  persist, power-based finality, extended proto/query, `leaf_preimage` in
-  `resolve_with_proof`.
-- ⬜ Frozen KATs (leaf preimage, sign-bytes) shared across both repos.
+- ✅ **Client verifier core** — `crates/epix-chain/src/finality.rs`:
+  `verify_finality()` + `attest_sign_bytes()` (pinned-pubkey verify, valcons dedup,
+  strict `sum*3 > total*2` + ≥80% buffer, freshness, monotonic height, WS
+  pin-expiry) + `parse_bundle()`. 18 unit vectors. `ed25519-dalek` only.
+- ✅ **Client leaf-binding** — `leaf.rs` `verify_and_parse_leaf()` hashes the chain's
+  canonical `leaf_preimage`, binds the name, parses the snapshot. 5 vectors.
+- ✅ **Client config + resolver wiring** — pinned set / chain_id / skew / ws_period /
+  monotonic height / `xid_verify_finality` gate; `resolver.rs` does leaf-binding +
+  `verify_finality_gated` (default OFF = legacy RPC-boolean, unchanged).
+- ✅ **Chain (`x/xid` + evmd)** — `MsgRegisterAttestKey` (+ CLI), ABCI++
+  vote-extension signing (`ExtendVote`/`VerifyVoteExtension`/`PrepareProposal`
+  wrap/`PreBlocker` verify+majority-block_time+persist), power-based
+  `IsDigestFinalized`, `leaf_preimage` in `resolve_with_proof`, extended query. Full
+  `make build` green. Completed the proto-gen migration (deleted 6 hand-written
+  placeholder files).
+- ✅ **Cross-repo KATs** — the `attest_sign_bytes` KAT (Go↔Rust byte-identical) plus
+  two REAL-devnet KATs (`devnet_finality_kat`, `devnet_leaf_kat`): the client
+  verifies a live devnet validator's ed25519 signature and its exact leaf preimage.
+- ✅ **Devnet end-to-end** — single-validator devnet, vote extensions enabled at
+  height 3, attest key registered → `finalized: true` (power-based), the client's
+  `verify_finality` + `verify_and_parse_leaf` accept the live data; negatives reject.
+
+**Rollout**: `xid_verify_finality` ships OFF; enable it after the chain upgrade sets
+`VoteExtensionsEnableHeight`, validators register attest keys, and a pinned validator
+set is shipped to clients. Chain commits: `feat/xid-finality-attestation`
+(e2a5bc97…1f88c009). Client commits: `feat/xid-finality-verification`.
 
 ---
 
