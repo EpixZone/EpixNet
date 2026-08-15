@@ -1,0 +1,205 @@
+# xID finality — chain-signed digest attestation + thin client verify (DESIGN v2)
+
+**Status: design v2 REVIEWED (adversarial, 2026-08-14) → verdict needs-changes.
+Not yet implemented.** Spans two repos: a `x/xid` change (EpixChain) and a thin
+verifier (EpixNet `crates/epix-chain`).
+
+## Review outcome — required changes (blocking, must fold in before implementing)
+
+Resolved sub-decisions: **mechanism = C-ve (ABCI++ vote extensions)** — the digest
+is recomputed every block, so per-tx signing chases a moving target; vote
+extensions re-sign gaslessly inside every precommit. **Key = separate registered
+attestation key** — the consensus key never signs app data (no cross-protocol
+reuse, smaller blast radius).
+
+**TWO LIVE forgery holes in today's resolver, independent of finality — fix first:**
+
+1. `resolver.rs` verifies the Merkle path against the RPC-supplied `leaf_hash` but
+   never recomputes `leaf_hash = sha256(canonical(domain payload))` nor checks the
+   entry name == queried name → a hostile RPC serves a genuine proof of a real leaf
+   with arbitrary `domain` data and it passes. (CLAUDE.md's "no need to reconstruct
+   leaf from domain data" is WRONG and is the root cause.)
+2. `attestation.rs::resolve_name` returns the RPC `record` with NO proof binding it
+   to the finalized digest — record-level RPC trust off a whole-state digest.
+
+**Finality hardening (all required):**
+
+- Verify each attestation against the **PINNED** pubkey (never the RPC-supplied
+  one); require the full `(valcons→pubkey,power)` triple to match a pinned row.
+- **Strict** threshold `sum*3 > 2*total` (not ≥), against the pinned total.
+- Dedup by `valcons` before summing.
+- Canonical sign-bytes: fixed-width big-endian `height(u64)`+`block_time(i64 nanos)`,
+  length-prefixed `chain_id`+`digest`, fixed-length domain tag. Freeze a byte-layout
+  KAT; client reconstructs over the digest it independently bound to `proof_root`.
+- Freshness: `|now−block_time| ≤ skew` **and** `height ≥ max_height_seen` persisted
+  across restarts. Residual sub-skew rollback + client-clock dependency documented.
+- Weak-subjectivity: ship the pin with `pinned_at_time`; **fail closed** when
+  `now − pinned_at_time > WS_PERIOD` (< unbonding/2), and reject bundles whose height
+  lags the pin beyond the window.
+- Power-drift safety buffer: require e.g. **≥80% of pinned power** (not bare 2/3) and
+  re-pin on any add/remove/jail/unbond and on >threshold share drift.
+- Threshold by **voting power, not validator count** (chain currently counts
+  validators; must switch), and `block_time` is BFT-time (size skew accordingly).
+- **Equivocation slashing** — DECIDED: **no slashing** (combined-push, small
+  operator-controlled set). The honest claim is therefore "signed by **>2/3 of a
+  pinned validator set** (no equivocation penalty)", and the exposure is bounded by
+  the WS pin-expiry + the ≥80% power safety-buffer above — NOT claimed equal to
+  consensus finality.
+
+**Delivery: one combined push** (both forgery-hole fixes + chain-side
+vote-extension attestation + client verifier) on `feat/xid-finality-verification`,
+landed as a single reviewed unit.
+
+Full findings: workflow `w7fh379aw` synthesis. The body below is the v2 design the
+above amends.
+
+### Implementation status
+
+- ✅ **Client verifier core** — `crates/epix-chain/src/finality.rs`: pure
+  `verify_finality()` + canonical `attest_sign_bytes()` (domain tag
+  `EPIX-XID-ATTEST1`, fixed-width/length-prefixed) enforcing pinned-pubkey
+  verification, valcons dedup, strict `sum*3 > total*2` + ≥80% buffer, freshness,
+  monotonic height, WS pin-expiry, height-≥-pin. 16 unit vectors (all the review's
+  negatives). `ed25519-dalek` only — no ics23/tendermint-rs.
+- ⬜ Client: leaf-binding fix (parse+hash the chain's canonical leaf preimage +
+  name binding) and the `attestation.rs` record-trust path.
+- ⬜ Client: config plumbing (pinned set / chain_id / skew / ws_period / monotonic
+  height / `xid_verify_finality` gate) + wire into `resolver.rs`.
+- ⬜ Chain (`x/xid`): `MsgRegisterAttestKey`, vote-extension signing, `PreBlocker`
+  persist, power-based finality, extended proto/query, `leaf_preimage` in
+  `resolve_with_proof`.
+- ⬜ Frozen KATs (leaf preimage, sign-bytes) shared across both repos.
+
+---
+
+**Original v2 design (amended by the review outcome above):**
+
+## Why v2 supersedes the light-client design
+
+v1 proposed a client-side CometBFT light client (verify the block commit + ICS23
+the digest under `AppHash`). **Rejected for this deployment** because:
+
+- **EpixNet runs on mobile.** A light client drags in `tendermint-rs` + `ics23`,
+  and per digest does header hashing + N precommit-signature checks + a two-level
+  ICS23 proof, plus fetching commits/validator-sets/proofs. Too heavy on a phone.
+- **Chain upgrades are cheap here** (small, operator-controlled validator set).
+
+So move the cryptography **onto the chain** (validators sign the digest) and make
+the client do only a few `ed25519` verifies + a voting-power sum. No ICS23, no
+tendermint-rs, no header verification.
+
+## Goal (unchanged)
+
+Cryptographic **client-side** proof that a resolved `name → digest` is finalized by
+≥2/3 of validator voting power. No trusting a bare RPC `finalized` boolean.
+
+## Trust model
+
+- **name → digest**: existing client-side domain Merkle proof — *unchanged*.
+- **digest → finalized**: client verifies `ed25519` signatures from validators over
+  a domain-separated message binding the digest, summing to ≥2/3 voting power,
+  against a **config-pinned validator set** (weak subjectivity). The
+  `auto:consensus` boolean is no longer trusted.
+
+## Feasibility facts (mainnet, 2026-08-14)
+
+`chain_id = epix_1916-1`; consensus keys ed25519; small validator set with
+`voting_power` exposed at `api.epix.zone/cosmos/base/tendermint/v1beta1/validatorsets/latest`;
+xid store key `xid`; the `MsgAttestStateDigest{Signer,Digest,Signature}` message and
+an `Attestation{ValidatorAddr,Digest,Signature,Height}` store already exist in
+`x/xid` — but `SubmitAttestation` never verifies `Signature`, and BeginBlock
+auto-writes `Signature:"auto:consensus"`. v2 makes those signatures real.
+
+## Sign-bytes & keys — the two critical security decisions (for review)
+
+1. **Domain separation / key choice.** A validator signature over app data MUST NOT
+   be reinterpretable as a CometBFT consensus vote (or vice versa). Two options:
+   - **(preferred) Separate attestation key**: each validator registers an
+     `ed25519` attestation pubkey on-chain (a `Msg` signed by its *operator* key
+     binds `valcons → attest_pubkey`); it signs digests with that key. No consensus
+     key reuse at all.
+   - **(fallback) Consensus key + strong domain prefix**: sign
+     `SHA256("EPIX-XID-ATTEST-v1" ‖ chain_id ‖ height ‖ block_time ‖ digest)`. The
+     prefix must be unambiguous vs CometBFT's canonical-vote sign-bytes. Review must
+     confirm no cross-protocol collision is possible.
+2. **Freshness binding.** The signed message includes `height` **and `block_time`**,
+   so a stale-but-valid replay (a hostile RPC serving an old digest + its real old
+   signatures) is caught: the client requires `|now − block_time| ≤ skew` and
+   `height ≥ max_height_seen` (monotonic). Without this, C is replayable.
+
+## Chain side (`x/xid`) — produce + persist per-validator digest signatures
+
+Two mechanisms; review to choose:
+
+- **C-msg (simpler):** validators run a lightweight signer that submits
+  `MsgAttestStateDigest` with a real signature over the sign-bytes above;
+  `SubmitAttestation` **verifies** it (against the registered attest key or
+  domain-separated consensus key) before storing `{valcons, sig, voting_power,
+  height, block_time}`. Cost: each validator runs a signer + pays gas per
+  attestation; a digest is "final" only once enough attest txs land.
+- **C-ve (cleaner, gasless):** ABCI++ **vote extensions** (Cosmos SDK v0.50 /
+  CometBFT v0.38). `ExtendVote` signs the digest; the app collects per-validator
+  signatures from `ExtendedCommitInfo` and persists them. No validator daemon, no
+  gas, tied to consensus participation. Cost: more chain-dev; vote-extension timing
+  (the digest signed lags one block).
+
+Keep `auto:consensus` as telemetry only; the **signed** attestations are what the
+client verifies.
+
+## Query (what the client fetches)
+
+`GET /xid/v1/attestations?digest=…` returns:
+`{ digest, height, block_time, total_voting_power,
+   attestations: [ { validator_consensus_addr, ed25519_pubkey, voting_power, signature } ] }`.
+Pubkeys + powers are included so the client only needs its **pinned set** to
+cross-check identities, not a second fetch.
+
+## Client side (thin — mobile-friendly)
+
+1. Resolve `name` → domain Merkle proof → `proof_root` (unchanged, client-verified).
+2. Fetch the signed attestation bundle for `proof_root`.
+3. For each attestation: confirm the validator + pubkey + power match the **pinned
+   validator set**; verify the `ed25519` signature over the domain-separated
+   sign-bytes.
+4. Require summed verified voting power ≥ 2/3 of the pinned total.
+5. **Freshness**: `|now − block_time| ≤ skew` and `height` monotonic non-decreasing.
+6. Bind `proof_root == attested digest`; fail closed on any failure.
+
+**Deps: `ed25519` verification only** (light; likely already in-tree). No `ics23`,
+no `tendermint-rs`, no header verification. Cost per resolve ≈ N cheap `ed25519`
+verifies (small N), cacheable per digest.
+
+## Trust anchor (weak subjectivity)
+
+- Pin `{ valcons → (ed25519 pubkey, voting_power) }` + `chain_id` in
+  config/app, re-pinned on validator-set changes (governance / app release). Small,
+  slowly-changing set.
+- **Optional later**: accept a pinned-set *update* only if signed by ≥2/3 of the
+  current pinned set (signed transitions), removing manual re-pin. Out of scope for
+  v1 of this feature.
+
+## Config & rollout
+
+- `xid_verify_finality` (bool, default OFF until reviewed + a set is pinned).
+- The pinned validator set + `chain_id` shipped as config/build data.
+- When off: behavior unchanged (RPC-asserted boolean). Chain-side signing can ship
+  first (harmless); the client flips on once anchored + reviewed.
+
+## Testing
+
+- **Frozen vectors** from real chain data: a `{digest, height, block_time,
+  attestations[], pinned_set}` bundle verified fully offline.
+- Negatives: tamper a sig; drop signers below 2/3; wrong pubkey; stale `block_time`;
+  non-monotonic `height`; digest≠proof_root; a validator not in the pinned set →
+  each must reject.
+- Cross-protocol: prove a valid consensus vote can't be replayed as an attestation
+  and vice versa (domain separation).
+
+## Non-goals / residuals
+
+- Liveness/censorship (RPC withholding answers) is unchanged — this closes
+  *forgery + stale replay*, not availability.
+- Weak subjectivity: a client whose pinned set is far out of date must re-pin from a
+  trusted source (standard).
+- Validator-set-change handling in v1 is manual re-pin; signed transitions are a
+  later enhancement.

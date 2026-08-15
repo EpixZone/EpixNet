@@ -6,12 +6,17 @@
 //! a resolution - a tampered proof is rejected.
 
 mod attestation;
+mod finality;
 mod merkle;
 mod resolver;
 mod types;
 mod vrf;
 
 pub use attestation::{ChainAttestation, StateDigest};
+pub use finality::{
+    attest_sign_bytes, verify_finality, AttestationEntry, FinalityBundle, FinalityError, PinnedSet,
+    PinnedValidator, VerifyParams, ATTEST_DOMAIN, DEFAULT_MIN_POWER_BPS,
+};
 pub use resolver::{XidResolver, DEFAULT_RPC_URL};
 pub use types::{DomainSnapshot, Identity};
 pub use vrf::{combine_beacons, derive_random, Beacon, Vrf};
