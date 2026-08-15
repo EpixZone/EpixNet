@@ -7,12 +7,14 @@
 
 mod attestation;
 mod finality;
+mod leaf;
 mod merkle;
 mod resolver;
 mod types;
 mod vrf;
 
 pub use attestation::{ChainAttestation, StateDigest};
+pub use leaf::verify_and_parse_leaf;
 pub use finality::{
     attest_sign_bytes, verify_finality, AttestationEntry, FinalityBundle, FinalityError, PinnedSet,
     PinnedValidator, VerifyParams, ATTEST_DOMAIN, DEFAULT_MIN_POWER_BPS,
@@ -129,6 +131,10 @@ pub enum ChainError {
     DigestMismatch,
     #[error("state digest not finalized by validators")]
     NotFinalized,
+    /// The returned domain data does not hash to the proven leaf, or is for a
+    /// different name — a hostile RPC swapping data behind a genuine proof.
+    #[error("leaf binding failed: {0}")]
+    LeafBindingFailed(String),
     #[error("malformed chain response: {0}")]
     Malformed(String),
 }
