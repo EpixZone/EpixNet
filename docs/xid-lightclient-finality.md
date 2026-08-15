@@ -53,6 +53,32 @@ landed as a single reviewed unit.
 Full findings: workflow `w7fh379aw` synthesis. The body below is the v2 design the
 above amends.
 
+### FINAL DESIGN — consensus-key vote extensions (validators only upgrade)
+
+The shipped design **supersedes the separate-attest-key approach described in the
+body below** (`MsgRegisterAttestKey` etc., now removed). Instead of a registered
+attest key, it uses **CometBFT's own vote-extension signature**: every validator's
+`ExtendVote` payload `{height, block_time, digest}` is signed by its **consensus
+key** by CometBFT (the `ExtensionSignature`) as part of the precommit. So:
+
+- **Validators do nothing but upgrade** — no key generation, no registration, no
+  config file. Works with HSM / remote signers (the app never touches the key).
+- **Slashable for free** — the attestation *is* the validator's precommit, so
+  equivocation is covered by CometBFT double-sign slashing (the earlier "no
+  equivocation penalty" caveat is gone).
+- **Chain** (`evmd/vote_extensions.go`): `PreBlocker` reconstructs
+  `MarshalDelimited(CanonicalVoteExtension{extension, height, round, chain_id})`,
+  verifies each `ExtensionSignature` against the validator's staking `ConsPubKey`
+  (mirrors `baseapp.ValidateVoteExtensions`), uses REAL staking power, persists the
+  signature + raw extension + round.
+- **Client** (`finality.rs`): pins the **consensus** validator set (already at
+  `/validators`), reproduces the same `CanonicalVoteExtension` bytes (hand-rolled
+  protobuf — proto3, so a zero `round` field is omitted, the subtle bit), and
+  verifies. Still just N ed25519 verifies; no ics23/tendermint-rs.
+- **Devnet-verified**: no registration → `finalized: true` automatically; the two
+  cross-repo KATs verify the live validator's real consensus-key signature + leaf
+  preimage.
+
 ### Implementation status — COMPLETE + devnet-verified (2026-08-15)
 
 - ✅ **Client verifier core** — `crates/epix-chain/src/finality.rs`:
