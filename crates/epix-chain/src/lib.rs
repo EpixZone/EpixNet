@@ -16,8 +16,8 @@ mod vrf;
 pub use attestation::{ChainAttestation, StateDigest};
 pub use leaf::verify_and_parse_leaf;
 pub use finality::{
-    attest_sign_bytes, verify_finality, AttestationEntry, FinalityBundle, FinalityError, PinnedSet,
-    PinnedValidator, VerifyParams, ATTEST_DOMAIN, DEFAULT_MIN_POWER_BPS,
+    attest_sign_bytes, parse_bundle, verify_finality, AttestationEntry, FinalityBundle,
+    FinalityError, PinnedSet, PinnedValidator, VerifyParams, ATTEST_DOMAIN, DEFAULT_MIN_POWER_BPS,
 };
 pub use resolver::{XidResolver, DEFAULT_RPC_URL};
 pub use types::{DomainSnapshot, Identity};
@@ -119,6 +119,98 @@ pub(crate) fn http_client(timeout: std::time::Duration) -> reqwest::Client {
     builder.build().expect("reqwest client")
 }
 
+// ---------------------------------------------------------------------------
+// Client-side finality verification config (see finality.rs, leaf.rs and
+// docs/xid-lightclient-finality.md). All process-global so a resolver created
+// anywhere picks them up; the node sets them at boot.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+
+/// The pinned validator set — the client's root of trust for finality. `None`
+/// until the node installs it; while `None` and [`XID_VERIFY_FINALITY`] is on,
+/// finality fails closed.
+static PINNED_VALIDATORS: std::sync::RwLock<Option<finality::PinnedSet>> =
+    std::sync::RwLock::new(None);
+
+/// Whether to cryptographically verify digest finality against the pinned set
+/// (and require leaf-binding). Default OFF — the node enables it once a pin is
+/// installed and the chain serves signed attestations. OFF = legacy RPC-boolean.
+static XID_VERIFY_FINALITY: AtomicBool = AtomicBool::new(false);
+
+/// Highest finalized-bundle height accepted so far — the monotonic anti-replay
+/// floor. The node persists this across restarts (a reinstall must not reset it
+/// to 0), via [`set_xid_max_height`] / [`xid_max_height`].
+static XID_MAX_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Max `|now − block_time|` (seconds) accepted for a finality bundle.
+static XID_SKEW_SECS: AtomicI64 = AtomicI64::new(120);
+/// Max pin age (seconds) before finality fails closed (weak subjectivity).
+/// Default 7 days — must be < the chain's unbonding period.
+static XID_WS_PERIOD_SECS: AtomicI64 = AtomicI64::new(7 * 24 * 3600);
+/// Required fraction of pinned voting power, in basis points (default 80%).
+static XID_MIN_POWER_BPS: AtomicU32 = AtomicU32::new(finality::DEFAULT_MIN_POWER_BPS);
+
+/// Install (or clear) the pinned validator set the client verifies finality
+/// against. Shipped from a signed app release and re-pinned within the WS window.
+pub fn set_pinned_validators(set: Option<finality::PinnedSet>) {
+    if let Ok(mut w) = PINNED_VALIDATORS.write() {
+        *w = set;
+    }
+}
+
+/// A clone of the current pinned set, if installed.
+pub fn pinned_validators() -> Option<finality::PinnedSet> {
+    PINNED_VALIDATORS.read().ok().and_then(|r| r.clone())
+}
+
+/// Enable/disable client-side finality verification (and leaf-binding enforcement).
+pub fn set_verify_finality(on: bool) {
+    XID_VERIFY_FINALITY.store(on, Ordering::Relaxed);
+}
+
+/// Whether client-side finality verification is enabled.
+pub fn verify_finality_enabled() -> bool {
+    XID_VERIFY_FINALITY.load(Ordering::Relaxed)
+}
+
+/// Set the finality policy knobs (seconds / basis points).
+pub fn set_finality_policy(skew_secs: i64, ws_period_secs: i64, min_power_bps: u32) {
+    XID_SKEW_SECS.store(skew_secs, Ordering::Relaxed);
+    XID_WS_PERIOD_SECS.store(ws_period_secs, Ordering::Relaxed);
+    XID_MIN_POWER_BPS.store(min_power_bps, Ordering::Relaxed);
+}
+
+/// The monotonic anti-replay floor (persist across restarts).
+pub fn xid_max_height() -> u64 {
+    XID_MAX_HEIGHT.load(Ordering::Relaxed)
+}
+
+/// Set the anti-replay floor (only ever raise it; the node loads the persisted
+/// value at boot and saves it after a successful verify).
+pub fn set_xid_max_height(h: u64) {
+    XID_MAX_HEIGHT.fetch_max(h, Ordering::Relaxed);
+}
+
+/// Build [`finality::VerifyParams`] from the configured policy + a `now` unix time.
+pub(crate) fn finality_params(now_unix: i64) -> finality::VerifyParams {
+    finality::VerifyParams {
+        now_unix,
+        skew_secs: XID_SKEW_SECS.load(Ordering::Relaxed),
+        ws_period_secs: XID_WS_PERIOD_SECS.load(Ordering::Relaxed),
+        min_power_bps: XID_MIN_POWER_BPS.load(Ordering::Relaxed),
+        max_height_seen: XID_MAX_HEIGHT.load(Ordering::Relaxed),
+    }
+}
+
+/// Current unix time in seconds (for finality freshness).
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Error, Debug)]
 pub enum ChainError {
     #[error("rpc request failed: {0}")]
@@ -135,6 +227,10 @@ pub enum ChainError {
     /// different name — a hostile RPC swapping data behind a genuine proof.
     #[error("leaf binding failed: {0}")]
     LeafBindingFailed(String),
+    /// Client-side finality verification rejected the attestation bundle
+    /// (bad signatures, <required power, stale, expired pin, …).
+    #[error("finality not verified: {0}")]
+    FinalityUnverified(String),
     #[error("malformed chain response: {0}")]
     Malformed(String),
 }

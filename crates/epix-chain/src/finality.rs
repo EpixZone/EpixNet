@@ -219,6 +219,38 @@ fn sig_from_bytes(bytes: &[u8]) -> Option<Signature> {
     Some(Signature::from_bytes(&arr))
 }
 
+/// A u64 that Cosmos proto-JSON may encode as a number or a string ("5011899").
+fn num_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    let v = v?;
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// Likewise for a signed int64 (e.g. a unix `block_time`).
+fn num_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    let v = v?;
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// Parse the `/xid/v1/attestations` response into a [`FinalityBundle`] for
+/// `digest_hex`. Signatures are hex. The per-validator RPC `ed25519_pubkey` /
+/// `voting_power` are intentionally IGNORED here — [`verify_finality`] uses the
+/// pinned values keyed by `valcons`, never the RPC-supplied ones — so only
+/// `validator_consensus_addr` + `signature` are consumed. Returns `None` if the
+/// required top-level fields are missing.
+pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityBundle> {
+    let height = num_u64(v.get("height"))?;
+    let block_time_unix = num_i64(v.get("block_time"))?;
+    let atts = v.get("attestations")?.as_array()?;
+    let mut attestations = Vec::with_capacity(atts.len());
+    for a in atts {
+        let valcons = a.get("validator_consensus_addr").and_then(|x| x.as_str())?.to_string();
+        let sig_hex = a.get("signature").and_then(|x| x.as_str())?;
+        let Ok(signature) = hex::decode(sig_hex.trim()) else { continue };
+        attestations.push(AttestationEntry { valcons, signature });
+    }
+    Some(FinalityBundle { digest_hex: digest_hex.to_string(), height, block_time_unix, attestations })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +468,43 @@ mod tests {
         let mut b = bundle(&set, &keys, &[0, 1, 2], 200, 1_000_090, DIGEST);
         b.digest_hex = "not-hex".into();
         assert_eq!(verify_finality(&b, &set, &params()), Err(FinalityError::BadDigest));
+    }
+
+    #[test]
+    fn parse_bundle_round_trips_and_verifies() {
+        let (set, keys) = setup(&[1, 1, 1]);
+        // Craft the RPC JSON as the gateway would (uint64 as STRINGS, sigs as hex,
+        // rpc pubkey/power present but ignored).
+        let digest = hex::decode(DIGEST).unwrap();
+        let msg = attest_sign_bytes(&set.chain_id, 200, 1_000_090, &digest);
+        let atts: Vec<serde_json::Value> = keys
+            .iter()
+            .map(|(valcons, sk)| {
+                serde_json::json!({
+                    "validator_consensus_addr": valcons,
+                    "ed25519_pubkey": "00", // bogus rpc-supplied key — must be ignored
+                    "voting_power": "999",   // bogus rpc-supplied power — must be ignored
+                    "signature": hex::encode(sk.sign(&msg).to_bytes()),
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "digest": DIGEST,
+            "height": "200",          // string, as Cosmos encodes uint64
+            "block_time": "1000090",  // string
+            "attestations": atts,
+        });
+        let bundle = parse_bundle(DIGEST, &json).expect("bundle parses");
+        assert_eq!(bundle.height, 200);
+        assert_eq!(bundle.block_time_unix, 1_000_090);
+        assert_eq!(bundle.attestations.len(), 3);
+        // And the parsed bundle verifies against the pinned set (rpc pubkey ignored).
+        assert_eq!(verify_finality(&bundle, &set, &params()), Ok(200));
+    }
+
+    #[test]
+    fn parse_bundle_rejects_missing_fields() {
+        assert!(parse_bundle("d", &serde_json::json!({ "height": "1" })).is_none());
     }
 
     #[test]

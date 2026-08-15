@@ -91,10 +91,6 @@ impl XidResolver {
             .get_json(&format!("{}/xid/v1/resolve_with_proof/{tld}/{name}", self.rpc_url))
             .await?;
 
-        let domain = data
-            .get("domain")
-            .filter(|d| !d.is_null())
-            .ok_or_else(|| ChainError::NotFound(key.clone()))?;
         let proof = data
             .get("proof")
             .ok_or_else(|| ChainError::Malformed("missing proof".into()))?;
@@ -112,29 +108,84 @@ impl XidResolver {
             .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        // Step 1 - Merkle proof.
+        let verify = crate::verify_finality_enabled();
+
+        // Step 1 - LEAF BINDING. The Merkle proof only proves *a* leaf is in the
+        // tree; the returned data must actually BE that leaf. The chain serves the
+        // canonical `leaf_preimage` (hex); we hash it (== leaf_hash), bind the name,
+        // and parse the snapshot FROM it. When verification is on, the preimage is
+        // REQUIRED (an RPC can't downgrade by omitting it). Pre-upgrade chains omit
+        // it, so with verification off we fall back to the (unbound) domain payload.
+        let leaf_preimage: Option<Vec<u8>> = data
+            .get("leaf_preimage")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s.trim()).ok());
+        let snapshot = match &leaf_preimage {
+            Some(pre) => crate::verify_and_parse_leaf(pre, leaf_hash, name, tld)?,
+            None if verify => {
+                return Err(ChainError::LeafBindingFailed(
+                    "leaf_preimage required when finality verification is enabled".into(),
+                ))
+            }
+            None => {
+                let domain = data
+                    .get("domain")
+                    .filter(|d| !d.is_null())
+                    .ok_or_else(|| ChainError::NotFound(key.clone()))?;
+                parse_domain(name, tld, domain)?
+            }
+        };
+
+        // Step 2 - Merkle inclusion proof over the (now name-bound) leaf.
         if !verify_proof(leaf_hash, leaf_index, &siblings, proof_root)? {
             return Err(ChainError::MerkleInvalid);
         }
 
-        // Step 2+3 - the proof root must equal a state digest that validators
-        // have finalized. The finalized digest is cached briefly (it is global
-        // chain state), so a burst of resolves shares one digest fetch. A
-        // proof that doesn't match the cached digest (its name changed since)
-        // forces a fresh fetch before we reject it, so caching never yields a
-        // false negative.
-        if !self.digest_matches(proof_root, false).await?
-            && !self.digest_matches(proof_root, true).await?
-        {
-            return Err(ChainError::DigestMismatch);
+        // Step 3 - the proof root must be a state digest validators finalized.
+        if verify {
+            // Cryptographic: verify signed validator power over `proof_root`
+            // against the pinned set (no trust in any RPC boolean).
+            self.verify_finality_gated(proof_root).await?;
+        } else {
+            // Legacy: the digest is confirmed finalized via the RPC boolean,
+            // cached briefly (global chain state). A proof that doesn't match the
+            // cached digest forces a fresh fetch before we reject it.
+            if !self.digest_matches(proof_root, false).await?
+                && !self.digest_matches(proof_root, true).await?
+            {
+                return Err(ChainError::DigestMismatch);
+            }
         }
 
-        let snapshot = parse_domain(name, tld, domain)?;
         self.cache
             .write()
             .await
             .insert(key, (snapshot.clone(), Instant::now()));
         Ok(snapshot)
+    }
+
+    /// Cryptographically verify that `digest` was signed by the required share of
+    /// PINNED validator voting power (replaces the RPC `finalized` boolean). The
+    /// last verified digest is memoized for [`DIGEST_TTL`] since it is global chain
+    /// state. Fails closed if no pin is installed.
+    async fn verify_finality_gated(&self, digest: &str) -> Result<()> {
+        if let Some((d, at)) = self.digest.read().await.as_ref() {
+            if d == digest && at.elapsed() < DIGEST_TTL {
+                return Ok(());
+            }
+        }
+        let pinned = crate::pinned_validators()
+            .ok_or_else(|| ChainError::FinalityUnverified("no pinned validator set installed".into()))?;
+        let att = self
+            .get_json(&format!("{}/xid/v1/attestations?digest={digest}", self.rpc_url))
+            .await?;
+        let bundle = crate::parse_bundle(digest, &att)
+            .ok_or_else(|| ChainError::Malformed("attestation bundle malformed".into()))?;
+        let height = crate::verify_finality(&bundle, &pinned, &crate::finality_params(crate::now_unix()))
+            .map_err(|e| ChainError::FinalityUnverified(format!("{e:?}")))?;
+        crate::set_xid_max_height(height);
+        *self.digest.write().await = Some((digest.to_string(), Instant::now()));
+        Ok(())
     }
 
     /// Whether `proof_root` equals the current attested + finalized state
