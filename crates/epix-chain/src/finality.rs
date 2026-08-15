@@ -235,7 +235,7 @@ fn num_i64(v: Option<&serde_json::Value>) -> Option<i64> {
 /// `digest_hex`. Signatures are hex. The per-validator RPC `ed25519_pubkey` /
 /// `voting_power` are intentionally IGNORED here — [`verify_finality`] uses the
 /// pinned values keyed by `valcons`, never the RPC-supplied ones — so only
-/// `validator_consensus_addr` + `signature` are consumed. Returns `None` if the
+/// `validator_cons_addr` + `signature` are consumed. Returns `None` if the
 /// required top-level fields are missing.
 pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityBundle> {
     let height = num_u64(v.get("height"))?;
@@ -243,7 +243,7 @@ pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityB
     let atts = v.get("attestations")?.as_array()?;
     let mut attestations = Vec::with_capacity(atts.len());
     for a in atts {
-        let valcons = a.get("validator_consensus_addr").and_then(|x| x.as_str())?.to_string();
+        let valcons = a.get("validator_cons_addr").and_then(|x| x.as_str())?.to_string();
         let sig_hex = a.get("signature").and_then(|x| x.as_str())?;
         let Ok(signature) = hex::decode(sig_hex.trim()) else { continue };
         attestations.push(AttestationEntry { valcons, signature });
@@ -481,7 +481,7 @@ mod tests {
             .iter()
             .map(|(valcons, sk)| {
                 serde_json::json!({
-                    "validator_consensus_addr": valcons,
+                    "validator_cons_addr": valcons,
                     "ed25519_pubkey": "00", // bogus rpc-supplied key — must be ignored
                     "voting_power": "999",   // bogus rpc-supplied power — must be ignored
                     "signature": hex::encode(sk.sign(&msg).to_bytes()),
@@ -505,6 +505,26 @@ mod tests {
     #[test]
     fn parse_bundle_rejects_missing_fields() {
         assert!(parse_bundle("d", &serde_json::json!({ "height": "1" })).is_none());
+    }
+
+    #[test]
+    fn attest_sign_bytes_kat() {
+        // Frozen cross-repo Known-Answer Test — the SAME vector is asserted in
+        // EpixChain x/xid/types/attestation_signbytes_test.go. If either side's
+        // encoding drifts, one of these two KATs breaks. Vector: chain_id
+        // "epix_1916-1", height 200, block_time 1000090, digest = 32 bytes of 0x11.
+        let digest = [0x11u8; 32];
+        let got = hex::encode(attest_sign_bytes("epix_1916-1", 200, 1_000_090, &digest));
+        let want = concat!(
+            "455049582d5849442d41545445535431", // domain "EPIX-XID-ATTEST1"
+            "0000000b",                         // len(chain_id)=11
+            "657069785f313931362d31",           // "epix_1916-1"
+            "00000000000000c8",                 // height=200 (u64 BE)
+            "00000000000f429a",                 // block_time=1000090 (i64 BE)
+            "00000020",                         // len(digest)=32
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        );
+        assert_eq!(got, want, "attest sign-bytes KAT must match the Go chain signer");
     }
 
     #[test]
