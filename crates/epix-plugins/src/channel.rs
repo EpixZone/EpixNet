@@ -169,7 +169,7 @@ async fn load_published_bundles(
 ///     (fail open — the name-level gate already handled full revocation);
 ///   - dedup by identity key, keeping the FRESHEST (highest `spk_idx`) copy so a
 ///     rotated prekey wins over a stale `data.json` left beside `data-<auth>.json`.
-fn refine_device_bundles(mut devs: Vec<Value>, active: &[String]) -> Vec<Value> {
+pub fn refine_device_bundles(mut devs: Vec<Value>, active: &[String]) -> Vec<Value> {
     if !active.is_empty() {
         devs.retain(|b| match b.get("auth").and_then(|a| a.as_str()) {
             Some(auth) => active.iter().any(|a| a == auth),

@@ -2450,6 +2450,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "epix-chain",
  "epix-channel",
  "epix-core",
  "epix-crypt",

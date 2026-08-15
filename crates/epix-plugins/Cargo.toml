@@ -27,5 +27,6 @@ tokio = { version = "1", features = ["rt", "time", "sync"] }
 
 [dev-dependencies]
 epix-xite = { path = "../epix-xite" }
+epix-chain = { path = "../epix-chain" }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
