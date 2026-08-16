@@ -33,7 +33,20 @@ use std::sync::OnceLock;
 /// node configured at boot.
 pub fn shared_resolver() -> Arc<XidResolver> {
     static SHARED: OnceLock<Arc<XidResolver>> = OnceLock::new();
-    SHARED.get_or_init(|| Arc::new(XidResolver::new(DEFAULT_RPC_URL))).clone()
+    SHARED.get_or_init(|| Arc::new(XidResolver::new(&resolver_rpc_url()))).clone()
+}
+
+/// The chain REST base the xID resolver targets. This is the single chain RPC
+/// URL — the resolver appends the `/xid/v1/...` paths itself, so there is no
+/// separate xID endpoint. Defaults to [`DEFAULT_RPC_URL`] (mainnet); set
+/// `EPIX_XID_RPC_URL` to override it for a local devnet or an alternate chain
+/// (e.g. `EPIX_XID_RPC_URL=http://127.0.0.1:1317`) without rebuilding.
+pub fn resolver_rpc_url() -> String {
+    std::env::var("EPIX_XID_RPC_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_RPC_URL.to_string())
 }
 
 /// Drop every in-memory xID cache in this process - the shared resolver's
