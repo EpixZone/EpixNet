@@ -26,6 +26,24 @@ pub struct PoolDelta {
     pub records: Arc<Vec<Value>>,
 }
 
+/// Node-installed hook that verifies a pool record's RLN proof — the zero-
+/// knowledge part that [`epix_content::pool::verify_pool_record`] deliberately
+/// does NOT do (so `epix-content` stays free of the proving stack).
+///
+/// Implemented by a heavier crate that depends on `epix-rln` (which holds the
+/// membership tree, the verifier, and the nullifier log), and installed on
+/// [`AppState`] via [`AppState::set_pool_admission`]. It is consulted only for
+/// records of a pool whose rule sets `rln_required`; if no admission hook is
+/// installed for such a pool, records are dropped (fail closed).
+pub trait PoolAdmission: Send + Sync {
+    /// Whether to admit one inbound record of `address`'s pool. `rln_proof` and
+    /// `ct` are the decoded record fields and `epoch` its epoch. Implementors
+    /// verify the proof against the current membership root and track the
+    /// nullifier (evicting a double-signalling member as a side effect);
+    /// `false` means reject/drop.
+    fn admit_record(&self, address: &str, rln_proof: &[u8], ct: &[u8], epoch: i64) -> bool;
+}
+
 /// Peers to fetch from in an anti-entropy sweep.
 const POOL_SWEEP_PEERS: usize = 16;
 /// Distinct served copies to union per shard before moving on.
@@ -91,6 +109,44 @@ impl AppState {
         let _ = self
             .pool_events
             .send(PoolDelta { address: address.to_string(), records: Arc::new(records) });
+    }
+
+    /// Install the RLN admission hook consulted for `rln_required` pools. Call
+    /// once at node startup (the hook lives in a crate that depends on
+    /// `epix-rln`; this keeps the proving stack out of `epix-ui`).
+    pub async fn set_pool_admission(&self, admission: Arc<dyn PoolAdmission>) {
+        *self.pool_admission.write().await = Some(admission);
+    }
+
+    /// Keep only the inbound records whose RLN proof the installed
+    /// [`PoolAdmission`] hook accepts. If none is installed for this RLN pool,
+    /// keep nothing (fail closed) — an unverified record must never be merged
+    /// into a shard we store and serve.
+    async fn filter_rln_admitted(&self, address: &str, container: Value) -> Value {
+        let Some(admission) = self.pool_admission.read().await.clone() else {
+            return pool::make_pool_container(vec![]);
+        };
+        let records = container
+            .get(pool::POOL_RECORDS_KEY)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let kept: Vec<Value> = records
+            .into_iter()
+            .filter(|rec| {
+                match (
+                    rec.get("rln").and_then(|v| v.as_str()).and_then(b64_decode),
+                    rec.get("ct").and_then(|v| v.as_str()).and_then(b64_decode),
+                    rec.get("epoch").and_then(|v| v.as_i64()),
+                ) {
+                    (Some(rln), Some(ct), Some(epoch)) => {
+                        admission.admit_record(address, &rln, &ct, epoch)
+                    }
+                    _ => false,
+                }
+            })
+            .collect();
+        pool::make_pool_container(kept)
     }
 
     // --- append (local write) --------------------------------------------
@@ -161,6 +217,15 @@ impl AppState {
             self.pool_rule_for_path(address, inner_path).await.ok_or("not a pool shard")?;
         let incoming: Value =
             serde_json::from_slice(signed).map_err(|e| format!("pool shard not JSON: {e}"))?;
+
+        // Anonymous rate-limiting: for an RLN pool, drop any inbound record whose
+        // proof does not verify (and let the verifier track nullifiers / evict
+        // double-signallers) BEFORE it is merged into the shard we store & serve.
+        let incoming = if rule.rln_required {
+            self.filter_rln_admitted(address, incoming).await
+        } else {
+            incoming
+        };
 
         let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
         let existing = storage

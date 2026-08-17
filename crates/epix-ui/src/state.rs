@@ -803,6 +803,10 @@ pub struct AppState {
     /// [`Self::subscribe_pool_deltas`] and filters by address. Decoupled so the
     /// pool machinery has no knowledge of its consumers.
     pub(crate) pool_events: tokio::sync::broadcast::Sender<crate::pool::PoolDelta>,
+    /// Optional RLN admission hook for `rln_required` pools, installed by the
+    /// node at startup. Kept as a trait object so the arkworks proving stack
+    /// stays out of this crate (see [`crate::pool::PoolAdmission`]).
+    pub(crate) pool_admission: RwLock<Option<Arc<dyn crate::pool::PoolAdmission>>>,
     /// Generic typed capability registry: a plugin installs its own state (e.g.
     /// the mail plugin's private index + engine) under a string key so its WS
     /// commands can retrieve it from the bound `AppState`, keeping the core free
@@ -1505,6 +1509,7 @@ impl AppState {
             edx_fetcher: RwLock::new(None),
             pool_rules: RwLock::new(HashMap::new()),
             pool_events: tokio::sync::broadcast::channel(1024).0,
+            pool_admission: RwLock::new(None),
             capabilities: std::sync::RwLock::new(HashMap::new()),
             local_sources: RwLock::new(Vec::new()),
             link_opener: RwLock::new(None),
