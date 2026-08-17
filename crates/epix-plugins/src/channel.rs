@@ -445,6 +445,8 @@ impl Plugin for ChannelPlugin {
                 let rln = crate::rln::RlnAdmission::new();
                 state.set_pool_admission(rln.clone()).await;
                 rln.refresh(&state, &xite).await;
+                // Also stash it so the send path can prove with the same gates.
+                state.install_capability(crate::rln::RLN_CAP, rln);
             }
 
             let snippets = state.config_bool("channel_feed_snippets", false).await;
@@ -837,6 +839,24 @@ impl WsCommand for ChannelSend {
         let published = load_published_bundles(&s.state, &ms.xite).await;
         let dests = resolve_destinations(&s.state, &ms, &recipients, &published).await?;
 
+        // For an rln_required pool, the node attaches an RLN membership proof to
+        // every record it sends. Fetch the shared admission (the same gates the
+        // ingest path uses) and this node's RLN identity seed up front, so the
+        // per-chunk seal task can prove without touching async state.
+        let rln_ctx: Option<(Arc<crate::rln::RlnAdmission>, Vec<u8>, String)> = if rule.rln_required {
+            let admission = s.state.capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP);
+            let auth = s.state.xite_auth_address(&ms.xite).await;
+            match (admission, auth) {
+                (Some(a), Some(auth)) => {
+                    let seed = s.state.derive_consumer_seed("rln", &auth).await.to_vec();
+                    Some((a, seed, ms.xite.clone()))
+                }
+                _ => return Err("this pool requires RLN but no membership is available".into()),
+            }
+        } else {
+            None
+        };
+
         // Seal each chunk of up to SLOTS destinations into one fixed-width record
         // (≤ SLOTS total devices is a single record; larger sends span the minimum
         // number of records). The sender's own copy is recorded on the first chunk
@@ -861,22 +881,45 @@ impl WsCommand for ChannelSend {
                 let now = now_ms();
                 let chunk_dests: Vec<epix_envelope::Dest> =
                     chunk.iter().map(|b| epix_envelope::Dest { bundle: b.clone() }).collect();
+                let rln_c = rln_ctx.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    epix_envelope::send_multi(
-                        db.as_ref(),
-                        engine.as_ref(),
-                        identity_id,
-                        &secret,
-                        &my_xid_c,
-                        &members_c,
-                        &chunk_dests,
-                        conv,
-                        &subject_c,
-                        &body_c,
-                        now,
-                        &rule_c,
-                        record_own,
-                    )
+                    if let Some((admission, seed, addr)) = rln_c {
+                        let ident = epix_rln::RlnIdentity::from_seed(&seed);
+                        let prover =
+                            |ct: &[u8], epoch: i64| admission.prove_for(&addr, &ident, epoch, 0, ct);
+                        epix_envelope::send_multi_with_rln(
+                            db.as_ref(),
+                            engine.as_ref(),
+                            identity_id,
+                            &secret,
+                            &my_xid_c,
+                            &members_c,
+                            &chunk_dests,
+                            conv,
+                            &subject_c,
+                            &body_c,
+                            now,
+                            &rule_c,
+                            record_own,
+                            &prover,
+                        )
+                    } else {
+                        epix_envelope::send_multi(
+                            db.as_ref(),
+                            engine.as_ref(),
+                            identity_id,
+                            &secret,
+                            &my_xid_c,
+                            &members_c,
+                            &chunk_dests,
+                            conv,
+                            &subject_c,
+                            &body_c,
+                            now,
+                            &rule_c,
+                            record_own,
+                        )
+                    }
                 })
                 .await
                 .map_err(|e| format!("channelSend seal task failed: {e}"))?

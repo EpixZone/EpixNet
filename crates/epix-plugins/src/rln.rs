@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use epix_rln::{commitment_from_hex, message_signal, Admission, PoolGate};
+use epix_rln::{commitment_from_hex, message_signal, Admission, PoolGate, RlnIdentity};
 use epix_ui::pool::PoolAdmission;
 use epix_ui::state::AppState;
 use serde_json::Value;
@@ -63,6 +63,23 @@ impl RlnAdmission {
                 state.log("ERROR", format!("RLN: gate build failed for {address}: {e}")).await;
             }
         }
+    }
+
+    /// Produce the RLN proof blob for `identity` (a member of `address`'s pool)
+    /// to attach to an outbound record with sealed payload `ct` in `epoch`.
+    /// Errors if no roster is loaded or the identity is not a member — either of
+    /// which correctly means this node cannot send to the pool.
+    pub fn prove_for(
+        &self,
+        address: &str,
+        identity: &RlnIdentity,
+        epoch: i64,
+        message_id: u32,
+        ct: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let gates = self.gates.lock().unwrap();
+        let gate = gates.get(address).ok_or("no RLN roster loaded for this pool")?;
+        gate.prove_as(identity, epoch.max(0) as u64, message_id, ct).map_err(|e| e.to_string())
     }
 }
 

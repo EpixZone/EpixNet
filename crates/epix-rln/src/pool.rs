@@ -102,6 +102,24 @@ impl PoolGate {
         self.engine.prove(identity, &self.membership, member_index, epoch, message_id, ct)
     }
 
+    /// Prove as `identity`, looking up its own index in this gate's roster.
+    /// Errors if the identity is not a member. Convenience over [`Self::prove`]
+    /// for the send path, which knows the member but not its index.
+    pub fn prove_as(
+        &self,
+        identity: &RlnIdentity,
+        epoch: u64,
+        message_id: u32,
+        ct: &[u8],
+    ) -> Result<Vec<u8>, RlnError> {
+        let key = fr_key(&identity.commitment())?;
+        let index = *self
+            .index_of
+            .get(&key)
+            .ok_or_else(|| RlnError::Membership("identity is not a member of this pool".into()))?;
+        self.prove(identity, index, epoch, message_id, ct)
+    }
+
     /// Admit (or not) a record carrying `rln_proof` for `epoch`, whose bound
     /// message is `ct` (the record's sealed payload).
     ///
