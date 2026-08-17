@@ -54,6 +54,23 @@ impl PoolGate {
         })
     }
 
+    /// Build a gate from an owner-signed roster of member identity commitments.
+    /// No member secrets are needed — the owner vouches for the list — so this
+    /// is how a node builds a gate from the signed roster it reads out of the
+    /// pool's content. Leaf `i` is the rate commitment of `commitments[i]`.
+    pub fn from_roster(
+        domain: Fr,
+        user_message_limit: u32,
+        commitments: &[Fr],
+    ) -> Result<Self, RlnError> {
+        let membership = Membership::from_commitments(commitments, user_message_limit)?;
+        let mut index_of = HashMap::new();
+        for (i, c) in commitments.iter().enumerate() {
+            index_of.insert(fr_key(c)?, i);
+        }
+        Ok(Self { engine: Rln::new(domain), membership, log: NullifierLog::new(), index_of })
+    }
+
     /// Enroll a member at `index`, remembering its commitment for ban lookup.
     pub fn enroll(&mut self, index: usize, identity: &RlnIdentity) -> Result<(), RlnError> {
         self.membership.insert(index, identity)?;

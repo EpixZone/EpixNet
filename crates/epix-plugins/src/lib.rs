@@ -7,8 +7,10 @@
 
 pub mod beacon;
 pub mod channel;
+pub mod rln;
 pub mod sidebar;
 
 pub use beacon::BeaconPlugin;
 pub use channel::ChannelPlugin;
+pub use rln::RlnAdmission;
 pub use sidebar::SidebarPlugin;

@@ -2772,6 +2772,7 @@ dependencies = [
  "epix-pairwise-engine",
  "epix-peer",
  "epix-plugin",
+ "epix-rln",
  "epix-ui",
  "epix-xite",
  "hex",

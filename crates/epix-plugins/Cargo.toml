@@ -16,6 +16,9 @@ epix-peer = { path = "../epix-peer" }
 # epix-channel = the mail-specific private index (its EnvelopeStore impl).
 epix-envelope = { path = "../epix-envelope" }
 epix-channel = { path = "../epix-channel" }
+# epix-rln = anonymous rate-limiting (RLN) admission for rln_required pools.
+# Pulls the zerokit/arkworks proving stack into the node binary.
+epix-rln = { path = "../epix-rln" }
 # The real mail crypto engine (X3DH + Double Ratchet). The node ships this as
 # the default mail engine; the FakeEngine remains only for dev/testing.
 epix-pairwise-engine = { path = "../epix-pairwise-engine" }

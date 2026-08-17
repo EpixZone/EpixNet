@@ -438,6 +438,15 @@ impl Plugin for ChannelPlugin {
             });
             state.install_capability(CHANNEL_CAP, ms.clone());
 
+            // RLN anonymous rate-limiting: install the owner-signed admission hook
+            // and load this xite's member roster. Inert unless the pool rule sets
+            // rln_required and a roster is published, so it is safe to always wire.
+            {
+                let rln = crate::rln::RlnAdmission::new();
+                state.set_pool_admission(rln.clone()).await;
+                rln.refresh(&state, &xite).await;
+            }
+
             let snippets = state.config_bool("channel_feed_snippets", false).await;
             state
                 .register_local_source(Arc::new(ChannelFeedSource {
