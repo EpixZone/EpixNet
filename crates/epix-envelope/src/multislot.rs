@@ -250,7 +250,8 @@ pub struct Dest {
 ///
 /// Fails if `dests.len() > SLOTS` (the caller chunks larger sends).
 #[allow(clippy::too_many_arguments)]
-pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
+#[allow(clippy::too_many_arguments)]
+fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     store: &S,
     engine: &E,
     identity_id: i64,
@@ -264,6 +265,7 @@ pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
     now_ms: i64,
     rule: &PoolRule,
     record_own: bool,
+    rln_prover: Option<&dyn Fn(&[u8], i64) -> std::result::Result<Vec<u8>, String>>,
 ) -> Result<SendResult> {
     if dests.is_empty() || dests.len() > SLOTS {
         return Err(Error::Protocol(format!(
@@ -348,6 +350,18 @@ pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
         "pow": 0,
         "author": author,
     });
+    // Anonymous rate-limiting: where the pool requires it, attach the RLN proof
+    // BEFORE PoW/sign so both cover it. The proof binds to `ct` + `epoch`; the
+    // caller's prover produces it (it holds the member identity + membership).
+    if rule.rln_required {
+        let prove = rln_prover.ok_or_else(|| {
+            Error::Protocol("pool requires an RLN proof but no prover was supplied".into())
+        })?;
+        let proof = prove(&ct, epoch)
+            .map_err(|e| Error::Protocol(format!("rln proof generation failed: {e}")))?;
+        record["rln"] = json!(b64(&proof));
+    }
+
     pool::solve_pow(&mut record, rule.pow_bits);
     let sig = epix_crypt::sign(&record_signed_data(&record), &author_pk).map_err(Error::Crypt)?;
     record["sign"] = json!(sig);
@@ -360,6 +374,58 @@ pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
 
     let shard_path = pool::shard_path(rule, epoch, &route_tag);
     Ok(SendResult { record, shard_path, epoch, msg_id })
+}
+
+/// Seal to multiple destinations for a PoW-only pool. See [`send_multi_inner`]
+/// for the mechanics; this is the common entry point.
+#[allow(clippy::too_many_arguments)]
+pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+) -> Result<SendResult> {
+    send_multi_inner(
+        store, engine, identity_id, id_secret, my_xid, members, dests, conv_id, subject, body,
+        now_ms, rule, record_own, None,
+    )
+}
+
+/// Like [`send_multi`], but for a pool whose rule sets `rln_required`:
+/// `rln_prover(ct, epoch)` returns the RLN proof blob to attach to the record.
+/// The proof is bound to `ct` + `epoch` and is covered by the record's PoW and
+/// signature. The prover holds the member identity and membership (see
+/// `epix-rln`'s `PoolGate::prove`).
+#[allow(clippy::too_many_arguments)]
+pub fn send_multi_with_rln<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+    rln_prover: &dyn Fn(&[u8], i64) -> std::result::Result<Vec<u8>, String>,
+) -> Result<SendResult> {
+    send_multi_inner(
+        store, engine, identity_id, id_secret, my_xid, members, dests, conv_id, subject, body,
+        now_ms, rule, record_own, Some(rln_prover),
+    )
 }
 
 #[cfg(test)]
