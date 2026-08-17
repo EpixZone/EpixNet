@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use rln::prelude::{Fr, SecretFr};
+use rln::prelude::Fr;
 
 use crate::{
     commitment_of_secret, fr_key, Membership, NullifierLog, Observation, Rln, RlnError, RlnIdentity,
@@ -34,10 +34,12 @@ pub enum Admission {
     /// The proof did not verify — a bad proof, a non-member, the wrong epoch, or
     /// a signal that does not match the record. Do not admit.
     Reject(RlnError),
-    /// The sender exceeded its per-epoch allowance. Its secret was recovered and
-    /// the identity has been evicted from the membership tree (the root changed).
-    /// Do not admit; propagate the ban.
-    Evicted { offender_commitment: Fr },
+    /// The sender exceeded its per-epoch allowance: the double-signal revealed
+    /// its secret, reported here as its commitment. The record is NOT admitted
+    /// (the rate limit is enforced). Structural removal is left to the caller —
+    /// under the owner-signed model the owner drops the member from its roster;
+    /// [`PoolGate::evict_member`] is available for callers that remove locally.
+    RateExceeded { offender_commitment: Fr },
 }
 
 impl PoolGate {
@@ -104,19 +106,24 @@ impl PoolGate {
         match self.log.observe(epoch, verified.nullifier, verified.share) {
             Ok(Observation::Fresh) => Admission::Admit,
             Ok(Observation::Replay) => Admission::Duplicate,
-            Ok(Observation::DoubleSignal { recovered_secret }) => self.evict(&recovered_secret),
+            Ok(Observation::DoubleSignal { recovered_secret }) => {
+                Admission::RateExceeded { offender_commitment: commitment_of_secret(&recovered_secret) }
+            }
             Err(e) => Admission::Reject(e),
         }
     }
 
-    /// Evict the identity behind a recovered secret and report its commitment.
-    fn evict(&mut self, secret: &SecretFr) -> Admission {
-        let commitment = commitment_of_secret(secret);
-        if let Ok(key) = fr_key(&commitment) {
+    /// Structurally remove the member with `commitment` from the tree — a ban
+    /// that changes the root. Under the owner-signed model this happens when the
+    /// owner regenerates its roster; a future self-validating model would have
+    /// every node call this on a reveal. Returns whether a member was found.
+    pub fn evict_member(&mut self, commitment: &Fr) -> bool {
+        if let Ok(key) = fr_key(commitment) {
             if let Some(index) = self.index_of.remove(&key) {
                 let _ = self.membership.remove(index);
+                return true;
             }
         }
-        Admission::Evicted { offender_commitment: commitment }
+        false
     }
 }

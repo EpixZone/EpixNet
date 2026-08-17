@@ -20,6 +20,24 @@ pub struct Membership {
 }
 
 impl Membership {
+    /// Build a membership tree from an ordered roster of member identity
+    /// commitments (the owner-signed list): leaf `i` is
+    /// `rate_commitment(commitments[i], user_message_limit)`. Every node that
+    /// has the same signed roster derives the same root.
+    pub fn from_commitments(
+        commitments: &[Fr],
+        user_message_limit: u32,
+    ) -> Result<Self, RlnError> {
+        let mut m = Self::new(user_message_limit)?;
+        let limit = Fr::from(u64::from(user_message_limit));
+        for (i, c) in commitments.iter().enumerate() {
+            m.tree
+                .set(i, crate::rate_commitment(*c, limit))
+                .map_err(|e| RlnError::Membership(e.to_string()))?;
+        }
+        Ok(m)
+    }
+
     /// A new, empty membership tree with the given per-epoch message allowance.
     pub fn new(user_message_limit: u32) -> Result<Self, RlnError> {
         let tree = OptimalMerkleTree::new(

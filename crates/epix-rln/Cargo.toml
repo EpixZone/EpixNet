@@ -15,6 +15,8 @@ zerokit_utils = { version = "3", default-features = false }
 # Deterministic identity derivation (xID-anchored: same seed -> same identity).
 rand_chacha = "0.3"
 thiserror = "2"
+# Hex encoding for the owner-signed membership roster (commitment <-> string).
+hex = "0.4"
 
 [dev-dependencies]
 rand = "0.8"

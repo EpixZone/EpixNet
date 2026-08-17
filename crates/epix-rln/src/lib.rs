@@ -25,7 +25,9 @@
 //! Still WIP: the `verify_pool_record` admission hook and send-path wiring in
 //! the node/pool crates. This crate is the engine those call into.
 
-use rln::prelude::{hash_to_field_le, CanonicalSerialize, Fr, Hasher, PoseidonHash};
+use rln::prelude::{
+    hash_to_field_le, CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash,
+};
 
 pub use rln;
 
@@ -108,4 +110,17 @@ pub fn rate_commitment(id_commitment: Fr, user_message_limit: Fr) -> Fr {
 /// proof cannot be lifted onto a different record.
 pub fn message_signal(bytes: &[u8]) -> Fr {
     hash_to_field_le(bytes)
+}
+
+/// Hex-encode an identity commitment (its 32-byte canonical form) for the
+/// owner-signed membership roster.
+pub fn commitment_to_hex(commitment: &Fr) -> String {
+    fr_key(commitment).map(hex::encode).unwrap_or_default()
+}
+
+/// Parse a hex-encoded identity commitment (from the roster) back to a field
+/// element, or `None` if it is not 32 valid canonical bytes.
+pub fn commitment_from_hex(s: &str) -> Option<Fr> {
+    let bytes = hex::decode(s).ok()?;
+    Fr::deserialize_compressed(&bytes[..]).ok()
 }
