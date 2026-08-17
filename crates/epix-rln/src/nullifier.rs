@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 
-use rln::prelude::{compute_id_secret, CanonicalSerialize, Fr, SecretFr};
+use rln::prelude::{compute_id_secret, Fr, SecretFr};
 
-use crate::RlnError;
+use crate::{fr_key, RlnError};
 
 /// The outcome of observing one verified proof's nullifier for an epoch.
 pub enum Observation {
@@ -46,7 +46,7 @@ impl NullifierLog {
         nullifier: Fr,
         share: (Fr, Fr),
     ) -> Result<Observation, RlnError> {
-        let key = fr_bytes(&nullifier)?;
+        let key = fr_key(&nullifier)?;
         let epoch_map = self.seen.entry(epoch).or_default();
         match epoch_map.get(&key).copied() {
             None => {
@@ -67,16 +67,4 @@ impl NullifierLog {
     pub fn prune_before(&mut self, oldest: u64) {
         self.seen.retain(|&e, _| e >= oldest);
     }
-}
-
-/// Canonical 32-byte key for a BN254 scalar (used to index nullifiers).
-fn fr_bytes(f: &Fr) -> Result<[u8; 32], RlnError> {
-    let mut v = Vec::with_capacity(32);
-    f.serialize_compressed(&mut v).map_err(|e| RlnError::Serialize(e.to_string()))?;
-    let mut out = [0u8; 32];
-    if v.len() != out.len() {
-        return Err(RlnError::Serialize(format!("nullifier serialized to {} bytes", v.len())));
-    }
-    out.copy_from_slice(&v);
-    Ok(out)
 }

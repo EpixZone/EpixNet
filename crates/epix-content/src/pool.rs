@@ -56,6 +56,10 @@ const ALLOWED_FIELDS: &[&str] = &["v", "epoch", "tag", "ct", "pow", "author", "s
 /// The only record version this build accepts.
 const POOL_RECORD_V: i64 = 1;
 
+/// Upper bound on the decoded `rln` proof blob. An RLN Groth16 proof plus its
+/// public values serializes to a few hundred bytes; this is generous headroom.
+const MAX_RLN_PROOF_BYTES: usize = 1024;
+
 /// Milliseconds per day — the epoch quantum.
 const MS_PER_DAY: i64 = 86_400_000;
 
@@ -89,6 +93,12 @@ pub enum PoolError {
     InsufficientPow,
     /// The signature does not recover to `author`.
     BadSignature,
+    /// The pool requires an RLN proof (`rln_required`) but the record has none.
+    MissingRlnProof,
+    /// The `rln` field is not valid base64, is empty, or exceeds the size cap.
+    /// Only its shape is checked here; the zk proof is verified at the node's
+    /// ingest seam, where the membership root and the RLN verifier are available.
+    BadRlnProof,
 }
 
 /// The owner-signed pool descriptor from a xite's root content.json:
@@ -119,6 +129,12 @@ pub struct PoolRule {
     /// (`"oldest_first"`) walks in chronological order. Live/current-week mail is
     /// never subject to this — it arrives via push and the current-week sweep.
     pub newest_first: bool,
+    /// Whether records must carry a valid RLN proof (the `rln` field) to be
+    /// admitted (anonymous rate limiting). [`verify_pool_record`] checks the
+    /// field's presence and shape; the zk proof itself is verified by the node
+    /// against the membership root (see the `epix-rln` crate). Absent or
+    /// `false` means PoW-only admission.
+    pub rln_required: bool,
 }
 
 impl PoolRule {
@@ -164,6 +180,8 @@ impl PoolRule {
         // it. An unknown value falls back to the default rather than failing.
         let newest_first =
             obj.get("sync_order").and_then(|v| v.as_str()) != Some("oldest_first");
+        // RLN admission is opt-in per pool; absent/false means PoW-only.
+        let rln_required = obj.get("rln_required").and_then(|v| v.as_bool()).unwrap_or(false);
         Some(PoolRule {
             dir,
             class,
@@ -174,6 +192,7 @@ impl PoolRule {
             max_record_bytes,
             max_shard_bytes,
             newest_first,
+            rln_required,
         })
     }
 }
@@ -397,11 +416,16 @@ pub fn verify_pool_record(
 ) -> Result<(), PoolError> {
     let obj = record.as_object().ok_or(PoolError::NotObject)?;
 
-    // 1. exact field set — reject any covert extra key.
+    // 1. exact field set — reject any covert extra key. The optional `rln` proof
+    //    field is permitted only where the pool rule requires RLN admission.
     for key in obj.keys() {
-        if !ALLOWED_FIELDS.contains(&key.as_str()) {
-            return Err(PoolError::UnknownField(key.clone()));
+        if ALLOWED_FIELDS.contains(&key.as_str()) {
+            continue;
         }
+        if key == "rln" && rule.rln_required {
+            continue;
+        }
+        return Err(PoolError::UnknownField(key.clone()));
     }
 
     // 2. version
@@ -435,6 +459,21 @@ pub fn verify_pool_record(
         .map_err(|_| PoolError::BadCiphertextSize)?;
     if !rule.pad_buckets.contains(&ct.len()) {
         return Err(PoolError::BadCiphertextSize);
+    }
+
+    // 4b. RLN proof shape (only where the pool requires it). The zk proof binds
+    //     to `ct` + `epoch` and is verified by the node against the membership
+    //     root; here we only ensure a well-formed, size-bounded blob is present.
+    //     The `rln` field is part of `record_signed_data`, so PoW and the
+    //     record signature cover it like every other field.
+    if rule.rln_required {
+        let rln_b64 = obj.get("rln").and_then(|x| x.as_str()).ok_or(PoolError::MissingRlnProof)?;
+        let rln = base64::engine::general_purpose::STANDARD
+            .decode(rln_b64)
+            .map_err(|_| PoolError::BadRlnProof)?;
+        if rln.is_empty() || rln.len() > MAX_RLN_PROOF_BYTES {
+            return Err(PoolError::BadRlnProof);
+        }
     }
 
     // 5. record size cap (canonical payload + the sign field's bytes are what
@@ -559,6 +598,7 @@ mod tests {
             max_record_bytes: 4096,
             max_shard_bytes: 1_000_000,
             newest_first: true,
+            rln_required: false,
         }
     }
 
@@ -599,6 +639,96 @@ mod tests {
     // now_ms for an epoch's own day (so `epoch <= today+1` holds).
     fn now_for(epoch: i64) -> i64 {
         epoch * MS_PER_DAY + 1
+    }
+
+    // --- RLN admission (structural) ---
+
+    fn rln_rule() -> PoolRule {
+        let mut r = rule();
+        r.rln_required = true;
+        r
+    }
+
+    /// A valid record that also carries an `rln` proof blob. The rln field is
+    /// present BEFORE PoW/sign, so both cover it (as they will on the wire).
+    fn valid_record_with_rln(epoch: i64, rln_bytes: &[u8]) -> Value {
+        let pk = epix_crypt::new_seed();
+        let author = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let mut rec = json!({
+            "v": 1,
+            "epoch": epoch,
+            "tag": tag_b64(1),
+            "ct": ct_b64(64, 7),
+            "pow": 0,
+            "author": author,
+            "rln": base64::engine::general_purpose::STANDARD.encode(rln_bytes),
+        });
+        solve_pow(&mut rec, 8);
+        let sig = epix_crypt::sign(&record_signed_data(&rec), &pk).unwrap();
+        rec["sign"] = json!(sig);
+        rec
+    }
+
+    #[test]
+    fn rln_required_accepts_wellformed_proof() {
+        let epoch = 100;
+        let rec = valid_record_with_rln(epoch, &[1u8; 300]);
+        assert_eq!(verify_pool_record(&rec, &rln_rule(), week_of(epoch), now_for(epoch)), Ok(()));
+    }
+
+    #[test]
+    fn rln_required_rejects_missing_proof() {
+        let epoch = 100;
+        let rec = valid_record(epoch, 1, 64, 7); // no rln field
+        assert_eq!(
+            verify_pool_record(&rec, &rln_rule(), week_of(epoch), now_for(epoch)),
+            Err(PoolError::MissingRlnProof)
+        );
+    }
+
+    #[test]
+    fn rln_field_rejected_when_pool_does_not_require_it() {
+        let epoch = 100;
+        // The rln field present under a PoW-only rule is a covert channel.
+        let rec = valid_record_with_rln(epoch, &[1u8; 200]);
+        assert_eq!(
+            verify_pool_record(&rec, &rule(), week_of(epoch), now_for(epoch)),
+            Err(PoolError::UnknownField("rln".into()))
+        );
+    }
+
+    #[test]
+    fn rln_required_rejects_oversized_proof() {
+        let epoch = 100;
+        let rec = valid_record_with_rln(epoch, &[1u8; MAX_RLN_PROOF_BYTES + 1]);
+        assert_eq!(
+            verify_pool_record(&rec, &rln_rule(), week_of(epoch), now_for(epoch)),
+            Err(PoolError::BadRlnProof)
+        );
+    }
+
+    #[test]
+    fn rln_required_rejects_non_base64_proof() {
+        let epoch = 100;
+        let mut rec = valid_record(epoch, 1, 64, 7);
+        rec["rln"] = json!("!!! not base64 !!!");
+        assert_eq!(
+            verify_pool_record(&rec, &rln_rule(), week_of(epoch), now_for(epoch)),
+            Err(PoolError::BadRlnProof)
+        );
+    }
+
+    #[test]
+    fn rln_required_parsed_from_descriptor() {
+        let mut v = json!({
+            "dir": "pool", "class": POOL_RECORD_FORMAT, "since_week": 0, "fanout": 16,
+            "pow_bits": 8, "pad_buckets": [64], "max_record_bytes": 4096,
+            "max_shard_bytes": 1000, "rln_required": true
+        });
+        assert!(PoolRule::parse(&v).unwrap().rln_required);
+        // absent => false (PoW-only)
+        v.as_object_mut().unwrap().remove("rln_required");
+        assert!(!PoolRule::parse(&v).unwrap().rln_required);
     }
 
     #[test]

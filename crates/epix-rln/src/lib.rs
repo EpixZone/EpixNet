@@ -25,7 +25,7 @@
 //! Still WIP: the `verify_pool_record` admission hook and send-path wiring in
 //! the node/pool crates. This crate is the engine those call into.
 
-use rln::prelude::{hash_to_field_le, Fr, Hasher, PoseidonHash};
+use rln::prelude::{hash_to_field_le, CanonicalSerialize, Fr, Hasher, PoseidonHash};
 
 pub use rln;
 
@@ -37,11 +37,26 @@ mod engine;
 mod identity;
 mod membership;
 mod nullifier;
+mod pool;
 
 pub use engine::{Rln, Verified};
 pub use identity::{commitment_of_secret, RlnIdentity};
 pub use membership::Membership;
 pub use nullifier::{NullifierLog, Observation};
+pub use pool::{Admission, PoolGate};
+
+/// Canonical 32-byte key for a BN254 scalar, used to index nullifiers and
+/// commitments in hash maps.
+pub(crate) fn fr_key(f: &Fr) -> Result<[u8; 32], RlnError> {
+    let mut v = Vec::with_capacity(32);
+    f.serialize_compressed(&mut v).map_err(|e| RlnError::Serialize(e.to_string()))?;
+    let mut out = [0u8; 32];
+    if v.len() != out.len() {
+        return Err(RlnError::Serialize(format!("scalar serialized to {} bytes", v.len())));
+    }
+    out.copy_from_slice(&v);
+    Ok(out)
+}
 
 /// Errors from the RLN engine. Crypto-layer failures carry the underlying
 /// message; logic failures (a proof for the wrong epoch, a proof that does not
