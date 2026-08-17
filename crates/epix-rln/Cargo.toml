@@ -9,8 +9,12 @@ description = "Anonymous rate-limiting for the ECX pool via Rate-Limiting Nullif
 # workspace root to gate off the sled-backed tree (see vendor/rln). We use only
 # the stateless verifier; the membership tree is xID-anchored and lives outside.
 rln = { version = "3", default-features = false }
+# In-memory sparse Merkle tree (the same backend rln's circuit expects) for the
+# membership tree, plus Poseidon.
+zerokit_utils = { version = "3", default-features = false }
+# Deterministic identity derivation (xID-anchored: same seed -> same identity).
+rand_chacha = "0.3"
+thiserror = "2"
 
 [dev-dependencies]
-# In-memory Merkle tree (the same backend rln uses) for the round-trip test.
-zerokit_utils = { version = "3", default-features = false }
 rand = "0.8"

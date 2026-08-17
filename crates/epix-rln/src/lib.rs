@@ -4,27 +4,69 @@
 //! sender is a member in good standing (a leaf in the xID-anchored membership
 //! tree) AND has not exceeded its per-epoch message allowance, all WITHOUT
 //! revealing which member sent it. If a member double-signals within an epoch,
-//! the scheme's Shamir shares reveal that member's secret, which is what powers
-//! the reputation-based eviction described in the ECX design: the offending
-//! identity is removed from the membership tree, and rejoining costs a fresh
-//! (paid) xID.
+//! the scheme's Shamir shares reveal that member's secret, which powers the
+//! reputation-based eviction from the ECX design: the offending identity is
+//! removed from the membership tree, and rejoining costs a fresh (paid) xID.
 //!
 //! This crate wraps the audited zerokit `rln` crate. The heavy crypto (the
 //! Groth16 circuit, Poseidon, the nullifier math) is zerokit's; this crate is
-//! the thin, EpixNet-shaped seam over it. The membership tree, epoch nullifier
-//! tracking, and pool-admission wiring build on top of this in follow-up work.
+//! the thin, EpixNet-shaped seam over it:
 //!
-//! Status: the verifier primitive and the proof/verify/recover round-trip are
-//! implemented and tested (`tests/round_trip.rs`). Membership, reputation, and
-//! the pool `verify_pool_record` hook are WIP.
-
-pub use rln;
+//! - [`RlnIdentity`] — a member's keys, derived deterministically from a seed so
+//!   they can be anchored to an xID.
+//! - [`Membership`] — the xID-anchored membership tree (leaves are rate
+//!   commitments); `insert` adds a member, `remove` is a ban.
+//! - [`Rln`] — the stateless prover/verifier; [`Rln::prove`] builds the proof
+//!   blob a record carries, [`Rln::verify`] checks it and returns the nullifier
+//!   and share the node needs.
+//! - [`NullifierLog`] — per-epoch nullifier tracking; a second, distinct share
+//!   for the same nullifier is a double-signal and yields the offender's secret.
+//!
+//! Still WIP: the `verify_pool_record` admission hook and send-path wiring in
+//! the node/pool crates. This crate is the engine those call into.
 
 use rln::prelude::{hash_to_field_le, Fr, Hasher, PoseidonHash};
+
+pub use rln;
 
 /// Merkle tree depth the bundled RLN circuit is built for. The membership tree
 /// must use this depth for proofs to verify.
 pub use rln::prelude::DEFAULT_TREE_DEPTH as RLN_TREE_DEPTH;
+
+mod engine;
+mod identity;
+mod membership;
+mod nullifier;
+
+pub use engine::{Rln, Verified};
+pub use identity::{commitment_of_secret, RlnIdentity};
+pub use membership::Membership;
+pub use nullifier::{NullifierLog, Observation};
+
+/// Errors from the RLN engine. Crypto-layer failures carry the underlying
+/// message; logic failures (a proof for the wrong epoch, a proof that does not
+/// verify) are typed so callers can react to them.
+#[derive(Debug, thiserror::Error)]
+pub enum RlnError {
+    #[error("membership tree error: {0}")]
+    Membership(String),
+    #[error("witness build failed: {0}")]
+    Witness(String),
+    #[error("proof generation failed: {0}")]
+    Prove(String),
+    #[error("proof verification error: {0}")]
+    Verify(String),
+    #[error("proof (de)serialization failed: {0}")]
+    Serialize(String),
+    #[error("proof is bound to a different epoch than the record")]
+    EpochMismatch,
+    #[error("proof did not verify against the accepted membership roots")]
+    InvalidProof,
+    #[error("proof values are missing the nullifier or share")]
+    MalformedValues,
+    #[error("secret recovery failed: {0}")]
+    Recover(String),
+}
 
 /// The per-epoch external nullifier that binds a proof to a rate-limit window.
 ///

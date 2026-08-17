@@ -2815,7 +2815,9 @@ name = "epix-rln"
 version = "0.1.0"
 dependencies = [
  "rand 0.8.7",
+ "rand_chacha 0.3.1",
  "rln",
+ "thiserror 2.0.20",
  "zerokit_utils",
 ]
 
