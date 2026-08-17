@@ -1,0 +1,16 @@
+[package]
+name = "epix-rln"
+version = "0.1.0"
+edition = "2021"
+description = "Anonymous rate-limiting for the ECX pool via Rate-Limiting Nullifiers (zerokit RLN). Proves pool-record admission rights without revealing which member sent it; double-signalling within an epoch reveals the offender's secret for reputation-based eviction."
+
+[dependencies]
+# zerokit RLN (PSE / vacp2p): audited Groth16 RLN over BN254, patched at the
+# workspace root to gate off the sled-backed tree (see vendor/rln). We use only
+# the stateless verifier; the membership tree is xID-anchored and lives outside.
+rln = { version = "3", default-features = false }
+
+[dev-dependencies]
+# In-memory Merkle tree (the same backend rln uses) for the round-trip test.
+zerokit_utils = { version = "3", default-features = false }
+rand = "0.8"
