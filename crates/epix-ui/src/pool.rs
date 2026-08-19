@@ -301,6 +301,38 @@ impl AppState {
                 }
             }
         }
+
+        // Reclaim disk: drop shards past the owner-set retention window.
+        self.prune_expired_pool_shards(address).await;
+    }
+
+    /// Delete pool shards older than the rule's retention window, set by the xite
+    /// owner in content.json (`retention_weeks`; absent or `0` = keep forever, so
+    /// this is a no-op then). Received messages live in each recipient's private
+    /// index, so pruning the SHARED pool never loses delivered mail — it only
+    /// reclaims disk. Also runs on the sweep tick.
+    pub async fn prune_expired_pool_shards(self: &Arc<Self>, address: &str) {
+        let rules = self.pool_rules_for(address).await;
+        if rules.iter().all(|r| r.retention_weeks <= 0) {
+            return; // no rule sets retention -> keep everything
+        }
+        let Some(storage) = self.xite_storage(address).await else {
+            return;
+        };
+        let cur_week = pool::week_of(pool::epoch_now(now_ms()));
+        let files = storage.list_files();
+        for rule in &rules {
+            let Some(keep_from) = pool::retention_keep_from(rule, cur_week) else {
+                continue;
+            };
+            for path in &files {
+                if let Some((week, _sub)) = pool::parse_shard_path(rule, path) {
+                    if week < keep_from {
+                        let _ = storage.delete(path);
+                    }
+                }
+            }
+        }
     }
 
     /// Newest-first historical backfill up to `max_weeks` back (0 = all),

@@ -135,6 +135,11 @@ pub struct PoolRule {
     /// against the membership root (see the `epix-rln` crate). Absent or
     /// `false` means PoW-only admission.
     pub rln_required: bool,
+    /// Weeks of pool history to keep before old shards are pruned from disk. `0`
+    /// (the default, or an absent `retention_weeks`) keeps everything forever.
+    /// Owner-set per xite via content.json, so each xite picks the policy that
+    /// fits its function (ephemeral chat, longer-lived mail, archival forum).
+    pub retention_weeks: i64,
 }
 
 impl PoolRule {
@@ -182,6 +187,9 @@ impl PoolRule {
             obj.get("sync_order").and_then(|v| v.as_str()) != Some("oldest_first");
         // RLN admission is opt-in per pool; absent/false means PoW-only.
         let rln_required = obj.get("rln_required").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Retention is opt-in per pool; absent/<=0 means keep forever.
+        let retention_weeks =
+            obj.get("retention_weeks").and_then(|v| v.as_i64()).filter(|&n| n > 0).unwrap_or(0);
         Some(PoolRule {
             dir,
             class,
@@ -193,6 +201,7 @@ impl PoolRule {
             max_shard_bytes,
             newest_first,
             rln_required,
+            retention_weeks,
         })
     }
 }
@@ -227,6 +236,17 @@ pub fn epoch_now(now_ms: i64) -> i64 {
 /// The shard week an `epoch` (day) belongs to.
 pub fn week_of(epoch: i64) -> i64 {
     epoch.div_euclid(DAYS_PER_WEEK)
+}
+
+/// The oldest week to KEEP under `rule`'s retention, given the current week, or
+/// `None` for indefinite retention (`retention_weeks <= 0`). Shards for weeks
+/// strictly older than the returned value are expired and may be pruned.
+pub fn retention_keep_from(rule: &PoolRule, cur_week: i64) -> Option<i64> {
+    if rule.retention_weeks <= 0 {
+        None
+    } else {
+        Some(cur_week - rule.retention_weeks + 1)
+    }
 }
 
 /// The shard sub-index for a 32-byte `tag` under `fanout`.
@@ -599,6 +619,7 @@ mod tests {
             max_shard_bytes: 1_000_000,
             newest_first: true,
             rln_required: false,
+            retention_weeks: 0,
         }
     }
 
@@ -716,6 +737,25 @@ mod tests {
             verify_pool_record(&rec, &rln_rule(), week_of(epoch), now_for(epoch)),
             Err(PoolError::BadRlnProof)
         );
+    }
+
+    #[test]
+    fn retention_parsed_and_keep_from_computed() {
+        let mut v = json!({
+            "dir": "pool", "class": POOL_RECORD_FORMAT, "since_week": 0, "fanout": 16,
+            "pow_bits": 8, "pad_buckets": [64], "max_record_bytes": 4096,
+            "max_shard_bytes": 1000, "retention_weeks": 4
+        });
+        let r = PoolRule::parse(&v).unwrap();
+        assert_eq!(r.retention_weeks, 4);
+        // With current week 100 and a 4-week window, weeks < 97 are expired.
+        assert_eq!(retention_keep_from(&r, 100), Some(97));
+
+        // Absent / non-positive => indefinite (keep everything).
+        v.as_object_mut().unwrap().remove("retention_weeks");
+        let r0 = PoolRule::parse(&v).unwrap();
+        assert_eq!(r0.retention_weeks, 0);
+        assert_eq!(retention_keep_from(&r0, 100), None);
     }
 
     #[test]
