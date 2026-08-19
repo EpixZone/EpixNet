@@ -397,6 +397,7 @@ impl Plugin for ChannelPlugin {
             Arc::new(ChannelSetConvState),
             Arc::new(ChannelDeleteLocal),
             Arc::new(ChannelMigrateLegacy),
+            Arc::new(ChannelRlnStatus),
         ]
     }
 
@@ -543,6 +544,62 @@ impl WsCommand for ChannelSessionInfo {
             "xite": ms.xite,
             "key_bundle_published": has_identity,
             "unread": unread,
+        }))
+    }
+}
+
+/// The footprint status the site renders as a progress bar + reset countdown:
+/// how much of this epoch's anonymous rate allowance the node has spent, when it
+/// resets, whether the node is an enrolled member, and how long the pool retains
+/// records. For a PoW-only pool it just reports retention.
+struct ChannelRlnStatus;
+#[async_trait]
+impl WsCommand for ChannelRlnStatus {
+    fn name(&self) -> &'static str {
+        "channelRlnStatus"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s)?;
+        let Some(rule) = s.state.pool_rules_for(&ms.xite).await.into_iter().next() else {
+            return Ok(json!({ "rln_required": false, "retention_weeks": 0 }));
+        };
+        let retention_weeks = rule.retention_weeks;
+        if !rule.rln_required {
+            return Ok(json!({ "rln_required": false, "retention_weeks": retention_weeks }));
+        }
+
+        // Current epoch (days) and seconds until the next one, when the allowance
+        // resets — the "resets at X" the UI shows on a hit limit.
+        let now = now_ms();
+        let day_ms = 86_400_000i64;
+        let epoch = now.div_euclid(day_ms);
+        let resets_in_secs = (((epoch + 1) * day_ms - now).max(0) / 1000) as u64;
+
+        let admission = s.state.capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP);
+        let (used, limit, member) = match &admission {
+            Some(a) => {
+                let (used, limit) = a.usage(&ms.xite, epoch.max(0) as u64).unwrap_or((0, 0));
+                let member = match s.state.xite_auth_address(&ms.xite).await {
+                    Some(auth) => {
+                        let seed = s.state.derive_consumer_seed("rln", &auth).await;
+                        a.is_member(&ms.xite, &epix_rln::RlnIdentity::from_seed(&seed))
+                    }
+                    None => false,
+                };
+                (used, limit, member)
+            }
+            None => (0, 0, false),
+        };
+
+        Ok(json!({
+            "rln_required": true,
+            "member": member,
+            "unit_limit": limit,
+            "units_used": used,
+            "units_remaining": limit.saturating_sub(used),
+            "epoch": epoch,
+            "resets_in_secs": resets_in_secs,
+            "retention_weeks": retention_weeks,
         }))
     }
 }

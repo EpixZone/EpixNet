@@ -107,6 +107,20 @@ impl RlnAdmission {
             .prove_as(identity, epoch_u, first_unit, weight, ct)
             .map_err(|e| e.to_string())
     }
+
+    /// This node's RLN footprint for `address` at `epoch`: `(units spent this
+    /// epoch, per-epoch unit allowance)`, if a roster is loaded. Feeds the
+    /// footprint progress bar. Read-only.
+    pub fn usage(&self, address: &str, epoch: u64) -> Option<(u32, u32)> {
+        let pools = self.pools.lock().unwrap();
+        let pool = pools.get(address)?;
+        Some((self.usage.spent(address, epoch), pool.limit))
+    }
+
+    /// Whether `identity` is enrolled in `address`'s roster.
+    pub fn is_member(&self, address: &str, identity: &RlnIdentity) -> bool {
+        self.pools.lock().unwrap().get(address).map(|p| p.gate.is_member(identity)).unwrap_or(false)
+    }
 }
 
 impl PoolAdmission for RlnAdmission {
@@ -166,6 +180,11 @@ impl UsageLedger {
             .and_then(|b| serde_json::from_slice::<HashMap<String, u32>>(&b).ok())
             .unwrap_or_default();
         Self { path, spent: Mutex::new(spent) }
+    }
+
+    /// Units spent at `(address, epoch)` so far (read-only).
+    fn spent(&self, address: &str, epoch: u64) -> u32 {
+        *self.spent.lock().unwrap().get(&format!("{address}|{epoch}")).unwrap_or(&0)
     }
 
     /// Reserve `weight` units at `(address, epoch)`; returns the first unit index

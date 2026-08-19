@@ -83,6 +83,12 @@ impl PoolGate {
         self.membership.root()
     }
 
+    /// Whether `identity` is enrolled in this gate's roster (used by the send
+    /// path and the footprint UI to tell a member from a non-member).
+    pub fn is_member(&self, identity: &RlnIdentity) -> bool {
+        fr_key(&identity.commitment()).map(|k| self.index_of.contains_key(&k)).unwrap_or(false)
+    }
+
     /// Forget nullifiers for epochs before `oldest` (bounds memory).
     pub fn prune_before(&mut self, oldest: u64) {
         self.log.prune_before(oldest);
