@@ -2117,6 +2117,40 @@ async fn serve(
     if let Some(log_file) = &opts.log_file {
         state.set_log_file(log_file);
     }
+
+    // xID finality: if a pinned validator set is shipped (`xid_pin.json` in the
+    // data root, captured from mainnet AFTER the v0.7.2 attestation upgrade),
+    // install it and REQUIRE client-side finality verification — xID resolution
+    // then fails closed unless the digest is signed by >2/3 of the pinned power.
+    // Absent, resolution falls back to the legacy RPC-trusted path with a warning.
+    {
+        let pin_path = opts.data_root.join("xid_pin.json");
+        match std::fs::read(&pin_path) {
+            Ok(bytes) => match epix_chain::install_finality_pin(&bytes) {
+                Ok(n) => {
+                    state
+                        .log(
+                            "INFO",
+                            format!(
+                                "xID finality: pinned {n} validators; resolution now requires >2/3 attestation"
+                            ),
+                        )
+                        .await
+                }
+                Err(e) => {
+                    state.log("ERROR", format!("xID finality pin {}: {e}", pin_path.display())).await
+                }
+            },
+            Err(_) => {
+                state
+                    .log(
+                        "WARN",
+                        "xID finality: no xid_pin.json found; using legacy RPC-trusted resolution",
+                    )
+                    .await
+            }
+        }
+    }
     // The Config page's "Data directory" works only when the root is the
     // user-relocatable desktop one (not pinned by EPIX_DATA_DIR or set
     // programmatically by an embedding shell). The choice persists as

@@ -187,6 +187,98 @@ pub fn verify_finality_enabled() -> bool {
     XID_VERIFY_FINALITY.load(Ordering::Relaxed)
 }
 
+/// Install a pinned validator set from a JSON pin file and turn ON client-side
+/// xID finality verification. After this, xID resolution REQUIRES a digest signed
+/// by more than two thirds of the pinned voting power and fails closed otherwise
+/// (see [`XidResolver`]).
+///
+/// The pin is captured from a trusted mainnet height AFTER the v0.7.2 attestation
+/// upgrade is live (before then there are no signed attestations to pin). Shape:
+///
+/// ```json
+/// { "chain_id": "epix_1917-1", "pinned_at_height": 5360001,
+///   "pinned_at_unix": 1790000000,
+///   "validators": [ { "valcons": "epixvalcons1...", "pubkey": "<64 hex>",
+///                     "voting_power": 1000000 } ] }
+/// ```
+///
+/// Returns the number of validators pinned.
+pub fn install_finality_pin(json: &[u8]) -> std::result::Result<usize, String> {
+    let pinned = parse_finality_pin(json)?;
+    let n = pinned.validators.len();
+    set_pinned_validators(Some(pinned));
+    set_verify_finality(true);
+    Ok(n)
+}
+
+/// Parse a pin file into a [`finality::PinnedSet`] without touching global state.
+pub fn parse_finality_pin(json: &[u8]) -> std::result::Result<finality::PinnedSet, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(json).map_err(|e| format!("pin JSON: {e}"))?;
+    let miss = |f: &str| format!("pin: missing {f}");
+    let chain_id = v.get("chain_id").and_then(|x| x.as_str()).ok_or_else(|| miss("chain_id"))?;
+    let height = v
+        .get("pinned_at_height")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| miss("pinned_at_height"))?;
+    let unix =
+        v.get("pinned_at_unix").and_then(|x| x.as_i64()).ok_or_else(|| miss("pinned_at_unix"))?;
+    let arr = v.get("validators").and_then(|x| x.as_array()).ok_or_else(|| miss("validators"))?;
+
+    let mut validators = std::collections::HashMap::new();
+    for e in arr {
+        let valcons = e
+            .get("valcons")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "pin: validator missing valcons".to_string())?;
+        let pk_hex = e
+            .get("pubkey")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| "pin: validator missing pubkey".to_string())?;
+        let power = e
+            .get("voting_power")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "pin: validator missing voting_power".to_string())?;
+        let pk = hex::decode(pk_hex).map_err(|_| "pin: pubkey not hex".to_string())?;
+        let pubkey: [u8; 32] =
+            pk.try_into().map_err(|_| "pin: pubkey not 32 bytes".to_string())?;
+        validators.insert(
+            valcons.to_string(),
+            finality::PinnedValidator { pubkey, voting_power: power },
+        );
+    }
+    if validators.is_empty() {
+        return Err("pin: no validators".into());
+    }
+    Ok(finality::PinnedSet::new(validators, chain_id, unix, height))
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_valid_pin() {
+        let json = br#"{ "chain_id": "epix_1917-1", "pinned_at_height": 5360001,
+            "pinned_at_unix": 1790000000, "validators": [
+              { "valcons": "epixvalcons1aa", "pubkey": "aa00000000000000000000000000000000000000000000000000000000000011", "voting_power": 700000 },
+              { "valcons": "epixvalcons1bb", "pubkey": "bb00000000000000000000000000000000000000000000000000000000000022", "voting_power": 300000 } ] }"#;
+        let pin = parse_finality_pin(json).unwrap();
+        assert_eq!(pin.validators.len(), 2);
+        assert_eq!(pin.total_power, 1_000_000);
+        assert_eq!(pin.chain_id, "epix_1917-1");
+        assert_eq!(pin.pinned_at_height, 5360001);
+    }
+
+    #[test]
+    fn rejects_malformed_pins() {
+        assert!(parse_finality_pin(b"not json").is_err());
+        assert!(parse_finality_pin(br#"{"chain_id":"x","pinned_at_height":1,"pinned_at_unix":1,"validators":[]}"#).is_err());
+        // bad pubkey length
+        assert!(parse_finality_pin(br#"{"chain_id":"x","pinned_at_height":1,"pinned_at_unix":1,"validators":[{"valcons":"v","pubkey":"aa","voting_power":1}]}"#).is_err());
+    }
+}
+
 /// Set the finality policy knobs (seconds / basis points).
 pub fn set_finality_policy(skew_secs: i64, ws_period_secs: i64, min_power_bps: u32) {
     XID_SKEW_SECS.store(skew_secs, Ordering::Relaxed);
