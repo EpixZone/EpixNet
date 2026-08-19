@@ -428,16 +428,12 @@ pub fn solve_pow(record: &mut Value, pow_bits: u32) -> u64 {
 ///    and cross-epoch replay);
 /// 7. `sha256d(payload)` clears `rule.pow_bits`;
 /// 8. `sign` recovers to `author`.
-pub fn verify_pool_record(
-    record: &Value,
+/// Step 1: exactly [`ALLOWED_FIELDS`] present. The optional `rln` proof field
+/// is permitted only where the pool rule requires RLN admission.
+fn check_field_set(
+    obj: &serde_json::Map<String, Value>,
     rule: &PoolRule,
-    shard_week: i64,
-    now_ms: i64,
 ) -> Result<(), PoolError> {
-    let obj = record.as_object().ok_or(PoolError::NotObject)?;
-
-    // 1. exact field set — reject any covert extra key. The optional `rln` proof
-    //    field is permitted only where the pool rule requires RLN admission.
     for key in obj.keys() {
         if ALLOWED_FIELDS.contains(&key.as_str()) {
             continue;
@@ -447,6 +443,58 @@ pub fn verify_pool_record(
         }
         return Err(PoolError::UnknownField(key.clone()));
     }
+    Ok(())
+}
+
+/// Step 4b: a well-formed, size-bounded RLN proof blob, only where the pool
+/// requires one (a no-op otherwise).
+fn check_rln_proof(
+    obj: &serde_json::Map<String, Value>,
+    rule: &PoolRule,
+) -> Result<(), PoolError> {
+    if !rule.rln_required {
+        return Ok(());
+    }
+    let rln_b64 = obj.get("rln").and_then(|x| x.as_str()).ok_or(PoolError::MissingRlnProof)?;
+    let rln = base64::engine::general_purpose::STANDARD
+        .decode(rln_b64)
+        .map_err(|_| PoolError::BadRlnProof)?;
+    if rln.is_empty() || rln.len() > MAX_RLN_PROOF_BYTES {
+        return Err(PoolError::BadRlnProof);
+    }
+    Ok(())
+}
+
+/// Step 6: epoch↔shard binding plus the cross-epoch replay guard.
+fn check_epoch_shard(
+    epoch: i64,
+    rule: &PoolRule,
+    shard_week: i64,
+    now_ms: i64,
+) -> Result<(), PoolError> {
+    let week = week_of(epoch);
+    if epoch < 0 || week < rule.since_week {
+        return Err(PoolError::EpochBeforeStart);
+    }
+    if week != shard_week {
+        return Err(PoolError::WrongShard);
+    }
+    if epoch > epoch_now(now_ms) + 1 {
+        return Err(PoolError::EpochInFuture);
+    }
+    Ok(())
+}
+
+pub fn verify_pool_record(
+    record: &Value,
+    rule: &PoolRule,
+    shard_week: i64,
+    now_ms: i64,
+) -> Result<(), PoolError> {
+    let obj = record.as_object().ok_or(PoolError::NotObject)?;
+
+    // 1. exact field set — reject any covert extra key.
+    check_field_set(obj, rule)?;
 
     // 2. version
     let v = obj.get("v").and_then(|x| x.as_i64()).ok_or(PoolError::MissingField("v"))?;
@@ -486,15 +534,7 @@ pub fn verify_pool_record(
     //     root; here we only ensure a well-formed, size-bounded blob is present.
     //     The `rln` field is part of `record_signed_data`, so PoW and the
     //     record signature cover it like every other field.
-    if rule.rln_required {
-        let rln_b64 = obj.get("rln").and_then(|x| x.as_str()).ok_or(PoolError::MissingRlnProof)?;
-        let rln = base64::engine::general_purpose::STANDARD
-            .decode(rln_b64)
-            .map_err(|_| PoolError::BadRlnProof)?;
-        if rln.is_empty() || rln.len() > MAX_RLN_PROOF_BYTES {
-            return Err(PoolError::BadRlnProof);
-        }
-    }
+    check_rln_proof(obj, rule)?;
 
     // 5. record size cap (canonical payload + the sign field's bytes are what
     //    lands on disk; bound the whole record to keep shards predictable).
@@ -504,16 +544,7 @@ pub fn verify_pool_record(
     }
 
     // 6. epoch/shard binding
-    let week = week_of(epoch);
-    if epoch < 0 || week < rule.since_week {
-        return Err(PoolError::EpochBeforeStart);
-    }
-    if week != shard_week {
-        return Err(PoolError::WrongShard);
-    }
-    if epoch > epoch_now(now_ms) + 1 {
-        return Err(PoolError::EpochInFuture);
-    }
+    check_epoch_shard(epoch, rule, shard_week, now_ms)?;
 
     // 7. proof of work
     if !meets_pow(&payload, rule.pow_bits) {

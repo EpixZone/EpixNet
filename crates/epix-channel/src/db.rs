@@ -13,7 +13,7 @@
 
 use epix_core::{Error, Result};
 use epix_db::Database;
-use epix_envelope::{EnvelopeStore, InboundCommit, SessionMatch};
+use epix_envelope::{EnvelopeStore, InboundCommit, NewSession, SessionMatch};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
@@ -476,16 +476,9 @@ impl ChannelDb {
 
     /// Create a session and register its initial expected receive tags in one
     /// transaction. Returns the new `session_id`.
-    pub fn create_session(
-        &self,
-        identity_id: i64,
-        conv_id: &str,
-        peer_xid: Option<&str>,
-        role: &str,
-        ratchet: &[u8],
-        established_ms: i64,
-        recv_tags: &[(u32, Vec<u8>)],
-    ) -> Result<i64> {
+    pub fn create_session(&self, session: NewSession<'_>) -> Result<i64> {
+        let NewSession { identity_id, conv_id, peer_xid, role, ratchet, established_ms, recv_tags } =
+            session;
         let mut conn = self.db.conn()?;
         let tx = conn.transaction().map_err(db_err)?;
         let (ratchet_stored, enc) = self.enc_blob(ratchet);
@@ -980,19 +973,8 @@ impl EnvelopeStore for ChannelDb {
     ) -> Result<Option<i64>> {
         ChannelDb::session_id_for_leg(self, identity_id, conv_id, peer_xid)
     }
-    fn create_session(
-        &self,
-        identity_id: i64,
-        conv_id: &str,
-        peer_xid: Option<&str>,
-        role: &str,
-        ratchet: &[u8],
-        established_ms: i64,
-        recv_tags: &[(u32, Vec<u8>)],
-    ) -> Result<i64> {
-        ChannelDb::create_session(
-            self, identity_id, conv_id, peer_xid, role, ratchet, established_ms, recv_tags,
-        )
+    fn create_session(&self, session: NewSession<'_>) -> Result<i64> {
+        ChannelDb::create_session(self, session)
     }
     fn update_session_ratchet(&self, session_id: i64, ratchet: &[u8]) -> Result<()> {
         ChannelDb::update_session_ratchet(self, session_id, ratchet)
@@ -1057,7 +1039,15 @@ mod tests {
         let d = db();
         let idn = d.upsert_identity("mud.epix", "epix1mud", 0, None).unwrap();
         let sid = d
-            .create_session(idn, "cafe00", Some("dice.epix"), "resp", b"ratchet-v0", 1000, &[])
+            .create_session(NewSession {
+                identity_id: idn,
+                conv_id: "cafe00",
+                peer_xid: Some("dice.epix"),
+                role: "resp",
+                ratchet: b"ratchet-v0",
+                established_ms: 1000,
+                recv_tags: &[],
+            })
             .unwrap();
 
         let c = InboundCommit {
@@ -1115,7 +1105,17 @@ mod tests {
     fn mark_read_clears_unread_and_delete_removes_thread() {
         let d = db();
         let idn = d.upsert_identity("mud.epix", "epix1mud", 0, None).unwrap();
-        let sid = d.create_session(idn, "cx", Some("p.epix"), "resp", b"r", 1, &[]).unwrap();
+        let sid = d
+            .create_session(NewSession {
+                identity_id: idn,
+                conv_id: "cx",
+                peer_xid: Some("p.epix"),
+                role: "resp",
+                ratchet: b"r",
+                established_ms: 1,
+                recv_tags: &[],
+            })
+            .unwrap();
         d.commit_inbound(&InboundCommit {
             identity_id: idn,
             session_id: sid,
@@ -1146,7 +1146,17 @@ mod tests {
     fn set_conv_state_persists_star_and_archive_into_folders() {
         let d = db();
         let idn = d.upsert_identity("mud.epix", "epix1mud", 0, None).unwrap();
-        let sid = d.create_session(idn, "cs", Some("p.epix"), "resp", b"r", 1, &[]).unwrap();
+        let sid = d
+            .create_session(NewSession {
+                identity_id: idn,
+                conv_id: "cs",
+                peer_xid: Some("p.epix"),
+                role: "resp",
+                ratchet: b"r",
+                established_ms: 1,
+                recv_tags: &[],
+            })
+            .unwrap();
         d.commit_inbound(&InboundCommit {
             identity_id: idn,
             session_id: sid,
@@ -1223,7 +1233,17 @@ mod tests {
     fn at_rest_encryption_seals_the_ratchet_blob() {
         let d = ChannelDb::memory_encrypted([4u8; 32]).unwrap();
         let idn = d.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
-        let sid = d.create_session(idn, "cv", Some("b.epix"), "init", b"RATCHET-STATE-XYZ", 1, &[]).unwrap();
+        let sid = d
+            .create_session(NewSession {
+                identity_id: idn,
+                conv_id: "cv",
+                peer_xid: Some("b.epix"),
+                role: "init",
+                ratchet: b"RATCHET-STATE-XYZ",
+                established_ms: 1,
+                recv_tags: &[],
+            })
+            .unwrap();
         assert_eq!(d.session_ratchet(sid).unwrap(), b"RATCHET-STATE-XYZ");
 
         // The raw ratchet column is sealed. Scoped so the single in-memory
@@ -1240,7 +1260,16 @@ mod tests {
         // An advance re-seals and still decrypts, and session_for_tag decrypts too.
         d.update_session_ratchet(sid, b"RATCHET-STATE-2").unwrap();
         assert_eq!(d.session_ratchet(sid).unwrap(), b"RATCHET-STATE-2");
-        d.create_session(idn, "cv", Some("b.epix"), "init", b"RS3", 1, &[(0, vec![7u8; 32])]).unwrap();
+        d.create_session(NewSession {
+            identity_id: idn,
+            conv_id: "cv",
+            peer_xid: Some("b.epix"),
+            role: "init",
+            ratchet: b"RS3",
+            established_ms: 1,
+            recv_tags: &[(0, vec![7u8; 32])],
+        })
+        .unwrap();
         let sm = d.session_for_tag(&[7u8; 32]).unwrap().unwrap();
         assert_eq!(sm.ratchet, b"RS3");
     }

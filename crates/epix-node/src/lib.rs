@@ -1600,7 +1600,7 @@ fn walk_disk_content_json(root: &std::path::Path) -> Vec<String> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.file_name().and_then(|n| n.to_str()) == Some("content.json") {
+            } else if path.file_name().and_then(std::ffi::OsStr::to_str) == Some("content.json") {
                 if let Ok(rel) = path.strip_prefix(root) {
                     let rel = rel.to_string_lossy().replace('\\', "/");
                     if rel != "content.json" {
@@ -2592,6 +2592,27 @@ pub fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &st
     }
 }
 
+/// The shared data root: `EPIX_DATA_DIR` if set, else the `data_dir`
+/// configured in the default location's `epixnet.conf`, else the conventional
+/// per-OS application-data location (`~/Library/Application Support/EpixNet`
+/// on macOS, `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
+/// `~/.local/share/EpixNet` on Linux). Shared by the server binary and the
+/// desktop browser so they use one identity, xite set, and Tor state.
+pub fn data_root() -> PathBuf {
+    epix_ui::paths::data_root()
+}
+
+/// Open `url` in the default browser (best effort, platform-specific).
+pub fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let (cmd, args): (&str, &[&str]) = ("open", &[]);
+    #[cfg(target_os = "windows")]
+    let (cmd, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let (cmd, args): (&str, &[&str]) = ("xdg-open", &[]);
+    let _ = std::process::Command::new(cmd).args(args).arg(url).spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2850,25 +2871,4 @@ mod tests {
             Some("0.0.0.0:80")
         );
     }
-}
-
-/// The shared data root: `EPIX_DATA_DIR` if set, else the `data_dir`
-/// configured in the default location's `epixnet.conf`, else the conventional
-/// per-OS application-data location (`~/Library/Application Support/EpixNet`
-/// on macOS, `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
-/// `~/.local/share/EpixNet` on Linux). Shared by the server binary and the
-/// desktop browser so they use one identity, xite set, and Tor state.
-pub fn data_root() -> PathBuf {
-    epix_ui::paths::data_root()
-}
-
-/// Open `url` in the default browser (best effort, platform-specific).
-pub fn open_in_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let (cmd, args): (&str, &[&str]) = ("open", &[]);
-    #[cfg(target_os = "windows")]
-    let (cmd, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let (cmd, args): (&str, &[&str]) = ("xdg-open", &[]);
-    let _ = std::process::Command::new(cmd).args(args).arg(url).spawn();
 }

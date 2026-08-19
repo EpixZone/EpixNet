@@ -298,8 +298,15 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
                 let begun =
                     engine.begin_session(id_secret, &dest.bundle, conv_id).map_err(crate::indexer::eng_err)?;
                 let recv = crate::indexer::to_tag_vecs(&begun.recv_tags);
-                let sid =
-                    store.create_session(identity_id, &conv_hex, peer_xid, "init", &begun.session, now_ms, &recv)?;
+                let sid = store.create_session(crate::store::NewSession {
+                    identity_id,
+                    conv_id: &conv_hex,
+                    peer_xid,
+                    role: "init",
+                    ratchet: &begun.session,
+                    established_ms: now_ms,
+                    recv_tags: &recv,
+                })?;
                 (sid, begun.session)
             }
         };

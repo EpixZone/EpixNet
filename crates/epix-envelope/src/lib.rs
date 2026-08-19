@@ -37,4 +37,4 @@ pub use indexer::{
     new_conv_id, process_record, process_record_one, send_message, ProcessOutcome, SendResult,
 };
 pub use multislot::{send_multi, send_multi_with_rln, Dest, SLOTS};
-pub use store::{EnvelopeStore, InboundCommit, SessionMatch, TAG_LOOKAHEAD};
+pub use store::{EnvelopeStore, InboundCommit, NewSession, SessionMatch, TAG_LOOKAHEAD};

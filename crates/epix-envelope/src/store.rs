@@ -57,6 +57,18 @@ pub struct InboundCommit {
     pub new_tags: Vec<(u32, Vec<u8>)>,
 }
 
+/// Parameters for [`EnvelopeStore::create_session`], grouped so the call stays
+/// under the argument-count limit.
+pub struct NewSession<'a> {
+    pub identity_id: i64,
+    pub conv_id: &'a str,
+    pub peer_xid: Option<&'a str>,
+    pub role: &'a str,
+    pub ratchet: &'a [u8],
+    pub established_ms: i64,
+    pub recv_tags: &'a [(u32, Vec<u8>)],
+}
+
 /// A consuming app's private index. Every method is the exact surface the
 /// indexer and send path need — nothing app-specific (threads, search, folders)
 /// belongs here; those stay on the concrete store.
@@ -81,17 +93,7 @@ pub trait EnvelopeStore {
         peer_xid: &str,
     ) -> Result<Option<i64>>;
     /// Create a session and register its initial expected receive tags atomically.
-    #[allow(clippy::too_many_arguments)]
-    fn create_session(
-        &self,
-        identity_id: i64,
-        conv_id: &str,
-        peer_xid: Option<&str>,
-        role: &str,
-        ratchet: &[u8],
-        established_ms: i64,
-        recv_tags: &[(u32, Vec<u8>)],
-    ) -> Result<i64>;
+    fn create_session(&self, session: NewSession<'_>) -> Result<i64>;
     /// Persist an advanced ratchet for an existing session (own send path).
     fn update_session_ratchet(&self, session_id: i64, ratchet: &[u8]) -> Result<()>;
     /// Commit a decrypted inbound record + its session/tag updates in one tx.

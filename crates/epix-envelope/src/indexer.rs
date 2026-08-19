@@ -392,15 +392,15 @@ where
     }
 
     let recv = to_tag_vecs(&op.next_recv_tags);
-    let session_id = store.create_session(
+    let session_id = store.create_session(crate::store::NewSession {
         identity_id,
-        &conv_hex,
-        sender.as_deref(),
-        "resp",
-        &op.session_after,
-        now_ms,
-        &recv,
-    )?;
+        conv_id: &conv_hex,
+        peer_xid: sender.as_deref(),
+        role: "resp",
+        ratchet: &op.session_after,
+        established_ms: now_ms,
+        recv_tags: &recv,
+    })?;
     let commit = InboundCommit {
         identity_id,
         session_id,

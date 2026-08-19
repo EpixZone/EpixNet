@@ -567,6 +567,37 @@ pub fn open_first(
     Some((to_bytes(&s), conv, sender_xid, ik_a, payload, next))
 }
 
+/// Open an established-session record whose `tag` matched at index `n`. The
+/// trailing `u32` is the outstanding skipped-message count after opening (records
+/// known to exist but not yet received) — a delivery-gap hint for the UI.
+pub fn open(
+    session_bytes: &[u8],
+    n: u32,
+    tag: &[u8; 32],
+    ct: &[u8],
+) -> Option<(Vec<u8>, Vec<u8>, Option<String>, Vec<(u32, [u8; 32])>, u32)> {
+    let mut s = from_bytes(session_bytes)?;
+    if ct.len() < EST_HDR_BLOCK {
+        return None;
+    }
+    let hk = header_key_for(&mut s, n)?;
+    let hp = aead_open(&hk, &nonce_from("est-hdr", tag), tag, &ct[..EST_HDR_BLOCK])?;
+    if hp.len() < EST_HDR_PLAIN {
+        return None;
+    }
+    let dh = arr32(&hp[..32]);
+    let pn = u32::from_le_bytes(hp[32..36].try_into().ok()?);
+    let ns = u32::from_le_bytes(hp[36..40].try_into().ok()?);
+    let mk = ratchet_decrypt_key(&mut s, dh, pn, ns)?;
+    let (mk_key, mk_nonce) = mk_keynonce(&mk);
+    let body_plain = aead_open(&mk_key, &mk_nonce, tag, &ct[EST_HDR_BLOCK..])?;
+    let payload = unpad_payload(&body_plain)?;
+    let sender = if s.peer_xid.is_empty() { None } else { Some(s.peer_xid.clone()) };
+    let pending = s.skipped_mk.len() as u32;
+    let next = window_tags(&s.tck_recv, s.i_recv);
+    Some((to_bytes(&s), payload, sender, next, pending))
+}
+
 #[cfg(test)]
 mod prod_vectors {
     //! Known-answer vectors that pin the PRODUCTION KDF-chain call sites (not
@@ -694,35 +725,4 @@ mod prod_vectors {
         println!("EST_TAG {}", h(&t2));
         println!("EST_CT {}", h(&c2));
     }
-}
-
-/// Open an established-session record whose `tag` matched at index `n`. The
-/// trailing `u32` is the outstanding skipped-message count after opening (records
-/// known to exist but not yet received) — a delivery-gap hint for the UI.
-pub fn open(
-    session_bytes: &[u8],
-    n: u32,
-    tag: &[u8; 32],
-    ct: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>, Option<String>, Vec<(u32, [u8; 32])>, u32)> {
-    let mut s = from_bytes(session_bytes)?;
-    if ct.len() < EST_HDR_BLOCK {
-        return None;
-    }
-    let hk = header_key_for(&mut s, n)?;
-    let hp = aead_open(&hk, &nonce_from("est-hdr", tag), tag, &ct[..EST_HDR_BLOCK])?;
-    if hp.len() < EST_HDR_PLAIN {
-        return None;
-    }
-    let dh = arr32(&hp[..32]);
-    let pn = u32::from_le_bytes(hp[32..36].try_into().ok()?);
-    let ns = u32::from_le_bytes(hp[36..40].try_into().ok()?);
-    let mk = ratchet_decrypt_key(&mut s, dh, pn, ns)?;
-    let (mk_key, mk_nonce) = mk_keynonce(&mk);
-    let body_plain = aead_open(&mk_key, &mk_nonce, tag, &ct[EST_HDR_BLOCK..])?;
-    let payload = unpad_payload(&body_plain)?;
-    let sender = if s.peer_xid.is_empty() { None } else { Some(s.peer_xid.clone()) };
-    let pending = s.skipped_mk.len() as u32;
-    let next = window_tags(&s.tck_recv, s.i_recv);
-    Some((to_bytes(&s), payload, sender, next, pending))
 }

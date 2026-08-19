@@ -19,6 +19,8 @@ fn rule() -> PoolRule {
         max_record_bytes: 60000,
         max_shard_bytes: 6_000_000,
         newest_first: true,
+        rln_required: false,
+        retention_weeks: 0,
     }
 }
 

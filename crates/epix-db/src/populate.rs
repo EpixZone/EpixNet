@@ -318,7 +318,7 @@ pub fn populate_xite_filtered(
                 stack.push(path);
                 continue;
             }
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(db_dir) else { continue };

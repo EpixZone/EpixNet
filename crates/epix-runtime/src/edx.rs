@@ -4033,6 +4033,8 @@ impl EdxFetcher for RuntimeEdxFetcher {
             &work.served,
         )
         .await;
+        // Bind before returning so the lock guard drops before `work` does
+        // (returning the expression directly borrows `work` past its drop).
         let served = std::mem::take(&mut *work.served.lock().expect("signed queue"));
         served
     }
