@@ -41,7 +41,7 @@ mod membership;
 mod nullifier;
 mod pool;
 
-pub use engine::{Rln, Verified};
+pub use engine::{Rln, Slot, Verified, MAX_UNITS_PER_PROOF};
 pub use identity::{commitment_of_secret, RlnIdentity};
 pub use membership::Membership;
 pub use nullifier::{NullifierLog, Observation};
@@ -81,6 +81,8 @@ pub enum RlnError {
     InvalidProof,
     #[error("proof values are missing the nullifier or share")]
     MalformedValues,
+    #[error("proof spends {got} units but the record's size bucket requires {want}")]
+    WrongUnits { got: u32, want: u32 },
     #[error("secret recovery failed: {0}")]
     Recover(String),
 }
@@ -110,6 +112,19 @@ pub fn rate_commitment(id_commitment: Fr, user_message_limit: Fr) -> Fr {
 /// proof cannot be lifted onto a different record.
 pub fn message_signal(bytes: &[u8]) -> Fr {
     hash_to_field_le(bytes)
+}
+
+/// The allowance-unit cost of a record whose sealed `ct` is `ct_len` bytes,
+/// given the pool's smallest padding bucket. The smallest bucket costs 1 unit; a
+/// bucket k times larger costs k units (rounded up). It is deterministic, so the
+/// sender and every verifier compute the same cost from the record alone — a
+/// prover cannot under-declare a big record's cost. Pools must size their
+/// buckets so the largest costs at most [`MAX_UNITS_PER_PROOF`] units.
+pub fn bucket_weight(ct_len: usize, smallest_bucket: usize) -> u32 {
+    if smallest_bucket == 0 {
+        return 1;
+    }
+    (ct_len.div_ceil(smallest_bucket).max(1)) as u32
 }
 
 /// Hex-encode an identity commitment (its 32-byte canonical form) for the

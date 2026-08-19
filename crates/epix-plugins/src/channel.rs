@@ -442,7 +442,8 @@ impl Plugin for ChannelPlugin {
             // and load this xite's member roster. Inert unless the pool rule sets
             // rln_required and a roster is published, so it is safe to always wire.
             {
-                let rln = crate::rln::RlnAdmission::new();
+                let ledger = state.data_root_path().map(|r| r.join("private").join("rln_usage.json"));
+                let rln = crate::rln::RlnAdmission::new(ledger);
                 state.set_pool_admission(rln.clone()).await;
                 rln.refresh(&state, &xite).await;
                 // Also stash it so the send path can prove with the same gates.
@@ -885,8 +886,10 @@ impl WsCommand for ChannelSend {
                 let res = tokio::task::spawn_blocking(move || {
                     if let Some((admission, seed, addr)) = rln_c {
                         let ident = epix_rln::RlnIdentity::from_seed(&seed);
+                        // The rail computes the record's unit cost from ct and
+                        // spends a fresh unit range, refusing past the allowance.
                         let prover =
-                            |ct: &[u8], epoch: i64| admission.prove_for(&addr, &ident, epoch, 0, ct);
+                            |ct: &[u8], epoch: i64| admission.prove_for(&addr, &ident, epoch, ct);
                         epix_envelope::send_multi_with_rln(
                             db.as_ref(),
                             engine.as_ref(),

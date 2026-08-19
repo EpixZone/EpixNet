@@ -24,25 +24,25 @@ fn gate_admits_dedups_rejects_nonmember_and_evicts_double_signal() {
     // --- a non-member cannot get a record admitted ---
     let mallory = RlnIdentity::from_seed(b"mallory.epix/ecx"); // never enrolled
     let ct_m = b"mallory payload";
-    let forged = gate.prove(&mallory, 5, epoch, 0, ct_m).expect("prove (empty slot)");
+    let forged = gate.prove(&mallory, 5, epoch, 0, 1, ct_m).expect("prove (empty slot)");
     assert!(
-        matches!(gate.admit(&forged, ct_m, epoch, &[root]), Admission::Reject(_)),
+        matches!(gate.admit(&forged, ct_m, epoch, 1, &[root]), Admission::Reject(_)),
         "a non-member's proof must not verify against the membership root"
     );
 
     // --- an honest message is admitted ---
     let ct1 = b"alice payload one";
-    let p1 = gate.prove(&alice, 0, epoch, 0, ct1).expect("prove 1");
-    assert!(matches!(gate.admit(&p1, ct1, epoch, &[root]), Admission::Admit));
+    let p1 = gate.prove(&alice, 0, epoch, 0, 1, ct1).expect("prove 1");
+    assert!(matches!(gate.admit(&p1, ct1, epoch, 1, &[root]), Admission::Admit));
 
     // --- a re-broadcast of the same record is a duplicate, not a violation ---
-    assert!(matches!(gate.admit(&p1, ct1, epoch, &[root]), Admission::Duplicate));
+    assert!(matches!(gate.admit(&p1, ct1, epoch, 1, &[root]), Admission::Duplicate));
 
     // --- a second, distinct message in the same epoch is dropped (rate limit)
     //     and reveals the offender; detection alone does NOT change the root ---
     let ct2 = b"alice payload two";
-    let p2 = gate.prove(&alice, 0, epoch, 0, ct2).expect("prove 2");
-    match gate.admit(&p2, ct2, epoch, &[root]) {
+    let p2 = gate.prove(&alice, 0, epoch, 0, 1, ct2).expect("prove 2");
+    match gate.admit(&p2, ct2, epoch, 1, &[root]) {
         Admission::RateExceeded { offender_commitment } => {
             assert_eq!(offender_commitment, alice.commitment(), "reveal must identify alice");
         }

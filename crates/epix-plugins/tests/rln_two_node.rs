@@ -83,7 +83,7 @@ async fn rln_gates_records_across_two_nodes() {
     // Alice's prover: a gate built from the roster (as the node's would be).
     let alice_gate = PoolGate::from_roster(domain, RLN_LIMIT, &[alice_rln.commitment()]).unwrap();
     let prove_alice = |ct: &[u8], epoch: i64| {
-        alice_gate.prove_as(&alice_rln, epoch.max(0) as u64, 0, ct).map_err(|e| e.to_string())
+        alice_gate.prove_as(&alice_rln, epoch.max(0) as u64, 0, 1, ct).map_err(|e| e.to_string())
     };
 
     let sent = send_multi_with_rln(
@@ -99,7 +99,7 @@ async fn rln_gates_records_across_two_nodes() {
     let bob_home = tempfile::tempdir().unwrap();
     let bob_root = bob_home.path().join("data").join(XITE);
     let bob_node = node(bob_home.path(), &bob_root, &roster).await;
-    let rln = RlnAdmission::new();
+    let rln = RlnAdmission::new(None);
     bob_node.set_pool_admission(rln.clone()).await;
     rln.refresh(&bob_node, XITE).await;
 
@@ -114,7 +114,7 @@ async fn rln_gates_records_across_two_nodes() {
     let mallory_gate =
         PoolGate::from_roster(domain, RLN_LIMIT, &[mallory_rln.commitment()]).unwrap();
     let prove_mallory = |ct: &[u8], epoch: i64| {
-        mallory_gate.prove_as(&mallory_rln, epoch.max(0) as u64, 0, ct).map_err(|e| e.to_string())
+        mallory_gate.prove_as(&mallory_rln, epoch.max(0) as u64, 0, 1, ct).map_err(|e| e.to_string())
     };
     let mallory_home = tempfile::tempdir().unwrap();
     let mallory_root = mallory_home.path().join("data").join(XITE);
@@ -149,4 +149,32 @@ async fn rln_gates_records_across_two_nodes() {
     } else {
         assert!(!d_landed, "the double-signal record is dropped, not landed");
     }
+}
+
+/// The sender rail: an honest client spends its allowance and is then REFUSED,
+/// so it never reuses a unit and can never slash itself. Only a modified client
+/// that bypasses this (like `prove_alice` above, which reuses unit 0) can
+/// double-signal — and the admission side catches that.
+#[tokio::test]
+async fn sender_rail_refuses_past_the_allowance() {
+    let alice_rln = RlnIdentity::from_seed(b"alice-rln-seed");
+    let roster = vec![commitment_to_hex(&alice_rln.commitment())];
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("data").join(XITE);
+    let n = node(home.path(), &root, &roster).await;
+    let rln = RlnAdmission::new(None);
+    rln.refresh(&n, XITE).await;
+
+    let epoch = 500i64;
+    let ct = vec![0u8; 8192]; // one smallest-bucket unit
+
+    // First send in the epoch succeeds (spends the 1-unit allowance).
+    assert!(rln.prove_for(XITE, &alice_rln, epoch, &ct).is_ok(), "first send is within allowance");
+    // Second send in the SAME epoch is refused by the rail (allowance = 1 unit),
+    // so the client never produces a unit-reusing proof.
+    let second = rln.prove_for(XITE, &alice_rln, epoch, &ct);
+    assert!(second.is_err(), "the rail refuses a second unit, preventing any self-slash");
+    assert!(second.unwrap_err().contains("allowance"), "the refusal explains the limit");
+    // The next epoch has a fresh allowance.
+    assert!(rln.prove_for(XITE, &alice_rln, epoch + 1, &ct).is_ok(), "a new epoch resets the rail");
 }

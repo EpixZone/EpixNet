@@ -89,17 +89,22 @@ impl PoolGate {
     }
 
     /// Produce the RLN proof blob for one of this gate's members to attach to a
-    /// record (the send side). `ct` is the record's sealed payload — the same
-    /// bytes [`PoolGate::admit`] re-derives the signal from.
+    /// record (the send side), spending `weight` allowance units starting at
+    /// `first_unit`. `ct` is the record's sealed payload — the same bytes
+    /// [`PoolGate::admit`] re-derives the signal from. The send path chooses
+    /// `weight` from the record's size bucket and `first_unit` from the member's
+    /// local usage ledger (so a fresh unit range is spent each time).
     pub fn prove(
         &self,
         identity: &RlnIdentity,
         member_index: usize,
         epoch: u64,
-        message_id: u32,
+        first_unit: u32,
+        weight: u32,
         ct: &[u8],
     ) -> Result<Vec<u8>, RlnError> {
-        self.engine.prove(identity, &self.membership, member_index, epoch, message_id, ct)
+        self.engine
+            .prove(identity, &self.membership, member_index, epoch, first_unit, weight, ct)
     }
 
     /// Prove as `identity`, looking up its own index in this gate's roster.
@@ -109,7 +114,8 @@ impl PoolGate {
         &self,
         identity: &RlnIdentity,
         epoch: u64,
-        message_id: u32,
+        first_unit: u32,
+        weight: u32,
         ct: &[u8],
     ) -> Result<Vec<u8>, RlnError> {
         let key = fr_key(&identity.commitment())?;
@@ -117,11 +123,11 @@ impl PoolGate {
             .index_of
             .get(&key)
             .ok_or_else(|| RlnError::Membership("identity is not a member of this pool".into()))?;
-        self.prove(identity, index, epoch, message_id, ct)
+        self.prove(identity, index, epoch, first_unit, weight, ct)
     }
 
     /// Admit (or not) a record carrying `rln_proof` for `epoch`, whose bound
-    /// message is `ct` (the record's sealed payload).
+    /// message is `ct` and whose size bucket costs `weight` units.
     ///
     /// `accepted_roots` is the window of membership roots currently honored —
     /// typically the current root plus a small grace history, so a proof made
@@ -132,18 +138,20 @@ impl PoolGate {
         rln_proof: &[u8],
         ct: &[u8],
         epoch: u64,
+        weight: u32,
         accepted_roots: &[Fr],
     ) -> Admission {
-        let verified: Verified = match self.engine.verify(rln_proof, accepted_roots, epoch, ct) {
-            Ok(v) => v,
-            Err(e) => return Admission::Reject(e),
-        };
-        match self.log.observe(epoch, verified.nullifier, verified.share) {
+        let verified: Verified =
+            match self.engine.verify(rln_proof, accepted_roots, epoch, ct, weight) {
+                Ok(v) => v,
+                Err(e) => return Admission::Reject(e),
+            };
+        match self.log.observe(epoch, &verified.slots) {
             Ok(Observation::Fresh) => Admission::Admit,
             Ok(Observation::Replay) => Admission::Duplicate,
-            Ok(Observation::DoubleSignal { recovered_secret }) => {
-                Admission::RateExceeded { offender_commitment: commitment_of_secret(&recovered_secret) }
-            }
+            Ok(Observation::DoubleSignal { recovered_secret }) => Admission::RateExceeded {
+                offender_commitment: commitment_of_secret(&recovered_secret),
+            },
             Err(e) => Admission::Reject(e),
         }
     }
