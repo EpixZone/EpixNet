@@ -14,6 +14,17 @@ reason = "bincode unmaintained; migration tracked separately."
 id = "RUSTSEC-2024-0436"
 reason = "paste unmaintained (proc-macro, low risk)."
 
+# arkworks zk stack (RLN anti-spam via the vendored rln crate): the Groth16 /
+# arkworks 0.5 tree pins two crates we cannot bump without patching arkworks,
+# both build/diagnostic-time only with no runtime surface.
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0055"
+reason = "tracing-subscriber 0.2 ANSI-escape log poisoning (CVSS 2.3); pulled only by ark-relations diagnostics, never wired into our logging. ark-relations 0.5 pins tracing-subscriber 0.2, so the 0.3.20 fix is unreachable on arkworks 0.5."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0388"
+reason = "derivative unmaintained (build-time proc-macro used by ark-crypto-primitives); pinned by arkworks 0.5, no runtime surface."
+
 # Desktop system-tray stack (Linux, epix-browser only): tao/tray-icon need the
 # gtk-rs GTK3 bindings, which upstream deprecated (GTK3 is EOL). Unavoidable for
 # a cross-platform tray; the Rust desktop ecosystem (Tauri included) ignores the

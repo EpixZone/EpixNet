@@ -18,6 +18,9 @@ jobs:
   build-test:
     name: Build & test
     runs-on: ubuntu-latest
+    # A warm-cache build+test is ~5-7 min; cap well below the 6h default so a
+    # stalled runner fails fast instead of burning a 6h slot.
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -30,7 +33,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+        # `timeout` per apt call + retry: a stalled Azure apt mirror otherwise
+        # hangs the step for the full 6h job timeout (observed on this branch).
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          for i in 1 2 3; do
+            if sudo timeout 300 apt-get update && \
+               sudo timeout 300 apt-get install -y --no-install-recommends \
+                 protobuf-compiler libudev-dev pkg-config libgtk-3-dev \
+                 libayatana-appindicator3-dev libxdo-dev; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $i failed or timed out; retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt-get failed after 3 attempts"; exit 1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
@@ -61,6 +79,7 @@ jobs:
   mobile-profiles:
     name: Mobile feature profiles
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -69,7 +88,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux build deps (protoc)
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          for i in 1 2 3; do
+            if sudo timeout 300 apt-get update && \
+               sudo timeout 300 apt-get install -y --no-install-recommends protobuf-compiler pkg-config; then
+              exit 0
+            fi
+            echo "::warning::apt attempt $i failed or timed out; retrying in 15s"
+            sleep 15
+          done
+          echo "::error::apt-get failed after 3 attempts"; exit 1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
