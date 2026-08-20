@@ -114,6 +114,42 @@ pub trait ContentSyncer: Send + Sync {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>);
 }
 
+/// The update payload for [`EdxFetcher::push_update`], grouped so the call stays
+/// under the argument-count limit; `peer` and `progressed` stay separate as the
+/// routing target and the liveness flag.
+pub struct PushJob<'a> {
+    pub address: &'a str,
+    pub inner_path: &'a str,
+    pub signed: Arc<Vec<u8>>,
+    pub modified: f64,
+    pub diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+    pub sender_peers: Arc<Vec<String>>,
+}
+
+/// Where an inbound update came from: the sender's address (if any), the diffs
+/// it carried, and the peer list it advertised. Grouped for
+/// [`AppState::apply_inbound_update`].
+pub struct InboundSource {
+    pub sender: Option<PeerAddr>,
+    pub diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    pub sender_peers: Vec<PeerAddr>,
+}
+
+/// The verified-and-applied inbound update handed to `finish_inbound_update`
+/// for the post-commit sync/publish. Grouped so the (internal) call stays under
+/// the argument-count limit.
+struct FinishInbound {
+    keys: Vec<String>,
+    xite: Xite,
+    sender: Option<PeerAddr>,
+    sender_peers: Vec<PeerAddr>,
+    inner_path: String,
+    uri: String,
+    diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    child_files: Option<Vec<epix_xite::FileEntry>>,
+    root_bytes: Option<Vec<u8>>,
+}
+
 /// Fetches a file's bytes over the EDX verified-streaming path (installed by
 /// the node, which owns the EDX client stack). Kept behind a trait so the UI
 /// crate stays free of the transport/swarm dependency, like the resolvers.
@@ -211,12 +247,7 @@ pub trait EdxFetcher: Send + Sync {
     async fn push_update(
         &self,
         peer: PeerAddr,
-        address: &str,
-        inner_path: &str,
-        signed: Arc<Vec<u8>>,
-        modified: f64,
-        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-        sender_peers: Arc<Vec<String>>,
+        job: PushJob<'_>,
         progressed: Arc<AtomicBool>,
     ) -> Result<(), EdxPushError>;
 
@@ -1232,12 +1263,14 @@ async fn push_update_to_peer(
             match edx
                 .push_update(
                     peer.clone(),
-                    &address,
-                    &inner_path,
-                    body,
-                    modified,
-                    diffs,
-                    sender_peers,
+                    PushJob {
+                        address: &address,
+                        inner_path: &inner_path,
+                        signed: body,
+                        modified,
+                        diffs,
+                        sender_peers,
+                    },
                     progressed,
                 )
                 .await
@@ -11737,10 +11770,9 @@ impl AppState {
         inner_path: &str,
         body: Option<Vec<u8>>,
         modified_hint: Option<f64>,
-        sender: Option<PeerAddr>,
-        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
-        sender_peers: Vec<PeerAddr>,
+        src: InboundSource,
     ) -> Result<InboundUpdate, String> {
+        let InboundSource { sender, diffs, sender_peers } = src;
         // A xite may be served under aliases (raw address + `.epix` name); an
         // update applies to every key sharing the pushed canonical address.
         let keys: Vec<String> = {
@@ -11969,17 +12001,17 @@ impl AppState {
         let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
         tokio::spawn(async move {
             state
-                .finish_inbound_update(
+                .finish_inbound_update(FinishInbound {
                     keys,
                     xite,
                     sender,
                     sender_peers,
-                    inner,
+                    inner_path: inner,
                     uri,
                     diffs,
                     child_files,
                     root_bytes,
-                )
+                })
                 .await;
         });
         Ok(InboundUpdate::Applied)
@@ -12017,18 +12049,18 @@ impl AppState {
     /// commit the staged content.json only if every declared file is present
     /// (else defer it for retry and keep serving the previous version), and
     /// re-publish to a few peers so the update spreads.
-    async fn finish_inbound_update(
-        self: &Arc<Self>,
-        keys: Vec<String>,
-        xite: Xite,
-        sender: Option<PeerAddr>,
-        sender_peers: Vec<PeerAddr>,
-        inner_path: String,
-        uri: String,
-        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
-        child_files: Option<Vec<epix_xite::FileEntry>>,
-        root_bytes: Option<Vec<u8>>,
-    ) {
+    async fn finish_inbound_update(self: &Arc<Self>, f: FinishInbound) {
+        let FinishInbound {
+            keys,
+            xite,
+            sender,
+            sender_peers,
+            inner_path,
+            uri,
+            diffs,
+            child_files,
+            root_bytes,
+        } = f;
         let key = keys[0].clone();
         // Diff keys are relative to the pushed content.json's directory (the
         // root for a root push, the user/include dir for a child push).
@@ -16732,12 +16764,7 @@ mod tests {
             async fn push_update(
                 &self,
                 _peer: PeerAddr,
-                _address: &str,
-                _inner_path: &str,
-                _signed: Arc<Vec<u8>>,
-                _modified: f64,
-                _diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-                _sender_peers: Arc<Vec<String>>,
+                _job: PushJob<'_>,
                 progressed: Arc<AtomicBool>,
             ) -> Result<(), EdxPushError> {
                 match self.mode {
@@ -16869,12 +16896,7 @@ mod tests {
             async fn push_update(
                 &self,
                 _: PeerAddr,
-                _: &str,
-                _: &str,
-                _: Arc<Vec<u8>>,
-                _: f64,
-                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-                _: Arc<Vec<String>>,
+                _: PushJob<'_>,
                 _: Arc<AtomicBool>,
             ) -> Result<(), EdxPushError> {
                 unreachable!()
@@ -16955,9 +16977,11 @@ mod tests {
                 "content.json",
                 None,
                 None,
-                None,
-                Default::default(),
-                vec![dead.clone(), good.clone()],
+                InboundSource {
+                    sender: None,
+                    diffs: Default::default(),
+                    sender_peers: vec![dead.clone(), good.clone()],
+                },
             )
             .await
             .unwrap();
@@ -17050,9 +17074,7 @@ mod tests {
                 &format!("{user_dir}/content.json"),
                 Some(serde_json::to_vec(&c2).unwrap()),
                 None,
-                None,
-                diffs,
-                Vec::new(),
+                InboundSource { sender: None, diffs, sender_peers: Vec::new() },
             )
             .await
             .unwrap();
@@ -19311,10 +19333,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let master = {
             let s = AppState::with_data_dir("test", dir.path());
-            // Bind before returning so the read guard drops before `s` does
-            // (returning the expression directly borrows `s` past its drop).
-            let master = s.user.read().await.master_address.clone();
-            master
+            // Bind the guard so it drops before `s`; the clone is the block's
+            // value. Cloning straight off `s.user.read().await` in the tail
+            // position would hold the read borrow of `s` past its drop.
+            let user = s.user.read().await;
+            user.master_address.clone()
         };
         assert!(dir.path().join("private/users.json").exists());
         assert!(!dir.path().join("users.json").exists(), "no node files at the root");
@@ -20864,12 +20887,7 @@ mod tests {
             async fn push_update(
                 &self,
                 _: PeerAddr,
-                _: &str,
-                _: &str,
-                _: Arc<Vec<u8>>,
-                _: f64,
-                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-                _: Arc<Vec<String>>,
+                _: PushJob<'_>,
                 _: Arc<AtomicBool>,
             ) -> Result<(), EdxPushError> {
                 unreachable!()
@@ -21051,12 +21069,7 @@ mod tests {
         async fn push_update(
             &self,
             _: PeerAddr,
-            _: &str,
-            _: &str,
-            _: Arc<Vec<u8>>,
-            _: f64,
-            _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-            _: Arc<Vec<String>>,
+            _: PushJob<'_>,
             _: Arc<AtomicBool>,
         ) -> Result<(), EdxPushError> {
             unreachable!()

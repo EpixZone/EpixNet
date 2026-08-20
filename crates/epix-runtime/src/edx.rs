@@ -25,7 +25,10 @@ use epix_protocol::server::{EdxHook, InboundHook};
 use epix_protocol::HandshakeInfo;
 use epix_transport::Transport;
 use epix_ui::conn_pool::{LinkOpener, PeerLink};
-use epix_ui::state::{EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, InboundUpdate};
+use epix_ui::state::{
+    EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, InboundSource, InboundUpdate,
+    PushJob,
+};
 use epix_ui::AppState;
 
 /// The peer's EDX Hello, in the shape the diagnostics Stats page renders. Only
@@ -699,9 +702,7 @@ impl SignedProvider for AppStateProvider {
                 inner_path,
                 Some(signed.to_vec()),
                 Some(modified),
-                sender,
-                diffs,
-                sender_peers,
+                InboundSource { sender, diffs, sender_peers },
             )
             .await
         {
@@ -4033,10 +4034,11 @@ impl EdxFetcher for RuntimeEdxFetcher {
             &work.served,
         )
         .await;
-        // Bind before returning so the lock guard drops before `work` does
-        // (returning the expression directly borrows `work` past its drop).
-        let served = std::mem::take(&mut *work.served.lock().expect("signed queue"));
-        served
+        // Bind the guard so it drops before `work` does; taking straight from
+        // `work.served.lock()` in the tail position would hold that borrow of
+        // `work` past the end of the function, where `work` is already dropped.
+        let mut served = work.served.lock().expect("signed queue");
+        std::mem::take(&mut *served)
     }
 
     async fn fetch_range(
@@ -4168,14 +4170,10 @@ impl EdxFetcher for RuntimeEdxFetcher {
     async fn push_update(
         &self,
         peer: PeerAddr,
-        address: &str,
-        inner_path: &str,
-        signed: Arc<Vec<u8>>,
-        modified: f64,
-        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-        sender_peers: Arc<Vec<String>>,
+        job: PushJob<'_>,
         progressed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), EdxPushError> {
+        let PushJob { address, inner_path, signed, modified, diffs, sender_peers } = job;
         // Dial the peer as an EDX link and push the update. A dial/handshake
         // failure means the peer looks unreachable (back it off); a failure
         // after the link is up means it answered but refused (alive).
@@ -6417,12 +6415,14 @@ mod tests {
         let pushed = fetcher
             .push_update(
                 epix_core::PeerAddr::Ip(addr),
-                &xite_addr,
-                &format!("{user_dir}/content.json"),
-                Arc::new(serde_json::to_vec(&c2).unwrap()),
-                2000.0,
-                Arc::new(diffs),
-                Arc::new(Vec::new()),
+                PushJob {
+                    address: &xite_addr,
+                    inner_path: &format!("{user_dir}/content.json"),
+                    signed: Arc::new(serde_json::to_vec(&c2).unwrap()),
+                    modified: 2000.0,
+                    diffs: Arc::new(diffs),
+                    sender_peers: Arc::new(Vec::new()),
+                },
                 progressed.clone(),
             )
             .await;
