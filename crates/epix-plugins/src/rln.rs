@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use epix_rln::rln::prelude::Fr;
 use epix_rln::{bucket_weight, commitment_from_hex, message_signal, Admission, PoolGate, RlnIdentity};
@@ -82,7 +82,7 @@ impl RlnAdmission {
         let Some((limit, smallest_bucket, roster)) =
             state.content(address).await.and_then(|c| parse_rln_descriptor(&c))
         else {
-            self.pools.lock().unwrap_or_else(|e| e.into_inner()).remove(address);
+            self.pools.lock().unwrap_or_else(PoisonError::into_inner).remove(address);
             return;
         };
         let commitments: Vec<_> = roster.iter().filter_map(|h| commitment_from_hex(h)).collect();
@@ -96,7 +96,7 @@ impl RlnAdmission {
                 // Scope the (non-Send) std MutexGuard so it is released BEFORE the
                 // await below — otherwise this future would not be `Send`.
                 {
-                    let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
                     let now = std::time::Instant::now();
                     // Carry the outgoing root (superseded as of NOW) and the still-
                     // unexpired older grace roots forward, so a proof made against
@@ -150,7 +150,7 @@ impl RlnAdmission {
         ct: &[u8],
     ) -> Result<Vec<u8>, String> {
         let epoch_u = epoch.max(0) as u64;
-        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         let pool = pools.get_mut(address).ok_or("no RLN roster loaded for this pool")?;
         let weight = bucket_weight(ct.len(), pool.smallest_bucket);
         let first_unit = self.usage.reserve(address, epoch_u, weight, pool.limit).ok_or_else(
@@ -172,20 +172,20 @@ impl RlnAdmission {
     /// epoch, per-epoch unit allowance)`, if a roster is loaded. Feeds the
     /// footprint progress bar. Read-only.
     pub fn usage(&self, address: &str, epoch: u64) -> Option<(u32, u32)> {
-        let pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        let pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         let pool = pools.get(address)?;
         Some((self.usage.spent(address, epoch), pool.limit))
     }
 
     /// Whether `identity` is enrolled in `address`'s roster.
     pub fn is_member(&self, address: &str, identity: &RlnIdentity) -> bool {
-        self.pools.lock().unwrap_or_else(|e| e.into_inner()).get(address).map(|p| p.gate.is_member(identity)).unwrap_or(false)
+        self.pools.lock().unwrap_or_else(PoisonError::into_inner).get(address).map(|p| p.gate.is_member(identity)).unwrap_or(false)
     }
 }
 
 impl PoolAdmission for RlnAdmission {
     fn admit_record(&self, address: &str, rln_proof: &[u8], ct: &[u8], epoch: i64) -> bool {
-        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(pool) = pools.get_mut(address) else {
             return false; // no roster loaded for this RLN pool: fail closed
         };
@@ -263,14 +263,14 @@ impl UsageLedger {
 
     /// Units spent at `(address, epoch)` so far (read-only).
     fn spent(&self, address: &str, epoch: u64) -> u32 {
-        *self.spent.lock().unwrap_or_else(|e| e.into_inner()).get(&format!("{address}|{epoch}")).unwrap_or(&0)
+        *self.spent.lock().unwrap_or_else(PoisonError::into_inner).get(&format!("{address}|{epoch}")).unwrap_or(&0)
     }
 
     /// Reserve `weight` units at `(address, epoch)`; returns the first unit index
     /// to spend, or `None` if that would exceed `limit`.
     fn reserve(&self, address: &str, epoch: u64, weight: u32, limit: u32) -> Option<u32> {
         let key = format!("{address}|{epoch}");
-        let mut s = self.spent.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.spent.lock().unwrap_or_else(PoisonError::into_inner);
         let cur = *s.get(&key).unwrap_or(&0);
         if cur.checked_add(weight)? > limit {
             return None;
@@ -288,7 +288,7 @@ impl UsageLedger {
     /// failed to produce a record), returning the units to the epoch allowance.
     fn release(&self, address: &str, epoch: u64, weight: u32) {
         let key = format!("{address}|{epoch}");
-        let mut s = self.spent.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.spent.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(cur) = s.get(&key).copied() {
             let back = cur.saturating_sub(weight);
             if back == 0 {
