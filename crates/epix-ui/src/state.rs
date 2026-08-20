@@ -829,6 +829,13 @@ pub struct AppState {
     /// content.json and rebuilt when it changes. A derived read cache, like
     /// `feed_cache`. GENERIC — any xite may declare a `pool` (see `crate::pool`).
     pub(crate) pool_rules: RwLock<HashMap<String, Vec<epix_content::PoolRule>>>,
+    /// Per-shard locks serializing the read-merge-write cycle for one pool shard,
+    /// keyed by "address\0inner_path". A local append and a concurrent inbound
+    /// merge on the SAME shard would otherwise lose-update each other (the
+    /// content.json path is guarded by `updates_in_flight`; pool shards need their
+    /// own guard because they bypass that gate).
+    pub(crate) pool_shard_locks:
+        std::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Broadcast bus of newly-landed pool records `(address, records)`. GENERIC:
     /// any consumer (the mail indexer, or another xite's handler) subscribes via
     /// [`Self::subscribe_pool_deltas`] and filters by address. Decoupled so the
@@ -1541,6 +1548,7 @@ impl AppState {
             edx_paths: std::sync::RwLock::new(HashMap::new()),
             edx_fetcher: RwLock::new(None),
             pool_rules: RwLock::new(HashMap::new()),
+            pool_shard_locks: std::sync::Mutex::new(HashMap::new()),
             pool_events: tokio::sync::broadcast::channel(1024).0,
             pool_admission: RwLock::new(None),
             capabilities: std::sync::RwLock::new(HashMap::new()),
@@ -10089,6 +10097,15 @@ impl AppState {
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
             self.bump_modified(address, modified).await;
+            // The ROOT content.json owns the pool descriptors, so refresh the
+            // cached pool rules when it changes — otherwise an owner adding a pool
+            // or changing fanout / retention / rln_required is ignored until the
+            // node restarts (the EDX serve gate and inbound routing read this
+            // cache, and a stale rln_required=false would keep a pool on PoW-only
+            // admission).
+            if inner_path == "content.json" {
+                self.refresh_pool_rules(address).await;
+            }
         }
         // A changed dbschema.json obsoletes the built db: its maps and tables
         // no longer match what pages query, and the map ingest below cannot

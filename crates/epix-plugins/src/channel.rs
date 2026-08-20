@@ -143,7 +143,20 @@ async fn load_published_bundles(
         let Some((dir, _file)) = bundle_path_parts(&path) else { continue };
         let Some(bytes) = state.read_xite_file(xite, &path).await else { continue };
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { continue };
-        let key = norm_xid(v.get("xid").and_then(|x| x.as_str()).unwrap_or(dir));
+        // Attribute the bundle to the cert-gated directory it lives in, 
+        // NOT to its self-declared `xid` field.
+        // Only the owner of `data/users/<name>.epix/` can write there, so the
+        // directory IS the authenticated identity (publish stamps the same value
+        // into the field). Keying by the JSON field would let anyone drop a bundle
+        // carrying THEIR own `ik` under a VICTIM's name, so the transcript-bound
+        // `ik_a` check in the indexer would then match and the forgery would index
+        // as "from victim". Drop any bundle whose declared `xid` disagrees.
+        let key = norm_xid(dir);
+        if let Some(declared) = v.get("xid").and_then(|x| x.as_str()) {
+            if norm_xid(declared) != key {
+                continue;
+            }
+        }
         by_name.entry(key).or_default().push(v);
     }
     // Apply revocation per name (one chain lookup each, both cached).
@@ -253,11 +266,19 @@ async fn index_batch(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec
     // sender_xid → bundle.ik synchronously inside spawn_blocking.
     let bundles = load_published_bundles(state, &ms.xite).await;
 
-    let (events, new_session) = tokio::task::spawn_blocking(move || {
-        process_batch_blocking(&db, engine.as_ref(), &identities, &records, now, &bundles)
-    })
-    .await
-    .unwrap_or((Vec::new(), false));
+    // Serialize inbound ratchet advances against the SEND path: both do a
+    // read-modify-write of the same opaque session-ratchet blob, so without a
+    // shared lock a send could persist a ratchet computed from stale state over an
+    // inbound advance (or vice versa), desyncing the ratchet and expected-tag
+    // table. The send handler holds this same lock across its seal→persist section.
+    let (events, new_session) = {
+        let _guard = ms.send_lock.lock().await;
+        tokio::task::spawn_blocking(move || {
+            process_batch_blocking(&db, engine.as_ref(), &identities, &records, now, &bundles)
+        })
+        .await
+        .unwrap_or((Vec::new(), false))
+    };
 
     for ev in events {
         state.push_site_event(&ms.xite, "channelEvent", ev);

@@ -25,7 +25,11 @@ pub struct XidResolver {
     /// digest is global chain state, identical for every name resolved in the
     /// same moment. Caching it turns a burst of N resolves from 3N HTTP calls
     /// (proof + digest + attestations, each) into N + 2.
-    digest: RwLock<Option<(String, Instant)>>,
+    /// `(digest, cached_at, crypto_verified)`. `crypto_verified` records whether
+    /// this digest was proven by pinned-validator signatures (true) or only by the
+    /// RPC's `finalized` boolean (false), so the cryptographic path never reuses a
+    /// digest the legacy path merely RPC-trusted.
+    digest: RwLock<Option<(String, Instant, bool)>>,
 }
 
 /// How long a confirmed-finalized digest is reused. Short: the digest advances
@@ -90,6 +94,18 @@ impl XidResolver {
         let data = self
             .get_json(&format!("{}/xid/v1/resolve_with_proof/{tld}/{name}", self.rpc_url))
             .await?;
+
+        // An unregistered name comes back as a gRPC-gateway error body (no proof
+        // and no domain). Report it as NotFound — a definite, negatively-cacheable
+        // answer — rather than Malformed, which reads as a transient chain fault
+        // (re-hit every lookup) and blurs "name available" with "chain broken".
+        if data.get("proof").is_none() && data.get("domain").is_none() {
+            let code = data.get("code").and_then(|v| v.as_i64());
+            let msg = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if code == Some(5) || msg.to_lowercase().contains("not found") {
+                return Err(ChainError::NotFound(key.clone()));
+            }
+        }
 
         let proof = data
             .get("proof")
@@ -169,8 +185,10 @@ impl XidResolver {
     /// last verified digest is memoized for [`DIGEST_TTL`] since it is global chain
     /// state. Fails closed if no pin is installed.
     async fn verify_finality_gated(&self, digest: &str) -> Result<()> {
-        if let Some((d, at)) = self.digest.read().await.as_ref() {
-            if d == digest && at.elapsed() < DIGEST_TTL {
+        if let Some((d, at, crypto_verified)) = self.digest.read().await.as_ref() {
+            // Only reuse a memo that was CRYPTOGRAPHICALLY verified — a digest the
+            // legacy RPC-boolean path cached must not satisfy this gate.
+            if *crypto_verified && d == digest && at.elapsed() < DIGEST_TTL {
                 return Ok(());
             }
         }
@@ -184,7 +202,7 @@ impl XidResolver {
         let height = crate::verify_finality(&bundle, &pinned, &crate::finality_params(crate::now_unix()))
             .map_err(|e| ChainError::FinalityUnverified(format!("{e:?}")))?;
         crate::set_xid_max_height(height);
-        *self.digest.write().await = Some((digest.to_string(), Instant::now()));
+        *self.digest.write().await = Some((digest.to_string(), Instant::now(), true));
         Ok(())
     }
 
@@ -193,7 +211,9 @@ impl XidResolver {
     /// (and re-verifies finalization of) a fresh digest.
     async fn digest_matches(&self, proof_root: &str, force_fresh: bool) -> Result<bool> {
         if !force_fresh {
-            if let Some((digest, at)) = self.digest.read().await.as_ref() {
+            if let Some((digest, at, _)) = self.digest.read().await.as_ref() {
+                // The legacy path needs only RPC-level trust, so either memo kind
+                // (crypto- or RPC-verified) is acceptable here.
                 if at.elapsed() < DIGEST_TTL {
                     return Ok(digest == proof_root);
                 }
@@ -210,7 +230,7 @@ impl XidResolver {
             return Err(ChainError::NotFinalized);
         }
         let matches = attested == proof_root;
-        *self.digest.write().await = Some((attested, Instant::now()));
+        *self.digest.write().await = Some((attested, Instant::now(), false));
         Ok(matches)
     }
 

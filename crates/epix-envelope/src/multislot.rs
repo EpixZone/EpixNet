@@ -288,10 +288,16 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     let ks_buckets = [KEYSLOT_LEN];
     for dest in dests {
         let peer_xid = dest.bundle.get("xid").and_then(|v| v.as_str());
-        let existing = match peer_xid {
-            Some(p) => store.session_id_for_leg(identity_id, &conv_hex, p)?,
-            None => None,
+        // Leg key: the peer DEVICE's identity key. A recipient's multiple devices
+        // share one human `xid` but have distinct identity keys; keying the session
+        // by the device key (not the name) gives each device its own ratchet —
+        // otherwise device 2 reuses device 1's session, seals a keyslot device 2
+        // can't open, and double-advances this sender's ratchet. Read it through
+        // the engine (matches the recv side's `ik_a` and stays engine-agnostic).
+        let Some(peer_ik) = engine.sender_ik(&dest.bundle).map(hex::encode) else {
+            continue; // a bundle with no device key is unusable (already filtered)
         };
+        let existing = store.session_id_for_leg(identity_id, &conv_hex, &peer_ik)?;
         let (session_id, session_blob) = match existing {
             Some(sid) => (sid, store.session_ratchet(sid)?),
             None => {
@@ -302,6 +308,7 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
                     identity_id,
                     conv_id: &conv_hex,
                     peer_xid,
+                    peer_ik: &peer_ik,
                     role: "init",
                     ratchet: &begun.session,
                     established_ms: now_ms,

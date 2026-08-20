@@ -270,9 +270,16 @@ impl GroupSession {
         let pt = aead_open(&mk, &nonce_from(&mk), tag, ct)?;
         let v: Value = serde_json::from_slice(&pt).ok()?;
         let pending = chain.skipped.len() as u32;
+        // Attribute the message to the AUTHENTICATED chain owner it decrypted
+        // under — NEVER the payload's self-declared `f`, which a member seals on
+        // their own chain and could set to another member's name (author spoof).
+        // Reject a payload whose declared sender disagrees, as defense in depth.
+        if v.get("f").and_then(|x| x.as_str()) != Some(sender_xid) {
+            return None;
+        }
         Some(GroupOpened {
             group_id: hex::decode(v.get("g")?.as_str()?).ok()?.try_into().ok()?,
-            sender_xid: v.get("f")?.as_str()?.to_string(),
+            sender_xid: sender_xid.to_string(),
             subject: v.get("s").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             body: v.get("b").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             sent_ms: v.get("t").and_then(|x| x.as_i64()).unwrap_or(0),

@@ -76,6 +76,10 @@ pub struct AttestationEntry {
     pub valcons: String,
     pub signature: Vec<u8>,
     pub vote_extension: Vec<u8>,
+    /// The consensus round THIS extension was signed at. Usually the shared commit
+    /// round, but reproduced per-attestation so a mixed-round response can't force
+    /// the wrong round into another validator's sign bytes and drop its vote.
+    pub round: u64,
 }
 
 /// The finality bundle the client fetches for a digest. `height`/`round` are the
@@ -205,7 +209,13 @@ fn parse_vote_extension(ext: &[u8]) -> Option<(u64, i64, String)> {
             }
             (_, 2) => {
                 let (len, n) = read_uvarint(&ext[i..])?;
-                i += n + len as usize;
+                // A malicious RPC controls `len`; add with overflow checks and
+                // reject a field that claims to run past the buffer, so the cursor
+                // can never wrap and re-read the same bytes (an infinite loop).
+                i = i.checked_add(n)?.checked_add(len as usize)?;
+                if i > ext.len() {
+                    return None;
+                }
             }
             (_, 1) => i += 8,
             (_, 5) => i += 4,
@@ -228,7 +238,11 @@ pub fn verify_finality(
     if bundle.height < pinned.pinned_at_height {
         return Err(FinalityError::HeightBeforePin);
     }
-    if (params.now_unix - bundle.block_time_unix).abs() > params.skew_secs {
+    // `block_time_unix` is attacker-controlled (from the RPC); a raw subtract +
+    // `.abs()` overflows on i64::MIN (panics under overflow-checks, and in release
+    // wraps to a small value that would silently PASS this staleness gate). Use
+    // saturating arithmetic and compare magnitudes without ever calling `.abs()`.
+    if params.now_unix.saturating_sub(bundle.block_time_unix).saturating_abs() > params.skew_secs {
         return Err(FinalityError::Stale);
     }
     if bundle.height < params.max_height_seen {
@@ -260,7 +274,7 @@ pub fn verify_finality(
         let msg = canonical_vote_ext_bytes(
             &att.vote_extension,
             bundle.height as i64,
-            bundle.round as i64,
+            att.round as i64,
             &pinned.chain_id,
         );
         if vk.verify_strict(&msg, &sig).is_ok() {
@@ -327,10 +341,12 @@ pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityB
         else {
             continue;
         };
-        if let Some(r) = num_u64(a.get("round")) {
-            round = r;
-        }
-        attestations.push(AttestationEntry { valcons, signature, vote_extension });
+        // Each attestation carries (or shares) its own round; reproduce it per
+        // entry so a mixed-round response can't drop otherwise-valid votes. Fall
+        // back to the most-recently-seen round when an entry omits it.
+        let att_round = num_u64(a.get("round")).unwrap_or(round);
+        round = att_round;
+        attestations.push(AttestationEntry { valcons, signature, vote_extension, round: att_round });
     }
     Some(FinalityBundle { digest_hex: digest_hex.to_string(), height, round, block_time_unix, attestations })
 }
@@ -409,6 +425,7 @@ mod tests {
                     valcons: valcons.clone(),
                     signature: sk.sign(&msg).to_bytes().to_vec(),
                     vote_extension: ext.clone(),
+                    round,
                 }
             })
             .collect();
@@ -488,13 +505,37 @@ mod tests {
     #[test]
     fn wrong_round_breaks_signatures() {
         let (set, keys) = setup(&[1, 1, 1]);
-        // Signed at round 0, but the bundle claims round 5 -> sign-bytes differ -> all fail.
+        // Signed at round 0, but each ATTESTATION claims round 5 -> sign-bytes
+        // differ -> all fail. Round is authoritative per-attestation, so the
+        // bundle-level `round` field alone no longer changes verification.
         let mut b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, 0, BT, DIGEST);
-        b.round = 5;
+        for a in &mut b.attestations {
+            a.round = 5;
+        }
         assert!(matches!(
             verify_finality(&b, &set, &params()),
             Err(FinalityError::InsufficientPower { got: 0, .. })
         ));
+    }
+
+    #[test]
+    fn mixed_round_attestations_all_count() {
+        // Two validators signed the SAME digest/height/block_time at DIFFERENT
+        // rounds (a valid, if unusual, commit). Each attestation's own round must
+        // be used to reconstruct its sign bytes, so BOTH votes count — a single
+        // shared bundle round would have dropped the odd one out.
+        let (set, keys) = setup(&[1, 1, 1]);
+        let a0 = bundle(&set, &keys, &[0], HEIGHT, 0, BT, DIGEST).attestations.remove(0);
+        let a1 = bundle(&set, &keys, &[1], HEIGHT, 7, BT, DIGEST).attestations.remove(0);
+        let a2 = bundle(&set, &keys, &[2], HEIGHT, 3, BT, DIGEST).attestations.remove(0);
+        let b = FinalityBundle {
+            digest_hex: DIGEST.into(),
+            height: HEIGHT,
+            round: 0,
+            block_time_unix: BT,
+            attestations: vec![a0, a1, a2],
+        };
+        assert_eq!(verify_finality(&b, &set, &params()).unwrap(), HEIGHT);
     }
 
     #[test]

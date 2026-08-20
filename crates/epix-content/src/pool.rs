@@ -177,10 +177,16 @@ impl PoolRule {
             return None;
         }
         let max_record_bytes = obj.get("max_record_bytes")?.as_u64()? as usize;
-        let max_shard_bytes = obj.get("max_shard_bytes")?.as_u64()? as usize;
-        if max_record_bytes == 0 || max_shard_bytes == 0 {
+        let declared_max_shard_bytes = obj.get("max_shard_bytes")?.as_u64()? as usize;
+        if max_record_bytes == 0 || declared_max_shard_bytes == 0 {
             return None;
         }
+        // A shard bigger than the signed-object serve cap can never be fetched or
+        // union-swept (`get_signed` refuses it), so the pool would silently stop
+        // propagating. Clamp eviction to keep every shard servable, whatever the
+        // owner declared. Mirrors `epix_edx::fetch::MAX_SIGNED_BYTES` (8 MiB).
+        const MAX_SERVE_BYTES: usize = 8 << 20;
+        let max_shard_bytes = declared_max_shard_bytes.min(MAX_SERVE_BYTES);
         // Default to newest-first backfill; only an explicit "oldest_first" flips
         // it. An unknown value falls back to the default rather than failing.
         let newest_first =
@@ -316,6 +322,14 @@ pub fn parse_shard_path(rule: &PoolRule, inner_path: &str) -> Option<(i64, u16)>
     let sub_str = file.strip_suffix(".json")?;
     let sub = u16::from_str_radix(sub_str, 16).ok()?;
     if sub >= rule.fanout {
+        return None;
+    }
+    // Require the CANONICAL spelling `shard_path` emits — reject leading zeros, a
+    // '+' sign, whitespace, or uppercase hex. Otherwise unboundedly many distinct
+    // strings map to one logical shard, which defeats per-shard serialization (two
+    // spellings take different locks) and lets a peer allocate unbounded per-path
+    // state.
+    if week_str != week.to_string() || sub_str != format!("{sub:02x}") {
         return None;
     }
     Some((week, sub))
@@ -593,6 +607,7 @@ pub fn merge_pool(
     inbound: &Value,
     rule: &PoolRule,
     shard_week: i64,
+    shard_sub: u16,
     now_ms: i64,
 ) -> (Value, Vec<Value>) {
     use std::collections::BTreeMap;
@@ -603,6 +618,20 @@ pub fn merge_pool(
     let mut by_sign: BTreeMap<String, Value> = BTreeMap::new();
     for r in pool_records_of(local).into_iter().chain(pool_records_of(inbound)) {
         if verify_pool_record(&r, rule, shard_week, now_ms).is_err() {
+            continue;
+        }
+        // Bind the record to this shard's SUB-index too. `verify_pool_record`
+        // binds only the week; without this an attacker could copy valid records
+        // from OTHER subs (no fresh PoW needed) into one shard, inflate it past
+        // `max_shard_bytes`, and force eviction of the genuine records addressed
+        // to that sub. A record only ever belongs in `shard_sub(tag, fanout)`.
+        let routed_here = r
+            .get("tag")
+            .and_then(|t| t.as_str())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .map(|t| crate::pool::shard_sub(&t, rule.fanout) == shard_sub)
+            .unwrap_or(false);
+        if !routed_here {
             continue;
         }
         let sig = sign_of(&r).to_string();
@@ -678,6 +707,37 @@ mod tests {
             "v": 1,
             "epoch": epoch,
             "tag": tag_b64(tag_seed),
+            "ct": ct_b64(ct_len, ct_fill),
+            "pow": 0,
+            "author": author,
+        });
+        solve_pow(&mut rec, 8);
+        let sig = epix_crypt::sign(&record_signed_data(&rec), &pk).unwrap();
+        rec["sign"] = json!(sig);
+        rec
+    }
+
+    // A 32-byte tag whose FIRST byte fixes the shard sub-index, the rest varied by
+    // `variant` so several records can share one sub yet stay distinct.
+    fn tag_b64_at(sub: u8, variant: u8) -> String {
+        let mut t = [0u8; 32];
+        t[0] = sub;
+        for (i, b) in t.iter_mut().enumerate().skip(1) {
+            *b = variant.wrapping_add(i as u8);
+        }
+        base64::engine::general_purpose::STANDARD.encode(t)
+    }
+
+    /// A valid record routed to shard sub `sub` (via its tag's first byte),
+    /// distinct per `variant`. Mirrors [`valid_record`] but pins the sub so a set
+    /// of records can legitimately share one shard.
+    fn valid_record_at(epoch: i64, sub: u8, variant: u8, ct_len: usize, ct_fill: u8) -> Value {
+        let pk = epix_crypt::new_seed();
+        let author = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let mut rec = json!({
+            "v": 1,
+            "epoch": epoch,
+            "tag": tag_b64_at(sub, variant),
             "ct": ct_b64(ct_len, ct_fill),
             "pow": 0,
             "author": author,
@@ -1032,21 +1092,22 @@ mod tests {
         let epoch = 100;
         let week = week_of(epoch);
         let now = now_for(epoch);
-        let a = valid_record(epoch, 1, 128, 1);
-        let b = valid_record(epoch, 2, 128, 2);
+        let sub = 3u16;
+        let a = valid_record_at(epoch, sub as u8, 1, 128, 1);
+        let b = valid_record_at(epoch, sub as u8, 2, 128, 2);
 
         let local = make_pool_container(vec![a.clone()]);
         let inbound = make_pool_container(vec![b.clone()]);
 
-        let (ab, delta_ab) = merge_pool(&local, &inbound, &r, week, now);
-        let (ba, _) = merge_pool(&inbound, &local, &r, week, now);
+        let (ab, delta_ab) = merge_pool(&local, &inbound, &r, week, sub, now);
+        let (ba, _) = merge_pool(&inbound, &local, &r, week, sub, now);
         assert_eq!(ab, ba, "commutative");
         // delta is exactly what's new to `local` (record b).
         assert_eq!(delta_ab.len(), 1);
         assert_eq!(sign_of(&delta_ab[0]), sign_of(&b));
 
         // idempotent: merging the same inbound again yields no new delta.
-        let (ab2, delta2) = merge_pool(&ab, &inbound, &r, week, now);
+        let (ab2, delta2) = merge_pool(&ab, &inbound, &r, week, sub, now);
         assert_eq!(ab2, ab, "idempotent");
         assert!(delta2.is_empty(), "no new records the second time");
     }
@@ -1057,10 +1118,10 @@ mod tests {
         let epoch = 100;
         let week = week_of(epoch);
         let now = now_for(epoch);
-        let keep = valid_record(epoch, 1, 128, 1);
+        let keep = valid_record_at(epoch, 3, 1, 128, 1);
         let local = make_pool_container(vec![keep.clone()]);
         let blank = make_pool_container(vec![]);
-        let (merged, delta) = merge_pool(&local, &blank, &r, week, now);
+        let (merged, delta) = merge_pool(&local, &blank, &r, week, 3, now);
         assert_eq!(pool_records_of(&merged).len(), 1, "blank inbound removes nothing");
         assert!(delta.is_empty());
     }
@@ -1071,14 +1132,15 @@ mod tests {
         let epoch = 100;
         let week = week_of(epoch);
         let now = now_for(epoch);
-        let good = valid_record(epoch, 1, 128, 1);
+        let good = valid_record_at(epoch, 3, 1, 128, 1);
 
         // An under-powered record (solved for 0 bits only; likely < 8 leading
-        // zero bits) that also carries a valid self-signature.
+        // zero bits) that also carries a valid self-signature. Same sub as `good`
+        // so this test isolates the PoW check, not the sub-index binding.
         let pk = epix_crypt::new_seed();
         let author = epix_crypt::privatekey_to_address(&pk).unwrap();
         let mut weak = json!({
-            "v": 1, "epoch": epoch, "tag": tag_b64(9), "ct": ct_b64(128, 5),
+            "v": 1, "epoch": epoch, "tag": tag_b64_at(3, 9), "ct": ct_b64(128, 5),
             "pow": 0, "author": author,
         });
         // do NOT solve pow; sign as-is
@@ -1091,6 +1153,7 @@ mod tests {
             &make_pool_container(vec![weak]),
             &r,
             week,
+            3,
             now,
         );
         let expected = if weak_fails { 1 } else { 2 };
@@ -1105,17 +1168,18 @@ mod tests {
         let epoch = 100;
         let week = week_of(epoch);
         let now = now_for(epoch);
-        let recs: Vec<Value> = (0..6).map(|i| valid_record(epoch, i as u8 + 1, 64, i as u8)).collect();
+        let recs: Vec<Value> =
+            (0..6).map(|i| valid_record_at(epoch, 3, i as u8 + 1, 64, i as u8)).collect();
 
         // Merge in two different orders; survivors must match byte-for-byte.
         let mut c1 = make_pool_container(vec![]);
         for rec in &recs {
-            let (m, _) = merge_pool(&c1, &make_pool_container(vec![rec.clone()]), &r, week, now);
+            let (m, _) = merge_pool(&c1, &make_pool_container(vec![rec.clone()]), &r, week, 3, now);
             c1 = m;
         }
         let mut c2 = make_pool_container(vec![]);
         for rec in recs.iter().rev() {
-            let (m, _) = merge_pool(&c2, &make_pool_container(vec![rec.clone()]), &r, week, now);
+            let (m, _) = merge_pool(&c2, &make_pool_container(vec![rec.clone()]), &r, week, 3, now);
             c2 = m;
         }
         assert_eq!(c1, c2, "eviction converges regardless of arrival order");
@@ -1127,23 +1191,49 @@ mod tests {
     fn records_sorted_by_epoch_then_tag_not_arrival() {
         let r = rule();
         let now = now_for(102);
-        // three records across two epochs, inserted out of order
-        let e1 = valid_record(100, 5, 64, 1);
-        let e2 = valid_record(100, 1, 64, 2);
-        let e3 = valid_record(101, 3, 64, 3);
+        // three records across two epochs (same week, same sub), inserted out of order
+        let e1 = valid_record_at(100, 3, 5, 64, 1);
+        let e2 = valid_record_at(100, 3, 1, 64, 2);
+        let e3 = valid_record_at(101, 3, 3, 64, 3);
         let (merged, _) = {
             let mut c = make_pool_container(vec![]);
             for rec in [e3.clone(), e1.clone(), e2.clone()] {
-                let (m, _) = merge_pool(&c, &make_pool_container(vec![rec]), &r, week_of(100), now);
+                let (m, _) = merge_pool(&c, &make_pool_container(vec![rec]), &r, week_of(100), 3, now);
                 c = m;
             }
             (c, ())
         };
         let out = pool_records_of(&merged);
-        // epoch ascending; within epoch 100, tag ascending (seed 1 < seed 5).
+        // epoch ascending; within epoch 100, tag ascending (variant 1 < variant 5).
         let epochs: Vec<i64> = out.iter().map(epoch_of).collect();
         let mut sorted = epochs.clone();
         sorted.sort();
         assert_eq!(epochs, sorted, "on-disk order is by epoch, not arrival");
+    }
+
+    #[test]
+    fn merge_drops_records_for_the_wrong_sub() {
+        let r = rule(); // fanout 16
+        let epoch = 100;
+        let week = week_of(epoch);
+        let now = now_for(epoch);
+        // A perfectly valid record whose tag routes to sub 5.
+        let rec = valid_record_at(epoch, 5, 1, 64, 1);
+        let tag = base64::engine::general_purpose::STANDARD
+            .decode(rec["tag"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(shard_sub(&tag, r.fanout), 5);
+
+        // Merged into sub 5 it is admitted...
+        let (into5, _) =
+            merge_pool(&make_pool_container(vec![]), &make_pool_container(vec![rec.clone()]), &r, week, 5, now);
+        assert_eq!(pool_records_of(&into5).len(), 1, "record for sub 5 lands in sub 5");
+
+        // ...but merged into a DIFFERENT sub it is rejected — no cross-sub piling,
+        // even though the record is otherwise valid (real PoW + signature).
+        let (into6, delta6) =
+            merge_pool(&make_pool_container(vec![]), &make_pool_container(vec![rec]), &r, week, 6, now);
+        assert!(pool_records_of(&into6).is_empty(), "record for sub 5 must not land in sub 6");
+        assert!(delta6.is_empty());
     }
 }

@@ -32,12 +32,18 @@ CREATE TABLE IF NOT EXISTS session (
     identity_id   INTEGER NOT NULL REFERENCES identity(identity_id),
     conv_id       TEXT NOT NULL,
     peer_xid      TEXT,
+    -- The peer DEVICE's identity key (leg key). One human `peer_xid` may have
+    -- several devices, each a distinct pairwise ratchet, so the leg is keyed by
+    -- the device key, NOT the human name. NOT NULL (a device always has an ik;
+    -- '' only for legacy pre-v3 rows) so the UNIQUE below actually fires — SQLite
+    -- treats NULLs as distinct, which previously let NULL-peer sessions duplicate.
+    peer_ik       TEXT NOT NULL DEFAULT '',
     role          TEXT NOT NULL,
     ratchet       BLOB NOT NULL,
     enc           INTEGER NOT NULL DEFAULT 0,
     established_ms INTEGER NOT NULL,
-    -- One pairwise session PER peer in a (possibly group) conversation.
-    UNIQUE(identity_id, conv_id, peer_xid));
+    -- One pairwise session PER peer DEVICE in a (possibly group) conversation.
+    UNIQUE(identity_id, conv_id, peer_ik));
 
 CREATE TABLE IF NOT EXISTS expected_tag (
     tag           BLOB PRIMARY KEY NOT NULL,
@@ -158,8 +164,9 @@ impl ChannelDb {
 
     /// Bump on any change that a pre-existing db must be MIGRATED for (not just a
     /// new `CREATE TABLE IF NOT EXISTS`). v2 = per-identity idempotency on `msg`
-    /// (drop the record-wide `sign_h UNIQUE`) + `processed`.
-    const SCHEMA_VERSION: i64 = 2;
+    /// (drop the record-wide `sign_h UNIQUE`) + `processed`. v3 = per-DEVICE
+    /// sessions (`session.peer_ik` leg key; UNIQUE moved off the human `peer_xid`).
+    const SCHEMA_VERSION: i64 = 3;
 
     fn open_inner(db: Database, enc_key: Option<[u8; 32]>) -> Result<Self> {
         let me = Self { db, enc_key };
@@ -167,6 +174,9 @@ impl ChannelDb {
         me.db.execute_batch(SCHEMA)?; // creates anything missing (fresh db → done)
         if prior < 2 {
             me.migrate_to_v2()?; // rebuild the two tables whose constraints changed
+        }
+        if prior < 3 {
+            me.migrate_to_v3()?; // rebuild session for the per-device leg key
         }
         me.set_user_version(Self::SCHEMA_VERSION)?;
         Ok(me)
@@ -243,6 +253,54 @@ impl ChannelDb {
         )
         .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Migrate a v2 db to v3: give `session` a `peer_ik` leg column and move its
+    /// UNIQUE off the human `peer_xid` onto `(identity_id, conv_id, peer_ik)`, so a
+    /// peer's multiple devices get distinct pairwise ratchets instead of colliding.
+    ///
+    /// Legacy v2 sessions are DROPPED rather than migrated: their leg was keyed by
+    /// the human name, but every live path now keys by the device identity key
+    /// (`hex(ik)`), and no legacy row carries that key. Migrating them with a
+    /// name-derived `peer_ik` would leave every pre-v3 session unreachable by
+    /// `session_id_for_leg` — a continued conversation would fork a new session on
+    /// the next reply, orphan the old row, and fire a spurious first-contact event.
+    /// A clean drop makes conversations re-establish via a single X3DH handshake.
+    /// (channels.db is new in this release cycle, so this only touches dev data.)
+    fn migrate_to_v3(&self) -> Result<()> {
+        let mut conn = self.db.conn()?;
+        // Both toggles must be set OUTSIDE a transaction. `foreign_keys=OFF` lets us
+        // drop the `session` table that `expected_tag` references; `legacy_alter_table
+        // =ON` stops SQLite's "smart rename" from rewriting `expected_tag`'s FK to
+        // the temp name. Recipe: create the new table under a temp name, DROP the
+        // old, RENAME the new into place, then clear `expected_tag` (its rows point
+        // at the now-gone legacy sessions).
+        conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
+            .map_err(db_err)?;
+        let tx = conn.transaction().map_err(db_err)?;
+        tx.execute_batch(
+            "\
+            CREATE TABLE session_v3 (
+                session_id    INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                identity_id   INTEGER NOT NULL REFERENCES identity(identity_id),
+                conv_id       TEXT NOT NULL,
+                peer_xid      TEXT,
+                peer_ik       TEXT NOT NULL DEFAULT '',
+                role          TEXT NOT NULL,
+                ratchet       BLOB NOT NULL,
+                enc           INTEGER NOT NULL DEFAULT 0,
+                established_ms INTEGER NOT NULL,
+                UNIQUE(identity_id, conv_id, peer_ik));
+            DROP TABLE session;
+            ALTER TABLE session_v3 RENAME TO session;
+            DELETE FROM expected_tag;
+            ",
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)?;
+        conn.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -477,23 +535,31 @@ impl ChannelDb {
     /// Create a session and register its initial expected receive tags in one
     /// transaction. Returns the new `session_id`.
     pub fn create_session(&self, session: NewSession<'_>) -> Result<i64> {
-        let NewSession { identity_id, conv_id, peer_xid, role, ratchet, established_ms, recv_tags } =
-            session;
+        let NewSession {
+            identity_id,
+            conv_id,
+            peer_xid,
+            peer_ik,
+            role,
+            ratchet,
+            established_ms,
+            recv_tags,
+        } = session;
         let mut conn = self.db.conn()?;
         let tx = conn.transaction().map_err(db_err)?;
         let (ratchet_stored, enc) = self.enc_blob(ratchet);
         tx.execute(
-            "INSERT INTO session (identity_id, conv_id, peer_xid, role, ratchet, enc, established_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(identity_id, conv_id, peer_xid)
-               DO UPDATE SET ratchet=excluded.ratchet, enc=excluded.enc",
-            rusqlite::params![identity_id, conv_id, peer_xid, role, ratchet_stored, enc, established_ms],
+            "INSERT INTO session (identity_id, conv_id, peer_xid, peer_ik, role, ratchet, enc, established_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(identity_id, conv_id, peer_ik)
+               DO UPDATE SET ratchet=excluded.ratchet, enc=excluded.enc, peer_xid=excluded.peer_xid",
+            rusqlite::params![identity_id, conv_id, peer_xid, peer_ik, role, ratchet_stored, enc, established_ms],
         )
         .map_err(db_err)?;
         let session_id: i64 = tx
             .query_row(
-                "SELECT session_id FROM session WHERE identity_id=? AND conv_id=? AND peer_xid IS ?",
-                rusqlite::params![identity_id, conv_id, peer_xid],
+                "SELECT session_id FROM session WHERE identity_id=? AND conv_id=? AND peer_ik=?",
+                rusqlite::params![identity_id, conv_id, peer_ik],
                 |r| r.get(0),
             )
             .map_err(db_err)?;
@@ -520,18 +586,18 @@ impl ChannelDb {
         Ok(())
     }
 
-    /// Look up an existing session id for one leg `(identity, conv, peer)`.
+    /// Look up an existing session id for one leg `(identity, conv, peer_ik)`.
     pub fn session_id_for_leg(
         &self,
         identity_id: i64,
         conv_id: &str,
-        peer_xid: &str,
+        peer_ik: &str,
     ) -> Result<Option<i64>> {
         let conn = self.db.conn()?;
         let r = conn
             .query_row(
-                "SELECT session_id FROM session WHERE identity_id=? AND conv_id=? AND peer_xid=?",
-                rusqlite::params![identity_id, conv_id, peer_xid],
+                "SELECT session_id FROM session WHERE identity_id=? AND conv_id=? AND peer_ik=?",
+                rusqlite::params![identity_id, conv_id, peer_ik],
                 |row| row.get::<_, i64>(0),
             )
             .ok();
@@ -694,10 +760,14 @@ impl ChannelDb {
     ) -> Result<bool> {
         let mut conn = self.db.conn()?;
         let tx = conn.transaction().map_err(db_err)?;
+        // Idempotency is PER IDENTITY (matching `UNIQUE(sign_h, identity_id)` and
+        // `commit_inbound`): the same source message legitimately imports once per
+        // local identity, so scoping the dedup to this identity avoids silently
+        // dropping a second identity's own copy.
         let dup: i64 = tx
             .query_row(
-                "SELECT COUNT(*) FROM msg WHERE sign_h=?1",
-                rusqlite::params![dedup_h],
+                "SELECT COUNT(*) FROM msg WHERE sign_h=?1 AND identity_id=?2",
+                rusqlite::params![dedup_h, identity_id],
                 |r| r.get(0),
             )
             .map_err(db_err)?;
@@ -969,9 +1039,9 @@ impl EnvelopeStore for ChannelDb {
         &self,
         identity_id: i64,
         conv_id: &str,
-        peer_xid: &str,
+        peer_ik: &str,
     ) -> Result<Option<i64>> {
-        ChannelDb::session_id_for_leg(self, identity_id, conv_id, peer_xid)
+        ChannelDb::session_id_for_leg(self, identity_id, conv_id, peer_ik)
     }
     fn create_session(&self, session: NewSession<'_>) -> Result<i64> {
         ChannelDb::create_session(self, session)
@@ -1043,6 +1113,7 @@ mod tests {
                 identity_id: idn,
                 conv_id: "cafe00",
                 peer_xid: Some("dice.epix"),
+                peer_ik: "ik-dice",
                 role: "resp",
                 ratchet: b"ratchet-v0",
                 established_ms: 1000,
@@ -1110,6 +1181,7 @@ mod tests {
                 identity_id: idn,
                 conv_id: "cx",
                 peer_xid: Some("p.epix"),
+                peer_ik: "ik-p",
                 role: "resp",
                 ratchet: b"r",
                 established_ms: 1,
@@ -1151,6 +1223,7 @@ mod tests {
                 identity_id: idn,
                 conv_id: "cs",
                 peer_xid: Some("p.epix"),
+                peer_ik: "ik-p",
                 role: "resp",
                 ratchet: b"r",
                 established_ms: 1,
@@ -1238,6 +1311,7 @@ mod tests {
                 identity_id: idn,
                 conv_id: "cv",
                 peer_xid: Some("b.epix"),
+                peer_ik: "ik-b",
                 role: "init",
                 ratchet: b"RATCHET-STATE-XYZ",
                 established_ms: 1,
@@ -1264,6 +1338,7 @@ mod tests {
             identity_id: idn,
             conv_id: "cv",
             peer_xid: Some("b.epix"),
+            peer_ik: "ik-b",
             role: "init",
             ratchet: b"RS3",
             established_ms: 1,
@@ -1305,9 +1380,9 @@ mod tests {
             .unwrap();
         }
 
-        // Opening via ChannelDb runs the v1→v2 migration.
+        // Opening via ChannelDb runs the v1→v2→v3 migrations.
         let d = ChannelDb::open(&path).unwrap();
-        assert_eq!(d.user_version().unwrap(), 2, "migrated to v2");
+        assert_eq!(d.user_version().unwrap(), 3, "migrated to latest schema");
 
         // The v1 message survived the msg-table rebuild, FTS included.
         let msgs = d.messages(1, "abcd").unwrap();

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use epix_rln::rln::prelude::Fr;
 use epix_rln::{bucket_weight, commitment_from_hex, message_signal, Admission, PoolGate, RlnIdentity};
 use epix_ui::pool::PoolAdmission;
 use epix_ui::state::AppState;
@@ -27,6 +28,25 @@ use serde_json::Value;
 /// path can reach the same gates the ingest path uses).
 pub const RLN_CAP: &str = "rln_admission";
 
+/// How many superseded membership roots stay honored after a roster change. A
+/// proof made against a root that was current moments before a member add/remove
+/// (or a peer a version behind) is still valid; without this grace window such a
+/// proof is dropped fail-closed and, since pool records are immutable, is lost
+/// forever, so the pool never converges across nodes with roster-version skew.
+const GRACE_ROOTS: usize = 2;
+
+/// How long a superseded root stays honored. The grace MUST be bounded by TIME,
+/// not just by count: with a count-only window a removed member stays admissible
+/// until two FURTHER roster edits occur, so in a low-churn pool removal would
+/// never take effect. This is long enough for content.json + an in-flight proof
+/// to propagate, but short enough that an owner-removed abuser is cut off quickly.
+const GRACE_ROOT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Epochs of nullifier history the double-signal log retains (day-bucketed → ~a
+/// week of active shards). Older epochs can never collide with a fresh nullifier
+/// (the external nullifier binds the epoch), so forgetting them is safe.
+const NULLIFIER_RETAIN_EPOCHS: i64 = 8;
+
 /// One pool's admission state: the roster gate, plus the config the weight
 /// calculation and the send rail need.
 struct Pool {
@@ -35,6 +55,10 @@ struct Pool {
     smallest_bucket: usize,
     /// Per-epoch allowance in units.
     limit: u32,
+    /// Recently-superseded roots still honored (grace window), each paired with
+    /// the instant it was superseded; expired past [`GRACE_ROOT_TTL`]. Most-recent
+    /// first, NOT including the gate's current root.
+    recent_roots: Vec<(Fr, std::time::Instant)>,
 }
 
 /// Node-side RLN admission using owner-signed rosters, one gate per pool, plus
@@ -58,7 +82,7 @@ impl RlnAdmission {
         let Some((limit, smallest_bucket, roster)) =
             state.content(address).await.and_then(|c| parse_rln_descriptor(&c))
         else {
-            self.pools.lock().unwrap().remove(address);
+            self.pools.lock().unwrap_or_else(|e| e.into_inner()).remove(address);
             return;
         };
         let commitments: Vec<_> = roster.iter().filter_map(|h| commitment_from_hex(h)).collect();
@@ -68,10 +92,39 @@ impl RlnAdmission {
         let domain = message_signal(address.as_bytes());
         match PoolGate::from_roster(domain, limit, &commitments) {
             Ok(gate) => {
-                self.pools
-                    .lock()
-                    .unwrap()
-                    .insert(address.to_string(), Pool { gate, smallest_bucket, limit });
+                let new_root = gate.root();
+                // Scope the (non-Send) std MutexGuard so it is released BEFORE the
+                // await below — otherwise this future would not be `Send`.
+                {
+                    let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
+                    let now = std::time::Instant::now();
+                    // Carry the outgoing root (superseded as of NOW) and the still-
+                    // unexpired older grace roots forward, so a proof made against
+                    // the just-superseded roster still verifies for GRACE_ROOT_TTL.
+                    let mut recent: Vec<(Fr, std::time::Instant)> = Vec::new();
+                    if let Some(prev) = pools.get(address) {
+                        recent.push((prev.gate.root(), now));
+                        recent.extend(
+                            prev.recent_roots
+                                .iter()
+                                .copied()
+                                .filter(|(_, ts)| now.duration_since(*ts) < GRACE_ROOT_TTL),
+                        );
+                    }
+                    recent.retain(|(r, _)| *r != new_root);
+                    // Dedup by root (tiny vec), keeping the newest timestamp.
+                    let mut recent_roots: Vec<(Fr, std::time::Instant)> = Vec::new();
+                    for (r, ts) in recent {
+                        if !recent_roots.iter().any(|(er, _)| *er == r) {
+                            recent_roots.push((r, ts));
+                        }
+                    }
+                    recent_roots.truncate(GRACE_ROOTS);
+                    pools.insert(
+                        address.to_string(),
+                        Pool { gate, smallest_bucket, limit, recent_roots },
+                    );
+                }
                 state
                     .log("INFO", format!("RLN: loaded {} members for {address}", commitments.len()))
                     .await;
@@ -97,43 +150,69 @@ impl RlnAdmission {
         ct: &[u8],
     ) -> Result<Vec<u8>, String> {
         let epoch_u = epoch.max(0) as u64;
-        let mut pools = self.pools.lock().unwrap();
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         let pool = pools.get_mut(address).ok_or("no RLN roster loaded for this pool")?;
         let weight = bucket_weight(ct.len(), pool.smallest_bucket);
         let first_unit = self.usage.reserve(address, epoch_u, weight, pool.limit).ok_or_else(
             || format!("epoch allowance exhausted ({} units); wait for the next window", pool.limit),
         )?;
-        pool.gate
-            .prove_as(identity, epoch_u, first_unit, weight, ct)
-            .map_err(|e| e.to_string())
+        // Roll the reservation back if proof generation fails, so a transient error
+        // (or a non-member reaching here) never permanently burns epoch allowance
+        // for a record that was never produced.
+        match pool.gate.prove_as(identity, epoch_u, first_unit, weight, ct) {
+            Ok(proof) => Ok(proof),
+            Err(e) => {
+                self.usage.release(address, epoch_u, weight);
+                Err(e.to_string())
+            }
+        }
     }
 
     /// This node's RLN footprint for `address` at `epoch`: `(units spent this
     /// epoch, per-epoch unit allowance)`, if a roster is loaded. Feeds the
     /// footprint progress bar. Read-only.
     pub fn usage(&self, address: &str, epoch: u64) -> Option<(u32, u32)> {
-        let pools = self.pools.lock().unwrap();
+        let pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         let pool = pools.get(address)?;
         Some((self.usage.spent(address, epoch), pool.limit))
     }
 
     /// Whether `identity` is enrolled in `address`'s roster.
     pub fn is_member(&self, address: &str, identity: &RlnIdentity) -> bool {
-        self.pools.lock().unwrap().get(address).map(|p| p.gate.is_member(identity)).unwrap_or(false)
+        self.pools.lock().unwrap_or_else(|e| e.into_inner()).get(address).map(|p| p.gate.is_member(identity)).unwrap_or(false)
     }
 }
 
 impl PoolAdmission for RlnAdmission {
     fn admit_record(&self, address: &str, rln_proof: &[u8], ct: &[u8], epoch: i64) -> bool {
-        let mut pools = self.pools.lock().unwrap();
+        let mut pools = self.pools.lock().unwrap_or_else(|e| e.into_inner());
         let Some(pool) = pools.get_mut(address) else {
             return false; // no roster loaded for this RLN pool: fail closed
         };
+        // Bound the in-memory nullifier log. Prune by the record's epoch CLAMPED
+        // to the local clock: clamping to `now_epoch` stops an attacker's
+        // future-dated `epoch` (unverified here — merge_pool checks it later) from
+        // pushing the cutoff forward and wiping live nullifiers (re-enabling
+        // replay), while using the epoch actually being admitted avoids
+        // over-pruning when the node processes an older epoch.
+        let now_epoch = epix_content::pool::epoch_now(epix_core::time::now_ms());
+        let prune_epoch = epoch.min(now_epoch);
+        let cutoff = prune_epoch.saturating_sub(NULLIFIER_RETAIN_EPOCHS).max(0) as u64;
+        pool.gate.prune_before(cutoff);
         // The record's cost is its size bucket, computed from ct alone, so a
         // prover cannot under-declare it.
         let weight = bucket_weight(ct.len(), pool.smallest_bucket);
-        let root = pool.gate.root();
-        matches!(pool.gate.admit(rln_proof, ct, epoch.max(0) as u64, weight, &[root]), Admission::Admit)
+        // Honor the current root plus a small, TIME-bounded grace window of
+        // superseded roots, so a proof made against the roster just before a member
+        // add/remove (or by a peer a content.json version behind) is still
+        // admitted. Drop expired grace roots first, so an owner-removed member is
+        // cut off once GRACE_ROOT_TTL elapses even if no further roster edit occurs.
+        let now = std::time::Instant::now();
+        pool.recent_roots.retain(|(_, ts)| now.duration_since(*ts) < GRACE_ROOT_TTL);
+        let mut roots = Vec::with_capacity(1 + pool.recent_roots.len());
+        roots.push(pool.gate.root());
+        roots.extend(pool.recent_roots.iter().map(|(r, _)| *r));
+        matches!(pool.gate.admit(rln_proof, ct, epoch.max(0) as u64, weight, &roots), Admission::Admit)
     }
 }
 
@@ -184,27 +263,60 @@ impl UsageLedger {
 
     /// Units spent at `(address, epoch)` so far (read-only).
     fn spent(&self, address: &str, epoch: u64) -> u32 {
-        *self.spent.lock().unwrap().get(&format!("{address}|{epoch}")).unwrap_or(&0)
+        *self.spent.lock().unwrap_or_else(|e| e.into_inner()).get(&format!("{address}|{epoch}")).unwrap_or(&0)
     }
 
     /// Reserve `weight` units at `(address, epoch)`; returns the first unit index
     /// to spend, or `None` if that would exceed `limit`.
     fn reserve(&self, address: &str, epoch: u64, weight: u32, limit: u32) -> Option<u32> {
         let key = format!("{address}|{epoch}");
-        let mut s = self.spent.lock().unwrap();
+        let mut s = self.spent.lock().unwrap_or_else(|e| e.into_inner());
         let cur = *s.get(&key).unwrap_or(&0);
         if cur.checked_add(weight)? > limit {
             return None;
         }
         s.insert(key, cur + weight);
-        if let Some(p) = &self.path {
+        // Bound the ledger: past epochs can never be spent against again (the
+        // external nullifier binds the epoch), so drop cursors older than the
+        // retention window instead of accumulating one key per epoch forever.
+        prune_old_epochs(&mut s, epoch);
+        Self::persist(&self.path, &s);
+        Some(cur)
+    }
+
+    /// Undo a `reserve` for `(address, epoch)` (a send that reserved but then
+    /// failed to produce a record), returning the units to the epoch allowance.
+    fn release(&self, address: &str, epoch: u64, weight: u32) {
+        let key = format!("{address}|{epoch}");
+        let mut s = self.spent.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cur) = s.get(&key).copied() {
+            let back = cur.saturating_sub(weight);
+            if back == 0 {
+                s.remove(&key);
+            } else {
+                s.insert(key, back);
+            }
+            Self::persist(&self.path, &s);
+        }
+    }
+
+    fn persist(path: &Option<PathBuf>, s: &HashMap<String, u32>) {
+        if let Some(p) = path {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Ok(bytes) = serde_json::to_vec(&*s) {
+            if let Ok(bytes) = serde_json::to_vec(s) {
                 let _ = std::fs::write(p, bytes);
             }
         }
-        Some(cur)
     }
+}
+
+/// Epochs of usage history to retain (day-bucketed epochs → ~a month).
+const USAGE_RETAIN_EPOCHS: u64 = 32;
+
+/// Drop `(address|epoch)` cursors whose epoch is older than the retention window.
+fn prune_old_epochs(s: &mut HashMap<String, u32>, current_epoch: u64) {
+    let cutoff = current_epoch.saturating_sub(USAGE_RETAIN_EPOCHS);
+    s.retain(|k, _| k.rsplit_once('|').and_then(|(_, e)| e.parse::<u64>().ok()).map_or(true, |e| e >= cutoff));
 }

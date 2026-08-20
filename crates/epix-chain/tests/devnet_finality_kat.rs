@@ -33,6 +33,7 @@ fn bundle() -> FinalityBundle {
             valcons: "epixvalcons1j74cjk4r9aqq34kmyft6rffgn4mrhdwwzunqvu".into(),
             signature: hex::decode(SIG).unwrap(),
             vote_extension: hex::decode(VOTE_EXT).unwrap(),
+            round: 0,
         }],
     }
 }
@@ -54,7 +55,11 @@ fn live_devnet_consensus_key_bundle_verifies() {
     let bad_pin = PinnedSet::new(bad, "epix_1916-1", 1786831098, 0);
     assert!(verify_finality(&bundle(), &bad_pin, &params()).is_err());
 
-    // Wrong round -> different CanonicalVoteExtension -> signature fails.
-    let mut b = bundle(); b.round = 999;
+    // Wrong round -> different CanonicalVoteExtension -> signature fails. Round is
+    // authoritative per-attestation now, so tamper the attestation's round.
+    let mut b = bundle();
+    for a in &mut b.attestations {
+        a.round = 999;
+    }
     assert!(verify_finality(&b, &pinned(), &params()).is_err());
 }

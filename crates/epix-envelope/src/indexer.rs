@@ -280,8 +280,12 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
     let Some(bp) = crate::multislot::open_shared_body(&k_msg, &body_hash, body_ct) else {
         return Ok(None);
     };
-    // Established sender is the verified session peer (fall back to the body's).
-    let sender = sm.peer_xid.clone().or(Some(bp.sender_xid.clone()));
+    // Established sender is the cryptographically-verified session peer. A matched
+    // tag + successful ratchet open prove this record came from that peer, so the
+    // attribution is `sm.peer_xid` — NEVER the attacker-controllable body
+    // `sender_xid`. If the session has no recorded peer name (an edge case), leave
+    // the sender unattributed rather than trust the body.
+    let sender = sm.peer_xid.clone();
     let commit = InboundCommit {
         identity_id: sm.identity_id,
         session_id: sm.session_id,
@@ -353,29 +357,35 @@ where
 
     // M1 anti-spoof: the body carries an attacker-controlled `sender_xid`, but the
     // keyslot carries a transcript-bound `ik_a`. Trust the attribution ONLY if the
-    // sender's PUBLISHED bundle proves it owns that identity key.
-    if let Some(ik_a) = op.ik_a.as_ref() {
-        // Authentic iff the transcript key matches ANY of the sender's published
-        // device bundles (a multi-device sender may seal from any linked key).
-        let matches = resolve_bundle(&bp.sender_xid)
-            .iter()
-            .any(|b| engine.sender_ik(b).as_ref() == Some(ik_a));
-        if !matches {
-            // No matching bundle: either a forgery, or a genuine message from a
-            // device whose bundle this node has not synced YET. We cannot tell
-            // the two apart from the transcript alone, so DEFER by returning `None`
-            // (this slot didn't deliver) — NOT `Some(NoMatch)`, which would abort
-            // scanning the record's OTHER slots. The record is left unprocessed by
-            // process_record if nothing else delivers, so a real message becomes
-            // indexable once that device's bundle syncs, while a forgery is simply
-            // re-probed (a bounded, PoW-gated cost) and never trusted. The IK
-            // never matches for a forgery, so it can never be indexed.
-            return Ok(None);
-        }
+    // sender's PUBLISHED bundle proves it owns that identity key. FAIL CLOSED: an
+    // engine that yields no `ik_a` cannot authenticate the sender, so the free-text
+    // `sender_xid` must NOT be trusted — defer exactly like an unverifiable match.
+    let Some(ik_a) = op.ik_a.as_ref() else {
+        return Ok(None);
+    };
+    // Authentic iff the transcript key matches ANY of the sender's published
+    // device bundles (a multi-device sender may seal from any linked key).
+    let matches = resolve_bundle(&bp.sender_xid)
+        .iter()
+        .any(|b| engine.sender_ik(b).as_ref() == Some(ik_a));
+    if !matches {
+        // No matching bundle: either a forgery, or a genuine message from a
+        // device whose bundle this node has not synced YET. We cannot tell the
+        // two apart from the transcript alone, so DEFER by returning `None` (this
+        // slot didn't deliver) — NOT `Some(NoMatch)`, which would abort scanning
+        // the record's OTHER slots. The record is left unprocessed by
+        // process_record if nothing else delivers, so a real message becomes
+        // indexable once that device's bundle syncs, while a forgery is simply
+        // re-probed (a bounded, PoW-gated cost) and never trusted. The IK never
+        // matches for a forgery, so it can never be indexed.
+        return Ok(None);
     }
 
     let sender = Some(bp.sender_xid.clone());
     let conv_hex = hex::encode(op.conv_id);
+    // Leg key: the sender DEVICE's transcript-bound identity key, so two devices
+    // of one human sender get separate ratchets and never collide on the name.
+    let peer_ik = hex::encode(ik_a);
 
     // Re-wrap dedup: a first-contact-openable record for a conversation leg that
     // ALREADY has a session is a re-opener — a send retry, or a second opener that
@@ -384,9 +394,7 @@ where
     // session here would fork the ratchet and double-index the opener. Drop it
     // idempotently: mark it processed for this identity so it is not re-probed on
     // every rescan, and report no new message.
-    if !bp.sender_xid.is_empty()
-        && store.session_id_for_leg(identity_id, &conv_hex, &bp.sender_xid)?.is_some()
-    {
+    if store.session_id_for_leg(identity_id, &conv_hex, &peer_ik)?.is_some() {
         store.mark_processed(h, identity_id)?;
         return Ok(Some(ProcessOutcome::AlreadyProcessed));
     }
@@ -396,6 +404,7 @@ where
         identity_id,
         conv_id: &conv_hex,
         peer_xid: sender.as_deref(),
+        peer_ik: &peer_ik,
         role: "resp",
         ratchet: &op.session_after,
         established_ms: now_ms,

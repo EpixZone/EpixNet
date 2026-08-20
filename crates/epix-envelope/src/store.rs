@@ -62,7 +62,12 @@ pub struct InboundCommit {
 pub struct NewSession<'a> {
     pub identity_id: i64,
     pub conv_id: &'a str,
+    /// Human identity of the peer, for display (may be shared across devices).
     pub peer_xid: Option<&'a str>,
+    /// The peer DEVICE's identity key (leg key). Distinguishes a peer's multiple
+    /// devices so each gets its own ratchet; must be stable per device and
+    /// non-empty (use the device's `ik`, hex/base64-encoded).
+    pub peer_ik: &'a str,
     pub role: &'a str,
     pub ratchet: &'a [u8],
     pub established_ms: i64,
@@ -83,14 +88,14 @@ pub trait EnvelopeStore {
     fn session_for_tag(&self, tag: &[u8]) -> Result<Option<SessionMatch>>;
     /// The raw ratchet blob of a session.
     fn session_ratchet(&self, session_id: i64) -> Result<Vec<u8>>;
-    /// An existing session id for one leg `(identity, conv, peer)`, if any. A
-    /// group conversation has one pairwise session PER peer, so the peer is part
-    /// of the key.
+    /// An existing session id for one leg `(identity, conv, peer_ik)`, if any. A
+    /// conversation has one pairwise session PER peer DEVICE, so the device's
+    /// identity key (not the shared human name) is the leg key.
     fn session_id_for_leg(
         &self,
         identity_id: i64,
         conv_id: &str,
-        peer_xid: &str,
+        peer_ik: &str,
     ) -> Result<Option<i64>>;
     /// Create a session and register its initial expected receive tags atomically.
     fn create_session(&self, session: NewSession<'_>) -> Result<i64>;

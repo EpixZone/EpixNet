@@ -182,13 +182,14 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Channels", "channel_enabled", "Enable metadata-private channels", "false", "bool"),
     ("Channels", "channel_xite", "Channel xite address", "", "text"),
     ("Channels", "channel_backfill_weeks", "Weeks of channel history to backfill (0 = all)", "4", "text"),
-    ("Channels", "channel_pow_threads", "Threads for channel proof-of-work", "1", "text"),
     ("Channels", "channel_send_jitter_max_secs", "Max random send delay (metadata privacy)", "0", "text"),
     ("Channels", "channel_burst_jitter_max_secs", "Max per-record gap for >8-recipient sends (metadata privacy)", "60", "text"),
-    ("Channels", "channel_encrypt_at_rest", "Encrypt the local channel index at rest", "true", "bool"),
     ("Channels", "channel_feed_snippets", "Show message snippets in the dashboard feed", "false", "bool"),
     // Seal message content + ratchet state at rest under a seed-derived key.
-    // Trade-off: full-text search falls back to a slower decrypt-then-scan.
+    // Trade-off: full-text search falls back to a slower decrypt-then-scan. The
+    // default here MUST match the code default in the channel plugin
+    // (`config_bool("channel_encrypt_at_rest", false)`) so the UI never advertises
+    // a state the node does not actually use.
     ("Channels", "channel_encrypt_at_rest", "Encrypt the private channel index at rest", "false", "bool"),
     // Test/dev only: run mail on the INSECURE FakeEngine when no secure engine
     // is compiled in. Never enable for real mail — it provides no confidentiality.

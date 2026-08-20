@@ -65,6 +65,27 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()
 }
 
+/// Keep only the records in a pool container whose tag routes to shard `sub`.
+fn filter_container_to_sub(container: Value, rule: &PoolRule, sub: u16) -> Value {
+    let kept: Vec<Value> = container
+        .get(pool::POOL_RECORDS_KEY)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|rec| {
+                    rec.get("tag")
+                        .and_then(|t| t.as_str())
+                        .and_then(b64_decode)
+                        .map(|t| pool::shard_sub(&t, rule.fanout) == sub)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    pool::make_pool_container(kept)
+}
+
 impl AppState {
     // --- descriptors ------------------------------------------------------
 
@@ -91,11 +112,39 @@ impl AppState {
         pool::is_under_pool_dir(&self.pool_rules_for(address).await, inner_path)
     }
 
+    /// The lock serializing one shard's read-merge-write cycle (created on first
+    /// use), so a local append and a concurrent inbound merge on the same shard
+    /// cannot clobber each other's records.
+    fn pool_shard_lock(&self, address: &str, inner_path: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("{address}\0{inner_path}");
+        let mut locks = self.pool_shard_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+
+    /// Drop a shard's lock-map entry once no task holds it, so the map cannot grow
+    /// without bound as different shard paths are touched. The caller MUST have
+    /// dropped its own guard and `Arc` clone first; the map mutex serializes this
+    /// against [`Self::pool_shard_lock`], so an entry is removed only when the map
+    /// is its sole owner (`strong_count == 1`) — no live holder can be stranded.
+    fn release_pool_shard_lock(&self, address: &str, inner_path: &str) {
+        let key = format!("{address}\0{inner_path}");
+        let mut locks = self.pool_shard_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(arc) = locks.get(&key) {
+            if Arc::strong_count(arc) == 1 {
+                locks.remove(&key);
+            }
+        }
+    }
+
     /// The pool rule (and its shard week) governing a shard path, if any.
-    async fn pool_rule_for_path(&self, address: &str, inner_path: &str) -> Option<(PoolRule, i64)> {
+    async fn pool_rule_for_path(
+        &self,
+        address: &str,
+        inner_path: &str,
+    ) -> Option<(PoolRule, i64, u16)> {
         for rule in self.pool_rules_for(address).await {
-            if let Some((week, _sub)) = pool::parse_shard_path(&rule, inner_path) {
-                return Some((rule, week));
+            if let Some((week, sub)) = pool::parse_shard_path(&rule, inner_path) {
+                return Some((rule, week, sub));
             }
         }
         None
@@ -122,7 +171,13 @@ impl AppState {
     /// [`PoolAdmission`] hook accepts. If none is installed for this RLN pool,
     /// keep nothing (fail closed) — an unverified record must never be merged
     /// into a shard we store and serve.
-    async fn filter_rln_admitted(&self, address: &str, container: Value) -> Value {
+    async fn filter_rln_admitted(
+        &self,
+        address: &str,
+        rule: &PoolRule,
+        week: i64,
+        container: Value,
+    ) -> Value {
         let Some(admission) = self.pool_admission.read().await.clone() else {
             return pool::make_pool_container(vec![]);
         };
@@ -131,21 +186,40 @@ impl AppState {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let kept: Vec<Value> = records
-            .into_iter()
-            .filter(|rec| {
-                match (
-                    rec.get("rln").and_then(|v| v.as_str()).and_then(b64_decode),
-                    rec.get("ct").and_then(|v| v.as_str()).and_then(b64_decode),
-                    rec.get("epoch").and_then(|v| v.as_i64()),
-                ) {
-                    (Some(rln), Some(ct), Some(epoch)) => {
-                        admission.admit_record(address, &rln, &ct, epoch)
+        let address = address.to_string();
+        let rule = rule.clone();
+        let now = now_ms();
+        // RLN verification is a CPU-bound Groth16 check; run the whole batch on the
+        // blocking pool so it never stalls an async reactor thread. Each record must
+        // pass FULL verification (self-signature, PoW, 32-byte tag, ct bucket,
+        // epoch↔week binding) BEFORE the nullifier-burning `admit_record`: admitting
+        // an otherwise-invalid record (e.g. one with only a corrupted `sign`, which
+        // `record_signed_data` strips so PoW still passes) would burn the GENUINE
+        // record's RLN nullifier — which `merge_pool` then drops — permanently
+        // denying delivery of the real message. This also gates the SNARK verify
+        // behind cheap checks, blunting ingest DoS amplification.
+        let kept = tokio::task::spawn_blocking(move || {
+            records
+                .into_iter()
+                .filter(|rec| {
+                    if pool::verify_pool_record(rec, &rule, week, now).is_err() {
+                        return false;
                     }
-                    _ => false,
-                }
-            })
-            .collect();
+                    match (
+                        rec.get("rln").and_then(|v| v.as_str()).and_then(b64_decode),
+                        rec.get("ct").and_then(|v| v.as_str()).and_then(b64_decode),
+                        rec.get("epoch").and_then(|v| v.as_i64()),
+                    ) {
+                        (Some(rln), Some(ct), Some(epoch)) => {
+                            admission.admit_record(&address, &rln, &ct, epoch)
+                        }
+                        _ => false,
+                    }
+                })
+                .collect::<Vec<Value>>()
+        })
+        .await
+        .unwrap_or_default();
         pool::make_pool_container(kept)
     }
 
@@ -176,19 +250,38 @@ impl AppState {
             record.get("epoch").and_then(|v| v.as_i64()).ok_or("pool record missing epoch")?;
         let shard = pool::shard_path(&rule, epoch, &tag);
 
+        // Serialize the read-merge-write against a concurrent inbound merge on the
+        // same shard, or the just-appended record could be clobbered before the
+        // spawned publish re-reads the shard (and the recipient never gets it).
+        // Fetch storage before the lock so the critical section holds no `?`
+        // early-exit that would skip the lock-map cleanup below.
         let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
-        let existing = storage
-            .read(&shard)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .unwrap_or_else(|| pool::make_pool_container(vec![]));
-        let incoming = pool::make_pool_container(vec![record]);
-        let (merged, delta) =
-            pool::merge_pool(&existing, &incoming, &rule, pool::week_of(epoch), now_ms());
-        storage.write(&shard, &serde_json::to_vec(&merged).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let shard_lock = self.pool_shard_lock(address, &shard);
+        let outcome: Result<Vec<Value>, String> = {
+            let _guard = shard_lock.lock().await;
+            let existing = storage
+                .read(&shard)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .unwrap_or_else(|| pool::make_pool_container(vec![]));
+            let incoming = pool::make_pool_container(vec![record]);
+            let (merged, delta) = pool::merge_pool(
+                &existing,
+                &incoming,
+                &rule,
+                pool::week_of(epoch),
+                pool::shard_sub(&tag, rule.fanout),
+                now_ms(),
+            );
+            serde_json::to_vec(&merged)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| storage.write(&shard, &bytes).map_err(|e| e.to_string()))
+                .map(|_| delta)
+        };
+        drop(shard_lock);
+        self.release_pool_shard_lock(address, &shard);
 
-        self.emit_pool_delta(address, delta);
+        self.emit_pool_delta(address, outcome?);
 
         let this = self.clone();
         let addr = address.to_string();
@@ -213,32 +306,66 @@ impl AppState {
         inner_path: &str,
         signed: &[u8],
     ) -> Result<bool, String> {
-        let (rule, week) =
+        let (rule, week, sub) =
             self.pool_rule_for_path(address, inner_path).await.ok_or("not a pool shard")?;
+        // Reject shards for weeks beyond the current one: no valid record can
+        // target a future epoch (verify_pool_record rejects them), so accepting
+        // arbitrary future weeks would only let a peer allocate per-shard state.
+        let current_week = pool::week_of(pool::epoch_now(now_ms()));
+        if week > current_week + 1 {
+            return Ok(false);
+        }
         let incoming: Value =
             serde_json::from_slice(signed).map_err(|e| format!("pool shard not JSON: {e}"))?;
+
+        // Bind the incoming records to THIS shard's sub-index FIRST — before any
+        // nullifier-mutating RLN admission. A record whose tag routes to a
+        // different sub does not belong in this shard, and letting it reach
+        // `admit_record` would BURN its RLN nullifier (poisoning the genuine copy
+        // destined for the correct sub) even though `merge_pool` would then drop
+        // it. `merge_pool` re-checks the sub as defense in depth.
+        let incoming = filter_container_to_sub(incoming, &rule, sub);
 
         // Anonymous rate-limiting: for an RLN pool, drop any inbound record whose
         // proof does not verify (and let the verifier track nullifiers / evict
         // double-signallers) BEFORE it is merged into the shard we store & serve.
         let incoming = if rule.rln_required {
-            self.filter_rln_admitted(address, incoming).await
+            self.filter_rln_admitted(address, &rule, week, incoming).await
         } else {
             incoming
         };
 
+        // Fetch storage before taking the shard lock so the read-merge-write
+        // critical section holds no `?` early-exit that would skip lock cleanup.
         let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
-        let existing = storage
-            .read(inner_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .unwrap_or_else(|| pool::make_pool_container(vec![]));
-        let (merged, delta) = pool::merge_pool(&existing, &incoming, &rule, week, now_ms());
+
+        // Serialize the read-merge-write against a concurrent local append or
+        // another inbound merge on the same shard (see `pool_shard_lock`).
+        let shard_lock = self.pool_shard_lock(address, inner_path);
+        let outcome: Result<Vec<Value>, String> = {
+            let _guard = shard_lock.lock().await;
+            let existing = storage
+                .read(inner_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .unwrap_or_else(|| pool::make_pool_container(vec![]));
+            let (merged, delta) = pool::merge_pool(&existing, &incoming, &rule, week, sub, now_ms());
+            if delta.is_empty() {
+                Ok(Vec::new())
+            } else {
+                serde_json::to_vec(&merged)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| storage.write(inner_path, &bytes).map_err(|e| e.to_string()))
+                    .map(|_| delta)
+            }
+        };
+        drop(shard_lock);
+        self.release_pool_shard_lock(address, inner_path);
+
+        let delta = outcome?;
         if delta.is_empty() {
             return Ok(false);
         }
-        storage.write(inner_path, &serde_json::to_vec(&merged).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
 
         self.emit_pool_delta(address, delta);
 

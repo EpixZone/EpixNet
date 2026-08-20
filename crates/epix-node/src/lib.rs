@@ -2138,7 +2138,16 @@ async fn serve(
                         .await
                 }
                 Err(e) => {
-                    state.log("ERROR", format!("xID finality pin {}: {e}", pin_path.display())).await
+                    // A pin file is PRESENT but invalid — the operator intended to
+                    // require client-side finality, so fail CLOSED (abort startup)
+                    // rather than silently downgrade to RPC-trusted resolution,
+                    // which is exactly the rogue-RPC attack the pin defends against.
+                    let msg = format!(
+                        "xID finality pin {} is present but invalid: {e}. Refusing to start with finality verification disabled; fix or remove the file to proceed.",
+                        pin_path.display()
+                    );
+                    state.log("ERROR", msg.clone()).await;
+                    return Err(msg);
                 }
             },
             Err(_) => {
