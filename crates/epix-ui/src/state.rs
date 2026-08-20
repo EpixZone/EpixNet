@@ -12071,98 +12071,11 @@ impl AppState {
         // bad/mismatched diff is ignored - the file just gets downloaded below.
         // `arrived` collects every file this update landed (patched here,
         // downloaded below) for the db ingest at the end.
-        let mut arrived: Vec<String> = Vec::new();
-        if !diffs.is_empty() {
-            for (file_path, actions) in &diffs {
-                let full = format!("{diff_dir}{file_path}");
-                let info = match &child_files {
-                    Some(list) => list.iter().find(|f| f.inner_path == full).cloned(),
-                    None => xite.file_info(&full),
-                };
-                let Some(info) = info else { continue };
-                if xite.storage.verify(&full, &info.sha512) {
-                    continue; // already current
-                }
-                let Ok(old) = xite.storage.read(&full) else { continue };
-                let Ok(new) = epix_content::patch(&old, actions) else { continue };
-                if XiteStorage::hash_bytes(&new) == info.sha512
-                    && xite.storage.write(&full, &new).is_ok()
-                {
-                    arrived.push(full);
-                }
-            }
-            if !arrived.is_empty() {
-                self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
-            }
-        }
-        if self.transport.read().await.is_some() {
-            let mut peers = self.connectable_peers(&key, 10).await;
-            let nets = self.dialable_networks().await;
-            // Prefer fetching from the sender - it definitely has the files
-            // it just announced - but only if its address is dialable (an
-            // inbound-only peer, e.g. `ip:0`, would just waste a worker).
-            // Screened the same way the advertised addresses below are: the
-            // sender is caller-supplied, so a peer that names our own address
-            // or an undialable network must not get a worker slot either.
-            if let Some(s) = sender {
-                if nets.can_dial(&s)
-                    && epix_peer::Peer::new(s.clone(), 0).is_connectable()
-                    && !self.is_own_peer(&s).await
-                    && !peers.contains(&s)
-                {
-                    peers.insert(0, s);
-                }
-            }
-            // Even before the sender's wire address: the addresses the
-            // publisher SAYS it is dialable at (onion/i2p/open clearnet).
-            // For a NAT'd publisher these are the only routes to the new
-            // files. Own addresses are dropped (a lone seeder must not dial
-            // itself) and so are networks we cannot dial right now.
-            for sp in sender_peers.into_iter().rev() {
-                if nets.can_dial(&sp)
-                    && epix_peer::Peer::new(sp.clone(), 0).is_connectable()
-                    && !self.is_own_peer(&sp).await
-                    && !peers.contains(&sp)
-                {
-                    peers.insert(0, sp);
-                }
-            }
-            // The files to fetch: for a root push, whatever the new root
-            // declares and we lack; for a child push, the child's declared
-            // files that are missing or stale.
-            let needed: Vec<epix_xite::FileEntry> = match &child_files {
-                Some(list) => list
-                    .iter()
-                    .filter(|f| !xite.storage.verify(&f.inner_path, &f.sha512))
-                    .cloned()
-                    .collect(),
-                None => xite.files_needed(),
-            };
-            if !needed.is_empty() && !peers.is_empty() {
-                let needed_paths: Vec<String> =
-                    needed.iter().map(|f| f.inner_path.clone()).collect();
-                // EDX-only over the reused session (staged content's b3 is
-                // authoritative pre-commit). A file with no `b3` does not
-                // arrive; only the files EDX landed are reported for db ingest.
-                let missed =
-                    self.edx_first(&key, needed, peers.clone(), xite.content.as_ref(), None).await;
-                let missed: std::collections::HashSet<&String> =
-                    missed.iter().map(|f| &f.inner_path).collect();
-                arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
-            }
-        }
+        let mut arrived =
+            self.apply_inbound_diffs(&xite, &child_files, &diff_dir, &diffs, &key).await;
+        self.fetch_pushed_files(&key, &xite, sender, sender_peers, &child_files, &mut arrived).await;
         if child_files.is_some() {
-            // Child data files (user posts) feed the db per file, so open
-            // pages see them without a full rebuild - the downloaded files
-            // AND the diff-patched ones. A patched file never enters the
-            // download list (it already verifies against the new hash), so
-            // ingesting only downloads left a pushed post on disk but
-            // invisible to queries until a restart rebuilt the db.
-            for path in &arrived {
-                if xite.storage.exists(path) {
-                    self.ingest_file_from(&key, path, None).await;
-                }
-            }
+            self.ingest_arrived_child_files(&key, &xite, &arrived).await;
         }
 
         // Root push: commit the staged content.json (write to disk + adopt for
@@ -12202,6 +12115,144 @@ impl AppState {
                 self.push_xite_info_event(k, "updated").await;
             }
         }
+    }
+
+    /// Patch our old copy of each diffed file and keep it only if the result
+    /// matches the new content.json's declared hash. A bad/mismatched diff is
+    /// ignored - the file just gets downloaded by [`Self::fetch_pushed_files`].
+    /// Returns the files this step landed (for the db ingest at the end).
+    async fn apply_inbound_diffs(
+        self: &Arc<Self>,
+        xite: &Xite,
+        child_files: &Option<Vec<epix_xite::FileEntry>>,
+        diff_dir: &str,
+        diffs: &HashMap<String, Vec<epix_content::DiffAction>>,
+        key: &str,
+    ) -> Vec<String> {
+        let mut arrived: Vec<String> = Vec::new();
+        if diffs.is_empty() {
+            return arrived;
+        }
+        for (file_path, actions) in diffs {
+            let full = format!("{diff_dir}{file_path}");
+            let info = match child_files {
+                Some(list) => list.iter().find(|f| f.inner_path == full).cloned(),
+                None => xite.file_info(&full),
+            };
+            let Some(info) = info else { continue };
+            if Self::patch_file_to_new_hash(xite, &full, &info.sha512, actions) {
+                arrived.push(full);
+            }
+        }
+        if !arrived.is_empty() {
+            self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
+        }
+        arrived
+    }
+
+    /// Patch our stored `full` from `actions` and keep it only if the result
+    /// matches `expected`. Returns whether the patched file landed - a file that
+    /// already verifies, or any bad/mismatched diff, is a no-op (`false`).
+    fn patch_file_to_new_hash(
+        xite: &Xite,
+        full: &str,
+        expected: &str,
+        actions: &[epix_content::DiffAction],
+    ) -> bool {
+        if xite.storage.verify(full, expected) {
+            return false; // already current
+        }
+        let Ok(old) = xite.storage.read(full) else { return false };
+        let Ok(new) = epix_content::patch(&old, actions) else { return false };
+        XiteStorage::hash_bytes(&new) == expected && xite.storage.write(full, &new).is_ok()
+    }
+
+    /// Fetch the files a push declared that we still lack, over the reused EDX
+    /// session, preferring the sender and the addresses it advertised. Extends
+    /// `arrived` with the files that landed. No-op without a transport.
+    async fn fetch_pushed_files(
+        self: &Arc<Self>,
+        key: &str,
+        xite: &Xite,
+        sender: Option<PeerAddr>,
+        sender_peers: Vec<PeerAddr>,
+        child_files: &Option<Vec<epix_xite::FileEntry>>,
+        arrived: &mut Vec<String>,
+    ) {
+        if self.transport.read().await.is_none() {
+            return;
+        }
+        let mut peers = self.connectable_peers(key, 10).await;
+        let nets = self.dialable_networks().await;
+        // Prefer fetching from the sender - it definitely has the files it just
+        // announced - but only if its address is dialable (an inbound-only peer,
+        // e.g. `ip:0`, would just waste a worker). The sender is caller-supplied,
+        // so it is screened exactly like the advertised addresses below.
+        if let Some(s) = sender {
+            if self.dialable_fresh_peer(&s, &nets, &peers).await {
+                peers.insert(0, s);
+            }
+        }
+        // Even before the sender's wire address: the addresses the publisher
+        // SAYS it is dialable at (onion/i2p/open clearnet). For a NAT'd
+        // publisher these are the only routes to the new files. Own addresses
+        // are dropped (a lone seeder must not dial itself) and so are networks
+        // we cannot dial right now.
+        for sp in sender_peers.into_iter().rev() {
+            if self.dialable_fresh_peer(&sp, &nets, &peers).await {
+                peers.insert(0, sp);
+            }
+        }
+        // The files to fetch: for a root push, whatever the new root declares
+        // and we lack; for a child push, the child's declared files that are
+        // missing or stale.
+        let needed: Vec<epix_xite::FileEntry> = match child_files {
+            Some(list) => list
+                .iter()
+                .filter(|f| !xite.storage.verify(&f.inner_path, &f.sha512))
+                .cloned()
+                .collect(),
+            None => xite.files_needed(),
+        };
+        if needed.is_empty() || peers.is_empty() {
+            return;
+        }
+        let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
+        // EDX-only over the reused session (staged content's b3 is authoritative
+        // pre-commit). A file with no `b3` does not arrive; only the files EDX
+        // landed are reported for db ingest.
+        let missed = self.edx_first(key, needed, peers.clone(), xite.content.as_ref(), None).await;
+        let missed: std::collections::HashSet<&String> =
+            missed.iter().map(|f| &f.inner_path).collect();
+        arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
+    }
+
+    /// Feed each landed child file (downloaded or diff-patched) into the db so
+    /// open pages see it without a full rebuild. A patched file never enters the
+    /// download list (it already verifies against the new hash), so ingesting
+    /// only downloads would leave a pushed post on disk but invisible to queries
+    /// until a restart rebuilt the db.
+    async fn ingest_arrived_child_files(
+        self: &Arc<Self>,
+        key: &str,
+        xite: &Xite,
+        arrived: &[String],
+    ) {
+        for path in arrived {
+            if xite.storage.exists(path) {
+                self.ingest_file_from(key, path, None).await;
+            }
+        }
+    }
+
+    /// Whether `p` is worth a worker slot for a push fetch: on a dialable
+    /// network, connectable, not one of our own addresses, and not already in
+    /// `peers`. Screens both the sender and its advertised addresses.
+    async fn dialable_fresh_peer(&self, p: &PeerAddr, nets: &DialableNets, peers: &[PeerAddr]) -> bool {
+        nets.can_dial(p)
+            && epix_peer::Peer::new(p.clone(), 0).is_connectable()
+            && !self.is_own_peer(p).await
+            && !peers.contains(p)
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
