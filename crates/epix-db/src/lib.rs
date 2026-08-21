@@ -141,10 +141,64 @@ impl Database {
     }
 
     /// Run a read query whose params are a JSON value (object = named binds,
-    /// array = positional). The shape the `dbQuery` WS command passes.
+    /// array = positional). The SQL here is trusted (built by the node, or an
+    /// already SELECT-checked `chartDbQuery`); for page-supplied SQL use
+    /// [`query_untrusted`](Self::query_untrusted).
     pub fn query_value(&self, sql: &str, params: &Value) -> Result<Vec<Value>> {
         let conn = self.conn()?;
         populate::query_value(&conn, sql, params)
+    }
+
+    /// Run a query whose SQL comes from an untrusted source - the `dbQuery` WS
+    /// command, where a served xite's page sends the SQL verbatim. A read-only
+    /// authorizer is installed for the call so the engine refuses anything but
+    /// reads: no INSERT/UPDATE/DELETE, no DDL, no PRAGMA, and - the dangerous
+    /// one - no `ATTACH`. Without this, `dbQuery` runs arbitrary SQL, and
+    /// `ATTACH DATABASE '<path>'` lets a caller create or overwrite a SQLite
+    /// file anywhere the node can write. On the public gateway, where `dbQuery`
+    /// is neither admin- nor owner-gated, that is a pre-auth arbitrary file
+    /// write reachable by any visitor bound to any served xite.
+    ///
+    /// Enforcement is at the SQLite engine (a statement blocklist is bypassable);
+    /// the authorizer is cleared before the pooled connection goes back so the
+    /// node's own writes (populate/update) are never affected.
+    pub fn query_untrusted(&self, sql: &str, params: &Value) -> Result<Vec<Value>> {
+        let conn = self.conn()?;
+        conn.authorizer(Some(read_only_authorizer));
+        // Cleared on every exit path (including `?`), before `conn` is returned
+        // to the pool, so the next checkout starts unrestricted.
+        let _restore = AuthorizerReset(&conn);
+        populate::query_value(&conn, sql, params)
+    }
+}
+
+/// Authorizer callback for [`Database::query_untrusted`]: allow only read
+/// actions (reads, the SELECT itself, scalar/aggregate functions, and recursive
+/// CTEs) and deny everything else. The catch-all covers writes, DDL, PRAGMA,
+/// transaction control, and ATTACH/DETACH - `Deny` turns each into a query
+/// error rather than silently ignoring it.
+fn read_only_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction, Authorization};
+    match ctx.action {
+        AuthAction::Select
+        | AuthAction::Read { .. }
+        | AuthAction::Function { .. }
+        | AuthAction::Recursive => Authorization::Allow,
+        _ => Authorization::Deny,
+    }
+}
+
+/// Clears the authorizer on drop, so a pooled connection never carries the
+/// read-only restriction back into the pool (which would block the node's own
+/// populate/update writes on the shared in-memory connection).
+struct AuthorizerReset<'a>(&'a rusqlite::Connection);
+
+impl Drop for AuthorizerReset<'_> {
+    fn drop(&mut self) {
+        self.0
+            .authorizer::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>(
+                None,
+            );
     }
 }
 
@@ -183,6 +237,43 @@ mod tests {
             .query_row("SELECT title FROM post WHERE post_id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "hi");
+    }
+
+    #[test]
+    fn query_untrusted_reads_but_blocks_writes_and_attach() {
+        use serde_json::json;
+        let db = Database::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE post (post_id INTEGER, title TEXT);
+             INSERT INTO post VALUES (1, 'hi'), (2, 'yo');",
+        )
+        .unwrap();
+
+        // Reads work, params bind, and functions/CTEs are allowed.
+        let rows = db.query_untrusted("SELECT title FROM post WHERE post_id = ?", &json!([1])).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "hi");
+        db.query_untrusted("SELECT COUNT(*) AS n FROM post", &Value::Null).unwrap();
+
+        // Writes and DDL are refused by the authorizer.
+        assert!(db.query_untrusted("INSERT INTO post VALUES (3, 'no')", &Value::Null).is_err());
+        assert!(db.query_untrusted("UPDATE post SET title = 'x'", &Value::Null).is_err());
+        assert!(db.query_untrusted("DELETE FROM post", &Value::Null).is_err());
+        assert!(db.query_untrusted("CREATE TABLE pwned (x)", &Value::Null).is_err());
+        // The data is untouched by the rejected writes.
+        let after = db.query_untrusted("SELECT COUNT(*) AS n FROM post", &Value::Null).unwrap();
+        assert_eq!(after[0]["n"].as_i64().unwrap(), 2);
+
+        // The file-write primitive: ATTACH to an on-disk path must be refused,
+        // and no file may be created for it.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("pwned.db");
+        let attach = format!("ATTACH DATABASE '{}' AS x", target.display());
+        assert!(db.query_untrusted(&attach, &Value::Null).is_err());
+        assert!(!target.exists(), "ATTACH must not create a file on disk");
+
+        // The authorizer was cleared: the node's own connection can still write.
+        db.execute_batch("INSERT INTO post VALUES (4, 'ok')").unwrap();
     }
 
     #[test]

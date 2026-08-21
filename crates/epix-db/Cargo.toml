@@ -7,7 +7,7 @@ description = "EpixNet storage: pooled SQLite, per-xite schema from dbschema.jso
 [dependencies]
 epix-core = { path = "../epix-core" }
 epix-content = { path = "../epix-content" }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "hooks"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.31"
 serde = { version = "1", features = ["derive"] }
