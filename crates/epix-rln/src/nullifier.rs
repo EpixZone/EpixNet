@@ -11,11 +11,18 @@
 //! that ends up holding both derives the SAME offender — the slashing evidence
 //! is a property of the replicated pool, not of arrival order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use rln::prelude::{compute_id_secret, Fr, SecretFr};
 
 use crate::{fr_key, RlnError, Slot};
+
+/// Stable logical identity of a pool record. Callers keep it unchanged across
+/// transport-only proof, PoW, and signature replacement.
+pub type RecordId = [u8; 32];
+
+/// Canonical serialized field element used as a nullifier key.
+pub type NullifierId = [u8; 32];
 
 /// The outcome of observing one verified proof's units for an epoch.
 pub enum Observation {
@@ -24,11 +31,44 @@ pub enum Observation {
     Fresh,
     /// Every active unit was already seen with the SAME share: a re-broadcast of
     /// an already-admitted record, not a new violation.
-    Replay,
+    Replay {
+        /// Whether this wrapper is the deterministic survivor.
+        keep_record: bool,
+        /// Previously retained equivalent wrappers that must be removed.
+        evicted_records: Vec<RecordId>,
+    },
+    /// Some units replay an existing share while others are new. A valid
+    /// retransmission must replay the whole proof. Accepting a sliding window
+    /// here would let one ciphertext consume overlapping allowance ranges.
+    PartialOverlap {
+        /// Whether the newly observed window is the deterministic survivor.
+        keep_record: bool,
+        /// Previously retained overlapping windows that must be removed.
+        evicted_records: Vec<RecordId>,
+    },
+    /// At least one unit belongs to a previously proven double-signal
+    /// component. The record is quarantined without changing live state.
+    Quarantined,
     /// At least one unit collides with a DIFFERENT share: the member exceeded its
     /// allowance (reused a unit across records). Its identity secret is
     /// recovered; use [`crate::commitment_of_secret`] to identify the offender.
-    DoubleSignal { recovered_secret: SecretFr },
+    DoubleSignal {
+        recovered_secret: SecretFr,
+        /// Previously accepted records in the conflicting component. They must
+        /// all be removed from persistent shards. The offending incoming record
+        /// is never retained.
+        conflicting_records: Vec<RecordId>,
+        /// Every nullifier in the touched conflicting component. Callers must
+        /// persist these before committing shard evictions, then import them
+        /// with [`NullifierLog::poison`].
+        poisoned_nullifiers: Vec<NullifierId>,
+    },
+}
+
+#[derive(Clone)]
+struct SeenShare {
+    share: (Fr, Fr),
+    record_id: RecordId,
 }
 
 /// Records the first share seen for each nullifier, per epoch, so a second
@@ -36,8 +76,14 @@ pub enum Observation {
 /// window and pruned with [`NullifierLog::prune_before`].
 #[derive(Default)]
 pub struct NullifierLog {
-    // epoch -> nullifier bytes -> the first (x, y) share seen
-    seen: HashMap<u64, HashMap<[u8; 32], (Fr, Fr)>>,
+    // epoch -> nullifier bytes -> the deterministic surviving share + record.
+    seen: HashMap<u64, HashMap<[u8; 32], SeenShare>>,
+    // epoch -> record -> all nullifiers it owns. This reverse index lets a
+    // lower record id evict every slot of an earlier conflicting record rather
+    // than leaving ghost slots that make reconciliation order-dependent.
+    records: HashMap<u64, HashMap<RecordId, Vec<[u8; 32]>>>,
+    // epoch -> nullifiers proven to be part of a double-signal component.
+    poisoned: HashMap<u64, BTreeSet<NullifierId>>,
 }
 
 impl NullifierLog {
@@ -45,39 +91,218 @@ impl NullifierLog {
         Self::default()
     }
 
+    pub(crate) fn contains_record(&self, epoch: u64, record_id: &RecordId) -> bool {
+        self.records
+            .get(&epoch)
+            .is_some_and(|records| records.contains_key(record_id))
+    }
+
     /// Observe a verified proof's active `slots` for `epoch`. Detection is
     /// deterministic and order-independent, so nodes that reconcile partitioned
     /// shards reach the same verdict.
-    pub fn observe(&mut self, epoch: u64, slots: &[Slot]) -> Result<Observation, RlnError> {
-        // First pass: does ANY unit collide with a different share? If so it is a
-        // double-signal regardless of the other units, and the recovered secret
-        // is the same on every node holding the pair.
+    pub fn observe(
+        &mut self,
+        epoch: u64,
+        record_id: RecordId,
+        slots: &[Slot],
+    ) -> Result<Observation, RlnError> {
+        let mut overlap_records = BTreeSet::new();
+        let mut recovered_secret: Option<SecretFr> = None;
+        let mut same_share = 0usize;
+        let mut incoming_keys = Vec::with_capacity(slots.len());
+
+        // First pass discovers the complete overlap component touched by this
+        // record and obtains slashing evidence from every differing share.
         for slot in slots {
             let key = fr_key(&slot.nullifier)?;
-            if let Some(&first) = self.seen.get(&epoch).and_then(|m| m.get(&key)) {
-                if first.0 != slot.share.0 {
-                    let recovered = compute_id_secret(first, slot.share)
+            incoming_keys.push(key);
+            if self
+                .poisoned
+                .get(&epoch)
+                .is_some_and(|poisoned| poisoned.contains(&key))
+            {
+                return Ok(Observation::Quarantined);
+            }
+            if let Some(first) = self.seen.get(&epoch).and_then(|m| m.get(&key)) {
+                overlap_records.insert(first.record_id);
+                if first.share.0 != slot.share.0 {
+                    let recovered = compute_id_secret(first.share, slot.share)
                         .map_err(|e| RlnError::Recover(e.to_string()))?;
-                    return Ok(Observation::DoubleSignal { recovered_secret: recovered });
+                    if let Some(expected) = &recovered_secret {
+                        if **expected != *recovered {
+                            return Err(RlnError::Recover(
+                                "colliding slots recovered different identity secrets".into(),
+                            ));
+                        }
+                    } else {
+                        recovered_secret = Some(recovered);
+                    }
+                } else {
+                    same_share += 1;
                 }
             }
         }
-        // No collision: record any not-yet-seen units. If every unit was already
-        // present (same share), it is a replay; otherwise at least one unit is new.
+
+        if let Some(recovered_secret) = recovered_secret {
+            // Quarantine the whole conflicting component. Keeping a
+            // deterministic replacement would make each new lower record id a
+            // fresh application delivery and turn rate limiting into a grind.
+            // Leave the observed shares in memory so repeated traffic remains
+            // quarantined until the epoch ages out.
+            let mut poisoned_nullifiers: BTreeSet<NullifierId> =
+                incoming_keys.into_iter().collect();
+            if let Some(records) = self.records.get(&epoch) {
+                for record_id in &overlap_records {
+                    if let Some(keys) = records.get(record_id) {
+                        poisoned_nullifiers.extend(keys.iter().copied());
+                    }
+                }
+            }
+            return Ok(Observation::DoubleSignal {
+                recovered_secret,
+                conflicting_records: overlap_records.into_iter().collect(),
+                poisoned_nullifiers: poisoned_nullifiers.into_iter().collect(),
+            });
+                }
+
+        // With no different share, only one complete wrapper or allowance
+        // window may survive. Select it by stable id so opposite-first
+        // partitions converge without granting extra capacity.
+        if same_share == slots.len() {
+            let (keep_record, evicted_records) =
+                self.resolve_overlap(epoch, record_id, slots, &overlap_records)?;
+            return Ok(Observation::Replay {
+                keep_record,
+                evicted_records,
+            });
+            }
+        if same_share > 0 {
+            let (keep_record, evicted_records) =
+                self.resolve_overlap(epoch, record_id, slots, &overlap_records)?;
+            return Ok(Observation::PartialOverlap {
+                keep_record,
+                evicted_records,
+            });
+        }
+        self.insert_record(epoch, record_id, slots)?;
+        Ok(Observation::Fresh)
+    }
+
+    fn insert_record(
+        &mut self,
+        epoch: u64,
+        record_id: RecordId,
+        slots: &[Slot],
+    ) -> Result<(), RlnError> {
         let epoch_map = self.seen.entry(epoch).or_default();
-        let mut any_new = false;
+        let mut keys = Vec::with_capacity(slots.len());
         for slot in slots {
             let key = fr_key(&slot.nullifier)?;
-            if epoch_map.insert(key, slot.share).is_none() {
-                any_new = true;
+            epoch_map.insert(
+                key,
+                SeenShare {
+                    share: slot.share,
+                    record_id,
+                },
+            );
+            keys.push(key);
+        }
+        self.records
+            .entry(epoch)
+            .or_default()
+            .insert(record_id, keys);
+        Ok(())
+    }
+
+    fn resolve_overlap(
+        &mut self,
+        epoch: u64,
+        record_id: RecordId,
+        slots: &[Slot],
+        overlap_records: &BTreeSet<RecordId>,
+    ) -> Result<(bool, Vec<RecordId>), RlnError> {
+        let winner = overlap_records
+            .iter()
+            .copied()
+            .chain([record_id])
+            .min()
+            .unwrap();
+        let already_present = self
+            .records
+            .get(&epoch)
+            .is_some_and(|records| records.contains_key(&record_id));
+        let evicted_records: Vec<RecordId> = overlap_records
+            .iter()
+            .copied()
+            .filter(|id| *id != winner)
+            .collect();
+        for id in &evicted_records {
+            self.remove_record(epoch, id);
+        }
+        let keep_record = winner == record_id && !already_present;
+        if keep_record {
+            self.insert_record(epoch, record_id, slots)?;
+        }
+        Ok((keep_record, evicted_records))
+    }
+
+    fn remove_record(&mut self, epoch: u64, record_id: &RecordId) {
+        let keys = self
+            .records
+            .get_mut(&epoch)
+            .and_then(|records| records.remove(record_id));
+        if let (Some(keys), Some(seen)) = (keys, self.seen.get_mut(&epoch)) {
+            for key in keys {
+                if seen
+                    .get(&key)
+                    .is_some_and(|entry| &entry.record_id == record_id)
+                {
+                    seen.remove(&key);
             }
         }
-        Ok(if any_new { Observation::Fresh } else { Observation::Replay })
+        }
+    }
+
+    /// Mark nullifiers as durable double-signal evidence. The caller must
+    /// persist `keys` before invoking this method. Live records touching a
+    /// poisoned key are removed from the normal survivor maps.
+    pub fn poison(&mut self, epoch: u64, keys: &[NullifierId]) {
+        if keys.is_empty() {
+            return;
+        }
+        self.poisoned
+            .entry(epoch)
+            .or_default()
+            .extend(keys.iter().copied());
+        let victims: Vec<RecordId> = self
+            .records
+            .get(&epoch)
+            .into_iter()
+            .flat_map(|records| records.iter())
+            .filter(|(_, record_keys)| {
+                self.poisoned
+                    .get(&epoch)
+                    .is_some_and(|poisoned| record_keys.iter().any(|key| poisoned.contains(key)))
+            })
+            .map(|(record_id, _)| *record_id)
+            .collect();
+        for record_id in victims {
+            self.remove_record(epoch, &record_id);
+        }
+    }
+
+    /// True when any supplied nullifier was durably poisoned.
+    pub fn touches_poisoned(&self, epoch: u64, keys: &[NullifierId]) -> bool {
+        self.poisoned
+            .get(&epoch)
+            .is_some_and(|poisoned| keys.iter().any(|key| poisoned.contains(key)))
     }
 
     /// Forget nullifiers for epochs strictly before `oldest`, bounding memory to
     /// the active window (paired with pool retention pruning).
     pub fn prune_before(&mut self, oldest: u64) {
         self.seen.retain(|&e, _| e >= oldest);
+        self.records.retain(|&e, _| e >= oldest);
+        self.poisoned.retain(|&e, _| e >= oldest);
     }
 }

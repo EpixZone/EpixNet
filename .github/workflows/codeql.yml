@@ -29,6 +29,12 @@ jobs:
       CODEQL_EXTRACTOR_RUST_OPTION_CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert hard-coded cryptographic value analysis is enabled
+        run: |
+          if grep -q 'rust/hard-coded-cryptographic-value' .github/codeql/codeql-config.yml; then
+            echo "::error::Do not disable hard-coded cryptographic value analysis repository-wide"
+            exit 1
+          fi
       # The Rust extractor resolves code with rust-analyzer, so it needs the
       # same environment as a real build: a toolchain with the rust-src
       # component (standard library sources), the dependency sources, and the

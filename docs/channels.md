@@ -148,7 +148,10 @@ deletion. Ordered:
 - **Phase A** (per user): `channelMigrateLegacy` imports decryptable legacy messages
   into the private index (implemented alongside this cutover).
 - **Phase B** (per user): `Mail.publishKeyBundle` overwrites `data.json` with the
-  bundle only and re-signs the user's content.json.
+  cert-aware, auth-signed v3 bundle and re-signs the user's content.json.
+  Unsigned v2 bundles are a hard cutover and must be republished. If an RLN
+  roster was generated from the pre-cutover raw per-xite auth identity, regenerate
+  its member commitment from the same cert-aware linked identity used by channels.
 - **Phase C** (owner, single publish): ship the new JS + content.json (pool) +
   dbschema v3. DB rebuild drops old tables; `messages.json` deleted on resync;
   legacy `data.json` >8 KB invalid until republished. **C follows B for all

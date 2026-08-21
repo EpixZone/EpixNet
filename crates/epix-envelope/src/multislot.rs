@@ -239,6 +239,23 @@ pub struct Dest {
     pub bundle: Value,
 }
 
+/// A fully sealed record whose ratchet mutations have not been persisted yet.
+/// Callers that split one logical message across several records batch-commit
+/// these only after every chunk and optional RLN proof has succeeded.
+#[derive(Debug, Clone)]
+pub struct PreparedSend {
+    pub commit: crate::store::OutboundCommit,
+    pub epoch: i64,
+}
+
+/// Proof bytes plus the durable allowance range used to create them. Production
+/// channel sends retain the reservation so an outbox retry can prove the same
+/// ciphertext against a refreshed root without spending a new range.
+pub struct RlnProofMaterial {
+    pub proof: Vec<u8>,
+    pub reservation: Option<crate::store::RlnReservation>,
+}
+
 /// Seal a message to MANY recipient devices as ONE count-hiding pool record.
 ///
 /// `dests` is the flat list of recipient-device bundles (every device of every
@@ -250,8 +267,7 @@ pub struct Dest {
 ///
 /// Fails if `dests.len() > SLOTS` (the caller chunks larger sends).
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
+fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     store: &S,
     engine: &E,
     identity_id: i64,
@@ -263,16 +279,36 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     subject: &str,
     body: &str,
     now_ms: i64,
+    next_attempt_ms: i64,
     rule: &PoolRule,
     record_own: bool,
-    rln_prover: Option<&dyn Fn(&[u8], i64) -> std::result::Result<Vec<u8>, String>>,
-) -> Result<SendResult> {
+    rln_prover: Option<&dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String>>,
+) -> Result<PreparedSend> {
     if dests.is_empty() || dests.len() > SLOTS {
         return Err(Error::Protocol(format!(
             "send_multi: {} destinations, must be 1..={SLOTS}",
             dests.len()
         )));
     }
+
+    // Validate the complete destination set before beginning any session or
+    // sealing any slot. Silently dropping one malformed bundle would turn an
+    // intended multi-recipient send into a partial delivery. If every bundle
+    // were malformed, it would also produce a valid-looking dummy-only record.
+    let peer_iks = dests
+        .iter()
+        .enumerate()
+        .map(|(index, dest)| {
+            engine
+                .sender_ik(&dest.bundle)
+                .map(hex::encode)
+                .ok_or_else(|| {
+                    Error::Protocol(format!(
+                        "send_multi: destination {index} has no usable identity key"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let conv_hex = hex::encode(conv_id);
 
     // ONE shared body under a fresh single-use key.
@@ -285,36 +321,33 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     // key payload, padded to the fixed keyslot bucket.
     let mut tags: Vec<[u8; 32]> = Vec::with_capacity(SLOTS);
     let mut keyslots: Vec<Vec<u8>> = Vec::with_capacity(SLOTS);
+    let mut sessions: Vec<crate::store::OutboundSession> = Vec::with_capacity(dests.len());
     let ks_buckets = [KEYSLOT_LEN];
-    for dest in dests {
-        let peer_xid = dest.bundle.get("xid").and_then(|v| v.as_str());
+    for (dest, peer_ik) in dests.iter().zip(peer_iks) {
+        let peer_xid = dest
+            .bundle
+            .get("xid")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let peer_auth = dest
+            .bundle
+            .get("auth")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         // Leg key: the peer DEVICE's identity key. A recipient's multiple devices
         // share one human `xid` but have distinct identity keys; keying the session
         // by the device key (not the name) gives each device its own ratchet —
         // otherwise device 2 reuses device 1's session, seals a keyslot device 2
         // can't open, and double-advances this sender's ratchet. Read it through
         // the engine (matches the recv side's `ik_a` and stays engine-agnostic).
-        let Some(peer_ik) = engine.sender_ik(&dest.bundle).map(hex::encode) else {
-            continue; // a bundle with no device key is unusable (already filtered)
-        };
         let existing = store.session_id_for_leg(identity_id, &conv_hex, &peer_ik)?;
-        let (session_id, session_blob) = match existing {
-            Some(sid) => (sid, store.session_ratchet(sid)?),
+        let (session_id, session_blob, recv_tags) = match existing {
+            Some(sid) => (Some(sid), store.session_ratchet(sid)?, Vec::new()),
             None => {
                 let begun =
                     engine.begin_session(id_secret, &dest.bundle, conv_id).map_err(crate::indexer::eng_err)?;
                 let recv = crate::indexer::to_tag_vecs(&begun.recv_tags);
-                let sid = store.create_session(crate::store::NewSession {
-                    identity_id,
-                    conv_id: &conv_hex,
-                    peer_xid,
-                    peer_ik: &peer_ik,
-                    role: "init",
-                    ratchet: &begun.session,
-                    established_ms: now_ms,
-                    recv_tags: &recv,
-                })?;
-                (sid, begun.session)
+                (None, begun.session, recv)
             }
         };
         // sender_xid / members / subject / sent_ms all travel in the SHARED body;
@@ -329,7 +362,22 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
                 sealed.ct.len()
             )));
         }
-        store.update_session_ratchet(session_id, &sealed.session_after)?;
+        // Do not persist this advance yet. The exact signed record and every
+        // session mutation land together below, after all remaining fallible
+        // work (padding, RLN proof, PoW, and signing) has succeeded.
+        sessions.push(crate::store::OutboundSession {
+            session_id,
+            identity_id,
+            conv_id: conv_hex.clone(),
+            peer_xid,
+            peer_ik,
+            peer_auth,
+            role: "init".into(),
+            ratchet_before: session_id.map(|_| session_blob),
+            ratchet_after: sealed.session_after,
+            established_ms: now_ms,
+            recv_tags,
+        });
         tags.push(sealed.tag);
         keyslots.push(sealed.ct);
     }
@@ -367,27 +415,92 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     // Anonymous rate-limiting: where the pool requires it, attach the RLN proof
     // BEFORE PoW/sign so both cover it. The proof binds to `ct` + `epoch`; the
     // caller's prover produces it (it holds the member identity + membership).
+    let mut rln_reservation = None;
     if rule.rln_required {
         let prove = rln_prover.ok_or_else(|| {
             Error::Protocol("pool requires an RLN proof but no prover was supplied".into())
         })?;
-        let proof = prove(&ct, epoch)
+        let material = prove(&ct, epoch)
             .map_err(|e| Error::Protocol(format!("rln proof generation failed: {e}")))?;
-        record["rln"] = json!(b64(&proof));
+        record["rln"] = json!(b64(&material.proof));
+        rln_reservation = material.reservation;
     }
 
     pool::solve_pow(&mut record, rule.pow_bits);
     let sig = epix_crypt::sign(&record_signed_data(&record), &author_pk).map_err(Error::Crypt)?;
     record["sign"] = json!(sig);
 
-    let msg_id = if record_own {
-        store.insert_sent(identity_id, &conv_hex, None, members, my_xid, subject, body, now_ms)?
-    } else {
-        0
-    };
-
     let shard_path = pool::shard_path(rule, epoch, &route_tag);
-    Ok(SendResult { record, shard_path, epoch, msg_id })
+    let sent = record_own.then(|| crate::store::OutboundMessage {
+        identity_id,
+        conv_id: conv_hex,
+        peer_xid: None,
+        members: members.to_vec(),
+        sender_xid: my_xid.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        sent_ms: now_ms,
+    });
+    let commit = crate::store::OutboundCommit {
+        sessions,
+        record: record.clone(),
+        shard_path: shard_path.clone(),
+        created_ms: now_ms,
+        next_attempt_ms,
+        recovery: crate::store::OutboundRecovery {
+            author_private_key: author_pk,
+            rln: rln_reservation,
+        },
+        sent,
+    };
+    Ok(PreparedSend { commit, epoch })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    next_attempt_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+    rln_prover: Option<&dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String>>,
+) -> Result<SendResult> {
+    let prepared = prepare_multi_inner(
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        next_attempt_ms,
+        rule,
+        record_own,
+        rln_prover,
+    )?;
+    let record = prepared.commit.record.clone();
+    let shard_path = prepared.commit.shard_path.clone();
+    let (outbox_id, msg_id) = store.commit_outbound(&prepared.commit)?;
+    Ok(SendResult {
+        record,
+        shard_path,
+        epoch: prepared.epoch,
+        msg_id,
+        outbox_id,
+    })
 }
 
 /// Seal to multiple destinations for a PoW-only pool. See [`send_multi_inner`]
@@ -408,9 +521,98 @@ pub fn send_multi<E: Engine + ?Sized, S: EnvelopeStore>(
     rule: &PoolRule,
     record_own: bool,
 ) -> Result<SendResult> {
+    send_multi_scheduled(
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        now_ms,
+        rule,
+        record_own,
+    )
+}
+
+/// [`send_multi`] with a durable earliest transport-attempt timestamp. The
+/// signed record and this timestamp are committed atomically, so send-origin
+/// and burst jitter survive process restart.
+#[allow(clippy::too_many_arguments)]
+pub fn send_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    next_attempt_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+) -> Result<SendResult> {
     send_multi_inner(
-        store, engine, identity_id, id_secret, my_xid, members, dests, conv_id, subject, body,
-        now_ms, rule, record_own, None,
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        next_attempt_ms,
+        rule,
+        record_own,
+        None,
+    )
+}
+
+/// Seal one chunk without mutating the store. A caller must commit the returned
+/// value, normally with [`EnvelopeStore::commit_outbound_batch`].
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    next_attempt_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+) -> Result<PreparedSend> {
+    prepare_multi_inner(
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        next_attempt_ms,
+        rule,
+        record_own,
+        None,
     )
 }
 
@@ -436,15 +638,272 @@ pub fn send_multi_with_rln<E: Engine + ?Sized, S: EnvelopeStore>(
     record_own: bool,
     rln_prover: &dyn Fn(&[u8], i64) -> std::result::Result<Vec<u8>, String>,
 ) -> Result<SendResult> {
+    send_multi_with_rln_scheduled(
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        now_ms,
+        rule,
+        record_own,
+        rln_prover,
+    )
+}
+
+/// [`send_multi_with_rln`] with a durable earliest transport-attempt timestamp.
+#[allow(clippy::too_many_arguments)]
+pub fn send_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    next_attempt_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+    rln_prover: &dyn Fn(&[u8], i64) -> std::result::Result<Vec<u8>, String>,
+) -> Result<SendResult> {
+    let adapted = |ct: &[u8], epoch: i64| {
+        rln_prover(ct, epoch).map(|proof| RlnProofMaterial {
+            proof,
+            reservation: None,
+        })
+    };
     send_multi_inner(
-        store, engine, identity_id, id_secret, my_xid, members, dests, conv_id, subject, body,
-        now_ms, rule, record_own, Some(rln_prover),
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        next_attempt_ms,
+        rule,
+        record_own,
+        Some(&adapted),
+    )
+}
+
+/// RLN variant of [`prepare_multi_scheduled`]. Proofs and signatures are fully
+/// produced, but no session or outbox state is persisted yet.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    next_attempt_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+    rln_prover: &dyn Fn(&[u8], i64) -> std::result::Result<Vec<u8>, String>,
+) -> Result<PreparedSend> {
+    let adapted = |ct: &[u8], epoch: i64| {
+        rln_prover(ct, epoch).map(|proof| RlnProofMaterial {
+            proof,
+            reservation: None,
+        })
+    };
+    prepare_multi_inner(
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        next_attempt_ms,
+        rule,
+        record_own,
+        Some(&adapted),
+    )
+}
+
+/// Production RLN prepare path with a durable allowance reservation attached
+/// to the transactional outbox row.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_multi_with_rln_reserved_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
+    store: &S,
+    engine: &E,
+    identity_id: i64,
+    id_secret: &IdentitySecret,
+    my_xid: &str,
+    members: &[String],
+    dests: &[Dest],
+    conv_id: [u8; 16],
+    subject: &str,
+    body: &str,
+    now_ms: i64,
+    next_attempt_ms: i64,
+    rule: &PoolRule,
+    record_own: bool,
+    rln_prover: &dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String>,
+) -> Result<PreparedSend> {
+    prepare_multi_inner(
+        store,
+        engine,
+        identity_id,
+        id_secret,
+        my_xid,
+        members,
+        dests,
+        conv_id,
+        subject,
+        body,
+        now_ms,
+        next_attempt_ms,
+        rule,
+        record_own,
+        Some(rln_prover),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct TrackingStore {
+        session_lookups: AtomicUsize,
+        outbound_commits: AtomicUsize,
+    }
+
+    fn unexpected_store_access<T>() -> Result<T> {
+        panic!("unexpected store access")
+    }
+
+    impl EnvelopeStore for TrackingStore {
+        fn is_processed(&self, _sign_h: &[u8], _identity_id: i64) -> Result<bool> {
+            unexpected_store_access()
+        }
+
+        fn mark_processed(&self, _sign_h: &[u8], _identity_id: i64) -> Result<()> {
+            unexpected_store_access()
+        }
+
+        fn session_for_tag(&self, _tag: &[u8]) -> Result<Option<crate::store::SessionMatch>> {
+            unexpected_store_access()
+        }
+
+        fn session_ratchet(&self, _session_id: i64) -> Result<Vec<u8>> {
+            unexpected_store_access()
+        }
+
+        fn session_id_for_leg(
+            &self,
+            _identity_id: i64,
+            _conv_id: &str,
+            _peer_ik: &str,
+        ) -> Result<Option<i64>> {
+            self.session_lookups.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        fn create_session(&self, _session: crate::store::NewSession<'_>) -> Result<i64> {
+            unexpected_store_access()
+        }
+
+        fn update_session_ratchet(&self, _session_id: i64, _ratchet: &[u8]) -> Result<()> {
+            unexpected_store_access()
+        }
+
+        fn commit_outbound(&self, _commit: &crate::store::OutboundCommit) -> Result<(i64, i64)> {
+            self.outbound_commits.fetch_add(1, Ordering::SeqCst);
+            Ok((1, 1))
+        }
+
+        fn commit_outbound_batch(
+            &self,
+            _commits: &[crate::store::OutboundCommit],
+        ) -> Result<Vec<(i64, i64)>> {
+            unexpected_store_access()
+        }
+
+        fn commit_inbound(&self, _commit: &crate::store::InboundCommit) -> Result<Option<i64>> {
+            unexpected_store_access()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn insert_sent(
+            &self,
+            _identity_id: i64,
+            _conv_id: &str,
+            _peer_xid: Option<&str>,
+            _members: &[String],
+            _sender_xid: &str,
+            _subject: &str,
+            _body: &str,
+            _sent_ms: i64,
+        ) -> Result<i64> {
+            unexpected_store_access()
+        }
+
+        fn unread_count(&self, _identity_id: i64) -> Result<i64> {
+            unexpected_store_access()
+        }
+    }
+
+    fn test_rule() -> PoolRule {
+        PoolRule {
+            dir: "pool".into(),
+            class: pool::POOL_RECORD_FORMAT.into(),
+            since_week: 0,
+            fanout: 16,
+            pow_bits: 0,
+            pad_buckets: vec![8192],
+            max_record_bytes: 16_384,
+            max_shard_bytes: 1_000_000,
+            newest_first: true,
+            rln_required: false,
+            retention_weeks: 0,
+        }
+    }
+
+    fn send_to_destinations(store: &TrackingStore, dests: &[Dest]) -> Result<SendResult> {
+        send_multi(
+            store,
+            &crate::engine::FakeEngine,
+            1,
+            &IdentitySecret::new([1u8; 32]),
+            "alice.epix",
+            &["alice.epix".into(), "bob.epix".into()],
+            dests,
+            [7u8; 16],
+            "subject",
+            "body",
+            1_780_000_000_000,
+            &test_rule(),
+            true,
+        )
+    }
 
     #[test]
     fn ct_round_trips_tags_keyslots_and_body() {
@@ -498,5 +957,39 @@ mod tests {
         let (k, h) = parse_keyslot_plain(&encoded).unwrap();
         assert_eq!(k, k_msg);
         assert_eq!(&h, blake3::hash(&body_ct).as_bytes());
+    }
+
+    #[test]
+    fn one_invalid_destination_aborts_before_any_recipient_state_is_touched() {
+        let engine = crate::engine::FakeEngine;
+        let valid = engine.publish_bundle(&IdentitySecret::new([2u8; 32]), "bob.epix");
+        let dests = vec![
+            Dest { bundle: valid },
+            Dest {
+                bundle: json!({ "xid": "carol.epix" }),
+            },
+        ];
+        let store = TrackingStore::default();
+
+        let err =
+            send_to_destinations(&store, &dests).expect_err("mixed destination set must fail");
+
+        assert!(matches!(err, Error::Protocol(message) if message.contains("destination 1")));
+        assert_eq!(store.session_lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(store.outbound_commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn invalid_only_destination_cannot_create_a_dummy_only_record() {
+        let dests = vec![Dest {
+            bundle: json!({ "xid": "bob.epix" }),
+        }];
+        let store = TrackingStore::default();
+
+        let err = send_to_destinations(&store, &dests).expect_err("dummy-only send must fail");
+
+        assert!(matches!(err, Error::Protocol(message) if message.contains("destination 0")));
+        assert_eq!(store.session_lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(store.outbound_commits.load(Ordering::SeqCst), 0);
     }
 }

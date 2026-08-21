@@ -147,6 +147,14 @@ mod tests {
         b
     }
 
+    fn authenticate_bundle(mut bundle: Value) -> Value {
+        let key = epix_crypt::new_seed();
+        bundle["auth"] = serde_json::json!(epix_crypt::privatekey_to_address(&key).unwrap());
+        let payload = keys::bundle_auth_payload(&bundle).unwrap();
+        bundle["auth_sig"] = serde_json::json!(epix_crypt::sign_keccak(&payload, &key).unwrap());
+        bundle
+    }
+
     const BUCKETS: &[usize] = &[512, 2048, 8192, 65536];
 
     // Register a session's receive tags into a tiny in-memory tag→n map, like
@@ -160,8 +168,8 @@ mod tests {
         let e = PairwiseEngine;
         let alice = IdentitySecret::new(rand_seed());
         let bob = IdentitySecret::new(rand_seed());
-        let bob_bundle = e.publish_bundle(&bob, "bob.epix");
-        let alice_bundle = e.publish_bundle(&alice, "alice.epix");
+        let bob_bundle = authenticate_bundle(e.publish_bundle(&bob, "bob.epix"));
+        let alice_bundle = authenticate_bundle(e.publish_bundle(&alice, "alice.epix"));
         assert!(e.verify_bundle(&bob_bundle) && e.verify_bundle(&alice_bundle));
 
         let conv = [9u8; 16];
@@ -326,12 +334,12 @@ mod tests {
         let stale_idx = 1000u32; // weeks in the past, not current_spk_idx()
 
         // Bob's bundle as if published long ago (stale spk + spk_idx).
-        let bob_bundle = serde_json::json!({
-            "v": 2, "xid": "bob.epix",
+        let bob_bundle = authenticate_bundle(serde_json::json!({
+            "v": 3, "xid": "bob.epix",
             "ik": keys::b64(&curve::public_key(&keys::ik_priv(&bob.seed))),
             "spk": keys::b64(&curve::public_key(&keys::spk_priv(&bob.seed, stale_idx))),
             "spk_idx": stale_idx,
-        });
+        }));
         assert!(e.verify_bundle(&bob_bundle));
 
         let begun = e.begin_session(&alice, &bob_bundle, [2u8; 16]).unwrap();

@@ -19,8 +19,14 @@ const VOTE_EXT: &str = "083110fac183d4061a40326462613564626333333965373331366165
 fn pinned() -> PinnedSet {
     let pk: [u8; 32] = hex::decode(CONS_PUBKEY).unwrap().try_into().unwrap();
     let mut v = HashMap::new();
-    v.insert("epixvalcons1j74cjk4r9aqq34kmyft6rffgn4mrhdwwzunqvu".to_string(), PinnedValidator { pubkey: pk, voting_power: 1000000 });
-    PinnedSet::new(v, "epix_1916-1", 1786831098, 0)
+    v.insert(
+        "epixvalcons1j74cjk4r9aqq34kmyft6rffgn4mrhdwwzunqvu".to_string(),
+        PinnedValidator {
+            pubkey: pk,
+            voting_power: 1000000,
+        },
+    );
+    PinnedSet::new(v, "epix_1916-1", 1786831098, 1).unwrap()
 }
 
 fn bundle() -> FinalityBundle {
@@ -51,8 +57,14 @@ fn live_devnet_consensus_key_bundle_verifies() {
 
     // Wrong pinned pubkey (attacker key) must NOT be credited.
     let mut bad = HashMap::new();
-    bad.insert("epixvalcons1j74cjk4r9aqq34kmyft6rffgn4mrhdwwzunqvu".to_string(), PinnedValidator { pubkey: [0u8; 32], voting_power: 1000000 });
-    let bad_pin = PinnedSet::new(bad, "epix_1916-1", 1786831098, 0);
+    bad.insert(
+        "epixvalcons1j74cjk4r9aqq34kmyft6rffgn4mrhdwwzunqvu".to_string(),
+        PinnedValidator {
+            pubkey: [0u8; 32],
+            voting_power: 1000000,
+        },
+    );
+    let bad_pin = PinnedSet::new(bad, "epix_1916-1", 1786831098, 1).unwrap();
     assert!(verify_finality(&bundle(), &bad_pin, &params()).is_err());
 
     // Wrong round -> different CanonicalVoteExtension -> signature fails. Round is

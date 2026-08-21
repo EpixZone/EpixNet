@@ -44,7 +44,7 @@ mod pool;
 pub use engine::{Rln, Slot, Verified, MAX_UNITS_PER_PROOF};
 pub use identity::{commitment_of_secret, RlnIdentity};
 pub use membership::Membership;
-pub use nullifier::{NullifierLog, Observation};
+pub use nullifier::{NullifierId, NullifierLog, Observation, RecordId};
 pub use pool::{Admission, PoolGate};
 
 /// Canonical 32-byte key for a BN254 scalar, used to index nullifiers and
@@ -83,6 +83,8 @@ pub enum RlnError {
     MalformedValues,
     #[error("proof spends {got} units but the record's size bucket requires {want}")]
     WrongUnits { got: u32, want: u32 },
+    #[error("proof only partially replays an already-spent allowance range")]
+    PartialOverlap,
     #[error("secret recovery failed: {0}")]
     Recover(String),
 }

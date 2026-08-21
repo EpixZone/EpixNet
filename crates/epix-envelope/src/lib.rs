@@ -34,7 +34,15 @@ pub mod store;
 
 pub use engine::{Begun, Engine, EngineError, FakeEngine, IdentitySecret, Opened, Sealed};
 pub use indexer::{
-    new_conv_id, process_record, process_record_one, send_message, ProcessOutcome, SendResult,
+    new_conv_id, process_record, process_record_one, process_record_with_peer_status, send_message,
+    ProcessOutcome, SendResult,
 };
-pub use multislot::{send_multi, send_multi_with_rln, Dest, SLOTS};
-pub use store::{EnvelopeStore, InboundCommit, NewSession, SessionMatch, TAG_LOOKAHEAD};
+pub use multislot::{
+    prepare_multi_scheduled, prepare_multi_with_rln_reserved_scheduled,
+    prepare_multi_with_rln_scheduled, send_multi, send_multi_scheduled, send_multi_with_rln,
+    send_multi_with_rln_scheduled, Dest, PreparedSend, RlnProofMaterial, SLOTS,
+};
+pub use store::{
+    EnvelopeStore, InboundCommit, NewSession, OutboundCommit, OutboundMessage, OutboundRecovery,
+    OutboundSession, PendingOutbound, RlnReservation, SessionMatch, TAG_LOOKAHEAD,
+};

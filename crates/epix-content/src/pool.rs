@@ -14,7 +14,7 @@
 //!
 //! A container is `{ "record_format": "epix-pool-1", "env": [ <record>, … ] }`.
 //! [`merge_pool`] unions the verified records of two containers (dedup by
-//! signature) and, like the OR-Set, NEVER removes a version for being absent on
+//! signed payload) and, like the OR-Set, NEVER removes a version for being absent on
 //! one side — a blank/partial container merges to a no-op. Pool records are
 //! IMMUTABLE: there are no edits, tombstones, `post_id` grouping or supersede
 //! logic (deletion is a purely local index action; the sealed record is never
@@ -187,6 +187,10 @@ impl PoolRule {
         // owner declared. Mirrors `epix_edx::fetch::MAX_SIGNED_BYTES` (8 MiB).
         const MAX_SERVE_BYTES: usize = 8 << 20;
         let max_shard_bytes = declared_max_shard_bytes.min(MAX_SERVE_BYTES);
+        if max_shard_bytes < crate::canonical::dumps_sorted(&make_pool_container(Vec::new())).len()
+        {
+            return None;
+        }
         // Default to newest-first backfill; only an explicit "oldest_first" flips
         // it. An unknown value falls back to the default rather than failing.
         let newest_first =
@@ -381,7 +385,7 @@ fn sort_records(records: &mut [Value]) {
 
 /// `sha256(sha256(data))`.
 fn sha256d(data: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(data.as_ref());
+    let first = Sha256::digest(data);
     let second = Sha256::digest(first.as_slice());
     second.into()
 }
@@ -406,6 +410,32 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
 /// the required work.
 pub fn meets_pow(payload: &str, pow_bits: u32) -> bool {
     leading_zero_bits(&sha256d(payload.as_bytes())) >= pow_bits
+}
+
+/// Immutable logical identity of one sealed pool message. Transport
+/// representations may change `pow`, `rln`, and `sign` while recovering a
+/// durable outbox row, but the ciphertext, routing tag, epoch, and anonymous
+/// author stay fixed. Deduping on this tuple prevents a re-proof/re-PoW from
+/// delivering the same logical message twice.
+pub fn logical_record_data(record: &Value) -> String {
+    crate::canonical::dumps_sorted(&json!({
+        "v": record.get("v").cloned().unwrap_or(Value::Null),
+        "epoch": record.get("epoch").cloned().unwrap_or(Value::Null),
+        "tag": record.get("tag").cloned().unwrap_or(Value::Null),
+        "ct": record.get("ct").cloned().unwrap_or(Value::Null),
+        "author": record.get("author").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+pub fn record_work_bits(record: &Value) -> u32 {
+    leading_zero_bits(&sha256d(record_signed_data(record).as_bytes()))
+}
+
+pub fn rln_reservation_id(epoch: i64, ct: &[u8]) -> [u8; 32] {
+    let mut material = b"epix-rln-outbox-reservation-v1\0".to_vec();
+    material.extend_from_slice(&epoch.to_be_bytes());
+    material.extend_from_slice(ct);
+    Sha256::digest(material).into()
 }
 
 /// Solve the proof of work for a record in place: try `pow` nonces until
@@ -442,6 +472,7 @@ pub fn solve_pow(record: &mut Value, pow_bits: u32) -> u64 {
 ///    and cross-epoch replay);
 /// 7. `sha256d(payload)` clears `rule.pow_bits`;
 /// 8. `sign` recovers to `author`.
+///
 /// Step 1: exactly [`ALLOWED_FIELDS`] present. The optional `rln` proof field
 /// is permitted only where the pool rule requires RLN admission.
 fn check_field_set(
@@ -567,6 +598,9 @@ pub fn verify_pool_record(
 
     // 8. self-signature (recovers to `author` under dbl or keccak scheme; a
     //    garbage signature fails both, never panics).
+    if !epix_crypt::is_canonical_recoverable_signature(sign) {
+        return Err(PoolError::BadSignature);
+    }
     if epix_crypt::verify(&payload, author, sign)
         || epix_crypt::verify_keccak(&payload, author, sign)
     {
@@ -587,7 +621,7 @@ fn container_len(records: &[Value]) -> usize {
 }
 
 /// Merge two pool containers into the union of their VERIFIED records for
-/// `shard_week`, deduped by signature. Grow-only, commutative and idempotent:
+/// `shard_week`, deduped by canonical signed payload. Grow-only, commutative and idempotent:
 /// a version absent on one side is never dropped for that reason. Every record
 /// (local and inbound) is re-verified, so a poisoned on-disk shard cannot smuggle
 /// a forged/under-powered record through a merge.
@@ -612,11 +646,28 @@ pub fn merge_pool(
 ) -> (Value, Vec<Value>) {
     use std::collections::BTreeMap;
 
-    let local_signs: std::collections::BTreeSet<String> =
-        pool_records_of(local).iter().map(|r| sign_of(r).to_string()).collect();
+    let payload_id = |record: &Value| sha256d(logical_record_data(record).as_bytes());
+    let routed_here = |record: &Value| {
+        record
+            .get("tag")
+            .and_then(|t| t.as_str())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .map(|t| crate::pool::shard_sub(&t, rule.fanout) == shard_sub)
+            .unwrap_or(false)
+    };
+    let local_ids: std::collections::BTreeSet<[u8; 32]> = pool_records_of(local)
+        .into_iter()
+        .filter(|record| {
+            routed_here(record) && verify_pool_record(record, rule, shard_week, now_ms).is_ok()
+        })
+        .map(|record| payload_id(&record))
+        .collect();
 
-    let mut by_sign: BTreeMap<String, Value> = BTreeMap::new();
-    for r in pool_records_of(local).into_iter().chain(pool_records_of(inbound)) {
+    let mut by_payload: BTreeMap<[u8; 32], Value> = BTreeMap::new();
+    for r in pool_records_of(local)
+        .into_iter()
+        .chain(pool_records_of(inbound))
+    {
         if verify_pool_record(&r, rule, shard_week, now_ms).is_err() {
             continue;
         }
@@ -625,23 +676,36 @@ pub fn merge_pool(
         // from OTHER subs (no fresh PoW needed) into one shard, inflate it past
         // `max_shard_bytes`, and force eviction of the genuine records addressed
         // to that sub. A record only ever belongs in `shard_sub(tag, fanout)`.
-        let routed_here = r
-            .get("tag")
-            .and_then(|t| t.as_str())
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-            .map(|t| crate::pool::shard_sub(&t, rule.fanout) == shard_sub)
-            .unwrap_or(false);
-        if !routed_here {
+        if !routed_here(&r) {
             continue;
         }
-        let sig = sign_of(&r).to_string();
-        if sig.is_empty() {
+        if sign_of(&r).is_empty() {
             continue;
         }
-        by_sign.entry(sig).or_insert(r);
+        // A Bitcoin compact recovery header has an optional +4 compressed-key
+        // flag. Both encodings recover the same author and cover the same
+        // payload. Keying by raw signature would let an observer toggle that
+        // unauthenticated flag and occupy a second shard entry. Keep one record
+        // per signed payload and choose the lexicographically smaller signature
+        // so partitions converge regardless of which encoding arrived first.
+        let id = payload_id(&r);
+        match by_payload.entry(id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(r);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let candidate_work = sha256d(record_signed_data(&r).as_bytes());
+                let retained_work = sha256d(record_signed_data(slot.get()).as_bytes());
+                if candidate_work < retained_work
+                    || (candidate_work == retained_work && sign_of(&r) < sign_of(slot.get()))
+                {
+                    slot.insert(r);
+                }
+            }
+        }
     }
 
-    let mut records: Vec<Value> = by_sign.into_values().collect();
+    let mut records: Vec<Value> = by_payload.into_values().collect();
 
     // Deterministic overflow eviction (rare): keep the highest-work records.
     if container_len(&records) > rule.max_shard_bytes {
@@ -650,15 +714,21 @@ pub fn merge_pool(
             let hb = sha256d(record_signed_data(b).as_bytes());
             ha.cmp(&hb).then_with(|| sign_of(a).cmp(sign_of(b)))
         });
-        while records.len() > 1 && container_len(&records) > rule.max_shard_bytes {
+        // A singleton is not exempt from the byte cap. Retaining an oversized
+        // final record would let append report success while GetSigned refuses
+        // the shard, which is especially dangerous for a durable outbox.
+        while !records.is_empty() && container_len(&records) > rule.max_shard_bytes {
             records.pop();
         }
     }
 
     sort_records(&mut records);
 
-    let delta: Vec<Value> =
-        records.iter().filter(|r| !local_signs.contains(sign_of(r))).cloned().collect();
+    let delta: Vec<Value> = records
+        .iter()
+        .filter(|r| !local_ids.contains(&payload_id(r)))
+        .cloned()
+        .collect();
 
     (make_pool_container(records), delta)
 }
@@ -666,6 +736,31 @@ pub fn merge_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn high_s_recovery_variant(signature: &str) -> String {
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .unwrap();
+        let order = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        let low_s = raw[33..65].to_vec();
+        let mut high_s = [0u8; 32];
+        let mut borrow = 0i16;
+        for index in (0..32).rev() {
+            let value = order[index] as i16 - low_s[index] as i16 - borrow;
+            if value < 0 {
+                high_s[index] = (value + 256) as u8;
+                borrow = 1;
+            } else {
+                high_s[index] = value as u8;
+                borrow = 0;
+            }
+        }
+        assert_eq!(borrow, 0);
+        raw[33..65].copy_from_slice(&high_s);
+        raw[0] = 27 + ((raw[0] - 27) ^ 1);
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
 
     fn rule() -> PoolRule {
         PoolRule {
@@ -908,6 +1003,12 @@ mod tests {
             "pow_bits": 8, "pad_buckets": [64], "max_record_bytes": 100, "max_shard_bytes": 100
         }))
         .is_none()); // fanout out of range
+        assert!(PoolRule::parse(&json!({
+            "dir": "pool", "class": POOL_RECORD_FORMAT, "since_week": 0, "fanout": 1,
+            "pow_bits": 0, "pad_buckets": [64], "max_record_bytes": 100,
+            "max_shard_bytes": 1
+        }))
+        .is_none()); // even an empty canonical shard could never be served
         let ok = PoolRule::parse(&json!({
             "dir": "pool/", "class": POOL_RECORD_FORMAT, "since_week": 5, "fanout": 16,
             "pow_bits": 22, "pad_buckets": [256, 64, 64, 128], "max_record_bytes": 45000,
@@ -1087,6 +1188,24 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_a_valid_high_s_signature_variant() {
+        let r = rule();
+        let epoch = 100;
+        let mut record = valid_record(epoch, 1, 128, 7);
+        let alternate = high_s_recovery_variant(record["sign"].as_str().unwrap());
+        assert!(epix_crypt::verify(
+            &record_signed_data(&record),
+            record["author"].as_str().unwrap(),
+            &alternate,
+        ));
+        record["sign"] = json!(alternate);
+        assert_eq!(
+            verify_pool_record(&record, &r, week_of(epoch), now_for(epoch)),
+            Err(PoolError::BadSignature)
+        );
+    }
+
+    #[test]
     fn merge_is_commutative_idempotent_and_returns_delta() {
         let r = rule();
         let epoch = 100;
@@ -1110,6 +1229,65 @@ mod tests {
         let (ab2, delta2) = merge_pool(&ab, &inbound, &r, week, sub, now);
         assert_eq!(ab2, ab, "idempotent");
         assert!(delta2.is_empty(), "no new records the second time");
+    }
+
+    #[test]
+    fn merge_dedups_compact_signature_header_variants() {
+        use base64::Engine as _;
+
+        let r = rule();
+        let epoch = 100;
+        let week = week_of(epoch);
+        let now = now_for(epoch);
+        let sub = 3u16;
+        let record = valid_record_at(epoch, sub as u8, 9, 128, 4);
+        let mut alternate = record.clone();
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(sign_of(&record))
+            .unwrap();
+        assert!((27..=30).contains(&raw[0]));
+        raw[0] += 4; // same recovery id, optional compressed-key flag
+        alternate["sign"] = json!(base64::engine::general_purpose::STANDARD.encode(raw));
+
+        assert_eq!(verify_pool_record(&record, &r, week, now), Ok(()));
+        assert_eq!(
+            verify_pool_record(&alternate, &r, week, now),
+            Err(PoolError::BadSignature),
+            "the optional recovery-header encoding is noncanonical for pool records"
+        );
+        assert_ne!(sign_of(&record), sign_of(&alternate));
+
+        let left = make_pool_container(vec![record]);
+        let right = make_pool_container(vec![alternate]);
+        let (lr, delta_lr) = merge_pool(&left, &right, &r, week, sub, now);
+        let (rl, delta_rl) = merge_pool(&right, &left, &r, week, sub, now);
+        assert_eq!(lr, rl, "both partitions choose the same canonical variant");
+        assert_eq!(
+            pool_records_of(&lr).len(),
+            1,
+            "one payload occupies one slot"
+        );
+        assert!(
+            delta_lr.is_empty(),
+            "alternate signature is not a new payload"
+        );
+        assert_eq!(
+            delta_rl.len(),
+            1,
+            "a canonical inbound record repairs a persisted noncanonical variant"
+        );
+
+        // Mirror the persistence seam, which writes only when delta is nonempty.
+        // A partition that had stored the formerly-accepted +4 variant therefore
+        // does replace it when it receives the canonical form.
+        let mut persisted = right;
+        if !delta_rl.is_empty() {
+            persisted = rl;
+        }
+        assert_eq!(
+            persisted, lr,
+            "write-on-delta storage converges to canonical bytes"
+        );
     }
 
     #[test]
@@ -1185,6 +1363,27 @@ mod tests {
         assert_eq!(c1, c2, "eviction converges regardless of arrival order");
         assert!(container_len(&pool_records_of(&c1)) <= r.max_shard_bytes);
         assert!(!pool_records_of(&c1).is_empty(), "keeps at least the highest-work record");
+    }
+
+    #[test]
+    fn oversized_singleton_is_rejected_by_capacity() {
+        let mut r = rule();
+        let epoch = 100;
+        let record = valid_record_at(epoch, 3, 1, 128, 1);
+        r.max_shard_bytes = container_len(&[record.clone()]).saturating_sub(1);
+
+        let (merged, delta) = merge_pool(
+            &make_pool_container(Vec::new()),
+            &make_pool_container(vec![record]),
+            &r,
+            week_of(epoch),
+            3,
+            now_for(epoch),
+        );
+
+        assert!(pool_records_of(&merged).is_empty());
+        assert!(delta.is_empty());
+        assert!(container_len(&pool_records_of(&merged)) <= r.max_shard_bytes);
     }
 
     #[test]

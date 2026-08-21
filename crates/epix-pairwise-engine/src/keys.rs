@@ -50,7 +50,7 @@ pub(crate) fn b64_32(s: &str) -> Option<[u8; 32]> {
 pub fn build_bundle(seed: &[u8; 32], xid: &str) -> Value {
     let idx = current_spk_idx();
     json!({
-        "v": 2,
+        "v": 3,
         "xid": xid,
         "ik": b64(&curve::public_key(&ik_priv(seed))),
         "spk": b64(&curve::public_key(&spk_priv(seed, idx))),
@@ -58,15 +58,65 @@ pub fn build_bundle(seed: &[u8; 32], xid: &str) -> Value {
     })
 }
 
-/// Validate a peer's published bundle's structure. Authenticity (that this
-/// bundle really belongs to `xid`) rests on the signed per-user `data.json`
-/// the node already verifies, plus the sealed-sender cross-check in `open_first`
-/// (the first message's inner `ik` must equal this bundle's `ik`).
+/// Domain-separated canonical payload signed by the linked auth key. The
+/// object is reconstructed field-by-field, so JSON insertion order and unknown
+/// fields cannot change the signed meaning.
+pub fn bundle_auth_payload(bundle: &Value) -> Option<String> {
+    let payload = json!({
+        "auth": bundle.get("auth")?.as_str()?,
+        "ik": bundle.get("ik")?.as_str()?,
+        "spk": bundle.get("spk")?.as_str()?,
+        "spk_idx": bundle.get("spk_idx")?.as_u64()?,
+        "v": bundle.get("v")?.as_i64()?,
+        "xid": bundle.get("xid")?.as_str()?,
+    });
+    Some(format!(
+        "epix-channel/bundle-auth/v1\n{}",
+        serde_json::to_string(&payload).ok()?
+    ))
+}
+
+/// Validate a peer's strict v3 bundle, including the linked auth signature over
+/// its canonical xID and key tuple. The loader separately binds that signed xID
+/// and auth address to the bundle's certified directory and filename.
 pub fn verify_bundle(bundle: &Value) -> bool {
-    bundle.get("v").and_then(|v| v.as_i64()) == Some(2)
-        && bundle.get("ik").and_then(|v| v.as_str()).and_then(b64_32).is_some()
-        && bundle.get("spk").and_then(|v| v.as_str()).and_then(b64_32).is_some()
+    const FIELDS: &[&str] = &["auth", "auth_sig", "ik", "spk", "spk_idx", "v", "xid"];
+    let Some(object) = bundle.as_object() else {
+        return false;
+    };
+    if object.len() != FIELDS.len() || !FIELDS.iter().all(|field| object.contains_key(*field)) {
+        return false;
+    }
+    bundle.get("v").and_then(|v| v.as_i64()) == Some(3)
+        && bundle.get("xid").and_then(|v| v.as_str()).is_some()
+        && bundle
+            .get("ik")
+            .and_then(|v| v.as_str())
+            .and_then(b64_32)
+            .is_some()
+        && bundle
+            .get("spk")
+            .and_then(|v| v.as_str())
+            .and_then(b64_32)
+            .is_some()
         && bundle.get("spk_idx").and_then(|v| v.as_u64()).is_some()
+        && bundle
+            .get("auth_sig")
+            .and_then(Value::as_str)
+            .is_some_and(epix_crypt::is_canonical_recoverable_signature)
+        && bundle_auth_payload(bundle).is_some_and(|payload| {
+            epix_crypt::verify_keccak(
+                &payload,
+                bundle
+                    .get("auth")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                bundle
+                    .get("auth_sig")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        })
 }
 
 /// Extract `(ik, spk, spk_idx)` from a peer bundle.
@@ -81,15 +131,46 @@ pub fn bundle_keys(bundle: &Value) -> Option<([u8; 32], [u8; 32], u32)> {
 mod tests {
     use super::*;
 
+    fn high_s_recovery_variant(signature: &str) -> String {
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .unwrap();
+        let order = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        let low_s = raw[33..65].to_vec();
+        let mut high_s = [0u8; 32];
+        let mut borrow = 0i16;
+        for index in (0..32).rev() {
+            let value = order[index] as i16 - low_s[index] as i16 - borrow;
+            if value < 0 {
+                high_s[index] = (value + 256) as u8;
+                borrow = 1;
+            } else {
+                high_s[index] = value as u8;
+                borrow = 0;
+            }
+        }
+        assert_eq!(borrow, 0);
+        raw[33..65].copy_from_slice(&high_s);
+        raw[0] = 27 + ((raw[0] - 27) ^ 1);
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
     fn good_bundle() -> Value {
-        build_bundle(&[1u8; 32], "bob.epix")
+        let key = epix_crypt::new_seed();
+        let auth = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut bundle = build_bundle(&[1u8; 32], "bob.epix");
+        bundle["auth"] = json!(auth);
+        let payload = bundle_auth_payload(&bundle).unwrap();
+        bundle["auth_sig"] = json!(epix_crypt::sign_keccak(&payload, &key).unwrap());
+        bundle
     }
 
     #[test]
     fn build_bundle_is_verifiable_and_deterministic() {
         let b = good_bundle();
         assert!(verify_bundle(&b));
-        assert_eq!(b, build_bundle(&[1u8; 32], "bob.epix"), "seed-deterministic");
+        assert_eq!(b["ik"], build_bundle(&[1u8; 32], "bob.epix")["ik"]);
         assert!(bundle_keys(&b).is_some());
     }
 
@@ -98,7 +179,7 @@ mod tests {
         // Wrong version (downgrade / version confusion).
         let mut b = good_bundle();
         b["v"] = json!(1);
-        assert!(!verify_bundle(&b), "v != 2 rejected");
+        assert!(!verify_bundle(&b), "v != 3 rejected");
         // Missing ik / spk / spk_idx.
         for field in ["ik", "spk", "spk_idx"] {
             let mut b = good_bundle();
@@ -112,7 +193,28 @@ mod tests {
         let mut b = good_bundle();
         b["spk"] = json!(b64(&[0u8; 16])); // 16 bytes, not 32
         assert!(!verify_bundle(&b), "wrong-length spk rejected");
-        assert!(bundle_keys(&b).is_none(), "bundle_keys also rejects short spk");
+        assert!(
+            bundle_keys(&b).is_none(),
+            "bundle_keys also rejects short spk"
+        );
+
+        let mut forged = good_bundle();
+        let sibling = epix_crypt::new_seed();
+        forged["auth"] = json!(epix_crypt::privatekey_to_address(&sibling).unwrap());
+        assert!(
+            !verify_bundle(&forged),
+            "auth cannot be swapped without its linked key"
+        );
+
+        let mut malleated = good_bundle();
+        let alternate = high_s_recovery_variant(malleated["auth_sig"].as_str().unwrap());
+        assert!(epix_crypt::verify_keccak(
+            &bundle_auth_payload(&malleated).unwrap(),
+            malleated["auth"].as_str().unwrap(),
+            &alternate,
+        ));
+        malleated["auth_sig"] = json!(alternate);
+        assert!(!verify_bundle(&malleated), "high-S auth signature rejected");
     }
 
     #[test]

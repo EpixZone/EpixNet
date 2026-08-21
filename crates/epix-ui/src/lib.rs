@@ -16,6 +16,7 @@ pub mod conn_pool;
 pub mod feed;
 pub mod geoip;
 pub mod local_feed;
+mod nmh_auth;
 pub mod paths;
 pub mod pool;
 pub mod state;
@@ -28,6 +29,9 @@ pub mod tracker;
 pub mod uipassword;
 
 pub use command::{CommandRegistry, WsCommand, WsSession};
+pub use nmh_auth::{
+    new_nmh_nonce, nmh_request_mac, nmh_request_mac_valid, nmh_response_mac, nmh_response_mac_valid,
+};
 pub use state::{
     self_exe, AppState, ContentSyncer, OnDemandResolver, PeerFinder, UpdateOutcome, XiteEntry,
     DEFAULT_SIZE_LIMIT_MB, UPDATE_PHASE_CHECKING, UPDATE_PHASE_UPDATING,
@@ -35,7 +39,7 @@ pub use state::{
 
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Json, Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::get,
@@ -50,6 +54,9 @@ use std::sync::Arc;
 /// The wrapper runtime (all.js / all.css / img / lib), embedded at build time.
 static UIMEDIA: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../ui/media");
 const WRAPPER_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/wrapper.html"));
+
+/// Authenticated node endpoint used by the separate native-messaging process.
+pub const NMH_RESOLVE_PATH: &str = "/EpixNet-Internal/Resolve";
 
 /// One plugin's `/uimedia/*` contributions.
 #[derive(Default, Clone)]
@@ -83,6 +90,10 @@ struct Ctx {
 /// The UI server.
 pub struct UiServer {
     ctx: Ctx,
+    /// A listener acquired by the node before it publishes its native-messaging
+    /// endpoint metadata. Keeping the socket here closes the probe-then-bind
+    /// race while preserving the existing `serve` API for other callers.
+    bound_listener: Option<std::net::TcpListener>,
 }
 
 impl UiServer {
@@ -118,13 +129,23 @@ impl UiServer {
                 #[cfg(feature = "bittorrent")]
                 bt,
             },
+            bound_listener: None,
         }
+    }
+
+    /// Retain an already-bound standard listener until the server future is
+    /// driven. The listener must be nonblocking before `serve` converts it to a
+    /// Tokio listener.
+    pub fn with_bound_listener(mut self, listener: std::net::TcpListener) -> Self {
+        self.bound_listener = Some(listener);
+        self
     }
 
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Status", get(serve_status))
+            .route(NMH_RESOLVE_PATH, axum::routing::post(serve_nmh_resolve))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
             .route("/uimedia/{*path}", get(serve_uimedia))
@@ -201,16 +222,32 @@ impl UiServer {
         router.with_state(self.ctx.clone())
     }
 
-    pub async fn serve(self, addr: SocketAddr) -> std::io::Result<()> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        self.serve_on(listener).await
+    pub async fn serve(mut self, addr: SocketAddr) -> std::io::Result<()> {
+        let listener = match self.bound_listener.take() {
+            Some(listener) => {
+                listener.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(listener)?
+            }
+            None => tokio::net::TcpListener::bind(addr).await?,
+        };
+        self.serve_listener(listener).await
     }
 
     /// Serve on an already-bound listener. Callers that must guarantee the UI
     /// is reachable before they proceed (the mobile shells point a web view at
     /// it the moment boot returns) bind first and hand the listener over, so
     /// there is no window where the port is not yet listening.
-    pub async fn serve_on(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
+    pub async fn serve_on(mut self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
+        if self.bound_listener.take().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "UI server already owns a bound listener",
+            ));
+        }
+        self.serve_listener(listener).await
+    }
+
+    async fn serve_listener(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
         let addr = listener.local_addr()?;
         // EpixNet enables the cross-origin gate by default only on a loopback
         // bind (a LAN/public bind is a deliberate multi-client deployment);
@@ -221,11 +258,16 @@ impl UiServer {
         // routes already understand, BEFORE routing. `Router::layer` runs after
         // route matching, so the rewrite is a `map_request` around the whole
         // router served per-connection via `Shared`.
-        let app = tower::ServiceExt::<axum::extract::Request>::map_request(
+        let rewritten = tower::ServiceExt::<axum::extract::Request>::map_request(
             self.router(),
             rewrite_proxy_host,
         );
-        axum::serve(listener, tower::make::Shared::new(app)).await
+        let app = Router::new().fallback_service(rewritten);
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
     }
 
     /// Spawn the local admin socket at `path` (a Unix domain socket). Each
@@ -848,6 +890,102 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct NmhResolveRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    nonce: String,
+    #[serde(default)]
+    mac: String,
+}
+
+fn signed_nmh_resolve_response(
+    token: &str,
+    request: &NmhResolveRequest,
+    status: StatusCode,
+    address: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    let response_mac = match nmh_response_mac(
+        token,
+        &request.nonce,
+        &request.name,
+        status.as_u16(),
+        address,
+        error,
+    ) {
+        Ok(mac) => mac,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "native-messaging response authentication failed" })),
+            )
+                .into_response();
+        }
+    };
+    let mut body = json!({
+        "nonce": request.nonce,
+        "mac": response_mac,
+    });
+    if let Some(address) = address {
+        body["address"] = json!(address);
+    }
+    if let Some(error) = error {
+        body["error"] = json!(error);
+    }
+    (status, Json(body)).into_response()
+}
+
+/// Resolve through the node-owned, finality-configured resolver. The native
+/// host runs in another process and must not instantiate an unpinned resolver
+/// of its own. A nonce-bound request MAC prevents a web page from using
+/// loopback requests to leak names to the chain. The authenticated response
+/// also lets the native host reject a process that has captured a stale port.
+async fn serve_nmh_resolve(
+    State(ctx): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(request): Json<NmhResolveRequest>,
+) -> Response {
+    if !peer.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "native-messaging endpoint is loopback-only" })),
+        )
+            .into_response();
+    }
+    let token = ctx.state.nmh_token();
+    if !nmh_request_mac_valid(token, &request.nonce, &request.name, &request.mac) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "native-messaging authentication failed" })),
+        )
+            .into_response();
+    }
+    let name = request.name.trim();
+    if name.is_empty() {
+        return signed_nmh_resolve_response(
+            token,
+            &request,
+            StatusCode::BAD_REQUEST,
+            None,
+            Some("resolve name is empty"),
+        );
+    }
+    match ctx.state.resolve_on_demand(name).await {
+        Some(address) => {
+            signed_nmh_resolve_response(token, &request, StatusCode::OK, Some(&address), None)
+        }
+        None => signed_nmh_resolve_response(
+            token,
+            &request,
+            StatusCode::BAD_GATEWAY,
+            None,
+            Some(&format!("could not resolve {name}")),
+        ),
+    }
 }
 
 /// `/{address}` → `/{address}/` (so a xite URL works without the trailing slash).

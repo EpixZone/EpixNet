@@ -2471,13 +2471,16 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 3.0.0",
+ "fslock-guard",
  "hex",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2507,6 +2510,7 @@ dependencies = [
  "base64 0.23.1",
  "epix-core",
  "epix-crypt",
+ "hex",
  "regex",
  "serde",
  "serde_json",
@@ -2644,7 +2648,6 @@ name = "epix-ffi"
 version = "0.1.0"
 dependencies = [
  "epix-build",
- "epix-chain",
  "epix-core",
  "epix-node",
  "thiserror 2.0.20",
@@ -2689,7 +2692,7 @@ dependencies = [
 name = "epix-nmh"
 version = "0.1.0"
 dependencies = [
- "epix-chain",
+ "epix-core",
  "epix-node",
  "hidapi",
  "reqwest",
@@ -2716,10 +2719,12 @@ dependencies = [
  "epix-ui",
  "epix-worker",
  "epix-xite",
+ "fslock-guard",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing-subscriber 0.3.23",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2729,6 +2734,7 @@ dependencies = [
  "base64 0.23.1",
  "chacha20poly1305 0.10.1",
  "curve25519-elligator2",
+ "epix-crypt",
  "epix-envelope",
  "getrandom 0.4.3",
  "hex",
@@ -2780,6 +2786,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2829,6 +2836,7 @@ name = "epix-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "epix-blob",
  "epix-bt",
  "epix-content",
@@ -2961,6 +2969,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "hmac 0.13.0",
  "include_dir",
  "libc",
  "maxminddb",
@@ -3023,6 +3032,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

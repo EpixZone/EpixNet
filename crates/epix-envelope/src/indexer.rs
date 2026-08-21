@@ -49,6 +49,9 @@ pub struct SendResult {
     pub epoch: i64,
     /// The row id of the sender's own copy in the private index.
     pub msg_id: i64,
+    /// Durable outbox row containing `record`. The transport removes it only
+    /// after the pool append succeeds.
+    pub outbox_id: i64,
 }
 
 pub(crate) fn eng_err(e: EngineError) -> Error {
@@ -121,6 +124,38 @@ where
     S: EnvelopeStore,
     R: Fn(&str) -> Vec<Value>,
 {
+    process_record_with_peer_status(
+        store,
+        engine,
+        identities,
+        record,
+        now_ms,
+        resolve_bundle,
+        |_, _| None,
+    )
+}
+
+/// [`process_record`] with a caller-supplied current peer-device status gate.
+/// `Some(false)` means chain data definitely revoked that name or device, and
+/// the matching record is discarded without advancing its ratchet. `None`
+/// preserves established-session delivery during a chain outage or incomplete
+/// bundle sync.
+#[allow(clippy::too_many_arguments)]
+pub fn process_record_with_peer_status<E, S, R, A>(
+    store: &S,
+    engine: &E,
+    identities: &[(i64, IdentitySecret, String)],
+    record: &Value,
+    now_ms: i64,
+    resolve_bundle: R,
+    peer_active: A,
+) -> Result<Vec<ProcessOutcome>>
+where
+    E: Engine + ?Sized,
+    S: EnvelopeStore,
+    R: Fn(&str) -> Vec<Value>,
+    A: Fn(&str, &str) -> Option<bool>,
+{
     let Some(sign) = record.get("sign").and_then(|v| v.as_str()) else {
         return Ok(Vec::new());
     };
@@ -149,7 +184,17 @@ where
     let mut outcomes = Vec::new();
     let mut delivered: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
-    scan_established(store, engine, &unpacked, &h, epoch, now_ms, &mut outcomes, &mut delivered)?;
+    scan_established(
+        store,
+        engine,
+        &unpacked,
+        &h,
+        epoch,
+        now_ms,
+        &peer_active,
+        &mut outcomes,
+        &mut delivered,
+    )?;
     scan_first_contact(
         store, engine, identities, &unpacked, &h, epoch, now_ms, &resolve_bundle, &mut outcomes,
         &mut delivered,
@@ -165,20 +210,36 @@ where
 /// matched but the ratchet couldn't open it (e.g. a dummy tag collision) — the
 /// identity is left undelivered so Tier-2 can still probe it.
 #[allow(clippy::too_many_arguments)]
-fn scan_established<E: Engine + ?Sized, S: EnvelopeStore>(
+fn scan_established<E: Engine + ?Sized, S: EnvelopeStore, A>(
     store: &S,
     engine: &E,
     unpacked: &crate::multislot::Unpacked,
     h: &[u8],
     epoch: i64,
     now_ms: i64,
+    peer_active: &A,
     outcomes: &mut Vec<ProcessOutcome>,
     delivered: &mut std::collections::HashSet<i64>,
-) -> Result<()> {
+) -> Result<()>
+where
+    A: Fn(&str, &str) -> Option<bool>,
+{
     for (j, tag) in unpacked.tags.iter().enumerate() {
         let tag_vec = tag.to_vec();
         let Some(sm) = store.session_for_tag(&tag_vec)? else { continue };
         if delivered.contains(&sm.identity_id) || store.is_processed(h, sm.identity_id)? {
+            continue;
+        }
+        if sm
+            .peer_xid
+            .as_deref()
+            .is_some_and(|xid| peer_active(xid, &sm.peer_ik) == Some(false))
+        {
+            // This hidden expected tag proves the record targets the revoked
+            // session. Drop it permanently without consuming or advancing the
+            // ratchet. Indeterminate status never reaches this branch.
+            store.mark_processed(h, sm.identity_id)?;
+            delivered.insert(sm.identity_id);
             continue;
         }
         if let Some(out) = open_established(
@@ -288,7 +349,8 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
     let sender = sm.peer_xid.clone();
     let commit = InboundCommit {
         identity_id: sm.identity_id,
-        session_id: sm.session_id,
+        session_id: Some(sm.session_id),
+        new_session: None,
         conv_id: sm.conv_id.clone(),
         peer_xid: sm.peer_xid.clone(),
         sender_xid: sender.clone(),
@@ -365,10 +427,11 @@ where
     };
     // Authentic iff the transcript key matches ANY of the sender's published
     // device bundles (a multi-device sender may seal from any linked key).
-    let matches = resolve_bundle(&bp.sender_xid)
+    let bundles = resolve_bundle(&bp.sender_xid);
+    let matched_bundle = bundles
         .iter()
-        .any(|b| engine.sender_ik(b).as_ref() == Some(ik_a));
-    if !matches {
+        .find(|b| engine.sender_ik(b).as_ref() == Some(ik_a));
+    let Some(matched_bundle) = matched_bundle else {
         // No matching bundle: either a forgery, or a genuine message from a
         // device whose bundle this node has not synced YET. We cannot tell the
         // two apart from the transcript alone, so DEFER by returning `None` (this
@@ -379,9 +442,19 @@ where
         // re-probed (a bounded, PoW-gated cost) and never trusted. The IK never
         // matches for a forgery, so it can never be indexed.
         return Ok(None);
-    }
+    };
+    let peer_auth = matched_bundle.get("auth").and_then(|a| a.as_str());
 
-    let sender = Some(bp.sender_xid.clone());
+    // Attribute and persist the authenticated bundle name, not a spelling from
+    // the encrypted body. Production loaders require this field to equal the
+    // canonical cert-gated directory name.
+    let sender = Some(
+        matched_bundle
+            .get("xid")
+            .and_then(Value::as_str)
+            .unwrap_or(&bp.sender_xid)
+            .to_string(),
+    );
     let conv_hex = hex::encode(op.conv_id);
     // Leg key: the sender DEVICE's transcript-bound identity key, so two devices
     // of one human sender get separate ratchets and never collide on the name.
@@ -400,19 +473,22 @@ where
     }
 
     let recv = to_tag_vecs(&op.next_recv_tags);
-    let session_id = store.create_session(crate::store::NewSession {
-        identity_id,
-        conv_id: &conv_hex,
-        peer_xid: sender.as_deref(),
-        peer_ik: &peer_ik,
-        role: "resp",
-        ratchet: &op.session_after,
-        established_ms: now_ms,
-        recv_tags: &recv,
-    })?;
     let commit = InboundCommit {
         identity_id,
-        session_id,
+        session_id: None,
+        new_session: Some(crate::store::OutboundSession {
+            session_id: None,
+            identity_id,
+            conv_id: conv_hex.clone(),
+            peer_xid: sender.clone(),
+            peer_ik,
+            peer_auth: peer_auth.map(String::from),
+            role: "resp".into(),
+            ratchet_before: None,
+            ratchet_after: op.session_after.clone(),
+            established_ms: now_ms,
+            recv_tags: recv,
+        }),
         conv_id: conv_hex.clone(),
         peer_xid: sender.clone(),
         sender_xid: sender.clone(),

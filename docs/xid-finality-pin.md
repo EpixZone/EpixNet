@@ -4,27 +4,43 @@ Client-side xID finality verification is a **setting plus a pinned validator
 set**, not a flag on its own. When a pin is installed, the node REQUIRES every
 xID resolution to be a Merkle proof rooted at a state digest signed by more than
 two thirds of the pinned voting power, and fails closed otherwise (a malicious or
-lagging RPC cannot forge a resolution). Without a pin, resolution falls back to
-the legacy RPC-trusted path.
+lagging RPC cannot forge a resolution). Without a pin, startup fails closed.
+
+## Merge blocker
+
+The chain upgrade that produces signed mainnet attestations is scheduled but is
+not live yet. A real `xid_pin.json` cannot be captured before that height. Do not
+merge or ship this branch until the post-upgrade pin has been captured, checked,
+and included in release packaging. Never fabricate a placeholder pin.
 
 ## How the node turns it on
 
 At boot the node reads `xid_pin.json` from its data root:
 
-- present and valid → `install_finality_pin` loads it and enables verification
+- present and valid: `install_finality_pin` loads it and enables verification
   (logged: `xID finality: pinned N validators; resolution now requires >2/3
   attestation`).
-- absent → legacy RPC-trusted resolution (logged as a `WARN`).
+- absent: startup fails closed. For pre-upgrade development only, an operator
+  can explicitly set `EPIX_XID_ALLOW_INSECURE_LEGACY=1`. This is logged as an
+  insecure compatibility mode and must not be set in an official release.
+- unreadable or invalid: startup fails closed, even when the compatibility
+  variable is set.
 
-So **requiring finality == shipping `xid_pin.json`**. Drop the file in, restart.
+The node also restores `xid_finality_checkpoint.json` from the data root. It
+contains the highest accepted height and digest. Every newer checkpoint is
+written atomically and synced before the resolution succeeds. Corruption, an
+I/O error, a lower height, or a different digest at the same height fails closed.
+
+So **requiring finality means shipping `xid_pin.json`**. Drop the trusted file
+in, restart, and confirm the finality log line.
 
 ## Why the pin can only be captured AFTER the chain upgrade
 
 The pin is the mainnet validator set that signs xID state digests. Those
 signatures only exist once the **v0.7.2 attestation upgrade** is live (before
-then there is nothing to pin). This is exactly why this branch is not merged to
-`main` until the chain upgrade completes: capture the pin from mainnet first,
-commit it, then merge.
+then there is nothing to pin). This is exactly why this branch must not be merged
+to `main` until the chain upgrade completes: capture the pin from mainnet first,
+validate it, include it in release packaging, then merge.
 
 ## Capturing the pin (post-upgrade)
 

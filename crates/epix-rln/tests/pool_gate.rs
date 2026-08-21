@@ -33,22 +33,78 @@ fn gate_admits_dedups_rejects_nonmember_and_evicts_double_signal() {
     // --- an honest message is admitted ---
     let ct1 = b"alice payload one";
     let p1 = gate.prove(&alice, 0, epoch, 0, 1, ct1).expect("prove 1");
-    assert!(matches!(gate.admit(&p1, ct1, epoch, 1, &[root]), Admission::Admit));
+    let logical_id = [7; 32];
+    assert!(matches!(
+        gate.admit_with_id(logical_id, &p1, ct1, epoch, 1, &[root]),
+        Admission::Admit
+    ));
 
     // --- a re-broadcast of the same record is a duplicate, not a violation ---
-    assert!(matches!(gate.admit(&p1, ct1, epoch, 1, &[root]), Admission::Duplicate));
+    assert!(matches!(
+        gate.admit_with_id(logical_id, &p1, ct1, epoch, 1, &[root]),
+        Admission::Duplicate {
+            keep_record: false,
+            replace_record: true,
+            ..
+        }
+    ));
+
+    // A roster change alters the proof wrapper but not the logical ciphertext.
+    // The current-root proof is verified and may replace the retained wrapper,
+    // while application delivery remains suppressed as a duplicate.
+    let bob = RlnIdentity::from_seed(b"bob.epix/ecx");
+    gate.enroll(1, &bob).expect("enroll bob");
+    let rotated_root = gate.root();
+    assert_ne!(rotated_root, root);
+    let current_proof = gate.prove(&alice, 0, epoch, 0, 1, ct1).expect("reprove 1");
+    assert!(matches!(
+        gate.admit_with_id(logical_id, &current_proof, ct1, epoch, 1, &[rotated_root]),
+        Admission::Duplicate {
+            keep_record: false,
+            replace_record: true,
+            ..
+        }
+    ));
 
     // --- a second, distinct message in the same epoch is dropped (rate limit)
     //     and reveals the offender; detection alone does NOT change the root ---
     let ct2 = b"alice payload two";
     let p2 = gate.prove(&alice, 0, epoch, 0, 1, ct2).expect("prove 2");
-    match gate.admit(&p2, ct2, epoch, 1, &[root]) {
-        Admission::RateExceeded { offender_commitment } => {
-            assert_eq!(offender_commitment, alice.commitment(), "reveal must identify alice");
+    match gate.admit(&p2, ct2, epoch, 1, &[rotated_root]) {
+        Admission::RateExceeded {
+            offender_commitment,
+            evicted_records,
+            poisoned_nullifiers,
+        } => {
+            assert_eq!(
+                offender_commitment,
+                alice.commitment(),
+                "reveal must identify alice"
+            );
+            assert!(
+                !evicted_records.is_empty(),
+                "the prior record is quarantined"
+            );
+            assert!(
+                !poisoned_nullifiers.is_empty(),
+                "the conflicting component yields durable poison"
+            );
+            gate.poison_nullifiers(epoch, &poisoned_nullifiers);
         }
         other => panic!("second message in one epoch must exceed the rate, got {other:?}"),
     }
-    assert_eq!(gate.root(), root, "detection alone must not change the root (owner-signed model)");
+    assert_eq!(
+        gate.root(),
+        rotated_root,
+        "detection alone must not change the root (owner-signed model)"
+    );
+
+    let ct3 = b"alice payload three";
+    let p3 = gate.prove(&alice, 0, epoch, 0, 1, ct3).expect("prove 3");
+    assert!(matches!(
+        gate.admit(&p3, ct3, epoch, 1, &[rotated_root]),
+        Admission::Quarantined
+    ));
 
     // --- explicit (owner-driven) eviction removes alice and changes the root ---
     assert!(gate.evict_member(&alice.commitment()), "alice was a member");
@@ -72,4 +128,10 @@ fn owner_roster_root_matches_enrollment_and_hex_roundtrips() {
     gate.enroll(0, &alice).expect("enroll alice");
     gate.enroll(1, &bob).expect("enroll bob");
     assert_eq!(roster.root(), gate.root(), "owner-list root must match enrollment");
+}
+
+#[test]
+fn zero_allowance_is_rejected() {
+    assert!(PoolGate::new(Fr::from(DOMAIN), 0).is_err());
+    assert!(PoolGate::from_roster(Fr::from(DOMAIN), 0, &[]).is_err());
 }

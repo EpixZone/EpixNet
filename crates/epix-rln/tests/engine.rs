@@ -42,21 +42,29 @@ fn weighted_spend_reuse_reveals_and_underpay_rejected() {
     let p1 = rln.prove(&id, &m, 0, epoch, 0, 3, ct1).unwrap();
     let v1 = rln.verify(&p1, &[root], epoch, ct1, 3).unwrap();
     assert_eq!(v1.slots.len(), 3, "a 3-unit record carries 3 slots");
-    assert!(matches!(log.observe(epoch, &v1.slots).unwrap(), Observation::Fresh));
+    assert!(matches!(
+        log.observe(epoch, [1; 32], &v1.slots).unwrap(),
+        Observation::Fresh
+    ));
 
     // A different record spending the NEXT fresh unit is fine.
     let ct2 = b"a one-unit record";
     let p2 = rln.prove(&id, &m, 0, epoch, 3, 1, ct2).unwrap();
     let v2 = rln.verify(&p2, &[root], epoch, ct2, 1).unwrap();
-    assert!(matches!(log.observe(epoch, &v2.slots).unwrap(), Observation::Fresh));
+    assert!(matches!(
+        log.observe(epoch, [2; 32], &v2.slots).unwrap(),
+        Observation::Fresh
+    ));
 
     // Reusing an already-spent unit (0) in a NEW record double-signals: the
     // offender's secret is recovered and identifies exactly Alice.
     let ct3 = b"reuse of unit zero";
     let p3 = rln.prove(&id, &m, 0, epoch, 0, 1, ct3).unwrap();
     let v3 = rln.verify(&p3, &[root], epoch, ct3, 1).unwrap();
-    match log.observe(epoch, &v3.slots).unwrap() {
-        Observation::DoubleSignal { recovered_secret } => {
+    match log.observe(epoch, [3; 32], &v3.slots).unwrap() {
+        Observation::DoubleSignal {
+            recovered_secret, ..
+        } => {
             assert_eq!(commitment_of_secret(&recovered_secret), id.commitment());
         }
         _ => panic!("reusing a spent unit must double-signal"),
@@ -69,6 +77,69 @@ fn weighted_spend_reuse_reveals_and_underpay_rejected() {
     assert!(matches!(
         rln.verify(&p4, &[root], epoch, ct4, 3),
         Err(RlnError::WrongUnits { got: 1, want: 3 })
+    ));
+}
+
+#[test]
+fn partial_same_signal_overlap_is_rejected_without_burning_new_units() {
+    let (rln, m, id, root) = member();
+    let mut log = NullifierLog::new();
+    let epoch = 101u64;
+    let ct = b"one ciphertext with sliding allowance windows";
+
+    let first = rln.prove(&id, &m, 0, epoch, 0, 2, ct).unwrap();
+    let first = rln.verify(&first, &[root], epoch, ct, 2).unwrap();
+    assert!(matches!(
+        log.observe(epoch, [1; 32], &first.slots).unwrap(),
+        Observation::Fresh
+    ));
+
+    // Same signal means the overlapping slot has the same Shamir share. The
+    // old any-new rule admitted this sliding window and burned unit 2.
+    let overlap = rln.prove(&id, &m, 0, epoch, 1, 2, ct).unwrap();
+    let overlap = rln.verify(&overlap, &[root], epoch, ct, 2).unwrap();
+    assert!(matches!(
+        log.observe(epoch, [2; 32], &overlap.slots).unwrap(),
+        Observation::PartialOverlap {
+            keep_record: false,
+            ref evicted_records,
+        } if evicted_records.is_empty()
+    ));
+
+    // Opposite first-seen order selects the same lower record id and explicitly
+    // evicts the prior window, so persisted callers can converge too.
+    let mut opposite = NullifierLog::new();
+    assert!(matches!(
+        opposite.observe(epoch, [2; 32], &overlap.slots).unwrap(),
+        Observation::Fresh
+    ));
+    assert!(matches!(
+        opposite.observe(epoch, [1; 32], &first.slots).unwrap(),
+        Observation::PartialOverlap {
+            keep_record: true,
+            ref evicted_records,
+        } if evicted_records == &vec![[2; 32]]
+    ));
+
+    // Equivalent wrappers carrying the exact same proof also converge by id.
+    assert!(matches!(
+        opposite.observe(epoch, [0; 32], &first.slots).unwrap(),
+        Observation::Replay {
+            keep_record: true,
+            ref evicted_records,
+        } if evicted_records == &vec![[1; 32]]
+    ));
+
+    // Unit 2 remained fresh because the rejected overlap mutated no state.
+    let fresh = rln
+        .prove(&id, &m, 0, epoch, 2, 1, b"fresh unit two")
+        .unwrap();
+    let fresh = rln
+        .verify(&fresh, &[root], epoch, b"fresh unit two", 1)
+        .unwrap();
+    assert!(matches!(
+        log.observe(epoch, [3; 32], &fresh.slots).unwrap(),
+        Observation::Fresh
     ));
 }
 

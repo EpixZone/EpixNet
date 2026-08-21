@@ -215,6 +215,22 @@ pub fn sign_keccak(data: &str, privatekey: &str) -> Result<String, String> {
     sign_digest(&digest_keccak(data.as_bytes()), privatekey)
 }
 
+/// Whether a base64 compact signature uses the one canonical recovery header
+/// emitted by this crate. Headers 31..=34 only toggle Bitcoin's legacy
+/// compressed-public-key flag. Epix addresses always recover from the same
+/// uncompressed SEC1 key, so accepting both forms creates an unauthenticated
+/// alternate encoding of an otherwise identical signed record.
+pub fn is_canonical_recoverable_signature(sig_b64: &str) -> bool {
+    base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .is_ok_and(|raw| {
+            raw.len() == 65
+                && (27..=30).contains(&raw[0])
+                && Signature::from_slice(&raw[1..])
+                    .is_ok_and(|signature| signature.normalize_s() == signature)
+        })
+}
+
 fn recover_address(digest: &[u8; 32], sig_b64: &str) -> Result<String, String> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(sig_b64)
@@ -325,5 +341,54 @@ mod tests {
         let sigk = sign_keccak(data, priv_hex).unwrap();
         assert!(verify_keccak(data, &addr, &sigk));
         assert!(!verify_keccak(data, &addr, &sig)); // wrong hash format
+    }
+
+    #[test]
+    fn compressed_header_variant_is_not_canonical() {
+        let pk = new_seed();
+        let sig = sign("canonical-header", &pk).unwrap();
+        assert!(is_canonical_recoverable_signature(&sig));
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(sig)
+            .unwrap();
+        raw[0] += 4;
+        let alternate = base64::engine::general_purpose::STANDARD.encode(raw);
+        assert!(!is_canonical_recoverable_signature(&alternate));
+    }
+
+    #[test]
+    fn high_s_recovery_variant_is_valid_but_not_canonical() {
+        let private_key = new_seed();
+        let address = privatekey_to_address(&private_key).unwrap();
+        let data = "canonical-low-s";
+        let signature = sign(data, &private_key).unwrap();
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .unwrap();
+
+        // secp256k1 signatures are malleable: (r, s, recid) and
+        // (r, n-s, recid^1) recover the same key. Construct the latter.
+        let order = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        let low_s = raw[33..65].to_vec();
+        let mut high_s = [0u8; 32];
+        let mut borrow = 0i16;
+        for index in (0..32).rev() {
+            let value = order[index] as i16 - low_s[index] as i16 - borrow;
+            if value < 0 {
+                high_s[index] = (value + 256) as u8;
+                borrow = 1;
+            } else {
+                high_s[index] = value as u8;
+                borrow = 0;
+            }
+        }
+        assert_eq!(borrow, 0);
+        raw[33..65].copy_from_slice(&high_s);
+        raw[0] = 27 + ((raw[0] - 27) ^ 1);
+        let alternate = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        assert!(verify(data, &address, &alternate));
+        assert!(!is_canonical_recoverable_signature(&alternate));
     }
 }

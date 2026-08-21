@@ -40,6 +40,11 @@ impl Membership {
 
     /// A new, empty membership tree with the given per-epoch message allowance.
     pub fn new(user_message_limit: u32) -> Result<Self, RlnError> {
+        if user_message_limit == 0 {
+            return Err(RlnError::Membership(
+                "user message limit must be at least one".into(),
+            ));
+        }
         let tree = OptimalMerkleTree::new(
             DEFAULT_TREE_DEPTH,
             Fr::from(0u64),

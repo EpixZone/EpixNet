@@ -21,8 +21,9 @@
 //! signed app release, and this module fails closed when the pin is older than
 //! `ws_period`. Because each attestation IS a consensus precommit, equivocation is
 //! covered by CometBFT double-sign slashing. Security rules (each has a test):
-//! verify against the PINNED pubkey; dedup by valcons; strict `sum*3 > total*2` +
-//! a `min_power_bps` buffer; freshness + monotonic height; WS pin-expiry.
+//! verify against the PINNED pubkey; dedup by valcons within one consensus round;
+//! strict `sum*3 > total*2` + a `min_power_bps` buffer; freshness + monotonic
+//! height; WS pin-expiry.
 
 use std::collections::{HashMap, HashSet};
 
@@ -62,9 +63,44 @@ impl PinnedSet {
         chain_id: impl Into<String>,
         pinned_at_unix: i64,
         pinned_at_height: u64,
-    ) -> Self {
-        let total_power = validators.values().map(|v| v.voting_power).sum();
-        Self { validators, total_power, chain_id: chain_id.into(), pinned_at_unix, pinned_at_height }
+    ) -> Result<Self, String> {
+        let chain_id = chain_id.into();
+        if chain_id.trim().is_empty() || chain_id.trim() != chain_id {
+            return Err("pin: chain_id must be non-empty and canonical".into());
+        }
+        if pinned_at_unix <= 0 {
+            return Err("pin: pinned_at_unix must be positive".into());
+        }
+        if pinned_at_height == 0 {
+            return Err("pin: pinned_at_height must be positive".into());
+        }
+        if validators.is_empty() {
+            return Err("pin: no validators".into());
+        }
+
+        let mut pubkeys = HashSet::new();
+        let mut total_power = 0u64;
+        for (valcons, validator) in &validators {
+            if valcons.trim().is_empty() || valcons.trim() != valcons {
+                return Err("pin: valcons must be non-empty and canonical".into());
+            }
+            if validator.voting_power == 0 {
+                return Err(format!("pin: validator {valcons} has zero voting power"));
+            }
+            if !pubkeys.insert(validator.pubkey) {
+                return Err("pin: duplicate consensus pubkey".into());
+            }
+            total_power = total_power
+                .checked_add(validator.voting_power)
+                .ok_or_else(|| "pin: total voting power overflows u64".to_string())?;
+        }
+        Ok(Self {
+            validators,
+            total_power,
+            chain_id,
+            pinned_at_unix,
+            pinned_at_height,
+        })
     }
 }
 
@@ -76,9 +112,9 @@ pub struct AttestationEntry {
     pub valcons: String,
     pub signature: Vec<u8>,
     pub vote_extension: Vec<u8>,
-    /// The consensus round THIS extension was signed at. Usually the shared commit
-    /// round, but reproduced per-attestation so a mixed-round response can't force
-    /// the wrong round into another validator's sign bytes and drop its vote.
+    /// The consensus round THIS extension was signed at. A commit has one round.
+    /// Verification groups attestations by this field and requires quorum in one
+    /// group, so an RPC cannot manufacture a quorum from votes across rounds.
     pub round: u64,
 }
 
@@ -232,7 +268,12 @@ pub fn verify_finality(
     pinned: &PinnedSet,
     params: &VerifyParams,
 ) -> Result<u64, FinalityError> {
-    if params.now_unix.saturating_sub(pinned.pinned_at_unix) > params.ws_period_secs {
+    if !crate::pin_within_weak_subjectivity(
+        pinned.pinned_at_unix,
+        params.now_unix,
+        params.ws_period_secs,
+        params.skew_secs,
+    ) {
         return Err(FinalityError::PinExpired);
     }
     if bundle.height < pinned.pinned_at_height {
@@ -254,17 +295,26 @@ pub fn verify_finality(
         _ => return Err(FinalityError::BadDigest),
     }
 
-    let mut counted: HashSet<&str> = HashSet::new();
-    let mut power: u64 = 0;
+    let mut counted_by_round: HashMap<u64, HashSet<&str>> = HashMap::new();
+    let mut power_by_round: HashMap<u64, u64> = HashMap::new();
     for att in &bundle.attestations {
-        // The payload must be for THIS bundle's digest + canonical block_time.
-        let Some((_h, ext_bt, ext_digest)) = parse_vote_extension(&att.vote_extension) else {
+        // The payload must be for THIS bundle's height, digest, and canonical
+        // block time. All three are controlled by the RPC until a signature
+        // binds them, so none may be ignored here.
+        let Some((ext_height, ext_bt, ext_digest)) = parse_vote_extension(&att.vote_extension)
+        else {
             continue;
         };
-        if ext_digest != bundle.digest_hex || ext_bt != bundle.block_time_unix {
+        if ext_height != bundle.height
+            || ext_digest != bundle.digest_hex
+            || ext_bt != bundle.block_time_unix
+        {
             continue;
         }
-        let Some(v) = pinned.validators.get(&att.valcons) else { continue };
+        let Some(v) = pinned.validators.get(&att.valcons) else {
+            continue;
+        };
+        let counted = counted_by_round.entry(att.round).or_default();
         if counted.contains(att.valcons.as_str()) {
             continue;
         }
@@ -279,11 +329,16 @@ pub fn verify_finality(
         );
         if vk.verify_strict(&msg, &sig).is_ok() {
             counted.insert(att.valcons.as_str());
-            power = power.saturating_add(v.voting_power);
+            let power = power_by_round.entry(att.round).or_default();
+            *power = power.saturating_add(v.voting_power);
         }
     }
 
     let total = pinned.total_power;
+    // A CometBFT commit has one consensus round. Select the strongest single
+    // round only. Summing power across rounds would allow a hostile RPC to join
+    // several valid, sub-quorum vote sets into a commit that never existed.
+    let power = power_by_round.values().copied().max().unwrap_or(0);
     let strict_supermajority = (power as u128) * 3 > (total as u128) * 2;
     let meets_buffer = (power as u128) * 10_000 >= (total as u128) * (params.min_power_bps as u128);
     if total == 0 || !strict_supermajority || !meets_buffer {
@@ -321,13 +376,16 @@ fn b64_or_hex(s: &str) -> Option<Vec<u8>> {
 
 /// Parse the `/xid/v1/attestations` response into a [`FinalityBundle`] for
 /// `digest_hex`. `signature` is hex; `vote_extension` is base64 (proto `bytes` via
-/// the gateway); `round` is read per-attestation (shared across the commit).
+/// the gateway); `round` is read per-attestation. Verification still requires
+/// one round to carry quorum.
 /// Legacy `auto:consensus` entries (non-hex signature / empty extension) are dropped.
 pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityBundle> {
     let height = num_u64(v.get("height"))?;
     let block_time_unix = num_i64(v.get("block_time"))?;
     let atts = v.get("attestations")?.as_array()?;
-    let mut round = 0u64;
+    let response_round = num_u64(v.get("round"));
+    let mut round = response_round.unwrap_or(0);
+    let mut saw_round = response_round.is_some();
     let mut attestations = Vec::with_capacity(atts.len());
     for a in atts {
         let valcons = match a.get("validator_cons_addr").and_then(|x| x.as_str()) {
@@ -341,12 +399,20 @@ pub fn parse_bundle(digest_hex: &str, v: &serde_json::Value) -> Option<FinalityB
         else {
             continue;
         };
-        // Each attestation carries (or shares) its own round; reproduce it per
-        // entry so a mixed-round response can't drop otherwise-valid votes. Fall
-        // back to the most-recently-seen round when an entry omits it.
-        let att_round = num_u64(a.get("round")).unwrap_or(round);
+        // Prefer the entry's signed round. If the API uses a shared top-level
+        // round, apply it to entries that omit the field. Do not inherit a
+        // previous entry's round because entries are independent.
+        let att_round = num_u64(a.get("round")).or(response_round).unwrap_or(0);
+        if !saw_round {
         round = att_round;
-        attestations.push(AttestationEntry { valcons, signature, vote_extension, round: att_round });
+            saw_round = true;
+        }
+        attestations.push(AttestationEntry {
+            valcons,
+            signature,
+            vote_extension,
+            round: att_round,
+        });
     }
     Some(FinalityBundle { digest_hex: digest_hex.to_string(), height, round, block_time_unix, attestations })
 }
@@ -392,7 +458,10 @@ mod tests {
             );
             keys.push((valcons, sk));
         }
-        (PinnedSet::new(validators, CHAIN, 1_000_000, 100), keys)
+        (
+            PinnedSet::new(validators, CHAIN, 1_000_000, 100).unwrap(),
+            keys,
+        )
     }
 
     fn params() -> VerifyParams {
@@ -519,11 +588,10 @@ mod tests {
     }
 
     #[test]
-    fn mixed_round_attestations_all_count() {
-        // Two validators signed the SAME digest/height/block_time at DIFFERENT
-        // rounds (a valid, if unusual, commit). Each attestation's own round must
-        // be used to reconstruct its sign bytes, so BOTH votes count — a single
-        // shared bundle round would have dropped the odd one out.
+    fn mixed_round_attestations_cannot_manufacture_quorum() {
+        // Each signature is valid on its own, but no consensus round has more
+        // than one third of the power. Aggregating them would accept a commit
+        // that never existed.
         let (set, keys) = setup(&[1, 1, 1]);
         let a0 = bundle(&set, &keys, &[0], HEIGHT, 0, BT, DIGEST).attestations.remove(0);
         let a1 = bundle(&set, &keys, &[1], HEIGHT, 7, BT, DIGEST).attestations.remove(0);
@@ -535,7 +603,25 @@ mod tests {
             block_time_unix: BT,
             attestations: vec![a0, a1, a2],
         };
-        assert_eq!(verify_finality(&b, &set, &params()).unwrap(), HEIGHT);
+        assert!(matches!(
+            verify_finality(&b, &set, &params()),
+            Err(FinalityError::InsufficientPower {
+                got: 1,
+                total: 3,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn one_round_quorum_survives_mixed_round_noise() {
+        let (set, keys) = setup(&[1, 1, 1, 1, 1]);
+        let mut b = bundle(&set, &keys, &[0, 1, 2, 3], HEIGHT, 7, BT, DIGEST);
+        let noise = bundle(&set, &keys, &[4], HEIGHT, 2, BT, DIGEST)
+            .attestations
+            .remove(0);
+        b.attestations.push(noise);
+        assert_eq!(verify_finality(&b, &set, &params()), Ok(HEIGHT));
     }
 
     #[test]
@@ -545,6 +631,22 @@ mod tests {
         let other = "2222222222222222222222222222222222222222222222222222222222222222";
         let mut b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, other);
         b.digest_hex = DIGEST.into();
+        assert!(matches!(
+            verify_finality(&b, &set, &params()),
+            Err(FinalityError::InsufficientPower { got: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn extension_height_must_match_bundle_height() {
+        let (set, keys) = setup(&[1, 1, 1]);
+        let mut b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, DIGEST);
+        let bad_ext = vote_ext(HEIGHT + 1, BT, DIGEST);
+        let msg = canonical_vote_ext_bytes(&bad_ext, HEIGHT as i64, ROUND as i64, CHAIN);
+        for (att, (_, key)) in b.attestations.iter_mut().zip(keys.iter()) {
+            att.vote_extension = bad_ext.clone();
+            att.signature = key.sign(&msg).to_bytes().to_vec();
+        }
         assert!(matches!(
             verify_finality(&b, &set, &params()),
             Err(FinalityError::InsufficientPower { got: 0, .. })
@@ -576,6 +678,22 @@ mod tests {
         p.now_unix = set.pinned_at_unix + p.ws_period_secs + 1;
         let b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, p.now_unix, DIGEST);
         assert_eq!(verify_finality(&b, &set, &p), Err(FinalityError::PinExpired));
+    }
+
+    #[test]
+    fn future_pin_respects_clock_skew_boundary() {
+        let (mut set, keys) = setup(&[1, 1, 1]);
+        let p = params();
+        let b = bundle(&set, &keys, &[0, 1, 2], HEIGHT, ROUND, BT, DIGEST);
+
+        set.pinned_at_unix = p.now_unix + p.skew_secs;
+        assert_eq!(verify_finality(&b, &set, &p), Ok(HEIGHT));
+
+        set.pinned_at_unix += 1;
+        assert_eq!(
+            verify_finality(&b, &set, &p),
+            Err(FinalityError::PinExpired)
+        );
     }
 
     #[test]

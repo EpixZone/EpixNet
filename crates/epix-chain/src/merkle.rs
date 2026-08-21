@@ -18,7 +18,7 @@ pub fn verify_proof(
     for sibling_hex in siblings {
         let sibling = hex::decode(sibling_hex)
             .map_err(|e| ChainError::Malformed(format!("sibling hash: {e}")))?;
-        let combined: Vec<u8> = if idx % 2 == 0 {
+        let combined: Vec<u8> = if idx & 1 == 0 {
             [current.as_slice(), sibling.as_slice()].concat()
         } else {
             [sibling.as_slice(), current.as_slice()].concat()

@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use rln::prelude::Fr;
 
 use crate::{
-    commitment_of_secret, fr_key, Membership, NullifierLog, Observation, Rln, RlnError, RlnIdentity,
-    Verified,
+    commitment_of_secret, fr_key, Membership, NullifierId, NullifierLog, Observation, RecordId,
+    Rln, RlnError, RlnIdentity, Verified,
 };
 
 /// Owns the RLN engine, the membership tree, and the nullifier log for one pool,
@@ -29,8 +29,26 @@ pub struct PoolGate {
 pub enum Admission {
     /// Verified and within the rate limit: admit the record.
     Admit,
-    /// A re-broadcast of an already-seen record: drop it as a duplicate.
-    Duplicate,
+    /// A re-broadcast of an already-seen logical record. Suppress delivery,
+    /// but a newly verified transport wrapper may replace the retained copy.
+    Duplicate {
+        keep_record: bool,
+        /// The same logical record remains the gate's survivor. A caller may
+        /// retain a newly verified transport wrapper, such as a current-root
+        /// reproof, while suppressing application delivery.
+        replace_record: bool,
+        evicted_records: Vec<RecordId>,
+    },
+    /// A same-signal proof partially overlaps an accepted allowance window.
+    /// Exactly one deterministic window survives, but this is not slashing
+    /// evidence because the Shamir shares are identical.
+    Overlap {
+        keep_record: bool,
+        evicted_records: Vec<RecordId>,
+    },
+    /// The proof touches durable double-signal evidence and must not be stored
+    /// or delivered.
+    Quarantined,
     /// The proof did not verify — a bad proof, a non-member, the wrong epoch, or
     /// a signal that does not match the record. Do not admit.
     Reject(RlnError),
@@ -39,7 +57,16 @@ pub enum Admission {
     /// (the rate limit is enforced). Structural removal is left to the caller —
     /// under the owner-signed model the owner drops the member from its roster;
     /// [`PoolGate::evict_member`] is available for callers that remove locally.
-    RateExceeded { offender_commitment: Fr },
+    RateExceeded {
+        offender_commitment: Fr,
+        /// Stable ids of every previously accepted record in the conflicting
+        /// component. All are quarantined and the incoming offender record is
+        /// never persisted.
+        evicted_records: Vec<RecordId>,
+        /// Nullifiers to persist as poison before the caller removes any
+        /// conflicting records from public shards.
+        poisoned_nullifiers: Vec<NullifierId>,
+    },
 }
 
 impl PoolGate {
@@ -81,6 +108,10 @@ impl PoolGate {
     /// The current membership root — the root fresh proofs should target.
     pub fn root(&self) -> Fr {
         self.membership.root()
+    }
+
+    pub fn root_id(&self) -> Result<[u8; 32], RlnError> {
+        crate::fr_key(&self.membership.root())
     }
 
     /// Whether `identity` is enrolled in this gate's roster (used by the send
@@ -147,19 +178,82 @@ impl PoolGate {
         weight: u32,
         accepted_roots: &[Fr],
     ) -> Admission {
+        let record_id = fr_key(&crate::message_signal(rln_proof)).unwrap_or([0; 32]);
+        self.admit_with_id(record_id, rln_proof, ct, epoch, weight, accepted_roots)
+    }
+
+    /// [`Self::admit`] with a stable logical id for the pool record. The id lets
+    /// the gate select a deterministic survivor across partitions while still
+    /// allowing proof, PoW, and signature wrappers to be replaced.
+    pub fn admit_with_id(
+        &mut self,
+        record_id: RecordId,
+        rln_proof: &[u8],
+        ct: &[u8],
+        epoch: u64,
+        weight: u32,
+        accepted_roots: &[Fr],
+    ) -> Admission {
         let verified: Verified =
             match self.engine.verify(rln_proof, accepted_roots, epoch, ct, weight) {
                 Ok(v) => v,
                 Err(e) => return Admission::Reject(e),
             };
-        match self.log.observe(epoch, &verified.slots) {
+        match self.log.observe(epoch, record_id, &verified.slots) {
             Ok(Observation::Fresh) => Admission::Admit,
-            Ok(Observation::Replay) => Admission::Duplicate,
-            Ok(Observation::DoubleSignal { recovered_secret }) => Admission::RateExceeded {
+            Ok(Observation::Replay {
+                keep_record,
+                evicted_records,
+            }) => Admission::Duplicate {
+                keep_record,
+                replace_record: self.log.contains_record(epoch, &record_id),
+                evicted_records,
+            },
+            Ok(Observation::PartialOverlap {
+                keep_record,
+                evicted_records,
+            }) => Admission::Overlap {
+                keep_record,
+                evicted_records,
+            },
+            Ok(Observation::Quarantined) => Admission::Quarantined,
+            Ok(Observation::DoubleSignal {
+                recovered_secret,
+                conflicting_records,
+                poisoned_nullifiers,
+            }) => Admission::RateExceeded {
                 offender_commitment: commitment_of_secret(&recovered_secret),
+                evicted_records: conflicting_records,
+                poisoned_nullifiers,
             },
             Err(e) => Admission::Reject(e),
         }
+    }
+
+    /// Import durable double-signal poison after it has been fsynced by the
+    /// caller.
+    pub fn poison_nullifiers(&mut self, epoch: u64, keys: &[NullifierId]) {
+        self.log.poison(epoch, keys);
+    }
+
+    /// Verify a record without mutating admission state and report whether it
+    /// touches durable double-signal poison.
+    pub fn proof_touches_poisoned(
+        &self,
+        rln_proof: &[u8],
+        ct: &[u8],
+        epoch: u64,
+        weight: u32,
+        accepted_roots: &[Fr],
+    ) -> Result<bool, RlnError> {
+        let verified = self
+            .engine
+            .verify(rln_proof, accepted_roots, epoch, ct, weight)?;
+        let mut keys = Vec::with_capacity(verified.slots.len());
+        for slot in &verified.slots {
+            keys.push(fr_key(&slot.nullifier)?);
+        }
+        Ok(self.log.touches_poisoned(epoch, &keys))
     }
 
     /// Structurally remove the member with `commitment` from the tree — a ban

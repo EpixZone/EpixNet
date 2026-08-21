@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 /// Re-export so embedders (FFI, shells) can name the served state without a
 /// direct `epix-ui` dependency.
-pub use epix_ui::AppState;
+pub use epix_ui::{
+    new_nmh_nonce, nmh_request_mac, nmh_request_mac_valid, nmh_response_mac,
+    nmh_response_mac_valid, AppState, NMH_RESOLVE_PATH,
+};
 
 /// The default Epix bootstrap announcers (re-exported from epix-core; the
 /// Beacon plugin seeds its book from the same list).
@@ -26,6 +29,30 @@ pub use epix_core::DEFAULT_TRACKERS;
 /// tests them).
 pub fn default_trackers() -> Vec<epix_xite::Tracker> {
     DEFAULT_TRACKERS.iter().filter_map(|t| epix_xite::Tracker::parse(t)).collect()
+}
+
+#[derive(Debug, Default)]
+struct OfflineTransport;
+
+#[async_trait::async_trait]
+impl Transport for OfflineTransport {
+    fn scheme(&self) -> &'static str {
+        "offline"
+    }
+
+    async fn dial(&self, _addr: &PeerAddr) -> epix_core::Result<epix_transport::PeerStream> {
+        Err(epix_core::Error::Protocol(
+            "network access is disabled by offline mode".to_string(),
+        ))
+    }
+}
+
+fn transport_for_network_policy(offline: bool, online: Arc<dyn Transport>) -> Arc<dyn Transport> {
+    if offline {
+        Arc::new(OfflineTransport)
+    } else {
+        online
+    }
 }
 /// Wall-clock trace of a clone's phase boundaries, on when `EPIX_TRACE_CLONE`
 /// is set. A clone is a chain of discovery, dial, fetch, verify and ingest
@@ -50,6 +77,13 @@ pub const DEFAULT_UI_PORT: u16 = 42222;
 pub const LEGACY_UI_PORT: u16 = 43110;
 /// The default UI bind (loopback, Epix's port).
 pub const DEFAULT_UI_ADDR: &str = "127.0.0.1:42222";
+/// Temporary, explicit compatibility switch for the eight-day chain-upgrade
+/// window before the real mainnet finality pin can be captured. Official
+/// releases must never set this variable.
+const ALLOW_INSECURE_XID_LEGACY_ENV: &str = "EPIX_XID_ALLOW_INSECURE_LEGACY";
+/// File shared with the native-messaging process. It lives under the private
+/// data directory and contains a new random secret for each node run.
+pub const NMH_TOKEN_RELATIVE_PATH: &str = "private/nmh-auth-token";
 
 /// How the embedded node should boot and serve.
 #[derive(Default)]
@@ -162,67 +196,84 @@ pub fn parse_inner_path(arg: &str) -> String {
 /// name has no cache entry or the entry expired ([`RESOLVE_CACHE_TTL_SECS`]).
 /// If an expired entry can't be re-resolved (chain unreachable), the stale
 /// mapping keeps serving rather than failing the boot.
-pub async fn resolve_target(data_root: &std::path::Path, target: &str) -> (String, String, bool) {
-    if target.starts_with("epix1") && !target.contains('.') {
-        return (target.to_string(), target.to_string(), false);
-    }
+async fn resolve_target(
+    data_root: &std::path::Path,
+    target: &str,
+) -> Result<(String, String, bool), String> {
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
+    match epix_core::classify_label(name) {
+        epix_core::LabelClass::Address => {
+            return Ok((name.to_string(), name.to_string(), false));
+        }
+        epix_core::LabelClass::AddressShaped => {
+            return Err(address_shaped_target_error(name, tld));
+        }
+        epix_core::LabelClass::Name => {}
+    }
     let full = format!("{name}.{tld}");
-    match cached_resolution(data_root, &full) {
-        Some((address, true)) => return (address, full, true),
+    match validated_cached_resolution(data_root, &full) {
+        Some((address, true)) => return Ok((address, full, true)),
         Some((stale, false)) => {
             // Expired: refresh from the chain; keep the stale mapping if that fails.
-            return match try_resolve_on_chain(name, tld).await {
-                Ok(address) => {
-                    write_resolve_cache(data_root, &full, &address);
+            return Ok(match try_resolve_on_chain_bound(name, tld).await {
+                Ok((address, binding)) => {
+                    write_resolve_cache_bound(data_root, &full, &address, binding.as_ref());
                     (address, full, false)
                 }
                 Err(_) => (stale, full, true),
-            };
+            });
         }
         None => {}
     }
-    let address = resolve_on_chain(name, tld).await;
-    write_resolve_cache(data_root, &full, &address);
-    (address, full, false)
+    let (address, binding) = try_resolve_on_chain_bound(name, tld).await?;
+    write_resolve_cache_bound(data_root, &full, &address, binding.as_ref());
+    Ok((address, full, false))
 }
 
-/// Resolve a `.epix` name to its xite address on the chain, or an error string
-/// (never panics - safe to call from a request handler).
-pub async fn try_resolve_on_chain(name: &str, tld: &str) -> Result<String, String> {
+fn address_shaped_target_error(name: &str, tld: &str) -> String {
+    format!(
+        "{name}.{tld} looks like a mistyped epix1 address (bad checksum); refusing to resolve it as a name"
+    )
+}
+
+fn validated_xite_address(address: &str, source: &str) -> Result<Address, String> {
+    Address::parse(address.to_string()).map_err(|_| {
+        format!("{source} contains invalid EpixNet xite address `{address}`; refusing to use it")
+    })
+}
+
+fn validated_cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(String, bool)> {
+    let (address, fresh) = cached_resolution(data_root, full)?;
+    let address = Address::parse(address).ok()?;
+    Some((address.to_string(), fresh))
+}
+
+async fn try_resolve_on_chain_bound(
+    name: &str,
+    tld: &str,
+) -> Result<(String, Option<(u64, String)>), String> {
     // Typo-space guard: an exact checksum-valid address is the dotted alias
     // and resolves to itself, never via xID (a registered same-string name is
     // inert). An address-SHAPED label with a bad checksum is a mistyped or
     // forged address and is refused outright - otherwise an attacker could
     // register the typo-space around a real address as names and phish.
-    if tld == "epix" {
         match epix_core::classify_label(name) {
-            epix_core::LabelClass::Address => return Ok(name.to_string()),
+        epix_core::LabelClass::Address => return Ok((name.to_string(), None)),
             epix_core::LabelClass::AddressShaped => {
-                return Err(format!(
-                    "{name}.{tld} looks like a mistyped epix1 address (bad checksum); refusing to resolve it as a name"
-                ));
+            return Err(address_shaped_target_error(name, tld));
             }
             epix_core::LabelClass::Name => {}
         }
-    }
     let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-    let domain = resolver
-        .resolve(name, tld)
+    let (domain, binding) = resolver
+        .resolve_fresh_bound(name, tld)
         .await
         .map_err(|e| format!("could not resolve {name}.{tld}: {e}"))?;
-    domain
+    let address = domain
         .xite_address()
-        .map(|a| a.to_string())
-        .ok_or_else(|| format!("{name}.{tld} has no EpixNet xite address record"))
-}
-
-/// Resolve a `.epix` name to its xite address on the chain (panics on failure -
-/// the initial-boot CLI path).
-pub async fn resolve_on_chain(name: &str, tld: &str) -> String {
-    try_resolve_on_chain(name, tld)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"))
+        .ok_or_else(|| format!("{name}.{tld} has no EpixNet xite address record"))?;
+    let address = validated_xite_address(address, &format!("{name}.{tld} xID record"))?;
+    Ok((address.to_string(), binding))
 }
 
 /// What [`serve`] should bring up as the node's launch xite (its homepage).
@@ -293,50 +344,34 @@ pub async fn boot(
     // anything reads config (the Tor-Always egress gate below, then AppState).
     migrate_legacy_conf(&opts.data_root);
 
-    // Arm the chain-egress gate BEFORE resolving the launch name. In Tor-Always
-    // mode the runtime only routes chain RPC through Tor once Arti has
-    // bootstrapped (~10-40s); a resolve that runs before then sends the .epix
-    // name and this node's IP to api.epix.zone in the clear. `serve` arms the
-    // same gate, but not until after this resolve would have run - so arm it
-    // here first.
-    #[cfg(feature = "tor")]
-    let tor_always = configured_tor_always(&opts.data_root, &opts);
-    #[cfg(not(feature = "tor"))]
-    let tor_always = false;
-    #[cfg(feature = "tor")]
-    epix_chain::set_chain_require_tor(tor_always);
-    // Same gate for the BT engine: in Tor-always mode a web-seed fetch must not
-    // egress until the SOCKS proxy is wired (below), or it would leak the IP.
-    #[cfg(all(feature = "tor", feature = "bittorrent"))]
-    epix_bt::http::set_require_tor(tor_always);
+    // Install the finality root of trust and restore its anti-rollback
+    // checkpoint before reading a launch cache entry or contacting chain RPC.
+    let xid_finality = initialize_xid_finality(&opts.data_root)?;
 
-    // Resolve the launch target. In Always mode use only the on-disk cache
-    // (never the chain): a name with no cache entry is deferred to the on-demand
-    // resolver, which resolves and clones it once Tor is up instead of leaking
-    // it over clearnet during the bootstrap window.
-    let launch = if tor_always {
-        match cached_launch(&opts.data_root, &opts.target) {
-            Some((address, display)) => resolved_launch(&opts, address, display)?,
-            None => LaunchTarget::Deferred { display: launch_display(&opts.target) },
-        }
-    } else {
-        let (address, display, _from_cache) =
-            resolve_target(&opts.data_root, &opts.target).await;
-        resolved_launch(&opts, address, display)?
-    };
+    // Parse the startup network policy strictly, arm its egress gate, and only
+    // then select the launch target. Tor-Always and offline mode use the cache
+    // only. An uncached name is deferred instead of leaking before the runtime
+    // has established its final network policy.
+    let (launch, startup_network_policy) = prepare_startup_launch_with(
+        &opts,
+        arm_startup_network_policy,
+        |data_root, target| async move { resolve_target(&data_root, &target).await },
+    )
+    .await?;
 
-    serve(opts, launch).await
+    serve(opts, launch, xid_finality, startup_network_policy).await
 }
 
 /// The display form of a launch target: a raw `epix1…` address passes through;
 /// a `.epix` name (or bare label defaulting to the `epix` TLD) is normalized to
 /// `name.tld` - the same string the on-demand resolver keys on.
-fn launch_display(target: &str) -> String {
-    if target.starts_with("epix1") && !target.contains('.') {
-        return target.to_string();
-    }
+fn launch_display(target: &str) -> Result<String, String> {
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
-    format!("{name}.{tld}")
+    match epix_core::classify_label(name) {
+        epix_core::LabelClass::Address => Ok(name.to_string()),
+        epix_core::LabelClass::AddressShaped => Err(address_shaped_target_error(name, tld)),
+        epix_core::LabelClass::Name => Ok(format!("{name}.{tld}")),
+    }
 }
 
 /// Resolve a launch target from the on-disk cache only (no chain query), for
@@ -344,13 +379,22 @@ fn launch_display(target: &str) -> String {
 /// boot. Returns `(address, display)` on any cache hit (fresh or stale, since a
 /// stale mapping keeps serving); `None` when the name has never been resolved,
 /// so it defers to the on-demand resolver.
-fn cached_launch(data_root: &std::path::Path, target: &str) -> Option<(String, String)> {
-    if target.starts_with("epix1") && !target.contains('.') {
-        return Some((target.to_string(), target.to_string()));
-    }
+fn cached_launch(
+    data_root: &std::path::Path,
+    target: &str,
+) -> Result<Option<(String, String)>, String> {
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
+    match epix_core::classify_label(name) {
+        epix_core::LabelClass::Address => {
+            return Ok(Some((name.to_string(), name.to_string())));
+        }
+        epix_core::LabelClass::AddressShaped => {
+            return Err(address_shaped_target_error(name, tld));
+        }
+        epix_core::LabelClass::Name => {}
+    }
     let full = format!("{name}.{tld}");
-    cached_resolution(data_root, &full).map(|(address, _fresh)| (address, full))
+    Ok(validated_cached_resolution(data_root, &full).map(|(address, _fresh)| (address, full)))
 }
 
 /// Build a [`LaunchTarget::Resolved`] for an address we can serve now: create
@@ -367,20 +411,22 @@ fn resolved_launch(
     address: String,
     display: String,
 ) -> Result<LaunchTarget, String> {
-    let data_dir = opts.data_root.join("data").join(&address);
+    let parsed = validated_xite_address(&address, "launch target")?;
+    let address = parsed.to_string();
+    let data_dir = opts.data_root.join("data").join(parsed.as_str());
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
-    let content = match Address::parse(address.clone()) {
-        Ok(addr) => {
-            let mut xite = Xite::new(addr, XiteStorage::new(&data_dir));
+    let mut xite = Xite::new(parsed, XiteStorage::new(&data_dir));
             let _ = xite.load_content(); // verified path: sets content when valid
             if xite.content.is_none() {
                 xite.load_content_local(); // local unsigned/edited copy: serve as-is
             }
-            xite.content.clone()
-        }
-        Err(_) => None,
-    };
-    Ok(LaunchTarget::Resolved { address, display, data_dir, content })
+    let content = xite.content.clone();
+    Ok(LaunchTarget::Resolved {
+        address,
+        display,
+        data_dir,
+        content,
+    })
 }
 
 /// Python `epixnet.conf` keys the Rust node honors by seeding them into
@@ -450,10 +496,18 @@ fn migrate_legacy_conf(data_root: &std::path::Path) {
         return;
     }
     let cfg_path = data_root.join("private").join("config.json");
-    let mut cfg: serde_json::Map<String, serde_json::Value> = std::fs::read(&cfg_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let mut cfg: serde_json::Map<String, serde_json::Value> = match std::fs::read(&cfg_path) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(serde_json::Value::Object(config)) => config,
+            // Preserve malformed or structurally invalid existing config so
+            // the strict startup parser below can reject it. Migration must
+            // never replace a bad file with a permissive default object.
+            _ => return,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        // Preserve unreadable files too. Startup reports the I/O failure.
+        Err(_) => return,
+    };
     let (seeded, ignored) = apply_legacy_conf(&conf, &mut cfg);
     if !seeded.is_empty() {
         if let Some(parent) = cfg_path.parent() {
@@ -509,56 +563,205 @@ fn legacy_ui_addr(conf: &std::collections::BTreeMap<String, String>) -> Option<S
     Some(format!("{}:{}", ip.unwrap_or("127.0.0.1"), port.unwrap_or("42222")))
 }
 
-/// Whether the effective Tor mode is Always, read from the raw node config plus
-/// launch options - the same precedence [`serve`] applies, but computed before
-/// the [`AppState`] exists so [`boot`] can arm the chain-egress gate ahead of
-/// the launch-name resolve.
-#[cfg(feature = "tor")]
-fn configured_tor_always(data_root: &std::path::Path, opts: &NodeOptions) -> bool {
-    let config: serde_json::Value =
-        std::fs::read(data_root.join("private").join("config.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(serde_json::Value::Null);
-    let offline = config
-        .get("offline")
-        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
-        .unwrap_or(false);
-    let mode = if offline {
-        epix_runtime::TorMode::Disable
-    } else if !opts.tor_mode.is_empty() {
-        epix_runtime::TorMode::parse(&opts.tor_mode)
-    } else {
-        let configured = config.get("tor").and_then(|v| v.as_str()).unwrap_or("enable");
-        epix_runtime::TorMode::parse(configured)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupNetworkPolicy {
+    Direct,
+    TorAlways,
+    Offline,
+}
+
+impl StartupNetworkPolicy {
+    fn defers_chain_resolution(self) -> bool {
+        matches!(self, Self::TorAlways | Self::Offline)
+    }
+}
+
+/// Parse the network policy before any launch-name lookup. A missing config is
+/// the normal first-run case. Any present but unreadable, invalid, or
+/// structurally ambiguous config fails startup instead of silently enabling
+/// direct egress.
+fn startup_network_policy(
+    data_root: &std::path::Path,
+    opts: &NodeOptions,
+) -> Result<StartupNetworkPolicy, String> {
+    let path = data_root.join("private").join("config.json");
+    let config = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("invalid node config {}: {error}", path.display()))?;
+            value.as_object().cloned().ok_or_else(|| {
+                format!(
+                    "invalid node config {}: expected a JSON object",
+                    path.display()
+                )
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read node config {}: {error}",
+                path.display()
+            ));
+        }
     };
-    mode == epix_runtime::TorMode::Always
-}
 
-/// Pick the UI bind address: the requested one if its port is free, otherwise -
-/// only when the requested port is Epix's default - fall back to the legacy
-/// EpixNet port so a fresh Epix and an old EpixNet can run side by side and old
-/// `127.0.0.1:43110` links still resolve. An explicitly chosen port is honored
-/// as-is (serve reports the bind error if it's taken).
-fn resolve_ui_bind(requested: std::net::SocketAddr) -> std::net::SocketAddr {
-    resolve_ui_bind_with(requested, |addr| std::net::TcpListener::bind(addr).is_ok())
+    let offline = match config.get("offline") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("true") => true,
+        Some(serde_json::Value::String(value)) if value.eq_ignore_ascii_case("false") => false,
+        Some(_) => {
+            return Err(format!(
+                "invalid node config {}: offline must be true or false",
+                path.display()
+            ));
 }
+    };
+    // Validate both sources even when offline or an explicit option wins. A
+    // malformed persisted policy must never be hidden by another setting.
+    let configured_tor = match config.get("tor") {
+        None => None,
+        Some(serde_json::Value::String(value)) => Some(parse_startup_tor_policy(
+            value,
+            &format!("node config {}", path.display()),
+        )?),
+        Some(_) => {
+            return Err(format!(
+                "invalid node config {}: tor must be a string",
+                path.display()
+            ));
+        }
+    };
+    let explicit_tor = (!opts.tor_mode.trim().is_empty())
+        .then(|| parse_startup_tor_policy(&opts.tor_mode, "node options"))
+        .transpose()?;
 
-/// The bind decision, with the port-availability check injected so it can be
-/// tested without touching real sockets.
-fn resolve_ui_bind_with(
-    requested: std::net::SocketAddr,
-    free: impl Fn(std::net::SocketAddr) -> bool,
-) -> std::net::SocketAddr {
-    if free(requested) || requested.port() != DEFAULT_UI_PORT {
-        return requested;
-    }
-    let fallback = std::net::SocketAddr::new(requested.ip(), LEGACY_UI_PORT);
-    if free(fallback) {
-        fallback
+    if offline {
+        Ok(StartupNetworkPolicy::Offline)
     } else {
-        requested
+        Ok(explicit_tor
+            .or(configured_tor)
+            .unwrap_or(StartupNetworkPolicy::Direct))
     }
+}
+
+fn parse_startup_tor_policy(value: &str, source: &str) -> Result<StartupNetworkPolicy, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "always" => Ok(StartupNetworkPolicy::TorAlways),
+        "disable" | "disabled" | "false" | "off" | "enable" | "enabled" | "true" | "on" => {
+            Ok(StartupNetworkPolicy::Direct)
+        }
+        _ => Err(format!("invalid Tor mode `{value}` in {source}")),
+    }
+}
+
+fn arm_startup_network_policy(policy: StartupNetworkPolicy) {
+    epix_chain::set_chain_route(None, policy.defers_chain_resolution());
+    #[cfg(feature = "bittorrent")]
+    {
+        epix_bt::http::set_socks(None);
+        epix_bt::http::set_require_tor(policy.defers_chain_resolution());
+    }
+}
+
+async fn prepare_startup_launch_with<A, F, Fut>(
+    opts: &NodeOptions,
+    arm_policy: A,
+    resolve: F,
+) -> Result<(LaunchTarget, StartupNetworkPolicy), String>
+where
+    A: FnOnce(StartupNetworkPolicy),
+    F: FnOnce(PathBuf, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, String, bool), String>>,
+{
+    let policy = startup_network_policy(&opts.data_root, opts)?;
+    arm_policy(policy);
+
+    if policy.defers_chain_resolution() {
+        let launch = match cached_launch(&opts.data_root, &opts.target)? {
+            Some((address, display)) => resolved_launch(opts, address, display),
+            None => Ok(LaunchTarget::Deferred {
+                display: launch_display(&opts.target)?,
+            }),
+        }?;
+        return Ok((launch, policy));
+    }
+    let (address, display, _from_cache) =
+        resolve(opts.data_root.clone(), opts.target.clone()).await?;
+    Ok((resolved_launch(opts, address, display)?, policy))
+}
+
+/// Acquire and retain the requested UI listener. Only the default port falls
+/// back to the legacy EpixNet port. This attempts the real bind once per port,
+/// instead of probing and dropping a socket before the server starts.
+fn bind_ui_listener_with<T>(
+    requested: std::net::SocketAddr,
+    default_port: u16,
+    fallback_port: u16,
+    mut bind: impl FnMut(std::net::SocketAddr) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    match bind(requested) {
+        Ok(listener) => Ok(listener),
+        Err(requested_error) if requested.port() == default_port => {
+            let fallback = std::net::SocketAddr::new(requested.ip(), fallback_port);
+            bind(fallback).map_err(|fallback_error| {
+                std::io::Error::new(
+                    fallback_error.kind(),
+                    format!(
+                        "cannot bind UI on {requested} ({requested_error}) or fallback {fallback} ({fallback_error})"
+                    ),
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Bind first, then run `publish` while the returned listener still owns the
+/// selected port. Native-messaging metadata must only be exposed inside this
+/// callback, after a different local process can no longer impersonate the
+/// node on that port.
+fn bind_and_publish_ui_endpoint_with<T>(
+    requested: std::net::SocketAddr,
+    default_port: u16,
+    fallback_port: u16,
+    publish: impl FnOnce(std::net::SocketAddr) -> T,
+) -> std::io::Result<(std::net::TcpListener, std::net::SocketAddr, T)> {
+    let listener = bind_ui_listener_with(
+        requested,
+        default_port,
+        fallback_port,
+        std::net::TcpListener::bind,
+    )?;
+    listener.set_nonblocking(true)?;
+    let bind = listener.local_addr()?;
+    let published = publish(bind);
+    Ok((listener, bind, published))
+}
+
+/// Publish the selected UI port before rotating the bearer token. If the port
+/// file cannot be updated, retaining the old token fails native messaging
+/// closed instead of sending the new token to a stale, attacker-owned port.
+fn publish_nmh_endpoint(
+    data_root: &std::path::Path,
+    bind: std::net::SocketAddr,
+    token: &str,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let port_path = data_root.join("ui_port");
+    if let Err(error) = std::fs::write(&port_path, bind.port().to_string()) {
+        warnings.push(format!(
+            "cannot publish native-messaging UI port {}: {error}; refusing to publish the current token",
+            port_path.display()
+        ));
+        return warnings;
+    }
+    if let Err(error) = write_nmh_auth_token(data_root, token) {
+        warnings.push(format!(
+            "native-messaging name resolution is unavailable: {error}"
+        ));
+    }
+    warnings
 }
 
 /// Boot and then serve forever (blocks). The convenience entry point for the
@@ -1705,6 +1908,10 @@ struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
     trackers: Vec<epix_xite::Tracker>,
+    /// Fixed startup policy. When true, only xites already complete on disk
+    /// may be opened. Resolution, announce, dialing, and resume work all fail
+    /// closed without touching the network.
+    network_disabled: bool,
     /// Names currently being cloned, so concurrent requests coalesce.
     in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Whether Tor is expected to come up (mode != Disable). Gates the
@@ -1731,6 +1938,11 @@ impl epix_ui::OnDemandResolver for OnDemand {
             && (self.state.xite_owned(&key).await || self.state.xite_core_complete(&key).await)
         {
             return Ok(());
+        }
+        if self.network_disabled {
+            return Err(format!(
+                "offline mode cannot resolve or fetch incomplete site {host}"
+            ));
         }
         // In Always mode, resolving a name that has no cache entry hits the
         // chain, which is gated until Tor is up. Wait for Tor first so the
@@ -1770,7 +1982,25 @@ impl epix_ui::OnDemandResolver for OnDemand {
     }
 
     async fn resolve(&self, host: &str) -> Option<String> {
+        if self.network_disabled {
+            resolve_host_cached_only(&self.data_root, host)
+        } else {
         resolve_host(&self.data_root, host).await
+    }
+}
+}
+
+/// Resolve without any chain access. Raw addresses pass through and cached
+/// names use either a fresh or stale validated mapping.
+fn resolve_host_cached_only(data_root: &std::path::Path, host: &str) -> Option<String> {
+    let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+    match epix_core::classify_label(name) {
+        epix_core::LabelClass::Address => Some(name.to_string()),
+        epix_core::LabelClass::AddressShaped => None,
+        epix_core::LabelClass::Name => {
+            validated_cached_resolution(data_root, &format!("{name}.{tld}"))
+                .map(|(address, _fresh)| address)
+        }
     }
 }
 
@@ -1779,26 +2009,20 @@ impl epix_ui::OnDemandResolver for OnDemand {
 /// A successful chain lookup is written back to the cache. Never clones.
 async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String> {
     let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-    // A bare dotless `epix1…` is in ADDRESS position: it resolves to itself
-    // (a bad one just fails to load as an address) and is never a chain name.
-    if !host.contains('.') && name.starts_with("epix1") {
-        return Some(name.to_string());
-    }
-    // A dotted label classifies against the address space: Address = the
-    // dotted alias, resolves to itself. AddressShaped = a mistyped/forged
-    // address, never resolvable as a name (typo-squat guard). A plain
-    // `epix1…` branding name (epix1shop) falls through to the chain - the
-    // old prefix-only check wrongly shadowed those.
+    // Every label classifies against the address space, including dotless
+    // inputs. Short `epix1…` branding names remain names; checksum-valid
+    // addresses pass through; address-shaped bad checksums fail closed.
     match epix_core::classify_label(name) {
         epix_core::LabelClass::Address => return Some(name.to_string()),
         epix_core::LabelClass::AddressShaped => return None,
         epix_core::LabelClass::Name => {}
     }
-    match cached_resolution(data_root, host) {
+    let full = format!("{name}.{tld}");
+    match validated_cached_resolution(data_root, &full) {
         Some((address, true)) => Some(address),
-        stale => match try_resolve_on_chain(name, tld).await {
-            Ok(address) => {
-                write_resolve_cache(data_root, host, &address);
+        stale => match try_resolve_on_chain_bound(name, tld).await {
+            Ok((address, binding)) => {
+                write_resolve_cache_bound(data_root, &full, &address, binding.as_ref());
                 Some(address)
             }
             Err(_) => stale.map(|(address, _)| address),
@@ -1813,24 +2037,25 @@ async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String>
 /// back to. Used to decide whether to wait for Tor before resolving in Always
 /// mode (mirrors [`resolve_host`]'s cache key).
 fn needs_chain_resolve(data_root: &std::path::Path, host: &str) -> bool {
-    let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-    // Bare dotless `epix1…` is address position: never a chain name. A dotted
-    // label hits the chain only when it is a real NAME - neither an address
-    // alias (resolves to itself) nor an address-shaped label (refused) does.
-    if !host.contains('.') && name.starts_with("epix1") {
-        return false;
-    }
+    let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+    // Only a real NAME can hit the chain. Valid addresses resolve to themselves
+    // and address-shaped bad checksums are rejected without egress.
     if epix_core::classify_label(name) != epix_core::LabelClass::Name {
         return false;
     }
-    cached_resolution(data_root, host).is_none()
+    validated_cached_resolution(data_root, &format!("{name}.{tld}")).is_none()
 }
 
 #[async_trait::async_trait]
 impl epix_ui::ContentSyncer for OnDemand {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>) {
-        let dir = self.data_root.join("data").join(address);
-        let Ok(addr) = Address::parse(address.to_string()) else { return (0, Vec::new()) };
+        if self.network_disabled {
+            return (0, Vec::new());
+        }
+        let Ok(addr) = validated_xite_address(address, "user-content sync target") else {
+            return (0, Vec::new());
+        };
+        let dir = self.data_root.join("data").join(addr.as_str());
         let mut xite = Xite::new(addr, XiteStorage::new(dir));
         // Only user_contents xites (with includes) have out-of-tree content.
         if !xite.load_content().unwrap_or(false) || xite.includes().is_empty() {
@@ -1941,7 +2166,13 @@ impl OnDemand {
     /// The clone/resume work behind [`Self::ensure`], which resolved `host`
     /// to `address` and holds the in-flight slot for it.
     async fn do_ensure(&self, host: &str, address: &str) -> Result<(), String> {
-        let data_dir = self.data_root.join("data").join(address);
+        if self.network_disabled {
+            return Err(format!(
+                "offline mode cannot resolve or fetch incomplete site {host}"
+            ));
+        }
+        let parsed = validated_xite_address(address, "on-demand clone target")?;
+        let data_dir = self.data_root.join("data").join(parsed.as_str());
         // Clone when the address isn't served yet, or resume when it is served
         // but its core files are incomplete (an interrupted earlier clone).
         // Owned xites never re-clone: local edits stay.
@@ -2106,58 +2337,114 @@ impl OnDemand {
     }
 }
 
+/// Read the xID finality pin without silently treating an arbitrary I/O error as
+/// "not installed". A missing pin is accepted only through the explicit,
+/// pre-upgrade compatibility switch passed by the caller.
+fn read_xid_finality_pin(
+    pin_path: &std::path::Path,
+    allow_insecure_legacy: bool,
+) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(pin_path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_insecure_legacy => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "required xID finality pin {} is missing. This branch must not ship or merge before the trusted post-upgrade pin is installed. For pre-upgrade development only, set {ALLOW_INSECURE_XID_LEGACY_ENV}=1 explicitly.",
+            pin_path.display()
+        )),
+        Err(e) => Err(format!(
+            "cannot read required xID finality pin {}: {e}. Refusing to downgrade to RPC-trusted resolution.",
+            pin_path.display()
+        )),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum XidFinalityBoot {
+    Verified {
+        validator_count: usize,
+        restored_height: Option<u64>,
+    },
+    InsecureLegacy,
+}
+
+/// Install xID finality before any launch-name cache or RPC lookup is allowed.
+/// Keeping this in `boot`, rather than `serve`, closes the cold-start window in
+/// which an unverified mapping could choose the xite the node serves.
+fn initialize_xid_finality(data_root: &std::path::Path) -> Result<XidFinalityBoot, String> {
+    let pin_path = data_root.join("xid_pin.json");
+    let allow_insecure_legacy =
+        std::env::var_os(ALLOW_INSECURE_XID_LEGACY_ENV).is_some_and(|value| value == "1");
+    match read_xid_finality_pin(&pin_path, allow_insecure_legacy)? {
+        Some(bytes) => {
+            let validator_count = epix_chain::install_finality_pin(&bytes).map_err(|e| {
+                format!(
+                    "xID finality pin {} is present but invalid: {e}. Refusing to start with finality verification disabled; replace it with a trusted pin.",
+                    pin_path.display()
+                )
+            })?;
+            let checkpoint_path = data_root.join("xid_finality_checkpoint.json");
+            let restored =
+                epix_chain::configure_finality_checkpoint(&checkpoint_path).map_err(|e| {
+                    format!(
+                        "xID finality checkpoint {} could not be restored: {e}",
+                        checkpoint_path.display()
+                    )
+                })?;
+            Ok(XidFinalityBoot::Verified {
+                validator_count,
+                restored_height: restored.map(|checkpoint| checkpoint.height),
+            })
+        }
+        None => {
+            epix_chain::set_pinned_validators(None);
+            epix_chain::set_verify_finality(false);
+            Ok(XidFinalityBoot::InsecureLegacy)
+        }
+    }
+}
+
 /// Wire up the [`AppState`], plugins, background runtime, and UI server for a
 /// launch target. Returns the server future + handle.
 async fn serve(
     opts: NodeOptions,
     launch: LaunchTarget,
+    xid_finality: XidFinalityBoot,
+    startup_network_policy: StartupNetworkPolicy,
 ) -> Result<(UiServer, RunningNode), String> {
     let state = AppState::with_data_dir(&opts.version, &opts.data_root);
+    state
+        .initialize_security_tokens()
+        .map_err(|error| format!("cannot initialize UI security tokens: {error}"))?;
     state.set_rev(&opts.rev).await;
     if let Some(log_file) = &opts.log_file {
         state.set_log_file(log_file);
     }
-
-    // xID finality: if a pinned validator set is shipped (`xid_pin.json` in the
-    // data root, captured from mainnet AFTER the v0.7.2 attestation upgrade),
-    // install it and REQUIRE client-side finality verification — xID resolution
-    // then fails closed unless the digest is signed by >2/3 of the pinned power.
-    // Absent, resolution falls back to the legacy RPC-trusted path with a warning.
-    {
-        let pin_path = opts.data_root.join("xid_pin.json");
-        match std::fs::read(&pin_path) {
-            Ok(bytes) => match epix_chain::install_finality_pin(&bytes) {
-                Ok(n) => {
-                    state
-                        .log(
-                            "INFO",
-                            format!(
-                                "xID finality: pinned {n} validators; resolution now requires >2/3 attestation"
-                            ),
-                        )
-                        .await
-                }
-                Err(e) => {
-                    // A pin file is PRESENT but invalid — the operator intended to
-                    // require client-side finality, so fail CLOSED (abort startup)
-                    // rather than silently downgrade to RPC-trusted resolution,
-                    // which is exactly the rogue-RPC attack the pin defends against.
-                    let msg = format!(
-                        "xID finality pin {} is present but invalid: {e}. Refusing to start with finality verification disabled; fix or remove the file to proceed.",
-                        pin_path.display()
-                    );
-                    state.log("ERROR", msg.clone()).await;
-                    return Err(msg);
-                }
-            },
-            Err(_) => {
-                state
-                    .log(
-                        "WARN",
-                        "xID finality: no xid_pin.json found; using legacy RPC-trusted resolution",
-                    )
-                    .await
-            }
+    match xid_finality {
+        XidFinalityBoot::Verified {
+            validator_count,
+            restored_height,
+        } => {
+            let checkpoint_note = restored_height
+                .map(|height| format!("; restored height {height}"))
+                .unwrap_or_default();
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "xID finality: pinned {validator_count} validators; resolution now requires >2/3 attestation{checkpoint_note}"
+                    ),
+                )
+                .await;
+        }
+        XidFinalityBoot::InsecureLegacy => {
+            state
+                .log(
+                    "WARN",
+                    format!(
+                        "xID finality: {ALLOW_INSECURE_XID_LEGACY_ENV}=1 explicitly enabled insecure pre-upgrade RPC-trusted resolution"
+                    ),
+                )
+                .await;
         }
     }
     // The Config page's "Data directory" works only when the root is the
@@ -2220,7 +2507,8 @@ async fn serve(
     // until some merger action happens to trigger a rebuild.
     state.rebuild_merger_dbs().await;
 
-    let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+    let offline = startup_network_policy == StartupNetworkPolicy::Offline;
+    let transport = transport_for_network_policy(offline, Arc::new(TcpTransport));
     state.set_transport(transport.clone()).await;
 
     // Trackers: configured list, else the built-in defaults. Either way this
@@ -2239,14 +2527,15 @@ async fn serve(
     // State-initiated announces (ensure_optional_peers) build the same full
     // tracker set the announce loop uses - including this bootstrap list.
     state.set_bootstrap_trackers(trackers.clone()).await;
-
     // Background optional-file retry loop: any xite whose "Download optional
     // files" / "Help distribute" toggle is on keeps fetching its missing
     // optional files - resuming interrupted downloads at startup and retrying
     // (with backoff) until everything arrived or the node stops. Registered
     // after the bootstrap trackers so its on-demand announces have the full
     // tracker set.
-    state.spawn_optional_retry_loop();
+    if !offline {
+        state.spawn_optional_retry_loop();
+    }
 
     // Liveness watchdog: probe the central xites lock and abort a wedged
     // process rather than let it squat the port looking alive.
@@ -2258,6 +2547,7 @@ async fn serve(
         state: state.clone(),
         data_root: opts.data_root.clone(),
         trackers: trackers.clone(),
+        network_disabled: offline,
         in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
         tor_always: std::sync::atomic::AtomicBool::new(false),
@@ -2287,11 +2577,6 @@ async fn serve(
         Some(p) => Some(p as u16),
         None => Some(DEFAULT_FILESERVER_PORT),
     };
-    let offline = state
-        .config_get("offline")
-        .await
-        .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
-        .unwrap_or(false);
     if let Some(port) = fileserver_port {
         state.set_fileserver_port(port).await;
     }
@@ -2332,9 +2617,12 @@ async fn serve(
         // SOCKS proxy is wired (below), so name resolution never leaks the real
         // IP or the queried name to api.epix.zone during the Tor bootstrap
         // window. Set before the runtime starts, so its first resolves are gated.
-        epix_chain::set_chain_require_tor(tor_mode == epix_runtime::TorMode::Always);
+        epix_chain::set_chain_route(None, offline || tor_mode == epix_runtime::TorMode::Always);
         #[cfg(feature = "bittorrent")]
-        epix_bt::http::set_require_tor(tor_mode == epix_runtime::TorMode::Always);
+        {
+            epix_bt::http::set_socks(None);
+            epix_bt::http::set_require_tor(offline || tor_mode == epix_runtime::TorMode::Always);
+        }
         // Ip peers are dialed through exit circuits in Always mode, so every
         // dial/transfer deadline must use the overlay budget - the clearnet
         // 15s cuts off exit-circuit dials mid-build and discovery goes dark.
@@ -2509,18 +2797,20 @@ async fn serve(
         .ui_addr
         .parse()
         .map_err(|_| format!("invalid ui_addr '{}'", opts.ui_addr))?;
-    let bind = resolve_ui_bind(requested);
+    let (ui_listener, bind, nmh_warnings) =
+        bind_and_publish_ui_endpoint_with(requested, DEFAULT_UI_PORT, LEGACY_UI_PORT, |bind| {
+            publish_nmh_endpoint(&opts.data_root, bind, state.nmh_token())
+        })
+        .map_err(|error| format!("bind UI endpoint: {error}"))?;
     if bind.port() != requested.port() {
         state
             .log("INFO", format!("UI port {} in use; using {}", requested.port(), bind.port()))
             .await;
     }
     state.set_ui_port(bind.port()).await;
-    // Record the actual UI port so the native-messaging host (a separate
-    // process Firefox launches) can find this node's status endpoint instead
-    // of guessing a fixed port - the bind may be the default, the legacy
-    // fallback, or a user-chosen one.
-    let _ = std::fs::write(opts.data_root.join("ui_port"), bind.port().to_string());
+    for warning in nmh_warnings {
+        state.log("WARN", warning).await;
+    }
     state.log("INFO", format!("Serving {display}")).await;
 
     if opts.open_browser {
@@ -2532,8 +2822,12 @@ async fn serve(
     // change apart and offer a restart.
     state.snapshot_boot_config().await;
 
-    let server =
-        UiServer::with_registry_and_media(state.clone(), plugins.command_registry(), plugins.media_bundle());
+    let server = UiServer::with_registry_and_media(
+        state.clone(),
+        plugins.command_registry(),
+        plugins.media_bundle(),
+    )
+    .with_bound_listener(ui_listener);
     // Local operator channel: a filesystem-guarded admin socket so a locked-down
     // (restricted / NoNewSites) node can still be administered server-side.
     #[cfg(unix)]
@@ -2543,6 +2837,62 @@ async fn serve(
 
 fn resolve_cache_path(data_root: &std::path::Path) -> PathBuf {
     data_root.join("resolve-cache.json")
+}
+
+type ResolveCachePathLocks =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>;
+
+fn canonical_resolve_cache_path(path: &std::path::Path) -> PathBuf {
+    // `data_root` is normally absolute. Canonicalizing the parent also makes
+    // syntactically different paths to a not-yet-created cache share a lock.
+    path.canonicalize().unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(path)
+                }
+            })
+    })
+}
+
+fn resolve_cache_lock(path: &std::path::Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<ResolveCachePathLocks> = std::sync::OnceLock::new();
+
+    let key = canonical_resolve_cache_path(path);
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(std::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn resolve_cache_process_lock(
+    path: &std::path::Path,
+) -> std::io::Result<fslock_guard::LockFileGuard> {
+    let canonical = canonical_resolve_cache_path(path);
+    let file_name = canonical.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "resolve cache path has no file name: {}",
+                canonical.display()
+            ),
+        )
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    fslock_guard::LockFileGuard::lock(canonical.with_file_name(lock_name))
 }
 
 /// How long a cached xID resolution stays fresh. Within this window the chain
@@ -2558,14 +2908,39 @@ fn now_secs() -> u64 {
 }
 
 /// Look up a name in the resolve cache: `Some((address, fresh))` where `fresh`
-/// says the entry is within [`RESOLVE_CACHE_TTL_SECS`]. Reads both the current
-/// format (`{"address": "epix1…", "resolved_at": secs}`) and the legacy plain
-/// string form (address known, age unknown - treated as expired so it upgrades
-/// on the next successful resolve).
-pub fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(String, bool)> {
-    match read_resolve_cache(data_root).get(full)? {
-        serde_json::Value::String(address) => Some((address.clone(), false)),
+/// says the entry is within [`RESOLVE_CACHE_TTL_SECS`]. When finality is active,
+/// a name entry is accepted only if it carries the exact height and digest of
+/// the current durable checkpoint. Legacy unbound entries become cache misses.
+fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(String, bool)> {
+    let cache = read_resolve_cache(data_root);
+    let finality_required =
+        epix_chain::verify_finality_enabled() && cache_target_requires_finality(full);
+    parse_cached_resolution(cache.get(full)?, finality_required, |height, digest| {
+        epix_chain::finality_checkpoint_matches(height, digest)
+    })
+}
+
+fn cache_target_requires_finality(full: &str) -> bool {
+    let (label, tld) = full.rsplit_once('.').unwrap_or((full, "epix"));
+    !(tld == "epix" && epix_core::classify_label(label) == epix_core::LabelClass::Address)
+}
+
+fn parse_cached_resolution(
+    value: &serde_json::Value,
+    finality_required: bool,
+    binding_current: impl Fn(u64, &str) -> bool,
+) -> Option<(String, bool)> {
+    match value {
+        serde_json::Value::String(address) if !finality_required => Some((address.clone(), false)),
+        serde_json::Value::String(_) => None,
         serde_json::Value::Object(entry) => {
+            if finality_required {
+                let height = entry.get("finality_height")?.as_u64()?;
+                let digest = entry.get("finality_digest")?.as_str()?;
+                if !binding_current(height, digest) {
+                    return None;
+                }
+            }
             let address = entry.get("address")?.as_str()?.to_string();
             let resolved_at = entry.get("resolved_at").and_then(|v| v.as_u64()).unwrap_or(0);
             let fresh = now_secs().saturating_sub(resolved_at) < RESOLVE_CACHE_TTL_SECS;
@@ -2575,30 +2950,468 @@ pub fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(Str
     }
 }
 
-fn read_resolve_cache(
-    data_root: &std::path::Path,
-) -> serde_json::Map<String, serde_json::Value> {
-    std::fs::read(resolve_cache_path(data_root))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+fn read_resolve_cache(data_root: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    read_resolve_cache_for_update(&resolve_cache_path(data_root)).unwrap_or_default()
+}
+
+fn read_resolve_cache_for_update(
+    path: &std::path::Path,
+) -> std::io::Result<serde_json::Map<String, serde_json::Value>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_slice(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid resolve cache {}: {error}", path.display()),
+        )
+    })
+}
+
+static RESOLVE_CACHE_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct ResolveCacheTemp {
+    path: PathBuf,
+}
+
+impl Drop for ResolveCacheTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn create_resolve_cache_temp(
+    destination: &std::path::Path,
+) -> std::io::Result<(ResolveCacheTemp, std::fs::File)> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "resolve cache path has no parent: {}",
+                destination.display()
+            ),
+        )
+    })?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("resolve-cache.json");
+    for _ in 0..128 {
+        let id = RESOLVE_CACHE_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!(".{name}.tmp-{}-{id}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((ResolveCacheTemp { path }, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not allocate a temporary resolve cache beside {}",
+            destination.display()
+        ),
+    ))
+}
+
+#[cfg(windows)]
+fn replace_resolve_cache_durable(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // SAFETY: both buffers are NUL-terminated and live for the duration of the
+    // call. The flags request an atomic replacement with write-through.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_resolve_cache_durable(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+fn persist_resolve_cache_atomic(
+    destination: &std::path::Path,
+    bytes: &[u8],
+    publish: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    use std::io::Write as _;
+
+    let (temporary, mut file) = create_resolve_cache_temp(destination)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    // For finality-bound writes this callback holds the durable checkpoint lock
+    // across `publish_resolve_cache_temp`, closing the check-to-rename gap.
+    publish(&temporary.path, destination)
+}
+
+fn publish_resolve_cache_temp(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    replace_resolve_cache_durable(temporary, destination)?;
+
+    #[cfg(unix)]
+    {
+        let parent = destination.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "resolve cache path has no parent: {}",
+                    destination.display()
+                ),
+            )
+        })?;
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Record a fresh chain resolution: `{"address": …, "resolved_at": now}`.
-/// Public so the native-messaging host shares the node's cache.
-pub fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &str) {
+/// Unbound writes remain available for explicit legacy-mode callers. They are
+/// never accepted for a name after client-side finality is enabled.
+#[cfg(test)]
+fn write_resolve_cache(data_root: &std::path::Path, full: &str, address: &str) {
+    write_resolve_cache_bound(data_root, full, address, None);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ResolveCacheWriteOutcome {
+    Published,
+    Superseded,
+}
+
+fn write_resolve_cache_bound(
+    data_root: &std::path::Path,
+    full: &str,
+    address: &str,
+    binding: Option<&(u64, String)>,
+) {
+    let finality_required =
+        epix_chain::verify_finality_enabled() && cache_target_requires_finality(full);
+    let _ = write_resolve_cache_bound_checked(
+        data_root,
+        full,
+        address,
+        binding,
+        finality_required,
+        |height, digest, temporary, destination| {
+            match epix_chain::publish_if_finality_checkpoint_current(height, digest, || {
+                publish_resolve_cache_temp(temporary, destination)
+            }) {
+                Some(result) => {
+                    result?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        },
+    );
+}
+
+fn write_resolve_cache_bound_checked(
+    data_root: &std::path::Path,
+    full: &str,
+    address: &str,
+    binding: Option<&(u64, String)>,
+    finality_required: bool,
+    publish_if_current: impl FnOnce(
+        u64,
+        &str,
+        &std::path::Path,
+        &std::path::Path,
+    ) -> std::io::Result<bool>,
+) -> std::io::Result<ResolveCacheWriteOutcome> {
     let path = resolve_cache_path(data_root);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    let mut cache = read_resolve_cache(data_root);
-    cache.insert(
-        full.to_string(),
-        serde_json::json!({ "address": address, "resolved_at": now_secs() }),
-    );
-    if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
-        let _ = std::fs::write(path, bytes);
+    if finality_required && binding.is_none() {
+        return Ok(ResolveCacheWriteOutcome::Superseded);
     }
+
+    let lock = resolve_cache_lock(&path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The Arc mutex serializes tasks in this process. The lock file extends the
+    // same read-modify-write critical section across separate node processes
+    // that share a data root.
+    let _process_guard = resolve_cache_process_lock(&path)?;
+    let mut cache = read_resolve_cache_for_update(&path)?;
+
+    // A delayed writer must never downgrade a newer binding already published
+    // for the same name, even if its caller supplies a faulty current-binding
+    // predicate.
+    if let Some((height, _)) = binding {
+        let existing_height = cache
+            .get(full)
+            .and_then(serde_json::Value::as_object)
+            .and_then(|entry| entry.get("finality_height"))
+            .and_then(serde_json::Value::as_u64);
+        if existing_height.is_some_and(|existing| existing > *height) {
+            return Ok(ResolveCacheWriteOutcome::Superseded);
+        }
+    }
+
+    let mut entry = serde_json::json!({
+        "address": address,
+        "resolved_at": now_secs(),
+    });
+    if let Some((height, digest)) = binding {
+        entry["finality_height"] = serde_json::json!(height);
+        entry["finality_digest"] = serde_json::json!(digest);
+    }
+    cache.insert(full.to_string(), entry);
+    let bytes = serde_json::to_vec_pretty(&cache).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cannot serialize resolve cache {}: {error}", path.display()),
+        )
+    })?;
+    let published = persist_resolve_cache_atomic(&path, &bytes, |temporary, destination| {
+        if let Some((height, digest)) = binding {
+            publish_if_current(*height, digest, temporary, destination)
+        } else {
+            publish_resolve_cache_temp(temporary, destination)?;
+            Ok(true)
+        }
+    })?;
+    Ok(if published {
+        ResolveCacheWriteOutcome::Published
+    } else {
+        ResolveCacheWriteOutcome::Superseded
+    })
+}
+
+/// Read the private per-run native-messaging token written by the node.
+pub fn read_nmh_auth_token(data_root: &std::path::Path) -> Result<String, String> {
+    let path = data_root.join(NMH_TOKEN_RELATIVE_PATH);
+    let encoded = std::fs::read(&path)
+        .map_err(|e| format!("cannot read native-messaging token {}: {e}", path.display()))?;
+    let token = decode_nmh_token(&encoded)?;
+    let token = token.trim().to_string();
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "native-messaging token {} is malformed",
+            path.display()
+        ));
+    }
+    Ok(token)
+}
+
+fn write_nmh_auth_token(data_root: &std::path::Path, token: &str) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let path = data_root.join(NMH_TOKEN_RELATIVE_PATH);
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "native-messaging token path has no parent: {}",
+            path.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "cannot create native-messaging token directory {}: {e}",
+            parent.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+            format!(
+                "cannot secure native-messaging token directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+
+    // DPAPI can fail. Encode before opening the live file so a protection
+    // failure cannot truncate the previous run's still-usable credential.
+    let encoded = encode_nmh_token(token)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|e| {
+        format!(
+            "cannot write native-messaging token {}: {e}",
+            path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                format!(
+                    "cannot secure native-messaging token {}: {e}",
+                    path.display()
+                )
+            })?;
+    }
+    file.write_all(&encoded)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| {
+            format!(
+                "cannot persist native-messaging token {}: {e}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(not(windows))]
+fn encode_nmh_token(token: &str) -> Result<Vec<u8>, String> {
+    Ok(token.as_bytes().to_vec())
+}
+
+#[cfg(not(windows))]
+fn decode_nmh_token(encoded: &[u8]) -> Result<String, String> {
+    String::from_utf8(encoded.to_vec())
+        .map_err(|_| "native-messaging token is not valid UTF-8".to_string())
+}
+
+/// Protect the bearer token with Windows DPAPI in the current-user scope. A
+/// permissive inherited ACL then reveals only ciphertext to another account.
+#[cfg(windows)]
+struct LocalAllocGuard(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for LocalAllocGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard is constructed only from a non-null DPAPI output
+        // allocation, which the API requires callers to release with LocalFree.
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn copy_dpapi_output(
+    output: windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
+    operation: &str,
+) -> Result<Vec<u8>, String> {
+    if output.pbData.is_null() || output.cbData == 0 {
+        if !output.pbData.is_null() {
+            drop(LocalAllocGuard(output.pbData.cast()));
+        }
+        return Err(format!(
+            "{operation} returned an empty native-messaging token buffer"
+        ));
+    }
+    let _allocation = LocalAllocGuard(output.pbData.cast());
+    // SAFETY: the non-null DPAPI output remains owned by `_allocation` and is
+    // valid for exactly `cbData` bytes until the copy completes.
+    Ok(unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec())
+}
+
+#[cfg(windows)]
+fn encode_nmh_token(token: &str) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let input_len = u32::try_from(token.len())
+        .map_err(|_| "native-messaging token is too large".to_string())?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_len,
+        pbData: token.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: the input points to `token` for this call. DPAPI allocates the
+    // output with LocalAlloc; it is copied before LocalFree.
+    if unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "cannot protect native-messaging token: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    copy_dpapi_output(output, "CryptProtectData")
+}
+
+#[cfg(windows)]
+fn decode_nmh_token(encoded: &[u8]) -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let input_len = u32::try_from(encoded.len())
+        .map_err(|_| "protected native-messaging token is too large".to_string())?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_len,
+        pbData: encoded.as_ptr().cast_mut(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: the input points to `encoded` for this call. No UI or optional
+    // entropy is used. Output is copied and released with LocalFree.
+    if unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "cannot unprotect native-messaging token for this Windows user: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let bytes = copy_dpapi_output(output, "CryptUnprotectData")?;
+    String::from_utf8(bytes)
+        .map_err(|_| "unprotected native-messaging token is not valid UTF-8".to_string())
 }
 
 /// The shared data root: `EPIX_DATA_DIR` if set, else the `data_dir`
@@ -2625,6 +3438,39 @@ pub fn open_in_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_finality_pin_requires_explicit_legacy_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = dir.path().join("xid_pin.json");
+        let err = read_xid_finality_pin(&pin, false).unwrap_err();
+        assert!(err.contains(ALLOW_INSECURE_XID_LEGACY_ENV));
+        assert_eq!(read_xid_finality_pin(&pin, true).unwrap(), None);
+    }
+
+    #[test]
+    fn finality_pin_read_errors_never_downgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = dir.path().join("xid_pin.json");
+        std::fs::create_dir(&pin).unwrap();
+        let err = read_xid_finality_pin(&pin, true).unwrap_err();
+        assert!(err.contains("Refusing to downgrade"));
+    }
+
+    #[test]
+    fn present_finality_pin_is_returned_in_both_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = dir.path().join("xid_pin.json");
+        std::fs::write(&pin, b"trusted bytes").unwrap();
+        assert_eq!(
+            read_xid_finality_pin(&pin, false).unwrap(),
+            Some(b"trusted bytes".to_vec())
+        );
+        assert_eq!(
+            read_xid_finality_pin(&pin, true).unwrap(),
+            Some(b"trusted bytes".to_vec())
+        );
+    }
 
     fn entries(names: &[&str]) -> Vec<epix_xite::FileEntry> {
         names
@@ -2663,18 +3509,95 @@ mod tests {
         let addr = |p: u16| std::net::SocketAddr::from(([127, 0, 0, 1], p));
 
         // Default port free -> use it.
-        assert_eq!(resolve_ui_bind_with(addr(DEFAULT_UI_PORT), |_| true), addr(DEFAULT_UI_PORT));
+        assert_eq!(
+            bind_ui_listener_with(
+                addr(DEFAULT_UI_PORT),
+                DEFAULT_UI_PORT,
+                LEGACY_UI_PORT,
+                |candidate| Ok::<_, std::io::Error>(candidate),
+            )
+            .unwrap(),
+            addr(DEFAULT_UI_PORT)
+        );
 
         // Default port taken -> fall back to the legacy EpixNet port.
-        let taken_default = |a: std::net::SocketAddr| a.port() != DEFAULT_UI_PORT;
-        assert_eq!(resolve_ui_bind_with(addr(DEFAULT_UI_PORT), taken_default), addr(LEGACY_UI_PORT));
+        assert_eq!(
+            bind_ui_listener_with(
+                addr(DEFAULT_UI_PORT),
+                DEFAULT_UI_PORT,
+                LEGACY_UI_PORT,
+                |candidate| {
+                    if candidate.port() == DEFAULT_UI_PORT {
+                        Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+                    } else {
+                        Ok(candidate)
+                    }
+                },
+            )
+            .unwrap(),
+            addr(LEGACY_UI_PORT)
+        );
 
-        // Default and legacy both taken -> keep the default (serve reports it).
-        assert_eq!(resolve_ui_bind_with(addr(DEFAULT_UI_PORT), |_| false), addr(DEFAULT_UI_PORT));
+        // Default and legacy both taken -> fail before publishing endpoint
+        // metadata instead of returning an address that is not owned.
+        assert!(bind_ui_listener_with(
+            addr(DEFAULT_UI_PORT),
+            DEFAULT_UI_PORT,
+            LEGACY_UI_PORT,
+            |_candidate| Err::<std::net::SocketAddr, _>(std::io::Error::from(
+                std::io::ErrorKind::AddrInUse
+            )),
+        )
+        .is_err());
 
-        // An explicitly chosen (non-default) port is honored even if taken -
-        // no surprise jump to 43110.
-        assert_eq!(resolve_ui_bind_with(addr(9999), |_| false), addr(9999));
+        // An explicitly chosen (non-default) port never jumps to 43110.
+        let mut attempts = Vec::new();
+        assert!(
+            bind_ui_listener_with(addr(9999), DEFAULT_UI_PORT, LEGACY_UI_PORT, |candidate| {
+                attempts.push(candidate);
+                Err::<std::net::SocketAddr, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            },)
+            .is_err()
+        );
+        assert_eq!(attempts, vec![addr(9999)]);
+    }
+
+    #[test]
+    fn native_messaging_metadata_is_published_only_after_listener_ownership() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hijacker = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let requested = hijacker.local_addr().unwrap();
+        std::fs::write(dir.path().join("ui_port"), requested.port().to_string()).unwrap();
+        write_nmh_auth_token(dir.path(), &"11".repeat(32)).unwrap();
+
+        let published = Cell::new(false);
+        let token = "22".repeat(32);
+        let (listener, bound, warnings) =
+            bind_and_publish_ui_endpoint_with(requested, requested.port(), 0, |bound| {
+                assert_ne!(bound, requested, "the occupied port must use fallback");
+                assert!(
+                    std::net::TcpListener::bind(bound).is_err(),
+                    "publication must run only while the node owns the selected port"
+                );
+                published.set(true);
+                publish_nmh_endpoint(dir.path(), bound, &token)
+            })
+            .unwrap();
+
+        assert!(published.get());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ui_port")).unwrap(),
+            bound.port().to_string()
+        );
+        assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), token);
+        assert!(
+            std::net::TcpListener::bind(bound).is_err(),
+            "UiServer must receive a retained listener, not a probe result"
+        );
+        drop(listener);
     }
 
     #[test]
@@ -2738,27 +3661,437 @@ mod tests {
     }
 
     #[test]
+    fn finality_mode_rejects_unbound_or_superseded_cache_entries() {
+        let unbound = serde_json::json!({
+            "address": "epix1forged",
+            "resolved_at": now_secs(),
+        });
+        assert_eq!(
+            parse_cached_resolution(&unbound, true, |_height, _digest| true),
+            None,
+            "a fresh legacy cache entry must not bypass finality"
+        );
+        assert_eq!(
+            parse_cached_resolution(&unbound, false, |_height, _digest| false),
+            Some(("epix1forged".into(), true)),
+            "explicit legacy mode keeps the compatibility cache"
+        );
+
+        let bound = serde_json::json!({
+            "address": "epix1verified",
+            "resolved_at": now_secs(),
+            "finality_height": 42,
+            "finality_digest": "11".repeat(32),
+        });
+        assert_eq!(
+            parse_cached_resolution(&bound, true, |height, digest| {
+                height == 42 && digest == "11".repeat(32)
+            }),
+            Some(("epix1verified".into(), true))
+        );
+        assert_eq!(
+            parse_cached_resolution(&bound, true, |_height, _digest| false),
+            None,
+            "a cache binding stops being valid when the checkpoint advances"
+        );
+
+        let pinned_at = 1_000_000_i64;
+        let ws_period = 7 * 24 * 3600;
+        let pin_current_at = |now: i64| now.saturating_sub(pinned_at) <= ws_period;
+        assert_eq!(
+            parse_cached_resolution(&bound, true, |_height, _digest| {
+                pin_current_at(pinned_at + ws_period)
+            }),
+            Some(("epix1verified".into(), true)),
+            "the exact weak-subjectivity boundary is still usable"
+        );
+        assert_eq!(
+            parse_cached_resolution(&bound, true, |_height, _digest| {
+                pin_current_at(pinned_at + ws_period + 1)
+            }),
+            None,
+            "after pin expiry a disk entry is a total miss, not a stale fallback"
+        );
+        assert_eq!(
+            parse_cached_resolution(&bound, true, |height, _digest| height >= 43),
+            None,
+            "a height-42 cache must miss after a trusted repin at height 43"
+        );
+    }
+
+    #[test]
+    fn cross_process_resolve_cache_writer_worker() {
+        if std::env::var_os("EPIX_RESOLVE_CACHE_WORKER").is_none() {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("EPIX_RESOLVE_CACHE_ROOT").unwrap());
+        let ready = PathBuf::from(std::env::var_os("EPIX_RESOLVE_CACHE_READY").unwrap());
+        let release = PathBuf::from(std::env::var_os("EPIX_RESOLVE_CACHE_RELEASE").unwrap());
+        let binding = (41, "41".repeat(32));
+
+        let outcome = write_resolve_cache_bound_checked(
+            &root,
+            "child.epix",
+            "epix1child",
+            Some(&binding),
+            true,
+            |_height, _digest, temporary, destination| {
+                std::fs::write(&ready, b"ready")?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !release.exists() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "parent never released resolve-cache writer",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                publish_resolve_cache_temp(temporary, destination)?;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, ResolveCacheWriteOutcome::Published);
+    }
+
+    #[test]
+    fn child_process_cache_writer_cannot_clobber_a_concurrent_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("child-ready");
+        let release = dir.path().join("release-child");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::cross_process_resolve_cache_writer_worker")
+            .arg("--nocapture")
+            .env("EPIX_RESOLVE_CACHE_WORKER", "1")
+            .env("EPIX_RESOLVE_CACHE_ROOT", dir.path())
+            .env("EPIX_RESOLVE_CACHE_READY", &ready)
+            .env("EPIX_RESOLVE_CACHE_RELEASE", &release)
+            .spawn()
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cache child did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let root = dir.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let parent_writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = write_resolve_cache_bound_checked(
+                &root,
+                "parent.epix",
+                "epix1parent",
+                None,
+                false,
+                |_height, _digest, _temporary, _destination| Ok(false),
+            );
+            finished_tx.send(()).unwrap();
+            result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a second process must not pass the cache read-modify-write lock"
+        );
+
+        std::fs::write(&release, b"go").unwrap();
+        assert!(child.wait().unwrap().success());
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(
+            parent_writer.join().unwrap().unwrap(),
+            ResolveCacheWriteOutcome::Published
+        );
+
+        let cache = read_resolve_cache_for_update(&resolve_cache_path(dir.path())).unwrap();
+        assert_eq!(cache["child.epix"]["address"], "epix1child");
+        assert_eq!(cache["parent.epix"]["address"], "epix1parent");
+    }
+
+    #[test]
+    fn concurrent_resolve_cache_writers_do_not_lose_names_or_publish_partial_json() {
+        let different = tempfile::tempdir().unwrap();
+        let mut writers = Vec::new();
+        for index in 0..24 {
+            let root = different.path().to_path_buf();
+            writers.push(std::thread::spawn(move || {
+                write_resolve_cache_bound_checked(
+                    &root,
+                    &format!("name-{index}.epix"),
+                    &format!("epix1address{index}"),
+                    None,
+                    false,
+                    |_height, _digest, _temporary, _destination| Ok(false),
+                )
+                .unwrap()
+            }));
+        }
+        for writer in writers {
+            assert_eq!(writer.join().unwrap(), ResolveCacheWriteOutcome::Published);
+        }
+        let cache = read_resolve_cache_for_update(&resolve_cache_path(different.path())).unwrap();
+        assert_eq!(cache.len(), 24, "read-modify-write must retain every name");
+        for index in 0..24 {
+            assert_eq!(
+                cache[&format!("name-{index}.epix")]["address"],
+                format!("epix1address{index}")
+            );
+        }
+
+        let same = tempfile::tempdir().unwrap();
+        let mut writers = Vec::new();
+        for index in 0..24 {
+            let root = same.path().to_path_buf();
+            writers.push(std::thread::spawn(move || {
+                write_resolve_cache_bound_checked(
+                    &root,
+                    "shared.epix",
+                    &format!("epix1address{index}"),
+                    None,
+                    false,
+                    |_height, _digest, _temporary, _destination| Ok(false),
+                )
+                .unwrap()
+            }));
+        }
+        for writer in writers {
+            assert_eq!(writer.join().unwrap(), ResolveCacheWriteOutcome::Published);
+        }
+        let bytes = std::fs::read(resolve_cache_path(same.path())).unwrap();
+        let cache: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(cache.len(), 1);
+        let address = cache["shared.epix"]["address"].as_str().unwrap();
+        assert!(address.starts_with("epix1address"));
+    }
+
+    #[test]
+    fn superseded_resolve_cache_writer_cannot_overwrite_newer_binding() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let current_height = Arc::new(AtomicU64::new(41));
+        let reached_final_check = Arc::new(std::sync::Barrier::new(2));
+        let release_final_check = Arc::new(std::sync::Barrier::new(2));
+
+        let stale_root = dir.path().to_path_buf();
+        let stale_height = Arc::clone(&current_height);
+        let stale_reached = Arc::clone(&reached_final_check);
+        let stale_release = Arc::clone(&release_final_check);
+        let stale = std::thread::spawn(move || {
+            let binding = (41, "41".repeat(32));
+            write_resolve_cache_bound_checked(
+                &stale_root,
+                "talk.epix",
+                "epix1stale",
+                Some(&binding),
+                true,
+                move |height, digest, temporary, destination| {
+                    stale_reached.wait();
+                    stale_release.wait();
+                    if stale_height.load(Ordering::SeqCst) != height || digest != "41".repeat(32) {
+                        return Ok(false);
+                    }
+                    publish_resolve_cache_temp(temporary, destination)?;
+                    Ok(true)
+                },
+            )
+            .unwrap()
+        });
+
+        reached_final_check.wait();
+        current_height.store(42, Ordering::SeqCst);
+        let fresh_root = dir.path().to_path_buf();
+        let fresh_height = Arc::clone(&current_height);
+        let fresh = std::thread::spawn(move || {
+            let binding = (42, "42".repeat(32));
+            write_resolve_cache_bound_checked(
+                &fresh_root,
+                "talk.epix",
+                "epix1fresh",
+                Some(&binding),
+                true,
+                move |height, digest, temporary, destination| {
+                    if fresh_height.load(Ordering::SeqCst) != height || digest != "42".repeat(32) {
+                        return Ok(false);
+                    }
+                    publish_resolve_cache_temp(temporary, destination)?;
+                    Ok(true)
+                },
+            )
+            .unwrap()
+        });
+        release_final_check.wait();
+
+        assert_eq!(stale.join().unwrap(), ResolveCacheWriteOutcome::Superseded);
+        assert_eq!(fresh.join().unwrap(), ResolveCacheWriteOutcome::Published);
+
+        // The on-disk height check is a second line of defense. Even a faulty
+        // caller that claims height 41 is current cannot downgrade height 42.
+        let stale_binding = (41, "41".repeat(32));
+        assert_eq!(
+            write_resolve_cache_bound_checked(
+                dir.path(),
+                "talk.epix",
+                "epix1late-stale",
+                Some(&stale_binding),
+                true,
+                |_height, _digest, temporary, destination| {
+                    publish_resolve_cache_temp(temporary, destination)?;
+                    Ok(true)
+                },
+            )
+            .unwrap(),
+            ResolveCacheWriteOutcome::Superseded
+        );
+        let cache = read_resolve_cache_for_update(&resolve_cache_path(dir.path())).unwrap();
+        assert_eq!(cache["talk.epix"]["address"], "epix1fresh");
+        assert_eq!(cache["talk.epix"]["finality_height"], 42);
+    }
+
+    #[test]
+    fn failed_or_truncated_resolve_cache_publication_retains_prior_file() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_cache_path(dir.path());
+        assert_eq!(
+            write_resolve_cache_bound_checked(
+                dir.path(),
+                "talk.epix",
+                "epix1prior",
+                None,
+                false,
+                |_height, _digest, _temporary, _destination| Ok(false),
+            )
+            .unwrap(),
+            ResolveCacheWriteOutcome::Published
+        );
+        let prior = std::fs::read(&path).unwrap();
+
+        let replacement = serde_json::to_vec(&serde_json::json!({
+            "talk.epix": { "address": "epix1replacement", "resolved_at": now_secs() }
+        }))
+        .unwrap();
+        let error = persist_resolve_cache_atomic(&path, &replacement, |temporary, _destination| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(temporary)?;
+            file.write_all(b"{")?;
+            file.sync_all()?;
+            Err(std::io::Error::other("injected publication failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&path).unwrap(), prior);
+        assert_eq!(
+            read_resolve_cache_for_update(&path).unwrap()["talk.epix"]["address"],
+            "epix1prior"
+        );
+
+        // A corrupt visible cache is a miss and is not silently replaced from
+        // an empty map by a later read-modify-write.
+        std::fs::write(&path, b"{").unwrap();
+        assert_eq!(cached_resolution(dir.path(), "talk.epix"), None);
+        assert!(write_resolve_cache_bound_checked(
+            dir.path(),
+            "other.epix",
+            "epix1other",
+            None,
+            false,
+            |_height, _digest, _temporary, _destination| Ok(false),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+    }
+
+    #[test]
+    fn native_messaging_token_is_private_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = "ab".repeat(32);
+        write_nmh_auth_token(dir.path(), &token).unwrap();
+        assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), token);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = dir.path().join(NMH_TOKEN_RELATIVE_PATH);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(dir.path().join("private"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        let rotated = "cd".repeat(32);
+        write_nmh_auth_token(dir.path(), &rotated).unwrap();
+        assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), rotated);
+
+        std::fs::write(dir.path().join(NMH_TOKEN_RELATIVE_PATH), "not-a-token").unwrap();
+        assert!(read_nmh_auth_token(dir.path()).is_err());
+    }
+
+    #[test]
     fn cached_launch_uses_cache_only_and_defers_a_miss() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
-        // A raw address passes straight through (no cache, no chain).
+        // A checksum-valid address passes straight through in either form.
         assert_eq!(
-            cached_launch(root, "epix1abcdef"),
-            Some(("epix1abcdef".into(), "epix1abcdef".into()))
+            cached_launch(root, DASH).unwrap(),
+            Some((DASH.into(), DASH.into()))
+        );
+        assert_eq!(
+            cached_launch(root, &format!("{DASH}.epix")).unwrap(),
+            Some((DASH.into(), DASH.into()))
         );
 
         // An uncached name has no cache hit -> None (boot defers it).
-        assert_eq!(cached_launch(root, "talk.epix"), None);
+        assert_eq!(cached_launch(root, "talk.epix").unwrap(), None);
+        assert_eq!(cached_launch(root, "epix1shop").unwrap(), None);
 
         // Once cached it resolves from disk without touching the chain, keyed by
         // the full name (matching how resolve_target writes it).
-        write_resolve_cache(root, "talk.epix", "epix1talk");
-        assert_eq!(cached_launch(root, "talk.epix"), Some(("epix1talk".into(), "talk.epix".into())));
+        write_resolve_cache(root, "talk.epix", DASH);
+        assert_eq!(
+            cached_launch(root, "talk.epix").unwrap(),
+            Some((DASH.into(), "talk.epix".into()))
+        );
 
         // A bare label defaults to the epix TLD for both lookup and display.
-        write_resolve_cache(root, "blog.epix", "epix1blog");
-        assert_eq!(cached_launch(root, "blog"), Some(("epix1blog".into(), "blog.epix".into())));
+        write_resolve_cache(root, "blog.epix", DASH);
+        assert_eq!(
+            cached_launch(root, "blog").unwrap(),
+            Some((DASH.into(), "blog.epix".into()))
+        );
+
+        // A bad-checksum address shape is rejected before a forged cache entry
+        // can turn it into a name.
+        let typo = format!("{}q", &DASH[..DASH.len() - 1]);
+        write_resolve_cache(root, &format!("{typo}.epix"), "epix1forged");
+        assert!(cached_launch(root, &typo).is_err());
     }
 
     #[test]
@@ -2766,19 +4099,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // A raw address never queries the chain.
-        assert!(!needs_chain_resolve(root, "epix1abcdef"));
-
-        // The dotted alias of a real address never queries the chain, and an
+        // Either alias of a real address never queries the chain, and an
         // address-shaped label (bad checksum, the typo-space around real
         // addresses) is refused - neither waits on Tor.
         const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        assert!(!needs_chain_resolve(root, DASH));
         assert!(!needs_chain_resolve(root, &format!("{DASH}.epix")));
-        let typo = format!("{}q.epix", &DASH[..DASH.len() - 1]);
+        let typo = format!("{}q", &DASH[..DASH.len() - 1]);
         assert!(!needs_chain_resolve(root, &typo));
+        assert!(!needs_chain_resolve(root, &format!("{typo}.epix")));
 
         // A short `epix1…` branding label is an ordinary NAME: with no cache
         // entry it must hit the chain (the old prefix-only check shadowed it).
+        assert!(needs_chain_resolve(root, "epix1shop"));
         assert!(needs_chain_resolve(root, "epix1shop.epix"));
 
         // A name with no cache entry must hit the chain (and can't fall back),
@@ -2786,28 +4119,107 @@ mod tests {
         assert!(needs_chain_resolve(root, "talk.epix"));
 
         // A fresh entry resolves from cache - no wait.
-        write_resolve_cache(root, "talk.epix", "epix1talk");
+        write_resolve_cache(root, "talk.epix", DASH);
         assert!(!needs_chain_resolve(root, "talk.epix"));
 
         // A stale entry still serves its stale mapping if the chain is
         // unreachable, so it needs no Tor wait either.
         let old = now_secs() - RESOLVE_CACHE_TTL_SECS - 1;
-        let cache = serde_json::json!({ "old.epix": { "address": "epix1old", "resolved_at": old } });
-        std::fs::write(resolve_cache_path(root), serde_json::to_vec(&cache).unwrap()).unwrap();
+        let cache = serde_json::json!({
+            "old.epix": { "address": DASH, "resolved_at": old }
+        });
+        std::fs::write(
+            resolve_cache_path(root),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
         assert!(!needs_chain_resolve(root, "old.epix"));
     }
 
     #[test]
     fn launch_display_normalizes_names_and_addresses() {
-        assert_eq!(launch_display("talk.epix"), "talk.epix");
-        assert_eq!(launch_display("blog"), "blog.epix");
-        assert_eq!(launch_display("epix1abcdef"), "epix1abcdef");
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        assert_eq!(launch_display("talk.epix").unwrap(), "talk.epix");
+        assert_eq!(launch_display("blog").unwrap(), "blog.epix");
+        assert_eq!(launch_display("epix1shop").unwrap(), "epix1shop.epix");
+        assert_eq!(launch_display(DASH).unwrap(), DASH);
+        assert_eq!(launch_display(&format!("{DASH}.epix")).unwrap(), DASH);
+
+        let typo = format!("{}q", &DASH[..DASH.len() - 1]);
+        assert!(launch_display(&typo).is_err());
     }
 
-    #[cfg(feature = "tor")]
+    #[tokio::test]
+    async fn resolve_target_rejects_bad_checksum_and_resolves_bare_epix1_name() {
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let typo = format!("{}q", &DASH[..DASH.len() - 1]);
+
+        write_resolve_cache(root, &format!("{typo}.epix"), "epix1forged");
+        let error = resolve_target(root, &typo).await.unwrap_err();
+        assert!(error.contains("bad checksum"), "{error}");
+
+        write_resolve_cache(root, "epix1shop.epix", DASH);
+        assert_eq!(
+            resolve_target(root, "epix1shop").await.unwrap(),
+            (DASH.into(), "epix1shop.epix".into(), true)
+        );
+        assert_eq!(
+            resolve_target(root, DASH).await.unwrap(),
+            (DASH.into(), DASH.into(), false)
+        );
+    }
+
     #[test]
-    fn configured_tor_always_follows_config_and_options() {
-        use epix_runtime::TorMode;
+    fn untrusted_xid_addresses_never_escape_data_root_or_survive_cache() {
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let container = tempfile::tempdir().unwrap();
+        let data_root = container.path().join("node");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let opts = NodeOptions::new(&data_root, DASH);
+        let absolute_escape = container.path().join("absolute-escape");
+        let traversal_escape = container.path().join("traversal-escape");
+        let absolute = absolute_escape.to_string_lossy().into_owned();
+        let traversal = "../../traversal-escape".to_string();
+        let invalid_bech32 = "epix1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq".to_string();
+
+        for invalid in [&absolute, &traversal, &invalid_bech32] {
+            assert!(validated_xite_address(invalid, "test xID record").is_err());
+            assert!(resolved_launch(&opts, invalid.clone(), "evil.epix".into()).is_err());
+        }
+        assert!(!absolute_escape.exists());
+        assert!(!traversal_escape.exists());
+        assert!(
+            !data_root.join("data").exists(),
+            "validation must run before any address-derived directory is created"
+        );
+
+        let cache = serde_json::json!({
+            "absolute.epix": { "address": absolute, "resolved_at": now_secs() },
+            "traversal.epix": { "address": traversal, "resolved_at": now_secs() },
+            "invalid.epix": { "address": invalid_bech32, "resolved_at": now_secs() },
+        });
+        std::fs::write(
+            resolve_cache_path(&data_root),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+        for name in ["absolute.epix", "traversal.epix", "invalid.epix"] {
+            assert_eq!(validated_cached_resolution(&data_root, name), None);
+            assert_eq!(cached_launch(&data_root, name).unwrap(), None);
+        }
+
+        let launch = resolved_launch(&opts, DASH.into(), "safe.epix".into()).unwrap();
+        let LaunchTarget::Resolved { data_dir, .. } = launch else {
+            panic!("valid address must produce a resolved launch");
+        };
+        assert_eq!(data_dir, data_root.join("data").join(DASH));
+        assert!(data_dir.is_dir());
+    }
+
+    #[test]
+    fn startup_network_policy_is_strict_and_preserves_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("private")).unwrap();
@@ -2818,19 +4230,235 @@ mod tests {
         };
 
         // No config, no option -> defaults to enable (not Always).
-        assert!(!configured_tor_always(root, &opts("")));
+        assert_eq!(
+            startup_network_policy(root, &opts("")).unwrap(),
+            StartupNetworkPolicy::Direct
+        );
 
         // An explicit option wins over config.
-        assert!(configured_tor_always(root, &opts("always")));
-        assert_eq!(TorMode::parse("always"), TorMode::Always);
+        assert_eq!(
+            startup_network_policy(root, &opts("always")).unwrap(),
+            StartupNetworkPolicy::TorAlways
+        );
 
         // Config chooses Always when no option is given.
         write_config(serde_json::json!({ "tor": "always" }));
-        assert!(configured_tor_always(root, &opts("")));
+        assert_eq!(
+            startup_network_policy(root, &opts("")).unwrap(),
+            StartupNetworkPolicy::TorAlways
+        );
 
-        // Offline forces Disable regardless of the tor choice.
+        // Offline forces the no-egress policy regardless of the Tor choice.
         write_config(serde_json::json!({ "tor": "always", "offline": true }));
-        assert!(!configured_tor_always(root, &opts("")));
+        assert_eq!(
+            startup_network_policy(root, &opts("")).unwrap(),
+            StartupNetworkPolicy::Offline
+        );
+
+        // A malformed field is rejected even if offline would otherwise hide it.
+        write_config(serde_json::json!({ "tor": 1, "offline": true }));
+        assert!(startup_network_policy(root, &opts("")).is_err());
+        write_config(serde_json::json!({ "tor": "mystery" }));
+        assert!(startup_network_policy(root, &opts("")).is_err());
+
+        let config_path = root.join("private").join("config.json");
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+        let error = startup_network_policy(root, &opts("")).unwrap_err();
+        assert!(error.contains("cannot read node config"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn offline_uncached_launch_arms_no_egress_without_calling_resolver() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        std::fs::write(
+            root.join("private").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({ "offline": true })).unwrap(),
+        )
+        .unwrap();
+        let opts = NodeOptions::new(root, "uncached.epix");
+        let armed = Arc::new(std::sync::Mutex::new(None));
+        let resolver_called = Arc::new(AtomicBool::new(false));
+
+        let armed_for_hook = armed.clone();
+        let called_for_resolver = resolver_called.clone();
+        let (launch, policy) = prepare_startup_launch_with(
+            &opts,
+            move |policy| *armed_for_hook.lock().unwrap() = Some(policy),
+            move |_data_root, _target| {
+                called_for_resolver.store(true, Ordering::SeqCst);
+                async { Err::<(String, String, bool), String>("resolver called".into()) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(policy, StartupNetworkPolicy::Offline);
+        assert_eq!(*armed.lock().unwrap(), Some(StartupNetworkPolicy::Offline));
+        assert!(!resolver_called.load(Ordering::SeqCst));
+        let LaunchTarget::Deferred { display } = launch else {
+            panic!("an uncached offline launch must remain deferred");
+        };
+        assert_eq!(display, "uncached.epix");
+    }
+
+    #[tokio::test]
+    async fn malformed_config_stops_before_route_or_resolver_egress() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("private")).unwrap();
+        std::fs::write(root.join("private").join("config.json"), b"{").unwrap();
+        let opts = NodeOptions::new(root, "uncached.epix");
+        let route_armed = Arc::new(AtomicBool::new(false));
+        let resolver_called = Arc::new(AtomicBool::new(false));
+
+        let armed_for_hook = route_armed.clone();
+        let called_for_resolver = resolver_called.clone();
+        let result = prepare_startup_launch_with(
+            &opts,
+            move |_policy| armed_for_hook.store(true, Ordering::SeqCst),
+            move |_data_root, _target| {
+                called_for_resolver.store(true, Ordering::SeqCst);
+                async { Err::<(String, String, bool), String>("resolver called".into()) }
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("malformed config must stop startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("invalid node config"), "{error}");
+        assert!(!route_armed.load(Ordering::SeqCst));
+        assert!(!resolver_called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn offline_on_demand_never_dials_tracker_for_raw_or_incomplete_target() {
+        use epix_ui::OnDemandResolver as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl Transport for CountingTransport {
+            fn scheme(&self) -> &'static str {
+                "tcp"
+            }
+
+            async fn dial(
+                &self,
+                _addr: &PeerAddr,
+            ) -> epix_core::Result<epix_transport::PeerStream> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(epix_core::Error::Other("counting transport dial".into()))
+            }
+        }
+
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let dials = Arc::new(AtomicUsize::new(0));
+        state
+            .set_transport(Arc::new(CountingTransport(dials.clone())))
+            .await;
+        let tracker = epix_xite::Tracker::Epix(PeerAddr::Ip("127.0.0.1:48333".parse().unwrap()));
+        let on_demand = OnDemand {
+            state: state.clone(),
+            data_root: dir.path().to_path_buf(),
+            trackers: vec![tracker],
+            network_disabled: true,
+            in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            tor_expected: std::sync::atomic::AtomicBool::new(false),
+            tor_always: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        // A raw address that is not local would normally announce to the Epix
+        // tracker through the counting transport and then clone from peers.
+        let error = on_demand.ensure(DASH).await.unwrap_err();
+        assert!(error.contains("offline mode"), "{error}");
+        assert!(!state.has_xite(DASH).await);
+
+        // A registered but interrupted xite would normally resume the same
+        // network flow. Offline mode must leave it untouched too.
+        let data_dir = dir.path().join("data").join(DASH);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        state
+            .add_xite(
+                DASH,
+                XiteEntry {
+                    storage: XiteStorage::new(&data_dir),
+                    content: None,
+                },
+            )
+            .await;
+        assert!(!state.xite_core_complete(DASH).await);
+        let error = on_demand.ensure(DASH).await.unwrap_err();
+        assert!(error.contains("offline mode"), "{error}");
+
+        // A complete local working copy still opens without networking.
+        std::fs::write(data_dir.join("content.json"), br#"{"files":{}}"#).unwrap();
+        assert!(state.xite_core_complete(DASH).await);
+        on_demand.ensure(DASH).await.unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn offline_transport_blocks_restored_peer_before_any_network_dial() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl Transport for CountingTransport {
+            fn scheme(&self) -> &'static str {
+                "tcp"
+            }
+
+            async fn dial(
+                &self,
+                _addr: &PeerAddr,
+            ) -> epix_core::Result<epix_transport::PeerStream> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(epix_core::Error::Other("counting transport dial".into()))
+            }
+        }
+
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data").join(DASH);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        state
+            .add_xite(
+                DASH,
+                XiteEntry {
+                    storage: XiteStorage::new(data_dir),
+                    content: None,
+                },
+            )
+            .await;
+        let peer = PeerAddr::Ip("127.0.0.1:48333".parse().unwrap());
+        state.add_peers(DASH, [peer.clone()]).await;
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let selected =
+            transport_for_network_policy(true, Arc::new(CountingTransport(dials.clone())));
+        state.set_transport(selected).await;
+
+        let result = state.edx_get_trackers(peer).await;
+        assert!(!matches!(result, Some(Ok(_))));
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            0,
+            "offline policy must reject before the configured network transport"
+        );
     }
 
     #[test]

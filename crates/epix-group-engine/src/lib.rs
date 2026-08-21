@@ -264,12 +264,21 @@ impl GroupSession {
 
     /// Open a group record from member `sender_xid` whose `tag` matched at the
     /// tag index `n` (the caller looked `tag` up in its registered window).
-    pub fn open(&mut self, sender_xid: &str, n: u32, tag: &[u8; 32], ct: &[u8]) -> Option<GroupOpened> {
-        let chain = self.peers.get_mut(sender_xid)?;
-        let mk = chain.recv_key(n)?;
+    pub fn open(
+        &mut self,
+        sender_xid: &str,
+        n: u32,
+        tag: &[u8; 32],
+        ct: &[u8],
+    ) -> Option<GroupOpened> {
+        // Authentication must succeed before the live receive chain advances.
+        // A copied public tag with forged ciphertext must not consume the
+        // genuine message key or slide the detection window.
+        let mut candidate = self.peers.get(sender_xid)?.clone();
+        let mk = candidate.recv_key(n)?;
         let pt = aead_open(&mk, &nonce_from(&mk), tag, ct)?;
         let v: Value = serde_json::from_slice(&pt).ok()?;
-        let pending = chain.skipped.len() as u32;
+        let pending = candidate.skipped.len() as u32;
         // Attribute the message to the AUTHENTICATED chain owner it decrypted
         // under — NEVER the payload's self-declared `f`, which a member seals on
         // their own chain and could set to another member's name (author spoof).
@@ -277,14 +286,20 @@ impl GroupSession {
         if v.get("f").and_then(|x| x.as_str()) != Some(sender_xid) {
             return None;
         }
-        Some(GroupOpened {
-            group_id: hex::decode(v.get("g")?.as_str()?).ok()?.try_into().ok()?,
+        let group_id = hex::decode(v.get("g")?.as_str()?).ok()?.try_into().ok()?;
+        if group_id != self.group_id {
+            return None;
+        }
+        let opened = GroupOpened {
+            group_id,
             sender_xid: sender_xid.to_string(),
             subject: v.get("s").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             body: v.get("b").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             sent_ms: v.get("t").and_then(|x| x.as_i64()).unwrap_or(0),
             pending,
-        })
+        };
+        self.peers.insert(sender_xid.to_string(), candidate);
+        Some(opened)
     }
 }
 
@@ -361,5 +376,48 @@ mod tests {
         // Eve has no chain for alice → cannot open.
         let mut eve = GroupSession::create(gid, "eve.epix");
         assert!(eve.open("alice.epix", 0, &m.tag, &m.ct).is_none());
+    }
+
+    #[test]
+    fn forged_ciphertext_does_not_consume_the_genuine_receive_key() {
+        let gid = [4u8; 16];
+        let mut alice = GroupSession::create(gid, "alice.epix");
+        let mut bob = GroupSession::create(gid, "bob.epix");
+        assert!(bob.add_member("alice.epix", &alice.my_bootstrap()));
+        let genuine = alice.seal("subject", "genuine", 10);
+        let mut forged = genuine.ct.clone();
+        forged[0] ^= 1;
+
+        assert!(bob
+            .open("alice.epix", genuine.index, &genuine.tag, &forged)
+            .is_none());
+        let opened = bob
+            .open("alice.epix", genuine.index, &genuine.tag, &genuine.ct)
+            .expect("the failed forgery must not advance the receive chain");
+        assert_eq!(opened.body, "genuine");
+    }
+
+    #[test]
+    fn payload_group_id_is_bound_before_the_receive_chain_commits() {
+        let gid = [5u8; 16];
+        let mut alice = GroupSession::create(gid, "alice.epix");
+        let mut wrong_group_alice = alice.clone();
+        wrong_group_alice.group_id = [6u8; 16];
+        let mut bob = GroupSession::create(gid, "bob.epix");
+        assert!(bob.add_member("alice.epix", &alice.my_bootstrap()));
+
+        let wrong = wrong_group_alice.seal("subject", "wrong group", 11);
+        assert!(bob
+            .open("alice.epix", wrong.index, &wrong.tag, &wrong.ct)
+            .is_none());
+
+        let genuine = alice.seal("subject", "right group", 12);
+        assert_eq!(genuine.index, wrong.index);
+        assert_eq!(genuine.tag, wrong.tag);
+        let opened = bob
+            .open("alice.epix", genuine.index, &genuine.tag, &genuine.ct)
+            .expect("wrong-group plaintext must not consume the receive chain");
+        assert_eq!(opened.group_id, gid);
+        assert_eq!(opened.body, "right group");
     }
 }

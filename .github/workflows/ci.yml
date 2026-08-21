@@ -53,6 +53,13 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Assert native host delegates xID resolution to the node
+        run: |
+          if grep -q '^epix-chain[[:space:]]*=' crates/epix-nmh/Cargo.toml || \
+             grep -R -n -E 'epix_chain|XidResolver|try_resolve_on_chain|resolve_on_chain|cached_resolution|write_resolve_cache' crates/epix-nmh/src; then
+            echo "::error::epix-nmh must use the authenticated node endpoint and must not resolve or cache xID names itself"
+            exit 1
+          fi
       # --all-targets also compiles tests and examples, so a break in any of
       # them (like the RustCrypto bump) fails here.
       - name: Build (all targets)
@@ -75,6 +82,11 @@ jobs:
       # #[ignore]d and stays skipped.
       - name: Test EDX runtime, UI and wire crates
         run: cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --locked
+      # Security-critical channel suites must execute, not merely compile under
+      # `build --all-targets`. These cover finality-backed identity resolution,
+      # durable ratchet/outbox behavior, pairwise and group engines, and RLN.
+      - name: Test metadata-private channel crates
+        run: cargo test -p epix-chain -p epix-envelope -p epix-channel -p epix-pairwise-engine -p epix-group-engine -p epix-rln -p epix-plugins -p epix-node -p epix-nmh -p epix-ffi --locked
 
   mobile-profiles:
     name: Mobile feature profiles

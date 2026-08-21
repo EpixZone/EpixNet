@@ -35,6 +35,13 @@ async-trait = "0.1"
 # they are dropped, which is why a stalled Tor bootstrap left "no logging
 # whatsoever" in the field.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fslock-guard = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [features]
 default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]

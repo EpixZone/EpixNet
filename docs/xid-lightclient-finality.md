@@ -27,12 +27,14 @@ reuse, smaller blast radius).
 - Verify each attestation against the **PINNED** pubkey (never the RPC-supplied
   one); require the full `(valcons→pubkey,power)` triple to match a pinned row.
 - **Strict** threshold `sum*3 > 2*total` (not ≥), against the pinned total.
-- Dedup by `valcons` before summing.
+- Dedup by `valcons` within a consensus round. Require the full threshold in one
+  round. Never sum valid votes from different rounds.
 - Canonical sign-bytes: fixed-width big-endian `height(u64)`+`block_time(i64 nanos)`,
   length-prefixed `chain_id`+`digest`, fixed-length domain tag. Freeze a byte-layout
   KAT; client reconstructs over the digest it independently bound to `proof_root`.
-- Freshness: `|now−block_time| ≤ skew` **and** `height ≥ max_height_seen` persisted
-  across restarts. Residual sub-skew rollback + client-clock dependency documented.
+- Freshness: `|now−block_time| ≤ skew` **and** `height ≥ max_height_seen`. Persist
+  the accepted height and digest atomically before returning success. Reject a
+  lower height and a different digest at the same height after restart.
 - Weak-subjectivity: ship the pin with `pinned_at_time`; **fail closed** when
   `now − pinned_at_time > WS_PERIOD` (< unbonding/2), and reject bundles whose height
   lags the pin beyond the window.
@@ -82,14 +84,15 @@ key** by CometBFT (the `ExtensionSignature`) as part of the precommit. So:
 ### Implementation status — COMPLETE + devnet-verified (2026-08-15)
 
 - ✅ **Client verifier core** — `crates/epix-chain/src/finality.rs`:
-  `verify_finality()` + `attest_sign_bytes()` (pinned-pubkey verify, valcons dedup,
-  strict `sum*3 > total*2` + ≥80% buffer, freshness, monotonic height, WS
-  pin-expiry) + `parse_bundle()`. 18 unit vectors. `ed25519-dalek` only.
+  `verify_finality()` + `attest_sign_bytes()` (pinned-pubkey verify, per-round
+  valcons dedup, one-round quorum, strict `sum*3 > total*2` + ≥80% buffer,
+  freshness, monotonic height, WS pin-expiry) + `parse_bundle()`.
 - ✅ **Client leaf-binding** — `leaf.rs` `verify_and_parse_leaf()` hashes the chain's
   canonical `leaf_preimage`, binds the name, parses the snapshot. 5 vectors.
 - ✅ **Client config + resolver wiring** — pinned set / chain_id / skew / ws_period /
-  monotonic height / `xid_verify_finality` gate; `resolver.rs` does leaf-binding +
-  `verify_finality_gated` (default OFF = legacy RPC-boolean, unchanged).
+  durable height-and-digest checkpoint / `xid_verify_finality` gate; `resolver.rs`
+  does leaf-binding + `verify_finality_gated`. Missing pins fail startup unless a
+  developer explicitly enables the pre-upgrade insecure compatibility mode.
 - ✅ **Chain (`x/xid` + evmd)** — `MsgRegisterAttestKey` (+ CLI), ABCI++
   vote-extension signing (`ExtendVote`/`VerifyVoteExtension`/`PrepareProposal`
   wrap/`PreBlocker` verify+majority-block_time+persist), power-based
@@ -199,8 +202,10 @@ cross-check identities, not a second fetch.
 3. For each attestation: confirm the validator + pubkey + power match the **pinned
    validator set**; verify the `ed25519` signature over the domain-separated
    sign-bytes.
-4. Require summed verified voting power ≥ 2/3 of the pinned total.
+4. Require summed verified voting power in one consensus round to exceed 2/3 of
+   the pinned total and meet the configured safety buffer.
 5. **Freshness**: `|now − block_time| ≤ skew` and `height` monotonic non-decreasing.
+   Atomically persist the accepted height and digest before returning success.
 6. Bind `proof_root == attested digest`; fail closed on any failure.
 
 **Deps: `ed25519` verification only** (light; likely already in-tree). No `ics23`,
@@ -218,10 +223,12 @@ verifies (small N), cacheable per digest.
 
 ## Config & rollout
 
-- `xid_verify_finality` (bool, default OFF until reviewed + a set is pinned).
-- The pinned validator set + `chain_id` shipped as config/build data.
-- When off: behavior unchanged (RPC-asserted boolean). Chain-side signing can ship
-  first (harmless); the client flips on once anchored + reviewed.
+- The pinned validator set + `chain_id` must ship as trusted release data after
+  the chain upgrade. This is a merge blocker.
+- Missing, unreadable, or invalid pins fail startup. Pre-upgrade developers can
+  set `EPIX_XID_ALLOW_INSECURE_LEGACY=1` explicitly. Official releases must not.
+- `xid_finality_checkpoint.json` stores the highest accepted height and digest.
+  Checkpoint load, verification, and publication all fail closed.
 
 ## Testing
 

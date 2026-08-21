@@ -3,8 +3,8 @@
 
 use epix_content::pool::{self, PoolRule};
 use epix_envelope::{
-    process_record, process_record_one, send_message, send_multi, Dest, Engine, FakeEngine,
-    IdentitySecret, ProcessOutcome, SLOTS,
+    process_record, process_record_one, process_record_with_peer_status, send_message, send_multi,
+    send_multi_with_rln, Dest, Engine, FakeEngine, IdentitySecret, ProcessOutcome, SLOTS,
 };
 use epix_channel::ChannelDb;
 
@@ -143,6 +143,300 @@ fn end_to_end_first_contact_and_reply() {
     }
     // Alice's thread now has her sent + Bob's reply.
     assert_eq!(alice_db.messages(alice_id, &hex::encode(conv)).unwrap().len(), 2);
+}
+
+#[test]
+fn failed_seal_does_not_advance_or_strand_first_contact() {
+    let e = FakeEngine;
+    let now = 1_780_000_000_000i64;
+    let alice_db = ChannelDb::memory().unwrap();
+    let bob_db = ChannelDb::memory().unwrap();
+    let alice = rand_id();
+    let bob = rand_id();
+    let alice_id = alice_db
+        .upsert_identity("alice.epix", "epix1alice", 0, None)
+        .unwrap();
+    let bob_id = bob_db
+        .upsert_identity("bob.epix", "epix1bob", 0, None)
+        .unwrap();
+    let alice_bundle = e.publish_bundle(&alice, "alice.epix");
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    let peer_ik = hex::encode(e.sender_ik(&bob_bundle).unwrap());
+    let conv = conv16();
+
+    let mut too_small = rule();
+    too_small.pad_buckets = vec![1024];
+    assert!(send_message(
+        &alice_db,
+        &e,
+        alice_id,
+        &alice,
+        "alice.epix",
+        &[],
+        &bob_bundle,
+        conv,
+        "oversize",
+        "body",
+        now,
+        &too_small,
+        true,
+    )
+    .is_err());
+    assert!(
+        alice_db
+            .session_id_for_leg(alice_id, &hex::encode(conv), &peer_ik)
+            .unwrap()
+            .is_none(),
+        "packing failure must not create or advance a session"
+    );
+    assert!(alice_db.pending_outbound(10).unwrap().is_empty());
+    assert!(alice_db
+        .messages(alice_id, &hex::encode(conv))
+        .unwrap()
+        .is_empty());
+
+    let mut rln_rule = rule();
+    rln_rule.rln_required = true;
+    let denied = |_: &[u8], _: i64| Err("allowance exhausted".to_string());
+    assert!(send_multi_with_rln(
+        &alice_db,
+        &e,
+        alice_id,
+        &alice,
+        "alice.epix",
+        &[],
+        &[Dest {
+            bundle: bob_bundle.clone()
+        }],
+        conv,
+        "rln",
+        "body",
+        now,
+        &rln_rule,
+        true,
+        &denied,
+    )
+    .is_err());
+    assert!(
+        alice_db
+            .session_id_for_leg(alice_id, &hex::encode(conv), &peer_ik)
+            .unwrap()
+            .is_none(),
+        "RLN failure must not create or advance a session"
+    );
+    assert!(alice_db.pending_outbound(10).unwrap().is_empty());
+
+    // A normal retry is still a genuine first contact and is decryptable.
+    let sent = send_message(
+        &alice_db,
+        &e,
+        alice_id,
+        &alice,
+        "alice.epix",
+        &[],
+        &bob_bundle,
+        conv,
+        "retry",
+        "delivered",
+        now,
+        &rule(),
+        true,
+    )
+    .unwrap();
+    let out = process_record_one(
+        &bob_db,
+        &e,
+        &[(bob_id, bob, "bob.epix".into())],
+        &sent.record,
+        now + 1,
+        |xid| {
+            if xid == "alice.epix" {
+                vec![alice_bundle.clone()]
+            } else {
+                Vec::new()
+            }
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        out,
+        ProcessOutcome::Indexed {
+            first_contact: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn durable_outbox_survives_restart_until_acknowledged() {
+    let e = FakeEngine;
+    let now = 1_780_000_000_000i64;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("channels.db");
+    let alice = rand_id();
+    let bob = rand_id();
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    let conv = conv16();
+
+    let sent = {
+        let db = ChannelDb::open(&path).unwrap();
+        let id = db
+            .upsert_identity("alice.epix", "epix1alice", 0, None)
+            .unwrap();
+        let sent = send_message(
+            &db,
+            &e,
+            id,
+            &alice,
+            "alice.epix",
+            &[],
+            &bob_bundle,
+            conv,
+            "durable",
+            "exact record",
+            now,
+            &rule(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.pending_outbound(10).unwrap().len(), 1);
+        sent
+    }; // simulated process shutdown before append/ack
+
+    let reopened = ChannelDb::open(&path).unwrap();
+    let pending = reopened.pending_outbound(10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].outbox_id, sent.outbox_id);
+    assert_eq!(
+        pending[0].record, sent.record,
+        "retry uses the exact signed record"
+    );
+    assert_eq!(pending[0].shard_path, sent.shard_path);
+    reopened.ack_outbound(sent.outbox_id).unwrap();
+    assert!(reopened.pending_outbound(10).unwrap().is_empty());
+}
+
+#[test]
+fn established_records_from_revoked_name_or_deleted_device_are_dropped() {
+    let e = FakeEngine;
+    let now = 1_780_000_000_000i64;
+    let alice_db = ChannelDb::memory().unwrap();
+    let bob_name_db = ChannelDb::memory().unwrap();
+    let bob_device_db = ChannelDb::memory().unwrap();
+    let alice = rand_id();
+    let bob = rand_id();
+    let alice_id = alice_db
+        .upsert_identity("alice.epix", "epix1alice", 0, None)
+        .unwrap();
+    let bob_name_id = bob_name_db
+        .upsert_identity("bob.epix", "epix1bob", 0, None)
+        .unwrap();
+    let bob_device_id = bob_device_db
+        .upsert_identity("bob.epix", "epix1bob", 0, None)
+        .unwrap();
+    let mut alice_bundle = e.publish_bundle(&alice, "alice.epix");
+    alice_bundle["auth"] = serde_json::json!("epix1alice");
+    let mut bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    bob_bundle["auth"] = serde_json::json!("epix1bob");
+    let alice_ik = hex::encode(e.sender_ik(&alice_bundle).unwrap());
+    let conv = conv16();
+
+    let first = send_message(
+        &alice_db,
+        &e,
+        alice_id,
+        &alice,
+        "alice.epix",
+        &[],
+        &bob_bundle,
+        conv,
+        "first",
+        "establish",
+        now,
+        &rule(),
+        true,
+    )
+    .unwrap();
+    for (db, id) in [(&bob_name_db, bob_name_id), (&bob_device_db, bob_device_id)] {
+        let out = process_record_one(
+            db,
+            &e,
+            &[(id, bob.clone(), "bob.epix".into())],
+            &first.record,
+            now + 1,
+            |_| vec![alice_bundle.clone()],
+        )
+        .unwrap();
+        assert!(matches!(
+            out,
+            ProcessOutcome::Indexed {
+                first_contact: true,
+                ..
+            }
+        ));
+        let peers = db.session_peers().unwrap();
+        assert_eq!(peers[0].peer_auth.as_deref(), Some("epix1alice"));
+        assert_eq!(peers[0].peer_ik, alice_ik);
+    }
+
+    let followup = send_message(
+        &alice_db,
+        &e,
+        alice_id,
+        &alice,
+        "alice.epix",
+        &[],
+        &bob_bundle,
+        conv,
+        "second",
+        "must be dropped",
+        now + 10,
+        &rule(),
+        false,
+    )
+    .unwrap();
+
+    // The current bundle file is absent in both checks. A definite name-level
+    // revocation still blocks the stored session.
+    let by_name = process_record_with_peer_status(
+        &bob_name_db,
+        &e,
+        &[(bob_name_id, bob.clone(), "bob.epix".into())],
+        &followup.record,
+        now + 11,
+        |_| Vec::new(),
+        |xid, _| (xid == "alice.epix").then_some(false),
+    )
+    .unwrap();
+    assert!(by_name.is_empty());
+
+    // The device bundle is also absent here. The retained peer identity key and
+    // auth link allow the caller's active-signer view to revoke only this leg.
+    let by_device = process_record_with_peer_status(
+        &bob_device_db,
+        &e,
+        &[(bob_device_id, bob, "bob.epix".into())],
+        &followup.record,
+        now + 11,
+        |_| Vec::new(),
+        |_, peer_ik| (peer_ik == alice_ik).then_some(false),
+    )
+    .unwrap();
+    assert!(by_device.is_empty());
+    assert_eq!(
+        bob_name_db
+            .messages(bob_name_id, &hex::encode(conv))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        bob_device_db
+            .messages(bob_device_id, &hex::encode(conv))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

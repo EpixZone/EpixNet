@@ -6,6 +6,7 @@ description = "The real pairwise channel crypto engine: X25519 X3DH + Double Rat
 
 [dependencies]
 epix-envelope = { path = "../epix-envelope" }
+epix-crypt = { path = "../epix-crypt" }
 # Sole curve library: a curve25519-dalek fork with Elligator2, so x25519 DH
 # (MontgomeryPoint::mul_clamped) and uniform first-contact representatives share
 # one point type.

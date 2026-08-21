@@ -17,6 +17,7 @@ epix-peer = { path = "../epix-peer" }
 # epix-channel = the mail-specific private index (its EnvelopeStore impl).
 epix-envelope = { path = "../epix-envelope" }
 epix-channel = { path = "../epix-channel" }
+epix-chain = { path = "../epix-chain" }
 # epix-rln = anonymous rate-limiting (RLN) admission for rln_required pools.
 # Pulls the zerokit/arkworks proving stack into the node binary.
 epix-rln = { path = "../epix-rln" }
@@ -28,9 +29,11 @@ serde_json = "1"
 base64 = "0.23"
 hex = "0.4"
 tokio = { version = "1", features = ["rt", "time", "sync"] }
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 epix-xite = { path = "../epix-xite" }
-epix-chain = { path = "../epix-chain" }
-tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
